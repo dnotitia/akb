@@ -122,11 +122,16 @@ interface. Three drivers ship; pick at config time:
 - **`qdrant`** — runs a separate Qdrant container; native RRF via the
   Query API. Useful when you already operate Qdrant or want to scale
   the vector store independently of Postgres.
-- **`seahorse`** — points at a managed Seahorse Cloud table over its
-  TABLE_V2 + BFF API (Bearer auth, per-table host). No infrastructure
-  to run on your side; you provision a table in the Seahorse console
-  (or let the driver auto-create one) and AKB stores its chunks
-  there. Native RRF, server-side BM25.
+- **`seahorse`** — points at a managed [Seahorse Cloud][shc] table over
+  its TABLE_V2 + BFF API (Bearer auth, per-table host). No
+  infrastructure to run on your side; you provision a table in the
+  Seahorse console (or let the driver auto-create one) and AKB stores
+  its chunks there. Native RRF, server-side BM25. See
+  [`docs/vector-store-seahorse.md`](./docs/vector-store-seahorse.md)
+  for the end-to-end setup walkthrough (sign-up → token → schema →
+  config).
+
+[shc]: https://console.seahorse.dnotitia.ai
 
 Switching drivers is a config edit (no schema migration on the main DB):
 
@@ -139,7 +144,7 @@ docker compose -f docker-compose.yaml -f docker-compose.qdrant.yaml up
 $EDITOR config/app.yaml     # vector_store_driver: qdrant
                             # vector_url: http://qdrant:6333
 
-# Seahorse Cloud:
+# Seahorse Cloud (managed; full guide in docs/vector-store-seahorse.md):
 docker compose up           # no extra container needed
 $EDITOR config/app.yaml     # vector_store_driver: seahorse
                             # seahorse_tenant_uuid: <your tenant>
