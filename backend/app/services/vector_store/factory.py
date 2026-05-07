@@ -52,6 +52,31 @@ def get_vector_store() -> VectorStore:
             sparse_shape=settings.vector_store_sparse_shape,
             get_main_pool=get_pool,
         )
+    elif driver == "seahorse":
+        from .seahorse import SeahorseStore
+        if not settings.seahorse_token:
+            raise RuntimeError(
+                "vector_store_driver=seahorse requires seahorse_token (Bearer) "
+                "in secret.yaml."
+            )
+        if not settings.seahorse_tenant_uuid:
+            raise RuntimeError(
+                "vector_store_driver=seahorse requires seahorse_tenant_uuid."
+            )
+        if not (settings.seahorse_table_name or settings.seahorse_table_uuid):
+            raise RuntimeError(
+                "vector_store_driver=seahorse requires either "
+                "seahorse_table_name or seahorse_table_uuid."
+            )
+        _singleton = SeahorseStore(
+            management_url=settings.seahorse_management_url,
+            token=settings.seahorse_token,
+            tenant_uuid=settings.seahorse_tenant_uuid,
+            table_name=settings.seahorse_table_name or None,
+            table_uuid=settings.seahorse_table_uuid or None,
+            dense_dim=settings.embed_dimensions,
+            auto_create=settings.seahorse_auto_create,
+        )
     else:
         # Unreachable given the Literal at config load; kept for safety
         # against future config refactors.

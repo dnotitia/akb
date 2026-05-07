@@ -28,11 +28,20 @@ deploy/k8s/
 ```
 
 **Vector store**: the base ships with `vector_store_driver: pgvector`
-inside the Postgres pod. To run Qdrant as a separate StatefulSet
-instead, add `qdrant.yaml` to `kustomization.yaml` and patch
-`akb-app-config` to set `vector_store_driver: qdrant` and
-`vector_url: http://qdrant:6333`. The internal/ overlay does exactly
-that for the production cluster.
+inside the Postgres pod. Other options:
+
+- **Qdrant** as a separate StatefulSet — add `qdrant.yaml` to
+  `kustomization.yaml` and patch `akb-app-config` to set
+  `vector_store_driver: qdrant` + `vector_url: http://qdrant:6333`.
+- **Seahorse Cloud** (managed) — no extra StatefulSet; patch
+  `akb-app-config` with `vector_store_driver: seahorse` +
+  `seahorse_tenant_uuid` + `seahorse_table_name`/`seahorse_table_uuid`,
+  and put `seahorse_token: shsk_<...>` in the secret. AKB calls the
+  Seahorse BFF (`https://console.seahorse.dnotitia.ai/bff`) for table
+  lifecycle and the per-table host for data CRUD/search.
+
+The `internal/` overlay shows the Qdrant pattern for the production
+cluster.
 
 ## Quickstart (generic)
 

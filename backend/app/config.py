@@ -91,7 +91,7 @@ class Settings(BaseModel):
     public_base_url: str = ""
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
-    vector_store_driver: Literal["qdrant", "pgvector"] = "qdrant"
+    vector_store_driver: Literal["qdrant", "pgvector", "seahorse"] = "qdrant"
 
     # Pgvector driver settings.
     vector_store_dsn: str = ""              # blank = reuse main PG pool
@@ -105,6 +105,17 @@ class Settings(BaseModel):
     vector_url: str = ""                    # e.g. http://qdrant:6333
     vector_api_key: str = ""
     vector_collection: str = "chunks"
+
+    # Seahorse Cloud driver settings. Two-plane API: management (BFF)
+    # for table lifecycle + per-table data-plane host. The driver
+    # discovers the data-plane host from the management lookup; only
+    # set the management URL + token + tenant + table identifier.
+    seahorse_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
+    seahorse_token: str = ""                # secret.yaml — Bearer (shsk_...)
+    seahorse_tenant_uuid: str = ""
+    seahorse_table_name: str = ""           # one of (table_name, table_uuid) required
+    seahorse_table_uuid: str = ""
+    seahorse_auto_create: bool = False      # auto-provision the AKB-shaped table
 
     # Indexing worker — claim size per batch. Larger = fewer round-trips
     # to the embedding API but longer per-batch wall clock and bigger

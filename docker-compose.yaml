@@ -5,8 +5,12 @@
 # under the `vector_index` schema; main `chunks` table stays plain
 # PostgreSQL.
 #
-# To use Qdrant instead, layer the optional override:
-#   docker compose -f docker-compose.yaml -f docker-compose.qdrant.yaml up
+# Other vector-store options:
+# - Qdrant as a separate container — layer the optional override:
+#     docker compose -f docker-compose.yaml -f docker-compose.qdrant.yaml up
+# - Seahorse Cloud (managed) — no override; just edit config/app.yaml
+#   (vector_store_driver: seahorse, plus tenant_uuid/table) and
+#   config/secret.yaml (seahorse_token).
 #
 # Usage:
 #   1. cp config/app.yaml.example config/app.yaml

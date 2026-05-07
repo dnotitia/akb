@@ -81,9 +81,11 @@ Two supported paths:
   vocab + stats live in `bm25_vocab` / `bm25_stats`.
 - **Vector store is a driver-pluggable derived index.** `pgvector`
   (default; can share the main PG instance under a separate
-  `vector_index` schema) or `qdrant` (separate StatefulSet). Holds both
-  the dense embedding and the corpus-side BM25 sparse vector. Driver
-  selection in `config/app.yaml` (`vector_store_driver`).
+  `vector_index` schema), `qdrant` (separate StatefulSet), or
+  `seahorse` (managed Seahorse Cloud table over BFF + per-table host
+  API; no infra to run). Each driver holds the dense embedding and the
+  corpus-side BM25 sparse vector. Selection in `config/app.yaml`
+  (`vector_store_driver`).
 - **Write path (POST /documents)** only touches PG + git. No vector-store
   round-trips on the request thread — chunks go in with
   `vector_indexed_at = NULL`.

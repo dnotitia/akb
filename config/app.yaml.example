@@ -91,6 +91,15 @@ vector_store_sparse_shape: posting
 vector_url: ""
 vector_collection: chunks
 
+# Seahorse Cloud driver settings (ignored unless driver is seahorse).
+# Two-plane API: management (BFF) for table lifecycle + per-table
+# data-plane host (auto-discovered from BFF response).
+seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
+seahorse_tenant_uuid: ""
+seahorse_table_name: ""    # one of (table_name, table_uuid) required
+seahorse_table_uuid: ""
+seahorse_auto_create: false   # set true to provision the AKB-shaped table on first boot
+
 # === Indexing worker tuning ===
 # Chunks claimed per worker tick. Larger = fewer round-trips to the
 # embedding API but bigger transaction footprint. 16 is safe at
