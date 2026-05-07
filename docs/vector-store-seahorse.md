@@ -23,7 +23,7 @@ If those don't apply, prefer `pgvector` (default) or `qdrant`.
 1. Open <https://console.seahorse.dnotitia.ai> and sign up.
 2. After login, the console drops you into a tenant. The tenant UUID
    appears in the URL of the database/tables page, e.g.
-   `…/main/database/tables?tenant=37cfb12f-7093-412f-8926-b5c4fba4356c`.
+   `…/main/database/tables?tenant=<your-tenant-uuid>`.
    Copy this — it's the `seahorse_tenant_uuid` you'll set later.
 
 ## 2. Issue an API token
@@ -102,7 +102,7 @@ embed_dimensions: 1536
 
 # Seahorse driver settings
 seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
-seahorse_tenant_uuid: "37cfb12f-…"            # from step 1
+seahorse_tenant_uuid: "<your-tenant-uuid>"    # from step 1
 seahorse_table_name: "akb_chunks"             # one of (name, uuid)
 # seahorse_table_uuid: ""                     # alternative to name
 seahorse_auto_create: false                   # true on first boot if going Option A
@@ -130,7 +130,7 @@ On boot you should see (only when `auto_create: true` and the table
 doesn't yet exist):
 
 ```
-INFO  akb.vector_store.seahorse: Seahorse table auto-created: name=akb_chunks tenant=37cfb12f-…
+INFO  akb.vector_store.seahorse: Seahorse table auto-created: name=akb_chunks tenant=<your-tenant-uuid>
 ```
 
 Subsequent boots silently call `ensure_collection` and validate the
