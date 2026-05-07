@@ -1,0 +1,40 @@
+name: hr
+display_name: "Human Resources"
+description: "인사 팀 지식베이스"
+collections:
+  - path: policies
+    name: "Policies & Regulations"
+    guide: |
+      사내 정책, 규정, 복리후생 안내를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]
+
+  - path: onboarding
+    name: "Onboarding"
+    guide: |
+      신규 입사자 온보딩 체크리스트, 가이드를 저장합니다.
+      권장 문서 타입: reference
+      템플릿: doc-templates/onboarding-checklist.md
+    suggested_types: [reference]
+
+  - path: org-chart
+    name: "Organization"
+    guide: |
+      조직도, 팀 구성, 역할 정의를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]
+
+  - path: reviews
+    name: "Performance Reviews"
+    guide: |
+      성과 평가 기준, 평가 양식, 리뷰 결과를 저장합니다.
+      권장 문서 타입: report
+    suggested_types: [report]
+
+  - path: recruitment
+    name: "Recruitment"
+    guide: |
+      채용 프로세스, JD 템플릿, 면접 가이드를 저장합니다.
+      권장 문서 타입: reference
+      템플릿: doc-templates/job-description.md
+    suggested_types: [reference, plan]

@@ -1,0 +1,41 @@
+name: qa
+display_name: "QA & Testing"
+description: "품질보증 팀 지식베이스"
+collections:
+  - path: test-plans
+    name: "Test Plans"
+    guide: |
+      테스트 계획서, 테스트 전략 문서를 저장합니다.
+      권장 문서 타입: plan
+      템플릿: doc-templates/test-plan.md
+    suggested_types: [plan]
+
+  - path: test-cases
+    name: "Test Cases & Suites"
+    guide: |
+      테스트 케이스, 테스트 시나리오를 저장합니다.
+      권장 문서 타입: spec
+    suggested_types: [spec]
+
+  - path: bug-reports
+    name: "Bug Reports"
+    guide: |
+      발견된 버그와 재현 방법을 기록합니다.
+      권장 문서 타입: report
+      템플릿: doc-templates/bug-report.md
+    suggested_types: [report]
+
+  - path: release-notes
+    name: "Release Notes"
+    guide: |
+      버전별 릴리스 노트를 저장합니다.
+      권장 문서 타입: report
+      템플릿: doc-templates/release-note.md
+    suggested_types: [report]
+
+  - path: automation
+    name: "Test Automation"
+    guide: |
+      테스트 자동화 가이드, CI/CD 테스트 설정 문서를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]

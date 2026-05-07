@@ -1,0 +1,40 @@
+name: issue-tracking
+display_name: "Issue Tracking"
+description: "이슈/인시던트 관리 지식베이스"
+collections:
+  - path: incidents
+    name: "Incidents"
+    guide: |
+      서비스 장애, 보안 이슈 등 인시던트를 기록합니다.
+      권장 문서 타입: report
+      템플릿: doc-templates/incident-report.md
+    suggested_types: [report]
+
+  - path: postmortems
+    name: "Postmortems"
+    guide: |
+      인시던트 사후 분석 (5 Whys, 타임라인, 재발 방지)을 저장합니다.
+      권장 문서 타입: report
+      템플릿: doc-templates/postmortem.md
+    suggested_types: [report]
+
+  - path: improvements
+    name: "Improvements"
+    guide: |
+      프로세스 개선 제안, 기술 부채 해결 계획을 저장합니다.
+      권장 문서 타입: plan, task
+    suggested_types: [plan, task]
+
+  - path: sla
+    name: "SLA & SLO"
+    guide: |
+      서비스 수준 목표, 모니터링 기준, 에스컬레이션 절차를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]
+
+  - path: changelog
+    name: "Changelog"
+    guide: |
+      시스템 변경 이력, 배포 기록을 저장합니다.
+      권장 문서 타입: note
+    suggested_types: [note]

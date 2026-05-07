@@ -1,0 +1,32 @@
+# Only the source tree + Dockerfile + pyproject ship in the image.
+# `config/` is operator-supplied at runtime via mount (compose:
+# ./config → /etc/akb; k8s: ConfigMap+Secret → /etc/akb). Bundling
+# anything from a developer's local config/ would shadow the
+# runtime mount and silently apply OSS-default values.
+config/
+secret/
+
+# Standard Python noise
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Project-local lock (bake into image only via pyproject install)
+uv.lock

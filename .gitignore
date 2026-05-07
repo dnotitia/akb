@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+*.whl
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.storybook-out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# AKB config (yaml — single source of runtime config; only .example is tracked)
+/config/*.yaml
+!/config/*.yaml.example
+
+# Operator-specific deploy overrides — internal hostnames, registry,
+# ClusterIssuers with real DNS-01 credentials, etc. The base manifests
+# under deploy/k8s/ stay generic; private overrides live here.
+/deploy/k8s/internal/
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Claude Code
+.claude/
+
+# Docker
+*.log
+
+# Data (local dev)
+/data/
+.playwright-mcp/

@@ -1,0 +1,96 @@
+# Redis (standalone) for AKB event stream — managed by the OT Container
+# Kit redis-operator (`redis.redis.opstreelabs.in/v1beta2`). If you
+# don't already run that operator, replace this manifest with a plain
+# StatefulSet/Deployment running the redis image of your choice — only
+# the Service name `redis` and the password Secret are load-bearing.
+#
+# Used by the events_publisher worker to fan out PG outbox events
+# (`akb:events` stream) to external subscribers via Redis Streams.
+#
+# The `redis-credentials` Secret holding the password is managed manually
+# (kubectl create secret) just like `akb-secret-config` — it's not in this
+# file because deploy.sh re-runs `kubectl kustomize | apply` on every
+# deploy, which would clobber a real password with a placeholder. Setup:
+#
+#     PW=$(openssl rand -base64 32)
+#     kubectl create secret generic redis-credentials -n akb \
+#       --from-literal=password="$PW"
+#     # then add `redis_password: "$PW"` to akb-secret-config (secret.yaml)
+#     # so the backend connects with the matching password.
+
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: Redis
+metadata:
+  name: redis
+  namespace: akb
+spec:
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.12
+    imagePullPolicy: IfNotPresent
+    # Event stream is metadata-only (vault_id, kind, ref_id, small JSON
+    # payload) and bounded by MAXLEN on the publisher side. 256Mi is
+    # plenty even at the 100k-entry MAXLEN default.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    redisSecret:
+      name: redis-credentials
+      key: password
+  redisExporter:
+    enabled: true
+    image: quay.io/opstree/redis-exporter:v1.44.0
+    imagePullPolicy: IfNotPresent
+    port: 9121
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+  # Redis config — XADD MAXLEN trims the stream from the publisher
+  # side, so eviction must be `noeviction` to avoid LRU lopping off
+  # the middle of the log.
+  redisConfig:
+    additionalRedisConfig: redis-config
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+        # Uncomment + set if your cluster's default StorageClass uses
+        # WaitForFirstConsumer binding — the redis-operator schedules
+        # the StatefulSet only after the PVC is Bound, so an Immediate
+        # binding class avoids a chicken-and-egg deadlock.
+        # storageClassName: <your-immediate-binding-class>
+  securityContext:
+    runAsUser: 1000
+  # fsGroup makes kubelet chown the PVC to the redis gid (1000) on
+  # mount. Without it the volume stays root:root and RDB snapshots
+  # fail (`stop-writes-on-bgsave-error yes` then halts writes).
+  podSecurityContext:
+    fsGroup: 1000
+    runAsUser: 1000
+
+---
+# Inline Redis config consumed via spec.redisConfig.additionalRedisConfig.
+# `noeviction` is intentional — the publisher uses XADD MAXLEN ~ to bound
+# the stream, and an LRU eviction would corrupt event ordering.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: akb
+data:
+  redis-additional.conf: |
+    maxmemory-policy noeviction
+    appendonly no
+    save 900 1
+    save 300 10

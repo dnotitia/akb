@@ -1,0 +1,17 @@
+{
+  "name": "akb-mcp",
+  "version": "0.6.0",
+  "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
+  "bin": {
+    "akb-mcp": "./bin/akb-mcp.mjs"
+  },
+  "type": "module",
+  "files": ["bin/", "lib/"],
+  "keywords": ["mcp", "akb", "knowledge-base", "claude-code", "cursor", "copilot", "ai-agent"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/byongjohn-han_dnotitia/akb.git",
+    "directory": "packages/akb-mcp-client"
+  }
+}

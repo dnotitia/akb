@@ -1,0 +1,375 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@import "@fontsource/ibm-plex-sans/300.css";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-sans/700.css";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/fraunces";
+@import "@fontsource/ibm-plex-serif/400.css";
+@import "@fontsource/ibm-plex-serif/500.css";
+@import "@fontsource/ibm-plex-serif/600.css";
+@import "@fontsource/ibm-plex-serif/400-italic.css";
+@import "@fontsource/ibm-plex-serif/500-italic.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ── Primitives (legacy names, kept as aliases for older utilities) ── */
+  --color-paper: #faf9f5;
+  --color-ink: #0a0908;
+  --color-smoke: #75716b;
+  --color-whisper: #ecebe6;
+  --color-spark: #ff4d12;
+  --color-ember: #c63d09;
+
+  /* ── Semantic tokens (light default) ──────────────────────────────── */
+  --color-background: #faf9f5;
+  --color-surface: #ffffff;
+  --color-surface-muted: #ecebe6;
+  --color-foreground: #0a0908;
+  --color-foreground-muted: #75716b;
+  --color-border: #0a0908;
+  --color-border-strong: #0a0908;
+  --color-accent: #ff4d12;
+  --color-accent-foreground: #faf9f5;
+  --color-success: #16a34a;
+  --color-warning: #ca8a04;
+  --color-destructive: #c63d09;
+  --color-destructive-foreground: #faf9f5;
+  --color-ring: #ff4d12;
+  --color-info: #3b82f6;
+  --color-good: #16a34a;
+
+  /* shadcn alias (existing components inherit) */
+  --color-primary: #0a0908;
+  --color-primary-foreground: #faf9f5;
+  --color-secondary: #ecebe6;
+  --color-secondary-foreground: #0a0908;
+  --color-muted: #ecebe6;
+  --color-muted-foreground: #75716b;
+  --color-card: #ffffff;
+  --color-card-foreground: #0a0908;
+  --color-input: #0a0908;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #0a0908;
+
+  /* Typography */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-serif: "IBM Plex Serif", "Tiempos Text", "Iowan Old Style", Georgia, serif;
+  --font-display: "Fraunces Variable", "Fraunces", ui-serif, Georgia, serif;
+
+  /* Motion */
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --duration-slow: 300ms;
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Sharp by default */
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+}
+
+/* ── Dark mode overrides ─────────────────────────────────────────── */
+.dark {
+  --color-background: #0f172a;
+  --color-surface: #1b2336;
+  --color-surface-muted: #272f42;
+  --color-foreground: #f8fafc;
+  --color-foreground-muted: #94a3b8;
+  --color-border: #334155;
+  --color-border-strong: #475569;
+  --color-accent: #ff4d12;
+  --color-accent-foreground: #0f172a;
+  --color-success: #22c55e;
+  --color-warning: #eab308;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #f8fafc;
+  --color-ring: #ff4d12;
+  --color-info: #60a5fa;
+  --color-good: #7ea563;
+
+  --color-primary: #f8fafc;
+  --color-primary-foreground: #0f172a;
+  --color-secondary: #272f42;
+  --color-secondary-foreground: #f8fafc;
+  --color-muted: #272f42;
+  --color-muted-foreground: #94a3b8;
+  --color-card: #1b2336;
+  --color-card-foreground: #f8fafc;
+  --color-input: #334155;
+  --color-popover: #1b2336;
+  --color-popover-foreground: #f8fafc;
+}
+
+/* ── Global ──────────────────────────────────────────────────────── */
+html, body {
+  font-family: var(--font-sans);
+  background: var(--color-background);
+  color: var(--color-foreground);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "ss02";
+}
+
+*, *::before, *::after {
+  border-color: var(--color-border);
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--color-accent-foreground);
+}
+
+/* ── Typography utilities ────────────────────────────────────────── */
+.font-display {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-variation-settings: "opsz" 144, "SOFT" 30;
+  font-weight: 400;
+  letter-spacing: -0.025em;
+  line-height: 0.95;
+}
+
+.font-display-tight {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-variation-settings: "opsz" 144, "SOFT" 30;
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 0.92;
+}
+
+/* Publication prose body (Fraunces readable body, editorial tone) */
+.font-display-body {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 14, "SOFT" 30;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.75;
+}
+
+/* Archive-grade serif — for internal display hierarchy (vault titles, doc H1).
+   Obsidian-like read-focus with warm tone. IBM Plex Serif. */
+.font-serif {
+  font-family: var(--font-serif);
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+
+.font-serif-italic {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.005em;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "zero", "ss01";
+}
+
+.coord {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-foreground-muted);
+}
+
+.coord-ink {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-foreground);
+}
+
+.coord-spark {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-accent);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  letter-spacing: -0.012em;
+}
+
+/* tabular figures for numeric columns */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Motion ──────────────────────────────────────────────────────── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.fade-up {
+  animation: fade-up var(--duration-slow) var(--ease-out) both;
+}
+
+.fade-in {
+  animation: fade-in var(--duration-base) var(--ease-out) both;
+}
+
+.stagger > * {
+  animation: fade-up var(--duration-slow) var(--ease-out) both;
+}
+.stagger > *:nth-child(1) { animation-delay: 40ms; }
+.stagger > *:nth-child(2) { animation-delay: 80ms; }
+.stagger > *:nth-child(3) { animation-delay: 120ms; }
+.stagger > *:nth-child(4) { animation-delay: 160ms; }
+.stagger > *:nth-child(5) { animation-delay: 200ms; }
+.stagger > *:nth-child(6) { animation-delay: 240ms; }
+.stagger > *:nth-child(7) { animation-delay: 280ms; }
+.stagger > *:nth-child(8) { animation-delay: 320ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Focus ring (accent-safe, used on accent-colored surfaces) ───── */
+.focus-ring {
+  outline: none;
+}
+.focus-ring:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+
+/* ── Prose (markdown) — reading-first, quiet by default ──────────── */
+.prose {
+  color: var(--color-foreground);
+  max-width: 70ch;
+  line-height: 1.75;
+}
+
+.prose a {
+  color: var(--color-foreground);
+  text-decoration: underline;
+  text-decoration-color: var(--color-foreground-muted);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  transition: color 150ms, text-decoration-color 150ms;
+}
+.prose a:hover {
+  color: var(--color-accent);
+  text-decoration-color: var(--color-accent);
+}
+.prose strong { color: var(--color-foreground); font-weight: 600; }
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+.prose h2 { font-size: 1.5em; margin-top: 2em; margin-bottom: 0.6em; }
+.prose h3 { font-size: 1.2em; margin-top: 1.6em; margin-bottom: 0.4em; }
+
+/* Inline code: soft muted tone, no border — blends with text */
+.prose code {
+  font-family: var(--font-mono);
+  background: var(--color-surface-muted);
+  color: var(--color-foreground);
+  padding: 0.08em 0.32em;
+  font-size: 0.88em;
+  border-radius: 0;
+  font-weight: 500;
+}
+/* Strip the default prose wrapping quotes around inline code */
+.prose code::before, .prose code::after { content: none; }
+
+.prose pre {
+  font-family: var(--font-mono);
+  background: var(--color-surface-muted);
+  color: var(--color-foreground);
+  padding: 1em;
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  font-size: 0.88em;
+}
+.prose pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 1em;
+  font-weight: 400;
+}
+.prose blockquote {
+  border-left: 2px solid var(--color-border);
+  color: var(--color-foreground-muted);
+  font-style: normal;
+  padding-left: 1em;
+}
+.prose blockquote p::before, .prose blockquote p::after { content: none; }
+.prose ul, .prose ol { padding-left: 1.4em; }
+.prose li { margin-top: 0.35em; margin-bottom: 0.35em; }
+.prose li p { margin-top: 0.2em; margin-bottom: 0.2em; }
+.prose hr { border-color: var(--color-border); }
+
+/* Wide markdown tables stay inside the reading column on mobile by
+   becoming horizontally scrollable instead of pushing the page wider. */
+.prose table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+}
+
+.dark .prose { color: var(--color-foreground); }
+.dark .prose strong { color: var(--color-foreground); }
+.dark .prose h1, .dark .prose h2, .dark .prose h3, .dark .prose h4 {
+  color: var(--color-foreground);
+}
+.dark .prose a { text-decoration-color: var(--color-foreground-muted); }
+
+/* ── Hairline utilities (preserved from v0.5) ────────────────────── */
+.hairline-b { border-bottom: 1px solid var(--color-border); }
+.hairline-t { border-top: 1px solid var(--color-border); }
+.hairline-l { border-left: 1px solid var(--color-border); }
+.hairline-r { border-right: 1px solid var(--color-border); }
+
+/* ── Whisper background (preserved as semantic-muted alias) ──────── */
+.whisper-bg { background: var(--color-surface-muted); }
+
+/* ── Dotted background (auth/landing hero only) ──────────────────── */
+.dotted {
+  background-image: radial-gradient(var(--color-border) 1px, transparent 1px);
+  background-size: 12px 12px;
+}
+
+/* ── Rail scroll — subtle scrollbar for secondary side panels ──────
+   Used when a rail pane (outline, history) can overflow. Keeps the
+   scrollbar faint so it doesn't compete with the primary content. */
+.rail-scroll { scrollbar-gutter: stable; scrollbar-width: thin; }
+.rail-scroll::-webkit-scrollbar { width: 6px; }
+.rail-scroll::-webkit-scrollbar-track { background: transparent; }
+.rail-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-border) 70%, transparent);
+  border-radius: 3px;
+}
+.rail-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}

@@ -1,0 +1,29 @@
+# Optional override — flips the vector store from pgvector
+# (default in docker-compose.yaml) to a separate Qdrant container.
+#
+# Usage:
+#   docker compose -f docker-compose.yaml -f docker-compose.qdrant.yaml up
+#
+# Set the matching driver in config/app.yaml before bringing the
+# stack up:
+#
+#   vector_store_driver: qdrant
+#   vector_url: http://qdrant:6333
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+
+  backend:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+volumes:
+  qdrant_data:
+  qdrant_snapshots:

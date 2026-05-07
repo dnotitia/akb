@@ -1,0 +1,106 @@
+# PostgreSQL with pgvector - simple StatefulSet deployment
+# Using pgvector/pgvector:pg16 which includes the vector extension pre-installed
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: akb
+type: Opaque
+stringData:
+  POSTGRES_DB: akb
+  POSTGRES_USER: akbuser
+  POSTGRES_PASSWORD: akb-secure-password-change-me
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: akb
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akb-postgres
+  template:
+    metadata:
+      labels:
+        app: akb-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          args:
+            - "-c"
+            - "shared_buffers=2GB"
+            - "-c"
+            - "effective_cache_size=6GB"
+            - "-c"
+            - "work_mem=32MB"
+            - "-c"
+            - "maintenance_work_mem=512MB"
+            - "-c"
+            - "random_page_cost=1.1"
+            - "-c"
+            - "shared_preload_libraries=pg_stat_statements"
+            - "-c"
+            - "pg_stat_statements.track=all"
+            - "-c"
+            - "max_connections=200"
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "1"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "akbuser", "-d", "akb"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: akb
+spec:
+  selector:
+    app: akb-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+
+# PG init.sql is handled by the backend at startup (postgres.init_db),
+# which performs the embedding-dimension placeholder substitution. No
+# separate init Job is needed.

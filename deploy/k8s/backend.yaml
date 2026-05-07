@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akb-app-config
+  namespace: akb
+data:
+  # Mounted at /etc/akb/app.yaml. All non-secret runtime config lives here.
+  # Defaults match config/app.yaml.example. Override per-environment via
+  # `kubectl edit configmap akb-app-config -n akb` or a kustomize overlay
+  # under deploy/k8s/internal/.
+  app.yaml: |
+    db_host: postgres
+    db_port: 5432
+    db_name: akb
+    db_user: akbuser
+    git_storage_path: /data/vaults
+
+    # Embedding (required) — any OpenAI-compatible /v1/embeddings endpoint.
+    # embed_dimensions MUST match the model.
+    embed_base_url: https://api.openai.com/v1
+    embed_model: text-embedding-3-small
+    embed_dimensions: 1536
+
+    # LLM (optional) — used by metadata_worker for auto-tagging external-git
+    # imports. Leave blank to disable; core CRUD/search keeps working.
+    llm_base_url: ""
+    llm_model: ""
+
+    # Reranker (optional) — cross-encoder rescoring of candidates.
+    rerank_enabled: false
+    rerank_provider: cohere
+    rerank_model: cohere/rerank-v3.5
+    rerank_prefetch: 30
+
+    # S3-compatible object storage (optional) — leave blank to disable.
+    s3_endpoint_url: ""
+    s3_bucket: akb-files
+
+    # Vector store — default driver is pgvector inside the main PG pod
+    # (`pgvector/pgvector:pg16` ships with the extension). Override
+    # via overlay (deploy/k8s/internal/) to use Qdrant instead.
+    vector_store_driver: pgvector
+    vector_store_dsn: ""
+    vector_store_schema: vector_index
+    vector_store_sparse_shape: posting
+    vector_url: ""
+    vector_collection: chunks
+
+    # Set to your public ingress URL for absolute /p/{slug} publication URLs.
+    public_base_url: ""
+
+    # Event stream (optional Redis fanout). Leave blank to disable —
+    # PG `events` outbox still works.
+    redis_url: ""
+    redis_event_stream: akb:events
+    redis_stream_maxlen: 100000
+
+---
+# akb-secret-config — managed manually (kubectl edit / sealed-secrets / vault),
+# never committed. Mounted at /etc/akb/secret.yaml. Expected shape:
+#
+#   stringData:
+#     secret.yaml: |
+#       db_password: <postgres password>
+#       jwt_secret:  <openssl rand -hex 32>
+#       embed_api_key: <provider key>
+#       llm_api_key: <provider key>
+#       rerank_api_key: <cohere key>
+#       vector_api_key: <qdrant api key>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: akb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akb-backend
+  template:
+    metadata:
+      labels:
+        app: akb-backend
+    spec:
+      containers:
+        - name: backend
+          image: akb-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: app-config
+              mountPath: /etc/akb/app.yaml
+              subPath: app.yaml
+              readOnly: true
+            - name: secret-config
+              mountPath: /etc/akb/secret.yaml
+              subPath: secret.yaml
+              readOnly: true
+            - name: vaultdata
+              mountPath: /data/vaults
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "1"
+            # No CPU limit on purpose: cgroup throttling caused /livez to
+            # time out under indexing bursts. Cluster has ~98% CPU headroom;
+            # revisit if other tenants land on the same node.
+            limits:
+              memory: "4Gi"
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: app-config
+          configMap:
+            name: akb-app-config
+        - name: secret-config
+          secret:
+            secretName: akb-secret-config
+        - name: vaultdata
+          persistentVolumeClaim:
+            claimName: akb-vaultdata
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: akb-vaultdata
+  namespace: akb
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: akb
+spec:
+  selector:
+    app: akb-backend
+  ports:
+    - port: 8000
+      targetPort: 8000

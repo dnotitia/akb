@@ -1,0 +1,38 @@
+name: finance
+display_name: "Finance"
+description: "재무 팀 지식베이스"
+collections:
+  - path: budgets
+    name: "Budgets"
+    guide: |
+      연간/분기별 예산 계획, 비용 분석을 저장합니다.
+      권장 문서 타입: plan
+    suggested_types: [plan]
+
+  - path: reports
+    name: "Financial Reports"
+    guide: |
+      재무제표, 월간/분기 보고서, 매출 분석을 저장합니다.
+      권장 문서 타입: report
+    suggested_types: [report]
+
+  - path: forecasts
+    name: "Forecasts"
+    guide: |
+      매출 예측, 비용 전망, 시나리오 분석을 저장합니다.
+      권장 문서 타입: report
+    suggested_types: [report]
+
+  - path: policies
+    name: "Financial Policies"
+    guide: |
+      경비 처리 규정, 결재 기준, 세무 가이드를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]
+
+  - path: invoices
+    name: "Invoices & Contracts"
+    guide: |
+      계약서, 인보이스, 발주서 관련 문서를 저장합니다.
+      권장 문서 타입: reference
+    suggested_types: [reference]

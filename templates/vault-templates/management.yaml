@@ -1,0 +1,41 @@
+name: management
+display_name: "Management"
+description: "경영/전략 지식베이스"
+collections:
+  - path: strategy
+    name: "Strategy"
+    guide: |
+      사업 전략, 시장 분석, 경쟁사 분석을 저장합니다.
+      권장 문서 타입: report, decision
+    suggested_types: [report, decision]
+
+  - path: meeting-notes
+    name: "Meeting Notes"
+    guide: |
+      경영 회의록, 의사결정 기록을 저장합니다.
+      권장 문서 타입: note
+      템플릿: doc-templates/meeting-notes.md
+    suggested_types: [note]
+
+  - path: okrs
+    name: "OKRs & KPIs"
+    guide: |
+      분기/연간 OKR, KPI 목표 및 달성 현황을 저장합니다.
+      권장 문서 타입: plan
+      템플릿: doc-templates/okr.md
+    suggested_types: [plan]
+
+  - path: proposals
+    name: "Proposals"
+    guide: |
+      신규 사업 제안서, 투자 제안서를 저장합니다.
+      권장 문서 타입: plan
+    suggested_types: [plan]
+
+  - path: weekly-updates
+    name: "Weekly Updates"
+    guide: |
+      주간 업무 보고, 팀별 현황 공유를 저장합니다.
+      권장 문서 타입: report
+      템플릿: doc-templates/weekly-update.md
+    suggested_types: [report]

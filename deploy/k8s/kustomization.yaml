@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: akb
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - redis.yaml
+  - backend.yaml
+  - frontend.yaml
+  - ingress.yaml
+
+# Vector store: default driver is pgvector running inside the main
+# Postgres pod (`postgres.yaml` already uses the pgvector/pgvector
+# image, so the extension is available; backend creates its own
+# `vector_index` schema). To run Qdrant as a separate StatefulSet
+# instead, add `qdrant.yaml` to this list and flip
+# `vector_store_driver` to `qdrant` (with vector_url set) in the
+# backend ConfigMap.
+
+# Note: akb-init-sql ConfigMap must be created manually before applying:
+#   kubectl create configmap akb-init-sql -n akb --from-file=init.sql=../../backend/app/db/init.sql

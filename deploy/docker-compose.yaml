@@ -1,0 +1,50 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: akb
+      POSTGRES_USER: akb
+      POSTGRES_PASSWORD: akb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      AKB_DB_HOST: db
+      AKB_DB_PORT: "5432"
+      AKB_DB_NAME: akb
+      AKB_DB_USER: akb
+      AKB_DB_PASSWORD: akb
+      AKB_GIT_STORAGE_PATH: /data/vaults
+      AKB_EMBED_BASE_URL: ${AKB_EMBED_BASE_URL:-http://host.docker.internal:8080/v1}
+      AKB_EMBED_MODEL: ${AKB_EMBED_MODEL:-qwen3-embed-8b}
+      AKB_EMBED_API_KEY: ${AKB_EMBED_API_KEY:-}
+      AKB_LLM_BASE_URL: ${AKB_LLM_BASE_URL:-http://host.docker.internal:8080/v1}
+      AKB_LLM_MODEL: ${AKB_LLM_MODEL:-openai/Qwen3.5-122B-A10B}
+      AKB_LLM_API_KEY: ${AKB_LLM_API_KEY:-}
+    volumes:
+      - vaultdata:/data/vaults
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  vaultdata:

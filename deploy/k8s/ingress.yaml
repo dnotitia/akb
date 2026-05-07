@@ -1,0 +1,69 @@
+# Replace `akb.example.com` with your hostname. The cert-manager
+# annotation assumes a ClusterIssuer named `letsencrypt-prod` exists
+# in the cluster — provide your own (DNS-01 / HTTP-01 / etc.) or
+# remove the annotation if you terminate TLS elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: akb-ingress
+  namespace: akb
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - akb.example.com
+      secretName: akb-tls
+  rules:
+    - host: akb.example.com
+      http:
+        paths:
+          # Backend API
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          # MCP endpoint (streamable HTTP)
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          # Health endpoints (detailed, liveness, readiness)
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /livez
+            pathType: Exact
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /readyz
+            pathType: Exact
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          # Frontend (everything else)
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

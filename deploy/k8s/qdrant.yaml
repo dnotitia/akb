@@ -1,0 +1,127 @@
+# Qdrant — hybrid search index (dense + sparse BM25 via Kiwi tokenizer)
+# PG is source of truth; Qdrant is a derived index. Full collection loss
+# is recoverable via `UPDATE chunks SET qdrant_indexed_at = NULL` + worker.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: qdrant-credentials
+  namespace: akb
+type: Opaque
+stringData:
+  QDRANT_API_KEY: qdrant-internal-key-change-me
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qdrant-config
+  namespace: akb
+data:
+  production.yaml: |
+    log_level: INFO
+    service:
+      http_port: 6333
+      grpc_port: 6334
+      api_key: ${QDRANT__SERVICE__API_KEY}
+    storage:
+      storage_path: /qdrant/storage
+      snapshots_path: /qdrant/snapshots
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: akb
+spec:
+  serviceName: qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akb-qdrant
+  template:
+    metadata:
+      labels:
+        app: akb-qdrant
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.12.4
+          ports:
+            - containerPort: 6333
+              name: http
+            - containerPort: 6334
+              name: grpc
+          env:
+            - name: QDRANT__SERVICE__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: qdrant-credentials
+                  key: QDRANT_API_KEY
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+            - name: qdrant-snapshots
+              mountPath: /qdrant/snapshots
+            - name: qdrant-config
+              mountPath: /qdrant/config
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            # No CPU limit: indexing+search bursts hit a ~1.5-core throttle
+            # and tank search latency under load. Memory headroom is
+            # generous because HNSW lives in RAM and grows with the
+            # collection — tune down for small deployments.
+            limits:
+              memory: "6Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 6333
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 6333
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: qdrant-config
+          configMap:
+            name: qdrant-config
+  volumeClaimTemplates:
+    - metadata:
+        name: qdrant-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+    - metadata:
+        name: qdrant-snapshots
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: akb
+spec:
+  selector:
+    app: akb-qdrant
+  ports:
+    - port: 6333
+      targetPort: 6333
+      name: http
+    - port: 6334
+      targetPort: 6334
+      name: grpc
+  clusterIP: None

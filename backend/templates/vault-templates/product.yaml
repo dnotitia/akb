@@ -1,0 +1,39 @@
+name: product
+display_name: "Product"
+description: "프로덕트 팀 지식베이스"
+collections:
+  - path: prd
+    name: "Product Requirements"
+    guide: |
+      제품 요구사항 정의서(PRD), 기능 명세를 저장합니다.
+      권장 문서 타입: spec
+      템플릿: doc-templates/prd.md
+    suggested_types: [spec]
+
+  - path: user-research
+    name: "User Research"
+    guide: |
+      사용자 인터뷰, 설문 결과, 페르소나, 사용성 테스트를 저장합니다.
+      권장 문서 타입: report
+    suggested_types: [report]
+
+  - path: roadmap
+    name: "Roadmap"
+    guide: |
+      제품 로드맵, 마일스톤, 릴리스 일정을 저장합니다.
+      권장 문서 타입: plan
+    suggested_types: [plan]
+
+  - path: analytics
+    name: "Analytics & Metrics"
+    guide: |
+      제품 지표 분석, A/B 테스트 결과, 퍼널 분석을 저장합니다.
+      권장 문서 타입: report
+    suggested_types: [report]
+
+  - path: design
+    name: "Design"
+    guide: |
+      디자인 가이드, UI/UX 결정, 와이어프레임 설명을 저장합니다.
+      권장 문서 타입: spec, decision
+    suggested_types: [spec, decision]

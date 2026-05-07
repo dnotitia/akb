@@ -1,0 +1,332 @@
+"""Repository for document operations."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+import asyncpg
+
+from app.exceptions import ConflictError
+from app.utils import dumps_jsonb
+
+
+class DocumentRepository:
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
+
+    async def create(
+        self,
+        vault_id: uuid.UUID,
+        collection_id: uuid.UUID | None,
+        path: str,
+        title: str,
+        doc_type: str,
+        status: str,
+        summary: str | None,
+        domain: str | None,
+        created_by: str | None,
+        now: datetime,
+        commit_hash: str,
+        tags: list[str],
+        metadata: dict,
+    ) -> uuid.UUID:
+        doc_id = uuid.uuid4()
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO documents
+                        (id, vault_id, collection_id, path, title, doc_type, status,
+                         summary, domain, created_by, created_at, updated_at,
+                         current_commit, tags, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    """,
+                    doc_id, vault_id, collection_id, path, title, doc_type, status,
+                    summary, domain, created_by, now, now,
+                    commit_hash, tags, dumps_jsonb(metadata),
+                )
+            except asyncpg.UniqueViolationError as e:
+                # (vault_id, path) is the only UNIQUE constraint that callers
+                # can collide on. Surface it as a 409 instead of a 500.
+                raise ConflictError(f"Document already exists at path: {path}") from e
+        return doc_id
+
+    # Standard WHERE clause for flexible document lookup (UUID, d-prefix, path substring)
+    _MATCH_WHERE = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%' OR d.metadata->>'id' = $2)"
+
+    async def find_by_ref(self, vault_id: uuid.UUID, ref: str) -> dict | None:
+        """Find document by ID, metadata.id, or path substring."""
+        async with self.pool.acquire() as conn:
+            return await self.find_by_ref_with_conn(conn, vault_id, ref)
+
+    async def find_by_ref_with_conn(self, conn, vault_id: uuid.UUID, ref: str) -> dict | None:
+        """Find document using an existing connection (no pool acquire)."""
+        row = await conn.fetchrow(
+            f"""
+            SELECT d.*, v.name as vault_name
+            FROM documents d
+            JOIN vaults v ON d.vault_id = v.id
+            WHERE d.vault_id = $1
+              AND {self._MATCH_WHERE}
+            """,
+            vault_id, ref,
+        )
+        return dict(row) if row else None
+
+    async def find_by_path(self, vault_id: uuid.UUID, path: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT d.*, v.name as vault_name
+                FROM documents d
+                JOIN vaults v ON d.vault_id = v.id
+                WHERE d.vault_id = $1 AND d.path = $2
+                """,
+                vault_id, path,
+            )
+            return dict(row) if row else None
+
+    async def update(
+        self,
+        doc_id: uuid.UUID,
+        title: str | None = None,
+        doc_type: str | None = None,
+        status: str | None = None,
+        summary: str | None = None,
+        domain: str | None = None,
+        now: datetime | None = None,
+        commit_hash: str | None = None,
+        tags: list[str] | None = None,
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE documents SET
+                    title = COALESCE($1, title),
+                    doc_type = COALESCE($2, doc_type),
+                    status = COALESCE($3, status),
+                    summary = COALESCE($4, summary),
+                    domain = COALESCE($5, domain),
+                    updated_at = COALESCE($6, updated_at),
+                    current_commit = COALESCE($7, current_commit),
+                    tags = COALESCE($8, tags)
+                WHERE id = $9
+                """,
+                title, doc_type, status, summary, domain, now, commit_hash, tags, doc_id,
+            )
+
+    async def delete(self, doc_id: uuid.UUID) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
+
+    async def list_by_collection(self, vault_id: uuid.UUID, collection_path: str) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT path, title, doc_type, status, summary, tags, updated_at
+                FROM documents
+                WHERE vault_id = $1 AND collection_id = (
+                    SELECT id FROM collections WHERE vault_id = $1 AND path = $2
+                )
+                ORDER BY updated_at DESC
+                """,
+                vault_id, collection_path,
+            )
+            return [dict(r) for r in rows]
+
+    async def list_by_vault(self, vault_id: uuid.UUID) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT path, title, doc_type, status, summary, tags, updated_at
+                FROM documents WHERE vault_id = $1 ORDER BY updated_at DESC
+                """,
+                vault_id,
+            )
+            return [dict(r) for r in rows]
+
+    # ── External-git mirror helpers ──────────────────────────
+
+    async def list_external_blobs(self, vault_id: uuid.UUID) -> dict[str, dict]:
+        """Return `{external_path: {id, external_blob}}` for every
+        external_git document in a vault. Used by the reconciler to
+        diff against the upstream tree without re-reading file content.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, external_path, external_blob
+                  FROM documents
+                 WHERE vault_id = $1 AND source = 'external_git'
+                """,
+                vault_id,
+            )
+        return {
+            r["external_path"]: {"id": r["id"], "external_blob": r["external_blob"]}
+            for r in rows
+        }
+
+    async def find_by_external_path(self, vault_id: uuid.UUID, external_path: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM documents
+                 WHERE vault_id = $1 AND source = 'external_git' AND external_path = $2
+                """,
+                vault_id, external_path,
+            )
+            return dict(row) if row else None
+
+    async def upsert_external(
+        self,
+        *,
+        vault_id: uuid.UUID,
+        collection_id: uuid.UUID | None,
+        path: str,
+        external_path: str,
+        external_blob: str,
+        title: str,
+        doc_type: str | None,
+        summary: str | None,
+        domain: str | None,
+        tags: list[str],
+        metadata: dict,
+        now: datetime,
+        commit_hash: str | None,
+        created_by: str | None = None,
+        conn=None,
+    ) -> tuple[uuid.UUID, bool]:
+        """Insert or update an external_git document. Stable on
+        (vault_id, external_path); content changes are detected via
+        external_blob upstream so the row identity stays intact across
+        re-syncs.
+
+        Returns `(id, inserted)` where `inserted=True` means this was a
+        fresh INSERT (i.e. caller should bump collections.doc_count).
+        Uses the PG `xmax = 0` trick to distinguish INSERT vs UPDATE on
+        a single `INSERT ... ON CONFLICT` statement.
+
+        Accepts an optional `conn` so callers that already hold a
+        connection (e.g. the reconcile loop doing upsert + chunks in
+        one transaction) don't re-acquire.
+        """
+        sql = """
+            INSERT INTO documents
+                (id, vault_id, collection_id, path, title, doc_type, status,
+                 summary, domain, created_by, created_at, updated_at,
+                 current_commit, tags, metadata,
+                 source, external_path, external_blob)
+            VALUES ($1, $2, $3, $4, $5, $6, 'active',
+                    $7, $8, $9, $10, $10, $11, $12, $13,
+                    'external_git', $14, $15)
+            ON CONFLICT (vault_id, path) DO UPDATE SET
+                collection_id  = EXCLUDED.collection_id,
+                title          = EXCLUDED.title,
+                doc_type       = EXCLUDED.doc_type,
+                summary        = EXCLUDED.summary,
+                domain         = EXCLUDED.domain,
+                updated_at     = EXCLUDED.updated_at,
+                current_commit = EXCLUDED.current_commit,
+                tags           = EXCLUDED.tags,
+                metadata       = EXCLUDED.metadata,
+                external_blob  = EXCLUDED.external_blob,
+                -- Re-trigger metadata_worker only when the blob actually
+                -- changes; unchanged content keeps its prior LLM fill.
+                llm_metadata_at = CASE
+                    WHEN documents.external_blob IS DISTINCT FROM EXCLUDED.external_blob
+                        THEN NULL
+                    ELSE documents.llm_metadata_at
+                END
+            RETURNING id, (xmax = 0) AS inserted
+        """
+        args = (
+            uuid.uuid4(), vault_id, collection_id, path, title, doc_type,
+            summary, domain, created_by, now, commit_hash, tags, dumps_jsonb(metadata),
+            external_path, external_blob,
+        )
+        if conn is not None:
+            row = await conn.fetchrow(sql, *args)
+        else:
+            async with self.pool.acquire() as acq:
+                row = await acq.fetchrow(sql, *args)
+        return row["id"], row["inserted"]
+
+    async def mark_llm_metadata_filled(
+        self,
+        doc_id: uuid.UUID,
+        summary: str | None,
+        tags: list[str] | None,
+        doc_type: str | None,
+        domain: str | None,
+        now: datetime,
+    ) -> None:
+        """Apply LLM-generated metadata, but only into NULL/empty fields
+        so that frontmatter-provided values always win.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE documents SET
+                    summary  = COALESCE(NULLIF(summary, ''), $2, summary),
+                    tags     = CASE
+                        WHEN tags IS NULL OR cardinality(tags) = 0 THEN COALESCE($3, tags)
+                        ELSE tags
+                    END,
+                    doc_type = COALESCE(NULLIF(doc_type, ''), $4, doc_type),
+                    domain   = COALESCE(NULLIF(domain, ''), $5, domain),
+                    llm_metadata_at = $6,
+                    updated_at = $6
+                WHERE id = $1
+                """,
+                doc_id, summary, tags, doc_type, domain, now,
+            )
+
+
+class CollectionRepository:
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
+
+    async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
+        async def _do(c):
+            row = await c.fetchrow(
+                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                vault_id, path,
+            )
+            if row:
+                return row["id"]
+            cid = uuid.uuid4()
+            name = path.rstrip("/").split("/")[-1]
+            await c.execute(
+                "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, $3, $4)",
+                cid, vault_id, path, name,
+            )
+            return cid
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
+
+    async def list_by_vault(self, vault_id: uuid.UUID) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT path, name, summary, doc_count, last_updated FROM collections WHERE vault_id = $1 ORDER BY name",
+                vault_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def increment_count(self, collection_id: uuid.UUID, now: datetime, conn=None) -> None:
+        sql = "UPDATE collections SET doc_count = doc_count + 1, last_updated = $1 WHERE id = $2"
+        if conn is not None:
+            await conn.execute(sql, now, collection_id)
+            return
+        async with self.pool.acquire() as acq:
+            await acq.execute(sql, now, collection_id)
+
+    async def decrement_count(self, collection_id: uuid.UUID, now: datetime, conn=None) -> None:
+        sql = "UPDATE collections SET doc_count = GREATEST(doc_count - 1, 0), last_updated = $1 WHERE id = $2"
+        if conn is not None:
+            await conn.execute(sql, now, collection_id)
+            return
+        async with self.pool.acquire() as acq:
+            await acq.execute(sql, now, collection_id)
