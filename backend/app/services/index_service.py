@@ -203,8 +203,30 @@ def chunk_markdown(content: str, metadata_header: str = "") -> list[Chunk]:
     return chunks
 
 
+def _hard_split_by_chars(text: str, limit: int, overlap: int) -> list[str]:
+    """Char-level split for content with no paragraph boundaries inside
+    the size limit. Used as a last-resort fallback so a single huge
+    paragraph (giant table, base64 blob, prose with no blank lines)
+    doesn't sneak past the size cap and overflow the embedding model's
+    context window.
+    """
+    if len(text) <= limit:
+        return [text]
+    pieces: list[str] = []
+    step = max(1, limit - overlap)
+    i = 0
+    while i < len(text):
+        pieces.append(text[i : i + limit])
+        if i + limit >= len(text):
+            break
+        i += step
+    return pieces
+
+
 def _split_large_chunk(section_path: str, content: str, char_offset: int) -> list[Chunk]:
-    """Split content exceeding MAX_CHUNK_SIZE at paragraph boundaries."""
+    """Split content exceeding MAX_CHUNK_SIZE at paragraph boundaries,
+    falling back to char-level splits for any single paragraph that is
+    itself larger than the limit."""
     if len(content) <= MAX_CHUNK_SIZE:
         return [
             Chunk(
@@ -216,7 +238,15 @@ def _split_large_chunk(section_path: str, content: str, char_offset: int) -> lis
             )
         ]
 
-    paragraphs = content.split("\n\n")
+    # Pre-split any paragraph larger than the limit into char-bounded
+    # pieces so the assembly loop below never has to swallow a single
+    # piece bigger than MAX_CHUNK_SIZE. Without this, a paragraph with
+    # no `\n\n` boundary inside it would be appended whole, producing
+    # chunks that exceed the embedding model's context.
+    paragraphs: list[str] = []
+    for raw in content.split("\n\n"):
+        paragraphs.extend(_hard_split_by_chars(raw, MAX_CHUNK_SIZE, OVERLAP))
+
     chunks: list[Chunk] = []
     current = ""
     current_start = char_offset
@@ -258,6 +288,46 @@ def _split_large_chunk(section_path: str, content: str, char_offset: int) -> lis
 
 # ── Embedding ────────────────────────────────────────────────
 
+async def _embed_call(
+    client, batch: list[str], timeout: float
+) -> tuple[str, list[list[float]] | None, str]:
+    """Single POST to the embeddings endpoint.
+
+    Returns (status, embeddings, detail):
+      - status='ok'        + embeddings filled
+      - status='transient' + None: 5xx / network / timeout — retry later
+      - status='permanent' + None: 4xx — almost always one bad input in
+        the batch (oversize, wrong content type). Caller should fall
+        back to per-item to isolate the offender.
+    `detail` is a short human-readable string suffix for logs/errors.
+    """
+    headers = (
+        {"Authorization": f"Bearer {settings.embed_api_key}"}
+        if settings.embed_api_key
+        else {}
+    )
+    try:
+        resp = await client.post(
+            f"{settings.embed_base_url}/embeddings",
+            json={"model": settings.embed_model, "input": batch},
+            headers=headers,
+            timeout=timeout,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.UnsupportedProtocol) as e:
+        return "transient", None, f"{type(e).__name__}: {e}"
+
+    if resp.status_code >= 500:
+        return "transient", None, f"HTTP {resp.status_code}: {resp.text[:160]}"
+    if resp.status_code >= 400:
+        return "permanent", None, f"HTTP {resp.status_code}: {resp.text[:160]}"
+
+    try:
+        data = resp.json()
+        return "ok", [item["embedding"] for item in data["data"]], ""
+    except (KeyError, ValueError) as e:
+        return "transient", None, f"malformed response: {e}"
+
+
 async def generate_embeddings(
     texts: list[str],
     *,
@@ -270,36 +340,57 @@ async def generate_embeddings(
     passes a short value so a hung embedding API doesn't stall every
     interactive search.
 
-    Returns empty list per text if embedding API is unavailable (graceful degradation).
+    Always returns a list with the same length as `texts`. Items where
+    the embedding could not be produced come back as an empty list — the
+    indexing worker treats those as per-chunk failures and increments
+    the per-row retry counter, instead of failing the whole batch.
+
+    On a 4xx batch failure the call falls back to per-item requests so
+    one oversize / malformed input can't poison its 31 batchmates. On a
+    transient (5xx / network / timeout) failure the whole batch is left
+    empty and the worker's normal retry/backoff handles it.
     """
     if not texts:
         return []
 
-    all_embeddings: list[list[float]] = []
-    batch_size = 32
-
     client = http_pool.get_client()
-    try:
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            resp = await client.post(
-                f"{settings.embed_base_url}/embeddings",
-                json={
-                    "model": settings.embed_model,
-                    "input": batch,
-                },
-                headers={"Authorization": f"Bearer {settings.embed_api_key}"} if settings.embed_api_key else {},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch_embeddings = [item["embedding"] for item in data["data"]]
-            all_embeddings.extend(batch_embeddings)
-    except (httpx.ConnectError, httpx.HTTPStatusError, httpx.TimeoutException, httpx.UnsupportedProtocol) as e:
-        logger.warning("Embedding API unavailable (%s). Chunks stored without vectors.", e)
-        return []
+    batch_size = 32
+    out: list[list[float]] = []
 
-    return all_embeddings
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        status, embs, detail = await _embed_call(client, batch, timeout)
+
+        if status == "ok" and embs is not None and len(embs) == len(batch):
+            out.extend(embs)
+            continue
+
+        if status == "transient":
+            logger.warning(
+                "Embedding API transient failure on batch of %d: %s",
+                len(batch), detail,
+            )
+            out.extend([[] for _ in batch])
+            continue
+
+        # Permanent (4xx) or shape mismatch — fall back to per-item so
+        # only the truly bad input(s) get marked as failed.
+        logger.warning(
+            "Embedding API rejected batch of %d (%s); isolating per-item",
+            len(batch), detail,
+        )
+        for txt in batch:
+            sub_status, sub_embs, sub_detail = await _embed_call(client, [txt], timeout)
+            if sub_status == "ok" and sub_embs is not None and len(sub_embs) == 1:
+                out.append(sub_embs[0])
+            else:
+                logger.warning(
+                    "Embedding API rejected single input (%d chars): %s",
+                    len(txt), sub_detail,
+                )
+                out.append([])
+
+    return out
 
 
 # ── DB operations ────────────────────────────────────────────
