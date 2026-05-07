@@ -50,6 +50,29 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    # Skip-if-already-applied guard. Without this, every backend
+    # startup re-runs step 5 below and force-NULLs vector_indexed_at on
+    # every successfully-indexed chunk — wiping out all accumulated
+    # indexing work since the last restart. Steps 1-4 are individually
+    # guarded by IF EXISTS, but the absence of `chunks.embedding` is
+    # the canonical signal that this migration's destructive bulk
+    # update has already run and must not run again.
+    embedding_exists = await conn.fetchval(
+        """
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name   = 'chunks'
+           AND column_name  = 'embedding'
+        """
+    )
+    if embedding_exists is None:
+        logger.info(
+            "Migration 016 already applied (chunks.embedding absent); "
+            "skipping force re-index"
+        )
+        return
+
     # 1. Drop embedding column. The dense vector now lives exclusively
     # in the configured vector store. We don't try to preserve the
     # data — the indexer rebuilds from chunks.content.

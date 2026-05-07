@@ -27,7 +27,7 @@ from app.db.postgres import get_pool
 from app.repositories.document_repo import DocumentRepository
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
 from app.services.git_service import GitService
-from app.services.llm_service import LLMError, chat_json
+from app.services.llm_service import LLMError, LLMPermanentError, chat_json
 from app.util.text import to_nfc_any
 
 logger = logging.getLogger("akb.metadata_worker")
@@ -175,6 +175,12 @@ async def _process_once() -> int:
             raw_bytes = await asyncio.to_thread(git.cat_blob, vault_name, blob_sha)
             body = raw_bytes.decode("utf-8", errors="replace")
             fields = await _resolve_metadata(vault_name, body)
+        except LLMPermanentError as e:
+            # Deterministic LLM failure — retrying will produce the same
+            # result. Burn straight to MAX so the worker stops picking it.
+            async with pool.acquire() as conn:
+                await _mark_failure(conn, doc_id, MAX_RETRIES - 1, str(e))
+            continue
         except (LLMError, RuntimeError, OSError) as e:
             async with pool.acquire() as conn:
                 await _mark_failure(conn, doc_id, row["llm_retry_count"], str(e))

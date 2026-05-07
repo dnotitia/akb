@@ -26,24 +26,36 @@ class LLMError(RuntimeError):
     """
 
 
+class LLMPermanentError(LLMError):
+    """Deterministic failure — same input will produce the same outcome.
+    Callers should abandon rather than retry (e.g. response truncated by
+    `max_tokens`, content filter refusal). Burning retries on these just
+    wastes API calls.
+    """
+
+
 async def chat_json(
     *,
     system: str,
     user: str,
     timeout: float = 30.0,
-    max_tokens: int = 800,
+    max_tokens: int = 1024,
     temperature: float = 0.0,
+    disable_reasoning: bool = True,
 ) -> dict[str, Any]:
     """Call the configured chat endpoint and parse the response as JSON.
 
-    Uses `response_format={"type": "json_object"}` when the upstream
-    accepts it. If the body comes back as not-quite-JSON (some providers
-    wrap with code fences) we strip and retry the parse before failing.
+    `disable_reasoning=True` (default) sends OpenRouter's
+    `reasoning: {enabled: false}` so hybrid CoT models (Qwen3, DeepSeek-R1,
+    etc.) skip the thinking phase. Without this, reasoning tokens silently
+    consume the `max_tokens` budget and `message.content` comes back null
+    with `finish_reason='length'` — which is what bricked metadata backfill
+    in production. JSON-extraction tasks don't benefit from CoT anyway.
     """
     if not settings.llm_base_url:
         raise LLMError("llm_base_url not configured")
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": settings.llm_model,
         "messages": [
             {"role": "system", "content": system},
@@ -53,6 +65,8 @@ async def chat_json(
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
+    if disable_reasoning:
+        payload["reasoning"] = {"enabled": False}
     headers = {}
     if settings.llm_api_key:
         headers["Authorization"] = f"Bearer {settings.llm_api_key}"
@@ -73,12 +87,17 @@ async def chat_json(
     except (KeyError, IndexError) as e:
         raise LLMError(f"unexpected LLM response shape: {e}") from e
 
-    # Some providers (incl. OpenRouter under content filters / refusals)
-    # return a choice whose message.content is null — downstream .strip()
-    # would raise AttributeError and abort the entire worker batch.
+    finish_reason = choice.get("finish_reason")
     if content is None:
+        # `length` is deterministic (same prompt + same max_tokens →
+        # same truncation). Refusals via content filters are also
+        # deterministic. Don't burn retries on either.
+        if finish_reason in ("length", "content_filter"):
+            raise LLMPermanentError(
+                f"LLM returned null content (finish_reason={finish_reason!r})"
+            )
         raise LLMError(
-            f"LLM returned null content (finish_reason={choice.get('finish_reason')!r})"
+            f"LLM returned null content (finish_reason={finish_reason!r})"
         )
 
     return _parse_json_loose(content)
