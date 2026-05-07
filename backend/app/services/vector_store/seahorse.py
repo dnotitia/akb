@@ -2,7 +2,7 @@
 
 Talks to Seahorse Cloud's two-plane API:
 
-- **Management (BFF)** at `vector_store_management_url` for table
+- **Management (BFF)** at `seahorse_management_url` for table
   lifecycle (list / get / create / delete).
 - **Per-table data plane host** for upsert / search / delete-row /
   schema. The host is discovered from the management response (each
@@ -160,7 +160,7 @@ class SeahorseStore:
                         f"name={self._table_name!r}, "
                         f"uuid={self._table_uuid!r}). "
                         "Create it in the console first or set "
-                        "vector_store_seahorse_auto_create=true."
+                        "seahorse_auto_create: true in app.yaml."
                     )
                 tbl = await self._create_table()
             self._validate_schema(tbl)
@@ -184,7 +184,7 @@ class SeahorseStore:
         if not self._table_name:
             raise VectorStoreUnavailable(
                 "Cannot auto-create Seahorse table without "
-                "vector_store_seahorse_table_name (uuid alone won't do "
+                "seahorse_table_name (uuid alone won't do "
                 "— it doesn't exist yet)."
             )
         body = {

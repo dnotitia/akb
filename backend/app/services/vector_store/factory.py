@@ -2,10 +2,12 @@
 
 Driver matrix:
 
-| `vector_store_driver` | required settings                          |
-| --------------------- | ------------------------------------------ |
-| `qdrant`              | `vector_url` (+ optional `vector_api_key`) |
-| `pgvector`            | `vector_store_dsn` blank reuses main PG    |
+| `vector_store_driver` | required settings                                   |
+| --------------------- | --------------------------------------------------- |
+| `qdrant`              | `vector_url` (+ optional `vector_api_key`)          |
+| `pgvector`            | `vector_store_dsn` blank reuses main PG             |
+| `seahorse`            | `seahorse_token` + `seahorse_tenant_uuid` + one of  |
+|                       | `seahorse_table_name` / `seahorse_table_uuid`       |
 
 The driver and sparse-shape values are validated at config load
 (pydantic Literals); the factory only needs to dispatch.
