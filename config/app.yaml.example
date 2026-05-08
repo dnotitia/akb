@@ -33,6 +33,27 @@ llm_base_url: ""
 llm_model: ""
 
 # === Reranker (optional) — cross-encoder rescoring of search candidates ===
+# Any endpoint that speaks the Cohere /rerank schema works
+# ({model, query, documents[, top_n]} → {results: [{index, relevance_score}]}).
+# `rerank_provider` is a label for logs; the dispatch is the same regardless.
+#
+# Tested setups:
+#   1. Cohere via OpenRouter (default — multilingual incl. Korean, fast):
+#        rerank_enabled: true
+#        rerank_model: cohere/rerank-v3.5
+#        rerank_base_url: ""   # falls back to llm_base_url
+#   2. Jina hosted (multilingual, lightweight):
+#        rerank_provider: jina
+#        rerank_model: jina-reranker-v2-base-multilingual
+#        rerank_base_url: https://api.jina.ai/v1
+#        rerank_api_key: <set in secret.yaml>
+#   3. On-prem open-weight (BAAI/bge-reranker-v2-m3, jina-reranker-v2,
+#      etc.) behind a Cohere-compatible shim (vLLM, HF TEI, or thin
+#      FastAPI wrapper):
+#        rerank_provider: onprem
+#        rerank_model: <model id served by your endpoint>
+#        rerank_base_url: http://reranker.svc.cluster.local:8000/v1
+#        rerank_api_key: ""    # leave empty if endpoint doesn't require one
 rerank_enabled: false
 rerank_provider: cohere
 rerank_model: cohere/rerank-v3.5

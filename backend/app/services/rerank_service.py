@@ -1,8 +1,18 @@
 """Reranker service — cross-encoder re-scoring of hybrid search candidates.
 
-Provider-agnostic. Currently ships one backend: `cohere/rerank-v3.5` via
-OpenRouter's OpenAI-style `/rerank` endpoint. Same API key as LLM/embedding
-path, 100+ languages including Korean, charged per search (not per token).
+Provider-agnostic over any endpoint that speaks the Cohere `/rerank`
+schema (`{model, query, documents[, top_n]}` → `{results: [{index,
+relevance_score}]}`). Tested setups:
+
+- `cohere/rerank-v3.5` via OpenRouter — multilingual (100+ langs incl.
+  Korean), lightweight, charged per search. Default in `app.yaml`.
+- Self-hosted open-weight rerankers (e.g. BAAI/bge-reranker-v2-m3,
+  jinaai/jina-reranker-v2-base-multilingual) behind a Cohere-compatible
+  shim (vLLM, Hugging Face TEI, sentence-transformers + a thin FastAPI
+  wrapper). Set `rerank_base_url` to the on-prem endpoint and
+  `rerank_model` to its model id.
+- Jina hosted API at `https://api.jina.ai/v1` — same Cohere-compatible
+  shape; set `rerank_base_url` + `rerank_api_key`.
 
 The interface returns `(original_index, relevance_score)` tuples sorted
 descending. Callers reorder their candidate list with these.
@@ -39,8 +49,9 @@ async def rerank(
         return []
     if not settings.rerank_enabled:
         raise RerankError("rerank disabled (settings.rerank_enabled=False)")
-    if settings.rerank_provider != "cohere":
-        raise RerankError(f"unsupported rerank provider: {settings.rerank_provider}")
+    # `rerank_provider` is a label for logs/diagnostics. Dispatch is
+    # always Cohere-compatible — operators point `rerank_base_url` at
+    # whichever endpoint speaks that schema.
 
     base_url = (settings.rerank_base_url or settings.llm_base_url).rstrip("/")
     api_key = settings.rerank_api_key or settings.llm_api_key
@@ -68,6 +79,15 @@ async def rerank(
     except (httpx.ConnectError, httpx.HTTPStatusError,
             httpx.TimeoutException, httpx.UnsupportedProtocol) as e:
         raise RerankError(f"rerank HTTP call failed: {e}") from e
+
+    # OpenRouter's Cohere route occasionally returns HTTP 200 with the
+    # body shaped as `{"error": {...}}` (rate-limit, transient upstream
+    # 5xx flattened to 200, etc.). Surface those as RerankError with the
+    # actual upstream message instead of the generic "unexpected shape".
+    err = body.get("error")
+    if err is not None:
+        msg = err.get("message") if isinstance(err, dict) else err
+        raise RerankError(f"upstream rerank error: {msg}")
 
     results = body.get("results")
     if not isinstance(results, list):
