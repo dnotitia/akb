@@ -92,29 +92,30 @@ async def create_table(
     now = datetime.now(timezone.utc)
 
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        if not vault:
-            raise NotFoundError("Vault", str(vault_id))
+        async with conn.transaction():
+            vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+            if not vault:
+                raise NotFoundError("Vault", str(vault_id))
 
-        existing = await table_registry_repo.find_by_name(conn, vault_id, name)
-        if existing:
-            raise ConflictError(f"Table already exists: {name}")
+            existing = await table_registry_repo.find_by_name(conn, vault_id, name)
+            if existing:
+                raise ConflictError(f"Table already exists: {name}")
 
-        for col in columns:
-            if col["name"].lower() in _RESERVED:
-                raise ValueError(
-                    f"Column name '{col['name']}' is reserved (auto-added by AKB). "
-                    f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
-                )
+            for col in columns:
+                if col["name"].lower() in _RESERVED:
+                    raise ValueError(
+                        f"Column name '{col['name']}' is reserved (auto-added by AKB). "
+                        f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
+                    )
 
-        pg_name = table_data_repo.pg_table_name(vault["name"], name)
-        await table_data_repo.create_dynamic_table(conn, pg_name, columns)
-        await table_registry_repo.insert(
-            conn,
-            table_id=tid, vault_id=vault_id, name=name,
-            description=description, columns=columns,
-            created_by=actor_id, now=now,
-        )
+            pg_name = table_data_repo.pg_table_name(vault["name"], name)
+            await table_data_repo.create_dynamic_table(conn, pg_name, columns)
+            await table_registry_repo.insert(
+                conn,
+                table_id=tid, vault_id=vault_id, name=name,
+                description=description, columns=columns,
+                created_by=actor_id, now=now,
+            )
 
     # Outside the create transaction on purpose: the embedding call can
     # be slow and we'd rather not hold a DB connection on it.
@@ -176,25 +177,26 @@ async def drop_table(
     edges referencing the table URI + metadata chunk."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        if not vault:
-            raise NotFoundError("Vault", str(vault_id))
+        async with conn.transaction():
+            vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+            if not vault:
+                raise NotFoundError("Vault", str(vault_id))
 
-        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
-        if not table:
-            raise NotFoundError("Table", table_name)
+            table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+            if not table:
+                raise NotFoundError("Table", table_name)
 
-        table_id = table["id"]
-        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-        await table_data_repo.drop_dynamic_table(conn, pg_name)
-        await table_registry_repo.delete(conn, table_id)
+            table_id = table["id"]
+            pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+            await table_data_repo.drop_dynamic_table(conn, pg_name)
+            await table_registry_repo.delete(conn, table_id)
 
-        # Clean up edges referencing this table.
-        t_uri = f"akb://{vault['name']}/table/{table_name}"
-        await conn.execute(
-            "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
-            t_uri,
-        )
+            # Clean up edges referencing this table.
+            t_uri = f"akb://{vault['name']}/table/{table_name}"
+            await conn.execute(
+                "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
+                t_uri,
+            )
 
     # Outside the TX: drop the metadata chunk via the vector-store
     # outbox (same pattern as file deletion).

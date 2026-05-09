@@ -215,10 +215,11 @@ class FileService:
             )
 
         async with pool.acquire() as conn:
-            await vault_files_repo.update_size(conn, fid, size_bytes)
-            vault_row = await conn.fetchrow(
-                "SELECT name FROM vaults WHERE id = $1", vault_id,
-            )
+            async with conn.transaction():
+                await vault_files_repo.update_size(conn, fid, size_bytes)
+                vault_row = await conn.fetchrow(
+                    "SELECT name FROM vaults WHERE id = $1", vault_id,
+                )
 
         # Index file metadata for hybrid search.
         try:
@@ -313,31 +314,42 @@ class FileService:
     ) -> dict:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
+
+        # 1. Look up the file + vault name (read-only, no TX needed).
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)
             if not row:
                 raise NotFoundError("File", file_id)
-
-            # Look up vault name for edge cleanup
-            vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+            vault_row = await conn.fetchrow(
+                "SELECT name FROM vaults WHERE id = $1", vault_id,
+            )
             vault_name = vault_row["name"] if vault_row else ""
 
-            s3_adapter.delete(row["s3_key"])
-            await vault_files_repo.delete(conn, fid)
+        # 2. External effect (S3 delete) before the PG TX so a TX abort
+        # later can't leave a half-deleted state. Commit 6 replaces this
+        # with an s3_delete_outbox INSERT inside the TX so the worker
+        # drains S3 atomically with the DB write.
+        s3_adapter.delete(row["s3_key"])
 
-            # Clean up edges referencing this file
-            if vault_name:
-                f_uri = f"akb://{vault_name}/file/{file_id}"
-                await conn.execute(
-                    "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
-                    f_uri,
-                )
+        # 3. Atomic PG mutations: vault_files row + edges + chunk
+        # outbox enqueue all under one TX so a partial failure can't
+        # leave dangling rows.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await vault_files_repo.delete(conn, fid)
 
-            # Drop the metadata chunk (outbox-driven vector-store delete).
-            try:
-                await delete_file_chunks(conn, file_id)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("file chunk delete failed for %s: %s", file_id, e)
+                if vault_name:
+                    f_uri = f"akb://{vault_name}/file/{file_id}"
+                    await conn.execute(
+                        "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
+                        f_uri,
+                    )
+
+                # Drop the metadata chunk (outbox-driven vector-store delete).
+                try:
+                    await delete_file_chunks(conn, file_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("file chunk delete failed for %s: %s", file_id, e)
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
         return {
