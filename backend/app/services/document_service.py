@@ -197,29 +197,30 @@ class DocumentService:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            chunks_indexed = await write_source_chunks(
-                conn, "document", str(pg_doc_id),
-                vault_id=vault_id,
-                chunks=chunks,
-            )
-            await store_document_relations(
-                conn, vault_id, req.vault, file_path,
-                req.depends_on, req.related_to, [],
-                req.content,
-            )
-            await emit_event(
-                conn, "document.put",
-                vault_id=vault_id, ref_type="document", ref_id=doc_id,
-                actor_id=agent_id,
-                payload={
-                    "vault": req.vault,
-                    "path": file_path,
-                    "title": req.title,
-                    "doc_type": req.type,
-                    "commit_hash": commit_hash,
-                    "collection": normalized_collection,
-                },
-            )
+            async with conn.transaction():
+                chunks_indexed = await write_source_chunks(
+                    conn, "document", str(pg_doc_id),
+                    vault_id=vault_id,
+                    chunks=chunks,
+                )
+                await store_document_relations(
+                    conn, vault_id, req.vault, file_path,
+                    req.depends_on, req.related_to, [],
+                    req.content,
+                )
+                await emit_event(
+                    conn, "document.put",
+                    vault_id=vault_id, ref_type="document", ref_id=doc_id,
+                    actor_id=agent_id,
+                    payload={
+                        "vault": req.vault,
+                        "path": file_path,
+                        "title": req.title,
+                        "doc_type": req.type,
+                        "commit_hash": commit_hash,
+                        "collection": normalized_collection,
+                    },
+                )
 
         await coll_repo.increment_count(collection_id, now)
 
@@ -553,17 +554,18 @@ class DocumentService:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await delete_document_chunks(conn, str(pg_doc_id))
-            await delete_document_relations(conn, vault, file_path)
-            await emit_event(
-                conn, "document.delete",
-                vault_id=vault_id, ref_type="document", ref_id=public_doc_id,
-                actor_id=agent_id,
-                payload={
-                    "vault": vault,
-                    "path": file_path,
-                },
-            )
+            async with conn.transaction():
+                await delete_document_chunks(conn, str(pg_doc_id))
+                await delete_document_relations(conn, vault, file_path)
+                await emit_event(
+                    conn, "document.delete",
+                    vault_id=vault_id, ref_type="document", ref_id=public_doc_id,
+                    actor_id=agent_id,
+                    payload={
+                        "vault": vault,
+                        "path": file_path,
+                    },
+                )
 
         await doc_repo.delete(pg_doc_id)
 
