@@ -1,10 +1,14 @@
 """File service — S3-backed binary file storage for vaults.
 
 AKB never touches file bytes. It only:
-1. Generates presigned URLs for direct client ↔ S3 transfer
-2. Manages file metadata in PostgreSQL
+1. Generates presigned URLs for direct client ↔ S3 transfer.
+2. Manages file metadata in PostgreSQL (`vault_files_repo`).
 
 Access control inherits from vault permissions.
+
+S3 client lifecycle and low-level primitives (head/get/put/delete,
+presigning, error mapping) live in `app.services.adapters.s3_adapter`.
+This module is the file-domain layer over those primitives.
 """
 
 from __future__ import annotations
@@ -14,33 +18,27 @@ import uuid
 from typing import Iterator
 from urllib.parse import quote
 
-import boto3
-from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
-
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
+from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
 )
 
-logger = logging.getLogger("akb.files")
+# Re-export so existing callers (publication_service, public routes)
+# don't break. New code should import directly from s3_adapter.
+from app.services.adapters.s3_adapter import StorageError  # noqa: F401
 
-_s3_client = None         # For server-side operations (internal endpoint)
-_s3_presign_client = None  # For generating presigned URLs (public endpoint)
-_bucket_verified = False
+logger = logging.getLogger("akb.files")
 
 _PRESIGN_UPLOAD_TTL = 3600
 _PRESIGN_DOWNLOAD_TTL = 3600
 _S3_STREAM_CHUNK_SIZE = 64 * 1024
 
 
-class StorageError(AKBError):
-    """Generic S3 storage error wrapper used by share_service / public routes."""
-    def __init__(self, message: str):
-        super().__init__(f"Storage error: {message}", status_code=502)
+# ── HTTP header helper (kept here — not S3-specific) ─────────────
 
 
 def content_disposition_attachment(filename: str) -> str:
@@ -60,124 +58,66 @@ def content_disposition_attachment(filename: str) -> str:
     return f'attachment; filename="{ascii_safe}"; filename*=UTF-8\'\'{utf8_encoded}'
 
 
+# ── Top-level S3 helpers (thin wrappers around s3_adapter) ───────
+
+
 def get_presigned_download_url(
     s3_key: str,
     ttl: int = _PRESIGN_DOWNLOAD_TTL,
     response_content_type: str | None = None,
     attachment_filename: str | None = None,
 ) -> str:
-    """Generate a presigned GET URL for an arbitrary S3 key.
+    """Presigned GET URL for an arbitrary S3 key.
 
     Used by share_service to bypass the vault_files lookup when the caller
     already has the s3_key in hand. Raises StorageError on failure.
 
-    If ``response_content_type`` is provided, S3 overrides the stored object's
-    Content-Type in the response. Needed when the object was uploaded with a
-    generic Content-Type but DB metadata has the correct one (e.g. legacy
-    uploads from proxy versions before mime_type propagation).
+    `response_content_type` overrides the stored object's Content-Type in
+    the response (needed when the object was uploaded with a generic
+    application/octet-stream but the DB metadata has the correct value).
 
-    If ``attachment_filename`` is provided, S3 sets Content-Disposition so the
-    browser forces a download rather than rendering inline (needed because the
-    presigned URL is cross-origin, so the <a download> attribute is ignored).
+    `attachment_filename` sets Content-Disposition so the browser forces
+    a download rather than rendering inline (the presigned URL is
+    cross-origin, so the <a download> attribute is ignored).
     """
-    try:
-        s3 = _get_presign_client()
-        params = {"Bucket": settings.s3_bucket, "Key": s3_key}
-        if response_content_type:
-            params["ResponseContentType"] = response_content_type
-        if attachment_filename:
-            params["ResponseContentDisposition"] = content_disposition_attachment(
-                attachment_filename
-            )
-        return s3.generate_presigned_url(
-            "get_object",
-            Params=params,
-            ExpiresIn=ttl,
-        )
-    except ClientError as e:
-        raise StorageError(_wrap_s3_error(e, f"presign download {s3_key}").message) from e
+    cd = (
+        content_disposition_attachment(attachment_filename)
+        if attachment_filename
+        else None
+    )
+    return s3_adapter.presign_get(
+        s3_key,
+        ttl=ttl,
+        response_content_type=response_content_type,
+        response_content_disposition=cd,
+    )
 
 
 def get_object_bytes(s3_key: str) -> bytes:
-    """Read an S3 object's bytes. Raises StorageError on failure."""
-    try:
-        s3 = _get_s3_client()
-        obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
-        return obj["Body"].read()
-    except ClientError as e:
-        raise StorageError(_wrap_s3_error(e, f"read {s3_key}").message) from e
+    return s3_adapter.get_bytes(s3_key)
 
 
 def iter_object_chunks(
     s3_key: str, chunk_size: int = _S3_STREAM_CHUNK_SIZE
 ) -> Iterator[bytes]:
-    """Yield an S3 object as chunks. Sync generator — FastAPI's
-    StreamingResponse iterates it in a thread pool so the underlying boto3
-    blocking I/O doesn't stall the event loop.
-
-    Used for downloads we proxy through the backend instead of redirecting
-    to a presigned S3 URL, e.g. when the page is HTTPS but S3 is HTTP and
-    browsers would block the redirect as a mixed-content download.
-
-    A failure mid-stream truncates the response (headers are already sent
-    when bytes start flowing), so we log and re-raise as StorageError to
-    surface the cause to operators.
-    """
-    try:
-        s3 = _get_s3_client()
-        obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
-    except ClientError as e:
-        raise StorageError(_wrap_s3_error(e, f"read {s3_key}").message) from e
-    body = obj["Body"]
-    try:
-        for chunk in body.iter_chunks(chunk_size=chunk_size):
-            yield chunk
-    except Exception as e:  # noqa: BLE001 — boto3/urllib3 surface various stream errors
-        logger.warning("S3 stream %s aborted: %s", s3_key, e)
-        raise StorageError(f"stream {s3_key}: {e}") from e
-    finally:
-        body.close()
+    return s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
 
 
-def put_object_bytes(s3_key: str, body: bytes, content_type: str = "application/octet-stream") -> None:
-    """Write bytes to S3. Raises StorageError on failure."""
-    try:
-        s3 = _get_s3_client()
-        s3.put_object(Bucket=settings.s3_bucket, Key=s3_key, Body=body, ContentType=content_type)
-    except ClientError as e:
-        raise StorageError(_wrap_s3_error(e, f"write {s3_key}").message) from e
+def put_object_bytes(
+    s3_key: str, body: bytes, content_type: str = "application/octet-stream",
+) -> None:
+    s3_adapter.put_bytes(s3_key, body, content_type=content_type)
 
 
-def _s3_config():
-    return {
-        "aws_access_key_id": settings.s3_access_key,
-        "aws_secret_access_key": settings.s3_secret_key,
-        "config": BotoConfig(signature_version="s3v4"),
-        **({"region_name": settings.s3_region} if settings.s3_region else {}),
-    }
-
-
+# Backward-compat alias for callers that imported the historical
+# private name (e.g. access_service). New code should call
+# `s3_adapter.client()` directly; this alias will be removed in a
+# follow-up commit once those imports are migrated.
 def _get_s3_client():
-    """S3 client for server-side operations (head, delete, etc.)."""
-    global _s3_client
-    if _s3_client is not None:
-        return _s3_client
-    _s3_client = boto3.client("s3", endpoint_url=settings.s3_endpoint_url, **_s3_config())
-    return _s3_client
+    return s3_adapter.client()
 
 
-def _get_presign_client():
-    """S3 client for generating presigned URLs.
-
-    Uses s3_public_url so clients can reach S3 from outside the cluster.
-    Falls back to s3_endpoint_url if s3_public_url is not set.
-    """
-    global _s3_presign_client
-    if _s3_presign_client is not None:
-        return _s3_presign_client
-    endpoint = settings.s3_public_url or settings.s3_endpoint_url
-    _s3_presign_client = boto3.client("s3", endpoint_url=endpoint, **_s3_config())
-    return _s3_presign_client
+# ── File-key naming convention ───────────────────────────────────
 
 
 def _s3_key(vault_name: str, collection: str, filename: str) -> str:
@@ -188,25 +128,12 @@ def _s3_key(vault_name: str, collection: str, filename: str) -> str:
     return f"{vault_name}/{uid}_{safe_name}"
 
 
+# ── File domain service ──────────────────────────────────────────
+
+
 class FileService:
     def __init__(self):
         self._bucket = settings.s3_bucket
-
-    def _ensure_bucket(self):
-        global _bucket_verified
-        if _bucket_verified:
-            return
-        s3 = _get_s3_client()
-        try:
-            s3.head_bucket(Bucket=self._bucket)
-        except ClientError as e:
-            code = e.response["Error"].get("Code", "")
-            if code in ("404", "NoSuchBucket"):
-                s3.create_bucket(Bucket=self._bucket)
-                logger.info("Created S3 bucket: %s", self._bucket)
-            else:
-                raise _wrap_s3_error(e, "check bucket")
-        _bucket_verified = True
 
     async def initiate_upload(
         self,
@@ -220,25 +147,16 @@ class FileService:
     ) -> dict:
         """Create a file record and return a presigned PUT URL.
 
-        Client (akb-mcp proxy) uploads directly to S3, then calls confirm_upload().
+        Client (akb-mcp proxy) uploads directly to S3, then calls
+        confirm_upload().
         """
-        self._ensure_bucket()
+        s3_adapter.ensure_bucket(self._bucket)
         s3_key = _s3_key(vault_name, collection, filename)
         file_id = uuid.uuid4()
 
-        s3 = _get_presign_client()
-        try:
-            presigned_url = s3.generate_presigned_url(
-                "put_object",
-                Params={
-                    "Bucket": self._bucket,
-                    "Key": s3_key,
-                    "ContentType": mime_type,
-                },
-                ExpiresIn=_PRESIGN_UPLOAD_TTL,
-            )
-        except ClientError as e:
-            raise _wrap_s3_error(e, f"presign upload {filename}")
+        presigned_url = s3_adapter.presign_put(
+            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
+        )
 
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -272,20 +190,20 @@ class FileService:
             if not row:
                 raise NotFoundError("File", file_id)
 
-        # Get actual size from S3
-        s3 = _get_s3_client()
+        # Read object size. Treat NoSuchKey specially: that means the
+        # client never finished its presigned upload; clean up the
+        # orphan DB record so the same filename can be retried.
         try:
-            head = s3.head_object(Bucket=self._bucket, Key=row["s3_key"])
-            size_bytes = head["ContentLength"]
-        except ClientError as e:
-            code = e.response["Error"].get("Code", "")
-            if code in ("404", "NoSuchKey"):
-                # Upload never completed — clean up orphan record
-                async with pool.acquire() as conn:
-                    await vault_files_repo.delete(conn, fid)
-                logger.warning("Orphan file record deleted: %s (S3 object missing)", file_id)
-                raise AKBError(f"Upload not found in storage — file record cleaned up: {file_id}", status_code=404)
-            raise _wrap_s3_error(e, f"confirm upload {file_id}")
+            meta = s3_adapter.head(row["s3_key"])
+            size_bytes = meta["ContentLength"]
+        except NotFoundError:
+            async with pool.acquire() as conn:
+                await vault_files_repo.delete(conn, fid)
+            logger.warning("Orphan file record deleted: %s (S3 object missing)", file_id)
+            raise AKBError(
+                f"Upload not found in storage — file record cleaned up: {file_id}",
+                status_code=404,
+            )
 
         async with pool.acquire() as conn:
             await vault_files_repo.update_size(conn, fid, size_bytes)
@@ -328,21 +246,16 @@ class FileService:
             if not row:
                 raise NotFoundError("File", file_id)
 
-        s3 = _get_presign_client()
-        try:
-            params = {"Bucket": self._bucket, "Key": row["s3_key"]}
-            # Override stored Content-Type with DB value so browsers inline
-            # render correctly even when the object was uploaded with a
-            # generic octet-stream (legacy proxy versions < 0.5.1).
-            if row["mime_type"] and row["mime_type"] != "application/octet-stream":
-                params["ResponseContentType"] = row["mime_type"]
-            presigned_url = s3.generate_presigned_url(
-                "get_object",
-                Params=params,
-                ExpiresIn=_PRESIGN_DOWNLOAD_TTL,
-            )
-        except ClientError as e:
-            raise _wrap_s3_error(e, f"presign download {file_id}")
+        # Override stored Content-Type with DB value so browsers inline
+        # render correctly even when the object was uploaded with a
+        # generic octet-stream (legacy proxy versions < 0.5.1).
+        ct = row["mime_type"] if (
+            row["mime_type"] and row["mime_type"] != "application/octet-stream"
+        ) else None
+        presigned_url = s3_adapter.presign_get(
+            row["s3_key"], ttl=_PRESIGN_DOWNLOAD_TTL,
+            response_content_type=ct,
+        )
 
         return {
             "name": row["name"],
@@ -390,17 +303,16 @@ class FileService:
             vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             vault_name = vault_row["name"] if vault_row else ""
 
-            s3 = _get_s3_client()
-            try:
-                s3.delete_object(Bucket=self._bucket, Key=row["s3_key"])
-            except ClientError as e:
-                raise _wrap_s3_error(e, f"delete {file_id}")
+            s3_adapter.delete(row["s3_key"])
             await vault_files_repo.delete(conn, fid)
 
             # Clean up edges referencing this file
             if vault_name:
                 f_uri = f"akb://{vault_name}/file/{file_id}"
-                await conn.execute("DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1", f_uri)
+                await conn.execute(
+                    "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
+                    f_uri,
+                )
 
             # Drop the metadata chunk (outbox-driven vector-store delete).
             try:
@@ -436,17 +348,3 @@ async def index_file_metadata(
             vault_id=vault_id,
             chunks=[chunk],
         )
-
-
-def _wrap_s3_error(e: ClientError, context: str) -> AKBError:
-    code = e.response["Error"].get("Code", "Unknown")
-    msg = e.response["Error"].get("Message", str(e))
-    logger.error("S3 error during %s: [%s] %s", context, code, msg)
-
-    if code in ("AccessDenied", "403"):
-        return AKBError(f"Storage access denied: {context}", status_code=502)
-    if code in ("NoSuchKey", "404"):
-        return NotFoundError("File in storage", context)
-    if code == "EntityTooLarge":
-        return AKBError(f"File too large: {context}", status_code=413)
-    return AKBError(f"Storage error during {context}: {msg}", status_code=502)
