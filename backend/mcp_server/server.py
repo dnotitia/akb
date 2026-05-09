@@ -424,7 +424,7 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
     try:
         return await table_service.create_table(
             access["vault_id"], args["name"], args["columns"],
-            args.get("description", ""), user.username,
+            actor_id=user.username, description=args.get("description", ""),
         )
     except ValueError as e:
         return {"error": str(e)}

@@ -28,9 +28,9 @@ async def upload_file(
         vault_id=access["vault_id"],
         collection=to_nfc(collection),
         filename=to_nfc(filename),
+        actor_id=user.username,
         mime_type=mime_type,
         description=to_nfc(description),
-        created_by=user.username,
     )
 
 
@@ -42,7 +42,9 @@ async def confirm_upload(
 ):
     """Called after presigned URL upload. Updates file size from S3. Recovery use only."""
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    return await file_service.confirm_upload(access["vault_id"], file_id)
+    return await file_service.confirm_upload(
+        access["vault_id"], file_id, actor_id=user.username,
+    )
 
 
 @router.get("/files/{vault}/{file_id}/download", summary="Get download URL")
@@ -74,5 +76,7 @@ async def delete_file(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    deleted = await file_service.delete(access["vault_id"], file_id)
+    deleted = await file_service.delete(
+        access["vault_id"], file_id, actor_id=user.username,
+    )
     return {"deleted": deleted}

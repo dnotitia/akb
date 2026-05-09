@@ -141,9 +141,10 @@ class FileService:
         vault_id: uuid.UUID,
         collection: str,
         filename: str,
+        *,
+        actor_id: str,
         mime_type: str = "application/octet-stream",
         description: str = "",
-        created_by: str = "",
     ) -> dict:
         """Create a file record and return a presigned PUT URL.
 
@@ -166,7 +167,7 @@ class FileService:
                 collection=collection, name=filename,
                 s3_key=s3_key, mime_type=mime_type,
                 size_bytes=0, description=description,
-                created_by=created_by,
+                created_by=actor_id,
             )
 
         logger.info("Presigned upload URL for %s/%s (file_id=%s)", vault_name, s3_key, file_id)
@@ -177,7 +178,13 @@ class FileService:
             "expires_in": _PRESIGN_UPLOAD_TTL,
         }
 
-    async def confirm_upload(self, vault_id: uuid.UUID, file_id: str) -> dict:
+    async def confirm_upload(
+        self,
+        vault_id: uuid.UUID,
+        file_id: str,
+        *,
+        actor_id: str,
+    ) -> dict:
         """Confirm upload completion. Updates size_bytes from S3 metadata.
 
         If the file doesn't exist in S3 (upload failed/abandoned),
@@ -291,7 +298,13 @@ class FileService:
             for r in rows
         ]
 
-    async def delete(self, vault_id: uuid.UUID, file_id: str) -> bool:
+    async def delete(
+        self,
+        vault_id: uuid.UUID,
+        file_id: str,
+        *,
+        actor_id: str,
+    ) -> bool:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:

@@ -27,7 +27,8 @@ class SqlRequest(NFCModel):
 async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
     return await table_service.create_table(
-        access["vault_id"], req.name, req.columns, req.description, user.username,
+        access["vault_id"], req.name, req.columns,
+        actor_id=user.username, description=req.description,
     )
 
 

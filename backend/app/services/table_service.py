@@ -83,8 +83,9 @@ async def create_table(
     vault_id: uuid.UUID,
     name: str,
     columns: list[dict],
+    *,
+    actor_id: str,
     description: str = "",
-    created_by: str | None = None,
 ) -> dict:
     pool = await get_pool()
     tid = uuid.uuid4()
@@ -112,7 +113,7 @@ async def create_table(
             conn,
             table_id=tid, vault_id=vault_id, name=name,
             description=description, columns=columns,
-            created_by=created_by, now=now,
+            created_by=actor_id, now=now,
         )
 
     # Outside the create transaction on purpose: the embedding call can
@@ -155,108 +156,6 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "created_at": r["created_at"].isoformat(),
             })
     return results
-
-
-async def insert_rows(
-    vault_id: uuid.UUID,
-    table_name: str,
-    rows: list[dict],
-    created_by: str | None = None,
-) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
-        if not table:
-            raise NotFoundError("Table", table_name)
-
-        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-        columns_meta = table_registry_repo.parse_columns(table["columns"])
-
-        inserted = 0
-        for row_data in rows:
-            ok = await table_data_repo.insert_row(
-                conn, pg_name, columns_meta, row_data, created_by=created_by,
-            )
-            if ok:
-                inserted += 1
-
-    return {"inserted": inserted, "table": table_name}
-
-
-async def query_table(
-    vault_id: uuid.UUID,
-    table_name: str,
-    where: dict | None = None,
-    order_by: str | None = None,
-    order_desc: bool = False,
-    limit: int = 100,
-    offset: int = 0,
-    aggregate: dict | None = None,
-) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
-        if not table:
-            raise NotFoundError("Table", table_name)
-
-        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-        columns_meta = table_registry_repo.parse_columns(table["columns"])
-
-        if aggregate:
-            agg = await table_data_repo.aggregate_rows(
-                conn, pg_name, where=where, aggregate=aggregate,
-            )
-            return {"aggregate": agg, "table": table_name}
-
-        result_rows, total = await table_data_repo.query_rows(
-            conn, pg_name, columns_meta,
-            where=where, order_by=order_by, order_desc=order_desc,
-            limit=limit, offset=offset,
-        )
-
-    return {"table": table_name, "total": total, "rows": result_rows}
-
-
-async def update_row(
-    vault_id: uuid.UUID,
-    table_name: str,
-    row_id: str,
-    data: dict,
-) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
-        if not table:
-            raise NotFoundError("Table", table_name)
-
-        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-        await table_data_repo.update_row(conn, pg_name, row_id, data)
-
-    return {"updated": True, "row_id": row_id}
-
-
-async def delete_rows(
-    vault_id: uuid.UUID,
-    table_name: str,
-    row_ids: list[str] | None = None,
-) -> dict:
-    if not row_ids:
-        return {"deleted": 0}
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
-        if not table:
-            raise NotFoundError("Table", table_name)
-
-        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-        count = await table_data_repo.delete_rows_by_id(conn, pg_name, row_ids)
-
-    return {"deleted": count, "table": table_name}
 
 
 async def execute_sql(
