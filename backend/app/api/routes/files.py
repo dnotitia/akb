@@ -66,7 +66,7 @@ async def list_files(
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     files = await file_service.list_files(access["vault_id"], collection, limit)
-    return {"vault": vault, "files": files, "total": len(files)}
+    return {"kind": "file", "vault": vault, "items": files, "total": len(files)}
 
 
 @router.delete("/files/{vault}/{file_id}", summary="Delete a file")
@@ -76,7 +76,6 @@ async def delete_file(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    deleted = await file_service.delete(
+    return await file_service.delete(
         access["vault_id"], file_id, actor_id=user.username,
     )
-    return {"deleted": deleted}

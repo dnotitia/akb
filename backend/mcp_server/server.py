@@ -29,6 +29,7 @@ from mcp.types import TextContent, Tool
 
 from app.config import settings
 from app.db.postgres import get_pool, init_db, close_pool
+from app.exceptions import NotFoundError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources, resolve_doc_to_uri
@@ -453,22 +454,12 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_drop_table")
 async def _handle_drop_table(args: dict, uid: str, user: _MCPUser) -> dict:
     access = await check_vault_access(uid, args["vault"], required_role="admin")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", access["vault_id"])
-        table = await conn.fetchrow(
-            "SELECT id FROM vault_tables WHERE vault_id = $1 AND name = $2",
-            access["vault_id"], args["table"],
+    try:
+        return await table_service.drop_table(
+            access["vault_id"], args["table"], actor_id=user.username,
         )
-        if not table:
-            return {"error": f"Table not found: {args['table']}"}
-        pg_name = table_service._pg_table_name(vault["name"], args["table"])
-        await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
-        await conn.execute("DELETE FROM vault_tables WHERE id = $1", table["id"])
-        # Clean up edges referencing this table
-        t_uri = table_uri(args["vault"], args["table"])
-        await conn.execute("DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1", t_uri)
-    return {"dropped": True, "table": args["table"]}
+    except NotFoundError as e:
+        return {"error": str(e)}
 
 
 @_h("akb_alter_table")
