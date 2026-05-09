@@ -69,6 +69,13 @@ async def delete(conn, table_id: uuid.UUID) -> None:
     await conn.execute("DELETE FROM vault_tables WHERE id = $1", table_id)
 
 
+async def update_columns(conn, table_id: uuid.UUID, columns: list[dict]) -> None:
+    await conn.execute(
+        "UPDATE vault_tables SET columns = $1, updated_at = NOW() WHERE id = $2",
+        json.dumps(columns), table_id,
+    )
+
+
 def parse_columns(raw: Any) -> list[dict]:
     """Normalise the `columns` jsonb to list[dict]. asyncpg returns it as
     a pre-parsed list normally, but legacy rows inserted as JSON string
