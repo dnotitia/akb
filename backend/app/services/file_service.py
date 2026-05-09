@@ -26,6 +26,7 @@ from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
 )
+from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -325,15 +326,12 @@ class FileService:
             )
             vault_name = vault_row["name"] if vault_row else ""
 
-        # 2. External effect (S3 delete) before the PG TX so a TX abort
-        # later can't leave a half-deleted state. Commit 6 replaces this
-        # with an s3_delete_outbox INSERT inside the TX so the worker
-        # drains S3 atomically with the DB write.
-        s3_adapter.delete(row["s3_key"])
-
-        # 3. Atomic PG mutations: vault_files row + edges + chunk
-        # outbox enqueue all under one TX so a partial failure can't
-        # leave dangling rows.
+        # 2. Atomic PG mutations: vault_files DELETE + edges cleanup +
+        # chunk-delete outbox + s3-delete outbox under one TX. The
+        # actual S3 delete is performed asynchronously by
+        # s3_delete_worker after the TX commits, so a crash between
+        # commit and S3 cannot leave us with an orphan blob (or a
+        # missing-blob row). The outbox row carries the s3_key.
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await vault_files_repo.delete(conn, fid)
@@ -350,6 +348,8 @@ class FileService:
                     await delete_file_chunks(conn, file_id)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("file chunk delete failed for %s: %s", file_id, e)
+
+                await _enqueue_s3_delete(conn, row["s3_key"])
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
         return {

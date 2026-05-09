@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
-from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker
+from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger("akb.lifecycle")
@@ -45,6 +45,14 @@ def start_workers() -> None:
     delete_worker.start()
     external_git_poller.start()
     started = ["embed_worker", "delete_worker", "external_git_poller"]
+    # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
+    # makes sense when S3 is configured; otherwise file uploads are
+    # disabled altogether and the outbox stays empty forever.
+    if settings.s3_endpoint_url:
+        s3_delete_worker.start()
+        started.append("s3_delete_worker")
+    else:
+        logger.info("s3_delete_worker disabled (S3 not configured)")
     # metadata_worker is the only LLM consumer in the request-independent
     # path. Skip it when LLM isn't configured so OSS users running without
     # an LLM key don't get retry/abandon noise on every external_git import.
@@ -69,6 +77,7 @@ async def stop_workers() -> None:
     await events_publisher.stop()
     await metadata_worker.stop()
     await external_git_poller.stop()
+    await s3_delete_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()
 
