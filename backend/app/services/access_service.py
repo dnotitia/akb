@@ -518,7 +518,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     self-delete endpoint can reuse the same path.
     """
     from app.config import settings
-    from app.services import table_service
+    from app.repositories import table_data_repo
     from app.services.git_service import GitService
     from app.services.index_service import delete_vault_chunks
 
@@ -550,7 +550,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 
         vtables = await conn.fetch("SELECT name FROM vault_tables WHERE vault_id = $1", vault_id)
         for vt in vtables:
-            pg_name = table_service._pg_table_name(vault_name, vt["name"])
+            pg_name = table_data_repo.pg_table_name(vault_name, vt["name"])
             await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
         await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
 

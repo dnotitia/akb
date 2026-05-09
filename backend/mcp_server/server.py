@@ -465,49 +465,16 @@ async def _handle_drop_table(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_alter_table")
 async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
     access = await check_vault_access(uid, args["vault"], required_role="admin")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", access["vault_id"])
-        table = await conn.fetchrow(
-            "SELECT id, columns FROM vault_tables WHERE vault_id = $1 AND name = $2",
+    try:
+        return await table_service.alter_table(
             access["vault_id"], args["table"],
+            actor_id=user.username,
+            add_columns=args.get("add_columns"),
+            drop_columns=args.get("drop_columns"),
+            rename_columns=args.get("rename_columns"),
         )
-        if not table:
-            return {"error": f"Table not found: {args['table']}"}
-
-        from app.utils import ensure_list
-        columns = ensure_list(table["columns"]) if isinstance(table["columns"], str) else list(table["columns"])
-        pg_name = table_service._pg_table_name(vault["name"], args["table"])
-
-        # Execute actual ALTER TABLE DDL
-        if args.get("add_columns"):
-            for col in args["add_columns"]:
-                if not any(c["name"] == col["name"] for c in columns):
-                    col_type = table_service.TYPE_MAP.get(col.get("type", "text"), "TEXT")
-                    safe_name = table_service._safe_ident(col["name"])
-                    await conn.execute(f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {safe_name} {col_type}")
-                    columns.append(col)
-
-        if args.get("drop_columns"):
-            for col_name in args["drop_columns"]:
-                safe_name = table_service._safe_ident(col_name)
-                await conn.execute(f"ALTER TABLE {pg_name} DROP COLUMN IF EXISTS {safe_name}")
-            columns = [c for c in columns if c["name"] not in args["drop_columns"]]
-
-        if args.get("rename_columns"):
-            for old_name, new_name in args["rename_columns"].items():
-                old_safe = table_service._safe_ident(old_name)
-                new_safe = table_service._safe_ident(new_name)
-                await conn.execute(f"ALTER TABLE {pg_name} RENAME COLUMN {old_safe} TO {new_safe}")
-                for c in columns:
-                    if c["name"] == old_name:
-                        c["name"] = new_name
-
-        await conn.execute(
-            "UPDATE vault_tables SET columns = $1, updated_at = NOW() WHERE id = $2",
-            json.dumps(columns), table["id"],
-        )
-    return {"table": args["table"], "columns": columns}
+    except NotFoundError as e:
+        return {"error": str(e)}
 
 
 @_h("akb_todo")

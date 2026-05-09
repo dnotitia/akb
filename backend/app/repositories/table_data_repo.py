@@ -76,6 +76,25 @@ async def count_rows(conn, pg_name: str) -> int:
         return 0
 
 
+async def add_column(conn, pg_name: str, col_name: str, col_type: str) -> None:
+    """Add a column to the dynamic table. Caller sanitises name/type."""
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+    )
+
+
+async def drop_column(conn, pg_name: str, col_name: str) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} DROP COLUMN IF EXISTS {col_name}"
+    )
+
+
+async def rename_column(conn, pg_name: str, old_name: str, new_name: str) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} RENAME COLUMN {old_name} TO {new_name}"
+    )
+
+
 # ── SQL rewriting (for execute_sql + table_query share path) ─────
 
 

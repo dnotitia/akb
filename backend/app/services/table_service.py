@@ -26,15 +26,12 @@ from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
 
-# Re-exported helpers — publication_service uses build_table_name_map
-# + rewrite_table_names; access_service / document_service still
-# import the historical _pg_table_name and _safe_ident names.
+# Re-exported helpers used by publication_service for the
+# `table_query` share path. Other modules import directly from
+# `table_data_repo`.
 from app.repositories.table_data_repo import (  # noqa: F401
-    TYPE_MAP,
     build_table_name_map,
-    pg_table_name as _pg_table_name,
     rewrite_table_names,
-    safe_ident as _safe_ident,
 )
 
 logger = logging.getLogger("akb.tables")
@@ -234,6 +231,92 @@ async def drop_table(
         "vault": vault["name"],
         "name": table_name,
         "deleted": True,
+    }
+
+
+async def alter_table(
+    vault_id: uuid.UUID,
+    table_name: str,
+    *,
+    actor_id: str,
+    add_columns: list[dict] | None = None,
+    drop_columns: list[str] | None = None,
+    rename_columns: dict[str, str] | None = None,
+) -> dict:
+    """Apply schema changes to a vault table:
+       - add_columns: [{name, type}, ...]
+       - drop_columns: ["name", ...]
+       - rename_columns: {"old": "new", ...}
+
+    All three are optional and combine in one TX. Emits `table.alter`
+    after the writes commit.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+            if not vault:
+                raise NotFoundError("Vault", str(vault_id))
+
+            table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+            if not table:
+                raise NotFoundError("Table", table_name)
+
+            columns = table_registry_repo.parse_columns(table["columns"])
+            pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+
+            added: list[str] = []
+            dropped: list[str] = []
+            renamed: dict[str, str] = {}
+
+            if add_columns:
+                for col in add_columns:
+                    if any(c["name"] == col["name"] for c in columns):
+                        continue
+                    col_type = table_data_repo.TYPE_MAP.get(col.get("type", "text"), "TEXT")
+                    safe_name = table_data_repo.safe_ident(col["name"])
+                    await table_data_repo.add_column(conn, pg_name, safe_name, col_type)
+                    columns.append(col)
+                    added.append(col["name"])
+
+            if drop_columns:
+                for col_name in drop_columns:
+                    safe_name = table_data_repo.safe_ident(col_name)
+                    await table_data_repo.drop_column(conn, pg_name, safe_name)
+                    dropped.append(col_name)
+                columns = [c for c in columns if c["name"] not in drop_columns]
+
+            if rename_columns:
+                for old_name, new_name in rename_columns.items():
+                    old_safe = table_data_repo.safe_ident(old_name)
+                    new_safe = table_data_repo.safe_ident(new_name)
+                    await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    for c in columns:
+                        if c["name"] == old_name:
+                            c["name"] = new_name
+                    renamed[old_name] = new_name
+
+            await table_registry_repo.update_columns(conn, table["id"], columns)
+
+            await emit_event(
+                conn, "table.alter",
+                vault_id=vault_id, ref_type="table", ref_id=str(table["id"]),
+                actor_id=actor_id,
+                payload={
+                    "vault": vault["name"],
+                    "table_name": table_name,
+                    "added": added,
+                    "dropped": dropped,
+                    "renamed": renamed,
+                },
+            )
+
+    return {
+        "kind": "table",
+        "id": str(table["id"]),
+        "vault": vault["name"],
+        "name": table_name,
+        "columns": columns,
     }
 
 

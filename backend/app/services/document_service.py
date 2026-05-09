@@ -47,7 +47,7 @@ from app.services.index_service import (
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
 from app.services.uri_service import doc_uri, table_uri, file_uri
-from app.services import table_service as _table_svc
+from app.repositories import table_data_repo
 from app.utils import ensure_dict, ensure_list
 
 logger = logging.getLogger("akb.documents")
@@ -653,7 +653,7 @@ class DocumentService:
                 vault_id,
             )
             for r in table_rows:
-                pg_name = _table_svc._pg_table_name(vault_row["name"], r["name"])
+                pg_name = table_data_repo.pg_table_name(vault_row["name"], r["name"])
                 try:
                     row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
                 except Exception:
