@@ -172,7 +172,9 @@ class FileService:
 
         logger.info("Presigned upload URL for %s/%s (file_id=%s)", vault_name, s3_key, file_id)
         return {
+            "kind": "file",
             "id": str(file_id),
+            "vault": vault_name,
             "upload_url": presigned_url,
             "s3_key": s3_key,
             "expires_in": _PRESIGN_UPLOAD_TTL,
@@ -235,10 +237,11 @@ class FileService:
 
         logger.info("Upload confirmed: %s (%d bytes)", row["name"], size_bytes)
         return {
+            "kind": "file",
             "id": file_id,
+            "vault": vault_row["name"] if vault_row else None,
             "name": row["name"],
             "collection": row["collection"],
-            "s3_key": row["s3_key"],
             "mime_type": row["mime_type"],
             "size_bytes": size_bytes,
         }
@@ -265,6 +268,8 @@ class FileService:
         )
 
         return {
+            "kind": "file",
+            "id": file_id,
             "name": row["name"],
             "download_url": presigned_url,
             "mime_type": row["mime_type"],
@@ -286,6 +291,7 @@ class FileService:
 
         return [
             {
+                "kind": "file",
                 "id": str(r["id"]),
                 "collection": r["collection"],
                 "name": r["name"],
@@ -304,7 +310,7 @@ class FileService:
         file_id: str,
         *,
         actor_id: str,
-    ) -> bool:
+    ) -> dict:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -334,7 +340,13 @@ class FileService:
                 logger.warning("file chunk delete failed for %s: %s", file_id, e)
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
-        return True
+        return {
+            "kind": "file",
+            "id": file_id,
+            "vault": vault_name,
+            "name": row["name"],
+            "deleted": True,
+        }
 
 
 async def index_file_metadata(

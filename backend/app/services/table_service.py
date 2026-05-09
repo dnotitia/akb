@@ -131,7 +131,13 @@ async def create_table(
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
     logger.info("Table created: %s → %s", name, pg_name)
-    return {"table_id": str(tid), "name": name, "columns": columns}
+    return {
+        "kind": "table",
+        "id": str(tid),
+        "vault": vault["name"],
+        "name": name,
+        "columns": columns,
+    }
 
 
 async def list_tables(vault_id: uuid.UUID) -> list[dict]:
@@ -148,7 +154,9 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
             pg_name = table_data_repo.pg_table_name(vault["name"], r["name"])
             count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
-                "table_id": str(r["id"]),
+                "kind": "table",
+                "id": str(r["id"]),
+                "vault": vault["name"],
                 "name": r["name"],
                 "description": r["description"],
                 "columns": table_registry_repo.parse_columns(r["columns"]),
@@ -156,6 +164,53 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "created_at": r["created_at"].isoformat(),
             })
     return results
+
+
+async def drop_table(
+    vault_id: uuid.UUID,
+    table_name: str,
+    *,
+    actor_id: str,
+) -> dict:
+    """Drop a vault-scoped table: registry row + dynamic PG table +
+    edges referencing the table URI + metadata chunk."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+        if not vault:
+            raise NotFoundError("Vault", str(vault_id))
+
+        table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+        if not table:
+            raise NotFoundError("Table", table_name)
+
+        table_id = table["id"]
+        pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+        await table_data_repo.drop_dynamic_table(conn, pg_name)
+        await table_registry_repo.delete(conn, table_id)
+
+        # Clean up edges referencing this table.
+        t_uri = f"akb://{vault['name']}/table/{table_name}"
+        await conn.execute(
+            "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
+            t_uri,
+        )
+
+    # Outside the TX: drop the metadata chunk via the vector-store
+    # outbox (same pattern as file deletion).
+    try:
+        await delete_table_index(str(table_id))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("table chunk delete failed for %s: %s", table_name, e)
+
+    logger.info("Table dropped: %s (%s)", table_name, pg_name)
+    return {
+        "kind": "table",
+        "id": str(table_id),
+        "vault": vault["name"],
+        "name": table_name,
+        "deleted": True,
+    }
 
 
 async def execute_sql(
@@ -204,13 +259,19 @@ async def execute_sql(
                                 row[k] = str(v)
                         result_rows.append(row)
                     return {
+                        "kind": "table_query",
+                        "vaults": vault_names,
                         "columns": list(dict(rows[0]).keys()) if rows else [],
-                        "rows": result_rows,
+                        "items": result_rows,
                         "total": len(result_rows),
                     }
                 else:
                     result = await conn.execute(rewritten)
-                    return {"result": result}
+                    return {
+                        "kind": "table_sql",
+                        "vaults": vault_names,
+                        "result": result,
+                    }
         except Exception as e:
             msg = str(e)
             if read_only and "read-only transaction" in msg:

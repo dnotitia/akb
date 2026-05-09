@@ -36,7 +36,7 @@ async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedU
 async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     tables = await table_service.list_tables(access["vault_id"])
-    return {"tables": tables}
+    return {"kind": "table", "vault": vault, "items": tables, "total": len(tables)}
 
 
 @router.post("/tables/{vault}/sql", summary="Execute SQL on vault tables")
@@ -56,18 +56,6 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
 @router.delete("/tables/{vault}/{table_name}", summary="Drop a table")
 async def drop_table(vault: str, table_name: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="admin")
-    from app.db.postgres import get_pool
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        v = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", access["vault_id"])
-        table = await conn.fetchrow(
-            "SELECT id FROM vault_tables WHERE vault_id = $1 AND name = $2",
-            access["vault_id"], table_name,
-        )
-        if not table:
-            raise HTTPException(status_code=404, detail=f"Table not found: {table_name}")
-        pg_name = table_service._pg_table_name(v["name"], table_name)
-        await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
-        await conn.execute("DELETE FROM vault_tables WHERE id = $1", table["id"])
-    await table_service.delete_table_index(str(table["id"]))
-    return {"dropped": True, "table": table_name}
+    return await table_service.drop_table(
+        access["vault_id"], table_name, actor_id=user.username,
+    )
