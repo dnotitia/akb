@@ -21,6 +21,7 @@ from botocore.exceptions import ClientError
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
+from app.repositories import vault_files_repo
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
 )
@@ -241,13 +242,13 @@ class FileService:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO vault_files (id, vault_id, collection, name, s3_key, mime_type, size_bytes, description, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """,
-                file_id, vault_id, collection, filename, s3_key,
-                mime_type, 0, description, created_by,
+            await vault_files_repo.insert(
+                conn,
+                file_id=file_id, vault_id=vault_id,
+                collection=collection, name=filename,
+                s3_key=s3_key, mime_type=mime_type,
+                size_bytes=0, description=description,
+                created_by=created_by,
             )
 
         logger.info("Presigned upload URL for %s/%s (file_id=%s)", vault_name, s3_key, file_id)
@@ -267,10 +268,7 @@ class FileService:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT name, s3_key, mime_type, collection, description FROM vault_files WHERE id = $1 AND vault_id = $2",
-                fid, vault_id,
-            )
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
             if not row:
                 raise NotFoundError("File", file_id)
 
@@ -284,16 +282,13 @@ class FileService:
             if code in ("404", "NoSuchKey"):
                 # Upload never completed — clean up orphan record
                 async with pool.acquire() as conn:
-                    await conn.execute("DELETE FROM vault_files WHERE id = $1", fid)
+                    await vault_files_repo.delete(conn, fid)
                 logger.warning("Orphan file record deleted: %s (S3 object missing)", file_id)
                 raise AKBError(f"Upload not found in storage — file record cleaned up: {file_id}", status_code=404)
             raise _wrap_s3_error(e, f"confirm upload {file_id}")
 
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE vault_files SET size_bytes = $1, updated_at = NOW() WHERE id = $2",
-                size_bytes, fid,
-            )
+            await vault_files_repo.update_size(conn, fid, size_bytes)
             vault_row = await conn.fetchrow(
                 "SELECT name FROM vaults WHERE id = $1", vault_id,
             )
@@ -327,9 +322,8 @@ class FileService:
         """Return a presigned GET URL for direct download from S3."""
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT name, s3_key, size_bytes, mime_type FROM vault_files WHERE id = $1 AND vault_id = $2",
-                uuid.UUID(file_id), vault_id,
+            row = await vault_files_repo.find_by_id(
+                conn, vault_id, uuid.UUID(file_id),
             )
             if not row:
                 raise NotFoundError("File", file_id)
@@ -366,24 +360,9 @@ class FileService:
     ) -> list[dict]:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            if collection:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, collection, name, mime_type, size_bytes, description, created_by, created_at
-                    FROM vault_files WHERE vault_id = $1 AND collection = $2
-                    ORDER BY created_at DESC LIMIT $3
-                    """,
-                    vault_id, collection, limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, collection, name, mime_type, size_bytes, description, created_by, created_at
-                    FROM vault_files WHERE vault_id = $1
-                    ORDER BY created_at DESC LIMIT $2
-                    """,
-                    vault_id, limit,
-                )
+            rows = await vault_files_repo.list_for_vault(
+                conn, vault_id, collection=collection, limit=limit,
+            )
 
         return [
             {
@@ -400,12 +379,10 @@ class FileService:
         ]
 
     async def delete(self, vault_id: uuid.UUID, file_id: str) -> bool:
+        fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT s3_key FROM vault_files WHERE id = $1 AND vault_id = $2",
-                uuid.UUID(file_id), vault_id,
-            )
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
             if not row:
                 raise NotFoundError("File", file_id)
 
@@ -418,7 +395,7 @@ class FileService:
                 s3.delete_object(Bucket=self._bucket, Key=row["s3_key"])
             except ClientError as e:
                 raise _wrap_s3_error(e, f"delete {file_id}")
-            await conn.execute("DELETE FROM vault_files WHERE id = $1", uuid.UUID(file_id))
+            await vault_files_repo.delete(conn, fid)
 
             # Clean up edges referencing this file
             if vault_name:
