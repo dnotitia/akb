@@ -103,6 +103,7 @@ async def _apply_migrations() -> None:
         "016_chunks_drop_embedding.py",    # drop embedding + embed_* cols (vector store owns the dense vec now)
         "017_chunks_indexing_queue_index.py",  # partial index for new-first claim order
         "018_drop_redundant_pending_index.py",  # idx_chunks_vector_pending is dead weight after 017
+        "019_s3_delete_outbox.py",              # s3_delete_outbox + indices for atomic file deletion
     ):
         module = _load_migration(filename)
         if module is None:
