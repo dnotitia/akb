@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo
+from app.repositories.events_repo import emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
@@ -116,6 +117,17 @@ async def create_table(
                 description=description, columns=columns,
                 created_by=actor_id, now=now,
             )
+            await emit_event(
+                conn, "table.create",
+                vault_id=vault_id, ref_type="table", ref_id=str(tid),
+                actor_id=actor_id,
+                payload={
+                    "vault": vault["name"],
+                    "table_name": name,
+                    "columns_count": len(columns),
+                    "description": description,
+                },
+            )
 
     # Outside the create transaction on purpose: the embedding call can
     # be slow and we'd rather not hold a DB connection on it.
@@ -196,6 +208,16 @@ async def drop_table(
             await conn.execute(
                 "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                 t_uri,
+            )
+
+            await emit_event(
+                conn, "table.drop",
+                vault_id=vault_id, ref_type="table", ref_id=str(table_id),
+                actor_id=actor_id,
+                payload={
+                    "vault": vault["name"],
+                    "table_name": table_name,
+                },
             )
 
     # Outside the TX: drop the metadata chunk via the vector-store
