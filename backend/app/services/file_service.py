@@ -22,6 +22,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
+from app.repositories.events_repo import emit_event
 from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
@@ -221,6 +222,18 @@ class FileService:
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )
+                await emit_event(
+                    conn, "file.put",
+                    vault_id=vault_id, ref_type="file", ref_id=file_id,
+                    actor_id=actor_id,
+                    payload={
+                        "vault": vault_row["name"] if vault_row else None,
+                        "collection": row["collection"],
+                        "name": row["name"],
+                        "mime_type": row["mime_type"],
+                        "size_bytes": size_bytes,
+                    },
+                )
 
         # Index file metadata for hybrid search.
         try:
@@ -350,6 +363,19 @@ class FileService:
                     logger.warning("file chunk delete failed for %s: %s", file_id, e)
 
                 await _enqueue_s3_delete(conn, row["s3_key"])
+
+                await emit_event(
+                    conn, "file.delete",
+                    vault_id=vault_id, ref_type="file", ref_id=file_id,
+                    actor_id=actor_id,
+                    payload={
+                        "vault": vault_name,
+                        "collection": row["collection"],
+                        "name": row["name"],
+                        "s3_key": row["s3_key"],
+                        "size_bytes": row["size_bytes"],
+                    },
+                )
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
         return {
