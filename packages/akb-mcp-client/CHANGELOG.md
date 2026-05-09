@@ -46,10 +46,9 @@ No proxy-side change required.
 
 - `repository.url` corrected to `https://github.com/dnotitia/akb.git`.
 - `CHANGELOG.md` is now part of the npm package.
-- Releases are now published by the
-  `.github/workflows/publish-akb-mcp.yml` workflow on a
-  matching `akb-mcp-v*` git tag (with `--provenance`). Manual
-  `npm publish` from a workstation still works as a fallback.
+- Releases are published manually with `npm publish --access public`
+  from `packages/akb-mcp-client/` after a backend cutover lands on
+  main.
 
 ## 0.6.0 and earlier
 
