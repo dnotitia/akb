@@ -266,7 +266,7 @@ echo "▸ 11. Tables via MCP"
 
 # Create table (real PG table via DDL)
 R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"mcp_items\",\"columns\":[{\"name\":\"product\",\"type\":\"text\"},{\"name\":\"qty\",\"type\":\"number\"}]}" | mcp_result)
-TBL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['table_id'])" 2>/dev/null)
+TBL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 [ -n "$TBL" ] && pass "akb_create_table ($TBL)" || fail "akb_create_table" "no id"
 
 # Insert via akb_sql
@@ -281,7 +281,7 @@ ROWS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['tota
 
 # Aggregate via akb_sql
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT SUM(qty) as total_qty, COUNT(*) as cnt FROM mcp_items\"}" | mcp_result)
-SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['total_qty'])" 2>/dev/null)
+SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['total_qty'])" 2>/dev/null)
 [ "$SUM" = "150" ] && pass "akb_sql SUM=150" || pass "Aggregate responded ($SUM)"
 
 # Browse tables (unified browse replaces akb_list_tables)
@@ -554,7 +554,7 @@ ALT_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(
 
 # Drop table
 R=$(mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"table\":\"mcp_items\"}" | mcp_result)
-DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('dropped',False))" 2>/dev/null)
+DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
 [ "$DROP_OK" = "True" ] && pass "Drop table" || fail "Drop table" "not dropped"
 
 # Verify gone

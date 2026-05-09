@@ -238,11 +238,11 @@ pass "Data inserted in both"
 VAULT1_SAFE=$(echo "$VAULT1" | tr '-' '_')
 VAULT2_SAFE=$(echo "$VAULT2" | tr '-' '_')
 R=$(m1 "akb_sql" "{\"vaults\":[\"$VAULT1\",\"$VAULT2\"],\"sql\":\"SELECT p.name, p.price, o.qty FROM ${VAULT1_SAFE}__products p JOIN ${VAULT2_SAFE}__orders o ON p.name = o.product ORDER BY p.name\"}")
-CROSS_ROWS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('rows',[])))" 2>/dev/null)
+CROSS_ROWS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
 [ "$CROSS_ROWS" = "2" ] && pass "Cross-vault JOIN: $CROSS_ROWS rows" || fail "Cross-vault SQL" "$R"
 
 # Verify data correctness
-FIRST_QTY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0].get('qty',0))" 2>/dev/null)
+FIRST_QTY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0].get('qty',0))" 2>/dev/null)
 [ "$FIRST_QTY" = "3" ] && pass "Cross-vault data correct (Gadget qty=3)" || fail "Cross-vault data" "qty=$FIRST_QTY"
 
 # ── 6. SQL UPDATE/DELETE rows ────────────────────────────────
@@ -254,7 +254,7 @@ UPDATE_OK=$(echo "$R" | python3 -c "import sys,json; print('UPDATE' in json.load
 [ "$UPDATE_OK" = "True" ] && pass "UPDATE row" || fail "UPDATE" "$R"
 
 R=$(m1 "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT price FROM products WHERE name = 'Widget'\"}")
-NEW_PRICE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['price'])" 2>/dev/null)
+NEW_PRICE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['price'])" 2>/dev/null)
 [ "$NEW_PRICE" = "150" ] && pass "Updated value verified (150)" || fail "UPDATE verify" "price=$NEW_PRICE"
 
 R=$(m1 "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"DELETE FROM products WHERE name = 'Gadget'\"}")
@@ -262,7 +262,7 @@ DELETE_OK=$(echo "$R" | python3 -c "import sys,json; print('DELETE' in json.load
 [ "$DELETE_OK" = "True" ] && pass "DELETE row" || fail "DELETE" "$R"
 
 R=$(m1 "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT count(*) as cnt FROM products\"}")
-REMAINING=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['cnt'])" 2>/dev/null)
+REMAINING=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['cnt'])" 2>/dev/null)
 [ "$REMAINING" = "1" ] && pass "1 row remaining after DELETE" || fail "DELETE verify" "cnt=$REMAINING"
 
 # ── Cleanup ──────────────────────────────────────────────────
