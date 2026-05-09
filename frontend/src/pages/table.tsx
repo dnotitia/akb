@@ -30,7 +30,7 @@ export default function TablePage() {
     fetch(`/api/v1/tables/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
       .then((r) => r.json())
       .then((d) => {
-        const found = (d.tables || []).find((x: any) => x.name === table);
+        const found = (d.items || []).find((x: any) => x.name === table);
         if (found) setInfo(found);
       })
       .catch(() => {});
@@ -45,9 +45,9 @@ export default function TablePage() {
           setError(d.error || d.detail);
           return;
         }
-        setRows(d.rows || []);
+        setRows(d.items || []);
         setCols(d.columns || []);
-        setTotal(d.total ?? d.rows?.length ?? 0);
+        setTotal(d.total ?? d.items?.length ?? 0);
       })
       .catch((e) => setError(String(e)));
   }, [vault, table, limit]);

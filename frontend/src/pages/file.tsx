@@ -27,7 +27,7 @@ export default function FilePage() {
     fetch(`/api/v1/files/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
       .then((r) => r.json())
       .then((d) => {
-        const found = (d.files || []).find((x: any) => x.id === fileId);
+        const found = (d.items || []).find((x: any) => x.id === fileId);
         if (found) setInfo(found);
         else setError("File not found in vault");
       })
