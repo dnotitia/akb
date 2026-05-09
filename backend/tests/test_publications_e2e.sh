@@ -56,7 +56,7 @@ DOC_ID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get
 # Create a table
 R=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT" -H "Content-Type: application/json" \
   -d '{"name":"products","columns":[{"name":"name","type":"text","required":true},{"name":"category","type":"text"},{"name":"price","type":"number"}]}')
-[ -n "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("table_id",""))' 2>/dev/null)" ] \
+[ -n "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)" ] \
   && pass "Table created" || fail "Table create" "$R"
 
 acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
@@ -506,7 +506,7 @@ SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("
 # Either accepted (because comment is after SELECT — harmless) or rejected; what
 # matters is products table still exists afterwards.
 EXISTS=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
-  -d '{"sql":"SELECT COUNT(*) FROM products"}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("rows",[{}])[0].get("count","?"))' 2>/dev/null)
+  -d '{"sql":"SELECT COUNT(*) FROM products"}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("items",[{}])[0].get("count","?"))' 2>/dev/null)
 [ "$EXISTS" != "?" ] && pass "products table survived comment injection (rows=$EXISTS)" || fail "Comment injection" "table dropped or query failed"
 
 # SQL declares parameter not used

@@ -289,7 +289,7 @@ echo "▸ 7. SQL Table Access Control"
 
 # User1 creates a table in vault1
 R=$(mcp_as "$PAT1" "$SID1" "akb_create_table" "{\"vault\":\"$VAULT1\",\"name\":\"finances\",\"description\":\"Sensitive data\",\"columns\":[{\"name\":\"item\",\"type\":\"text\",\"required\":true},{\"name\":\"amount\",\"type\":\"number\"}]}" | mr)
-TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('table_id') or d.get('name')=='finances'))" 2>/dev/null)
+TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('id') or d.get('name')=='finances'))" 2>/dev/null)
 [ "$TABLE_OK" = "True" ] && pass "Table created in private vault" || fail "Table create" "$R"
 
 # User1 inserts data
@@ -299,7 +299,7 @@ INSERT_OK=$(echo "$R" | python3 -c "import sys,json; print('INSERT' in json.load
 
 # User1 can SELECT
 R=$(mcp_as "$PAT1" "$SID1" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT * FROM finances\"}" | mr)
-ROW_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('rows',[])))" 2>/dev/null)
+ROW_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
 [ "$ROW_COUNT" = "2" ] && pass "User1 SELECT: 2 rows" || fail "User1 SELECT" "expected 2, got $ROW_COUNT"
 
 # User2 should NOT be able to SELECT from user1's private vault table
@@ -317,7 +317,7 @@ mcp_as "$PAT1" "$SID1" "akb_grant" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\",\
 
 # User2 as reader CAN SELECT
 R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT * FROM finances\"}" | mr)
-READER_SELECT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('rows',[])))" 2>/dev/null)
+READER_SELECT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
 [ "$READER_SELECT" = "2" ] && pass "Reader can SELECT: 2 rows" || fail "Reader SELECT" "$R"
 
 # User2 as reader should NOT be able to INSERT
@@ -345,7 +345,7 @@ WRITER_INSERT=$(echo "$R" | python3 -c "import sys,json; print('INSERT' in json.
 
 # Verify 3 rows now
 R=$(mcp_as "$PAT1" "$SID1" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT count(*) as cnt FROM finances\"}" | mr)
-FINAL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['cnt'])" 2>/dev/null)
+FINAL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['cnt'])" 2>/dev/null)
 [ "$FINAL_COUNT" = "3" ] && pass "Final row count: 3" || fail "Final count" "expected 3, got $FINAL_COUNT"
 
 # Revoke User2 access
@@ -380,7 +380,7 @@ CTE_BLOCKED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); p
 
 # 8d. Verify data not corrupted (still 3 rows)
 R=$(mcp_as "$PAT1" "$SID1" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"SELECT count(*) as cnt FROM finances\"}" | mr)
-INTEGRITY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['cnt'])" 2>/dev/null)
+INTEGRITY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['cnt'])" 2>/dev/null)
 [ "$INTEGRITY" = "3" ] && pass "Data integrity preserved (3 rows)" || fail "Data integrity" "expected 3, got $INTEGRITY"
 
 # Revoke again

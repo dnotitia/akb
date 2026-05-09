@@ -484,7 +484,7 @@ echo "▸ 18. Vault Tables"
 # Create table
 R=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT" -H 'Content-Type: application/json' \
   -d '{"name":"test_items","description":"Test table","columns":[{"name":"name","type":"text"},{"name":"price","type":"number"},{"name":"active","type":"boolean"}]}' 2>/dev/null)
-TBL_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['table_id'])" 2>/dev/null)
+TBL_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 [ -n "$TBL_ID" ] && pass "Table created ($TBL_ID)" || fail "Create table" "no id"
 
 # Insert via SQL
@@ -508,12 +508,12 @@ ACTIVE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 # Aggregate via SQL
 R=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT SUM(price) as total FROM test_items"}' 2>/dev/null)
-AGG_SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['total'])" 2>/dev/null)
+AGG_SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['total'])" 2>/dev/null)
 [ "$AGG_SUM" = "4000" ] && pass "SQL SUM=4000" || pass "SQL aggregate ($AGG_SUM)"
 
 # List tables
 R=$(acurl "$BASE_URL/api/v1/tables/$VAULT" 2>/dev/null)
-TBL_LIST=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['tables']))" 2>/dev/null)
+TBL_LIST=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['items']))" 2>/dev/null)
 [ "$TBL_LIST" -ge 1 ] 2>/dev/null && pass "List tables: $TBL_LIST" || fail "List tables" "expected >=1"
 
 # ── 19. Vault Templates ────────────────────────────────────

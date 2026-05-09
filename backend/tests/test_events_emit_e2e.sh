@@ -51,10 +51,8 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT" ] || { echo "FATAL: could not get PAT"; exit 1; }
 
-curl -sk -X POST "$BASE_URL/api/v1/vaults" \
-  -H "Authorization: Bearer $PAT" \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$VAULT\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT" \
+  -H "Authorization: Bearer $PAT" >/dev/null
 
 VAULT_ID=$(run_psql "SELECT id FROM vaults WHERE name = '$VAULT'")
 [ -n "$VAULT_ID" ] && pass "vault registered ($VAULT_ID)" || { fail "vault" "not in DB"; exit 1; }

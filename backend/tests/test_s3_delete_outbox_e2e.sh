@@ -50,16 +50,14 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT" ] || { echo "FATAL: could not get PAT"; exit 1; }
 
-curl -sk -X POST "$BASE_URL/api/v1/vaults" \
-  -H "Authorization: Bearer $PAT" \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$VAULT\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT" \
+  -H "Authorization: Bearer $PAT" >/dev/null
 
 # Insert a synthetic vault_files row directly (skip S3 upload step —
 # we're testing the DB-side outbox enqueue, not the S3 round-trip).
 VAULT_ID=$(run_psql "SELECT id FROM vaults WHERE name = '$VAULT'")
-FILE_ID=$(run_psql "INSERT INTO vault_files (vault_id, collection, name, s3_key, mime_type, size_bytes, description, created_by) VALUES ('$VAULT_ID', '', 'synthetic.txt', '$VAULT/$(date +%s)_synthetic.txt', 'text/plain', 12, '', '$USER') RETURNING id")
-S3_KEY=$(run_psql "SELECT s3_key FROM vault_files WHERE id = '$FILE_ID'")
+FILE_ID=$(run_psql "INSERT INTO vault_files (vault_id, collection, name, s3_key, mime_type, size_bytes, description, created_by) VALUES ('$VAULT_ID', '', 'synthetic.txt', '$VAULT/$(date +%s)_synthetic.txt', 'text/plain', 12, '', '$USER') RETURNING id" | head -n 1)
+S3_KEY=$(run_psql "SELECT s3_key FROM vault_files WHERE id = '$FILE_ID'" | head -n 1)
 
 [ -n "$FILE_ID" ] && pass "synthetic file row inserted ($FILE_ID)" || { fail "setup" "no file row"; exit 1; }
 

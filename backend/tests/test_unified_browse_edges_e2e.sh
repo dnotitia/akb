@@ -89,7 +89,7 @@ DOC2_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 
 # Table
 R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"test_metrics\",\"description\":\"API performance metrics\",\"columns\":[{\"name\":\"endpoint\",\"type\":\"text\"},{\"name\":\"latency_ms\",\"type\":\"number\"}]}" | mcp_result)
-TBL_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['table_id'])" 2>/dev/null)
+TBL_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
 [ -n "$TBL_ID" ] && pass "Table created (test_metrics)" || fail "Table" "no id"
 
 # Insert rows
@@ -432,7 +432,7 @@ pass "Linked doc1 → temp_table"
 
 # Drop table
 R=$(mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"table\":\"temp_table\"}" | mcp_result)
-DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('dropped',False))" 2>/dev/null)
+DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
 [ "$DROP_OK" = "True" ] && pass "Temp table dropped" || fail "Drop temp table" "not dropped"
 
 # Verify edges cleaned up
