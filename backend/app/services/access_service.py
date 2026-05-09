@@ -533,12 +533,11 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
         # Delete S3 files before DB cascade removes vault_files records.
         file_rows = await conn.fetch("SELECT s3_key FROM vault_files WHERE vault_id = $1", vault_id)
         if file_rows and settings.s3_endpoint_url:
-            from app.services.file_service import _get_s3_client
-            s3 = _get_s3_client()
+            from app.services.adapters import s3_adapter
             failed = []
             for fr in file_rows:
                 try:
-                    s3.delete_object(Bucket=settings.s3_bucket, Key=fr["s3_key"])
+                    s3_adapter.delete(fr["s3_key"])
                 except Exception as e:  # noqa: BLE001
                     failed.append(fr["s3_key"])
                     logger.warning("Failed to delete S3 object %s: %s", fr["s3_key"], e)
