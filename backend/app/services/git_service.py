@@ -118,7 +118,13 @@ class GitService:
         the lock is cleared by hand. Running this at startup recovers
         every affected vault before any worker can run into the same wall.
 
-        Lock locations checked:
+        Vault enumeration source: every `<storage>/<name>.git` bare repo
+        in `storage_path`. Iterating bare repos (rather than the linked
+        worktree dir) means we still find locks for vaults whose
+        `_worktrees/<name>` directory was wiped or never created — the
+        admin path inside the bare can hold an `index.lock` independently.
+
+        Lock locations checked per vault:
           1. `<bare>/worktrees/<name>/index.lock` — where git keeps the
              index for linked worktrees (the path the AKB write paths
              actually touch).
@@ -135,15 +141,17 @@ class GitService:
         Returns the number of locks removed.
         """
         cleared = 0
-        if not self.worktrees_path.exists():
+        if not self.storage_path.exists():
             return cleared
-        for vault_dir in self.worktrees_path.iterdir():
-            if not vault_dir.is_dir():
+        for bare in self.storage_path.iterdir():
+            if not bare.is_dir() or not bare.name.endswith(".git"):
                 continue
-            vault_name = vault_dir.name
+            vault_name = bare.name[: -len(".git")]
+            if not vault_name:
+                continue
             candidates = [
-                self._bare_path(vault_name) / "worktrees" / vault_name / "index.lock",
-                vault_dir / ".git" / "index.lock",
+                bare / "worktrees" / vault_name / "index.lock",
+                self._worktree_path(vault_name) / ".git" / "index.lock",
             ]
             for lock in candidates:
                 # `.git` in a linked worktree is a file (gitdir pointer),
