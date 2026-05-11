@@ -186,6 +186,69 @@ async def _sweep_outbox_once() -> int:
     return n
 
 
+# ── Abandoned-chunk reaper ────────────────────────────────────────
+
+# A chunk is "abandoned" once vector_retry_count has hit MAX_RETRIES:
+# the indexing worker has stopped picking it and it will sit in
+# `vector_indexed_at IS NULL` forever. Operators see them as a stuck
+# `indexing N` counter on the UI. After this grace window we delete
+# them from PG (enqueuing the vector-store cleanup via the outbox)
+# so the counter clears itself.
+#
+# The grace window lets an operator notice + investigate the failure
+# (e.g. an oversize chunk from a bug in the chunker) before the row
+# is reclaimed. 7d is generous; tune via REAP_GRACE_INTERVAL if needed.
+REAP_GRACE_INTERVAL = "7 days"
+REAP_INTERVAL_SECONDS = 3600.0
+_last_reap_at: float = 0.0
+
+
+async def _reap_abandoned_chunks_once() -> int:
+    """Delete chunks whose `vector_retry_count >= MAX_RETRIES` and whose
+    last retry attempt was more than REAP_GRACE_INTERVAL ago. Enqueues
+    them to `vector_delete_outbox` so this worker's normal delete pass
+    removes them from the vector store too. Rate-limited."""
+    global _last_reap_at
+    now = time.monotonic()
+    if now - _last_reap_at < REAP_INTERVAL_SECONDS:
+        return 0
+    _last_reap_at = now
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            n = await conn.fetchval(
+                f"""
+                WITH abandoned AS (
+                    SELECT id, source_type, source_id
+                      FROM chunks
+                     WHERE vector_indexed_at IS NULL
+                       AND vector_retry_count >= $1
+                       AND (
+                           vector_next_attempt_at IS NULL
+                        OR vector_next_attempt_at < NOW() - INTERVAL '{REAP_GRACE_INTERVAL}'
+                       )
+                ),
+                enqueued AS (
+                    INSERT INTO vector_delete_outbox
+                        (chunk_id, source_type, source_id, next_attempt_at)
+                    SELECT id, source_type, source_id, NOW() FROM abandoned
+                    RETURNING 1
+                ),
+                deleted AS (
+                    DELETE FROM chunks WHERE id IN (SELECT id FROM abandoned)
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM deleted
+                """,
+                MAX_RETRIES,
+            )
+    n = int(n or 0)
+    if n:
+        logger.info("abandoned-chunk reap: removed %d rows (outbox enqueued)", n)
+    return n
+
+
 # ── Main loop ─────────────────────────────────────────────────────
 
 
@@ -199,6 +262,10 @@ async def _process_once() -> int:
         await _sweep_outbox_once()
     except Exception as e:  # noqa: BLE001
         logger.exception("delete_worker outbox sweep failed: %s", e)
+    try:
+        await _reap_abandoned_chunks_once()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delete_worker abandoned-chunk reap failed: %s", e)
     return d
 
 

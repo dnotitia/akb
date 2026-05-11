@@ -543,9 +543,19 @@ class DocumentService:
         collection_id = row["collection_id"]
 
         commit_msg = f"[delete] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: delete"
-        await asyncio.to_thread(
-            self.git.delete_file, vault_name=vault, file_path=file_path, message=commit_msg
-        )
+        # Idempotent: if the git file is already gone (crash-recovery
+        # state, manual cleanup, etc.) the DB cleanup below still runs.
+        # Without this, a partial-delete leaves an undeletable document
+        # row that needs operator intervention.
+        try:
+            await asyncio.to_thread(
+                self.git.delete_file, vault_name=vault, file_path=file_path, message=commit_msg,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "Document %s/%s already absent from git — proceeding with DB-only cleanup",
+                vault, file_path,
+            )
 
         # Capture the public d-id BEFORE the row is gone so subscribers
         # see the same identifier they'd have used to fetch the doc.
