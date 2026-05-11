@@ -170,15 +170,16 @@ async def _sweep_outbox_once() -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         n = await conn.fetchval(
-            f"""
+            """
             WITH d AS (
                 DELETE FROM vector_delete_outbox
                  WHERE processed_at IS NOT NULL
-                   AND processed_at < NOW() - INTERVAL '{SWEEP_GRACE_INTERVAL}'
+                   AND processed_at < NOW() - $1::interval
                 RETURNING 1
             )
             SELECT COUNT(*) FROM d
-            """
+            """,
+            SWEEP_GRACE_INTERVAL,
         )
     n = int(n or 0)
     if n:
@@ -218,7 +219,7 @@ async def _reap_abandoned_chunks_once() -> int:
     async with pool.acquire() as conn:
         async with conn.transaction():
             n = await conn.fetchval(
-                f"""
+                """
                 WITH abandoned AS (
                     SELECT id, source_type, source_id
                       FROM chunks
@@ -226,8 +227,9 @@ async def _reap_abandoned_chunks_once() -> int:
                        AND vector_retry_count >= $1
                        AND (
                            vector_next_attempt_at IS NULL
-                        OR vector_next_attempt_at < NOW() - INTERVAL '{REAP_GRACE_INTERVAL}'
+                        OR vector_next_attempt_at < NOW() - $2::interval
                        )
+                     FOR UPDATE SKIP LOCKED
                 ),
                 enqueued AS (
                     INSERT INTO vector_delete_outbox
@@ -241,7 +243,7 @@ async def _reap_abandoned_chunks_once() -> int:
                 )
                 SELECT COUNT(*) FROM deleted
                 """,
-                MAX_RETRIES,
+                MAX_RETRIES, REAP_GRACE_INTERVAL,
             )
     n = int(n or 0)
     if n:
