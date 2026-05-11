@@ -11,6 +11,7 @@ import logging
 from app.config import settings
 from app.db.postgres import close_pool, init_db
 from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker
+from app.services.git_service import GitService
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger("akb.lifecycle")
@@ -35,6 +36,15 @@ async def init_storage() -> None:
     _validate_required_settings()
     await init_db()
     logger.info("Database initialized")
+    # Self-heal: clear stale git index.lock files left behind by a
+    # crashed prior process. Without this, the affected vault's writes
+    # fail silently until an operator removes the lock by hand.
+    try:
+        cleared = GitService().cleanup_stale_locks()
+        if cleared:
+            logger.info("Cleared %d stale git lock(s) at startup", cleared)
+    except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
+        logger.warning("Stale-lock self-heal failed (continuing): %s", e)
     # Force-construct so a misconfigured vector-store URL/DSN fails at startup rather
     # than silently serving empty search results later.
     get_vector_store()

@@ -53,9 +53,16 @@ export default function VaultPage() {
   const [commitsLoaded, setCommitsLoaded] = useState(false);
 
   const vaultHealth = useVaultHealth(name);
+  // Same shape as the global header: `pending` from the backend includes
+  // retry-exhausted (abandoned) chunks, so subtract them to get the
+  // "actively indexing" count and surface abandoned separately.
+  const vUpsert = vaultHealth?.vector_store?.backfill?.upsert;
+  const vaultAbandoned: number = vUpsert?.abandoned || 0;
   const vaultPending: number | null = vaultHealth
-    ? (vaultHealth.vector_store?.backfill?.upsert?.pending || 0) +
-      (vaultHealth.metadata_backfill?.pending || 0)
+    ? Math.max(
+        0,
+        (vUpsert?.pending || 0) - vaultAbandoned,
+      ) + (vaultHealth.metadata_backfill?.pending || 0)
     : null;
 
   useEffect(() => {
@@ -123,7 +130,7 @@ export default function VaultPage() {
           externalGit={info?.is_external_git}
           publicAccess={info?.public_access}
         />
-        <IndexingBadge pending={vaultPending} />
+        <IndexingBadge pending={vaultPending} abandoned={vaultAbandoned} />
         <div className="ml-auto flex items-baseline gap-4">
           <Link
             to={`/vault/${name}/members`}

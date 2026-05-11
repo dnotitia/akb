@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, quote
@@ -106,6 +107,69 @@ class GitService:
 
     def vault_exists(self, vault_name: str) -> bool:
         return self._bare_path(vault_name).exists()
+
+    def cleanup_stale_locks(self, max_age_seconds: float = 60.0) -> int:
+        """Remove `index.lock` files for every vault that are older than
+        `max_age_seconds`.
+
+        A crashed git process (OOM, SIGKILL, container restart mid-commit)
+        leaves the index.lock behind; subsequent writes to that worktree
+        fail with "Unable to create '.../index.lock': File exists" until
+        the lock is cleared by hand. Running this at startup recovers
+        every affected vault before any worker can run into the same wall.
+
+        Lock locations checked:
+          1. `<bare>/worktrees/<name>/index.lock` — where git keeps the
+             index for linked worktrees (the path the AKB write paths
+             actually touch).
+          2. `<worktree>/.git/index.lock` — fallback for non-linked
+             setups (initial clone path) where `.git` is a real dir.
+
+        Safe under concurrency: the only write paths that touch a
+        worktree's index hold `_vault_lock(vault_name)` per-vault, so
+        startup self-heal — which runs before workers — cannot remove
+        a lock held by a live operation. The age threshold provides
+        defense in depth in the unlikely case startup overlaps with an
+        in-flight commit (lock would be < 1s old, well under 60s).
+
+        Returns the number of locks removed.
+        """
+        cleared = 0
+        if not self.worktrees_path.exists():
+            return cleared
+        for vault_dir in self.worktrees_path.iterdir():
+            if not vault_dir.is_dir():
+                continue
+            vault_name = vault_dir.name
+            candidates = [
+                self._bare_path(vault_name) / "worktrees" / vault_name / "index.lock",
+                vault_dir / ".git" / "index.lock",
+            ]
+            for lock in candidates:
+                # `.git` in a linked worktree is a file (gitdir pointer),
+                # not a dir — its `index.lock` path is meaningless. Skip
+                # quickly if the parent isn't a directory.
+                if not lock.parent.is_dir():
+                    continue
+                if not lock.exists() or lock.is_dir():
+                    continue
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except OSError:
+                    continue
+                if age < max_age_seconds:
+                    continue
+                try:
+                    lock.unlink()
+                except OSError as e:
+                    logger.warning("failed to clear stale lock %s: %s", lock, e)
+                    continue
+                logger.warning(
+                    "removed stale git index.lock (age=%.0fs) at %s",
+                    age, lock,
+                )
+                cleared += 1
+        return cleared
 
     def cleanup_vault_dirs(self, vault_name: str) -> None:
         """Idempotently remove every on-disk artefact a vault owns.

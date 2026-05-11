@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Archive,
   CircleDashed,
   Eye,
@@ -83,36 +84,63 @@ export function VaultStateBadge({
 /**
  * Indexing activity indicator.
  *
- * Pass `pending` as:
- *   - `null` / `undefined` — `/health` hasn't resolved yet; renders a muted
- *     skeleton chip that reserves layout space so the badge doesn't pop-in
- *     jarringly once the real value arrives.
- *   - `0` — loaded and nothing pending; renders nothing.
- *   - `> 0` — renders the active spinner badge with a fade-in transition.
+ * - `pending`   — actively-indexing chunks (i.e. backend's
+ *                 `pending − abandoned`). `null`/`undefined` ⇒ skeleton;
+ *                 `0` ⇒ no spinner. `> 0` ⇒ spinner + count.
+ * - `abandoned` — retry-exhausted chunks that the worker has given up
+ *                 on. Surfaced as a separate warning chip when > 0 so
+ *                 they don't masquerade as "still indexing" forever.
+ *                 (The backend's delete_worker reaps them after the
+ *                 grace window — until then this chip is the signal.)
  */
-export function IndexingBadge({ pending }: { pending: number | null | undefined }) {
+export function IndexingBadge({
+  pending,
+  abandoned = 0,
+}: {
+  pending: number | null | undefined;
+  abandoned?: number;
+}) {
+  const abandonedChip = abandoned > 0 ? (
+    <Badge
+      variant="outline"
+      className="border-destructive/40 text-destructive"
+      title={`${abandoned.toLocaleString()} chunk(s) failed indexing and are awaiting auto-reap`}
+    >
+      <AlertTriangle className="h-3 w-3" aria-hidden />
+      {abandoned.toLocaleString()} abandoned
+    </Badge>
+  ) : null;
+
   if (pending == null) {
     return (
-      <Badge
-        variant="outline"
-        className="opacity-40 animate-pulse"
-        title="Checking indexing status…"
-        aria-busy="true"
-      >
-        <CircleDashed className="h-3 w-3" aria-hidden />
-        checking…
-      </Badge>
+      <>
+        <Badge
+          variant="outline"
+          className="opacity-40 animate-pulse"
+          title="Checking indexing status…"
+          aria-busy="true"
+        >
+          <CircleDashed className="h-3 w-3" aria-hidden />
+          checking…
+        </Badge>
+        {abandonedChip}
+      </>
     );
   }
-  if (pending <= 0) return null;
+  if (pending <= 0) {
+    return abandonedChip;
+  }
   return (
-    <Badge
-      variant="pending"
-      className="fade-in"
-      title={`${pending.toLocaleString()} items pending`}
-    >
-      <CircleDashed className="h-3 w-3 animate-spin" aria-hidden />
-      indexing {pending.toLocaleString()}
-    </Badge>
+    <>
+      <Badge
+        variant="pending"
+        className="fade-in"
+        title={`${pending.toLocaleString()} items pending`}
+      >
+        <CircleDashed className="h-3 w-3 animate-spin" aria-hidden />
+        indexing {pending.toLocaleString()}
+      </Badge>
+      {abandonedChip}
+    </>
   );
 }

@@ -60,10 +60,19 @@ export function Layout() {
   // Vector-store backfill across every vault. Lives here (not on
   // per-vault pages) because /health is global — surfacing it on a
   // vault page made users think it was vault-scoped.
+  //
+  // Backend reports `pending` as "vector_indexed_at IS NULL" — a superset
+  // of `abandoned` (retry-exhausted chunks). The badge should show only
+  // the *active* indexing pressure (= pending − abandoned), otherwise
+  // abandoned rows look like a stuck counter that never decreases.
+  // Abandoned rows are reaped by delete_worker after a grace window;
+  // until then they're surfaced through the separate `abandoned` chip.
   const { data: health } = useHealth(!!getToken());
-  const indexingPending: number | null = health
-    ? (health.vector_store?.backfill?.upsert?.pending || 0)
+  const upsert = health?.vector_store?.backfill?.upsert;
+  const indexingPending: number | null = upsert
+    ? Math.max(0, (upsert.pending || 0) - (upsert.abandoned || 0))
     : null;
+  const indexingAbandoned: number = upsert?.abandoned || 0;
 
   // Vault workspace routes lock to viewport height and supply their own
   // internal scroll regions (tree / content / etc.). Non-vault routes keep
@@ -91,7 +100,7 @@ export function Layout() {
           <div className="mx-auto flex max-w-[1400px] items-center justify-between gap-3 px-6 py-1">
             <div className="coord">§ AKB · Agent Knowledgebase</div>
             <div className="flex items-center gap-3">
-              <IndexingBadge pending={indexingPending} />
+              <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
               <div className="coord hidden md:block">
                 {new Date().toUTCString().slice(0, 22).toUpperCase()}
               </div>
