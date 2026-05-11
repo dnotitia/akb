@@ -34,7 +34,7 @@ logger = logging.getLogger("akb.delete_worker")
 BATCH_SIZE = 16
 
 # Outbox sweep cadence + retention window.
-SWEEP_GRACE_INTERVAL = "1 day"
+SWEEP_GRACE_INTERVAL = timedelta(days=1)
 SWEEP_INTERVAL_SECONDS = 3600.0
 _last_sweep_at: float = 0.0
 
@@ -199,7 +199,7 @@ async def _sweep_outbox_once() -> int:
 # The grace window lets an operator notice + investigate the failure
 # (e.g. an oversize chunk from a bug in the chunker) before the row
 # is reclaimed. 7d is generous; tune via REAP_GRACE_INTERVAL if needed.
-REAP_GRACE_INTERVAL = "7 days"
+REAP_GRACE_INTERVAL = timedelta(days=7)
 REAP_INTERVAL_SECONDS = 3600.0
 _last_reap_at: float = 0.0
 
