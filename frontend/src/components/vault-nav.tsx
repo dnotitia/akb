@@ -3,25 +3,29 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Box,
   Plus,
+  RefreshCw,
   Search as SearchIcon,
   Share2,
 } from "lucide-react";
-import { listVaults } from "@/lib/api";
+import { useVaults } from "@/hooks/use-vaults";
 import { cn } from "@/lib/utils";
-
-interface VaultSummary {
-  id: string;
-  name: string;
-  role?: string;
-  is_pinned?: boolean;
-}
 
 /**
  * Left vault-level navigation column — col 1 of the 3-col workspace.
  * Shows: all-vaults picker (with filter) · this-vault page list · account.
  */
-export function VaultNav({ current }: { current: string }) {
-  const [vaults, setVaults] = useState<VaultSummary[]>([]);
+export interface VaultNavProps {
+  current: string;
+  /**
+   * Called once with the `refetch` from `useVaults` so a parent (e.g.
+   * `VaultShell`) can plumb it into a `VaultRefreshProvider`. The nav
+   * owns the hook so the local manual-refresh button stays simple.
+   */
+  onRefetchReady?: (refetch: () => void) => void;
+}
+
+export function VaultNav({ current, onRefetchReady }: VaultNavProps) {
+  const { vaults, loading, refetch } = useVaults();
   const [filter, setFilter] = useState("");
   const { pathname } = useLocation();
 
@@ -31,10 +35,14 @@ export function VaultNav({ current }: { current: string }) {
   // mutation). The list endpoint is a cheap PG query — refetching on
   // navigation is the simplest way to keep it honest.
   useEffect(() => {
-    listVaults()
-      .then((d) => setVaults((d.vaults as VaultSummary[]) || []))
-      .catch(() => setVaults([]));
-  }, [pathname]);
+    refetch();
+  }, [pathname, refetch]);
+
+  // Publish refetch upward for sibling components that mutate the vault
+  // list (e.g. delete-vault-dialog in vault-settings).
+  useEffect(() => {
+    onRefetchReady?.(refetch);
+  }, [onRefetchReady, refetch]);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -51,13 +59,28 @@ export function VaultNav({ current }: { current: string }) {
       <div className="px-2 pt-3 pb-1 shrink-0">
         <div className="px-2 pb-1.5 flex items-center justify-between">
           <span className="coord">VAULTS</span>
-          <Link
-            to="/vault/new"
-            aria-label="New vault"
-            className="text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-          >
-            <Plus className="h-3 w-3" aria-hidden />
-          </Link>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={refetch}
+              disabled={loading}
+              title="Refresh vaults"
+              aria-label="Refresh vaults"
+              className="text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}
+                aria-hidden
+              />
+            </button>
+            <Link
+              to="/vault/new"
+              aria-label="New vault"
+              className="text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            >
+              <Plus className="h-3 w-3" aria-hidden />
+            </Link>
+          </div>
         </div>
         <div className="relative mb-1">
           <SearchIcon

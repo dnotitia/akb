@@ -36,7 +36,18 @@ interface BrowseItem {
 export function useVaultTree(vault: string | undefined) {
   const [items, setItems] = useState<BrowseItem[] | null>(null);
   const [error, setError] = useState<string>("");
+  // Counter bumped on every refetch invocation so the underlying
+  // effect re-runs even when `vault` is unchanged (manual refresh,
+  // post-mutation invalidate).
+  const [refetchTick, setRefetchTick] = useState(0);
 
+  const refetch = useCallback(() => {
+    setRefetchTick((n) => n + 1);
+  }, []);
+
+  // `alive` guard still matters: if `vault` changes mid-flight (or the
+  // user fires refetch twice before the first resolves), we don't want
+  // a late response to clobber the newer state.
   useEffect(() => {
     if (!vault) return;
     let alive = true;
@@ -46,14 +57,14 @@ export function useVaultTree(vault: string | undefined) {
       .then((d) => { if (alive) setItems(d.items as BrowseItem[]); })
       .catch((e) => { if (alive) setError(e.message || String(e)); });
     return () => { alive = false; };
-  }, [vault]);
+  }, [vault, refetchTick]);
 
   const tree = useMemo<TreeNode[] | null>(() => {
     if (!items) return null;
     return buildTree(items);
   }, [items]);
 
-  return { tree, loading: items === null && !error, error };
+  return { tree, loading: items === null && !error, error, refetch };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

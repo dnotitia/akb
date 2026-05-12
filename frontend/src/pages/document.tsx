@@ -30,6 +30,7 @@ import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 
 const RELATION_COLOR: Record<string, string> = {
   implements: "text-good",
@@ -43,6 +44,7 @@ const RELATION_COLOR: Record<string, string> = {
 export default function DocumentPage() {
   const { name, id } = useParams<{ name: string; id: string }>();
   const navigate = useNavigate();
+  const { refetchTree } = useVaultRefresh();
   const [doc, setDoc] = useState<any>(null);
   const [relations, setRelations] = useState<any[]>([]);
   const [provenance, setProvenance] = useState<any[]>([]);
@@ -394,7 +396,12 @@ export default function DocumentPage() {
         vault={name!}
         docId={docId}
         doc={doc}
-        onSaved={(next) => setDoc({ ...doc, ...next })}
+        onSaved={(next) => {
+          setDoc({ ...doc, ...next });
+          // Title/type/status changes are surfaced in the tree row
+          // labels; refresh so the sidebar matches.
+          refetchTree();
+        }}
       />
 
       <PublishOptionsDialog
@@ -416,6 +423,7 @@ export default function DocumentPage() {
         variant="destructive"
         onConfirm={async () => {
           await deleteDocument(name!, docId);
+          refetchTree();
           navigate(`/vault/${name}`);
         }}
       />

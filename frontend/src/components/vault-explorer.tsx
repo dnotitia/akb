@@ -7,10 +7,12 @@ import {
   FileText,
   FolderPlus,
   Network,
+  RefreshCw,
   Table,
   Trash2,
 } from "lucide-react";
 import { useVaultTree, useExpandedPaths, type TreeNode } from "@/hooks/use-vault-tree";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import {
   activePathFromRoute,
   countDocs,
@@ -52,15 +54,39 @@ export interface VaultExplorerProps {
   vault: string;
   /**
    * Optional callback fired after a successful create/delete-collection
-   * mutation. Task 12 will plug a `refetchTree` here so the tree
-   * auto-invalidates; for now the parent can omit it and the tree will
-   * simply show stale state until reload.
+   * mutation. When omitted, the explorer falls back to
+   * `useVaultRefresh().refetchTree` so any in-tree mutation invalidates
+   * the cached browse response.
    */
   onMutation?: () => void;
+  /**
+   * Called once with the tree's `refetch` function so a parent (e.g.
+   * `VaultShell`) can plumb it into a `VaultRefreshProvider`. The
+   * explorer owns the hook (chicken-and-egg with the tree fetch), but
+   * the parent needs the handle to share it with siblings.
+   */
+  onRefetchReady?: (refetch: () => void) => void;
 }
 
-export function VaultExplorer({ vault, onMutation }: VaultExplorerProps) {
-  const { tree, loading, error } = useVaultTree(vault);
+export function VaultExplorer({
+  vault,
+  onMutation,
+  onRefetchReady,
+}: VaultExplorerProps) {
+  const { tree, loading, error, refetch } = useVaultTree(vault);
+  const refreshCtx = useVaultRefresh();
+  // Prefer the explicit prop; otherwise fall back to context. This lets
+  // tests render the explorer with no provider and still wire mutation
+  // refreshes for production.
+  const handleMutation = onMutation ?? refreshCtx.refetchTree;
+
+  // Publish our refetch upward exactly once per change so the parent can
+  // forward it to a context provider. `onRefetchReady` should itself be
+  // stable; calling it on every render is fine — React deduplicates the
+  // setState inside the parent if the function identity matches.
+  useEffect(() => {
+    onRefetchReady?.(refetch);
+  }, [onRefetchReady, refetch]);
   const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
   const { pathname } = useLocation();
   const [filter, setFilter] = useState("");
@@ -261,6 +287,19 @@ export function VaultExplorer({ vault, onMutation }: VaultExplorerProps) {
               + COLL
             </button>
           )}
+          <button
+            type="button"
+            onClick={refetch}
+            disabled={loading}
+            title="Refresh tree"
+            aria-label="Refresh vault tree"
+            className="inline-flex items-center coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer disabled:cursor-default disabled:opacity-60"
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}
+              aria-hidden
+            />
+          </button>
           <Link
             to={`/vault/${vault}/graph`}
             title="Knowledge graph"
@@ -372,7 +411,7 @@ export function VaultExplorer({ vault, onMutation }: VaultExplorerProps) {
         open={createOpen}
         onOpenChange={setCreateOpen}
         onCreated={() => {
-          onMutation?.();
+          handleMutation();
         }}
       />
       <DeleteCollectionDialog
@@ -385,7 +424,7 @@ export function VaultExplorer({ vault, onMutation }: VaultExplorerProps) {
           if (!o) setDeleteTarget(null);
         }}
         onDeleted={() => {
-          onMutation?.();
+          handleMutation();
         }}
       />
     </aside>

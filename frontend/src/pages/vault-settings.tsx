@@ -15,6 +15,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { DeleteVaultDialog } from "@/components/delete-vault-dialog";
 import { RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 
 interface VaultInfo {
   name: string;
@@ -41,6 +42,7 @@ const PUBLIC_DESCRIPTIONS: Record<PublicAccess, string> = {
 export default function VaultSettingsPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
+  const { refetchVaults } = useVaultRefresh();
   const [info, setInfo] = useState<VaultInfo | null>(null);
   const [description, setDescription] = useState("");
   const [publicAccess, setPublicAccess] = useState<PublicAccess>("none");
@@ -357,7 +359,12 @@ export default function VaultSettingsPage() {
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         vault={name}
-        onDeleted={() => navigate("/vault")}
+        onDeleted={() => {
+          // Invalidate the sidebar list before navigating so the
+          // just-deleted vault doesn't briefly reappear in the picker.
+          refetchVaults();
+          navigate("/vault");
+        }}
       />
     </div>
   );
