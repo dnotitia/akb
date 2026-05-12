@@ -466,6 +466,53 @@ class GitService:
             commit = work_repo.index.commit(message, author=author, committer=author)
             return commit.hexsha
 
+    def delete_paths_bulk(
+        self,
+        *,
+        vault_name: str,
+        file_paths: list[str],
+        message: str,
+        author_name: str = "AKB System",
+        author_email: str = "akb@system",
+    ) -> str | None:
+        """Remove many paths in one commit under a per-vault lock.
+
+        Idempotent on missing paths: any entry in `file_paths` that does
+        not exist in the worktree is skipped silently (no exception). If
+        every requested path is already absent, no commit is made and
+        this returns `None`. Duplicates in `file_paths` are deduplicated
+        (order-preserving) before the presence check so a doubled path
+        doesn't trip `index.remove` on its second occurrence.
+
+        Mirrors `delete_file`'s lock + worktree-prep + commit shape.
+        Returns the new commit's hex SHA, or `None` when no commit was made.
+        """
+        with _vault_lock(vault_name):
+            wt = self._ensure_worktree(vault_name)
+            if wt is None:
+                # Empty bare repo or missing vault — nothing to delete.
+                return None
+
+            work_repo = Repo(str(wt))
+            work_repo.git.reset("--hard", "HEAD")
+
+            # Dedupe while preserving caller order so log output is stable
+            # and so a doubled path doesn't make `index.remove` fail on
+            # the second occurrence.
+            unique_paths = list(dict.fromkeys(file_paths))
+            present = [p for p in unique_paths if (wt / p).exists()]
+            if not present:
+                logger.debug(
+                    "delete_paths_bulk: all paths already absent for vault=%s (%d requested)",
+                    vault_name, len(unique_paths),
+                )
+                return None
+
+            work_repo.index.remove(present, working_tree=True)
+            author = Actor(author_name, author_email)
+            commit = work_repo.index.commit(message, author=author, committer=author)
+            return commit.hexsha
+
     def _commit_via_clone(
         self,
         vault_name: str,
