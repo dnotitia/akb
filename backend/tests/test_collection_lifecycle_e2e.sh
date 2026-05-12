@@ -1,0 +1,303 @@
+#!/bin/bash
+#
+# AKB Collection Lifecycle E2E Tests
+# Covers akb_create_collection / akb_delete_collection MCP tools and the
+# matching REST endpoints. See plan:
+#   docs/superpowers/plans/2026-05-12-collection-lifecycle-viewer-toggle.md
+#
+set -uo pipefail
+
+BASE_URL="${AKB_URL:-http://localhost:8000}"
+VAULT="coll-life-$(date +%s)"
+E2E_USER="coll-life-u1-$(date +%s)"
+READER_USER="coll-life-u2-$(date +%s)"
+PASS=0
+FAIL=0
+ERRORS=()
+
+pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
+fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
+
+echo "╔══════════════════════════════════════════╗"
+echo "║   AKB Collection Lifecycle E2E Tests     ║"
+echo "║   Target: $BASE_URL/mcp/"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+
+# ── 0. Setup: register user + get PAT ───────────────────────
+echo "▸ 0. Setup"
+
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$E2E_USER\",\"email\":\"$E2E_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"coll-life-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+[ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+
+# Register a second user (reader) for the REST ACL test
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$READER_USER\",\"email\":\"$READER_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+JWT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$READER_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $JWT2" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"coll-life-reader"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+[ -n "$PAT2" ] && pass "Reader PAT acquired" || { fail "Reader PAT" "could not get PAT"; exit 1; }
+
+# ── 1. MCP Initialize ───────────────────────────────────────
+echo ""
+echo "▸ 1. MCP Initialize"
+
+INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"coll-life-e2e","version":"1.0"}}}' 2>&1)
+
+SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
+[ -n "$SID" ] && pass "Session ID received ($SID)" || { fail "Session ID" "missing"; exit 1; }
+
+# Send initialized notification
+curl -sk -X POST "$BASE_URL/mcp/" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
+
+# Helper: MCP tool call
+MCP_ID=10
+mcp_call() {
+  local tool=$1 args=$2
+  MCP_ID=$((MCP_ID+1))
+  curl -sk -X POST "$BASE_URL/mcp/" \
+    -H "Authorization: Bearer $PAT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "mcp-session-id: $SID" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
+}
+
+mcp_result() {
+  python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null
+}
+
+# ── 2. Vault Setup ──────────────────────────────────────────
+echo ""
+echo "▸ 2. Vault setup"
+
+R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"collection lifecycle E2E\"}" | mcp_result)
+VAULT_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['vault_id'])" 2>/dev/null)
+[ -n "$VAULT_ID" ] && pass "vault created ($VAULT)" || { fail "create_vault" "no vault_id"; exit 1; }
+
+# ── 3. Create empty collection ──────────────────────────────
+echo ""
+echo "▸ 3. Create empty collection"
+
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
+OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+CREATED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created'))" 2>/dev/null)
+COLL_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['path'])" 2>/dev/null)
+COLL_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['doc_count'])" 2>/dev/null)
+[ "$OK" = "True" ] && [ "$CREATED" = "True" ] && [ "$COLL_PATH" = "specs" ] && [ "$COLL_DC" = "0" ] \
+  && pass "akb_create_collection(specs) → ok, created=true, doc_count=0" \
+  || fail "akb_create_collection specs" "ok=$OK created=$CREATED path=$COLL_PATH doc_count=$COLL_DC; raw=$R"
+
+# Browse verifies the new empty collection appears at top level
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+HAS_SPECS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((i for i in d.get('items',[]) if i.get('name')=='specs' and i.get('type')=='collection'), {}).get('doc_count', -1))" 2>/dev/null)
+[ "$HAS_SPECS" = "0" ] && pass "browse shows 'specs' at top level with doc_count=0" \
+  || fail "browse empty specs" "doc_count=$HAS_SPECS"
+
+# ── 4. Idempotent create ────────────────────────────────────
+echo ""
+echo "▸ 4. Idempotent create"
+
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
+CREATED2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created'))" 2>/dev/null)
+[ "$CREATED2" = "False" ] && pass "second create returns created=false" \
+  || fail "idempotent create" "expected created=false, got created=$CREATED2; raw=$R"
+
+# ── 5. Path normalization ───────────────────────────────────
+echo ""
+echo "▸ 5. Path normalization"
+
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"  /api-specs/  \"}" | mcp_result)
+NORM_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['collection']['path'])" 2>/dev/null)
+[ "$NORM_PATH" = "api-specs" ] && pass "input '  /api-specs/  ' normalized to 'api-specs'" \
+  || fail "normalization (return)" "expected 'api-specs', got '$NORM_PATH'; raw=$R"
+
+# Browse: confirm normalized path is the one stored
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+HAS_NORM=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='api-specs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
+[ "$HAS_NORM" = "True" ] && pass "browse shows normalized 'api-specs'" \
+  || fail "normalization (browse)" "api-specs not found in browse"
+
+# ── 6. Invalid paths rejected ───────────────────────────────
+echo ""
+echo "▸ 6. Invalid paths rejected"
+
+INVALID_PATHS=("" "/" "../etc" "a/../b")
+for p in "${INVALID_PATHS[@]}"; do
+  # JSON-escape the path
+  esc_p=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$p")
+  R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":$esc_p}" | mcp_result)
+  ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+  [ "$ERR" = "invalid_path" ] && pass "rejected invalid path: $(printf %q "$p")" \
+    || fail "invalid path '$p'" "expected error=invalid_path, got error='$ERR'; raw=$R"
+done
+
+# ── 7. Delete empty collection ──────────────────────────────
+echo ""
+echo "▸ 7. Delete empty collection"
+
+R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"specs\"}" | mcp_result)
+DOK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+DDOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_docs'))" 2>/dev/null)
+DFILES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_files'))" 2>/dev/null)
+[ "$DOK" = "True" ] && [ "$DDOCS" = "0" ] && [ "$DFILES" = "0" ] \
+  && pass "delete empty 'specs' → ok, deleted_docs=0, deleted_files=0" \
+  || fail "delete empty specs" "ok=$DOK deleted_docs=$DDOCS deleted_files=$DFILES; raw=$R"
+
+# Browse: specs should be gone
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+GONE_SPECS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='specs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
+[ "$GONE_SPECS" = "False" ] && pass "browse no longer lists 'specs'" \
+  || fail "browse after delete empty" "specs still present"
+
+# ── 8. Delete non-empty without recursive → rejected ────────
+echo ""
+echo "▸ 8. Delete non-empty without recursive → rejected"
+
+# Create 'docs' and put a doc inside
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
+NE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+[ "$NE_OK" = "True" ] && pass "create 'docs' for non-empty test" \
+  || fail "create docs" "ok=$NE_OK; raw=$R"
+
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"DocsDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
+NE_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+[ -n "$NE_DOC_ID" ] && pass "put doc into 'docs' ($NE_DOC_ID)" \
+  || fail "put docs doc" "no doc_id; raw=$R"
+
+# Delete without recursive
+R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
+NE_ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+NE_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_count', -1))" 2>/dev/null)
+[ "$NE_ERR" = "not_empty" ] && [ "$NE_DC" -ge 1 ] 2>/dev/null \
+  && pass "non-empty delete rejected with error=not_empty, doc_count=$NE_DC" \
+  || fail "non-empty no-recursive" "error=$NE_ERR doc_count=$NE_DC; raw=$R"
+
+# Doc must still exist
+R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$NE_DOC_ID\"}" | mcp_result)
+STILL_EXISTS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d and d.get('title','')!='')" 2>/dev/null)
+[ "$STILL_EXISTS" = "True" ] && pass "doc still exists after rejected delete" \
+  || fail "doc after rejected delete" "doc missing or errored; raw=$R"
+
+# ── 9. Delete recursive cascade ─────────────────────────────
+echo ""
+echo "▸ 9. Delete recursive cascade"
+
+R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\",\"recursive\":true}" | mcp_result)
+CASC_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+CASC_DOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted_docs', -1))" 2>/dev/null)
+[ "$CASC_OK" = "True" ] && [ "$CASC_DOCS" -ge 1 ] 2>/dev/null \
+  && pass "recursive delete: ok, deleted_docs=$CASC_DOCS" \
+  || fail "recursive delete" "ok=$CASC_OK deleted_docs=$CASC_DOCS; raw=$R"
+
+# Doc is gone
+R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$NE_DOC_ID\"}" | mcp_result)
+DOC_GONE=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$DOC_GONE" = "True" ] && pass "doc gone after recursive delete" \
+  || fail "doc after recursive" "doc still retrievable; raw=$R"
+
+# Collection is gone
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+COLL_GONE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='docs' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
+[ "$COLL_GONE" = "False" ] && pass "collection 'docs' gone after recursive delete" \
+  || fail "collection after recursive" "'docs' still present in browse"
+
+# ── 10. Empty-is-valid invariant ────────────────────────────
+echo ""
+echo "▸ 10. Empty-is-valid invariant"
+
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" | mcp_result)
+KE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+[ "$KE_OK" = "True" ] && pass "created 'keepempty'" \
+  || fail "create keepempty" "ok=$KE_OK; raw=$R"
+
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"OnlyDoc\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
+KE_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+[ -n "$KE_DOC_ID" ] && pass "put OnlyDoc ($KE_DOC_ID) into 'keepempty'" \
+  || fail "put OnlyDoc" "no doc_id; raw=$R"
+
+R=$(mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$KE_DOC_ID\"}" | mcp_result)
+KE_DEL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
+[ "$KE_DEL" = "True" ] && pass "deleted OnlyDoc" \
+  || fail "delete OnlyDoc" "deleted=$KE_DEL; raw=$R"
+
+# Browse: keepempty should still show, doc_count=0
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+KE_DC=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((i for i in d.get('items',[]) if i.get('name')=='keepempty' and i.get('type')=='collection'), {}).get('doc_count', -1))" 2>/dev/null)
+[ "$KE_DC" = "0" ] && pass "'keepempty' survives last-doc delete with doc_count=0" \
+  || fail "empty-is-valid invariant" "doc_count=$KE_DC (expected 0)"
+
+# ── 11. REST ACL — reader cannot create or delete ───────────
+echo ""
+echo "▸ 11. REST ACL"
+
+# Reader has NO access at all (no grant) — expect 403 on create
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE_URL/api/v1/collections/$VAULT" \
+  -H "Authorization: Bearer $PAT2" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"unauthorized"}' 2>/dev/null)
+[ "$HTTP_CODE" = "403" ] && pass "REST POST /collections without access → 403" \
+  || fail "REST POST 403" "got HTTP $HTTP_CODE (expected 403)"
+
+# Grant reader role to user2 (still insufficient for write — should still 403)
+R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"reader\"}" | mcp_result)
+GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
+[ "$GRANTED" = "True" ] && pass "granted reader role to $READER_USER" \
+  || fail "grant reader" "granted=$GRANTED; raw=$R"
+
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X POST "$BASE_URL/api/v1/collections/$VAULT" \
+  -H "Authorization: Bearer $PAT2" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"reader-tried"}' 2>/dev/null)
+[ "$HTTP_CODE" = "403" ] && pass "reader role REST POST → 403" \
+  || fail "reader POST 403" "got HTTP $HTTP_CODE (expected 403)"
+
+# Also verify DELETE is forbidden for reader
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/keepempty" \
+  -H "Authorization: Bearer $PAT2" 2>/dev/null)
+[ "$HTTP_CODE" = "403" ] && pass "reader role REST DELETE → 403" \
+  || fail "reader DELETE 403" "got HTTP $HTTP_CODE (expected 403)"
+
+# ── Summary ──────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════"
+if [ $FAIL -eq 0 ]; then
+  echo "✓ All $PASS tests passed"
+  exit 0
+else
+  echo "✗ $FAIL failures (of $((PASS+FAIL)) total)"
+  printf '  - %s\n' "${ERRORS[@]}"
+  exit 1
+fi

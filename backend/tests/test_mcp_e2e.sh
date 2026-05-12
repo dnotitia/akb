@@ -244,6 +244,19 @@ R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_resul
 IS_ERROR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
 [ "$IS_ERROR" = "True" ] && pass "Deleted doc returns error" || fail "Delete verify" "doc still exists"
 
+# Empty-is-valid invariant — deleting the last doc in a collection
+# leaves the row in place (Plan: 2026-05-12 collection lifecycle).
+echo ""
+echo "▸ Empty collection survives last-doc delete"
+
+mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" >/dev/null
+PUTR=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"keep-t\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
+KEEP_DOC_ID=$(echo "$PUTR" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$KEEP_DOC_ID\"}" >/dev/null
+BROWSE_KEEP=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+HAS_KEEP=$(echo "$BROWSE_KEEP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for i in d.get('items', []) if i.get('name') == 'keepempty' and i.get('type') == 'collection'))" 2>/dev/null)
+[ "$HAS_KEEP" = "1" ] && pass "empty collection survives last-doc delete" || fail "empty-is-valid" "keepempty not found in browse"
+
 # ── 10. Memory via MCP ───────────────────────────────────────
 echo ""
 echo "▸ 10. Memory via MCP"
