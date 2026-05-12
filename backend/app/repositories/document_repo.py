@@ -330,3 +330,108 @@ class CollectionRepository:
             return
         async with self.pool.acquire() as acq:
             await acq.execute(sql, now, collection_id)
+
+    # ── Lifecycle helpers (used by CollectionService) ────────
+    #
+    # All four take an optional `conn` so the caller can compose them
+    # inside an outer transaction — same pattern as get_or_create /
+    # increment_count above.
+
+    async def create_empty(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        summary: str | None = None,
+        conn=None,
+    ) -> tuple[uuid.UUID, bool]:
+        """Idempotent insert. Returns `(collection_id, created)`. When the
+        row already exists, returns the existing id with `created=False`
+        so callers can distinguish a no-op from a fresh create (matters
+        for git commit + event emission).
+        """
+        async def _do(c):
+            cid = uuid.uuid4()
+            name = path.rstrip("/").split("/")[-1]
+            row = await c.fetchrow(
+                """
+                INSERT INTO collections (id, vault_id, path, name, summary, doc_count)
+                VALUES ($1, $2, $3, $4, $5, 0)
+                ON CONFLICT (vault_id, path) DO NOTHING
+                RETURNING id
+                """,
+                cid, vault_id, path, name, summary,
+            )
+            if row is not None:
+                return row["id"], True
+            existing = await c.fetchrow(
+                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                vault_id, path,
+            )
+            return existing["id"], False
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
+
+    async def delete_by_id(self, collection_id: uuid.UUID, conn=None) -> None:
+        sql = "DELETE FROM collections WHERE id = $1"
+        if conn is not None:
+            await conn.execute(sql, collection_id)
+            return
+        async with self.pool.acquire() as acq:
+            await acq.execute(sql, collection_id)
+
+    @staticmethod
+    def _like_escape(s: str) -> str:
+        """Escape LIKE metacharacters so user-supplied folder names with
+        `%`, `_`, or `\\` don't widen the match. Paired with
+        `ESCAPE '\\'` in the query."""
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    async def list_docs_under(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        conn=None,
+    ) -> list[dict]:
+        """Return documents whose path starts with `{path}/`. Used by
+        cascade delete to find every doc beneath a collection root."""
+        like = self._like_escape(path.rstrip("/")) + "/%"
+        sql = (
+            "SELECT id, path, collection_id, metadata "
+            "FROM documents "
+            "WHERE vault_id = $1 AND path LIKE $2 ESCAPE '\\'"
+        )
+        async def _do(c):
+            rows = await c.fetch(sql, vault_id, like)
+            return [dict(r) for r in rows]
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
+
+    async def list_files_under(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        conn=None,
+    ) -> list[dict]:
+        """Return vault_files whose `collection` equals `path` exactly or
+        starts with `{path}/`. Covers the folder itself plus every
+        descendant — used by cascade delete to enqueue S3 cleanup."""
+        bare = path.rstrip("/")
+        like = self._like_escape(bare) + "/%"
+        sql = (
+            "SELECT id, vault_id, collection, name, s3_key, mime_type, "
+            "       size_bytes, description, created_by, created_at, updated_at "
+            "  FROM vault_files "
+            " WHERE vault_id = $1 "
+            "   AND (collection = $2 OR collection LIKE $3 ESCAPE '\\')"
+        )
+        async def _do(c):
+            rows = await c.fetch(sql, vault_id, bare, like)
+            return [dict(r) for r in rows]
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
