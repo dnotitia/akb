@@ -245,13 +245,36 @@ export default function DocumentPage() {
             which lets long inline tokens push the width past the grid cell
             and introduce a horizontal scrollbar). */}
         <div className="flex items-center justify-end mb-3">
-          <button
-            onClick={() => setView(view === "raw" ? "rendered" : "raw")}
-            aria-pressed={view === "raw"}
-            className="text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          <div
+            role="tablist"
+            aria-label="Document view"
+            className="inline-flex border border-border"
           >
-            {view === "raw" ? "RENDERED" : "RAW"}
-          </button>
+            <button
+              role="tab"
+              aria-selected={view === "rendered"}
+              onClick={() => setView("rendered")}
+              className={`px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                view === "rendered"
+                  ? "bg-foreground text-background"
+                  : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+              }`}
+            >
+              RENDERED
+            </button>
+            <button
+              role="tab"
+              aria-selected={view === "raw"}
+              onClick={() => setView("raw")}
+              className={`px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                view === "raw"
+                  ? "bg-foreground text-background"
+                  : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+              }`}
+            >
+              RAW
+            </button>
+          </div>
         </div>
 
         {view === "rendered" ? (

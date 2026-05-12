@@ -117,17 +117,19 @@ describe("DocumentPage view toggle", () => {
     // Wait for the page to settle in rendered mode.
     await screen.findByRole("heading", { level: 1, name: "BodyHeading" });
 
-    const toggle = screen.getByRole("button", { name: "RAW" });
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-    await user.click(toggle);
+    const rawTab = screen.getByRole("tab", { name: "RAW" });
+    const renderedTab = screen.getByRole("tab", { name: "RENDERED" });
+    expect(rawTab).toHaveAttribute("aria-selected", "false");
+    expect(renderedTab).toHaveAttribute("aria-selected", "true");
+    await user.click(rawTab);
 
     // Pre appears now.
     const pre = await screen.findByTestId("doc-raw");
     expect(pre).toBeInTheDocument();
 
-    // Button label flips.
-    const flipped = screen.getByRole("button", { name: "RENDERED" });
-    expect(flipped).toHaveAttribute("aria-pressed", "true");
+    // Selection flips on the segmented control.
+    expect(screen.getByRole("tab", { name: "RAW" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "RENDERED" })).toHaveAttribute("aria-selected", "false");
 
     // The URL search now contains view=raw.
     expect(screen.getByTestId("location-search")).toHaveTextContent("view=raw");
