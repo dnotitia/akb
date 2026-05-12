@@ -294,6 +294,7 @@ async def test_delete_empty(service_with_fake_git, vault_name, pool, vault_id):
         "collection": "empty",
         "deleted_docs": 0,
         "deleted_files": 0,
+        "deleted_sub_collections": 0,
     }
     # No docs => no git commit attempted.
     assert fake.calls == []
@@ -352,6 +353,7 @@ async def test_delete_non_empty_without_recursive_raises(
         )
     assert ei.value.doc_count >= 1
     assert ei.value.file_count == 0
+    assert ei.value.sub_collection_count == 0
     # No git commit on the abort path.
     assert fake.calls == []
 
@@ -472,6 +474,98 @@ async def test_delete_unknown_collection_raises_not_found(
     with pytest.raises(NotFoundError):
         await service.delete(
             vault=vault_name, path="never-existed", recursive=False, agent_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_nested_parent_without_recursive_raises(
+    service_with_fake_git, vault_name, pool, vault_id
+):
+    """Reproduces the nested-parent bug: only `test/test` exists (no
+    row at `test`), client calls delete on `test` without recursive.
+    The old single-row semantics returned 404; the new prefix semantics
+    must return `CollectionNotEmptyError(0, 0, 1)` because the
+    sub-collection lives under the prefix."""
+    from app.repositories.document_repo import CollectionRepository
+    from app.services.collection_service import CollectionNotEmptyError
+
+    service, fake = service_with_fake_git
+    coll_repo = CollectionRepository(pool)
+    # Create ONLY the nested row.
+    await coll_repo.create_empty(vault_id, "test/test")
+
+    with pytest.raises(CollectionNotEmptyError) as ei:
+        await service.delete(
+            vault=vault_name, path="test", recursive=False, agent_id="alice",
+        )
+    assert ei.value.doc_count == 0
+    assert ei.value.file_count == 0
+    assert ei.value.sub_collection_count == 1
+    # No git commit on the abort path.
+    assert fake.calls == []
+
+    # The nested row must still be there — abort is non-destructive.
+    rows = await coll_repo.list_by_vault(vault_id)
+    paths = {r["path"] for r in rows}
+    assert "test/test" in paths
+    # And `test` itself still has no row.
+    assert "test" not in paths
+
+
+@pytest.mark.asyncio
+async def test_delete_nested_parent_recursive_removes_subrows(
+    service_with_fake_git, vault_name, pool, vault_id
+):
+    """Recursive delete of a nested-parent prefix removes every
+    sub-collection row under it even when no row exists at the
+    prefix itself."""
+    from app.repositories.document_repo import CollectionRepository
+
+    service, _fake = service_with_fake_git
+    coll_repo = CollectionRepository(pool)
+    await coll_repo.create_empty(vault_id, "test/test")
+    await coll_repo.create_empty(vault_id, "test/other")
+
+    out = await service.delete(
+        vault=vault_name, path="test", recursive=True, agent_id="alice",
+    )
+    assert out["ok"] is True
+    assert out["collection"] == "test"
+    assert out["deleted_docs"] == 0
+    assert out["deleted_files"] == 0
+    assert out["deleted_sub_collections"] >= 2
+
+    rows = await coll_repo.list_by_vault(vault_id)
+    paths = {r["path"] for r in rows}
+    assert "test/test" not in paths
+    assert "test/other" not in paths
+    assert "test" not in paths
+
+
+@pytest.mark.asyncio
+async def test_delete_truly_missing_raises_not_found(
+    service_with_fake_git, vault_name
+):
+    """Path with no row at it AND no descendant rows / docs / files
+    must still surface NotFoundError under prefix semantics."""
+    from app.exceptions import NotFoundError
+
+    service, _fake = service_with_fake_git
+    with pytest.raises(NotFoundError):
+        await service.delete(
+            vault=vault_name,
+            path="totally-absent",
+            recursive=False,
+            agent_id=None,
+        )
+    # Even recursive=True on a truly empty prefix should 404 — there's
+    # nothing to delete.
+    with pytest.raises(NotFoundError):
+        await service.delete(
+            vault=vault_name,
+            path="totally-absent",
+            recursive=True,
+            agent_id=None,
         )
 
 

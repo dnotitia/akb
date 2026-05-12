@@ -125,6 +125,7 @@ export function VaultExplorer({
     path: string;
     docCount: number;
     fileCount: number;
+    subCollectionCount: number;
   } | null>(null);
 
   const activeSig = useMemo(() => activePathFromRoute(pathname, tree), [pathname, tree]);
@@ -284,7 +285,6 @@ export function VaultExplorer({
               className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
             >
               <FolderPlus className="h-3 w-3" aria-hidden />
-              + COLL
             </button>
           )}
           <button
@@ -382,6 +382,14 @@ export function VaultExplorer({
                         // files. Revisit when the tree carries
                         // file→collection relationships.
                         fileCount: 0,
+                        // The tree already nests sub-collections under
+                        // their parent, so this is a pure local walk.
+                        // Critical for the nested-parent case: when the
+                        // user clicks trash on a synthesized parent
+                        // (no row but with descendant collection rows),
+                        // this drives the dialog into cascade mode and
+                        // shows the strengthened banner.
+                        subCollectionCount: countSubCollections(node),
                       })
                     }
                   />
@@ -419,6 +427,7 @@ export function VaultExplorer({
         path={deleteTarget?.path ?? ""}
         docCount={deleteTarget?.docCount ?? 0}
         fileCount={deleteTarget?.fileCount ?? 0}
+        subCollectionCount={deleteTarget?.subCollectionCount ?? 0}
         open={deleteTarget !== null}
         onOpenChange={(o) => {
           if (!o) setDeleteTarget(null);
@@ -563,6 +572,22 @@ const TreeRow = memo(function TreeRow({
 });
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
+
+/** Count every descendant collection node under `node` (excluding the
+ *  node itself). Used by the delete dialog's cascade-mode banner so the
+ *  user sees how many sub-collections will be removed. The tree client
+ *  already nests collections under their parent so this is a pure
+ *  local walk — no server round-trip. */
+function countSubCollections(node: TreeNode): number {
+  if (!node.children) return 0;
+  let n = 0;
+  for (const c of node.children) {
+    if (c.kind === "collection") {
+      n += 1 + countSubCollections(c);
+    }
+  }
+  return n;
+}
 
 function findNextByPrefix(rows: FlatRow[], start: number, prefix: string): number {
   const n = rows.length;

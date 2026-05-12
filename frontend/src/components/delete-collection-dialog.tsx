@@ -20,22 +20,32 @@ interface DeleteCollectionDialogProps {
   path: string;
   docCount: number;
   fileCount: number;
+  /**
+   * Number of descendant collection rows under this path. Surfaces the
+   * nested-parent case where the client tree synthesizes a parent that
+   * has no backing collection row but does have children (e.g. only
+   * `test/test` exists, user clicks trash on synthesized `test`).
+   * Without this, the dialog would open in empty-mode and the backend
+   * would 409 with `sub_collection_count >= 1`.
+   */
+  subCollectionCount: number;
   onDeleted: () => void;
 }
 
 /** Two-mode delete dialog for collections.
  *
- *  - Empty mode (`docCount + fileCount === 0`): one-click confirm.
+ *  - Empty mode (`docCount + fileCount + subCollectionCount === 0`):
+ *    one-click confirm.
  *  - Cascade mode (any count > 0): requires the user to type the collection
- *    path exactly before the destructive button enables — mirrors the
- *    type-name-to-confirm pattern used by `DeleteVaultDialog`.
+ *    path exactly before the destructive button enables, and shows a
+ *    prominent destructive alert banner listing the affected categories.
  *
  *  The `recursive` boolean passed to the API reflects which mode submitted:
  *  cascade=true, empty=false. If the server replies 409 (
  *  `collection_not_empty`) for an empty-mode submission, that's the
- *  TOCTOU race where docs landed between the parent's fetch and our
- *  submit — we surface the message and stay open. The parent should
- *  refresh and reopen with updated counts. */
+ *  TOCTOU race where content landed between the parent's snapshot and
+ *  our submit — we surface the message and stay open. The parent
+ *  should refresh and reopen with updated counts. */
 export function DeleteCollectionDialog({
   open,
   onOpenChange,
@@ -43,9 +53,10 @@ export function DeleteCollectionDialog({
   path,
   docCount,
   fileCount,
+  subCollectionCount,
   onDeleted,
 }: DeleteCollectionDialogProps) {
-  const isCascade = docCount > 0 || fileCount > 0;
+  const isCascade = docCount + fileCount + subCollectionCount > 0;
   const [typed, setTyped] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -93,6 +104,21 @@ export function DeleteCollectionDialog({
     }
   }
 
+  // Bulleted item list for the destructive banner. Each line is skipped
+  // when its count is zero so the banner only enumerates real impact.
+  const items: string[] = [];
+  if (docCount > 0) {
+    items.push(`${docCount} document${docCount === 1 ? "" : "s"}`);
+  }
+  if (fileCount > 0) {
+    items.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
+  }
+  if (subCollectionCount > 0) {
+    items.push(
+      `${subCollectionCount} sub-collection${subCollectionCount === 1 ? "" : "s"}`,
+    );
+  }
+
   return (
     <Dialog open={open} onOpenChange={(o) => !working && onOpenChange(o)}>
       <DialogContent className="max-w-xl">
@@ -106,26 +132,18 @@ export function DeleteCollectionDialog({
           <DialogDescription>
             {isCascade ? (
               <>
-                This will permanently delete{" "}
-                <span className="font-semibold text-foreground">
-                  {docCount} document{docCount === 1 ? "" : "s"}
-                </span>{" "}
-                and{" "}
-                <span className="font-semibold text-foreground">
-                  {fileCount} file{fileCount === 1 ? "" : "s"}
-                </span>{" "}
-                in{" "}
-                <span className="font-mono font-semibold text-foreground">
+                Cascade delete of{" "}
+                <code className="font-mono font-semibold text-foreground">
                   {path}
-                </span>
+                </code>
                 .
               </>
             ) : (
               <>
                 Delete empty collection{" "}
-                <span className="font-mono font-semibold text-foreground">
+                <code className="font-mono font-semibold text-foreground">
                   {path}
-                </span>
+                </code>
                 ?
               </>
             )}
@@ -134,12 +152,41 @@ export function DeleteCollectionDialog({
 
         {isCascade && (
           <div className="space-y-4">
+            {/* Destructive alert banner — strongest visual cue. The
+             *  bulleted enumeration replaces the previous inline doc/file
+             *  body sentence so users see counts in a list form that
+             *  scans faster, and the heading is mono uppercase to mirror
+             *  the visual language used elsewhere for warnings. */}
+            <div
+              role="alert"
+              className="border border-destructive/40 bg-destructive/10 p-3 flex items-start gap-3"
+            >
+              <AlertTriangle
+                className="h-5 w-5 shrink-0 text-destructive mt-0.5"
+                aria-hidden
+              />
+              <div className="flex-1 min-w-0 space-y-2">
+                <p className="font-mono text-xs uppercase tracking-wide font-semibold text-destructive">
+                  Permanent deletion · cannot be undone
+                </p>
+                <ul className="list-disc pl-5 text-sm text-foreground space-y-0.5">
+                  {items.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                  <li>
+                    Path{" "}
+                    <code className="font-mono font-semibold">{path}</code>
+                  </li>
+                </ul>
+              </div>
+            </div>
+
             <div>
               <Label
                 htmlFor="confirm-collection-path"
                 className="coord-ink mb-1.5 block"
               >
-                Type the collection path to confirm
+                Type the path to confirm permanent deletion
               </Label>
               <Input
                 id="confirm-collection-path"
@@ -153,7 +200,7 @@ export function DeleteCollectionDialog({
               />
               <p className="text-xs text-foreground-muted mt-1.5">
                 Delete enables once{" "}
-                <span className="font-mono">{path}</span> is typed exactly.
+                <code className="font-mono">{path}</code> is typed exactly.
               </p>
             </div>
           </div>

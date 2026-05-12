@@ -290,6 +290,58 @@ HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
 [ "$HTTP_CODE" = "403" ] && pass "reader role REST DELETE → 403" \
   || fail "reader DELETE 403" "got HTTP $HTTP_CODE (expected 403)"
 
+# ── 12. Nested parent delete (prefix semantics) ─────────────
+echo ""
+echo "▸ 12. Nested parent delete"
+
+# Create only "nested/inner" — no row at "nested" itself. This is the
+# bug reproducer: the client tree synthesizes a parent that has no
+# backing row.
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"nested/inner\"}" | mcp_result)
+NP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
+[ "$NP_OK" = "True" ] && pass "created 'nested/inner' (parent has no row)" \
+  || fail "create nested/inner" "ok=$NP_OK; raw=$R"
+
+# DELETE /collections/<v>/nested (no recursive) → expect 409 with sub_collection_count >= 1
+NP_HTTP=$(curl -sk -o /tmp/np_body.json -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/nested" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+NP_SUB=$(python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("detail",{}).get("sub_collection_count", -1))' </tmp/np_body.json 2>/dev/null)
+[ "$NP_HTTP" = "409" ] && [ "$NP_SUB" -ge 1 ] 2>/dev/null \
+  && pass "REST DELETE 'nested' non-recursive → 409 sub_collection_count=$NP_SUB" \
+  || fail "nested non-recursive 409" "http=$NP_HTTP sub_collection_count=$NP_SUB; body=$(cat /tmp/np_body.json)"
+
+# DELETE /collections/<v>/nested?recursive=true → 200, deleted_sub_collections >= 1
+NP_HTTP=$(curl -sk -o /tmp/np_body.json -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/nested?recursive=true" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+NP_DSUB=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted_sub_collections", -1))' </tmp/np_body.json 2>/dev/null)
+[ "$NP_HTTP" = "200" ] && [ "$NP_DSUB" -ge 1 ] 2>/dev/null \
+  && pass "REST DELETE 'nested' recursive → 200 deleted_sub_collections=$NP_DSUB" \
+  || fail "nested recursive 200" "http=$NP_HTTP deleted_sub_collections=$NP_DSUB; body=$(cat /tmp/np_body.json)"
+
+# Browse: neither 'nested' nor 'nested/inner' should be present
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+HAS_NESTED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('name')=='nested' and i.get('type')=='collection' for i in d.get('items',[])))" 2>/dev/null)
+[ "$HAS_NESTED" = "False" ] && pass "browse no longer shows 'nested'" \
+  || fail "browse after nested recursive delete" "'nested' still present"
+
+# Bonus: truly-missing path still returns 404 (NotFoundError invariant)
+NP_HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/totally-absent" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+[ "$NP_HTTP" = "404" ] && pass "REST DELETE truly-missing path → 404" \
+  || fail "truly-missing 404" "got HTTP $NP_HTTP (expected 404)"
+
+# Bonus: same via MCP — sub_collection_count surfaces on `not_empty`
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2/inner\"}" | mcp_result)
+R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2\"}" | mcp_result)
+NP_MCP_ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+NP_MCP_SUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sub_collection_count', -1))" 2>/dev/null)
+[ "$NP_MCP_ERR" = "not_empty" ] && [ "$NP_MCP_SUB" -ge 1 ] 2>/dev/null \
+  && pass "MCP delete_collection on nested parent → not_empty sub_collection_count=$NP_MCP_SUB" \
+  || fail "MCP nested not_empty" "error=$NP_MCP_ERR sub_collection_count=$NP_MCP_SUB; raw=$R"
+
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════"

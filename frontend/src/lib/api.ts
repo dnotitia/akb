@@ -152,12 +152,14 @@ export interface CollectionDeleteResult {
   collection: string;
   deleted_docs: number;
   deleted_files: number;
+  deleted_sub_collections: number;
 }
 
 export interface CollectionNotEmptyDetail {
   message: string;
   doc_count: number;
   file_count: number;
+  sub_collection_count: number;
 }
 
 export const createCollection = (vault: string, path: string, summary?: string) =>

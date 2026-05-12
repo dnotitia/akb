@@ -36,20 +36,36 @@ class InvalidPathError(ValueError):
 
 
 class CollectionNotEmptyError(Exception):
-    """Raised by `CollectionService.delete` when the target collection
-    still has documents or files and the caller did not pass
-    `recursive=True`.
+    """Raised by `CollectionService.delete` when the target path still
+    has docs, files, or sub-collections under it (prefix semantics) and
+    the caller did not pass `recursive=True`.
 
-    Carries `doc_count` and `file_count` so the HTTP layer can surface
-    them in a structured 409 response (see Task 5).
+    Carries `doc_count`, `file_count`, and `sub_collection_count` so the
+    HTTP layer can surface them in a structured 409 response (see
+    Task 5). `sub_collection_count` covers the nested-parent case: a
+    user with only `test/test` who deletes `test` (no row at `test`)
+    will see this exception with `sub_collection_count=1`.
     """
 
-    def __init__(self, doc_count: int, file_count: int):
+    def __init__(
+        self,
+        doc_count: int,
+        file_count: int,
+        sub_collection_count: int = 0,
+    ):
+        parts: list[str] = []
+        if doc_count:
+            parts.append(f"{doc_count} document(s)")
+        if file_count:
+            parts.append(f"{file_count} file(s)")
+        if sub_collection_count:
+            parts.append(f"{sub_collection_count} sub-collection(s)")
         super().__init__(
-            f"Collection has {doc_count} documents and {file_count} files"
+            f"Collection has {', '.join(parts) or 'content'}"
         )
         self.doc_count = doc_count
         self.file_count = file_count
+        self.sub_collection_count = sub_collection_count
 
 
 _MAX_PATH_BYTES = 1024
@@ -168,39 +184,38 @@ class CollectionService:
         recursive: bool,
         agent_id: str | None,
     ) -> dict:
-        """Delete a collection, optionally cascading over docs + files.
+        """Delete a collection using **prefix semantics** over the path.
 
-        Algorithm (single TX, lock held through git):
+        The supplied path `P` is treated as a prefix: it matches the
+        exact row at `P` (if one exists) plus every collection row,
+        document, and file under `P/`. This fixes the nested-parent
+        delete case where the user has, e.g., only `test/test` but the
+        client tree synthesizes a `test` parent: deleting `test` must
+        find the `test/test` sub-collection (no row at `test`) and
+        cascade properly when `recursive=True`.
 
-        1. Normalize the path; resolve the vault.
-        2. Open ONE transaction. `SELECT … FOR UPDATE` the collection row
-           (raise `NotFoundError` if absent) and read every doc + file
-           under it. If non-empty and `recursive=False`, raise
-           `CollectionNotEmptyError` — the TX rolls back, the row is
-           untouched.
-        3. **While still inside that TX**, run git first (via
-           `asyncio.to_thread`) so the doc files are removed from the
-           working tree before we touch the DB rows. Per-vault thread
-           lock inside `GitService` serializes concurrent git writes;
-           the PG row lock layered on top keeps a concurrent `akb_put`
-           from inserting a new doc under this collection_id between
-           our snapshot and our cleanup.
-        4. Same TX: cascade chunks/edges/rows for each doc + file,
-           DELETE the `collections` row, emit `collection.delete`.
+        Contract:
 
-        Race-safety: holding `FOR UPDATE` on the collection row across
-        git + cleanup means a racing `akb_put` calling
-        `CollectionRepository.get_or_create` blocks until our TX commits
-        or aborts. If we commit, the row is gone and the racer's
-        `get_or_create` re-inserts a fresh row (new id) — its document
-        attaches to *that* row, not the doomed one. No orphan docs can
-        point at a deleted collection_id. If we abort (non-recursive on
-        non-empty), nothing changes and the racer proceeds normally.
+        - Truly empty under `P` (no row at `P`, no sub-collection rows
+          under `P`, no docs, no files) → `NotFoundError`.
+        - Empty mode (`recursive=False`): succeed only if the row at
+          `P` exists AND there are zero sub-collections, docs, or
+          files. Otherwise `CollectionNotEmptyError(doc_count,
+          file_count, sub_collection_count)`.
+        - Cascade mode (`recursive=True`): delete everything at and
+          under `P` — all sub-collection rows + all docs (one git
+          commit) + all files (s3 outbox) + the row at `P` if it
+          exists. Returns `{ok, collection, deleted_docs,
+          deleted_files, deleted_sub_collections}`.
 
-        The cost is that this holds a PG connection for the duration of
-        the git commit. `document_service.delete` makes the same
-        trade-off for the same reason; per-vault git serialization
-        already bounds the practical contention.
+        Race-safety: the target row (if any) and all sub-collection
+        rows are locked `FOR UPDATE` inside the same transaction, so a
+        concurrent `akb_put` that calls
+        `CollectionRepository.get_or_create` against any of those paths
+        blocks until our TX commits. After we commit, the racer sees
+        the rows gone and re-inserts with fresh ids — never reusing a
+        doomed id, never leaving a doc pointing at a deleted
+        collection.
         """
         norm = _normalize_path(path)
         vault_repo, coll_repo = await self._repos()
@@ -211,24 +226,55 @@ class CollectionService:
         pool = await get_pool()
         docs_count = 0
         files_count = 0
+        sub_count = 0
 
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # ── Lock + snapshot ─────────────────────────────
-                row = await conn.fetchrow(
+                # ── Lock + snapshot under prefix ────────────────
+                # Target row may or may not exist (nested-parent
+                # case). FOR UPDATE on a missing row is a no-op; we
+                # only lock if the row is there.
+                target_row = await conn.fetchrow(
                     "SELECT id FROM collections "
                     "WHERE vault_id = $1 AND path = $2 FOR UPDATE",
                     vault_id, norm,
                 )
-                if row is None:
-                    raise NotFoundError("Collection", norm)
-                collection_id = row["id"]
+
+                # Sub-collection rows (strictly under `norm/`). We lock
+                # them with a separate `FOR UPDATE` listing so a racing
+                # `akb_put` can't slip a doc under one of them between
+                # our snapshot and our cleanup.
+                sub_rows_locked = await conn.fetch(
+                    "SELECT id, path FROM collections "
+                    "WHERE vault_id = $1 AND path LIKE $2 ESCAPE '\\' "
+                    "FOR UPDATE",
+                    vault_id,
+                    CollectionRepository._like_escape(norm.rstrip("/")) + "/%",
+                )
+                sub_rows = [dict(r) for r in sub_rows_locked]
+
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
                 files = await coll_repo.list_files_under(vault_id, norm, conn=conn)
-                if (docs or files) and not recursive:
-                    raise CollectionNotEmptyError(len(docs), len(files))
 
-                # ── Git first, still under the row lock ─────────
+                # ── Total-empty check ───────────────────────────
+                # Nothing at or under the prefix → genuine 404.
+                if (
+                    target_row is None
+                    and not sub_rows
+                    and not docs
+                    and not files
+                ):
+                    raise NotFoundError("Collection", norm)
+
+                # ── Empty-mode reject ───────────────────────────
+                # `recursive=False` succeeds ONLY when the target row
+                # exists and nothing else lives under the prefix.
+                if not recursive and (sub_rows or docs or files):
+                    raise CollectionNotEmptyError(
+                        len(docs), len(files), len(sub_rows),
+                    )
+
+                # ── Git first (cascade only; empty-mode has no docs)
                 doc_paths = [d["path"] for d in docs]
                 if doc_paths:
                     commit_msg = (
@@ -255,7 +301,7 @@ class CollectionService:
                             vault,
                         )
 
-                # ── PG cleanup (same TX, lock still held) ───────
+                # ── PG cleanup (same TX, locks still held) ──────
                 for d in docs:
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
@@ -284,9 +330,19 @@ class CollectionService:
                     await _enqueue_s3_delete(conn, f["s3_key"])
                     await vault_files_repo.delete(conn, uuid.UUID(file_id))
 
-                await conn.execute(
-                    "DELETE FROM collections WHERE id = $1", collection_id,
-                )
+                # Delete the union of sub-collection ids and the
+                # target row (if it exists). Empty-mode success has
+                # no sub_rows and reaches here only when target_row
+                # is non-None and nothing else lives under it.
+                ids_to_delete: list[uuid.UUID] = [r["id"] for r in sub_rows]
+                if target_row is not None:
+                    ids_to_delete.append(target_row["id"])
+                if ids_to_delete:
+                    await conn.execute(
+                        "DELETE FROM collections WHERE id = ANY($1::uuid[])",
+                        ids_to_delete,
+                    )
+
                 await emit_event(
                     conn,
                     "collection.delete",
@@ -299,18 +355,21 @@ class CollectionService:
                         "path": norm,
                         "deleted_docs": len(docs),
                         "deleted_files": len(files),
+                        "deleted_sub_collections": len(sub_rows),
                     },
                 )
                 docs_count = len(docs)
                 files_count = len(files)
+                sub_count = len(sub_rows)
 
         logger.info(
-            "Collection delete: vault=%s path=%s docs=%d files=%d",
-            vault, norm, docs_count, files_count,
+            "Collection delete: vault=%s path=%s docs=%d files=%d sub=%d",
+            vault, norm, docs_count, files_count, sub_count,
         )
         return {
             "ok": True,
             "collection": norm,
             "deleted_docs": docs_count,
             "deleted_files": files_count,
+            "deleted_sub_collections": sub_count,
         }

@@ -27,6 +27,7 @@ describe("DeleteCollectionDialog", () => {
       collection: "x",
       deleted_docs: 0,
       deleted_files: 0,
+      deleted_sub_collections: 0,
     });
     const user = userEvent.setup();
     const onOpenChange = vi.fn();
@@ -37,6 +38,7 @@ describe("DeleteCollectionDialog", () => {
         path="x"
         docCount={0}
         fileCount={0}
+        subCollectionCount={0}
         open
         onOpenChange={onOpenChange}
         onDeleted={onDeleted}
@@ -44,7 +46,7 @@ describe("DeleteCollectionDialog", () => {
     );
 
     // No type-to-confirm input shown in empty mode.
-    expect(screen.queryByLabelText(/type the collection path/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/type the path/i)).not.toBeInTheDocument();
 
     const btn = screen.getByRole("button", { name: /^delete$/i });
     expect(btn).not.toBeDisabled();
@@ -63,6 +65,7 @@ describe("DeleteCollectionDialog", () => {
       collection: "x",
       deleted_docs: 3,
       deleted_files: 1,
+      deleted_sub_collections: 0,
     });
     const user = userEvent.setup();
     const onOpenChange = vi.fn();
@@ -73,6 +76,7 @@ describe("DeleteCollectionDialog", () => {
         path="x"
         docCount={3}
         fileCount={1}
+        subCollectionCount={0}
         open
         onOpenChange={onOpenChange}
         onDeleted={onDeleted}
@@ -82,7 +86,7 @@ describe("DeleteCollectionDialog", () => {
     const btn = screen.getByRole("button", { name: /^delete$/i });
     expect(btn).toBeDisabled();
 
-    const input = screen.getByLabelText(/type the collection path/i);
+    const input = screen.getByLabelText(/type the path/i);
     await user.type(input, "wrong");
     expect(btn).toBeDisabled();
 
@@ -105,6 +109,7 @@ describe("DeleteCollectionDialog", () => {
         path="x"
         docCount={3}
         fileCount={1}
+        subCollectionCount={0}
         open
         onOpenChange={() => {}}
         onDeleted={() => {}}
@@ -115,6 +120,57 @@ describe("DeleteCollectionDialog", () => {
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent?.toLowerCase()).toContain("3 document");
     expect(dialog.textContent?.toLowerCase()).toContain("1 file");
+  });
+
+  it("nested-parent: subCollectionCount=1 drives cascade mode and lists 1 sub-collection", async () => {
+    deleteMock.mockResolvedValue({
+      ok: true,
+      collection: "test",
+      deleted_docs: 0,
+      deleted_files: 0,
+      deleted_sub_collections: 1,
+    });
+    const user = userEvent.setup();
+    const onOpenChange = vi.fn();
+    const onDeleted = vi.fn();
+    render(
+      <DeleteCollectionDialog
+        vault="v"
+        path="test"
+        docCount={0}
+        fileCount={0}
+        subCollectionCount={1}
+        open
+        onOpenChange={onOpenChange}
+        onDeleted={onDeleted}
+      />,
+    );
+
+    // Cascade title + destructive banner present.
+    expect(
+      screen.getByText(/delete collection and all contents/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/permanent deletion · cannot be undone/i),
+    ).toBeInTheDocument();
+    // Banner lists "1 sub-collection" exactly (singular).
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toMatch(/1 sub-collection(?!s)/);
+
+    // Type-to-confirm gates the destructive button.
+    const btn = screen.getByRole("button", { name: /^delete$/i });
+    expect(btn).toBeDisabled();
+    const input = screen.getByLabelText(/type the path/i);
+    await user.type(input, "test");
+    expect(btn).not.toBeDisabled();
+    await user.click(btn);
+
+    // Cascade mode → recursive=true.
+    await waitFor(() =>
+      expect(deleteMock).toHaveBeenCalledWith("v", "test", true),
+    );
+    expect(onDeleted).toHaveBeenCalled();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("renders inline error and keeps dialog open when the API rejects", async () => {
@@ -128,6 +184,7 @@ describe("DeleteCollectionDialog", () => {
         path="x"
         docCount={0}
         fileCount={0}
+        subCollectionCount={0}
         open
         onOpenChange={onOpenChange}
         onDeleted={onDeleted}
@@ -155,6 +212,7 @@ describe("DeleteCollectionDialog", () => {
         path="x"
         docCount={0}
         fileCount={0}
+        subCollectionCount={0}
         open
         onOpenChange={() => {}}
         onDeleted={() => {}}
@@ -173,6 +231,7 @@ describe("DeleteCollectionDialog", () => {
       collection: "x",
       deleted_docs: 0,
       deleted_files: 0,
+      deleted_sub_collections: 0,
     });
   });
 });

@@ -1041,16 +1041,24 @@ Requires writer role.""",
 
     "akb_delete_collection": """# akb_delete_collection — Delete a Collection
 
-Empty collection: pass just `vault` + `path`. Non-empty: pass
-`recursive=true` to cascade delete all documents and files under the
-path. Cascade is one git commit for the whole batch.
+The `path` is treated as a **prefix**, not a single row. Deleting `P`
+covers the row at `P` (if any) plus every sub-collection, document,
+and file under `P/`.
+
+- Empty mode (default): succeeds only if the row at `P` exists and
+  nothing else lives under the prefix. Any sub-collection, document,
+  or file rejects with `not_empty` and the counts.
+- `recursive=true`: cascade-delete the row at `P` (if any), every
+  sub-collection row beneath it, all documents (one git commit), and
+  all files (s3 outbox).
+- A path with no row and no descendants returns a NotFound error.
 
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
 | vault | ✓ | Vault name |
-| path | ✓ | Collection path |
-| recursive | | Default `false`. Set `true` for non-empty cascades. |
+| path | ✓ | Collection path (prefix) |
+| recursive | | Default `false`. Set `true` to cascade sub-collections + docs + files. |
 
 ## Examples
 ```

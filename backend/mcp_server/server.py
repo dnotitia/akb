@@ -753,6 +753,7 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
             "message": str(exc),
             "doc_count": exc.doc_count,
             "file_count": exc.file_count,
+            "sub_collection_count": exc.sub_collection_count,
         }
 
 

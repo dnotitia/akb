@@ -448,3 +448,48 @@ class CollectionRepository:
             return await _do(conn)
         async with self.pool.acquire() as acq:
             return await _do(acq)
+
+    async def list_collections_under(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        *,
+        exclude_self: bool = False,
+        conn=None,
+    ) -> list[dict]:
+        """Return collection rows whose `path` equals `P` exactly or
+        starts with `P/`. Used by prefix-delete to discover all sub-
+        collections beneath a target path (including paths where the
+        target itself has no row, but descendants do — the nested-parent
+        delete case).
+
+        When `exclude_self=True`, the exact-match row at `path` is
+        omitted from the result. LIKE metacharacters in the user-
+        supplied path are escaped so a folder literally named `a_b`
+        only matches `a_b` and `a_b/...`, not `aXb`.
+        """
+        bare = path.rstrip("/")
+        like = self._like_escape(bare) + "/%"
+        if exclude_self:
+            sql = (
+                "SELECT id, path, name, summary, doc_count, last_updated "
+                "  FROM collections "
+                " WHERE vault_id = $1 "
+                "   AND path LIKE $2 ESCAPE '\\'"
+            )
+            args = (vault_id, like)
+        else:
+            sql = (
+                "SELECT id, path, name, summary, doc_count, last_updated "
+                "  FROM collections "
+                " WHERE vault_id = $1 "
+                "   AND (path = $2 OR path LIKE $3 ESCAPE '\\')"
+            )
+            args = (vault_id, bare, like)
+        async def _do(c):
+            rows = await c.fetch(sql, *args)
+            return [dict(r) for r in rows]
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
