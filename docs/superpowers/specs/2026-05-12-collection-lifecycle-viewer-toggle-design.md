@@ -105,7 +105,9 @@ class CollectionService:
         # 5. cascade path:
         #    a. git.delete_paths_bulk(paths=[...docs, ...files],
         #                              message="[delete-collection] <path>\n\n<N> docs, <M> files")
-        #    b. PG txn:
+        #       (runs BEFORE the PG transaction opens — git is the slower,
+        #        more crash-prone step; we want it committed before we touch DB)
+        #    b. PG txn (single transaction wraps all rows below):
         #         delete chunks for each doc (writes vector_delete_outbox)
         #         delete relations for each doc
         #         delete documents rows
@@ -162,7 +164,7 @@ Either outcome is internally consistent. The window is narrow (held only during 
 ### Partial failure
 
 - **Git commit fails mid-cascade**: nothing committed (git has not yet seen the staged changes — `git rm` runs sequentially, then one commit). PG transaction is rolled back. No partial state.
-- **PG txn fails after git commit**: caller sees error; vector outbox / s3 outbox writes are rolled back. Git is ahead of PG. Self-heal: existing reaper logic for orphan docs is per-doc; for cascade we accept that on retry the user will see the docs gone (git already removed) and the DB will be cleaned up by an idempotent retry. We document this in the tool docstring; in practice PG commit after a successful git commit is the unlikely failure.
+- **PG txn fails after git commit**: caller sees error; vector outbox / s3 outbox writes are rolled back. Git is ahead of PG. Recovery contract: **the API caller retries**. The cascade is idempotent because (a) `git.delete_paths_bulk` is idempotent on missing files (already required by the persistent-worktree pattern), (b) `list_docs_under` re-runs the snapshot, finds residual rows, and deletes them in a fresh transaction. The orphan-doc reaper is not relied on for this path — it is per-doc and does not know about collection-level intent.
 - **Vector outbox drain fails**: existing behavior — `vector_indexer` retries from the outbox. No change.
 
 ## Backend — MCP tools
@@ -276,10 +278,7 @@ DELETE /api/v1/collections/{vault}/{path:path}?recursive=bool
 
 Mutation call sites (create/delete vault, create/delete collection, create/update/delete document, upload/delete file) call the relevant `refetch()` on success. Plumbing:
 
-- A lightweight `useVaultMutations()` hook that wraps the existing api functions and accepts a `{ onSuccess?: () => void }` per call site. Each caller passes `refetch` from the hook context.
-- Alternatively (preferred for minimum diff): expose `refetch` from `use-vault-tree` and `use-vaults` via a small context (`VaultRefreshContext`) so mutations anywhere in the tree can `useContext(VaultRefreshContext).refetchTree()` without prop drilling.
-
-The context approach is the simpler choice; document the contract that mutation success handlers call the appropriate `refetch`.
+**Chosen approach**: expose `refetch` from `use-vault-tree` and `use-vaults` via a small context (`VaultRefreshContext`) so mutations anywhere in the tree can `useContext(VaultRefreshContext).refetchTree()` without prop drilling. Contract: mutation success handlers call the appropriate `refetch` themselves; the context only plumbs the callback. No wrapper hook around api functions — that would add an indirection layer without clear payoff at the current call-site count.
 
 ## Frontend — Document viewer toggle
 
@@ -321,7 +320,7 @@ The context approach is the simpler choice; document the contract that mutation 
 ### New backend E2E: `backend/tests/test_collection_lifecycle_e2e.sh`
 
 Coverage:
-- Create empty → tree shows it via `akb_browse`.
+- Create empty → tree shows it via `akb_browse`, with `doc_count: 0` reflected at the read API surface (empty-is-valid invariant at the public API, not just internal state).
 - Create same path twice → second call returns `created: false`.
 - Create with invalid path (`""`, `"../x"`, `"/abs"`) → 400.
 - Delete empty → row gone, tree no longer lists.
