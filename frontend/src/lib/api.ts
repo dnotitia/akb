@@ -12,6 +12,23 @@ export function getToken(): string | null {
   return _token;
 }
 
+/**
+ * Error thrown by `api()` when the server returns a structured 4xx/5xx body
+ * (FastAPI `HTTPException(detail=dict)`). Inherits from `Error` so existing
+ * call sites that catch `Error` continue to work; new code can narrow with
+ * `if (e instanceof ApiError) e.detail.foo`.
+ */
+export class ApiError<T = unknown> extends Error {
+  status: number;
+  detail: T;
+  constructor(message: string, status: number, detail: T) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -27,6 +44,16 @@ async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
+    if (body && typeof body.detail === "object" && body.detail !== null) {
+      // FastAPI returns {detail: {...}} for HTTPException(detail=dict).
+      // Preserve the structured payload so callers can render its fields.
+      const detail = body.detail as { message?: string };
+      throw new ApiError(
+        detail.message || `${res.status} ${res.statusText}`,
+        res.status,
+        body.detail,
+      );
+    }
     throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
   }
   return res.json();
@@ -105,6 +132,50 @@ export const updateVault = (
 ) => api<any>(`/vaults/${vault}`, { method: "PATCH", body: JSON.stringify(patch) });
 export const deleteVaultPermanent = (vault: string) =>
   api<any>(`/vaults/${vault}`, { method: "DELETE" });
+
+// ── Collections ──
+export interface CollectionRowSummary {
+  path: string;
+  name: string;
+  summary: string | null;
+  doc_count: number;
+}
+
+export interface CollectionCreateResult {
+  ok: true;
+  created: boolean;
+  collection: CollectionRowSummary;
+}
+
+export interface CollectionDeleteResult {
+  ok: true;
+  collection: string;
+  deleted_docs: number;
+  deleted_files: number;
+}
+
+export interface CollectionNotEmptyDetail {
+  message: string;
+  doc_count: number;
+  file_count: number;
+}
+
+export const createCollection = (vault: string, path: string, summary?: string) =>
+  api<CollectionCreateResult>(`/collections/${encodeURIComponent(vault)}`, {
+    method: "POST",
+    body: JSON.stringify({ path, summary }),
+  });
+
+export const deleteCollection = (vault: string, path: string, recursive: boolean) => {
+  // Path may contain '/' — backend uses {path:path} catch-all. Encode segments
+  // individually so '/' stays as a separator.
+  const segs = path.split("/").map(encodeURIComponent).join("/");
+  const qs = recursive ? "?recursive=true" : "";
+  return api<CollectionDeleteResult>(
+    `/collections/${encodeURIComponent(vault)}/${segs}${qs}`,
+    { method: "DELETE" },
+  );
+};
 
 // ── Documents ──
 export const putDocument = (data: any) =>
