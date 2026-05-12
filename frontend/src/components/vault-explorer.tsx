@@ -121,6 +121,15 @@ export function VaultExplorer({
 
   // Dialog state.
   const [createOpen, setCreateOpen] = useState(false);
+  // When non-null, seeds the create-collection dialog's path with this
+  // parent prefix + a trailing slash. Null means root create.
+  const [createParentPath, setCreateParentPath] = useState<string | null>(null);
+  // Stable opener so we can pass it down through memoized row props
+  // without recreating identities on every render.
+  const openCreate = useCallback((parent: string | null) => {
+    setCreateParentPath(parent);
+    setCreateOpen(true);
+  }, []);
   const [deleteTarget, setDeleteTarget] = useState<{
     path: string;
     docCount: number;
@@ -279,7 +288,7 @@ export function VaultExplorer({
           {canWrite && (
             <button
               type="button"
-              onClick={() => setCreateOpen(true)}
+              onClick={() => openCreate(null)}
               title="New collection"
               aria-label="New collection"
               className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
@@ -369,6 +378,7 @@ export function VaultExplorer({
                     vault={vault}
                     onToggle={toggle}
                     canWrite={canWrite}
+                    onCreateSubCollection={(node) => openCreate(node.path)}
                     onDeleteCollection={(node) =>
                       setDeleteTarget({
                         path: node.path,
@@ -406,6 +416,22 @@ export function VaultExplorer({
                     ↓ SHOW {fullSectionRows[kind].length - rows.length} MORE
                   </button>
                 )}
+              {/* Always-visible "new collection" ghost row at the bottom
+                  of the DOCUMENTS section. Pairs the discoverable bottom-
+                  of-list affordance with the existing header shortcut and
+                  the row-hover sub-collection `+`. Only renders for
+                  writer+ and only in the DOCUMENTS section, since
+                  collections live under documents. */}
+              {open && kind === "documents" && canWrite && (
+                <button
+                  type="button"
+                  onClick={() => openCreate(null)}
+                  className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  <FolderPlus className="h-3 w-3" aria-hidden />
+                  <span className="coord">+ NEW COLLECTION</span>
+                </button>
+              )}
             </div>
           );
         })}
@@ -417,7 +443,14 @@ export function VaultExplorer({
       <CreateCollectionDialog
         vault={vault}
         open={createOpen}
-        onOpenChange={setCreateOpen}
+        onOpenChange={(o) => {
+          setCreateOpen(o);
+          // Clear the cached parent on close so a subsequent root-create
+          // (via the header or bottom-of-section button) doesn't inherit
+          // a stale parent prefix.
+          if (!o) setCreateParentPath(null);
+        }}
+        initialPath={createParentPath ?? undefined}
         onCreated={() => {
           handleMutation();
         }}
@@ -495,10 +528,14 @@ interface RowProps {
   /** Fired when the user clicks the trash icon on a collection row.
    *  Parent decides which dialog to open and seeds it with counts. */
   onDeleteCollection?: (node: TreeNode) => void;
+  /** Fired when the user clicks the `+` (new sub-collection) icon on a
+   *  collection row. Parent opens the create dialog with this node's
+   *  path prefilled as the parent. */
+  onCreateSubCollection?: (node: TreeNode) => void;
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onCreateSubCollection,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -527,6 +564,21 @@ const TreeRow = memo(function TreeRow({
           <span className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
           {count > 0 && <span className="coord ml-auto shrink-0">{count}</span>}
         </button>
+        {canWrite && onCreateSubCollection && (
+          <button
+            type="button"
+            onClick={(e) => {
+              // Stop the row's expand-toggle from also firing.
+              e.stopPropagation();
+              onCreateSubCollection(node);
+            }}
+            title={`New sub-collection in ${node.path}`}
+            aria-label={`Create sub-collection in ${node.path}`}
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-accent transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            <FolderPlus className="h-3 w-3" aria-hidden />
+          </button>
+        )}
         {canWrite && onDeleteCollection && (
           <button
             type="button"

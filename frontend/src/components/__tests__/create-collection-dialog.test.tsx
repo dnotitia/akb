@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
 
@@ -128,6 +128,42 @@ describe("CreateCollectionDialog", () => {
     expect(await screen.findByText(/already exists/i)).toBeInTheDocument();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
     expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("prefills the path input from initialPath with a trailing slash and submits the joined leaf", async () => {
+    createMock.mockResolvedValue({
+      ok: true,
+      created: true,
+      collection: { path: "parent/leaf", name: "leaf", summary: null, doc_count: 0 },
+    });
+    const user = userEvent.setup();
+    const onOpenChange = vi.fn();
+    const onCreated = vi.fn();
+    render(
+      <CreateCollectionDialog
+        vault="v"
+        open
+        initialPath="parent"
+        onOpenChange={onOpenChange}
+        onCreated={onCreated}
+      />,
+    );
+
+    const input = screen.getByLabelText(/path/i) as HTMLInputElement;
+    // Prefilled with parent + trailing slash so the user can type the
+    // leaf name directly.
+    expect(input.value).toBe("parent/");
+
+    // Append the leaf name. fireEvent.change is used instead of
+    // userEvent.type because the input's controlled state means
+    // userEvent.type would interact with the autoFocus selection
+    // behavior in unpredictable ways across jsdom versions.
+    fireEvent.change(input, { target: { value: "parent/leaf" } });
+    await user.click(screen.getByRole("button", { name: /create/i }));
+
+    await waitFor(() => expect(createMock).toHaveBeenCalled());
+    expect(createMock).toHaveBeenCalledWith("v", "parent/leaf", undefined);
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("parent/leaf"));
   });
 
   it("shows inline error when the API rejects", async () => {

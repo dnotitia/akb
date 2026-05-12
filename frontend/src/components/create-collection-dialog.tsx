@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { createCollection } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,19 @@ interface CreateCollectionDialogProps {
   onOpenChange: (open: boolean) => void;
   vault: string;
   onCreated: (path: string) => void;
+  /**
+   * Optional parent collection path. When provided, the path input is
+   * prefilled with `${initialPath}/` (trailing slash) so the user can
+   * type the leaf name directly. The caret is positioned at the end of
+   * the input on open. Resets back to this seed on dialog close.
+   */
+  initialPath?: string;
+}
+
+/** Compute the initial value for the path input given an optional parent.
+ *  Centralized so `open=true` mount and `open=false` reset agree. */
+function seedFor(initialPath: string | undefined): string {
+  return initialPath ? `${initialPath}/` : "";
 }
 
 /** Normalize + validate a collection path client-side so we can short-circuit
@@ -41,21 +54,58 @@ export function CreateCollectionDialog({
   onOpenChange,
   vault,
   onCreated,
+  initialPath,
 }: CreateCollectionDialogProps) {
-  const [path, setPath] = useState("");
+  const [path, setPath] = useState(() => seedFor(initialPath));
   const [summary, setSummary] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
+  const pathInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Reset to the parent-prefilled seed whenever the dialog closes OR the
+  // seed itself changes. The latter covers reopening with a different
+  // `initialPath` (e.g. clicking the row-hover `+` on a different
+  // collection without unmounting the dialog in between).
   useEffect(() => {
     if (!open) {
-      setPath("");
+      setPath(seedFor(initialPath));
       setSummary("");
       setError("");
       setInfo("");
+    } else {
+      // Re-seed on open so a stale value from a previous open doesn't
+      // bleed across opens. The reset-on-close above usually handles
+      // this, but if the parent flips `initialPath` while open the
+      // input should track it.
+      setPath(seedFor(initialPath));
     }
-  }, [open]);
+  }, [open, initialPath]);
+
+  // Place the cursor at the end of the prefilled input so the user can
+  // type the leaf name without first navigating past the prefix.
+  // Radix's Dialog autoFocuses the first focusable element on mount,
+  // but it doesn't position the caret — we have to do that ourselves.
+  useEffect(() => {
+    if (!open) return;
+    // Defer to next tick so Radix's own focus-trap settles first;
+    // otherwise the dialog's auto-focus selects the whole input and
+    // clobbers our caret position.
+    const id = window.setTimeout(() => {
+      const el = pathInputRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      try {
+        el.setSelectionRange(len, len);
+      } catch {
+        // setSelectionRange can throw on input types where it's not
+        // supported. Our input is a plain text input so this is purely
+        // defensive — swallow and move on.
+      }
+    }, 0);
+    return () => window.clearTimeout(id);
+  }, [open, initialPath]);
 
   async function handleSubmit() {
     setError("");
@@ -104,6 +154,7 @@ export function CreateCollectionDialog({
             </Label>
             <Input
               id="collection-path"
+              ref={pathInputRef}
               value={path}
               onChange={(e) => setPath(e.target.value)}
               placeholder="api-specs"
