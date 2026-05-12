@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -45,6 +45,9 @@ export default function DocumentPage() {
   const { name, id } = useParams<{ name: string; id: string }>();
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const view: "rendered" | "raw" =
+    searchParams.get("view") === "raw" ? "raw" : "rendered";
   const [doc, setDoc] = useState<any>(null);
   const [relations, setRelations] = useState<any[]>([]);
   const [provenance, setProvenance] = useState<any[]>([]);
@@ -52,12 +55,30 @@ export default function DocumentPage() {
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [copiedRaw, setCopiedRaw] = useState(false);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [vaultRole, setVaultRole] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const docId = id ? decodeURIComponent(id) : "";
+
+  const setView = (next: "rendered" | "raw") => {
+    const p = new URLSearchParams(searchParams);
+    if (next === "raw") p.set("view", "raw");
+    else p.delete("view");
+    setSearchParams(p, { replace: true });
+  };
+
+  async function copyRaw() {
+    try {
+      await navigator.clipboard.writeText(doc?.content || "");
+      setCopiedRaw(true);
+      setTimeout(() => setCopiedRaw(false), 1500);
+    } catch {
+      // clipboard API may be unavailable; silently no-op
+    }
+  }
 
   useEffect(() => {
     if (!name) return;
@@ -223,14 +244,43 @@ export default function DocumentPage() {
             right edge. 100% keeps prose inside the column (unlike `none`,
             which lets long inline tokens push the width past the grid cell
             and introduce a horizontal scrollbar). */}
-        <div
-          className="prose dark:prose-invert min-w-0"
-          style={{ maxWidth: "100%" }}
-        >
-          <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-            {doc.content || ""}
-          </Markdown>
+        <div className="flex items-center justify-end mb-3">
+          <button
+            onClick={() => setView(view === "raw" ? "rendered" : "raw")}
+            aria-pressed={view === "raw"}
+            className="text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            {view === "raw" ? "RENDERED" : "RAW"}
+          </button>
         </div>
+
+        {view === "rendered" ? (
+          <div
+            className="prose dark:prose-invert min-w-0"
+            style={{ maxWidth: "100%" }}
+          >
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {doc.content || ""}
+            </Markdown>
+          </div>
+        ) : (
+          <div className="relative">
+            <button
+              type="button"
+              onClick={copyRaw}
+              aria-label="Copy markdown"
+              className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-accent border border-border bg-surface transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              {copiedRaw ? "COPIED" : "COPY"}
+            </button>
+            <pre
+              data-testid="doc-raw"
+              className="font-mono text-[13px] leading-[1.55] whitespace-pre-wrap overflow-x-auto bg-surface-muted p-4 border border-border"
+            >
+              {doc.content || ""}
+            </pre>
+          </div>
+        )}
       </article>
 
       {/* ── Right rail ──────────────────────────────────────────
