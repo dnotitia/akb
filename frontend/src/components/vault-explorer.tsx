@@ -285,17 +285,6 @@ export function VaultExplorer({
           {vault}
         </Link>
         <div className="flex items-center gap-2 shrink-0">
-          {canWrite && (
-            <button
-              type="button"
-              onClick={() => openCreate(null)}
-              title="New collection"
-              aria-label="New collection"
-              className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
-            >
-              <FolderPlus className="h-3 w-3" aria-hidden />
-            </button>
-          )}
           <button
             type="button"
             onClick={refetch}

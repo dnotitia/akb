@@ -140,34 +140,9 @@ describe("VaultExplorer — interaction", () => {
 });
 
 describe("VaultExplorer — role gating", () => {
-  it("renders the '+ COLL' button for writer+ roles", async () => {
-    vaultInfoMock.mockResolvedValue({ role: "writer" });
-    renderAt("/vault/v");
-    // The header-affordance button has the exact aria-label "New collection".
-    // Other affordances (bottom-of-section, sub-collection) have distinct
-    // accessible names so this match remains unambiguous after the
-    // 3-tier rollout.
-    expect(
-      await screen.findByRole("button", { name: /^new collection$/i }),
-    ).toBeInTheDocument();
-  });
-
-  it("hides the '+ COLL' button for reader role", async () => {
-    vaultInfoMock.mockResolvedValue({ role: "reader" });
-    renderAt("/vault/v");
-    // Wait for the tree to render before asserting absence.
-    await screen.findByRole("button", { name: /architecture/ });
-    expect(
-      screen.queryByRole("button", { name: /^new collection$/i }),
-    ).not.toBeInTheDocument();
-  });
-
   it("renders the bottom-of-section '+ NEW COLLECTION' for writer role", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer" });
     renderAt("/vault/v");
-    // The header button uses aria-label="New collection", the bottom-of-
-    // section button has visible text "+ NEW COLLECTION". Look for the
-    // text variant explicitly.
     expect(await screen.findByText(/\+ NEW COLLECTION/)).toBeInTheDocument();
   });
 
