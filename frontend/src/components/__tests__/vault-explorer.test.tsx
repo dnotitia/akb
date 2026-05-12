@@ -6,11 +6,20 @@ import { VaultExplorer } from "@/components/vault-explorer";
 
 vi.mock("@/lib/api", () => ({
   browseVault: vi.fn(),
+  getVaultInfo: vi.fn(),
+  // Mutations are not exercised by these tests but the explorer imports
+  // them transitively via the dialog components.
+  createCollection: vi.fn(),
+  deleteCollection: vi.fn(),
+  ApiError: class ApiError extends Error {
+    status?: number;
+  },
 }));
 
-// Pull the mock reference after declaration so we can set per-test responses.
-import { browseVault } from "@/lib/api";
+// Pull the mock references after declaration so we can set per-test responses.
+import { browseVault, getVaultInfo } from "@/lib/api";
 const browseMock = browseVault as unknown as ReturnType<typeof vi.fn>;
+const vaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
 
 const sample = {
   vault: "v",
@@ -36,6 +45,10 @@ function renderAt(pathname: string) {
 beforeEach(() => {
   browseMock.mockReset();
   browseMock.mockResolvedValue(sample);
+  vaultInfoMock.mockReset();
+  // Default to reader so the existing tests don't accidentally render
+  // the mutation affordances. Tests that need writer+ override this.
+  vaultInfoMock.mockResolvedValue({ role: "reader" });
   localStorage.clear();
 });
 
@@ -123,6 +136,26 @@ describe("VaultExplorer — interaction", () => {
     expect(btn.parentElement).toHaveAttribute("aria-expanded", "true");
     await user.keyboard("{ArrowLeft}");
     expect(btn.parentElement).toHaveAttribute("aria-expanded", "false");
+  });
+});
+
+describe("VaultExplorer — role gating", () => {
+  it("renders the '+ COLL' button for writer+ roles", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v");
+    expect(
+      await screen.findByRole("button", { name: /new collection/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the '+ COLL' button for reader role", async () => {
+    vaultInfoMock.mockResolvedValue({ role: "reader" });
+    renderAt("/vault/v");
+    // Wait for the tree to render before asserting absence.
+    await screen.findByRole("button", { name: /architecture/ });
+    expect(
+      screen.queryByRole("button", { name: /new collection/i }),
+    ).not.toBeInTheDocument();
   });
 });
 

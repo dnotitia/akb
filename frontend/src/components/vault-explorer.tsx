@@ -5,8 +5,10 @@ import {
   ChevronRight,
   File,
   FileText,
+  FolderPlus,
   Network,
   Table,
+  Trash2,
 } from "lucide-react";
 import { useVaultTree, useExpandedPaths, type TreeNode } from "@/hooks/use-vault-tree";
 import {
@@ -17,6 +19,9 @@ import {
   leafHref,
   type FlatRow,
 } from "@/lib/tree-route";
+import { getVaultInfo } from "@/lib/api";
+import { CreateCollectionDialog } from "@/components/create-collection-dialog";
+import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
@@ -43,7 +48,18 @@ const SECTION_LABEL: Record<SectionKind, string> = {
  * all visible rows are concatenated in section order (documents → tables →
  * files) for arrow/home/end/typeahead purposes.
  */
-export function VaultExplorer({ vault }: { vault: string }) {
+export interface VaultExplorerProps {
+  vault: string;
+  /**
+   * Optional callback fired after a successful create/delete-collection
+   * mutation. Task 12 will plug a `refetchTree` here so the tree
+   * auto-invalidates; for now the parent can omit it and the tree will
+   * simply show stale state until reload.
+   */
+  onMutation?: () => void;
+}
+
+export function VaultExplorer({ vault, onMutation }: VaultExplorerProps) {
   const { tree, loading, error } = useVaultTree(vault);
   const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
   const { pathname } = useLocation();
@@ -55,6 +71,35 @@ export function VaultExplorer({ vault }: { vault: string }) {
     files: false,
   });
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Role-gated affordances. We fetch the role on mount/vault-change rather
+  // than threading it through props because the existing parent
+  // (`VaultShell`) doesn't have it cached and adding a redundant fetch in
+  // the shell would slow first paint. document.tsx uses the same pattern.
+  const [vaultRole, setVaultRole] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    getVaultInfo(vault)
+      .then((d) => {
+        if (alive) setVaultRole(d?.role || null);
+      })
+      .catch(() => {
+        if (alive) setVaultRole(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [vault]);
+  const canWrite =
+    vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+
+  // Dialog state.
+  const [createOpen, setCreateOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    path: string;
+    docCount: number;
+    fileCount: number;
+  } | null>(null);
 
   const activeSig = useMemo(() => activePathFromRoute(pathname, tree), [pathname, tree]);
 
@@ -203,15 +248,29 @@ export function VaultExplorer({ vault }: { vault: string }) {
         >
           {vault}
         </Link>
-        <Link
-          to={`/vault/${vault}/graph`}
-          title="Knowledge graph"
-          aria-label="Knowledge graph"
-          className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
-          <Network className="h-3 w-3" aria-hidden />
-          GRAPH
-        </Link>
+        <div className="flex items-center gap-2 shrink-0">
+          {canWrite && (
+            <button
+              type="button"
+              onClick={() => setCreateOpen(true)}
+              title="New collection"
+              aria-label="New collection"
+              className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+            >
+              <FolderPlus className="h-3 w-3" aria-hidden />
+              + COLL
+            </button>
+          )}
+          <Link
+            to={`/vault/${vault}/graph`}
+            title="Knowledge graph"
+            aria-label="Knowledge graph"
+            className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            <Network className="h-3 w-3" aria-hidden />
+            GRAPH
+          </Link>
+        </div>
       </header>
 
       <div className="border-b border-border px-2 py-1.5 shrink-0">
@@ -270,6 +329,22 @@ export function VaultExplorer({ vault }: { vault: string }) {
                     isActive={r.sig === activeSig}
                     vault={vault}
                     onToggle={toggle}
+                    canWrite={canWrite}
+                    onDeleteCollection={(node) =>
+                      setDeleteTarget({
+                        path: node.path,
+                        docCount: countDocs(node),
+                        // TODO: the in-memory tree currently flattens files
+                        // to vault root (see use-vault-tree.ts buildTree),
+                        // so a collection's true file count isn't available
+                        // client-side. The server's 409 response will
+                        // surface the real count if the user picks
+                        // empty-mode on a collection that secretly has
+                        // files. Revisit when the tree carries
+                        // file→collection relationships.
+                        fileCount: 0,
+                      })
+                    }
                   />
                 ))}
               {open &&
@@ -288,6 +363,31 @@ export function VaultExplorer({ vault }: { vault: string }) {
           );
         })}
       </div>
+
+      {/* Mutation dialogs. Mounted unconditionally so portals stay
+          stable across renders; visibility is fully driven by the
+          `open` prop and the optional `deleteTarget` payload. */}
+      <CreateCollectionDialog
+        vault={vault}
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={() => {
+          onMutation?.();
+        }}
+      />
+      <DeleteCollectionDialog
+        vault={vault}
+        path={deleteTarget?.path ?? ""}
+        docCount={deleteTarget?.docCount ?? 0}
+        fileCount={deleteTarget?.fileCount ?? 0}
+        open={deleteTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setDeleteTarget(null);
+        }}
+        onDeleted={() => {
+          onMutation?.();
+        }}
+      />
     </aside>
   );
 }
@@ -341,10 +441,16 @@ interface RowProps {
   isActive: boolean;
   vault: string;
   onToggle: (path: string) => void;
+  /** Writer+ unlocks per-row destructive affordances (collection rows
+   *  only for now). Readers see the row unchanged. */
+  canWrite?: boolean;
+  /** Fired when the user clicks the trash icon on a collection row.
+   *  Parent decides which dialog to open and seeds it with counts. */
+  onDeleteCollection?: (node: TreeNode) => void;
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -352,12 +458,17 @@ const TreeRow = memo(function TreeRow({
     const count = countDocs(node);
     const ChevronIcon = isOpen ? ChevronDown : ChevronRight;
     return (
-      <div role="treeitem" aria-expanded={isOpen} aria-level={depth + 1}>
+      <div
+        role="treeitem"
+        aria-expanded={isOpen}
+        aria-level={depth + 1}
+        className="group relative flex items-stretch focus-within:bg-surface-muted/40"
+      >
         <button
           data-sig={sig}
           onClick={() => onToggle(node.path)}
           style={indent}
-          className={`w-full flex items-center gap-1.5 pr-2 py-1 text-left group transition-colors hover:bg-surface-muted focus:bg-surface-muted focus:outline-none cursor-pointer ${
+          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1 text-left transition-colors hover:bg-surface-muted focus:bg-surface-muted focus:outline-none cursor-pointer ${
             isActive ? "bg-accent/10" : ""
           }`}
         >
@@ -368,6 +479,21 @@ const TreeRow = memo(function TreeRow({
           <span className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
           {count > 0 && <span className="coord ml-auto shrink-0">{count}</span>}
         </button>
+        {canWrite && onDeleteCollection && (
+          <button
+            type="button"
+            onClick={(e) => {
+              // Stop the row's expand-toggle from also firing.
+              e.stopPropagation();
+              onDeleteCollection(node);
+            }}
+            title={`Delete ${node.path}`}
+            aria-label={`Delete collection ${node.path}`}
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-destructive transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            <Trash2 className="h-3 w-3" aria-hidden />
+          </button>
+        )}
       </div>
     );
   }
