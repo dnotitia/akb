@@ -828,6 +828,43 @@ TOOLS = [
         },
     ),
     Tool(
+        name="akb_create_collection",
+        description=(
+            "Create an empty collection (folder) inside a vault. Idempotent — "
+            "returns {created: false} if the collection already exists. Writer or higher role."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Vault name"},
+                "path":  {"type": "string", "description": "Collection path, e.g. 'api-specs' or 'docs/guides'"},
+                "summary": {"type": "string", "description": "Optional one-line description"},
+            },
+            "required": ["vault", "path"],
+        },
+    ),
+    Tool(
+        name="akb_delete_collection",
+        description=(
+            "Delete a collection. If empty, removes the metadata row. If non-empty, requires "
+            "recursive=true to cascade delete every document and file under the path. "
+            "Cascade emits one git commit for the entire batch. Writer or higher role."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Vault name"},
+                "path":  {"type": "string", "description": "Collection path to delete"},
+                "recursive": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when the collection is non-empty.",
+                },
+            },
+            "required": ["vault", "path"],
+        },
+    ),
+    Tool(
         name="akb_set_public",
         description="Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
         inputSchema={

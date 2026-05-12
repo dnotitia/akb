@@ -715,6 +715,47 @@ async def _handle_delete_vault(args: dict, uid: str, user: _MCPUser) -> dict:
     return await delete_vault(uid, args["vault"])
 
 
+@_h("akb_create_collection")
+async def _handle_create_collection(args: dict, uid: str, user: _MCPUser) -> dict:
+    from app.services.collection_service import (
+        CollectionService, InvalidPathError,
+    )
+    await check_vault_access(uid, args["vault"], required_role="writer")
+    svc = CollectionService()
+    try:
+        return await svc.create(
+            vault=args["vault"], path=args["path"],
+            summary=args.get("summary"),
+            agent_id=uid,
+        )
+    except InvalidPathError as exc:
+        return {"error": "invalid_path", "message": str(exc)}
+
+
+@_h("akb_delete_collection")
+async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dict:
+    from app.services.collection_service import (
+        CollectionService, CollectionNotEmptyError, InvalidPathError,
+    )
+    await check_vault_access(uid, args["vault"], required_role="writer")
+    svc = CollectionService()
+    try:
+        return await svc.delete(
+            vault=args["vault"], path=args["path"],
+            recursive=bool(args.get("recursive", False)),
+            agent_id=uid,
+        )
+    except InvalidPathError as exc:
+        return {"error": "invalid_path", "message": str(exc)}
+    except CollectionNotEmptyError as exc:
+        return {
+            "error": "not_empty",
+            "message": str(exc),
+            "doc_count": exc.doc_count,
+            "file_count": exc.file_count,
+        }
+
+
 @_h("akb_history")
 async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, args["vault"], required_role="reader")

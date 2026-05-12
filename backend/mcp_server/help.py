@@ -124,6 +124,8 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_delete` | Removing a document |
 | `akb_browse` | Exploring what exists (tree view) |
 | `akb_drill_down` | Reading specific sections of a long document |
+| `akb_create_collection` | Creating an empty collection (folder) in a vault |
+| `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
 
 ## Document Types
 `note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`
@@ -1016,6 +1018,47 @@ akb_list_vaults()
 ```
 akb_create_vault(name="project-x", description="Project X docs", template="engineering")
 ```""",
+
+    "akb_create_collection": """# akb_create_collection — Create an Empty Collection
+
+Creates a collection (folder) in a vault. Idempotent — returns
+`{created: false}` if it already exists. No git side effect (empty
+collections don't materialize as directories).
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| vault | ✓ | Vault name |
+| path | ✓ | Collection path, e.g. 'api-specs', 'docs/guides' |
+| summary | | Optional one-line description |
+
+## Example
+```
+akb_create_collection(vault="eng", path="api-specs", summary="Public API contracts")
+```
+
+Requires writer role.""",
+
+    "akb_delete_collection": """# akb_delete_collection — Delete a Collection
+
+Empty collection: pass just `vault` + `path`. Non-empty: pass
+`recursive=true` to cascade delete all documents and files under the
+path. Cascade is one git commit for the whole batch.
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| vault | ✓ | Vault name |
+| path | ✓ | Collection path |
+| recursive | | Default `false`. Set `true` for non-empty cascades. |
+
+## Examples
+```
+akb_delete_collection(vault="eng", path="old-specs")
+akb_delete_collection(vault="eng", path="legacy", recursive=True)
+```
+
+Requires writer role.""",
 
     "akb_delete": """# akb_delete — Delete a Document
 
