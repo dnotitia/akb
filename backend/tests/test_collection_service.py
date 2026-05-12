@@ -261,12 +261,22 @@ class _FakeGit:
 
 
 @pytest_asyncio.fixture
-async def service_with_fake_git(service):
+async def service_with_fake_git(pool, monkeypatch):
+    """A fresh service constructed via `CollectionService(git=<fake>)`.
+
+    Mirrors the `service` fixture's `get_pool` monkeypatch (so the new
+    instance hits the test pool) but goes through constructor injection
+    for `git` — matches the idiom used by `DocumentService` and avoids
+    the real `GitService`'s `/data/vaults` mkdir.
+    """
+    from app.services import collection_service as cs
+
+    async def _fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(cs, "get_pool", _fake_get_pool)
     fake = _FakeGit()
-    # Assign via the property setter so we never construct a real
-    # `GitService` (whose ctor would `mkdir` /data/vaults on prod paths).
-    service.git = fake
-    return service, fake
+    return cs.CollectionService(git=fake), fake
 
 
 @pytest.mark.asyncio
@@ -463,3 +473,83 @@ async def test_delete_unknown_collection_raises_not_found(
         await service.delete(
             vault=vault_name, path="never-existed", recursive=False, agent_id=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_delete_recursive_blocks_concurrent_put(
+    service_with_fake_git, vault_name, pool, vault_id
+):
+    """A concurrent `akb_put` racing with a recursive cascade must NOT
+    leave orphan documents pointing at a deleted collection_id.
+
+    The simulation drives both sides explicitly: a background task
+    starts the cascade; once it has acquired the `FOR UPDATE` lock and
+    is in the middle of its commit (we don't have a deterministic
+    pause point, so we approximate by giving the cascade head-start +
+    using a separate connection to call `get_or_create`), the racer
+    attempts the same path. Because we hold the row lock for the
+    entire TX, `get_or_create` must block; after the cascade commits,
+    the racer sees the row gone and re-inserts with a fresh id —
+    never reusing the doomed id.
+
+    The crucial post-condition: no document has `collection_id`
+    referencing a now-absent collections row.
+    """
+    import asyncio as _aio
+
+    from app.repositories.document_repo import CollectionRepository
+
+    service, _fake = service_with_fake_git
+    coll_repo = CollectionRepository(pool)
+
+    # Seed: one pre-existing doc under "race-me" so cascade has work.
+    _cid_before, _doc_id = await _seed_doc_under(
+        pool, vault_id, vault_name, "race-me", "race-me/old.md",
+    )
+
+    # Capture the pre-cascade collection id; the racer must NOT end up
+    # with the same id (it should observe the row gone and re-insert).
+    async with pool.acquire() as conn:
+        pre_cid = await conn.fetchval(
+            "SELECT id FROM collections WHERE vault_id=$1 AND path=$2",
+            vault_id, "race-me",
+        )
+
+    cascade_task = _aio.create_task(
+        service.delete(
+            vault=vault_name, path="race-me", recursive=True, agent_id="alice",
+        )
+    )
+    # Yield so the cascade can open its TX + acquire FOR UPDATE.
+    await _aio.sleep(0.05)
+
+    # Racer: try to grab/insert the same path. Should block until
+    # cascade commits, then re-insert with a fresh id.
+    racer_cid = await coll_repo.get_or_create(vault_id, "race-me")
+
+    out = await cascade_task
+    assert out["deleted_docs"] >= 1
+
+    # Critical invariant: no document points at a deleted collection_id.
+    async with pool.acquire() as conn:
+        orphans = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM documents d
+             WHERE d.vault_id = $1
+               AND d.collection_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM collections c WHERE c.id = d.collection_id
+               )
+            """,
+            vault_id,
+        )
+    assert orphans == 0, "cascade left orphan documents pointing at a deleted collection"
+
+    # If the racer ran after cascade committed, it should have a NEW id;
+    # the doomed id must be gone from collections.
+    async with pool.acquire() as conn:
+        pre_still_present = await conn.fetchval(
+            "SELECT 1 FROM collections WHERE id = $1", pre_cid,
+        )
+    assert pre_still_present is None
+    assert racer_cid != pre_cid
