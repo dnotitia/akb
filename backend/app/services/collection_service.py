@@ -83,7 +83,14 @@ class CollectionService:
         if not vault_id:
             raise NotFoundError("Vault", vault)
 
-        _cid, created = await coll_repo.create_empty(vault_id, norm, summary=summary)
+        # `create_empty` returns the *current* row state, not the
+        # caller's inputs. On a no-op (created=False) the stored
+        # summary / doc_count win — the contract is "report what's in
+        # the DB," so an idempotent re-create against an existing
+        # collection with 5 docs surfaces doc_count=5, not 0.
+        _cid, created, name, cur_summary, cur_doc_count = await coll_repo.create_empty(
+            vault_id, norm, summary=summary,
+        )
 
         # emit_event MUST run inside the same transaction as its
         # domain row so the event is dropped on rollback. The repo
@@ -113,8 +120,8 @@ class CollectionService:
             "created": created,
             "collection": {
                 "path": norm,
-                "name": norm.split("/")[-1],
-                "summary": summary,
-                "doc_count": 0,
+                "name": name,
+                "summary": cur_summary,
+                "doc_count": cur_doc_count,
             },
         }

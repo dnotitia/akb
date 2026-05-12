@@ -145,6 +145,48 @@ async def test_create_idempotent(service, vault_name):
     # Path should round-trip identically on the no-op call too.
     assert second["collection"]["path"] == "docs/api"
     assert second["collection"]["name"] == "api"
+    # Contract: an idempotent re-create reports stored state, not the
+    # caller's args. The DB still has summary='v1' from the first call,
+    # so the response must surface that — not "ignored".
+    assert second["collection"]["summary"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_create_idempotent_reflects_real_doc_count(
+    service, vault_name, pool, vault_id
+):
+    """A no-op re-create against a collection with N docs must report
+    `doc_count == N`, not the hardcoded 0 the in-memory envelope used to
+    show. Bumps the counter directly via the repository (no full
+    document put pathway needed) so the test stays focused on the
+    response-shape contract.
+    """
+    from datetime import datetime, timezone
+
+    from app.repositories.document_repo import CollectionRepository
+
+    first = await service.create(
+        vault=vault_name, path="loaded", summary="seed", agent_id=None,
+    )
+    assert first["collection"]["doc_count"] == 0
+
+    coll_repo = CollectionRepository(pool)
+    # Look up the collection id, bump it twice to simulate two docs.
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM collections WHERE vault_id=$1 AND path=$2",
+            vault_id, "loaded",
+        )
+    now = datetime.now(timezone.utc)
+    await coll_repo.increment_count(row["id"], now)
+    await coll_repo.increment_count(row["id"], now)
+
+    second = await service.create(
+        vault=vault_name, path="loaded", summary=None, agent_id=None,
+    )
+    assert second["created"] is False
+    assert second["collection"]["doc_count"] == 2
+    assert second["collection"]["summary"] == "seed"
 
 
 @pytest.mark.asyncio

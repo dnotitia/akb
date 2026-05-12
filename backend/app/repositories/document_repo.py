@@ -343,11 +343,17 @@ class CollectionRepository:
         path: str,
         summary: str | None = None,
         conn=None,
-    ) -> tuple[uuid.UUID, bool]:
-        """Idempotent insert. Returns `(collection_id, created)`. When the
-        row already exists, returns the existing id with `created=False`
-        so callers can distinguish a no-op from a fresh create (matters
-        for git commit + event emission).
+    ) -> tuple[uuid.UUID, bool, str, str | None, int]:
+        """Idempotent insert. Returns
+        `(collection_id, created, name, summary, doc_count)`.
+
+        Both branches return the *current row state* — when the row
+        already exists, `summary` and `doc_count` reflect what's in the
+        DB, not what the caller passed (idempotent calls must not
+        clobber stored state, and callers building a response envelope
+        need the truth to surface). `created=False` lets callers
+        distinguish a no-op from a fresh create (matters for git commit
+        + event emission).
         """
         async def _do(c):
             cid = uuid.uuid4()
@@ -357,17 +363,24 @@ class CollectionRepository:
                 INSERT INTO collections (id, vault_id, path, name, summary, doc_count)
                 VALUES ($1, $2, $3, $4, $5, 0)
                 ON CONFLICT (vault_id, path) DO NOTHING
-                RETURNING id
+                RETURNING id, name, summary, doc_count
                 """,
                 cid, vault_id, path, name, summary,
             )
             if row is not None:
-                return row["id"], True
+                return row["id"], True, row["name"], row["summary"], row["doc_count"]
             existing = await c.fetchrow(
-                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                """
+                SELECT id, name, summary, doc_count
+                  FROM collections
+                 WHERE vault_id = $1 AND path = $2
+                """,
                 vault_id, path,
             )
-            return existing["id"], False
+            return (
+                existing["id"], False,
+                existing["name"], existing["summary"], existing["doc_count"],
+            )
         if conn is not None:
             return await _do(conn)
         async with self.pool.acquire() as acq:

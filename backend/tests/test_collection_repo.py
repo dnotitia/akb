@@ -81,9 +81,14 @@ async def vault_id(pool):
 @pytest.mark.asyncio
 async def test_create_empty_inserts_new_row(pool, vault_id):
     repo = CollectionRepository(pool)
-    cid, created = await repo.create_empty(vault_id, "alpha")
+    cid, created, name, summary, doc_count = await repo.create_empty(
+        vault_id, "alpha",
+    )
     assert isinstance(cid, uuid.UUID)
     assert created is True
+    assert name == "alpha"
+    assert summary is None
+    assert doc_count == 0
 
     rows = await repo.list_by_vault(vault_id)
     paths = {r["path"] for r in rows}
@@ -93,17 +98,26 @@ async def test_create_empty_inserts_new_row(pool, vault_id):
 @pytest.mark.asyncio
 async def test_create_empty_is_idempotent(pool, vault_id):
     repo = CollectionRepository(pool)
-    cid1, created1 = await repo.create_empty(vault_id, "beta", summary="first")
-    cid2, created2 = await repo.create_empty(vault_id, "beta", summary="ignored")
+    cid1, created1, _, summary1, doc_count1 = await repo.create_empty(
+        vault_id, "beta", summary="first",
+    )
+    cid2, created2, _, summary2, doc_count2 = await repo.create_empty(
+        vault_id, "beta", summary="ignored",
+    )
     assert created1 is True
     assert created2 is False
     assert cid1 == cid2
+    # No-op call must report stored state, not the caller's input.
+    assert summary1 == "first"
+    assert summary2 == "first"
+    assert doc_count1 == 0
+    assert doc_count2 == 0
 
 
 @pytest.mark.asyncio
 async def test_delete_by_id_removes_row(pool, vault_id):
     repo = CollectionRepository(pool)
-    cid, _ = await repo.create_empty(vault_id, "gamma")
+    cid, *_ = await repo.create_empty(vault_id, "gamma")
     await repo.delete_by_id(cid)
     rows = await repo.list_by_vault(vault_id)
     assert "gamma" not in {r["path"] for r in rows}
