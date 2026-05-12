@@ -297,7 +297,12 @@ const [templates, setTemplates] = useState<VaultTemplateSummary[]>([]);
 const [selectedTemplate, setSelectedTemplate] = useState<string>("");
 
 useEffect(() => {
-  listVaultTemplates().then(setTemplates).catch(() => setTemplates([]));
+  listVaultTemplates()
+    .then(setTemplates)
+    .catch((e) => {
+      console.warn("Failed to load vault templates; falling back to none-only.", e);
+      setTemplates([]);
+    });
 }, []);
 
 const selectedSummary = useMemo(
