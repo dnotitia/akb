@@ -10,3 +10,20 @@ class ResizeObserverStub {
 if (typeof globalThis.ResizeObserver === "undefined") {
   (globalThis as any).ResizeObserver = ResizeObserverStub;
 }
+
+// jsdom doesn't implement matchMedia — stub it so theme hooks don't throw.
+if (typeof window.matchMedia === "undefined") {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (_query: string) => ({
+      matches: false,
+      media: _query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
