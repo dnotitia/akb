@@ -1,8 +1,10 @@
 """REST API routes for document CRUD."""
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
 from app.api.deps import get_current_user
+from app.services import template_registry
 from app.services.access_service import check_vault_access, list_accessible_vaults
 from app.models.document import (
     DocumentPutRequest,
@@ -14,6 +16,20 @@ from app.services.auth_service import AuthenticatedUser
 from app.services.document_service import DocumentService
 from app.util.text import to_nfc
 
+
+class VaultTemplateCollection(BaseModel):
+    path: str
+    name: str
+
+
+class VaultTemplate(BaseModel):
+    name: str
+    display_name: str
+    description: str
+    collection_count: int
+    collections: list[VaultTemplateCollection]
+
+
 router = APIRouter()
 doc_service = DocumentService()
 
@@ -24,6 +40,27 @@ async def create_vault(name: str, description: str = "", template: str | None = 
     description = to_nfc(description)
     vault_id = await doc_service.create_vault(name, description, owner_id=user.user_id, template=template, public_access=public_access)
     return {"vault_id": vault_id, "name": name, "template": template, "public_access": public_access}
+
+
+@router.get(
+    "/vaults/templates",
+    response_model=list[VaultTemplate],
+    summary="List available vault templates",
+)
+async def list_vault_templates(user: AuthenticatedUser = Depends(get_current_user)):
+    return [
+        VaultTemplate(
+            name=s.name,
+            display_name=s.display_name,
+            description=s.description,
+            collection_count=s.collection_count,
+            collections=[
+                VaultTemplateCollection(path=c.path, name=c.name)
+                for c in s.collections
+            ],
+        )
+        for s in template_registry.list_summaries()
+    ]
 
 
 @router.get("/vaults", summary="List accessible vaults")
