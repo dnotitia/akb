@@ -26,6 +26,7 @@ interface VaultInfo {
   name: string;
   description?: string;
   role?: "owner" | "admin" | "writer" | "reader";
+  role_source?: "member" | "public";
 }
 
 export default function VaultMembersPage() {
@@ -90,7 +91,19 @@ export default function VaultMembersPage() {
           <ArrowLeft className="h-3 w-3" aria-hidden />
           BACK TO {name.toUpperCase()}
         </Link>
-        {info?.role && <RoleBadge role={info.role} />}
+        {info?.role && (
+          info.role_source === "public" ? (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider border border-warning/40 bg-warning/10 text-warning"
+              title="This role is granted by the vault's public_access setting, not by direct membership. Contact the owner if this was unintended."
+              aria-label={`Public ${info.role}`}
+            >
+              PUBLIC · {info.role.toUpperCase()}
+            </span>
+          ) : (
+            <RoleBadge role={info.role} />
+          )
+        )}
       </div>
 
       <div className="coord mb-3">
