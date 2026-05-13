@@ -111,9 +111,33 @@ export const listPATs = () => api<{ tokens: any[] }>("/auth/tokens");
 export const revokePAT = (id: string) => api<any>(`/auth/tokens/${id}`, { method: "DELETE" });
 
 // ── Vaults ──
+export interface VaultTemplateCollection {
+  path: string;
+  name: string;
+}
+
+export interface VaultTemplateSummary {
+  name: string;
+  display_name: string;
+  description: string;
+  collection_count: number;
+  collections: VaultTemplateCollection[];
+}
+
+export const listVaultTemplates = () =>
+  api<VaultTemplateSummary[]>("/vaults/templates");
+
 export const listVaults = () => api<{ vaults: any[] }>("/my/vaults");
-export const createVault = (name: string, description?: string) =>
-  api<any>(`/vaults?name=${encodeURIComponent(name)}&description=${encodeURIComponent(description || "")}`, { method: "POST" });
+export const createVault = (
+  name: string,
+  description?: string,
+  template?: string,
+) => {
+  const params = new URLSearchParams({ name });
+  if (description) params.set("description", description);
+  if (template) params.set("template", template);
+  return api<any>(`/vaults?${params}`, { method: "POST" });
+};
 export const getVaultInfo = (vault: string) => api<any>(`/vaults/${vault}/info`);
 export const getVaultMembers = (vault: string) => api<{ members: any[] }>(`/vaults/${vault}/members`);
 export const grantAccess = (vault: string, user: string, role: string) =>
