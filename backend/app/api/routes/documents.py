@@ -1,6 +1,6 @@
 """REST API routes for document CRUD."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
@@ -36,6 +36,11 @@ doc_service = DocumentService()
 
 @router.post("/vaults", summary="Create a new vault")
 async def create_vault(name: str, description: str = "", template: str | None = None, public_access: str = "none", user: AuthenticatedUser = Depends(get_current_user)):
+    if template is not None and template not in template_registry.list_names():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unknown template: {template}",
+        )
     name = to_nfc(name)
     description = to_nfc(description)
     vault_id = await doc_service.create_vault(name, description, owner_id=user.user_id, template=template, public_access=public_access)
