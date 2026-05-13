@@ -1,14 +1,19 @@
-// frontend/src/components/graph/__tests__/GraphCanvas.smoke.test.tsx
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { GraphCanvas } from "../GraphCanvas";
 
+const JSDOM_CANVAS_INIT_PHRASES = [
+  "getContext",                                      // HTMLCanvasElement.getContext is not implemented
+  "Cannot read properties of null (reading 'scale')", // force-graph hits the null ctx
+];
+
+function isJsdomCanvasInitError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return JSDOM_CANVAS_INIT_PHRASES.some((phrase) => message.includes(phrase));
+}
+
 describe("GraphCanvas smoke", () => {
-  it("renders without throwing on empty input (or only canvas-unavailable error)", () => {
-    // jsdom does not implement Canvas. force-graph throws when it tries to call
-    // canvas.getContext('2d'). We catch that specific error and treat it as a
-    // pass — it proves the component mounted correctly up to the point where the
-    // Canvas API is missing (a jsdom limitation, not a logic error).
+  it("mounts without component-level errors (canvas init from jsdom is tolerated)", () => {
     try {
       const { container } = render(
         <GraphCanvas
@@ -24,14 +29,11 @@ describe("GraphCanvas smoke", () => {
       );
       expect(container).toBeTruthy();
     } catch (err) {
-      // Accept only the expected canvas-not-implemented error from jsdom.
-      const message = err instanceof Error ? err.message : String(err);
-      const isCanvasError =
-        message.includes("scale") ||          // "Cannot read properties of null (reading 'scale')" from force-graph
-        message.includes("getContext") ||      // explicit getContext failure
-        message.includes("canvas") ||          // any canvas-related message
-        message.includes("null");              // null return from getContext
-      expect(isCanvasError, `Unexpected error: ${message}`).toBe(true);
+      if (!isJsdomCanvasInitError(err)) {
+        throw err;
+      }
+      // jsdom canvas init failure — the component reached the render path;
+      // success for smoke purposes.
     }
   });
 });

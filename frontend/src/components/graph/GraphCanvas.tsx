@@ -204,11 +204,17 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [onContextMenu],
   );
 
-  const handleNodeDrag = useCallback((n: RenderNode) => {
-    // Shift-drag pinning is handled by the page shell via pinned set mutations.
-    // The lib does not pass the MouseEvent here in the public API typings,
-    // so we simply no-op; pin state is managed externally.
-    void n;
+  const handleNodeDrag = useCallback((_n: RenderNode, _t: { x: number; y: number }) => {
+    // TODO(task-6): shift+drag pinning.
+    //
+    // react-force-graph-2d's `onNodeDrag` does NOT pass a MouseEvent, so we
+    // cannot read ev.shiftKey here. The page shell (Task 6) must:
+    //   1. Track shift-key state via window.addEventListener('keydown'|'keyup').
+    //   2. When a drag begins while shift is held, add the node's URI to the
+    //      `pinned` set passed in via props. Pinning then takes effect through
+    //      the existing `onNodeDragEnd` branch that preserves fx/fy for pinned
+    //      nodes (line below).
+    // This canvas component intentionally stays stateless about keyboard.
   }, []);
 
   return (
