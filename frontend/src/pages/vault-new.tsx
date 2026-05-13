@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ArrowRight, ChevronRight, GitBranch, Loader2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronRight, GitBranch, Loader2 } from "lucide-react";
 import { createVault, listVaultTemplates, type VaultTemplateSummary } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,6 +34,28 @@ export default function VaultNewPage() {
     () => templates.find((t) => t.name === selectedTemplate) || null,
     [templates, selectedTemplate],
   );
+
+  function handleCancel() {
+    // Prefer history-back so users return to where they came from.
+    // navigate(-1) is a no-op when there is no prior entry; the browser
+    // simply stays put. For deep-link visits with no history we still
+    // want to land somewhere sensible — window.history.length > 1
+    // signals that we have a prior entry in real browsers.
+    if (typeof window !== "undefined" && window.history.length > 1) {
+      navigate(-1);
+    } else {
+      navigate("/");
+    }
+  }
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !creating) handleCancel();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creating]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -183,8 +205,8 @@ export default function VaultNewPage() {
               </>
             )}
           </Button>
-          <Button asChild variant="outline">
-            <Link to="/">Cancel</Link>
+          <Button type="button" variant="outline" onClick={handleCancel}>
+            <ArrowLeft className="h-4 w-4" aria-hidden /> Cancel
           </Button>
         </div>
       </form>
