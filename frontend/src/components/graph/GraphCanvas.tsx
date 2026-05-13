@@ -198,7 +198,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   const handleNodeRightClick = useCallback(
     (n: RenderNode, ev: MouseEvent) => {
-      ev.preventDefault();
+      // Native context menu remains available until the custom menu lands.
+      // TODO(graph-context-menu): preventDefault here once the floating
+      // menu (Pin/Unpin/Hide/Copy/Open-new-tab) is wired in the page shell.
       onContextMenu(n, ev.clientX, ev.clientY);
     },
     [onContextMenu],
