@@ -86,7 +86,7 @@ export function GraphDetailPanel({
   return (
     <aside className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface">
       <header className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="coord">{(kind || "document").toUpperCase()} · {docId.toUpperCase()}</span>
+        <span className="coord">{kind || "document"} · {docId}</span>
         <button onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground">
           <X className="h-3 w-3" />
         </button>
