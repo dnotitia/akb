@@ -573,3 +573,7 @@ export const adminResetPassword = (userId: string) =>
     `/admin/users/${encodeURIComponent(userId)}/reset-password`,
     { method: "POST" },
   );
+
+// ── Provenance / drill-down ──
+export const getProvenance = (docId: string) =>
+  api<{ provenance: any }>(`/provenance/${encodeURIComponent(docId)}`);
