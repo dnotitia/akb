@@ -115,14 +115,13 @@ For admin/owner members, `role_source = "member"`.
 
 The MCP path (`akb_whoami`, `akb_browse`, etc.) does not surface this field — only the REST `getVaultInfo` does. MCP clients are agents and don't need the UI badge.
 
+**`list_accessible_vaults` is NOT modified.** It currently returns role via a SQL COALESCE that derives from owner / public_access / membership; frontend does not consume `role_source` from the list endpoint. Leave the query and response shape untouched. The single new field lives only on `getVaultInfo`'s response.
+
 ### Frontend change
 
 `frontend/src/lib/api.ts` — extend the `getVaultInfo` return type with `role_source?: "member" | "public"` (optional for backwards compat; an old backend response without the field is treated as `"member"`).
 
-Where to render the badge:
-
-- Vault overview header (existing layout — verify location during implementation).
-- Or unconditionally in `title-bar.tsx` next to the vault breadcrumb segment.
+**Badge location — decided**: render in the **vault-members page header** (`vault-members.tsx:93` already renders the viewer's role pill via `{info?.role && <RoleBadge role={info.role} />}`). Replace that pill with one that switches treatment based on `info?.role_source`. Same pattern can apply to the vault-overview page header if it has its own role pill — verify and mirror; otherwise leave alone. **Do not** put the badge in `title-bar.tsx` — TitleBar stays role-agnostic.
 
 Pill design:
 
@@ -328,7 +327,7 @@ vault-members.tsx member row:
 1. Replace the existing `<RoleBadge role={m.role} />` block with a conditional render:
 
 ```tsx
-{canManage && m.role !== "owner" && m.user_id !== currentUser.user_id ? (
+{canManage && m.role !== "owner" && m.username !== currentUser?.username ? (
   <RoleSelect
     member={m}
     onChanged={(prev, next) => showUndoToast(m, prev, next)}
@@ -337,6 +336,8 @@ vault-members.tsx member row:
   <RoleBadge role={m.role} />
 )}
 ```
+
+**Note on identifiers**: the existing `Member` interface in `vault-members.tsx:17-23` only exposes `username`, not `user_id`. Use `username` for the self-check. `currentUser` comes from a new `getMe()` fetch on mount (Settings page already uses the same call); store in a `useState<User | null>(null)` and gate the select on `currentUser` being non-null.
 
 2. New component `frontend/src/components/role-select.tsx`:
 
@@ -461,6 +462,15 @@ No change. `grantAccess(vault, user, role)` is already idempotent via `ON CONFLI
 ### Backend
 
 `backend/tests/test_access_service.py` (extend or create) — unit test that `check_vault_access` returns `role_source: "public"` for non-members accessing public-reader/writer vaults and `role_source: "member"` for actual members and owners. Live test via `backend/tests/test_security_edge_e2e.sh` extension: bootstrap a public-writer vault, register a second user who is NOT a member, call `GET /api/v1/vaults/{vault}/info` as that user, assert response has `role: "writer"` AND `role_source: "public"`.
+
+**Route-level smoke** (small but worth adding) — same e2e file, one extra block:
+```bash
+# Member of a private vault → role_source must be "member"
+JWT_OWNER=...
+R=$(curl -sk "$BASE_URL/api/v1/vaults/$VAULT/info" -H "Authorization: Bearer $JWT_OWNER")
+echo "$R" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["role_source"]=="member",d'
+```
+This catches serializer regressions where the field is computed correctly in the service but dropped before it reaches the JSON response.
 
 ### Frontend
 
