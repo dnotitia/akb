@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { ArrowRight, Loader2 } from "lucide-react";
 import { authLogin, authRegister, setToken } from "@/lib/api";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -485,6 +485,17 @@ function AuthForm({
           </>
         )}
       </button>
+
+      {mode === "login" && (
+        <div className="text-center pt-2">
+          <Link
+            to="/auth/forgot"
+            className="coord hover:text-accent transition-colors"
+          >
+            Forgot password?
+          </Link>
+        </div>
+      )}
     </form>
   );
 }

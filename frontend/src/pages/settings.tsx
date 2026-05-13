@@ -6,6 +6,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Key,
   Loader2,
   Plus,
   RotateCw,
@@ -20,8 +21,10 @@ import {
   getToken,
   adminListUsers,
   adminDeleteUser,
+  changePassword,
   type AdminUser,
 } from "@/lib/api";
+import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
 import { formatDate } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -73,7 +76,40 @@ export default function SettingsPage() {
   const [clientTab, setClientTab] = useState<ClientTab>("claude");
   const [pendingDeleteUser, setPendingDeleteUser] = useState<AdminUser | null>(null);
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
+  const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwConfirm, setPwConfirm] = useState("");
+  const [pwError, setPwError] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwOk, setPwOk] = useState(false);
   const { theme } = useTheme();
+
+  async function handleChangePassword(e: React.FormEvent) {
+    e.preventDefault();
+    setPwError("");
+    setPwOk(false);
+    if (pwNew !== pwConfirm) {
+      setPwError("New password and confirmation do not match");
+      return;
+    }
+    if (pwNew.length < 8) {
+      setPwError("New password must be at least 8 characters");
+      return;
+    }
+    setPwBusy(true);
+    try {
+      await changePassword(pwCurrent, pwNew);
+      setPwOk(true);
+      setPwCurrent("");
+      setPwNew("");
+      setPwConfirm("");
+    } catch (e: any) {
+      setPwError(e?.message || "Failed to change password");
+    } finally {
+      setPwBusy(false);
+    }
+  }
 
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -277,7 +313,7 @@ export default function SettingsPage() {
         </TabsList>
 
         {/* Profile — read-only account info */}
-        <TabsContent value="profile" className="pt-6 max-w-4xl">
+        <TabsContent value="profile" className="pt-6 max-w-4xl space-y-6">
           <div className="border border-border bg-surface">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4 p-6">
               <ReadOnlyField label="USERNAME" value={user.username} />
@@ -293,6 +329,69 @@ export default function SettingsPage() {
               />
             </div>
           </div>
+
+          <section
+            className="space-y-3 pt-6 border-t border-border"
+            aria-labelledby="change-pw-heading"
+          >
+            <h2 id="change-pw-heading" className="coord-ink">
+              CHANGE PASSWORD
+            </h2>
+            <form
+              onSubmit={handleChangePassword}
+              className="space-y-3 max-w-md"
+            >
+              <div>
+                <Label htmlFor="pw-current">Current password</Label>
+                <Input
+                  id="pw-current"
+                  type="password"
+                  autoComplete="current-password"
+                  value={pwCurrent}
+                  onChange={(e) => setPwCurrent(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <Label htmlFor="pw-new">New password</Label>
+                <Input
+                  id="pw-new"
+                  type="password"
+                  autoComplete="new-password"
+                  value={pwNew}
+                  onChange={(e) => setPwNew(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <Label htmlFor="pw-confirm">Confirm new password</Label>
+                <Input
+                  id="pw-confirm"
+                  type="password"
+                  autoComplete="new-password"
+                  value={pwConfirm}
+                  onChange={(e) => setPwConfirm(e.target.value)}
+                  required
+                />
+              </div>
+              {pwError && (
+                <p role="alert" className="text-destructive text-xs font-mono">
+                  {pwError}
+                </p>
+              )}
+              {pwOk && (
+                <p className="text-foreground text-xs font-mono">
+                  Password changed.
+                </p>
+              )}
+              <Button type="submit" disabled={pwBusy}>
+                {pwBusy && (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                )}
+                Change password
+              </Button>
+            </form>
+          </section>
         </TabsContent>
 
         {/* Tokens — PATs + fresh token banner when minted */}
@@ -683,19 +782,31 @@ export default function SettingsPage() {
                               — SELF —
                             </span>
                           ) : (
-                            <button
-                              onClick={() => setPendingDeleteUser(u)}
-                              disabled={deletingId === u.id}
-                              aria-label={`Delete user ${u.username}`}
-                              className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive disabled:opacity-40 transition-colors cursor-pointer"
-                            >
-                              {deletingId === u.id ? (
-                                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                              ) : (
-                                <Trash2 className="h-3 w-3" aria-hidden />
-                              )}
-                              {deletingId === u.id ? "Deleting" : "Delete"}
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => setResetTarget(u)}
+                                title={`Reset password for ${u.username}`}
+                                aria-label={`Reset password for ${u.username}`}
+                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer"
+                              >
+                                <Key className="h-3 w-3" aria-hidden />
+                                Reset
+                              </button>
+                              <button
+                                onClick={() => setPendingDeleteUser(u)}
+                                disabled={deletingId === u.id}
+                                aria-label={`Delete user ${u.username}`}
+                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive disabled:opacity-40 transition-colors cursor-pointer"
+                              >
+                                {deletingId === u.id ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                                ) : (
+                                  <Trash2 className="h-3 w-3" aria-hidden />
+                                )}
+                                {deletingId === u.id ? "Deleting" : "Delete"}
+                              </button>
+                            </>
                           )}
                         </div>
                       </div>
@@ -732,6 +843,15 @@ export default function SettingsPage() {
         confirmLabel="Delete user"
         variant="destructive"
         onConfirm={confirmDeleteUser}
+      />
+
+      <AdminResetPasswordDialog
+        userId={resetTarget?.id ?? ""}
+        username={resetTarget?.username ?? ""}
+        open={resetTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setResetTarget(null);
+        }}
       />
     </div>
   );
