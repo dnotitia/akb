@@ -386,6 +386,28 @@ INTEGRITY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 # Revoke again
 mcp_as "$PAT1" "$SID1" "akb_revoke" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\"}" >/dev/null 2>&1
 
+# ── 9. role_source field on /vaults/{vault}/info ─────────────
+echo ""
+echo "▸ 9. role_source field on /vaults/{vault}/info"
+
+# Owner (member) of their own vault → role_source=member
+INFO=$(curl -sk "$BASE_URL/api/v1/vaults/$VAULT1/info" -H "Authorization: Bearer $PAT1")
+RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("role_source","MISSING"))' 2>/dev/null)
+[ "$RS" = "member" ] && pass "owner sees role_source=member" \
+  || fail "role_source owner" "got $RS"
+
+# Set vault to public-writer so a non-member can read it
+curl -sk -X PATCH "$BASE_URL/api/v1/vaults/$VAULT1" \
+  -H "Authorization: Bearer $PAT1" \
+  -H 'Content-Type: application/json' \
+  -d '{"public_access":"writer"}' >/dev/null
+
+# User2 is not a member (just revoked above) → role_source=public
+INFO=$(curl -sk "$BASE_URL/api/v1/vaults/$VAULT1/info" -H "Authorization: Bearer $PAT2")
+RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("role_source","MISSING"))' 2>/dev/null)
+[ "$RS" = "public" ] && pass "non-member sees role_source=public" \
+  || fail "role_source public" "got $RS"
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"

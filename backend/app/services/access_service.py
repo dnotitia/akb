@@ -76,16 +76,16 @@ async def check_vault_access(user_id: str, vault_name: str, required_role: str =
         # System admin bypasses all vault ACL
         is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
         if is_admin:
-            return {"vault_id": vault["id"], "role": "owner", "status": vault["status"]}
+            return {"vault_id": vault["id"], "role": "owner", "status": vault["status"], "role_source": "member"}
 
         # Owner always has full access
         if vault["owner_id"] == uid:
-            return {"vault_id": vault["id"], "role": "owner", "status": vault["status"]}
+            return {"vault_id": vault["id"], "role": "owner", "status": vault["status"], "role_source": "member"}
 
         # Public vault access (none / reader / writer)
         public_access = vault.get("public_access", "none")
         if public_access != "none" and _role_level(required_role) <= _role_level(public_access):
-            return {"vault_id": vault["id"], "role": public_access, "status": vault["status"]}
+            return {"vault_id": vault["id"], "role": public_access, "status": vault["status"], "role_source": "public"}
 
         # Check vault_access table
         access = await conn.fetchrow(
@@ -97,7 +97,7 @@ async def check_vault_access(user_id: str, vault_name: str, required_role: str =
         if not user_role or _role_level(user_role) < _role_level(required_role):
             raise ForbiddenError(f"Requires '{required_role}' role on vault '{vault_name}'")
 
-        return {"vault_id": vault["id"], "role": user_role, "status": vault["status"]}
+        return {"vault_id": vault["id"], "role": user_role, "status": vault["status"], "role_source": "member"}
 
 
 async def get_user_role(user_id: str, vault_name: str) -> str | None:
@@ -276,6 +276,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
     UI uses to gate owner-only controls and render state badges."""
     access = await check_vault_access(user_id, vault_name, required_role="reader")
     caller_role = access["role"]
+    role_source = access["role_source"]
 
     pool = await get_pool()
     # Fan out the eight independent counts/lookups onto the connection pool
@@ -324,6 +325,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         "is_external_git": bool(is_external_git),
         "public_access": vault["public_access"],
         "role": caller_role,
+        "role_source": role_source,
         "owner": owner["username"] if owner else None,
         "owner_display_name": owner["display_name"] if owner else None,
         "member_count": member_count + 1,  # +1 for owner
