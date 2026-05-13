@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowRight, ChevronRight, GitBranch, Loader2 } from "lucide-react";
-import { createVault } from "@/lib/api";
+import { createVault, listVaultTemplates, type VaultTemplateSummary } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,6 +18,22 @@ export default function VaultNewPage() {
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
+  const [templates, setTemplates] = useState<VaultTemplateSummary[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState<string>("");
+
+  useEffect(() => {
+    listVaultTemplates()
+      .then(setTemplates)
+      .catch((e) => {
+        console.warn("Failed to load vault templates; falling back to none-only.", e);
+        setTemplates([]);
+      });
+  }, []);
+
+  const selectedSummary = useMemo(
+    () => templates.find((t) => t.name === selectedTemplate) || null,
+    [templates, selectedTemplate],
+  );
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -33,7 +49,11 @@ export default function VaultNewPage() {
     setError("");
     setCreating(true);
     try {
-      await createVault(trimmed, description.trim() || undefined);
+      await createVault(
+        trimmed,
+        description.trim() || undefined,
+        selectedTemplate || undefined,
+      );
       navigate(`/vault/${trimmed}`);
     } catch (err: any) {
       setError(err?.message || "Failed to create vault");
@@ -93,6 +113,31 @@ export default function VaultNewPage() {
             onChange={(e) => setDescription(e.target.value)}
             placeholder="What this vault is for"
           />
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="vault-template">
+            Template <span className="normal-case tracking-normal text-foreground-muted">(optional)</span>
+          </Label>
+          <select
+            id="vault-template"
+            value={selectedTemplate}
+            onChange={(e) => setSelectedTemplate(e.target.value)}
+            className="w-full bg-surface border border-border px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent transition-colors"
+          >
+            <option value="">None — empty vault</option>
+            {templates.map((t) => (
+              <option key={t.name} value={t.name}>{t.display_name}</option>
+            ))}
+          </select>
+          {selectedSummary && (
+            <div className="coord">
+              {selectedSummary.description}
+              <br />
+              Will create {selectedSummary.collection_count} collections:{" "}
+              {selectedSummary.collections.map((c) => c.path).join(" · ")}
+            </div>
+          )}
         </div>
 
         <TooltipProvider>
