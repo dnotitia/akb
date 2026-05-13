@@ -251,10 +251,20 @@ export const grepDocs = (query: string, vault?: string, limit = 20) => {
 };
 
 // ── Graph ──
+export interface GraphApiNode {
+  uri: string;
+  name?: string;
+  resource_type?: string;
+}
+export interface GraphApiEdge {
+  source: string;
+  target: string;
+  relation?: string;
+}
 export const getGraph = (vault: string, docId?: string, depth = 2, limit = 50) => {
   const p = new URLSearchParams({ depth: String(depth), limit: String(limit) });
   if (docId) p.set("doc_id", docId);
-  return api<{ nodes: any[]; edges: any[] }>(`/graph/${vault}?${p}`);
+  return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph/${vault}?${p}`);
 };
 
 // ── Drill Down ──
@@ -265,8 +275,19 @@ export const drillDown = (vault: string, docId: string, section?: string) => {
 };
 
 // ── Relations ──
+export interface RelationRow {
+  source: string;
+  target: string;
+  relation: string;
+  // backend may include resource_type / display_name on the "other" side
+  other_uri?: string;
+  other_name?: string;
+  other_type?: string;
+}
 export const getRelations = (vault: string, docId: string) =>
-  api<{ relations: any[] }>(`/relations/${vault}/${docId}`);
+  api<{ doc_id: string; resource_uri: string; relations: RelationRow[] }>(
+    `/relations/${vault}/${encodeURIComponent(docId)}`,
+  );
 
 // ── Recent ──
 export const getRecent = (vault?: string, limit = 20) => {
