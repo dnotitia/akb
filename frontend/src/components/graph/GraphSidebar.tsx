@@ -63,10 +63,12 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
       setHits([]);
       return;
     }
+    let cancelled = false;
     const handle = setTimeout(async () => {
       try {
         // searchDocs(query, vault?, limit) — order: query first, vault second
         const resp = await searchDocs(query.trim(), vault, 8);
+        if (cancelled) return;
         const rows = (resp.results || []).slice(0, 8).map((r: any) => ({
           doc_id: r.doc_id || r.id,
           title: r.title || r.name || r.doc_id || "(untitled)",
@@ -74,10 +76,13 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
         }));
         setHits(rows);
       } catch {
-        setHits([]);
+        if (!cancelled) setHits([]);
       }
     }, 300);
-    return () => clearTimeout(handle);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
   }, [query, vault]);
 
   function commitEntry(hit: SearchHit) {
