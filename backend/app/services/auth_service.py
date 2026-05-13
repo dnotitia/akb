@@ -19,7 +19,8 @@ import jwt
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AuthenticationError, ConflictError
+from app.exceptions import AuthenticationError, ConflictError, NotFoundError
+from app.repositories.events_repo import emit_event
 
 
 @dataclass
@@ -121,6 +122,50 @@ async def login(username: str, password: str) -> dict:
                 "is_admin": row["is_admin"],
             },
         }
+
+
+class BadPasswordChange(Exception):
+    """Raised when change_password is called with input the user can correct.
+
+    Distinct from app.exceptions.ValidationError (which the global handler
+    maps to 422 — a pydantic-shaped validation failure). These cases are
+    HTTP 400: the request reached the service, the user just chose a bad
+    new password. The route maps this to HTTPException(400) so the
+    frontend can render an inline form error.
+    """
+
+
+async def change_password(user_id: str, current: str, new: str) -> None:
+    """Change own password. Verifies current; rejects too-short or unchanged."""
+    if len(new) < 8:
+        raise BadPasswordChange("New password must be at least 8 characters")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT password_hash FROM users WHERE id = $1",
+            uuid.UUID(user_id),
+        )
+        if row is None:
+            raise NotFoundError("User", user_id)
+        if not verify_password(current, row["password_hash"]):
+            raise AuthenticationError("Current password is incorrect")
+        if verify_password(new, row["password_hash"]):
+            raise BadPasswordChange("New password must differ from current")
+
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                hash_password(new),
+                uuid.UUID(user_id),
+            )
+            await emit_event(
+                conn,
+                "auth.password_changed",
+                ref_type="user",
+                ref_id=user_id,
+                actor_id=user_id,
+                payload={"user_id": user_id},
+            )
 
 
 # ── PAT operations ──────────────────────────────────────────
