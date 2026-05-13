@@ -159,10 +159,21 @@ async def reset_password(
 Append after `login`:
 
 ```python
+class BadPasswordChange(Exception):
+    """Raised when change_password is called with input the user can correct.
+
+    Distinct from ValidationError (which the global handler maps to 422 — a
+    pydantic-shaped validation failure). These cases are HTTP 400: the
+    request reached the service, the user just chose a bad new password.
+    The route maps this to HTTPException(400) so the frontend can render an
+    inline form error.
+    """
+
+
 async def change_password(user_id: str, current: str, new: str) -> None:
     """Change own password. Verifies current; rejects too-short or unchanged."""
     if len(new) < 8:
-        raise ValidationError("New password must be at least 8 characters")
+        raise BadPasswordChange("New password must be at least 8 characters")
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -174,7 +185,7 @@ async def change_password(user_id: str, current: str, new: str) -> None:
         if not verify_password(current, row["password_hash"]):
             raise AuthenticationError("Current password is incorrect")
         if verify_password(new, row["password_hash"]):
-            raise ValidationError("New password must differ from current")
+            raise BadPasswordChange("New password must differ from current")
 
         async with conn.transaction():
             await conn.execute(
@@ -199,6 +210,9 @@ async def change_password(user_id: str, current: str, new: str) -> None:
 Append after the existing PAT routes:
 
 ```python
+from fastapi import HTTPException, status
+
+
 class ChangePasswordRequest(NFCModel):
     current_password: str
     new_password: str
@@ -209,12 +223,15 @@ async def change_password_route(
     req: ChangePasswordRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    from app.services.auth_service import change_password
-    await change_password(user.user_id, req.current_password, req.new_password)
+    from app.services.auth_service import change_password, BadPasswordChange
+    try:
+        await change_password(user.user_id, req.current_password, req.new_password)
+    except BadPasswordChange as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     return {"ok": True}
 ```
 
-Exception → HTTP mapping is handled by the existing global exception handlers (verify `AuthenticationError` → 401, `ValidationError` → 400, `NotFoundError` → 404).
+`AuthenticationError` → 401 and `NotFoundError` → 404 are handled by the existing global exception handlers in `main.py`. The new `BadPasswordChange` is mapped explicitly to 400 in the route (the global `ValidationError` handler returns 422, which is wrong for these user-correctable cases — see the BadPasswordChange docstring).
 
 ### Modified: `backend/app/api/routes/access.py`
 
@@ -347,9 +364,9 @@ Modal opened from the admin users page row action. Two states:
 - **Confirm**: "Generate a temporary password for `<username>`? They will be able to log in with it immediately." [Cancel] [Generate]
 - **Result**: Large mono display of the temp password + copy button. Warning: "Share this with the user out-of-band (Slack, etc.). It cannot be retrieved again." [Done]
 
-### Modified: existing admin users page (`frontend/src/pages/admin-users.tsx` or equivalent)
+### Modified: `frontend/src/pages/settings.tsx` (admin tab)
 
-Add a "Reset password" button (key icon) to each user row, opening the dialog above.
+The admin-user table lives inside `settings.tsx`'s `"admin"` tab (rendered only when `user.is_admin`). It already uses `adminListUsers` / `adminDeleteUser` and renders one row per user with a delete action. Add a second row action — "Reset password" button (key icon) — that opens `AdminResetPasswordDialog`. No separate admin-users page exists or should be created.
 
 ### Modified: `frontend/src/lib/api.ts`
 
@@ -475,5 +492,5 @@ No admin involvement, no CLI, no temp password.
 **Frontend — modified**:
 - `frontend/src/pages/auth.tsx` — "Forgot password?" link
 - `frontend/src/lib/api.ts` — `changePassword`, `adminResetPassword`
-- `frontend/src/pages/admin-users.tsx` (or equivalent admin users page) — row action button
+- `frontend/src/pages/settings.tsx (admin tab)` (or equivalent admin users page) — row action button
 - frontend router config — `/auth/forgot`, `/settings/account` routes
