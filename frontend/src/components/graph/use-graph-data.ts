@@ -77,18 +77,21 @@ interface BfsExpandArgs {
   ) => Promise<{ resource_uri: string; relations: RelationRow[] }>;
 }
 
-function rowToEdge(row: RelationRow): GraphEdge | null {
+function rowToEdge(row: RelationRow, selfUri: string): GraphEdge | null {
   const relation = normalizeRelation(row.relation);
   if (!relation) return null;
-  return { source: row.source, target: row.target, relation };
+  if (row.direction === "outgoing") {
+    return { source: selfUri, target: row.uri, relation };
+  }
+  return { source: row.uri, target: selfUri, relation };
 }
 
 function rowToNeighbor(row: RelationRow): GraphNode | null {
-  if (!row.other_uri) return null;
+  if (!row.uri) return null;
   return {
-    uri: row.other_uri,
-    name: row.other_name || row.other_uri,
-    kind: normalizeKind(row.other_type),
+    uri: row.uri,
+    name: row.name || row.uri,
+    kind: normalizeKind(row.resource_type),
   };
 }
 
@@ -117,10 +120,10 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   const edgeKeys = new Set<string>();
   const edges: GraphEdge[] = [];
 
-  function ingest(rows: RelationRow[]): string[] {
+  function ingest(rows: RelationRow[], selfUri: string): string[] {
     const newDocIds: string[] = [];
     for (const row of rows) {
-      const edge = rowToEdge(row);
+      const edge = rowToEdge(row, selfUri);
       if (edge) {
         const k = `${edge.source}\u0001${edge.target}\u0001${edge.relation}`;
         if (!edgeKeys.has(k)) {
@@ -143,7 +146,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   // claims the docId atomically), so duplicate entries in `frontier`
   // — e.g. siblings pointing at the same neighbor — collapse to a
   // single fetch on the next hop.
-  let frontier: string[] = ingest(seedResp.relations);
+  let frontier: string[] = ingest(seedResp.relations, seedResp.resource_uri);
 
   for (let hop = 1; hop < depth; hop++) {
     const toFetch = frontier.filter((docId) => {
@@ -158,7 +161,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
     const nextFrontier: string[] = [];
     for (const r of responses) {
       if (!r) continue;
-      nextFrontier.push(...ingest(r.relations));
+      nextFrontier.push(...ingest(r.relations, r.resource_uri));
     }
     if (nextFrontier.length === 0) break;
     frontier = nextFrontier;

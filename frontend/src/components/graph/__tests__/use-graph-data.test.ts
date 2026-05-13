@@ -74,12 +74,11 @@ describe("bfsExpand", () => {
       resource_uri: `akb://v/doc/${docId}`,
       relations: [
         {
-          source: `akb://v/doc/${docId}`,
-          target: "akb://v/doc/d-2",
+          direction: "outgoing" as const,
           relation: "depends_on",
-          other_uri: "akb://v/doc/d-2",
-          other_name: "Second",
-          other_type: "document",
+          uri: "akb://v/doc/d-2",
+          name: "Second",
+          resource_type: "document",
         },
       ],
     }));
@@ -107,12 +106,11 @@ describe("bfsExpand", () => {
           resource_uri: "akb://v/doc/d-1",
           relations: [
             {
-              source: "akb://v/doc/d-1",
-              target: "akb://v/doc/d-2",
+              direction: "outgoing" as const,
               relation: "depends_on",
-              other_uri: "akb://v/doc/d-2",
-              other_name: "Second",
-              other_type: "document",
+              uri: "akb://v/doc/d-2",
+              name: "Second",
+              resource_type: "document",
             },
           ],
         };
@@ -123,12 +121,11 @@ describe("bfsExpand", () => {
           resource_uri: "akb://v/doc/d-2",
           relations: [
             {
-              source: "akb://v/doc/d-2",
-              target: "akb://v/doc/d-3",
+              direction: "outgoing" as const,
               relation: "references",
-              other_uri: "akb://v/doc/d-3",
-              other_name: "Third",
-              other_type: "document",
+              uri: "akb://v/doc/d-3",
+              name: "Third",
+              resource_type: "document",
             },
           ],
         };
@@ -155,12 +152,11 @@ describe("bfsExpand", () => {
       resource_uri: `akb://v/doc/${docId}`,
       relations: [
         {
-          source: `akb://v/doc/${docId}`,
-          target: "akb://v/doc/d-1", // cycle back to entry
+          direction: "outgoing" as const,
           relation: "depends_on",
-          other_uri: "akb://v/doc/d-1",
-          other_name: "First",
-          other_type: "document",
+          uri: "akb://v/doc/d-1", // cycle back to entry
+          name: "First",
+          resource_type: "document",
         },
       ],
     }));
@@ -194,10 +190,10 @@ describe("bfsExpand", () => {
           doc_id: docId,
           resource_uri: "akb://v/doc/d-1",
           relations: [
-            { source: "akb://v/doc/d-1", target: "akb://v/doc/d-fail", relation: "depends_on",
-              other_uri: "akb://v/doc/d-fail", other_name: "Fail", other_type: "document" },
-            { source: "akb://v/doc/d-1", target: "akb://v/doc/d-ok", relation: "depends_on",
-              other_uri: "akb://v/doc/d-ok", other_name: "OK", other_type: "document" },
+            { direction: "outgoing" as const, relation: "depends_on",
+              uri: "akb://v/doc/d-fail", name: "Fail", resource_type: "document" },
+            { direction: "outgoing" as const, relation: "depends_on",
+              uri: "akb://v/doc/d-ok", name: "OK", resource_type: "document" },
           ],
         };
       }
@@ -207,8 +203,8 @@ describe("bfsExpand", () => {
           doc_id: docId,
           resource_uri: "akb://v/doc/d-ok",
           relations: [
-            { source: "akb://v/doc/d-ok", target: "akb://v/doc/d-deep", relation: "references",
-              other_uri: "akb://v/doc/d-deep", other_name: "Deep", other_type: "document" },
+            { direction: "outgoing" as const, relation: "references",
+              uri: "akb://v/doc/d-deep", name: "Deep", resource_type: "document" },
           ],
         };
       }
@@ -239,10 +235,10 @@ describe("bfsExpand", () => {
           doc_id: docId,
           resource_uri: "akb://v/doc/d-1",
           relations: [
-            { source: "akb://v/doc/d-1", target: "akb://v/doc/d-a", relation: "depends_on",
-              other_uri: "akb://v/doc/d-a", other_name: "A", other_type: "document" },
-            { source: "akb://v/doc/d-1", target: "akb://v/doc/d-b", relation: "depends_on",
-              other_uri: "akb://v/doc/d-b", other_name: "B", other_type: "document" },
+            { direction: "outgoing" as const, relation: "depends_on",
+              uri: "akb://v/doc/d-a", name: "A", resource_type: "document" },
+            { direction: "outgoing" as const, relation: "depends_on",
+              uri: "akb://v/doc/d-b", name: "B", resource_type: "document" },
           ],
         };
       }
@@ -251,8 +247,8 @@ describe("bfsExpand", () => {
           doc_id: docId,
           resource_uri: `akb://v/doc/${docId}`,
           relations: [
-            { source: `akb://v/doc/${docId}`, target: "akb://v/doc/d-shared", relation: "references",
-              other_uri: "akb://v/doc/d-shared", other_name: "Shared", other_type: "document" },
+            { direction: "outgoing" as const, relation: "references",
+              uri: "akb://v/doc/d-shared", name: "Shared", resource_type: "document" },
           ],
         };
       }
@@ -282,8 +278,8 @@ describe("bfsExpand", () => {
         doc_id: docId,
         resource_uri: `akb://v/doc/${docId}`,
         relations: [
-          { source: `akb://v/doc/${docId}`, target: `akb://v/doc/${next}`, relation: "depends_on",
-            other_uri: `akb://v/doc/${next}`, other_name: next, other_type: "document" },
+          { direction: "outgoing" as const, relation: "depends_on",
+            uri: `akb://v/doc/${next}`, name: next, resource_type: "document" },
         ],
       };
     });

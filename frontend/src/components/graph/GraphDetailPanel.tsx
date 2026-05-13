@@ -72,7 +72,7 @@ export function GraphDetailPanel({
   const doc = docQuery.data;
   const preview = (doc?.content || "").split("\n").slice(0, PREVIEW_LINES).join("\n");
 
-  const groupedRels = groupRelations(relQuery.data?.relations || [], uri);
+  const groupedRels = groupRelations(relQuery.data?.relations || []);
   const totalRels =
     groupedRels.incoming.reduce((s, g) => s + g.rows.length, 0) +
     groupedRels.outgoing.reduce((s, g) => s + g.rows.length, 0);
@@ -260,33 +260,22 @@ interface GroupedRel {
     other_uri: string;
     other_name: string;
     other_type: NodeKind;
-    direction: "in" | "out";
   }>;
 }
 
 function groupRelations(
-  rows: Array<{
-    source: string;
-    target: string;
-    relation: string;
-    other_uri?: string;
-    other_name?: string;
-    other_type?: string;
-  }>,
-  selfUri: string,
+  rows: Array<{ direction: "outgoing" | "incoming"; relation: string; uri: string; name?: string; resource_type?: string }>,
 ): { incoming: GroupedRel[]; outgoing: GroupedRel[] } {
   const out: Map<string, GroupedRel> = new Map();
   const inc: Map<string, GroupedRel> = new Map();
   for (const r of rows) {
     const rel = r.relation as RelationKind;
-    const isOut = r.source === selfUri;
-    const map = isOut ? out : inc;
+    const map = r.direction === "outgoing" ? out : inc;
     if (!map.has(rel)) map.set(rel, { relation: rel, rows: [] });
     map.get(rel)!.rows.push({
-      other_uri: r.other_uri || (isOut ? r.target : r.source),
-      other_name: r.other_name || "(unnamed)",
-      other_type: (r.other_type as NodeKind) || "document",
-      direction: isOut ? "out" : "in",
+      other_uri: r.uri,
+      other_name: r.name || "(unnamed)",
+      other_type: (r.resource_type as NodeKind) || "document",
     });
   }
   return { outgoing: [...out.values()], incoming: [...inc.values()] };

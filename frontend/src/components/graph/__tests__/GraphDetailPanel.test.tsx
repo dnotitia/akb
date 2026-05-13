@@ -44,11 +44,11 @@ describe("GraphDetailPanel · document node", () => {
       resource_uri: "akb://akb/doc/x",
       relations: [
         {
-          source: "akb://akb/doc/x",
-          target: "akb://akb/doc/y",
+          direction: "outgoing",
           relation: "depends_on",
-          other_name: "Y",
-          other_type: "document",
+          uri: "akb://akb/doc/y",
+          name: "Y",
+          resource_type: "document",
         },
       ],
     });

@@ -276,13 +276,11 @@ export const drillDown = (vault: string, docId: string, section?: string) => {
 
 // ── Relations ──
 export interface RelationRow {
-  source: string;
-  target: string;
+  direction: "outgoing" | "incoming";
   relation: string;
-  // backend may include resource_type / display_name on the "other" side
-  other_uri?: string;
-  other_name?: string;
-  other_type?: string;
+  uri: string;          // the "other" side
+  resource_type?: string;
+  name?: string;
 }
 export const getRelations = (vault: string, docId: string) =>
   api<{ doc_id: string; resource_uri: string; relations: RelationRow[] }>(
