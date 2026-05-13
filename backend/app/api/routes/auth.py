@@ -1,6 +1,6 @@
 """REST API routes for auth — register, login, PAT management."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
@@ -34,6 +34,11 @@ class CreatePATRequest(NFCModel):
     name: str
     scopes: list[str] | None = None
     expires_days: int | None = None
+
+
+class ChangePasswordRequest(NFCModel):
+    current_password: str
+    new_password: str
 
 
 @router.post("/auth/register", summary="Register a new user")
@@ -74,3 +79,16 @@ async def delete_token(token_id: str, user: AuthenticatedUser = Depends(get_curr
     if not success:
         raise NotFoundError("Token", token_id)
     return {"revoked": True}
+
+
+@router.post("/auth/change-password", summary="Change own password")
+async def change_password_route(
+    req: ChangePasswordRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.auth_service import change_password, BadPasswordChange
+    try:
+        await change_password(user.user_id, req.current_password, req.new_password)
+    except BadPasswordChange as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    return {"ok": True}
