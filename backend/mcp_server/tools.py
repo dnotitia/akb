@@ -5,6 +5,8 @@ All tool schemas for the AKB MCP server.
 
 from mcp.types import Tool
 
+from app.services import template_registry
+
 
 TOOLS = [
     Tool(
@@ -29,8 +31,11 @@ TOOLS = [
                 "description": {"type": "string", "description": "What this vault is for"},
                 "template": {
                     "type": "string",
-                    "description": "Vault template to apply (pre-creates collections with guides). Ignored when external_git is set.",
-                    "enum": ["engineering", "qa", "hr", "finance", "management", "issue-tracking", "product"],
+                    "enum": template_registry.list_names(),
+                    "description": (
+                        "Vault template to apply (pre-creates collections with guides). "
+                        "Ignored when external_git is set."
+                    ),
                 },
                 "public_access": {"type": "string", "enum": ["none", "reader", "writer"], "default": "none", "description": "Public access: none=private, reader=public read, writer=public read+write"},
                 "external_git": {
