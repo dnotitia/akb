@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Crown, Plus, Trash2, UserCog } from "lucide-react";
 import {
+  getMe,
   getVaultInfo,
   getVaultMembers,
+  grantAccess,
   revokeAccess,
   transferOwnership,
 } from "@/lib/api";
@@ -11,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { InviteMemberDialog } from "@/components/invite-member-dialog";
 import { RoleBadge } from "@/components/status-badge";
+import { RoleSelect } from "@/components/role-select";
 import { EmptyState } from "@/components/empty-state";
 import { timeAgo } from "@/lib/utils";
 
@@ -37,6 +40,19 @@ export default function VaultMembersPage() {
   const [inviteOpen, setInviteOpen] = useState(false);
   const [pendingRevoke, setPendingRevoke] = useState<Member | null>(null);
   const [pendingTransfer, setPendingTransfer] = useState<Member | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ username: string } | null>(null);
+  const [undoTarget, setUndoTarget] = useState<{
+    username: string;
+    prev: string;
+    next: string;
+  } | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getMe()
+      .then((u) => setCurrentUser({ username: u.username }))
+      .catch(() => setCurrentUser(null));
+  }, []);
 
   useEffect(() => {
     if (!name) return;
@@ -76,6 +92,29 @@ export default function VaultMembersPage() {
     if (!name || !pendingTransfer) return;
     await transferOwnership(name, pendingTransfer.username);
     await refresh();
+  }
+
+  async function handleRoleChanged(m: Member, prev: string, next: string) {
+    await refresh();
+    setUndoTarget({ username: m.username, prev, next });
+    setTimeout(() => {
+      setUndoTarget((cur) =>
+        cur && cur.username === m.username && cur.next === next ? null : cur,
+      );
+    }, 5000);
+  }
+
+  async function handleUndo() {
+    if (!undoTarget) return;
+    const { username, prev } = undoTarget;
+    setUndoTarget(null);
+    setUndoError(null);
+    try {
+      await grantAccess(name!, username, prev);
+      await refresh();
+    } catch (e: any) {
+      setUndoError(e?.message || "Undo failed");
+    }
   }
 
   if (!name) return null;
@@ -138,6 +177,26 @@ export default function VaultMembersPage() {
         )}
       </header>
 
+      {undoTarget && (
+        <div role="status" className="flex items-center gap-3 px-3 py-2 border border-border bg-surface-muted mb-4 mt-4">
+          <span className="text-sm text-foreground">
+            Changed {undoTarget.username} from {undoTarget.prev.toUpperCase()} to {undoTarget.next.toUpperCase()}.
+          </span>
+          <button
+            type="button"
+            onClick={handleUndo}
+            className="text-xs font-mono uppercase tracking-wider text-accent hover:underline cursor-pointer"
+          >
+            Undo
+          </button>
+        </div>
+      )}
+      {undoError && (
+        <div role="alert" className="px-3 py-2 border border-destructive bg-destructive/10 text-destructive text-xs font-mono mb-4 mt-4">
+          Undo failed: {undoError}
+        </div>
+      )}
+
       {/* List */}
       {error ? (
         <div role="alert" className="border border-destructive p-3 mt-4 text-sm">
@@ -174,7 +233,15 @@ export default function VaultMembersPage() {
                 <div className="coord truncate">{m.email}</div>
               </div>
               <div className="flex items-center gap-3 shrink-0">
-                <RoleBadge role={m.role} />
+                {canManage && m.role !== "owner" && currentUser && m.username !== currentUser.username ? (
+                  <RoleSelect
+                    vault={name!}
+                    member={m}
+                    onChanged={(prev, next) => handleRoleChanged(m, prev, next)}
+                  />
+                ) : (
+                  <RoleBadge role={m.role} />
+                )}
                 <span className="coord tabular-nums w-[64px] text-right">
                   {m.role === "owner"
                     ? "—"
