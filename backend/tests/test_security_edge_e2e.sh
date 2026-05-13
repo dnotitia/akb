@@ -390,23 +390,26 @@ mcp_as "$PAT1" "$SID1" "akb_revoke" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\"}
 echo ""
 echo "▸ 9. role_source field on /vaults/{vault}/info"
 
-# Owner (member) of their own vault → role_source=member
+# Owner of $VAULT1 (member) → role_source=member
 INFO=$(curl -sk "$BASE_URL/api/v1/vaults/$VAULT1/info" -H "Authorization: Bearer $PAT1")
 RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("role_source","MISSING"))' 2>/dev/null)
 [ "$RS" = "member" ] && pass "owner sees role_source=member" \
   || fail "role_source owner" "got $RS"
 
-# Set vault to public-writer so a non-member can read it
-curl -sk -X PATCH "$BASE_URL/api/v1/vaults/$VAULT1" \
-  -H "Authorization: Bearer $PAT1" \
-  -H 'Content-Type: application/json' \
-  -d '{"public_access":"writer"}' >/dev/null
+# Create a NEW throwaway vault for the public branch test (don't mutate $VAULT1)
+PUBLIC_VAULT="rolesrc-pub-$(date +%s)-$$"
+curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$PUBLIC_VAULT&description=role-source-public-test&public_access=writer" \
+  -H "Authorization: Bearer $PAT1" >/dev/null
 
-# User2 is not a member (just revoked above) → role_source=public
-INFO=$(curl -sk "$BASE_URL/api/v1/vaults/$VAULT1/info" -H "Authorization: Bearer $PAT2")
+# User2 (non-member) accessing the new public-writer vault → role_source=public
+INFO=$(curl -sk "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT/info" -H "Authorization: Bearer $PAT2")
 RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("role_source","MISSING"))' 2>/dev/null)
 [ "$RS" = "public" ] && pass "non-member sees role_source=public" \
   || fail "role_source public" "got $RS"
+
+# Cleanup: delete the throwaway public vault before the suite's general cleanup runs.
+curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT" \
+  -H "Authorization: Bearer $PAT1" >/dev/null
 
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
