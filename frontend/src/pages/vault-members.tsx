@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, Crown, Plus, Trash2, UserCog } from "lucide-react";
+import { ArrowLeft, Crown, Globe, Plus, Trash2, UserCog } from "lucide-react";
 import {
   getMe,
   getVaultInfo,
@@ -9,6 +9,7 @@ import {
   revokeAccess,
   transferOwnership,
 } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { InviteMemberDialog } from "@/components/invite-member-dialog";
@@ -132,13 +133,17 @@ export default function VaultMembersPage() {
         </Link>
         {info?.role && (
           info.role_source === "public" ? (
-            <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider border border-warning/40 bg-warning/10 text-warning"
+            <div
+              className="flex items-center gap-1.5"
               title="This role is granted by the vault's public_access setting, not by direct membership. Contact the owner if this was unintended."
               aria-label={`Public ${info.role}`}
             >
-              PUBLIC · {info.role.toUpperCase()}
-            </span>
+              <Badge variant="info">
+                <Globe className="h-3 w-3" aria-hidden />
+                PUBLIC
+              </Badge>
+              <RoleBadge role={info.role} />
+            </div>
           ) : (
             <RoleBadge role={info.role} />
           )

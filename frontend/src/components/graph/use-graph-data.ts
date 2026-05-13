@@ -61,8 +61,10 @@ export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
   return { nodes, edges };
 }
 
+export const DEGRADED_NODE_THRESHOLD = 500;
+
 export function isDegraded(rawNodeCount: number): boolean {
-  return rawNodeCount > 500;
+  return rawNodeCount > DEGRADED_NODE_THRESHOLD;
 }
 
 interface BfsExpandArgs {
@@ -137,6 +139,10 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   }
 
   // Seed hop populates the first frontier from the entry's neighbors.
+  // Dedup is enforced inside the loop's `toFetch` filter (visited.add
+  // claims the docId atomically), so duplicate entries in `frontier`
+  // — e.g. siblings pointing at the same neighbor — collapse to a
+  // single fetch on the next hop.
   let frontier: string[] = ingest(seedResp.relations);
 
   for (let hop = 1; hop < depth; hop++) {
@@ -193,15 +199,18 @@ export function useNeighborhood(
   return useQuery({
     queryKey: ["graph", vault, "neighborhood", entry, depth],
     enabled: !!entry,
-    queryFn: () =>
-      bfsExpand({
+    queryFn: () => {
+      // `enabled` above guarantees `entry` is defined when this runs.
+      if (!entry) throw new Error("useNeighborhood: entry required");
+      return bfsExpand({
         vault,
-        entry: entry as string,
+        entry,
         depth,
         fetchRelations: async (v, docId) => {
           const r = await getRelations(v, docId);
           return { resource_uri: r.resource_uri, relations: r.relations };
         },
-      }),
+      });
+    },
   });
 }

@@ -22,9 +22,15 @@ export interface VaultNavProps {
    * owns the hook so the local manual-refresh button stays simple.
    */
   onRefetchReady?: (refetch: () => void) => void;
+  /**
+   * Called when the user clicks the currently-active vault row.
+   * The shell wires this to the tree-visibility toggle so the vault
+   * label doubles as a sidebar open/close handle.
+   */
+  onCurrentVaultClick?: () => void;
 }
 
-export function VaultNav({ current, onRefetchReady }: VaultNavProps) {
+export function VaultNav({ current, onRefetchReady, onCurrentVaultClick }: VaultNavProps) {
   const { vaults, loading, refetch } = useVaults();
   const [filter, setFilter] = useState("");
   const { pathname } = useLocation();
@@ -104,15 +110,19 @@ export function VaultNav({ current, onRefetchReady }: VaultNavProps) {
           {filtered.length === 0 && filter && (
             <div className="px-2 py-2 coord">— NO MATCHES —</div>
           )}
-          {filtered.map((v) => (
-            <NavItem
-              key={v.id}
-              to={`/vault/${v.name}`}
-              label={v.name}
-              icon={Box}
-              active={v.name === current}
-            />
-          ))}
+          {filtered.map((v) => {
+            const isActive = v.name === current;
+            return (
+              <NavItem
+                key={v.id}
+                to={`/vault/${v.name}`}
+                label={v.name}
+                icon={Box}
+                active={isActive}
+                onActiveClick={isActive ? onCurrentVaultClick : undefined}
+              />
+            );
+          })}
         </div>
       </div>
 
@@ -126,17 +136,25 @@ function NavItem({
   icon: Icon,
   active,
   accent,
+  onActiveClick,
 }: {
   to: string;
   label: string;
   icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   active?: boolean;
   accent?: boolean;
+  onActiveClick?: () => void;
 }) {
   return (
     <Link
       to={to}
       aria-current={active ? "page" : undefined}
+      onClick={(e) => {
+        if (active && onActiveClick) {
+          e.preventDefault();
+          onActiveClick();
+        }
+      }}
       className={cn(
         "flex items-center gap-2 px-2 h-7 text-sm transition-colors",
         "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
