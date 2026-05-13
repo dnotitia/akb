@@ -203,7 +203,7 @@ async def change_password(user_id: str, current: str, new: str) -> None:
             )
 ```
 
-`ValidationError` already exists or follows the existing exceptions pattern in `app.exceptions`; verify before implementing.
+`BadPasswordChange` is a new exception local to `auth_service` — no changes to `app.exceptions` needed.
 
 ### Modified: `backend/app/api/routes/auth.py`
 
