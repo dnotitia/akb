@@ -542,3 +542,13 @@ export interface AdminUser {
 export const adminListUsers = () => api<{ users: AdminUser[] }>("/admin/users");
 export const adminDeleteUser = (user_id: string) =>
   api<any>(`/admin/users/${user_id}`, { method: "DELETE" });
+export const changePassword = (current_password: string, new_password: string) =>
+  api<{ ok: true }>("/auth/change-password", {
+    method: "POST",
+    body: JSON.stringify({ current_password, new_password }),
+  });
+export const adminResetPassword = (userId: string) =>
+  api<{ temporary_password: string; username: string }>(
+    `/admin/users/${encodeURIComponent(userId)}/reset-password`,
+    { method: "POST" },
+  );
