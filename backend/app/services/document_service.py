@@ -823,18 +823,13 @@ class DocumentService:
         return str(vault_id)
 
     async def _apply_template(self, vault_name: str, vault_id: uuid.UUID, template: str, coll_repo) -> None:
-        """Apply a vault template by reading from _system vault or built-in defaults."""
-        import yaml
-        from pathlib import Path
+        """Apply a vault template via the shared TemplateRegistry."""
+        from app.services import template_registry
 
-        # Try loading from templates directory (shipped with backend)
-        template_path = Path(__file__).parent.parent.parent / "templates" / "vault-templates" / f"{template}.yaml"
-        if not template_path.exists():
+        tmpl = template_registry.get(template)
+        if tmpl is None:
             logger.warning("Template not found: %s", template)
             return
-
-        with open(template_path) as f:
-            tmpl = yaml.safe_load(f)
 
         now = datetime.now(timezone.utc)
         for coll in tmpl.get("collections", []):
