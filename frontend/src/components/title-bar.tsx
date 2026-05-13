@@ -1,5 +1,5 @@
-import { Link } from "react-router-dom";
-import { Compass, GitGraph, Search as SearchIcon, Share2 } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -17,6 +17,18 @@ export function TitleBar({
   right?: ReactNode;
   className?: string;
 }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const canBack =
+    typeof window !== "undefined" &&
+    window.history.length > 1 &&
+    location.pathname !== "/";
+
+  function handleBack() {
+    if (canBack) navigate(-1);
+  }
+
   return (
     <div
       className={cn(
@@ -25,6 +37,25 @@ export function TitleBar({
         className,
       )}
     >
+      <button
+        type="button"
+        onClick={handleBack}
+        disabled={!canBack}
+        aria-label="Go back"
+        title="Go back"
+        className={cn(
+          "inline-flex items-center justify-center h-9 w-9 -ml-2",
+          "text-foreground-muted hover:text-foreground hover:bg-surface-muted",
+          "active:scale-95",
+          "disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent",
+          "transition-colors duration-150",
+          "motion-reduce:transition-none motion-reduce:active:scale-100",
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+          "cursor-pointer",
+        )}
+      >
+        <ArrowLeft className="h-4 w-4" aria-hidden />
+      </button>
       <span
         className="inline-block h-2 w-2 rounded-full bg-accent"
         aria-hidden
