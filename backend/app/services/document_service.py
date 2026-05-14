@@ -55,7 +55,7 @@ free-form this section. Agents read it as context, not a hard schema.)
 
 ## Do not
 
-- Inline secrets in bodies; use ${secrets.X} placeholders
+- Inline secrets in bodies; use ${{secrets.X}} placeholders
 - Edit auto-generated docs without checking provenance
 """
 
