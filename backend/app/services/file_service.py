@@ -22,6 +22,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
+from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services.adapters import s3_adapter
 from app.services.index_service import (
@@ -130,6 +131,29 @@ def _s3_key(vault_name: str, collection: str, filename: str) -> str:
     return f"{vault_name}/{uid}_{safe_name}"
 
 
+def _normalize_collection_path(path: str | None) -> str:
+    """Same rules as `document_service._normalize_collection`: strip
+    leading/trailing slashes, collapse duplicates, reject path-traversal
+    and forbidden characters. Returns "" for empty/None (= vault root).
+    Duplicated here to keep file_service self-contained — kept in sync
+    with the document_service / table_service variants by code review."""
+    if not path:
+        return ""
+    normalized = path.strip().strip("/")
+    if not normalized:
+        return ""
+    parts = [p for p in normalized.split("/") if p]
+    for part in parts:
+        if part in (".", ".."):
+            raise ValueError(
+                f"Invalid collection path: '{path}'. "
+                "Path traversal segments ('.', '..') are not allowed."
+            )
+        if "\x00" in part or "\\" in part:
+            raise ValueError(f"Invalid character in collection path: '{path}'")
+    return "/".join(parts)
+
+
 # ── File domain service ──────────────────────────────────────────
 
 
@@ -151,10 +175,14 @@ class FileService:
         """Create a file record and return a presigned PUT URL.
 
         Client (akb-mcp proxy) uploads directly to S3, then calls
-        confirm_upload().
+        confirm_upload(). `collection` is a path string (empty / None
+        for vault root); a matching `collections` row is auto-created
+        if needed so files share the same FK-normalized hierarchy as
+        documents and tables.
         """
         s3_adapter.ensure_bucket(self._bucket)
-        s3_key = _s3_key(vault_name, collection, filename)
+        collection_path = _normalize_collection_path(collection)
+        s3_key = _s3_key(vault_name, collection_path, filename)
         file_id = uuid.uuid4()
 
         presigned_url = s3_adapter.presign_put(
@@ -163,20 +191,32 @@ class FileService:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await vault_files_repo.insert(
-                conn,
-                file_id=file_id, vault_id=vault_id,
-                collection=collection, name=filename,
-                s3_key=s3_key, mime_type=mime_type,
-                size_bytes=0, description=description,
-                created_by=actor_id,
-            )
+            async with conn.transaction():
+                collection_id = None
+                if collection_path:
+                    coll_repo = CollectionRepository(pool)
+                    collection_id = await coll_repo.get_or_create(
+                        vault_id, collection_path, conn=conn,
+                    )
+                await vault_files_repo.insert(
+                    conn,
+                    file_id=file_id, vault_id=vault_id,
+                    name=filename,
+                    s3_key=s3_key, mime_type=mime_type,
+                    size_bytes=0, description=description,
+                    created_by=actor_id,
+                    collection_id=collection_id,
+                )
 
-        logger.info("Presigned upload URL for %s/%s (file_id=%s)", vault_name, s3_key, file_id)
+        logger.info(
+            "Presigned upload URL for %s/%s (file_id=%s, collection=%s)",
+            vault_name, s3_key, file_id, collection_path or "<root>",
+        )
         return {
             "kind": "file",
             "id": str(file_id),
             "vault": vault_name,
+            "collection": collection_path or None,
             "upload_url": presigned_url,
             "s3_key": s3_key,
             "expires_in": _PRESIGN_UPLOAD_TTL,
@@ -298,11 +338,34 @@ class FileService:
         collection: str | None = None,
         limit: int = 50,
     ) -> list[dict]:
+        """List files in a vault. When `collection` is set (path string),
+        only files in that exact collection (NULL collection_id for empty
+        path = vault root) are returned. The path is resolved to a
+        collection_id at query time."""
         pool = await get_pool()
         async with pool.acquire() as conn:
-            rows = await vault_files_repo.list_for_vault(
-                conn, vault_id, collection=collection, limit=limit,
-            )
+            if collection is None:
+                rows = await vault_files_repo.list_for_vault(
+                    conn, vault_id, limit=limit,
+                )
+            else:
+                collection_path = _normalize_collection_path(collection)
+                if collection_path == "":
+                    # Empty path => vault root scope.
+                    rows = await vault_files_repo.list_for_vault(
+                        conn, vault_id, collection_id=None, scoped=True, limit=limit,
+                    )
+                else:
+                    cid_row = await conn.fetchrow(
+                        "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                        vault_id, collection_path,
+                    )
+                    if not cid_row:
+                        return []  # collection doesn't exist → no files
+                    rows = await vault_files_repo.list_for_vault(
+                        conn, vault_id,
+                        collection_id=cid_row["id"], scoped=True, limit=limit,
+                    )
 
         return [
             {
@@ -382,6 +445,7 @@ class FileService:
             "kind": "file",
             "id": file_id,
             "vault": vault_name,
+            "collection": row.get("collection"),
             "name": row["name"],
             "deleted": True,
         }

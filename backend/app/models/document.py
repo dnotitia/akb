@@ -100,6 +100,10 @@ class BrowseItem(BaseModel):
     type: str  # "collection", "document", "table", "file"
     uri: str | None = None  # akb:// URI for this resource
     summary: str | None = None
+    # Collection membership — set on tables/files (documents encode it
+    # in `path`). NULL for resources at vault root. Frontend tree
+    # builder uses this to place tables/files under their collection.
+    collection: str | None = None
     # Document fields
     doc_count: int | None = None  # for collections
     doc_type: str | None = None  # for documents

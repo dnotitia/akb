@@ -6,6 +6,12 @@ composes repo calls under one `async with conn.transaction():` block.
 
 Data tables (the `vt_***` PG tables that hold actual rows) live in
 `table_data_repo`. This module only deals with the registry row.
+
+Collection membership is normalized via FK `vault_tables.collection_id`
+referencing `collections.id` (NULL == vault root). Table names remain
+unique within a vault (NOT per-collection), so the PG-side
+`pg_table_name(vault, name)` mapping is unchanged and a table can be
+moved between collections without renaming.
 """
 
 from __future__ import annotations
@@ -19,28 +25,75 @@ from app.utils import ensure_list
 
 
 async def find_by_name(conn, vault_id: uuid.UUID, name: str) -> dict | None:
+    """Look up a table by (vault, name). Name is unique within a vault
+    (across all collections) so no collection scoping is needed here.
+    The returned row carries `collection_id` for callers that need to
+    know which collection the table currently belongs to."""
     row = await conn.fetchrow(
         """
-        SELECT id, vault_id, name, description, columns, created_by,
-               created_at, updated_at
-          FROM vault_tables
-         WHERE vault_id = $1 AND name = $2
+        SELECT vt.id, vt.vault_id, vt.collection_id, c.path AS collection,
+               vt.name, vt.description, vt.columns, vt.created_by,
+               vt.created_at, vt.updated_at
+          FROM vault_tables vt
+          LEFT JOIN collections c ON c.id = vt.collection_id
+         WHERE vt.vault_id = $1 AND vt.name = $2
         """,
         vault_id, name,
     )
     return dict(row) if row else None
 
 
-async def list_for_vault(conn, vault_id: uuid.UUID) -> list[dict]:
-    rows = await conn.fetch(
-        """
-        SELECT id, name, description, columns, created_at
-          FROM vault_tables
-         WHERE vault_id = $1
-         ORDER BY name
-        """,
-        vault_id,
-    )
+async def list_for_vault(
+    conn,
+    vault_id: uuid.UUID,
+    *,
+    collection_id: uuid.UUID | None = None,
+    scoped: bool = False,
+) -> list[dict]:
+    """List tables in a vault.
+
+    Default (`scoped=False`) returns every table regardless of collection.
+    With `scoped=True`, only rows whose `collection_id` matches
+    `collection_id` (NULL = vault root) are returned — used by the
+    per-collection browse path.
+    """
+    if scoped:
+        if collection_id is None:
+            rows = await conn.fetch(
+                """
+                SELECT vt.id, vt.collection_id, c.path AS collection,
+                       vt.name, vt.description, vt.columns, vt.created_at
+                  FROM vault_tables vt
+                  LEFT JOIN collections c ON c.id = vt.collection_id
+                 WHERE vt.vault_id = $1 AND vt.collection_id IS NULL
+                 ORDER BY vt.name
+                """,
+                vault_id,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT vt.id, vt.collection_id, c.path AS collection,
+                       vt.name, vt.description, vt.columns, vt.created_at
+                  FROM vault_tables vt
+                  LEFT JOIN collections c ON c.id = vt.collection_id
+                 WHERE vt.vault_id = $1 AND vt.collection_id = $2
+                 ORDER BY vt.name
+                """,
+                vault_id, collection_id,
+            )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT vt.id, vt.collection_id, c.path AS collection,
+                   vt.name, vt.description, vt.columns, vt.created_at
+              FROM vault_tables vt
+              LEFT JOIN collections c ON c.id = vt.collection_id
+             WHERE vt.vault_id = $1
+             ORDER BY vt.name
+            """,
+            vault_id,
+        )
     return [dict(r) for r in rows]
 
 
@@ -54,14 +107,17 @@ async def insert(
     columns: list[dict],
     created_by: str | None,
     now: datetime,
+    collection_id: uuid.UUID | None = None,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO vault_tables
-            (id, vault_id, name, description, columns, created_by, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            (id, vault_id, collection_id, name, description, columns,
+             created_by, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
         """,
-        table_id, vault_id, name, description, json.dumps(columns), created_by, now,
+        table_id, vault_id, collection_id, name, description,
+        json.dumps(columns), created_by, now,
     )
 
 

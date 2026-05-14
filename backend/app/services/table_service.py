@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo
+from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
@@ -84,10 +85,19 @@ async def create_table(
     *,
     actor_id: str,
     description: str = "",
+    collection: str | None = None,
 ) -> dict:
+    """Create a vault-scoped table inside an optional collection.
+
+    `collection` is a path string (e.g. "specs" or "sessions/learnings").
+    NULL / empty → vault root. The path is normalized and the matching
+    `collections` row is auto-created via `CollectionRepository.get_or_create`
+    if it doesn't exist yet.
+    """
     pool = await get_pool()
     tid = uuid.uuid4()
     now = datetime.now(timezone.utc)
+    collection_path = _normalize_collection_path(collection)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -106,6 +116,13 @@ async def create_table(
                         f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
                     )
 
+            collection_id = None
+            if collection_path:
+                coll_repo = CollectionRepository(pool)
+                collection_id = await coll_repo.get_or_create(
+                    vault_id, collection_path, conn=conn,
+                )
+
             pg_name = table_data_repo.pg_table_name(vault["name"], name)
             await table_data_repo.create_dynamic_table(conn, pg_name, columns)
             await table_registry_repo.insert(
@@ -113,6 +130,7 @@ async def create_table(
                 table_id=tid, vault_id=vault_id, name=name,
                 description=description, columns=columns,
                 created_by=actor_id, now=now,
+                collection_id=collection_id,
             )
             await emit_event(
                 conn, "table.create",
@@ -121,6 +139,7 @@ async def create_table(
                 payload={
                     "vault": vault["name"],
                     "table_name": name,
+                    "collection": collection_path or None,
                     "columns_count": len(columns),
                     "description": description,
                 },
@@ -140,14 +159,36 @@ async def create_table(
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
-    logger.info("Table created: %s → %s", name, pg_name)
+    logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
         "id": str(tid),
         "vault": vault["name"],
+        "collection": collection_path or None,
         "name": name,
         "columns": columns,
     }
+
+
+def _normalize_collection_path(path: str | None) -> str:
+    """Same rules as `document_service._normalize_collection`: strip
+    leading/trailing slashes, collapse duplicates, reject path-traversal
+    and forbidden characters. Returns "" for empty/None (= vault root)."""
+    if not path:
+        return ""
+    normalized = path.strip().strip("/")
+    if not normalized:
+        return ""
+    parts = [p for p in normalized.split("/") if p]
+    for part in parts:
+        if part in (".", ".."):
+            raise ValueError(
+                f"Invalid collection path: '{path}'. "
+                "Path traversal segments ('.', '..') are not allowed."
+            )
+        if "\x00" in part or "\\" in part:
+            raise ValueError(f"Invalid character in collection path: '{path}'")
+    return "/".join(parts)
 
 
 async def list_tables(vault_id: uuid.UUID) -> list[dict]:
@@ -167,6 +208,7 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "kind": "table",
                 "id": str(r["id"]),
                 "vault": vault["name"],
+                "collection": r["collection"],
                 "name": r["name"],
                 "description": r["description"],
                 "columns": table_registry_repo.parse_columns(r["columns"]),
@@ -213,6 +255,7 @@ async def drop_table(
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
+                    "collection": table.get("collection"),
                     "table_name": table_name,
                 },
             )
@@ -229,6 +272,7 @@ async def drop_table(
         "kind": "table",
         "id": str(table_id),
         "vault": vault["name"],
+        "collection": table.get("collection"),
         "name": table_name,
         "deleted": True,
     }

@@ -411,14 +411,21 @@ TOOLS = [
         name="akb_create_table",
         description=(
             "Create a structured data table in a vault. "
-            "Tables live alongside documents and follow the same permissions. "
-            "Define columns with name and type (text, number, boolean, date, json)."
+            "Tables live alongside documents inside collections and follow the same permissions. "
+            "Define columns with name and type (text, number, boolean, date, json). "
+            "Optional `collection` (e.g. 'sessions/learnings') groups the table under that "
+            "collection so it appears beside the documents and files there in akb_browse; "
+            "omit for vault root."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string"},
-                "name": {"type": "string", "description": "Table name"},
+                "name": {"type": "string", "description": "Table name (unique within the vault)"},
+                "collection": {
+                    "type": "string",
+                    "description": "Collection path (e.g. 'specs' or 'sessions/learnings'). Omit for vault root.",
+                },
                 "description": {"type": "string"},
                 "columns": {
                     "type": "array",

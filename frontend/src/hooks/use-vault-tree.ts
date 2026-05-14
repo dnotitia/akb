@@ -18,6 +18,9 @@ interface BrowseItem {
   name: string;
   path: string;
   file_id?: string;
+  /** Path of the collection this resource lives in, or null for vault root.
+   *  Documents encode collection in `path` and leave this null. */
+  collection?: string | null;
   [k: string]: any;
 }
 
@@ -101,12 +104,35 @@ export function buildTree(items: BrowseItem[]): TreeNode[] {
     }
   }
 
-  // Phase 3: tables + files at root.
+  // Phase 3: tables + files under their collection (or root if none).
+  // Backend now sends `collection` on every table/file item — the
+  // unified-collection refactor put doc/table/file siblings under the
+  // same `collections.id` FK. NULL collection => vault root.
+  const attachToCollection = (
+    node: TreeNode,
+    collectionPath: string | null | undefined,
+  ) => {
+    if (collectionPath && colByPath.has(collectionPath)) {
+      colByPath.get(collectionPath)!.children!.push(node);
+    } else if (collectionPath) {
+      const parent = ensureCollection(collectionPath, null, roots, colByPath);
+      parent.children!.push(node);
+    } else {
+      roots.push(node);
+    }
+  };
+
   for (const t of items.filter((i) => i.type === "table")) {
-    roots.push({ kind: "table", name: t.name, path: t.name, raw: t });
+    attachToCollection(
+      { kind: "table", name: t.name, path: t.name, raw: t },
+      t.collection,
+    );
   }
   for (const f of items.filter((i) => i.type === "file")) {
-    roots.push({ kind: "file", name: f.name, path: f.file_id || f.path, raw: f });
+    attachToCollection(
+      { kind: "file", name: f.name, path: f.file_id || f.path, raw: f },
+      f.collection,
+    );
   }
 
   sortTree(roots);
