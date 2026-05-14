@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { formatDate } from "@/lib/utils";
 import { PasswordGate } from "@/components/password-gate";
+import { SummaryFold } from "@/components/summary-fold";
 import { TableViewer } from "@/components/table-viewer";
 import { FileViewer } from "@/components/file-viewer";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -189,11 +190,7 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           {data.title}
         </h1>
 
-        {data.summary && (
-          <p className="font-display-body text-lg text-foreground border-l-2 border-accent pl-4 mb-10 max-w-prose">
-            {data.summary}
-          </p>
-        )}
+        <SummaryFold summary={data.summary} prominent className="mt-4 mb-10" />
 
         {data.content_unavailable && (
           <div

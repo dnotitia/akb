@@ -24,6 +24,7 @@ import {
 import { timeAgo } from "@/lib/utils";
 import { parseHeadings, slugify } from "@/lib/markdown";
 import { DocumentOutline } from "@/components/doc-outline";
+import { SummaryFold } from "@/components/summary-fold";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { HistoryList } from "@/components/history-list";
@@ -201,11 +202,7 @@ export default function DocumentPage() {
         {/* Frontmatter card — mono metadata with semantic colors */}
         <FrontmatterCard doc={doc} />
 
-        {doc.summary && (
-          <p className="font-serif text-[17px] leading-[1.6] text-foreground mb-7 mt-6">
-            {doc.summary}
-          </p>
-        )}
+        <SummaryFold summary={doc.summary} className="mt-4 mb-7" />
 
         {publishError && (
           <div
