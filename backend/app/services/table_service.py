@@ -170,25 +170,7 @@ async def create_table(
     }
 
 
-def _normalize_collection_path(path: str | None) -> str:
-    """Same rules as `document_service._normalize_collection`: strip
-    leading/trailing slashes, collapse duplicates, reject path-traversal
-    and forbidden characters. Returns "" for empty/None (= vault root)."""
-    if not path:
-        return ""
-    normalized = path.strip().strip("/")
-    if not normalized:
-        return ""
-    parts = [p for p in normalized.split("/") if p]
-    for part in parts:
-        if part in (".", ".."):
-            raise ValueError(
-                f"Invalid collection path: '{path}'. "
-                "Path traversal segments ('.', '..') are not allowed."
-            )
-        if "\x00" in part or "\\" in part:
-            raise ValueError(f"Invalid character in collection path: '{path}'")
-    return "/".join(parts)
+from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
 
 
 async def list_tables(vault_id: uuid.UUID) -> list[dict]:

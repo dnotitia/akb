@@ -85,16 +85,37 @@ async def _already_applied(conn) -> bool:
     return bool(has_tables_fk and has_files_fk and legacy_text_gone)
 
 
+async def _ensure_indexes(conn) -> None:
+    """Create the FK indexes if missing. Runs unconditionally on every
+    boot so DBs that ran an earlier revision of this migration (which
+    landed the FK columns but not the indexes) get the index added on
+    the next deploy. `IF NOT EXISTS` keeps it idempotent."""
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vault_tables_collection "
+        "ON vault_tables(collection_id)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vault_files_collection "
+        "ON vault_files(collection_id)"
+    )
+
+
 async def _run(conn):
     if await _already_applied(conn):
+        # Ensure indexes exist even on already-migrated DBs — an earlier
+        # revision of this migration shipped without them.
+        await _ensure_indexes(conn)
         logger.info(
             "Migration 020 already applied "
-            "(collection_id FKs present, legacy TEXT removed); skipping"
+            "(collection_id FKs present, legacy TEXT removed); indexes ensured"
         )
         return
 
     async with conn.transaction():
-        # 1+2: add FK columns (idempotent via IF NOT EXISTS).
+        # 1+2: add FK columns (idempotent via IF NOT EXISTS) + indexes.
+        # Every scoped browse / cascade-delete now JOINs and filters on
+        # these columns; without the index the seq scan dominates on
+        # large vaults.
         await conn.execute(
             """
             ALTER TABLE vault_tables
@@ -103,11 +124,19 @@ async def _run(conn):
             """
         )
         await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vault_tables_collection "
+            "ON vault_tables(collection_id)"
+        )
+        await conn.execute(
             """
             ALTER TABLE vault_files
                 ADD COLUMN IF NOT EXISTS collection_id UUID
                     REFERENCES collections(id) ON DELETE SET NULL
             """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vault_files_collection "
+            "ON vault_files(collection_id)"
         )
 
         # 3: populate vault_files.collection_id from existing TEXT.

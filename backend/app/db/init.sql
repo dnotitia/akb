@@ -171,6 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_indexing_queue
 CREATE TABLE IF NOT EXISTS vault_tables (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     description TEXT,
     columns JSONB NOT NULL DEFAULT '[]',
@@ -190,6 +191,7 @@ CREATE TABLE IF NOT EXISTS vault_table_rows (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_tables_vault ON vault_tables(vault_id);
+CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_table ON vault_table_rows(table_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_data ON vault_table_rows USING gin(data);
 
@@ -227,7 +229,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target_type);
 CREATE TABLE IF NOT EXISTS vault_files (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
-    collection TEXT NOT NULL DEFAULT '',
+    collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     s3_key TEXT NOT NULL,
     mime_type TEXT,
@@ -240,7 +242,7 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(vault_id, collection);
+CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
 
 -- ============================================================
 -- Publications (unified public-link feature for documents, tables, files)

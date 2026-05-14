@@ -112,14 +112,6 @@ def put_object_bytes(
     s3_adapter.put_bytes(s3_key, body, content_type=content_type)
 
 
-# Backward-compat alias for callers that imported the historical
-# private name (e.g. access_service). New code should call
-# `s3_adapter.client()` directly; this alias will be removed in a
-# follow-up commit once those imports are migrated.
-def _get_s3_client():
-    return s3_adapter.client()
-
-
 # ── File-key naming convention ───────────────────────────────────
 
 
@@ -131,27 +123,7 @@ def _s3_key(vault_name: str, collection: str, filename: str) -> str:
     return f"{vault_name}/{uid}_{safe_name}"
 
 
-def _normalize_collection_path(path: str | None) -> str:
-    """Same rules as `document_service._normalize_collection`: strip
-    leading/trailing slashes, collapse duplicates, reject path-traversal
-    and forbidden characters. Returns "" for empty/None (= vault root).
-    Duplicated here to keep file_service self-contained — kept in sync
-    with the document_service / table_service variants by code review."""
-    if not path:
-        return ""
-    normalized = path.strip().strip("/")
-    if not normalized:
-        return ""
-    parts = [p for p in normalized.split("/") if p]
-    for part in parts:
-        if part in (".", ".."):
-            raise ValueError(
-                f"Invalid collection path: '{path}'. "
-                "Path traversal segments ('.', '..') are not allowed."
-            )
-        if "\x00" in part or "\\" in part:
-            raise ValueError(f"Invalid character in collection path: '{path}'")
-    return "/".join(parts)
+from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
 
 
 # ── File domain service ──────────────────────────────────────────

@@ -59,3 +59,61 @@ class NFCModel(BaseModel):
     @classmethod
     def _normalize_nfc(cls, data: Any) -> Any:
         return to_nfc_any(data)
+
+
+# ── Collection path normalizer (single source of truth) ──────────
+#
+# Why this lives next to NFC: collection paths flow through the same
+# user-text → DB pipeline as titles, so it makes sense to keep all
+# string-shape validators together. Previous incarnations were
+# duplicated across document_service, file_service, table_service, and
+# collection_service with subtly divergent rules; this is the union of
+# all four.
+
+_MAX_PATH_BYTES = 1024
+
+
+def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> str:
+    """Canonical collection-path normalizer.
+
+    Rules:
+      - Strip whitespace + leading/trailing slashes.
+      - Collapse duplicate slashes (via split/join).
+      - Reject `.`, `..`, empty segments (path traversal).
+      - Reject NUL, backslash, and control characters (ord < 32).
+      - Reject paths longer than 1 KiB encoded (`_MAX_PATH_BYTES`).
+
+    Returns "" for empty / None input when `allow_empty=True`
+    (== vault root). When `allow_empty=False`, an empty input raises
+    `ValueError` — used by callers that demand a named collection
+    (e.g. `akb_create_collection`).
+    """
+    if path is None or path == "":
+        if allow_empty:
+            return ""
+        raise ValueError("collection path is empty")
+    if not isinstance(path, str):
+        raise ValueError("collection path must be a string")
+
+    normalized = path.strip().strip("/")
+    if not normalized:
+        if allow_empty:
+            return ""
+        raise ValueError("collection path is empty")
+
+    if len(normalized.encode("utf-8")) > _MAX_PATH_BYTES:
+        raise ValueError("collection path is too long")
+
+    parts: list[str] = []
+    for raw in normalized.split("/"):
+        if raw in ("", ".", ".."):
+            raise ValueError(
+                f"Invalid collection path: '{path}'. "
+                "Empty / '.' / '..' segments are not allowed."
+            )
+        if "\x00" in raw or "\\" in raw or any(ord(c) < 32 for c in raw):
+            raise ValueError(
+                f"Invalid character in collection path: '{path}'"
+            )
+        parts.append(raw)
+    return "/".join(parts)

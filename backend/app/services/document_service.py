@@ -107,32 +107,7 @@ class EditError(AKBError):
         super().__init__(message, status_code=400)
 
 
-def _normalize_collection(collection: str) -> str:
-    """Normalize and validate a collection path.
-
-    - Strips leading/trailing slashes
-    - Collapses multiple slashes
-    - Rejects '..' segments (path traversal)
-    - Rejects absolute paths
-    - Returns "" for empty/root
-    """
-    if not collection:
-        return ""
-    # Strip leading/trailing slashes
-    normalized = collection.strip().strip("/")
-    if not normalized:
-        return ""
-    # Reject path traversal
-    parts = [p for p in normalized.split("/") if p]
-    for part in parts:
-        if part == ".." or part == ".":
-            raise ValueError(
-                f"Invalid collection path: '{collection}'. "
-                "Path traversal segments ('.', '..') are not allowed."
-            )
-        if "\x00" in part or "/" in part or "\\" in part:
-            raise ValueError(f"Invalid character in collection path: '{collection}'")
-    return "/".join(parts)
+from app.util.text import normalize_collection_path as _normalize_collection
 
 
 def _slugify(title: str) -> str:
@@ -222,7 +197,11 @@ class DocumentService:
         logger.info("Document created: %s (commit: %s)", file_path, commit_hash[:8])
 
         # DB
-        collection_id = await coll_repo.get_or_create(vault_id, req.collection)
+        # Use the *normalized* path so the `collections` row's `path`
+        # matches the document's stored `path`. Passing the raw
+        # `req.collection` here would create rows with leading/trailing
+        # slashes or whitespace, diverging from the doc path under it.
+        collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
         metadata = {**(req.metadata or {}), "id": doc_id}
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
