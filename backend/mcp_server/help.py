@@ -1640,6 +1640,9 @@ akb_unlink(vault="eng",
   target="akb://eng/table/endpoints")  # removes ALL relations
 ```""",
 
+    # ── Vault skill ───────────────────────────────────────────
+    "vault-skill": None,  # populated after VAULT_SKILL_TOPIC_BODY is defined below
+
 }
 
 
@@ -1683,6 +1686,89 @@ def _resolve_help(topic: str | None) -> str:
 **Tools:** {", ".join(sorted(tools))}
 
 Use `akb_help(topic="...")` with any of the above."""
+
+
+# ── Vault skill router ────────────────────────────────────
+
+VAULT_SKILL_PATH = "overview/vault-skill.md"
+
+VAULT_SKILL_TOPIC_BODY = """# Vault skill
+
+Each AKB vault can declare its writing conventions in a `vault-skill` document
+at `overview/vault-skill.md`. Agents read it via:
+
+    akb_help(topic="vault-skill", vault="<vault>")
+
+The doc is a normal AKB document with `type="skill"`. The vault owner edits it
+with regular AKB tools (akb_edit / akb_update). New vaults receive a starter
+template at creation time.
+
+If a vault has no vault-skill yet, the owner can create one with:
+
+    akb_put(
+      vault="<vault>",
+      collection="overview",
+      title="Vault Skill",
+      type="skill",
+      content="<see template in this topic body>",
+    )
+
+When no vault has a custom skill, agents follow these fallback rules:
+- akb_browse before writing to learn the existing collection layout
+- akb_search / akb_grep before writing to avoid duplicates
+- Never inline secrets; use ${secrets.X} placeholders
+"""
+
+# Patch the HELP dict now that the constant is defined
+HELP["vault-skill"] = VAULT_SKILL_TOPIC_BODY
+
+
+_MISSING_FALLBACK = """No `overview/vault-skill.md` found in this vault.
+
+The vault owner can create one with:
+
+    akb_put(
+      vault="{vault}",
+      collection="overview",
+      title="Vault Skill",
+      type="skill",
+      content="<see akb_help(topic='vault-skill') for the template>",
+    )
+
+Until then, follow general AKB conventions:
+- akb_browse before writing to learn the existing collection layout
+- akb_search / akb_grep before writing to avoid duplicates
+- Never inline secrets; use ${{secrets.X}} placeholders
+"""
+
+
+async def render_vault_skill_response(vault, fetch_fn):
+    """Render the akb_help(topic='vault-skill', vault?) response.
+
+    Args:
+        vault: Vault name (str) or None.
+        fetch_fn: async callable (vault, doc_id) → dict|None. The dict carries
+            at least 'content'; optional 'commit', 'updated_at' used for the
+            source-attribution header. None means doc not found.
+
+    Returns:
+        Markdown string.
+    """
+    if not vault:
+        return VAULT_SKILL_TOPIC_BODY
+
+    doc = await fetch_fn(vault, VAULT_SKILL_PATH)
+    if doc is None:
+        body = _MISSING_FALLBACK.format(vault=vault)
+        return f"# Vault skill for {vault}\n\n{body}"
+
+    version = doc.get("commit") or doc.get("updated_at") or "unknown"
+    return (
+        f"# Vault skill for {vault}\n"
+        f"<!-- akb-skill-source -->\n\n"
+        f"Source: vault owner ({VAULT_SKILL_PATH}, version {version})\n\n"
+        f"{doc['content']}"
+    )
 
 
 # ── Tool Handlers ────────────────────────────────────────────

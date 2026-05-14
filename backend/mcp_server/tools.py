@@ -917,6 +917,10 @@ TOOLS = [
                         "or workflow names (link-documents, research, onboarding, data-tracking)"
                     ),
                 },
+                "vault": {
+                    "type": "string",
+                    "description": "Vault name. Required for topic='vault-skill' — returns that vault's skill doc body if it exists.",
+                },
             },
         },
     ),

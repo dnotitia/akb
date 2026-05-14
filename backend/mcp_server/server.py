@@ -119,6 +119,20 @@ def _h(name: str):
 @_h("akb_help")
 async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     topic = args.get("topic")
+    vault = args.get("vault")
+    if topic == "vault-skill" and vault:
+        from mcp_server.help import render_vault_skill_response, VAULT_SKILL_PATH
+        async def _fetch(v, doc_id):
+            row = await _find_doc(v, doc_id)
+            if row is None:
+                return None
+            # NB: DB column is `current_commit`, not `commit_hash`.
+            return {
+                "content": row.get("content", ""),
+                "commit": row.get("current_commit"),
+                "updated_at": str(row.get("updated_at", "")),
+            }
+        return {"help": await render_vault_skill_response(vault, _fetch)}
     return {"help": _resolve_help(topic)}
 
 
