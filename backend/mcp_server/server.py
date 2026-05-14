@@ -50,6 +50,7 @@ from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.tools import TOOLS
 from mcp_server.help import HELP, _resolve_help
+from mcp_server.instructions import INSTRUCTIONS
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -68,7 +69,7 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
 
 session_service = SessionService()
 
-server = Server("akb")
+server = Server("akb", instructions=INSTRUCTIONS)
 
 
 class _MCPUser:
