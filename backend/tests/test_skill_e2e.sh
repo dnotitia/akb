@@ -189,7 +189,9 @@ mcp akb_delete_vault "{\"name\":\"$SEARCH_VAULT\"}" >/dev/null 2>&1
 # ── 6. doc_type='skill' is queryable ────────────────────────
 echo "▸ 6. akb_search supports type='skill'"
 
-S1=$(mcp akb_search "{\"vault\":\"$VAULT\",\"query\":\"vault\",\"type\":\"skill\"}" | mcp_text)
+# Wait for async chunk + BM25/vector indexing to settle on the edited vault-skill.
+sleep 8
+S1=$(mcp akb_search "{\"vault\":\"$VAULT\",\"query\":\"Document types\",\"type\":\"skill\"}" | mcp_text)
 echo "$S1" | grep -q "overview/vault-skill.md" \
   && pass "type=skill filter accepts and matches" \
   || fail "T6.1" "search with type=skill did not return the skill doc"
