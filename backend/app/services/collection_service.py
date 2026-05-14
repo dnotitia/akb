@@ -68,31 +68,20 @@ class CollectionNotEmptyError(Exception):
         self.sub_collection_count = sub_collection_count
 
 
-_MAX_PATH_BYTES = 1024
-
-
 def _normalize_path(path: str) -> str:
-    """Normalize and validate a collection path.
-
-    Strips surrounding whitespace and leading/trailing slashes, then
-    inspects each remaining segment. The rules mirror
-    `_normalize_collection` in `document_service` (no empty / `.` / `..`
-    segments, no control characters) so collection paths produced here
-    are interchangeable with those a `put` call would generate.
+    """Validate a non-empty collection path via the canonical normalizer
+    in `app.util.text`. Wraps the generic `ValueError` into the
+    domain-specific `InvalidPathError` so the HTTP layer can map it to
+    a 400 without leaking implementation details. Empty input is
+    rejected here (collection-management endpoints demand a named
+    target) while service callers that treat empty as "vault root"
+    keep using the helper with `allow_empty=True`.
     """
-    if not isinstance(path, str):
-        raise InvalidPathError("path must be a string")
-    s = path.strip().strip("/")
-    if not s:
-        raise InvalidPathError("path is empty")
-    if len(s.encode("utf-8")) > _MAX_PATH_BYTES:
-        raise InvalidPathError("path is too long")
-    for seg in s.split("/"):
-        if seg in ("", ".", ".."):
-            raise InvalidPathError(f"invalid path segment: {seg!r}")
-        if any(ord(ch) < 32 for ch in seg):
-            raise InvalidPathError("control characters not allowed")
-    return s
+    from app.util.text import normalize_collection_path
+    try:
+        return normalize_collection_path(path, allow_empty=False)
+    except ValueError as exc:
+        raise InvalidPathError(str(exc)) from exc
 
 
 class CollectionService:

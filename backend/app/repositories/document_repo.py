@@ -429,17 +429,25 @@ class CollectionRepository:
         path: str,
         conn=None,
     ) -> list[dict]:
-        """Return vault_files whose `collection` equals `path` exactly or
-        starts with `{path}/`. Covers the folder itself plus every
-        descendant — used by cascade delete to enqueue S3 cleanup."""
+        """Return vault_files whose collection path equals `path` exactly
+        or starts with `{path}/`. Covers the folder itself plus every
+        descendant — used by cascade delete to enqueue S3 cleanup.
+
+        Implementation joins `collections` on the new `collection_id`
+        FK (migration 020). Pre-migration callers that relied on the
+        legacy `vault_files.collection` TEXT column are not supported.
+        """
         bare = path.rstrip("/")
         like = self._like_escape(bare) + "/%"
         sql = (
-            "SELECT id, vault_id, collection, name, s3_key, mime_type, "
-            "       size_bytes, description, created_by, created_at, updated_at "
-            "  FROM vault_files "
-            " WHERE vault_id = $1 "
-            "   AND (collection = $2 OR collection LIKE $3 ESCAPE '\\')"
+            "SELECT vf.id, vf.vault_id, vf.collection_id, "
+            "       c.path AS collection, vf.name, vf.s3_key, vf.mime_type, "
+            "       vf.size_bytes, vf.description, vf.created_by, "
+            "       vf.created_at, vf.updated_at "
+            "  FROM vault_files vf "
+            "  JOIN collections c ON c.id = vf.collection_id "
+            " WHERE vf.vault_id = $1 "
+            "   AND (c.path = $2 OR c.path LIKE $3 ESCAPE '\\')"
         )
         async def _do(c):
             rows = await c.fetch(sql, vault_id, bare, like)

@@ -16,6 +16,7 @@ class CreateTableRequest(NFCModel):
     name: str
     description: str = ""
     columns: list[dict]
+    collection: str | None = None
 
 
 class SqlRequest(NFCModel):
@@ -29,6 +30,7 @@ async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedU
     return await table_service.create_table(
         access["vault_id"], req.name, req.columns,
         actor_id=user.username, description=req.description,
+        collection=req.collection,
     )
 
 

@@ -107,32 +107,7 @@ class EditError(AKBError):
         super().__init__(message, status_code=400)
 
 
-def _normalize_collection(collection: str) -> str:
-    """Normalize and validate a collection path.
-
-    - Strips leading/trailing slashes
-    - Collapses multiple slashes
-    - Rejects '..' segments (path traversal)
-    - Rejects absolute paths
-    - Returns "" for empty/root
-    """
-    if not collection:
-        return ""
-    # Strip leading/trailing slashes
-    normalized = collection.strip().strip("/")
-    if not normalized:
-        return ""
-    # Reject path traversal
-    parts = [p for p in normalized.split("/") if p]
-    for part in parts:
-        if part == ".." or part == ".":
-            raise ValueError(
-                f"Invalid collection path: '{collection}'. "
-                "Path traversal segments ('.', '..') are not allowed."
-            )
-        if "\x00" in part or "/" in part or "\\" in part:
-            raise ValueError(f"Invalid character in collection path: '{collection}'")
-    return "/".join(parts)
+from app.util.text import normalize_collection_path as _normalize_collection
 
 
 def _slugify(title: str) -> str:
@@ -222,7 +197,11 @@ class DocumentService:
         logger.info("Document created: %s (commit: %s)", file_path, commit_hash[:8])
 
         # DB
-        collection_id = await coll_repo.get_or_create(vault_id, req.collection)
+        # Use the *normalized* path so the `collections` row's `path`
+        # matches the document's stored `path`. Passing the raw
+        # `req.collection` here would create rows with leading/trailing
+        # slashes or whitespace, diverging from the doc path under it.
+        collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
         metadata = {**(req.metadata or {}), "id": doc_id}
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
@@ -635,6 +614,14 @@ class DocumentService:
     # ── Browse ────────────────────────────────────────────────
 
     async def browse(self, vault: str, collection: str | None = None, depth: int = 1, content_type: str = "all") -> BrowseResponse:
+        """Unified vault browse.
+
+        - `collection=None`  → top-level: collections + ROOT docs/tables/files
+          (resources whose `collection_id IS NULL`).
+        - `collection="X"`   → docs/tables/files whose `collection_id` matches
+          collection `X`. Subcollection nesting is left to the frontend tree
+          to assemble from the flat collection list.
+        """
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(vault)
@@ -650,11 +637,24 @@ class DocumentService:
         items: list[BrowseItem] = []
 
         if collection:
+            coll_id = await self._resolve_collection_id(vault_id, collection)
             if show_docs:
                 items.extend(await self._browse_docs_in_collection(doc_repo, vault, vault_id, collection))
+            if show_tables:
+                items.extend(await self._browse_tables(
+                    vault, vault_id, collection_id=coll_id, scoped=True,
+                ))
             if show_files:
-                items.extend(await self._browse_files(vault, vault_id, collection=collection))
+                items.extend(await self._browse_files(
+                    vault, vault_id, collection_id=coll_id, scoped=True,
+                ))
         else:
+            # Top-level browse returns the full picture: every collection,
+            # every doc (paths encode their collection), and every table /
+            # file with its `collection` attribute. The frontend tree
+            # builder then groups tables/files under their collection
+            # without a second round-trip. Scoped queries happen only when
+            # the caller explicitly passes `collection=`.
             if show_docs:
                 items.extend(await self._browse_collections(doc_repo, coll_repo, vault, vault_id, depth))
             if show_tables:
@@ -664,6 +664,19 @@ class DocumentService:
 
         hint = self._browse_hint(vault, collection, items)
         return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
+
+    async def _resolve_collection_id(self, vault_id, collection_path: str):
+        """Resolve a path to its `collections.id`. Returns None if the
+        collection row doesn't exist yet (e.g. browsing a path that
+        no resource has been put into). Caller treats None as "no
+        scoped resources here"."""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                vault_id, collection_path,
+            )
+        return row["id"] if row else None
 
     async def _browse_docs_in_collection(self, doc_repo, vault: str, vault_id, collection: str) -> list[BrowseItem]:
         rows = await doc_repo.list_by_collection(vault_id, collection)
@@ -699,15 +712,23 @@ class DocumentService:
                 ))
         return items
 
-    async def _browse_tables(self, vault: str, vault_id) -> list[BrowseItem]:
-        import json as _json
+    async def _browse_tables(
+        self,
+        vault: str,
+        vault_id,
+        *,
+        collection_id=None,
+        scoped: bool = False,
+    ) -> list[BrowseItem]:
+        """List tables. With `scoped=True`, only tables whose
+        `collection_id` matches (NULL = vault root)."""
+        from app.repositories import table_registry_repo
         items: list[BrowseItem] = []
         pool = await get_pool()
         async with pool.acquire() as conn:
             vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
-            table_rows = await conn.fetch(
-                "SELECT id, name, description, columns, created_at FROM vault_tables WHERE vault_id = $1 ORDER BY name",
-                vault_id,
+            table_rows = await table_registry_repo.list_for_vault(
+                conn, vault_id, collection_id=collection_id, scoped=scoped,
             )
             for r in table_rows:
                 pg_name = table_data_repo.pg_table_name(vault_row["name"], r["name"])
@@ -721,29 +742,37 @@ class DocumentService:
                     uri=table_uri(vault, r["name"]),
                     summary=r["description"], row_count=row_count,
                     columns=cols,
+                    collection=r.get("collection"),
                     last_updated=r["created_at"],
                 ))
         return items
 
-    async def _browse_files(self, vault: str, vault_id, collection: str | None = None) -> list[BrowseItem]:
+    async def _browse_files(
+        self,
+        vault: str,
+        vault_id,
+        *,
+        collection_id=None,
+        scoped: bool = False,
+    ) -> list[BrowseItem]:
+        from app.repositories import vault_files_repo
         pool = await get_pool()
         async with pool.acquire() as conn:
-            if collection:
-                rows = await conn.fetch(
-                    "SELECT id, name, mime_type, size_bytes, description, created_at FROM vault_files WHERE vault_id = $1 AND collection = $2 ORDER BY created_at DESC",
-                    vault_id, collection,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, collection, name, mime_type, size_bytes, description, created_at FROM vault_files WHERE vault_id = $1 ORDER BY collection, created_at DESC",
-                    vault_id,
-                )
+            rows = await vault_files_repo.list_for_vault(
+                conn, vault_id,
+                collection_id=collection_id, scoped=scoped,
+                # Browse renders the full list — don't apply a 50-row
+                # cap silently. If this turns into a performance issue
+                # we can paginate at the route layer.
+                limit=10_000,
+            )
         return [
             BrowseItem(
                 name=r["name"], path=f"_files/{r['id']}", type="file",
                 uri=file_uri(vault, str(r["id"])),
                 file_id=str(r["id"]), mime_type=r["mime_type"],
                 size_bytes=r["size_bytes"], summary=r["description"],
+                collection=r.get("collection"),
                 last_updated=r["created_at"],
             )
             for r in rows
