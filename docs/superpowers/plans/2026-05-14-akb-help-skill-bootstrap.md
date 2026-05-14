@@ -103,9 +103,9 @@ AKB stores documents/tables/files in vaults. Before writing into a vault:
 - [ ] **Step 1.1: Inspect current enum sites**
 
 ```bash
-grep -n '"reference"' backend/mcp_server/tools.py backend/app/models/document.py backend/app/services/metadata_worker.py
+grep -n 'reference' backend/mcp_server/tools.py backend/app/models/document.py backend/app/services/metadata_worker.py
 ```
-Expected: 3 hits, one per file, each ending with `"reference"`.
+Expected: matches in all three files — two enums in `tools.py`, the `_DOC_TYPES` set in `metadata_worker.py`, and a comment string in `document.py:17` (the field itself is plain `str`, no `Literal` alias).
 
 - [ ] **Step 1.2: Edit `backend/mcp_server/tools.py:73` — `akb_put` type enum**
 
@@ -122,15 +122,15 @@ Replace with:
 
 Same edit (append `"skill"`).
 
-- [ ] **Step 1.4: Edit `backend/app/models/document.py:17`**
+- [ ] **Step 1.4: Update the `document.py:17` comment**
 
-Find the Literal type alias (around line 17):
+The field is plain `str` (no `Literal` alias, no enforcement at this layer — validation happens at the MCP schema). Just keep the comment in sync as documentation. Find:
 ```python
-DocType = Literal["note", "report", "decision", "spec", "plan", "session", "task", "reference"]
+    type: str = "note"  # note, report, decision, spec, plan, session, task, reference
 ```
-Append `"skill"`:
+Append `, skill`:
 ```python
-DocType = Literal["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"]
+    type: str = "note"  # note, report, decision, spec, plan, session, task, reference, skill
 ```
 
 - [ ] **Step 1.5: Edit `backend/app/services/metadata_worker.py:38`**
@@ -144,17 +144,17 @@ Append `"skill"`:
 _DOC_TYPES = {"note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"}
 ```
 
-- [ ] **Step 1.6: Smoke check — Python import + Pydantic model**
-
-```bash
-cd backend && python -c "from app.models.document import DocType; print(DocType.__args__)"
-```
-Expected output ends with `'skill')`.
+- [ ] **Step 1.6: Smoke check — Python import + module load**
 
 ```bash
 cd backend && python -c "from app.services.metadata_worker import _DOC_TYPES; print(sorted(_DOC_TYPES))"
 ```
 Expected output includes `'skill'`.
+
+```bash
+cd backend && python -c "from mcp_server.tools import TOOLS; akb_put = next(t for t in TOOLS if t.name == 'akb_put'); print(akb_put.inputSchema['properties']['type']['enum'])"
+```
+Expected output ends with `'skill']`.
 
 - [ ] **Step 1.7: Commit**
 
