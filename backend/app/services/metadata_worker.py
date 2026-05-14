@@ -35,7 +35,7 @@ logger = logging.getLogger("akb.metadata_worker")
 BATCH_SIZE = 4
 MAX_BODY_CHARS = 6000  # truncate very long docs before sending to the LLM
 
-_DOC_TYPES = {"note", "report", "decision", "spec", "plan", "session", "task", "reference"}
+_DOC_TYPES = {"note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"}
 
 _SYSTEM_PROMPT = (
     "You are a metadata extractor for a technical knowledge base. "

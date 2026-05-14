@@ -14,7 +14,7 @@ class DocumentFrontmatter(NFCModel):
 
     id: str | None = None
     title: str
-    type: str = "note"  # note, report, decision, spec, plan, session, task, reference
+    type: str = "note"  # note, report, decision, spec, plan, session, task, reference, skill
     status: str = "draft"  # draft, active, archived, superseded
     created_by: str | None = None
     created_at: datetime | None = None

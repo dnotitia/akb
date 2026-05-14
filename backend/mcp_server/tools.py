@@ -70,7 +70,7 @@ TOOLS = [
                 "type": {
                     "type": "string",
                     "description": "Document type",
-                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference"],
+                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
                     "default": "note",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
@@ -211,7 +211,7 @@ TOOLS = [
                 "type": {
                     "type": "string",
                     "description": "Filter by document type",
-                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference"],
+                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags"},
                 "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
