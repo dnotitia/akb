@@ -43,7 +43,7 @@ interface RenderEdge {
 }
 
 const NODE_SIZE = 16;
-const LABEL_ZOOM_THRESHOLD = 0.5;
+const LABEL_ZOOM_THRESHOLD = 0.3;
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCanvas(
   {
@@ -59,6 +59,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   ref,
 ) {
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
+  const fittedRef = useRef(false);
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
   const [frozen, setFrozen] = useState(false);
@@ -90,6 +91,17 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       fg.resumeAnimation();
     }
   }, [degraded, frozen]);
+
+  // Auto fit-to-view once when nodes first populate
+  useEffect(() => {
+    if (fittedRef.current) return;
+    if (nodes.length === 0) return;
+    const t = setTimeout(() => {
+      fgRef.current?.zoomToFit(400, 60);
+      fittedRef.current = true;
+    }, 500);
+    return () => clearTimeout(t);
+  }, [nodes.length]);
 
   const visibleNodes = useMemo(
     () => nodes.filter((n) => !hidden.has(n.uri)),
@@ -144,6 +156,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       if (isPinned) {
         ctx.fillStyle = colors.accent;
         ctx.fillRect(x + NODE_SIZE / 2 - 3, y - NODE_SIZE / 2, 3, 3);
+      }
+
+      if (scale > 0.6) {
+        const glyph = n.kind === "document" ? "D" : n.kind === "table" ? "T" : "F";
+        ctx.font = `bold 8px ui-monospace, SFMono-Regular, monospace`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = colors.foregroundMuted;
+        ctx.fillText(glyph, x, y);
       }
 
       if (scale > LABEL_ZOOM_THRESHOLD) {
@@ -212,7 +233,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   }, []);
 
   return (
-    <div className="absolute inset-0">
+    <div
+      className="absolute inset-0"
+      role="img"
+      aria-label={`Knowledge graph: ${nodes.length} nodes, ${edges.length} edges`}
+    >
       <div className="absolute top-3 left-3 z-10 flex gap-1">
         <CanvasButton
           onClick={() => setFrozen((f) => !f)}
@@ -278,7 +303,7 @@ function CanvasButton({
       onClick={onClick}
       title={label}
       aria-label={label}
-      className="inline-flex items-center justify-center h-6 w-6 bg-surface border border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer"
+      className="inline-flex items-center justify-center h-8 w-8 bg-surface border border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer"
     >
       <Icon className="h-3 w-3" aria-hidden />
     </button>

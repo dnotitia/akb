@@ -97,7 +97,7 @@ export function GraphDetailPanel({
 
       <div className="px-3 py-3 border-b border-border">
         <h2 className="font-serif text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
-        <p className="coord text-foreground-muted truncate">{uri}</p>
+        <p className="coord text-foreground-muted truncate" title={uri}>{uri}</p>
         <div className="flex flex-wrap gap-1 mt-3">
           <Button size="sm" variant="accent" onClick={openDoc}>
             <ExternalLink className="h-3 w-3" /> Open
@@ -106,7 +106,7 @@ export function GraphDetailPanel({
             Copy URI
           </Button>
           {onTogglePin && (
-            <Button size="sm" variant={pinned ? "accent" : "outline"} onClick={onTogglePin}>
+            <Button size="sm" variant={pinned ? "accent" : "outline"} onClick={onTogglePin} aria-pressed={!!pinned}>
               <Pin className="h-3 w-3" /> {pinned ? "Pinned" : "Pin"}
             </Button>
           )}
@@ -214,6 +214,7 @@ export function GraphDetailPanel({
             className="coord hover:text-foreground inline-flex items-center gap-1"
           >
             {metaOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            {metaOpen ? "hide metadata" : "show metadata"}
           </button>
         }
       >

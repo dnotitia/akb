@@ -161,9 +161,21 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
       </Section>
 
       <Section label="DEPTH" className="px-2">
-        <div className="flex items-center gap-3">
+        <div
+          className={cn(
+            "flex items-center gap-3 text-[11px]",
+            !view.entry && "opacity-50",
+          )}
+          aria-disabled={!view.entry}
+        >
           {([1, 2, 3] as const).map((d) => (
-            <label key={d} className="inline-flex items-center gap-1 text-[11px] cursor-pointer">
+            <label
+              key={d}
+              className={cn(
+                "inline-flex items-center gap-1",
+                view.entry ? "cursor-pointer" : "cursor-not-allowed",
+              )}
+            >
               <input
                 type="radio"
                 name="depth"
@@ -176,6 +188,11 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
             </label>
           ))}
         </div>
+        {!view.entry && (
+          <p className="coord text-foreground-muted mt-2">
+            Set an entry point to enable
+          </p>
+        )}
       </Section>
 
       <Section label="TYPES" className="px-2">
@@ -188,10 +205,10 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "px-1.5 py-0.5 border font-mono text-[10px] uppercase tracking-[0.12em]",
+                "inline-flex items-center h-7 px-2 border font-mono text-[10px] uppercase tracking-[0.12em]",
                 view.types.has(k)
                   ? "border-foreground text-foreground"
-                  : "border-border text-foreground-muted opacity-50",
+                  : "border-border text-foreground-muted opacity-70",
               )}
             >
               {k}
@@ -210,10 +227,10 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
               aria-label={`Toggle ${r}`}
               aria-pressed={view.relations.has(r)}
               className={cn(
-                "px-1.5 py-0.5 border font-mono text-[10px] uppercase tracking-[0.12em] text-left",
+                "inline-flex items-center h-7 px-2 border font-mono text-[10px] uppercase tracking-[0.12em] text-left",
                 view.relations.has(r)
                   ? "border-foreground text-foreground"
-                  : "border-border text-foreground-muted opacity-50",
+                  : "border-border text-foreground-muted opacity-70",
               )}
             >
               {r}
@@ -242,7 +259,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
                 <button
                   type="button"
                   onClick={() => onChange({ ...view, entry: r.doc_id })}
-                  className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-muted truncate"
+                  className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:bg-accent/10 active:text-foreground truncate"
                 >
                   {r.title}
                 </button>
@@ -297,7 +314,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
                 <button
                   type="button"
                   onClick={() => onNavigate(s.url)}
-                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-muted truncate"
+                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:opacity-60 transition-opacity duration-150 truncate"
                 >
                   {s.name}
                 </button>

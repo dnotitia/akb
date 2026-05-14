@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
+import { Button } from "@/components/ui/button";
 import { GraphCanvas, type GraphCanvasHandle } from "@/components/graph/GraphCanvas";
 import { GraphSidebar } from "@/components/graph/GraphSidebar";
 import { GraphDetailPanel } from "@/components/graph/GraphDetailPanel";
@@ -75,8 +76,9 @@ export default function GraphPage() {
       return;
     }
     lastClickRef.current = uri ? { uri, at: Date.now() } : null;
-    if (uri === view.selected) return;
-    setView({ ...view, selected: uri });
+    const sel = uri ? (docIdFromUri(uri) ?? uri) : undefined;
+    if (sel === view.selected) return;
+    setView({ ...view, selected: sel });
   }
 
   function handleDoubleClick(node: GraphNode) {
@@ -92,7 +94,12 @@ export default function GraphPage() {
   }
 
   const selectedNode = view.selected
-    ? merged.nodes.find((n) => n.uri === view.selected)
+    ? merged.nodes.find(
+        (n) =>
+          n.uri === view.selected ||
+          n.doc_id === view.selected ||
+          docIdFromUri(n.uri) === view.selected,
+      )
     : undefined;
   const selectedDocId = selectedNode ? (selectedNode.doc_id || docIdFromUri(selectedNode.uri)) : null;
   const detailOpen = !!selectedNode && !!selectedDocId;
@@ -129,7 +136,7 @@ export default function GraphPage() {
           type="button"
           onClick={() => setSidebarOpen((v) => !v)}
           aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-          className="absolute top-3 right-3 z-10 h-6 w-6 inline-flex items-center justify-center bg-surface border border-border text-foreground-muted hover:text-foreground"
+          className="absolute top-3 right-3 z-10 h-8 w-8 inline-flex items-center justify-center bg-surface border border-border text-foreground-muted hover:text-foreground"
         >
           {sidebarOpen ? <PanelLeftClose className="h-3 w-3" /> : <PanelLeftOpen className="h-3 w-3" />}
         </button>
@@ -143,7 +150,19 @@ export default function GraphPage() {
         {loading ? (
           <div className="p-8"><Skeleton className="h-64 w-full" /></div>
         ) : error ? (
-          <EmptyState title="Failed to load graph" description={String(error)} />
+          <EmptyState
+            title="Failed to load graph"
+            description={String(error)}
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => (view.entry ? neighborQuery.refetch() : fullQuery.refetch())}
+              >
+                Retry
+              </Button>
+            }
+          />
         ) : merged.nodes.length === 0 ? (
           <EmptyState title="Empty graph" description="No relations match the current filters." />
         ) : (
@@ -167,7 +186,10 @@ export default function GraphPage() {
           docId={selectedDocId}
           kind={selectedNode.kind}
           uri={selectedNode.uri}
-          onSelectUri={(uri) => setView({ ...view, selected: uri })}
+          onSelectUri={(uri) => {
+            const sel = docIdFromUri(uri) ?? uri;
+            setView({ ...view, selected: sel });
+          }}
           onFitToNode={(uri) => canvasRef.current?.centerOnNode(uri)}
           onClose={() => setView({ ...view, selected: undefined })}
           onTogglePin={() => {
