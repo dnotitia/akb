@@ -13,6 +13,53 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 
+VAULT_SKILL_SEED_TEMPLATE = """# {vault} Vault Skill
+
+> Edit this document to describe how agents should write into this vault.
+> Until you do, it acts as the AKB-default template — agents fall back to
+> general AKB conventions (browse before write, no inline secrets, etc.).
+
+## Purpose
+
+(Describe what this vault is for and what it is not for. One paragraph.)
+
+## Document types
+
+Use these types when writing documents. Skip the rest unless the body explicitly calls for them.
+
+- note — lightweight record
+- report — synthesized analysis
+- decision — durable decision with rationale
+- spec — technical or product specification
+- plan — future work
+- session — agent session record
+- task — assignment
+- reference — stable reference material
+
+## Tag conventions
+
+- topic:<slug> — concept grouping
+- source:<system> — imported source family
+- area:<slug> — organizational area
+
+## Collections
+
+(Optional — list collections and their write policy here. Vault owner can
+free-form this section. Agents read it as context, not a hard schema.)
+
+## Relation rules
+
+- depends_on — one resource cannot be understood without another
+- references — background citation
+- derived_from — generated/curated work depends on source material
+
+## Do not
+
+- Inline secrets in bodies; use ${secrets.X} placeholders
+- Edit auto-generated docs without checking provenance
+"""
+
+
 def _safe_remote_host(url: str) -> str:
     """Redact userinfo (potential PAT) before logging. Only the hostname
     is retained since the rest of the URL can leak credentials when the
@@ -732,7 +779,7 @@ class DocumentService:
         public_access: str = "none",
         external_git: dict | None = None,
     ) -> str:
-        vault_repo, _, coll_repo = await self._repos()
+        vault_repo, doc_repo, coll_repo = await self._repos()
 
         # Validate vault name: lowercase, hyphens, digits only, non-empty.
         # Raise ValidationError (422) rather than bare ValueError (500).
@@ -809,6 +856,48 @@ class DocumentService:
             )
             if template:
                 await self._apply_template(name, vault_id, template, coll_repo)
+            # Seed overview/vault-skill.md so every non-mirror vault carries a starter
+            # skill doc. The vault owner edits this later via akb_edit/akb_update; agents
+            # read it via akb_help(topic="vault-skill", vault=...).
+            #
+            # Unlike `_apply_template` which writes only git (the existing collection-level
+            # `_guide.md` files are not reachable via akb_get because no DB row is created),
+            # the vault-skill seed writes BOTH git AND a documents row so akb_get /
+            # akb_browse / akb_search can find it.
+            if not external_git:  # mirror vaults are read-only
+                skill_body = VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", name)
+                skill_path = "overview/vault-skill.md"
+                now = datetime.now(timezone.utc)
+
+                # 1) git commit — capture commit hash for the document row
+                commit_hash = await asyncio.to_thread(
+                    self.git.commit_file,
+                    vault_name=name,
+                    file_path=skill_path,
+                    content=skill_body,
+                    message="[init] Seed vault-skill.md",
+                )
+
+                # 2) Ensure overview collection exists (templates may not have created it)
+                overview_coll_id, _, _, _, _ = await coll_repo.create_empty(vault_id, "overview")
+
+                # 3) Insert document row
+                short_id = f"d-{uuid.uuid4().hex[:8]}"
+                await doc_repo.create(
+                    vault_id=vault_id,
+                    collection_id=overview_coll_id,
+                    path=skill_path,
+                    title=f"{name} Vault Skill",
+                    doc_type="skill",
+                    status="active",
+                    summary=None,
+                    domain=None,
+                    created_by=str(owner_id) if owner_id else None,
+                    now=now,
+                    commit_hash=commit_hash,
+                    tags=["akb:skill"],
+                    metadata={"id": short_id},
+                )
         except BaseException:
             try:
                 await asyncio.to_thread(self.git.cleanup_vault_dirs, name)
