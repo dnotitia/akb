@@ -5,7 +5,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { getDocument, getRelations, getProvenance, drillDown } from "@/lib/api";
-import { type NodeKind, type RelationKind } from "./graph-types";
+import { ALL_NODE_KINDS, ALL_RELATIONS, type NodeKind, type RelationKind, kindToSegment } from "./graph-types";
+import { Section } from "./Section";
 
 interface Props {
   vault: string;
@@ -35,6 +36,9 @@ interface DocResponse {
 }
 
 const PREVIEW_LINES = 40;
+
+const REL_SET = new Set<string>(ALL_RELATIONS);
+const KIND_SET = new Set<string>(ALL_NODE_KINDS);
 
 export function GraphDetailPanel({
   vault,
@@ -78,15 +82,14 @@ export function GraphDetailPanel({
     groupedRels.outgoing.reduce((s, g) => s + g.rows.length, 0);
 
   function openDoc() {
-    const segment = kind === "table" ? "table" : kind === "file" ? "file" : "doc";
-    const path = `/vault/${vault}/${segment}/${encodeURIComponent(docId)}`;
-    window.location.assign(path);
+    const segment = kindToSegment(kind);
+    window.location.assign(`/vault/${vault}/${segment}/${encodeURIComponent(docId)}`);
   }
 
   return (
     <aside className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface">
       <header className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="coord">{kind || "document"} · {docId}</span>
+        <span className="coord">{kind} · {docId}</span>
         <button onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground">
           <X className="h-3 w-3" />
         </button>
@@ -111,13 +114,13 @@ export function GraphDetailPanel({
       </div>
 
       {doc?.summary && (
-        <Section label="SUMMARY">
+        <Section label="SUMMARY" className="px-3">
           <p className="text-[12px] leading-relaxed text-foreground">{doc.summary}</p>
         </Section>
       )}
 
       {kind === "table" && doc?.columns && (
-        <Section label="COLUMNS">
+        <Section label="COLUMNS" className="px-3">
           <ul className="flex flex-wrap gap-1">
             {doc.columns.map((c) => (
               <li key={c}>
@@ -129,7 +132,7 @@ export function GraphDetailPanel({
       )}
 
       {kind === "file" && (
-        <Section label="FILE">
+        <Section label="FILE" className="px-3">
           <p className="coord">
             {doc?.mime_type || "—"} · {doc?.size_bytes ? `${doc.size_bytes} bytes` : "—"}
           </p>
@@ -137,7 +140,7 @@ export function GraphDetailPanel({
       )}
 
       {doc?.tags && doc.tags.length > 0 && (
-        <Section label="TAGS">
+        <Section label="TAGS" className="px-3">
           <div className="flex flex-wrap gap-1">
             {doc.tags.map((t) => (
               <Badge key={t} variant="outline">{t}</Badge>
@@ -146,7 +149,7 @@ export function GraphDetailPanel({
         </Section>
       )}
 
-      <Section label={`RELATIONS [${totalRels}]`}>
+      <Section label={`RELATIONS [${totalRels}]`} className="px-3">
         {totalRels === 0 ? (
           <p className="coord text-foreground-muted">none</p>
         ) : (
@@ -176,7 +179,7 @@ export function GraphDetailPanel({
       </Section>
 
       {kind === "document" && (
-        <Section label="PREVIEW">
+        <Section label="PREVIEW" className="px-3">
           <button
             type="button"
             onClick={() => setSectionsOpen((v) => !v)}
@@ -201,6 +204,7 @@ export function GraphDetailPanel({
 
       <Section
         label="META"
+        className="px-3"
         rightAction={
           <button
             type="button"
@@ -234,26 +238,6 @@ export function GraphDetailPanel({
   );
 }
 
-function Section({
-  label,
-  rightAction,
-  children,
-}: {
-  label: string;
-  rightAction?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="border-b border-border px-3 py-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="coord">§ {label}</span>
-        {rightAction}
-      </div>
-      {children}
-    </section>
-  );
-}
-
 interface GroupedRel {
   relation: RelationKind;
   rows: Array<{
@@ -269,13 +253,16 @@ function groupRelations(
   const out: Map<string, GroupedRel> = new Map();
   const inc: Map<string, GroupedRel> = new Map();
   for (const r of rows) {
+    if (!REL_SET.has(r.relation)) continue;
     const rel = r.relation as RelationKind;
     const map = r.direction === "outgoing" ? out : inc;
     if (!map.has(rel)) map.set(rel, { relation: rel, rows: [] });
     map.get(rel)!.rows.push({
       other_uri: r.uri,
       other_name: r.name || "(unnamed)",
-      other_type: (r.resource_type as NodeKind) || "document",
+      other_type: KIND_SET.has(r.resource_type ?? "")
+        ? (r.resource_type as NodeKind)
+        : "document",
     });
   }
   return { outgoing: [...out.values()], incoming: [...inc.values()] };

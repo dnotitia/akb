@@ -68,6 +68,10 @@ export function readColors(): GraphColors {
   };
 }
 
+export function kindToSegment(kind: NodeKind): "doc" | "table" | "file" {
+  return kind === "table" ? "table" : kind === "file" ? "file" : "doc";
+}
+
 export const RELATION_DASH: Record<RelationKind, number[]> = {
   depends_on: [],
   implements: [],

@@ -23,7 +23,6 @@ describe("GraphCanvas smoke", () => {
           hidden={new Set()}
           degraded={false}
           onSelect={() => {}}
-          onDoubleClick={() => {}}
           onContextMenu={() => {}}
         />,
       );

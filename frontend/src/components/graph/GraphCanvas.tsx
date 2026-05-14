@@ -23,7 +23,6 @@ interface Props {
   hidden: Set<string>;
   degraded: boolean;
   onSelect: (uri: string | undefined) => void;
-  onDoubleClick: (node: GraphNode) => void;
   onContextMenu: (
     node: GraphNode,
     screenX: number,
@@ -54,7 +53,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     hidden,
     degraded,
     onSelect,
-    onDoubleClick,
     onContextMenu,
   },
   ref,
@@ -77,12 +75,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [nodes],
   );
 
-  // Re-read CSS variables on theme change so paint functions use the right palette.
   useEffect(() => {
     setColors(readColors());
   }, [theme]);
 
-  // When degraded, kill simulation entirely.
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
@@ -188,14 +184,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     onSelect(undefined);
   }, [onSelect]);
 
-  // Kept on public contract; emulated by page shell (Task 6) via click timing.
-  const handleNodeDoubleClick = useCallback(
-    (n: RenderNode) => {
-      onDoubleClick(n);
-    },
-    [onDoubleClick],
-  );
-
   const handleNodeRightClick = useCallback(
     (n: RenderNode, ev: MouseEvent) => {
       // Native context menu remains available until the custom menu lands.
@@ -254,7 +242,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkCanvasObject={paintLink as never}
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
-        linkDirectionalArrowColor={() => colors.foregroundMuted}
+        linkDirectionalArrowColor={colors.foregroundMuted}
         cooldownTicks={degraded ? 0 : 200}
         onNodeClick={handleNodeClick as never}
         onBackgroundClick={handleBackgroundClick}
@@ -267,7 +255,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           }
         }}
       />
-      {/* handleNodeDoubleClick is defined for the public contract; wired by page shell (Task 6) */}
     </div>
   );
 });

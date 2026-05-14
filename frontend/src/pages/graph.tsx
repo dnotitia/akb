@@ -15,7 +15,7 @@ import {
   docIdFromUri,
 } from "@/components/graph/use-graph-data";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
-import { type GraphEdge, type GraphNode, type GraphView } from "@/components/graph/graph-types";
+import { kindToSegment, type GraphEdge, type GraphNode, type GraphView } from "@/components/graph/graph-types";
 
 const DOUBLECLICK_MS = 250;
 
@@ -75,13 +75,14 @@ export default function GraphPage() {
       return;
     }
     lastClickRef.current = uri ? { uri, at: Date.now() } : null;
+    if (uri === view.selected) return;
     setView({ ...view, selected: uri });
   }
 
   function handleDoubleClick(node: GraphNode) {
     const id = node.doc_id || docIdFromUri(node.uri);
     if (!id) return;
-    const segment = node.kind === "table" ? "table" : node.kind === "file" ? "file" : "doc";
+    const segment = kindToSegment(node.kind);
     navigate(`/vault/${vault}/${segment}/${encodeURIComponent(id)}`);
   }
 
@@ -107,7 +108,6 @@ export default function GraphPage() {
         <GraphSidebar
           vault={vault!}
           view={view}
-          currentUrl={"?" + viewToQuery(view)}
           onChange={setView}
           onNavigate={(qs) => {
             navigate({ search: qs.startsWith("?") ? qs : `?${qs}` }, { replace: true });
@@ -156,7 +156,6 @@ export default function GraphPage() {
             hidden={hidden}
             degraded={degraded}
             onSelect={handleSelect}
-            onDoubleClick={handleDoubleClick}
             onContextMenu={handleContextMenu}
           />
         )}

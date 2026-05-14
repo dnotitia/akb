@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { Search as SearchIcon, X } from "lucide-react";
 import { searchDocs } from "@/lib/api";
 import { useGraphHistory } from "@/hooks/use-graph-history";
+import { useDebounce } from "@/hooks/use-debounce";
 import {
   ALL_NODE_KINDS,
   ALL_RELATIONS,
@@ -10,12 +11,13 @@ import {
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
+import { viewToQuery } from "./graph-state";
+import { Section } from "./Section";
 import { cn } from "@/lib/utils";
 
 interface Props {
   vault: string;
   view: GraphView;
-  currentUrl: string; // e.g. "?entry=d-1&depth=2" — used when saving a view
   onChange: (next: GraphView) => void;
   onNavigate: (queryString: string) => void;
 }
@@ -26,19 +28,7 @@ interface SearchHit {
   type: NodeKind;
 }
 
-/** Build a query string from the current GraphView so saved views survive prop drift. */
-function viewToQueryString(view: GraphView, currentUrl: string): string {
-  // If entry is present, build a minimal query string from view state.
-  if (view.entry) {
-    const p = new URLSearchParams();
-    p.set("entry", view.entry);
-    p.set("depth", String(view.depth));
-    return "?" + p.toString();
-  }
-  return currentUrl;
-}
-
-export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: Props) {
+export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
   const { recent, pushRecent, clearRecent, saved, saveView, deleteView } =
     useGraphHistory(vault);
   const [query, setQuery] = useState("");
@@ -50,6 +40,8 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
   // subsequent onBlur double-commit.
   const saveCommittedRef = useRef(false);
 
+  const debouncedQuery = useDebounce(query, 300);
+
   // Focus the input whenever it appears (savingName transitions from null → "").
   useEffect(() => {
     if (savingName !== null) {
@@ -57,17 +49,14 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
     }
   }, [savingName]);
 
-  // Debounced search → /search
   useEffect(() => {
-    if (!query.trim()) {
+    if (!debouncedQuery.trim()) {
       setHits([]);
       return;
     }
     let cancelled = false;
-    const handle = setTimeout(async () => {
-      try {
-        // searchDocs(query, vault?, limit) — order: query first, vault second
-        const resp = await searchDocs(query.trim(), vault, 8);
+    searchDocs(debouncedQuery.trim(), vault, 8)
+      .then((resp) => {
         if (cancelled) return;
         const rows = (resp.results || []).slice(0, 8).map((r: any) => ({
           doc_id: r.doc_id || r.id,
@@ -75,15 +64,10 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
           type: (r.resource_type || r.type || "document") as NodeKind,
         }));
         setHits(rows);
-      } catch {
-        if (!cancelled) setHits([]);
-      }
-    }, 300);
-    return () => {
-      cancelled = true;
-      clearTimeout(handle);
-    };
-  }, [query, vault]);
+      })
+      .catch(() => { if (!cancelled) setHits([]); });
+    return () => { cancelled = true; };
+  }, [debouncedQuery, vault]);
 
   function commitEntry(hit: SearchHit) {
     pushRecent({ doc_id: hit.doc_id, title: hit.title });
@@ -119,8 +103,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
       setSavingName(null);
       return;
     }
-    const url = viewToQueryString(view, currentUrl);
-    saveView(trimmed, url);
+    saveView(trimmed, "?" + viewToQuery(view));
     setSavingName(null);
   }
 
@@ -134,7 +117,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
       className="flex flex-col h-full overflow-y-auto border-r border-border bg-surface"
       aria-label="Graph controls"
     >
-      <Section label="ENTRY POINT">
+      <Section label="ENTRY POINT" className="px-2">
         <div className="relative">
           <SearchIcon className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-foreground-muted pointer-events-none" />
           <input
@@ -177,7 +160,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
         )}
       </Section>
 
-      <Section label="DEPTH">
+      <Section label="DEPTH" className="px-2">
         <div className="flex items-center gap-3">
           {([1, 2, 3] as const).map((d) => (
             <label key={d} className="inline-flex items-center gap-1 text-[11px] cursor-pointer">
@@ -195,7 +178,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
         </div>
       </Section>
 
-      <Section label="TYPES">
+      <Section label="TYPES" className="px-2">
         <div className="flex flex-wrap gap-1">
           {ALL_NODE_KINDS.map((k) => (
             <button
@@ -217,7 +200,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
         </div>
       </Section>
 
-      <Section label="RELATIONS">
+      <Section label="RELATIONS" className="px-2">
         <div className="grid grid-cols-2 gap-1">
           {ALL_RELATIONS.map((r) => (
             <button
@@ -241,6 +224,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
 
       <Section
         label="RECENT"
+        className="px-2"
         rightAction={
           recent.length > 0 ? (
             <button type="button" onClick={clearRecent} className="coord hover:text-foreground">
@@ -270,6 +254,7 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
 
       <Section
         label="SAVED VIEWS"
+        className="px-2"
         rightAction={
           <button
             type="button"
@@ -330,25 +315,5 @@ export function GraphSidebar({ vault, view, currentUrl, onChange, onNavigate }: 
         )}
       </Section>
     </aside>
-  );
-}
-
-function Section({
-  label,
-  rightAction,
-  children,
-}: {
-  label: string;
-  rightAction?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="border-b border-border px-2 py-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="coord">§ {label}</span>
-        {rightAction}
-      </div>
-      {children}
-    </section>
   );
 }

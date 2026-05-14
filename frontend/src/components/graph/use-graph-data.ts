@@ -170,14 +170,16 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   return { nodes: [...nodesByUri.values()], edges };
 }
 
-/* React Query hooks — the consumers used by `pages/graph.tsx`. */
-
 export function useFullGraph(vault: string, enabled: boolean) {
   return useQuery({
     queryKey: ["graph", vault, "full"],
     enabled,
     queryFn: async (): Promise<GraphPayload> => {
-      const resp = await getGraph(vault);
+      // Full mode loads up to 200 nodes; `isDegraded` (>500) is unreachable
+      // today, so 200 is the practical upper bound on full-vault renders.
+      // Truncation is silent — surface "showing first N of M" if it becomes
+      // a real concern.
+      const resp = await getGraph(vault, undefined, 2, 200);
       const nodes: GraphNode[] = resp.nodes.map((n) => ({
         uri: n.uri,
         name: n.name || n.uri,
@@ -202,18 +204,16 @@ export function useNeighborhood(
   return useQuery({
     queryKey: ["graph", vault, "neighborhood", entry, depth],
     enabled: !!entry,
-    queryFn: () => {
-      // `enabled` above guarantees `entry` is defined when this runs.
-      if (!entry) throw new Error("useNeighborhood: entry required");
-      return bfsExpand({
+    queryFn: () =>
+      bfsExpand({
         vault,
-        entry,
+        // `enabled: !!entry` above gates this query; entry is defined here.
+        entry: entry!,
         depth,
         fetchRelations: async (v, docId) => {
           const r = await getRelations(v, docId);
           return { resource_uri: r.resource_uri, relations: r.relations };
         },
-      });
-    },
+      }),
   });
 }

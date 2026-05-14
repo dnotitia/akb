@@ -11,13 +11,11 @@ vi.mock("@/lib/api", () => ({
   searchDocs: vi.fn(),
 }));
 const mockedSearchDocs = vi.mocked(searchDocs);
-// Alias for existing tests
-const searchDocsMock = mockedSearchDocs;
 
 afterEach(cleanup);
 beforeEach(() => {
   localStorage.clear();
-  searchDocsMock.mockReset();
+  mockedSearchDocs.mockReset();
 });
 
 function setup(view: Partial<GraphView> = {}) {
@@ -27,7 +25,6 @@ function setup(view: Partial<GraphView> = {}) {
     <GraphSidebar
       vault="akb"
       view={{ ...DEFAULT_VIEW, ...view }}
-      currentUrl="?"
       onChange={onChange}
       onNavigate={onNavigate}
     />,
@@ -93,12 +90,8 @@ describe("GraphSidebar · saved + recent", () => {
 });
 
 describe("GraphSidebar · entry search", () => {
-  beforeEach(() => {
-    searchDocsMock.mockReset();
-  });
-
   it("debounces, lists hits, and commits the chosen entry", async () => {
-    searchDocsMock.mockResolvedValue({
+    mockedSearchDocs.mockResolvedValue({
       query: "road",
       total: 1,
       results: [
@@ -111,7 +104,6 @@ describe("GraphSidebar · entry search", () => {
       <GraphSidebar
         vault="akb"
         view={DEFAULT_VIEW}
-        currentUrl="?"
         onChange={onChange}
         onNavigate={() => {}}
       />,
@@ -130,9 +122,7 @@ describe("GraphSidebar · entry search", () => {
     expect(stored).toContain("d-1");
     vi.useRealTimers();
   });
-});
 
-describe("GraphSidebar · entry search", () => {
   it("debounces, lists hits, commits the chosen entry, and pushes to recent", async () => {
     mockedSearchDocs.mockResolvedValue({
       query: "road",
@@ -145,7 +135,6 @@ describe("GraphSidebar · entry search", () => {
       <GraphSidebar
         vault="akb"
         view={DEFAULT_VIEW}
-        currentUrl="?"
         onChange={onChange}
         onNavigate={() => {}}
       />,
