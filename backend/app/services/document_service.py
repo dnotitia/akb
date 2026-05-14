@@ -866,38 +866,20 @@ class DocumentService:
             # akb_browse / akb_search can find it.
             if not external_git:  # mirror vaults are read-only
                 skill_body = VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", name)
-                skill_path = "overview/vault-skill.md"
-                now = datetime.now(timezone.utc)
-
-                # 1) git commit — capture commit hash for the document row
-                commit_hash = await asyncio.to_thread(
-                    self.git.commit_file,
-                    vault_name=name,
-                    file_path=skill_path,
+                # Route through the canonical put() so chunks/BM25 indexing,
+                # frontmatter composition, collection-count increment, and the
+                # document.put event all run — fixing I1–I4.
+                # put() calls coll_repo.get_or_create internally, so no
+                # separate create_empty is needed.
+                seed_req = DocumentPutRequest(
+                    vault=name,
+                    collection="overview",
+                    title="Vault Skill",
                     content=skill_body,
-                    message="[init] Seed vault-skill.md",
-                )
-
-                # 2) Ensure overview collection exists (templates may not have created it)
-                overview_coll_id, _, _, _, _ = await coll_repo.create_empty(vault_id, "overview")
-
-                # 3) Insert document row
-                short_id = f"d-{uuid.uuid4().hex[:8]}"
-                await doc_repo.create(
-                    vault_id=vault_id,
-                    collection_id=overview_coll_id,
-                    path=skill_path,
-                    title=f"{name} Vault Skill",
-                    doc_type="skill",
-                    status="active",
-                    summary=None,
-                    domain=None,
-                    created_by=str(owner_id) if owner_id else None,
-                    now=now,
-                    commit_hash=commit_hash,
+                    type="skill",
                     tags=["akb:skill"],
-                    metadata={"id": short_id},
                 )
+                await self.put(seed_req, agent_id=str(owner_id) if owner_id else None)
         except BaseException:
             try:
                 await asyncio.to_thread(self.git.cleanup_vault_dirs, name)

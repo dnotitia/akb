@@ -136,6 +136,30 @@ echo "$GET2" | grep -q '"type": *"skill"' \
   && pass "type=skill preserved across edit" \
   || fail "T5.2" "type changed after update"
 
+# ── 5b. Seeded vault-skill is immediately searchable (no edit required) ────
+echo "▸ 5b. Seeded doc is indexed at create time"
+
+# Create a fresh vault (don't reuse $VAULT which was already edited)
+SEARCH_VAULT="skill-e2e-search-$(date +%s)"
+mcp akb_create_vault "{\"name\":\"$SEARCH_VAULT\",\"description\":\"e2e search\"}" >/dev/null
+
+# Wait a moment for async indexing to complete
+sleep 2
+
+# akb_grep should find the seeded body (chunks indexed)
+GREP_RESP=$(mcp akb_grep "{\"vault\":\"$SEARCH_VAULT\",\"pattern\":\"Document types\"}")
+echo "$GREP_RESP" | grep -q "overview/vault-skill.md" \
+  && pass "Seeded doc is grep-findable without prior edit" \
+  || fail "T5b.1" "seeded doc not in chunk index"
+
+# Also verify frontmatter is present in git (akb_get returns parsed body, not raw)
+GET_FM=$(mcp akb_get "{\"vault\":\"$SEARCH_VAULT\",\"doc_id\":\"overview/vault-skill.md\"}")
+echo "$GET_FM" | grep -q '"type": *"skill"' && pass "Seeded doc has frontmatter (type=skill visible)" \
+  || fail "T5b.2" "no frontmatter on seeded doc (type missing)"
+
+# Cleanup
+mcp akb_delete_vault "{\"name\":\"$SEARCH_VAULT\"}" >/dev/null 2>&1
+
 # ── 6. doc_type='skill' is queryable ────────────────────────
 echo "▸ 6. akb_search supports type='skill'"
 

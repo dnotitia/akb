@@ -25,3 +25,14 @@ def test_seed_runs_after_template_apply():
     # is called by inspecting the git commit log on a real but ephemeral vault
     # — easier to do this in E2E. Skip-mark this if the harness doesn't run it.
     pass
+
+
+def test_seed_uses_canonical_put_path():
+    """The seed should produce a vault-skill doc indistinguishable from one
+    created via akb_put — meaning chunks indexed, frontmatter composed,
+    collection count incremented. We assert the public observable: after
+    seed, the document body in git has frontmatter.
+
+    Skipped at unit level; the actual check is in the E2E suite.
+    """
+    pytest.skip("Covered by test_skill_e2e.sh — verifies frontmatter & search visibility.")
