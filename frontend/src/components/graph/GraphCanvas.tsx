@@ -10,6 +10,7 @@ import {
   type GraphNode,
   type GraphColors,
 } from "./graph-types";
+import { endpointUri } from "./use-graph-data";
 
 export interface GraphCanvasHandle {
   centerOnNode: (uri: string) => void;
@@ -95,7 +96,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [nodes, hidden],
   );
   const visibleEdges = useMemo(
-    () => edges.filter((e) => !hidden.has(e.source as string) && !hidden.has(e.target as string)),
+    () =>
+      edges.filter(
+        (e) => !hidden.has(endpointUri(e.source)) && !hidden.has(endpointUri(e.target)),
+      ),
     [edges, hidden],
   );
 

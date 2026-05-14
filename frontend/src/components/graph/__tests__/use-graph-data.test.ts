@@ -53,6 +53,38 @@ describe("applyFilters", () => {
     expect(out.edges.map((e) => e.relation)).toEqual(["depends_on"]);
   });
 
+  it("survives force-graph mutating edge.source/target into node-object references", () => {
+    // react-force-graph rewrites edge.source/target from string URI to the
+    // resolved node object after the simulation starts. The filter must
+    // still match endpoints by URI and emit fresh string-source edges
+    // so the next render's force-graph can resolve them again.
+    const mutatedEdges = [
+      { source: nodes[0], target: nodes[1], relation: "depends_on" as const },
+      { source: nodes[1], target: nodes[2], relation: "references" as const },
+    ];
+    const out = applyFilters({ nodes, edges: mutatedEdges as unknown as GraphEdge[] }, DEFAULT_VIEW);
+    expect(out.edges.length).toBe(2);
+    for (const e of out.edges) {
+      expect(typeof e.source).toBe("string");
+      expect(typeof e.target).toBe("string");
+    }
+    expect(out.edges.map((e) => e.source)).toEqual(["a", "b"]);
+    expect(out.edges.map((e) => e.target)).toEqual(["b", "c"]);
+  });
+
+  it("returns fresh edge objects so force-graph mutation doesn't leak across renders", () => {
+    const out1 = applyFilters({ nodes, edges }, DEFAULT_VIEW);
+    // Simulate force-graph mutating the first render's links in place.
+    (out1.edges[0] as any).source = nodes[0];
+    (out1.edges[0] as any).target = nodes[1];
+    // Next render: same base inputs (edges still original strings).
+    const out2 = applyFilters({ nodes, edges }, DEFAULT_VIEW);
+    expect(out2.edges[0].source).toBe("a");
+    expect(out2.edges[0].target).toBe("b");
+    // And the freshly-returned edges must be different objects.
+    expect(out2.edges[0]).not.toBe(out1.edges[0]);
+  });
+
   it("passes through when filters are at defaults", () => {
     const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
     expect(out.nodes.length).toBe(3);

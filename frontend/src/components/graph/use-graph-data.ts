@@ -52,12 +52,37 @@ export function mergeGraph(a: GraphPayload, b: GraphPayload): GraphPayload {
   return { nodes: [...nodeByUri.values()], edges };
 }
 
+// react-force-graph mutates edge.source/edge.target from string-URI to a
+// node-object reference once the simulation starts. Any downstream filter
+// that does `keep.has(e.source)` would silently drop every edge after the
+// first frame. This extractor normalizes back to the URI string.
+export function endpointUri(end: unknown): string {
+  if (typeof end === "string") return end;
+  if (end && typeof end === "object" && "uri" in end) {
+    return (end as { uri: string }).uri;
+  }
+  return "";
+}
+
 export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
   const nodes = p.nodes.filter((n) => v.types.has(n.kind));
   const keep = new Set(nodes.map((n) => n.uri));
-  const edges = p.edges.filter(
-    (e) => v.relations.has(e.relation) && keep.has(e.source) && keep.has(e.target),
-  );
+  const edges = p.edges
+    .filter(
+      (e) =>
+        v.relations.has(e.relation) &&
+        keep.has(endpointUri(e.source)) &&
+        keep.has(endpointUri(e.target)),
+    )
+    // Freshen each edge so force-graph mutating source/target on this
+    // render's links doesn't poison the cached base graph for the next
+    // filter toggle. Reset to plain URI strings so the simulation can
+    // re-resolve them against the current node objects.
+    .map((e) => ({
+      source: endpointUri(e.source),
+      target: endpointUri(e.target),
+      relation: e.relation,
+    }));
   return { nodes, edges };
 }
 
