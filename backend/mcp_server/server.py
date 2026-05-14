@@ -121,7 +121,7 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     topic = args.get("topic")
     vault = args.get("vault")
     if topic == "vault-skill" and vault:
-        from mcp_server.help import render_vault_skill_response, VAULT_SKILL_PATH
+        from mcp_server.help import render_vault_skill_response
         async def _fetch(v, doc_id):
             row = await _find_doc(v, doc_id)
             if row is None:

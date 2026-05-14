@@ -1716,7 +1716,7 @@ If a vault has no vault-skill yet, the owner can create one with:
 When no vault has a custom skill, agents follow these fallback rules:
 - akb_browse before writing to learn the existing collection layout
 - akb_search / akb_grep before writing to avoid duplicates
-- Never inline secrets; use ${secrets.X} placeholders
+- Never inline secrets; use ${{secrets.X}} placeholders
 """
 
 # Patch the HELP dict now that the constant is defined
@@ -1759,7 +1759,7 @@ async def render_vault_skill_response(vault, fetch_fn):
 
     doc = await fetch_fn(vault, VAULT_SKILL_PATH)
     if doc is None:
-        body = _MISSING_FALLBACK.format(vault=vault)
+        body = _MISSING_FALLBACK.replace("{vault}", vault)
         return f"# Vault skill for {vault}\n\n{body}"
 
     version = doc.get("commit") or doc.get("updated_at") or "unknown"
