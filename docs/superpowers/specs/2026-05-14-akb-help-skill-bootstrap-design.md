@@ -108,7 +108,7 @@ Claude Code injects this into the system prompt every turn (no compaction loss, 
 
 ### B3. Vault creation template seed
 
-`backend/app/services/document_service.py:_apply_template` (or directly in `create_vault`) seeds `overview/vault-skill.md` for every non-mirror vault, regardless of which template is chosen.
+`backend/app/services/document_service.py:create_vault` seeds `overview/vault-skill.md` for every non-mirror vault **directly** (not inside `_apply_template`), so vaults created with `template=None` also receive the seed. Place the seed call after `_apply_template` returns and inside the existing `try` block so the vault-create rollback covers it.
 
 Template body — short, prose-only, no frontmatter rules in v1:
 
@@ -194,7 +194,7 @@ type="skill" is preserved across edits
 | Phase | Change | Files | LOC |
 |---|---|---|---|
 | **P1** Data model | `"skill"` added to doc-type enum | `tools.py` (line 73, 214), `models/document.py` (line 17), `metadata_worker.py` (line 38) | ~5 |
-| **P2** Help router | `akb_help(topic="vault-skill", vault?)` branch + missing notice | `mcp_server/help.py`, tool handler | ~60 |
+| **P2** Help router | `akb_help(topic="vault-skill", vault?)` branch + missing notice; **also extend `tools.py` `akb_help` tool schema to declare `vault?: string` parameter** | `mcp_server/help.py`, `mcp_server/server.py` handler, `mcp_server/tools.py` schema | ~60 |
 | **P3** Initialize instructions | `Server("akb")` initialize handler returns `instructions` | `mcp_server/server.py` (~line 71), `mcp_server/http_app.py` | ~15 |
 | **P4** Vault create seed | After template apply, write `overview/vault-skill.md` | `app/services/document_service.py` (around line 822) | ~30 |
 | **P5** E2E | Cover B1–B4 | `backend/tests/test_skill_e2e.sh` (new) | ~80 |
@@ -222,10 +222,10 @@ These are intentionally not in v1. Each is additive and requires no data migrati
 | `doc_type="skill"` collides with future external use | TEXT column, no SQL enum — collision is at MCP schema layer only. Easy to rename. |
 | `_apply_template` rollback paths during vault create | Existing rollback already covers extra files. New seed sits inside the same transaction. |
 
-## Open questions (none blocking)
+## Open questions
 
-- Should `akb_help(topic="vault-skill", vault=X)` also include the doc's `updated_at` / commit-sha in the response header for staleness signaling? **Suggested default: yes, as a markdown line; tiny cost, useful for agents that want to detect changes mid-session.**
-- Should missing-vault-skill response auto-link to the vault's owner's username (from `akb_vault_info`)? **Suggested default: no in v1 — keep the response small.**
+- **Include `updated_at` / commit-sha in B1 response header?** Decided: **yes**, as the `version {commit-or-updated-at}` line already shown in the B1 template. Tiny cost, useful for agents detecting changes mid-session.
+- **Auto-link owner's username in the missing-vault-skill response?** Decided: **no in v1** — keep the response small. Owner can use `akb_vault_info` themselves.
 
 ---
 
