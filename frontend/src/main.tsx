@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
 import AuthPage from "@/pages/auth";
@@ -22,8 +23,15 @@ import VaultSettingsPage from "@/pages/vault-settings";
 import VaultActivityPage from "@/pages/vault-activity";
 import "./index.css";
 
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { staleTime: 30_000, retry: 1, refetchOnWindowFocus: false },
+  },
+});
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
+    <QueryClientProvider client={queryClient}>
     <BrowserRouter>
       <Routes>
         <Route path="/auth" element={<AuthPage />} />
@@ -50,5 +58,6 @@ createRoot(document.getElementById("root")!).render(
         </Route>
       </Routes>
     </BrowserRouter>
+    </QueryClientProvider>
   </StrictMode>
 );
