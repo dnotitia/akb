@@ -1,10 +1,8 @@
 FROM node:22-slim AS builder
 
-RUN npm install -g pnpm@latest
-
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
 RUN npx vite build
