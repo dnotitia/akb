@@ -1539,7 +1539,7 @@ Expected: all green.
 - [ ] **Step 5: Manual smoke against production (if deploying)**
 
 After `deploy/k8s/internal/deploy-internal.sh`:
-- Log into `https://akb.agent.seahorse.dnotitia.com` as a test user.
+- Log into `<your-prod-host>` as a test user.
 - Settings → Profile → change password to a new value → success.
 - Log out, log back in with the new password.
 - As admin, Settings → Admin → click key icon on a user → Generate → confirm temp password renders + copy works.
@@ -1554,7 +1554,7 @@ After `deploy/k8s/internal/deploy-internal.sh`:
 ```bash
 git push origin main
 bash deploy/k8s/internal/deploy-internal.sh
-curl -sk https://akb.agent.seahorse.dnotitia.com/livez
+curl -sk <your-prod-host>/livez
 ```
 
 ---
