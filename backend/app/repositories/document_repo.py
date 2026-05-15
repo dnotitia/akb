@@ -52,14 +52,18 @@ class DocumentRepository:
                 raise ConflictError(f"Document already exists at path: {path}") from e
         return doc_id
 
-    # Document lookup keys: PG UUID or path. The legacy d-prefix arm
-    # (`metadata->>'id' = $2`) was dropped — MCP / REST clients address
-    # documents by URI, which the handler splits into (vault, path) and
-    # passes path here.
-    _MATCH_WHERE = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%')"
+    # Document lookup keys: PG UUID or exact path. MCP / REST handlers
+    # all split the URI into (vault, path) before calling here, so the
+    # path is canonical. The earlier `path LIKE '%' || $2 || '%'` arm
+    # was a substring match that, after the URI cutover, could silently
+    # return the wrong doc when one path was a substring of another
+    # (`api.md` matching `api-v2.md`) — turning a benign-looking
+    # `akb_delete` into a wrong-resource delete. Exact match closes
+    # that class of bug.
+    _MATCH_WHERE = "(d.id::text = $2 OR d.path = $2)"
 
     async def find_by_ref(self, vault_id: uuid.UUID, ref: str) -> dict | None:
-        """Find document by UUID or path (substring match)."""
+        """Find document by UUID or exact path."""
         async with self.pool.acquire() as conn:
             return await self.find_by_ref_with_conn(conn, vault_id, ref)
 
@@ -119,8 +123,14 @@ class DocumentRepository:
                 title, doc_type, status, summary, domain, now, commit_hash, tags, doc_id,
             )
 
-    async def delete(self, doc_id: uuid.UUID) -> None:
-        async with self.pool.acquire() as conn:
+    async def delete(self, doc_id: uuid.UUID, *, conn=None) -> None:
+        """Delete the documents row. When `conn` is provided the DELETE
+        runs on the caller's connection (so it joins the same TX as the
+        cascade in `document_service.delete`)."""
+        if conn is None:
+            async with self.pool.acquire() as own_conn:
+                await own_conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
+        else:
             await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
 
     async def list_by_collection(self, vault_id: uuid.UUID, collection_path: str) -> list[dict]:

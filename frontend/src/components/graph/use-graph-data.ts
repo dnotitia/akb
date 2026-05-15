@@ -105,6 +105,11 @@ interface BfsExpandArgs {
 function rowToEdge(row: RelationRow, selfUri: string): GraphEdge | null {
   const relation = normalizeRelation(row.relation);
   if (!relation) return null;
+  // The relations endpoint can in principle emit an edge whose
+  // counter-party URI is null (unresolved forward ref). Skipping
+  // those keeps the graph free of `{source: "...", target: undefined}`
+  // shapes that would silently confuse the layout / viz layer.
+  if (!row.uri) return null;
   if (row.direction === "outgoing") {
     return { source: selfUri, target: row.uri, relation };
   }

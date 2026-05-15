@@ -12,6 +12,7 @@ Flow:
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 
 from app.config import settings
@@ -24,6 +25,31 @@ from app.services.rerank_service import RerankError, rerank
 from app.utils import ensure_dict
 
 logger = logging.getLogger("akb.search")
+
+# Strips the indexing-time enrichment block emitted by
+# `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
+# at least one more KEY: line and a `\n\n` separator before the body.
+# It rides along with every doc chunk so the BM25 and dense legs see
+# doc-level signals during retrieval — but it is noise when the chunk
+# content is shown to humans or agents. Requiring TWO header lines + a
+# `\n\n` body separator avoids stripping a user paragraph that happens
+# to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
+# body separator) and intentionally do not match.
+_CHUNK_HEADER_KEYS = "TITLE|SUMMARY|TAGS|PATH|TYPE|VAULT|MIME|SIZE|DESCRIPTION"
+_CHUNK_HEADER_RE = re.compile(
+    rf"\ATITLE:[^\n]*\n(?:(?:{_CHUNK_HEADER_KEYS}):[^\n]*\n)+\n"
+)
+
+
+def strip_chunk_metadata_header(text: str | None) -> str | None:
+    """Strip the indexing-time TITLE/SUMMARY/TAGS/PATH/TYPE/... block
+    from a chunk's stored `content` before returning it to clients.
+    Leaves the body untouched if no such block is present (e.g. older
+    chunks indexed before the enrichment was added, or table/file
+    chunks that are pure-metadata with no body)."""
+    if not text:
+        return text
+    return _CHUNK_HEADER_RE.sub("", text, count=1)
 
 
 class SearchService:
@@ -299,7 +325,7 @@ class SearchService:
                     vault=m["vault"], path=m["path"], title=m["title"],
                     doc_type=m["doc_type"], summary=m["summary"],
                     tags=m["tags"], score=h.score,
-                    matched_section=h.content[:500] if h.content else None,
+                    matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
                 )
             )
         return results
@@ -466,8 +492,13 @@ class SearchService:
                     "matches": [],
                 }
 
-            # Extract individual matching lines from chunk
-            chunk_lines = r["content"].split("\n")
+            # Extract individual matching lines from chunk. Strip the
+            # indexing-time TITLE/SUMMARY/... enrichment so a user
+            # grepping for a real body word doesn't get phantom hits
+            # against the doc-level signals that ride along with every
+            # chunk.
+            chunk_body = strip_chunk_metadata_header(r["content"]) or ""
+            chunk_lines = chunk_body.split("\n")
             for i, line in enumerate(chunk_lines):
                 if regex:
                     matched = bool(_re.search(pattern, line, 0 if case_sensitive else _re.IGNORECASE))
@@ -568,7 +599,10 @@ class SearchService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             # Match by UUID, metadata.id (d- prefix), or path substring
-            doc_match = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%')"
+            # Exact path match — same reasoning as `find_by_ref`. The
+            # earlier substring `LIKE '%' || $2 || '%'` arm caused
+            # cross-doc section bleed when paths shared a substring.
+            doc_match = "(d.id::text = $2 OR d.path = $2)"
             if section:
                 rows = await conn.fetch(
                     f"""
@@ -599,7 +633,7 @@ class SearchService:
             return [
                 {
                     "section_path": r["section_path"],
-                    "content": r["content"],
+                    "content": strip_chunk_metadata_header(r["content"]),
                     "chunk_index": r["chunk_index"],
                 }
                 for r in rows

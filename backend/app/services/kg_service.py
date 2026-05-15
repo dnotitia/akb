@@ -565,16 +565,26 @@ async def _store_edge(
 
 
 async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | None:
-    """Resolve a document reference (doc_id, path, or metadata.id) to UUID."""
-    # Full match pattern: UUID, metadata.id, or path substring
-    row = await conn.fetchrow(
-        "SELECT id FROM documents WHERE vault_id = $1 AND (id::text = $2 OR path LIKE '%' || $2 || '%')",
-        vault_id, ref,
-    )
-    if row:
-        return row["id"]
+    """Resolve a non-URI document reference to its PG UUID.
 
-    # By UUID
+    Used by `_store_edge` for the *legacy* path where a doc's frontmatter
+    `depends_on` / `related_to` list contains a bare string instead of
+    an `akb://` URI. New code is URI-first and bypasses this function
+    entirely (the URI path in `_store_edge` short-circuits before us).
+
+    Match arms (in order, each by exact / suffix / UUID — never by
+    substring; the legacy substring arm was a wrong-doc magnet after
+    the URI cutover):
+      1. UUID — `id = $2`
+      2. Exact path — `path = $2`
+      3. Trailing-segment match — `path LIKE '%/' || $2` (e.g. ref
+         `api.md` matches `notes/api.md` iff there is exactly one such
+         doc; the unique constraint on `(vault_id, path)` does NOT
+         dedupe across collections, so this can still return one of
+         several matches — but the suffix is anchored at `/`, so
+         `api.md` cannot match `funapi.md`).
+    """
+    # By UUID first — cheapest and unambiguous.
     try:
         uid = uuid.UUID(ref)
         row = await conn.fetchrow(
@@ -586,7 +596,7 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
     except ValueError:
         pass
 
-    # By path (exact or suffix match)
+    # Exact path.
     row = await conn.fetchrow(
         "SELECT id FROM documents WHERE vault_id = $1 AND path = $2",
         vault_id, ref,
@@ -594,7 +604,8 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
     if row:
         return row["id"]
 
-    # By path suffix
+    # Trailing-segment match: `api.md` ↔ `notes/api.md`. Anchored at
+    # `/` so it can't match arbitrary substrings.
     row = await conn.fetchrow(
         "SELECT id FROM documents WHERE vault_id = $1 AND path LIKE '%/' || $2",
         vault_id, ref,
@@ -699,17 +710,3 @@ async def _bfs_collect(
 
 # ── URI builder helpers for callers ──────────────────────────
 
-async def resolve_doc_to_uri(vault_name: str, doc_ref: str) -> str | None:
-    """Resolve a doc ref (doc_id, path, metadata.id) to its akb:// URI."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
-        if not vault:
-            return None
-        doc_id = await _resolve_doc_ref(conn, vault["id"], doc_ref)
-        if not doc_id:
-            return None
-        path = await conn.fetchval("SELECT path FROM documents WHERE id = $1", doc_id)
-        if not path:
-            return None
-        return doc_uri(vault_name, path)

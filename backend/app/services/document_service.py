@@ -377,53 +377,54 @@ class DocumentService:
         )
 
         chunks_indexed = 0
-        if req.content is not None:
-            # Use the values that were actually persisted to DB, not the
-            # raw request — e.g. req.title may be None when caller kept
-            # the title unchanged.
-            meta_header = build_doc_metadata_header(
-                vault_name=vault, path=file_path,
-                title=req.title or row["title"],
-                summary=req.summary if req.summary is not None else row["summary"],
-                tags=req.tags if req.tags is not None else (list(row["tags"]) if row["tags"] else []),
-                doc_type=req.type or row["doc_type"],
-            )
-            chunks = chunk_markdown(new_body, metadata_header=meta_header)
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                chunks_indexed = await write_source_chunks(
-                    conn, "document", str(pg_doc_id),
-                    vault_id=vault_id,
-                    chunks=chunks,
-                )
-
-        # Re-extract edges when content or relations changed
-        if req.content is not None or req.depends_on is not None or req.related_to is not None:
-            depends = current_fm.get("depends_on", []) or []
-            related = current_fm.get("related_to", []) or []
-            implements = current_fm.get("implements", []) or []
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                await store_document_relations(
-                    conn, vault_id, vault, file_path,
-                    depends, related, implements,
-                    new_body,
-                )
-
+        # One transaction across chunks + relations + event so partial
+        # failure either commits all three or none — previously each
+        # was a separate connection, leaving git ahead of indices and
+        # subscribers missing the `document.update` signal when a
+        # mid-flight failure hit.
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await emit_event(
-                conn, "document.update",
-                vault_id=vault_id,
-                resource_uri=doc_uri(vault, file_path),
-                actor_id=agent_id,
-                payload={
-                    "vault": vault,
-                    "path": file_path,
-                    "commit_hash": commit_hash,
-                    "content_changed": req.content is not None,
-                },
-            )
+            async with conn.transaction():
+                if req.content is not None:
+                    # Use the values that were actually persisted to DB, not the
+                    # raw request — e.g. req.title may be None when caller kept
+                    # the title unchanged.
+                    meta_header = build_doc_metadata_header(
+                        vault_name=vault, path=file_path,
+                        title=req.title or row["title"],
+                        summary=req.summary if req.summary is not None else row["summary"],
+                        tags=req.tags if req.tags is not None else (list(row["tags"]) if row["tags"] else []),
+                        doc_type=req.type or row["doc_type"],
+                    )
+                    chunks = chunk_markdown(new_body, metadata_header=meta_header)
+                    chunks_indexed = await write_source_chunks(
+                        conn, "document", str(pg_doc_id),
+                        vault_id=vault_id,
+                        chunks=chunks,
+                    )
+
+                if req.content is not None or req.depends_on is not None or req.related_to is not None:
+                    depends = current_fm.get("depends_on", []) or []
+                    related = current_fm.get("related_to", []) or []
+                    implements = current_fm.get("implements", []) or []
+                    await store_document_relations(
+                        conn, vault_id, vault, file_path,
+                        depends, related, implements,
+                        new_body,
+                    )
+
+                await emit_event(
+                    conn, "document.update",
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(vault, file_path),
+                    actor_id=agent_id,
+                    payload={
+                        "vault": vault,
+                        "path": file_path,
+                        "commit_hash": commit_hash,
+                        "content_changed": req.content is not None,
+                    },
+                )
 
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
@@ -611,8 +612,12 @@ class DocumentService:
                         "path": file_path,
                     },
                 )
-
-        await doc_repo.delete(pg_doc_id)
+                # Doc row delete inside the same TX. Previously this ran
+                # on a separate connection — a crash between the cascade
+                # commit and the row delete left an orphan documents row
+                # (no chunks/edges/publications). Recovery was possible
+                # via retry but the inconsistency was visible.
+                await doc_repo.delete(pg_doc_id, conn=conn)
 
         if collection_id:
             await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc))

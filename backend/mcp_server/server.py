@@ -32,7 +32,7 @@ from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import NotFoundError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
-from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources, resolve_doc_to_uri
+from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, table_uri, file_uri, parse_uri, split_uri
 from app.services.access_service import (
     check_vault_access, grant_access, revoke_access, list_vault_members,
@@ -216,10 +216,17 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
         try:
             body = _fm.loads(raw).content
         except Exception:
-            # If frontmatter parsing fails (malformed legacy commits),
-            # fall back to the raw string — better to ship something
-            # than 500. The caller is reading historical content.
-            body = raw
+            # YAML parser choked (rare — happens on historical commits
+            # with malformed frontmatter). Strip a leading `---\n…\n---`
+            # block by regex so the response body never leaks the yaml
+            # header verbatim (which on legacy commits still carries
+            # `id: d-XXXXXXXX`). If no `---` fence is present we ship
+            # the raw content — it has no frontmatter to leak.
+            import re as _re
+            stripped = _re.sub(
+                r"\A---\r?\n.*?\r?\n---\r?\n", "", raw, count=1, flags=_re.DOTALL,
+            )
+            body = stripped
         return {
             "title": doc["title"],
             "uri": doc_uri(vault, doc["path"]),

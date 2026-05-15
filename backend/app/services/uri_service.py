@@ -24,10 +24,25 @@ def make_uri(vault: str, resource_type: str, identifier: str) -> str:
 
 
 def parse_uri(uri: str) -> tuple[str, str, str] | None:
-    """Parse an AKB URI into (vault, type, identifier). Returns None if invalid."""
+    """Parse an AKB URI into (vault, type, identifier). Returns None if invalid.
+
+    A single trailing `/` on the identifier is stripped so URIs that
+    differ only by that slash (`akb://v/doc/x` vs `akb://v/doc/x/`)
+    resolve to the same canonical handle. Without this normalization a
+    hand-built URI in a frontmatter `depends_on` list could spawn a
+    separate edge row vs. server-generated callers — they'd index as
+    two distinct strings even though they refer to the same resource.
+    """
     m = _URI_RE.match(uri)
     if m:
-        return m.group(1), m.group(2), m.group(3)
+        ident = m.group(3)
+        if ident.endswith("/"):
+            ident = ident.rstrip("/")
+            # Defensive: if the entire identifier was slashes
+            # (`akb://v/doc//`) the strip leaves empty — reject.
+            if not ident:
+                return None
+        return m.group(1), m.group(2), ident
     return None
 
 
