@@ -123,23 +123,23 @@ echo ""
 echo "▸ 4. Document CRUD via MCP"
 
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"MCP Created Spec\",\"content\":\"## API Spec\\n\\nCreated via MCP tool call.\\n\\n## Endpoints\\n\\nGET /api/v1/health\",\"type\":\"spec\",\"tags\":[\"mcp\",\"test\"]}" | mcp_result)
-DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 CHUNKS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['chunks_indexed'])" 2>/dev/null)
-[ -n "$DOC_ID" ] && pass "akb_put created doc ($DOC_ID, $CHUNKS chunks)" || fail "akb_put" "no doc_id"
+[ -n "$DOC_URI" ] && pass "akb_put created doc ($DOC_URI, $CHUNKS chunks)" || fail "akb_put" "no uri"
 
 # Put a second doc that links to the first
 DOC_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"plans\",\"title\":\"Migration Plan\",\"content\":\"## Plan\\n\\nMigrate based on [API Spec]($DOC_PATH).\\n\\n## Timeline\\n\\n- Week 1: Review\",\"type\":\"plan\",\"tags\":[\"mcp\"],\"depends_on\":[\"$DOC_ID\"]}" | mcp_result)
-DOC2_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-[ -n "$DOC2_ID" ] && pass "akb_put with link ($DOC2_ID)" || fail "akb_put link" "no doc_id"
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"plans\",\"title\":\"Migration Plan\",\"content\":\"## Plan\\n\\nMigrate based on [API Spec]($DOC_PATH).\\n\\n## Timeline\\n\\n- Week 1: Review\",\"type\":\"plan\",\"tags\":[\"mcp\"],\"depends_on\":[\"$DOC_URI\"]}" | mcp_result)
+DOC2_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$DOC2_URI" ] && pass "akb_put with link ($DOC2_URI)" || fail "akb_put link" "no uri"
 
 # Get document
-R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
 GET_TITLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
 [ "$GET_TITLE" = "MCP Created Spec" ] && pass "akb_get returns correct title" || fail "akb_get" "wrong title: $GET_TITLE"
 
 # Update document
-R=$(mcp_call akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\",\"status\":\"active\",\"message\":\"Promote via MCP\"}" | mcp_result)
+R=$(mcp_call akb_update "{\"uri\":\"$DOC_URI\",\"status\":\"active\",\"message\":\"Promote via MCP\"}" | mcp_result)
 UPD_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['commit_hash'])" 2>/dev/null)
 [ -n "$UPD_COMMIT" ] && pass "akb_update ($UPD_COMMIT)" || fail "akb_update" "no commit"
 
@@ -160,8 +160,7 @@ SEARCH_TOTAL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 [ "$SEARCH_TOTAL" -ge 1 ] 2>/dev/null && pass "akb_search: $SEARCH_TOTAL results" || pass "akb_search: 0 results (embedding may not index in MCP context)"
 
 # Drill down
-DOC_UUID=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-R=$(mcp_call akb_drill_down "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_UUID\"}" | mcp_result)
+R=$(mcp_call akb_drill_down "{\"uri\":\"$DOC_URI\"}" | mcp_result)
 SECT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['sections']))" 2>/dev/null)
 [ "$SECT_COUNT" -ge 1 ] 2>/dev/null && pass "akb_drill_down: $SECT_COUNT sections" || fail "akb_drill_down" "expected >=1"
 
@@ -169,13 +168,7 @@ SECT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.st
 echo ""
 echo "▸ 6. Relations & Graph via MCP"
 
-# Get doc2 path for URI construction
-DOC2_GET=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC2_ID\"}" | mcp_result)
-DOC2_UUID=$(echo "$DOC2_GET" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-DOC2_RELPATH=$(echo "$DOC2_GET" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-DOC2_RURI="akb://$VAULT/doc/$DOC2_RELPATH"
-
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC2_RURI\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\"}" | mcp_result)
 REL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$REL_COUNT" -ge 1 ] 2>/dev/null && pass "akb_relations: $REL_COUNT relations" || fail "akb_relations" "expected >=1"
 
@@ -184,7 +177,7 @@ NODE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.st
 EDGE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['edges']))" 2>/dev/null)
 [ "$NODE_COUNT" -ge 2 ] 2>/dev/null && pass "akb_graph: $NODE_COUNT nodes, $EDGE_COUNT edges" || fail "akb_graph" "expected >=2 nodes"
 
-R=$(mcp_call akb_provenance "{\"doc_id\":\"$DOC2_UUID\"}" | mcp_result)
+R=$(mcp_call akb_provenance "{\"uri\":\"$DOC2_URI\"}" | mcp_result)
 PROV_TITLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
 [ -n "$PROV_TITLE" ] && pass "akb_provenance: $PROV_TITLE" || fail "akb_provenance" "no title"
 
@@ -211,7 +204,7 @@ HAS_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 
 # Diff — get first commit hash and check diff for the doc
 FIRST_HASH=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['activity'][0]['hash'])" 2>/dev/null)
-R=$(mcp_call akb_diff "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\",\"commit\":\"$FIRST_HASH\"}" | mcp_result)
+R=$(mcp_call akb_diff "{\"uri\":\"$DOC_URI\",\"commit\":\"$FIRST_HASH\"}" | mcp_result)
 DIFF_TYPE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null)
 [ -n "$DIFF_TYPE" ] && pass "akb_diff: type=$DIFF_TYPE" || fail "akb_diff" "no type"
 
@@ -235,12 +228,12 @@ MEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.std
 echo ""
 echo "▸ 9. Delete via MCP"
 
-R=$(mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_delete "{\"uri\":\"$DOC_URI\"}" | mcp_result)
 DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "akb_delete" || fail "akb_delete" "expected True"
 
 # Verify deleted
-R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
 IS_ERROR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
 [ "$IS_ERROR" = "True" ] && pass "Deleted doc returns error" || fail "Delete verify" "doc still exists"
 
@@ -251,8 +244,8 @@ echo "▸ Empty collection survives last-doc delete"
 
 mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" >/dev/null
 PUTR=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"keep-t\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-KEEP_DOC_ID=$(echo "$PUTR" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$KEEP_DOC_ID\"}" >/dev/null
+KEEP_DOC_URI=$(echo "$PUTR" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+mcp_call akb_delete "{\"uri\":\"$KEEP_DOC_URI\"}" >/dev/null
 BROWSE_KEEP=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
 HAS_KEEP=$(echo "$BROWSE_KEEP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for i in d.get('items', []) if i.get('name') == 'keepempty' and i.get('type') == 'collection'))" 2>/dev/null)
 [ "$HAS_KEEP" = "1" ] && pass "empty collection survives last-doc delete" || fail "empty-is-valid" "keepempty not found in browse"
@@ -279,8 +272,8 @@ echo "▸ 11. Tables via MCP"
 
 # Create table (real PG table via DDL)
 R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"mcp_items\",\"columns\":[{\"name\":\"product\",\"type\":\"text\"},{\"name\":\"qty\",\"type\":\"number\"}]}" | mcp_result)
-TBL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-[ -n "$TBL" ] && pass "akb_create_table ($TBL)" || fail "akb_create_table" "no id"
+TBL_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$TBL_URI" ] && pass "akb_create_table ($TBL_URI)" || fail "akb_create_table" "no uri"
 
 # Insert via akb_sql
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO mcp_items (product, qty) VALUES ('Widget', 100), ('Gadget', 50)\"}" | mcp_result)
@@ -308,9 +301,9 @@ echo "▸ 12. Publish via MCP"
 
 # Re-create a doc for publish test (previous was deleted)
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"Pub Test\",\"content\":\"## Public\\n\\nTest.\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-PUB_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+PUB_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 
-R=$(mcp_call akb_publish "{\"vault\":\"$VAULT\",\"doc_id\":\"$PUB_DOC\"}" | mcp_result)
+R=$(mcp_call akb_publish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
 PUB_SLUG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['slug'])" 2>/dev/null)
 [ -n "$PUB_SLUG" ] && pass "akb_publish (slug: $PUB_SLUG)" || fail "akb_publish" "no slug"
 
@@ -318,7 +311,7 @@ PUB_SLUG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['
 PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
 [ "$PUB_TITLE" = "Pub Test" ] && pass "Public access works" || fail "Public access" "wrong title: $PUB_TITLE"
 
-R=$(mcp_call akb_unpublish "{\"vault\":\"$VAULT\",\"doc_id\":\"$PUB_DOC\"}" | mcp_result)
+R=$(mcp_call akb_unpublish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
 UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['published'])" 2>/dev/null)
 [ "$UNPUB" = "False" ] && pass "akb_unpublish" || fail "akb_unpublish" "expected False"
 
@@ -441,7 +434,7 @@ UPGRADED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).g
 
 # User2 CAN now write
 R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"user2-docs\",\"title\":\"Writer Test\",\"content\":\"## Written by User2\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-WRITE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('doc_id' in d)" 2>/dev/null)
+WRITE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('uri' in d)" 2>/dev/null)
 [ "$WRITE_OK" = "True" ] && pass "User2 can write as writer" || fail "Writer write" "denied"
 
 # User1 revokes User2's access
@@ -465,7 +458,7 @@ PUB_LVL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).ge
 
 # User2 (no grant) can now write
 R=$(mcp_call2 akb_put "{\"vault\":\"$VAULT\",\"collection\":\"public-test\",\"title\":\"Public Write\",\"content\":\"# Public\",\"type\":\"note\",\"tags\":[]}" | mcp_result2)
-PUB_WRITE=$(echo "$R" | python3 -c "import sys,json; print('doc_id' in json.load(sys.stdin))" 2>/dev/null)
+PUB_WRITE=$(echo "$R" | python3 -c "import sys,json; print('uri' in json.load(sys.stdin))" 2>/dev/null)
 [ "$PUB_WRITE" = "True" ] && pass "User2 can write (public writer)" || fail "Public write" "denied"
 
 # Set to reader — write should be blocked
@@ -503,16 +496,16 @@ echo "▸ 18. Document History & Diff"
 
 # Create a doc, then update it to create history
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"history-test\",\"title\":\"History Doc\",\"content\":\"## V1\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-HIST_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+HIST_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 
-R=$(mcp_call akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$HIST_DOC\",\"content\":\"## V2 Updated\",\"message\":\"history test\"}" | mcp_result)
+R=$(mcp_call akb_update "{\"uri\":\"$HIST_DOC_URI\",\"content\":\"## V2 Updated\",\"message\":\"history test\"}" | mcp_result)
 
-R=$(mcp_call akb_history "{\"vault\":\"$VAULT\",\"doc_id\":\"$HIST_DOC\"}" | mcp_result)
+R=$(mcp_call akb_history "{\"uri\":\"$HIST_DOC_URI\"}" | mcp_result)
 HIST_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('history',[])))" 2>/dev/null)
 [ "$HIST_COUNT" -ge 2 ] 2>/dev/null && pass "akb_history: $HIST_COUNT versions" || fail "akb_history" "expected >=2"
 
 HIST_HASH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['history'][0]['hash'])" 2>/dev/null)
-R=$(mcp_call akb_diff "{\"vault\":\"$VAULT\",\"doc_id\":\"$HIST_DOC\",\"commit\":\"$HIST_HASH\"}" | mcp_result)
+R=$(mcp_call akb_diff "{\"uri\":\"$HIST_DOC_URI\",\"commit\":\"$HIST_HASH\"}" | mcp_result)
 DIFF_TYPE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null)
 [ "$DIFF_TYPE" = "modified" ] && pass "akb_diff: $DIFF_TYPE" || fail "akb_diff" "expected modified, got $DIFF_TYPE"
 
@@ -561,12 +554,12 @@ echo ""
 echo "▸ 21. Table DDL"
 
 # Alter table — add column
-R=$(mcp_call akb_alter_table "{\"vault\":\"$VAULT\",\"table\":\"mcp_items\",\"add_columns\":[{\"name\":\"category\",\"type\":\"text\"}]}" | mcp_result)
+R=$(mcp_call akb_alter_table "{\"uri\":\"akb://$VAULT/table/mcp_items\",\"add_columns\":[{\"name\":\"category\",\"type\":\"text\"}]}" | mcp_result)
 ALT_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(c['name']=='category' for c in d.get('columns',[])))" 2>/dev/null)
 [ "$ALT_OK" = "True" ] && pass "Alter table: add column" || fail "Alter table" "column not added"
 
 # Drop table
-R=$(mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"table\":\"mcp_items\"}" | mcp_result)
+R=$(mcp_call akb_drop_table "{\"uri\":\"akb://$VAULT/table/mcp_items\"}" | mcp_result)
 DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
 [ "$DROP_OK" = "True" ] && pass "Drop table" || fail "Drop table" "not dropped"
 

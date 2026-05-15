@@ -154,11 +154,11 @@ Some detailed content here.
 CONTENT
 
 PUT_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"File Param Test\",\"file\":\"$TEST_MD\",\"tags\":[\"e2e\",\"file-param\"]}}")
-DOC_ID=$(tool_result "$PUT_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
-[ -n "$DOC_ID" ] && pass "akb_put with file: doc_id=$DOC_ID" || fail "akb_put file" "no doc_id — $(tool_result "$PUT_RESP")"
+DOC_URI=$(tool_result "$PUT_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$DOC_URI" ] && pass "akb_put with file: uri=$DOC_URI" || fail "akb_put file" "no uri — $(tool_result "$PUT_RESP")"
 
 # Verify content matches
-GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}}")
+GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
 GOT_TITLE=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
 GOT_CONTENT=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content","")[:50])' 2>/dev/null)
 [ "$GOT_TITLE" = "File Param Test" ] && pass "Title matches" || fail "Title" "expected 'File Param Test', got '$GOT_TITLE'"
@@ -179,12 +179,12 @@ Content has been completely replaced via file param on akb_update.
 - Updated Item Y
 CONTENT
 
-UPDATE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_update\",\"arguments\":{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\",\"file\":\"$TEST_MD2\",\"message\":\"Update via file param\"}}")
+UPDATE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_update\",\"arguments\":{\"uri\":\"$DOC_URI\",\"file\":\"$TEST_MD2\",\"message\":\"Update via file param\"}}")
 UPDATE_COMMIT=$(tool_result "$UPDATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit_hash",""))' 2>/dev/null)
 [ -n "$UPDATE_COMMIT" ] && pass "akb_update with file: commit=$UPDATE_COMMIT" || fail "akb_update file" "no commit — $(tool_result "$UPDATE_RESP")"
 
 # Verify updated content
-GET_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}}")
+GET_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
 GOT_CONTENT2=$(tool_result "$GET_RESP2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content","")[:60])' 2>/dev/null)
 echo "$GOT_CONTENT2" | grep -q "Updated Document from File" && pass "Updated content from file verified" || fail "Update content" "mismatch: $GOT_CONTENT2"
 
@@ -218,9 +218,9 @@ LARGE_SIZE=$(wc -c < "$TEST_LARGE" | tr -d ' ')
 
 # Large files need longer timeout for server-side chunking/embedding
 LARGE_RESP=$(MSGID=$((MSGID+1)); echo "{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"Large File Test\",\"file\":\"$TEST_LARGE\"}}}" >&3; RESPONSE=""; read -r -t 90 RESPONSE <&4 || true; echo "$RESPONSE")
-LARGE_DOC_ID=$(tool_result "$LARGE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
+LARGE_DOC_URI=$(tool_result "$LARGE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
 LARGE_CHUNKS=$(tool_result "$LARGE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("chunks_indexed",0))' 2>/dev/null)
-[ -n "$LARGE_DOC_ID" ] && pass "Large file ($LARGE_SIZE bytes): doc_id=$LARGE_DOC_ID, chunks=$LARGE_CHUNKS" || fail "Large file" "$(tool_result "$LARGE_RESP")"
+[ -n "$LARGE_DOC_URI" ] && pass "Large file ($LARGE_SIZE bytes): uri=$LARGE_DOC_URI, chunks=$LARGE_CHUNKS" || fail "Large file" "$(tool_result "$LARGE_RESP")"
 
 # ── Cleanup vault ─────────────────────────────────────────────
 echo ""

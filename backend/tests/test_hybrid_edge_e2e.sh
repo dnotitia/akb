@@ -149,10 +149,10 @@ echo "▸ 4. Rapid successive update"
 # strings into pieces, and the v1/v2/v3 variants would share most tokens —
 # making the assertion below false even when stale-cleanup works.
 R=$(mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"Fluid Doc\",\"content\":\"## v1\\n\\nInitial content mentioning Mongoose habitat.\"}" | mcp_text)
-DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 
-mcp akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\",\"content\":\"## v2\\n\\nSecond content mentioning Octopus tentacles.\",\"message\":\"v2\"}" >/dev/null
-mcp akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\",\"content\":\"## v3\\n\\nThird content mentioning Rhinoceros horn.\",\"message\":\"v3\"}" >/dev/null
+mcp akb_update "{\"uri\":\"$DOC_URI\",\"content\":\"## v2\\n\\nSecond content mentioning Octopus tentacles.\",\"message\":\"v2\"}" >/dev/null
+mcp akb_update "{\"uri\":\"$DOC_URI\",\"content\":\"## v3\\n\\nThird content mentioning Rhinoceros horn.\",\"message\":\"v3\"}" >/dev/null
 sleep "$INDEX_WAIT"
 
 # Only v3 should be found; the v1/v2 unique words should return nothing
@@ -214,8 +214,8 @@ done
 echo ""
 echo "▸ 7. Multi-chunk delete propagation"
 
-DOC_ID_BIG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-mcp akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID_BIG\"}" >/dev/null
+DOC_URI_BIG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+mcp akb_delete "{\"uri\":\"$DOC_URI_BIG\"}" >/dev/null
 sleep 5  # sync delete removes vector-store points immediately; small buffer for any in-flight
 
 MISS=0
@@ -302,11 +302,11 @@ echo ""
 echo "▸ 14. Drill-down alignment"
 
 R=$(mcp akb_search "{\"query\":\"Rhinoceros\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
-HIT_DOC=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); rs=d.get('results',[]); print(rs[0]['doc_id'] if rs else '')" 2>/dev/null)
-if [ -n "$HIT_DOC" ]; then
-  R=$(mcp akb_drill_down "{\"vault\":\"$VAULT\",\"doc_id\":\"$HIT_DOC\"}" | mcp_text)
+HIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); rs=d.get('results',[]); print(rs[0]['uri'] if rs else '')" 2>/dev/null)
+if [ -n "$HIT_DOC_URI" ]; then
+  R=$(mcp akb_drill_down "{\"uri\":\"$HIT_DOC_URI\"}" | mcp_text)
   N_SEC=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('sections',[])))" 2>/dev/null)
-  [ "$N_SEC" -ge 1 ] 2>/dev/null && pass "drill-down on search hit: $N_SEC sections" || fail "drill-down" "no sections for $HIT_DOC"
+  [ "$N_SEC" -ge 1 ] 2>/dev/null && pass "drill-down on search hit: $N_SEC sections" || fail "drill-down" "no sections for $HIT_DOC_URI"
 else
   fail "drill-down" "search returned no hit to drill into"
 fi
@@ -348,9 +348,9 @@ HAS_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 
 # Update flow (the actual replace path)
 R=$(mcp akb_search "{\"query\":\"UniqornAlpha\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
-DOC=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(next((r['doc_id'] for r in rs if r.get('title')=='Idempo'),''))" 2>/dev/null)
-if [ -n "$DOC" ]; then
-  mcp akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC\",\"content\":\"## a\\n\\nUniqornBeta replacement content.\"}" >/dev/null
+DOC_URI=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(next((r['uri'] for r in rs if r.get('title')=='Idempo'),''))" 2>/dev/null)
+if [ -n "$DOC_URI" ]; then
+  mcp akb_update "{\"uri\":\"$DOC_URI\",\"content\":\"## a\\n\\nUniqornBeta replacement content.\"}" >/dev/null
   sleep "$INDEX_WAIT"
   TOTAL=$(search_total "UniqornAlpha")
   [ "$TOTAL" = "0" ] && pass "akb_update purges old token" || fail "update-alpha-stale" "got $TOTAL"
@@ -366,11 +366,11 @@ mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"DelTarget
 sleep "$INDEX_WAIT"
 
 R=$(mcp akb_search "{\"query\":\"Platypussa\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
-DEL_DOC=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0]['doc_id'] if rs else '')" 2>/dev/null)
-[ -n "$DEL_DOC" ] && pass "DelTarget visible in search ($DEL_DOC)" || fail "del-find" "not found"
+DEL_DOC_URI=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0]['uri'] if rs else '')" 2>/dev/null)
+[ -n "$DEL_DOC_URI" ] && pass "DelTarget visible in search ($DEL_DOC_URI)" || fail "del-find" "not found"
 
-if [ -n "$DEL_DOC" ]; then
-  mcp akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$DEL_DOC\"}" >/dev/null
+if [ -n "$DEL_DOC_URI" ]; then
+  mcp akb_delete "{\"uri\":\"$DEL_DOC_URI\"}" >/dev/null
   sleep 3
   TOTAL=$(search_total "Platypussa")
   [ "$TOTAL" = "0" ] && pass "post-delete search returns 0" || fail "del-stale" "got $TOTAL"

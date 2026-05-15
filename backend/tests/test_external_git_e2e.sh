@@ -107,14 +107,14 @@ R=$(mcp_call akb_put \
 ERR=$(echo "$R" | mcp_result_field "['error']")
 echo "$ERR" | grep -q "read-only" && pass "akb_put rejected" || fail "akb_put guard" "got '$ERR'"
 
-# akb_update needs a doc_id; the guard triggers before find_by_ref resolves,
-# so any made-up id is fine for asserting the block.
+# akb_update needs a URI; the guard triggers before find_by_ref resolves,
+# so any made-up URI is fine for asserting the block.
 R=$(mcp_call akb_update \
-  "{\"vault\":\"$VAULT\",\"doc_id\":\"d-deadbeef\",\"content\":\"edit\"}")
+  "{\"uri\":\"akb://$VAULT/doc/missing/deadbeef.md\",\"content\":\"edit\"}")
 ERR=$(echo "$R" | mcp_result_field "['error']")
 echo "$ERR" | grep -q "read-only" && pass "akb_update rejected" || fail "akb_update guard" "got '$ERR'"
 
-R=$(mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"d-deadbeef\"}")
+R=$(mcp_call akb_delete "{\"uri\":\"akb://$VAULT/doc/missing/deadbeef.md\"}")
 ERR=$(echo "$R" | mcp_result_field "['error']")
 echo "$ERR" | grep -q "read-only" && pass "akb_delete rejected" || fail "akb_delete guard" "got '$ERR'"
 
@@ -155,18 +155,19 @@ VAULT_ECHO=$(echo "$R" | mcp_result_field "['vault']")
 [ "$VAULT_ECHO" = "$VAULT" ] && pass "akb_browse responds (root empty is expected for root-only repos)" || fail "akb_browse" "got '$VAULT_ECHO'"
 
 # Spoon-Knife's README.md is the canonical indexed file.
-R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"README.md\"}")
+README_URI="akb://$VAULT/doc/README.md"
+R=$(mcp_call akb_get "{\"uri\":\"$README_URI\"}")
 TITLE=$(echo "$R" | mcp_result_field "['title']")
 [ -n "$TITLE" ] && pass "akb_get README.md (title='$TITLE')" || fail "akb_get" "no title"
 
-R=$(mcp_call akb_history "{\"vault\":\"$VAULT\",\"doc_id\":\"README.md\",\"limit\":5}")
+R=$(mcp_call akb_history "{\"uri\":\"$README_URI\",\"limit\":5}")
 HIST_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(len(d.get('history',[])))" 2>/dev/null)
 [ -n "$HIST_COUNT" ] && [ "$HIST_COUNT" -ge 1 ] 2>/dev/null && pass "akb_history returns $HIST_COUNT commit(s)" || fail "akb_history" "no commits"
 
 # Grab the first commit and diff it.
 FIRST_COMMIT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(d['history'][0]['hash'])" 2>/dev/null)
 if [ -n "$FIRST_COMMIT" ]; then
-  R=$(mcp_call akb_diff "{\"vault\":\"$VAULT\",\"doc_id\":\"README.md\",\"commit\":\"$FIRST_COMMIT\"}")
+  R=$(mcp_call akb_diff "{\"uri\":\"$README_URI\",\"commit\":\"$FIRST_COMMIT\"}")
   DIFF=$(echo "$R" | mcp_result_field "['diff']")
   [ -n "$DIFF" ] && pass "akb_diff returns patch for $FIRST_COMMIT" || fail "akb_diff" "empty diff"
 fi

@@ -251,7 +251,8 @@ class DocumentService:
         await coll_repo.increment_count(collection_id, now)
 
         return DocumentPutResponse(
-            doc_id=doc_id, vault=req.vault, path=file_path,
+            uri=doc_uri(req.vault, file_path),
+            vault=req.vault, path=file_path,
             commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
         )
 
@@ -279,7 +280,8 @@ class DocumentService:
         public_slug = await self._get_public_slug(row["id"])
 
         return DocumentResponse(
-            id=str(row["id"]), vault=row["vault_name"], path=row["path"],
+            uri=doc_uri(row["vault_name"], row["path"]),
+            vault=row["vault_name"], path=row["path"],
             title=row["title"], type=row["doc_type"] or "note", status=row["status"],
             summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
             created_at=row["created_at"], updated_at=row["updated_at"],
@@ -422,7 +424,8 @@ class DocumentService:
             )
 
         return DocumentPutResponse(
-            doc_id=doc_ref, vault=vault, path=file_path,
+            uri=doc_uri(vault, file_path),
+            vault=vault, path=file_path,
             commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
         )
 
@@ -490,9 +493,8 @@ class DocumentService:
             new_body = current_body.replace(old_string, new_string, 1)
 
         if new_body == current_body:
-            meta = ensure_dict(row["metadata"])
             return DocumentPutResponse(
-                doc_id=meta.get("id", str(pg_doc_id)),
+                uri=doc_uri(vault, file_path),
                 vault=vault, path=file_path,
                 commit_hash=row.get("current_commit") or "",
                 chunks_indexed=0, entities_found=0,
@@ -546,7 +548,7 @@ class DocumentService:
             )
 
         return DocumentPutResponse(
-            doc_id=ensure_dict(row["metadata"]).get("id", str(pg_doc_id)),
+            uri=doc_uri(vault, file_path),
             vault=vault, path=file_path,
             commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
         )
@@ -768,9 +770,14 @@ class DocumentService:
             )
         return [
             BrowseItem(
-                name=r["name"], path=f"_files/{r['id']}", type="file",
+                name=r["name"],
+                # Build the human path from collection + filename. The
+                # canonical handle is `uri`; `path` is purely a
+                # display string and must not embed the file UUID.
+                path=(f"{r.get('collection')}/{r['name']}" if r.get("collection") else r["name"]),
+                type="file",
                 uri=file_uri(vault, str(r["id"])),
-                file_id=str(r["id"]), mime_type=r["mime_type"],
+                mime_type=r["mime_type"],
                 size_bytes=r["size_bytes"], summary=r["description"],
                 collection=r.get("collection"),
                 last_updated=r["created_at"],

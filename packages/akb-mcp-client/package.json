@@ -1,6 +1,6 @@
 {
   "name": "akb-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
   "bin": {
     "akb-mcp": "./bin/akb-mcp.mjs"

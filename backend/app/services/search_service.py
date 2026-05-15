@@ -253,10 +253,11 @@ class SearchService:
             if by_type["file"]:
                 rows = await conn.fetch(
                     """
-                    SELECT f.id, v.name AS vault_name, f.collection, f.name,
-                           f.description, f.mime_type
+                    SELECT f.id, v.name AS vault_name, c.path AS collection,
+                           f.name, f.description, f.mime_type
                       FROM vault_files f
                       JOIN vaults v ON f.vault_id = v.id
+                      LEFT JOIN collections c ON c.id = f.collection_id
                      WHERE f.id = ANY($1)
                     """,
                     [uuid.UUID(x) for x in by_type["file"]],
@@ -272,16 +273,29 @@ class SearchService:
                         "tags": [],
                     }
 
+        from app.services.uri_service import make_uri
+
         results: list[SearchResult] = []
         for h in hits:
             key = (h.source_type, h.source_id)
             m = meta.get(key)
             if not m:
                 continue
+            # Build the canonical URI per resource type. `source_id` is
+            # the internal handle we use to fetch metadata; it never
+            # leaves this function — the client only sees `uri`.
+            if h.source_type == "document":
+                uri = make_uri(m["vault"], "doc", m["path"])
+            elif h.source_type == "table":
+                uri = make_uri(m["vault"], "table", m["title"])
+            elif h.source_type == "file":
+                uri = make_uri(m["vault"], "file", h.source_id)
+            else:
+                continue
             results.append(
                 SearchResult(
                     source_type=h.source_type,
-                    source_id=h.source_id,
+                    uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     doc_type=m["doc_type"], summary=m["summary"],
                     tags=m["tags"], score=h.score,

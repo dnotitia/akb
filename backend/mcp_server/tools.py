@@ -1,6 +1,28 @@
 """AKB MCP Tool Definitions.
 
 All tool schemas for the AKB MCP server.
+
+Identifier policy
+-----------------
+Clients never see internal database IDs (UUIDs, prefixed `d-…` ids,
+file UUIDs, table UUIDs). The single canonical handle for every vault
+resource is the AKB URI:
+
+  - akb://{vault}/doc/{path/to/file.md}
+  - akb://{vault}/table/{name}
+  - akb://{vault}/file/{uuid}
+
+Tools that target an existing resource take `uri` and nothing else
+(vault is encoded in the URI). Tools that *create* a new resource keep
+`vault` + identity bits (title, collection, name) since no URI exists
+yet — the returned payload then carries the newly-minted `uri`.
+
+The pair tools (`akb_link`, `akb_unlink`) take `source` + `target`
+URIs — they too do not need a separate `vault` arg.
+
+Opaque domain handles that are *not* vault resources keep their own
+ID parameter (`session_id`, `todo_id`, `memory_id`, publication
+`slug`); these are not URI-addressable.
 """
 
 from mcp.types import Tool
@@ -56,9 +78,9 @@ TOOLS = [
     Tool(
         name="akb_put",
         description=(
-            "Store a new document in the knowledge base. "
-            "The document is saved as a versioned Markdown file with structured metadata. "
-            "Automatically chunked and indexed for semantic search."
+            "Store a new document. The response carries the canonical `uri` "
+            "(akb://{vault}/doc/{path}) — use that to address the document from "
+            "every other tool. Automatically chunked and indexed for semantic search."
         ),
         inputSchema={
             "type": "object",
@@ -76,8 +98,8 @@ TOOLS = [
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
                 "domain": {"type": "string", "description": "Domain: engineering, product, ops, legal, etc."},
                 "summary": {"type": "string", "description": "Brief summary (auto-generated if omitted)"},
-                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Doc IDs or akb:// URIs this depends on"},
-                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Doc IDs or akb:// URIs of related resources"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs this depends on"},
+                "related_to": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs of related resources"},
             },
             "required": ["vault", "collection", "title", "content"],
         },
@@ -85,18 +107,17 @@ TOOLS = [
     Tool(
         name="akb_get",
         description=(
-            "Retrieve a document by its ID or path. Returns full content with metadata. "
-            "Use akb_browse or akb_search first to find the document ID. "
+            "Retrieve a document by its URI. Returns full content with metadata. "
+            "Use akb_browse or akb_search first to obtain the URI. "
             "Optionally pass a commit hash (from akb_history) to read a previous version."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID or file path within the vault"},
+                "uri": {"type": "string", "description": "Document URI (akb://{vault}/doc/{path})"},
                 "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_history)"},
             },
-            "required": ["vault", "doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(
@@ -105,25 +126,23 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": "string", "description": "New document body (replaces existing)"},
                 "title": {"type": "string", "description": "New title"},
                 "status": {"type": "string", "enum": ["draft", "active", "archived", "superseded"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
-                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (doc IDs or akb:// URIs)"},
-                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update related list (doc IDs or akb:// URIs)"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (akb:// URIs)"},
+                "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update related list (akb:// URIs)"},
                 "message": {"type": "string", "description": "Commit message describing the change"},
             },
-            "required": ["vault", "doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(
         name="akb_edit",
         description=(
-            "Edit a single document by replacing exact text. Scope is one document (doc_id required). "
-            "Use this for precise partial edits. "
+            "Edit a single document by replacing exact text. Scope is one document. "
             "old_string must be unique within the document (or use replace_all). "
             "If old_string is not found or appears multiple times, the call fails with a clear error. "
             "For find-and-replace across many documents, use akb_grep with replace instead."
@@ -131,8 +150,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
                 "old_string": {
                     "type": "string",
                     "description": "Exact text to replace. Must be unique in the document body unless replace_all=true. Include surrounding context if needed for uniqueness.",
@@ -148,19 +166,18 @@ TOOLS = [
                 },
                 "message": {"type": "string", "description": "Commit message describing the change"},
             },
-            "required": ["vault", "doc_id", "old_string", "new_string"],
+            "required": ["uri", "old_string", "new_string"],
         },
     ),
     Tool(
         name="akb_delete",
-        description="Delete a document from the knowledge base. Removes from Git, search index, and knowledge graph.",
+        description="Delete a document. Removes from Git, search index, and knowledge graph.",
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
             },
-            "required": ["vault", "doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(
@@ -169,7 +186,7 @@ TOOLS = [
             "Browse ALL vault content — documents (by collection), tables, and files. "
             "Without collection: shows top-level collections, tables, and files. "
             "With collection: shows documents and files in that collection. "
-            "Use content_type to filter by type."
+            "Each item carries its canonical `uri` — pass that URI to akb_get / akb_update / akb_delete."
         ),
         inputSchema={
             "type": "object",
@@ -199,8 +216,8 @@ TOOLS = [
             "Search documents with hybrid retrieval — dense vector (semantic) fused with "
             "BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language "
             "questions and short keyword queries well. For exact string / regex matches "
-            "(code, URLs, version numbers) prefer akb_grep. Returns doc summaries with "
-            "fusion scores; use akb_drill_down or akb_get for full content."
+            "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
+            "use akb_drill_down or akb_get with that URI for full content."
         ),
         inputSchema={
             "type": "object",
@@ -225,7 +242,7 @@ TOOLS = [
             "Search for exact text or regex patterns across document content. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
-            "Returns matching documents with the matched lines and their section paths. "
+            "Returns matching documents (each with its `uri`) and matched lines. "
             "Optionally pass `replace` to find-and-replace across all matching documents."
         ),
         inputSchema={
@@ -252,11 +269,10 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
                 "section": {"type": "string", "description": "Section path filter (partial match, e.g. 'Background')"},
             },
-            "required": ["vault", "doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(
@@ -313,61 +329,56 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
                 "commit": {"type": "string", "description": "Commit hash (from akb_history or akb_activity)"},
             },
-            "required": ["vault", "doc_id", "commit"],
+            "required": ["uri", "commit"],
         },
     ),
     Tool(
         name="akb_relations",
         description=(
             "Get relations for any resource (document, table, or file). "
-            "Shows cross-type connections: doc→table, doc→file, table→file, etc. "
-            "Get the resource_uri from akb_browse results."
+            "Shows cross-type connections: doc→table, doc→file, table→file, etc."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "resource_uri": {"type": "string", "description": "AKB URI (e.g. akb://vault/doc/specs/api.md, akb://vault/table/expenses, akb://vault/file/abc123)"},
+                "uri": {"type": "string", "description": "Resource URI (akb://vault/doc/path, akb://vault/table/name, akb://vault/file/uuid)"},
                 "direction": {"type": "string", "enum": ["incoming", "outgoing", "both"], "default": "both"},
                 "type": {"type": "string", "description": "Filter by relation type (depends_on, related_to, implements, references, attached_to)"},
             },
-            "required": ["vault", "resource_uri"],
+            "required": ["uri"],
         },
     ),
     Tool(
         name="akb_graph",
         description=(
             "Get a knowledge graph — nodes (documents, tables, files) and edges (relations). "
-            "Provide resource_uri to get a subgraph centered on any resource with BFS traversal. "
-            "If omitted, returns the full vault graph showing all cross-type connections."
+            "Provide `uri` to get a subgraph centered on any resource with BFS traversal. "
+            "Provide `vault` (without uri) to get the full vault graph."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "resource_uri": {"type": "string", "description": "Center resource URI (omit for full vault graph)"},
+                "uri": {"type": "string", "description": "Center resource URI (omit + pass vault for full vault graph)"},
+                "vault": {"type": "string", "description": "Vault name (only when uri is omitted — for full vault graph)"},
                 "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 5, "description": "BFS depth"},
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200, "description": "Max nodes"},
             },
-            "required": ["vault"],
         },
     ),
     Tool(
         name="akb_link",
         description=(
             "Create a relation between any two resources (documents, tables, files). "
-            "Uses AKB URIs: akb://{vault}/doc/{path}, akb://{vault}/table/{name}, akb://{vault}/file/{id}. "
+            "Source and target are AKB URIs. "
             "Relation types: depends_on, related_to, implements, references, attached_to, derived_from. "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
                 "source": {"type": "string", "description": "Source resource URI (e.g. akb://vault/doc/specs/api.md)"},
                 "target": {"type": "string", "description": "Target resource URI (e.g. akb://vault/table/experiments)"},
                 "relation": {
@@ -376,7 +387,7 @@ TOOLS = [
                     "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from"],
                 },
             },
-            "required": ["vault", "source", "target", "relation"],
+            "required": ["source", "target", "relation"],
         },
     ),
     Tool(
@@ -388,12 +399,11 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
                 "source": {"type": "string", "description": "Source resource URI"},
                 "target": {"type": "string", "description": "Target resource URI"},
                 "relation": {"type": "string", "description": "Specific relation type to remove (omit to remove all)"},
             },
-            "required": ["vault", "source", "target"],
+            "required": ["source", "target"],
         },
     ),
     Tool(
@@ -402,15 +412,16 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
             },
-            "required": ["doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(
         name="akb_create_table",
         description=(
-            "Create a structured data table in a vault. "
+            "Create a structured data table in a vault. The response carries the "
+            "canonical `uri` (akb://{vault}/table/{name}). "
             "Tables live alongside documents inside collections and follow the same permissions. "
             "Define columns with name and type (text, number, boolean, date, json). "
             "Optional `collection` (e.g. 'sessions/learnings') groups the table under that "
@@ -473,10 +484,9 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "table": {"type": "string", "description": "Table name to delete"},
+                "uri": {"type": "string", "description": "Table URI (akb://{vault}/table/{name})"},
             },
-            "required": ["vault", "table"],
+            "required": ["uri"],
         },
     ),
     Tool(
@@ -485,8 +495,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "table": {"type": "string", "description": "Table name"},
+                "uri": {"type": "string", "description": "Table URI (akb://{vault}/table/{name})"},
                 "add_columns": {
                     "type": "array",
                     "description": "Columns to add",
@@ -509,7 +518,7 @@ TOOLS = [
                     "description": "Rename columns: {old_name: new_name}",
                 },
             },
-            "required": ["vault", "table"],
+            "required": ["uri"],
         },
     ),
     Tool(
@@ -526,7 +535,7 @@ TOOLS = [
                 "assignee": {"type": "string", "description": "Username to assign to (omit = yourself)"},
                 "vault": {"type": "string", "description": "Related vault (optional)"},
                 "note": {"type": "string", "description": "Additional details"},
-                "ref_doc": {"type": "string", "description": "Related document ID (optional)"},
+                "ref_uri": {"type": "string", "description": "Related resource URI (optional)"},
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
                 "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)"},
             },
@@ -624,6 +633,9 @@ TOOLS = [
         name="akb_publish",
         description=(
             "Create a public share URL for a document, table query, or file. "
+            "For a document or file, pass the resource `uri`. For a table query, "
+            "pass the SQL plus `vault` (queries can span multiple vaults — list them "
+            "in query_vault_names). "
             "Supports expiration, password protection, view count limits, snapshots, and section filtering. "
             "Returns a shareable URL accessible without authentication. "
             "Prefer `public_url_full` (absolute URL) when sharing the link with a user; "
@@ -632,15 +644,14 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
+                "uri": {"type": "string", "description": "Resource URI to publish (document or file). Omit for table_query."},
                 "resource_type": {
                     "type": "string",
                     "enum": ["document", "table_query", "file"],
                     "default": "document",
-                    "description": "Type of resource to share",
+                    "description": "Type of resource to share. For document/file, also pass uri. For table_query, pass query_sql + vault.",
                 },
-                "doc_id": {"type": "string", "description": "Document ID (for resource_type=document)"},
-                "file_id": {"type": "string", "description": "File ID (for resource_type=file)"},
+                "vault": {"type": "string", "description": "Vault name (required for resource_type=table_query)"},
                 "query_sql": {
                     "type": "string",
                     "description": "SELECT SQL with :param placeholders (for resource_type=table_query)",
@@ -677,20 +688,20 @@ TOOLS = [
                     "description": "Whether the share can be embedded via iframe/oEmbed",
                 },
             },
-            "required": ["vault"],
         },
     ),
     Tool(
         name="akb_unpublish",
-        description="Remove a public share. Provide either slug or doc_id (deletes all shares for that document).",
+        description=(
+            "Remove a public share. Pass `slug` to delete a single publication, "
+            "or `uri` to delete all publications for that resource."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID — deletes all publications for this doc"},
+                "uri": {"type": "string", "description": "Resource URI — deletes all publications for this resource"},
                 "slug": {"type": "string", "description": "Publication slug — deletes that specific publication"},
             },
-            "required": ["vault"],
         },
     ),
     Tool(
@@ -716,9 +727,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
-                "publication_id": {"type": "string", "description": "Publication UUID"},
+                "slug": {"type": "string", "description": "Publication slug"},
             },
-            "required": ["vault", "publication_id"],
+            "required": ["vault", "slug"],
         },
     ),
     Tool(
@@ -897,11 +908,10 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "doc_id": {"type": "string", "description": "Document ID"},
+                "uri": {"type": "string", "description": "Document URI"},
                 "limit": {"type": "integer", "default": 20, "description": "Max entries"},
             },
-            "required": ["vault", "doc_id"],
+            "required": ["uri"],
         },
     ),
     Tool(

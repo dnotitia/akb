@@ -79,7 +79,7 @@ echo "▸ 1. Vault create seeds overview/vault-skill.md"
 
 mcp akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"e2e\"}" >/dev/null
 
-GET_RESP=$(mcp akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"overview/vault-skill.md\"}" | mcp_text)
+GET_RESP=$(mcp akb_get "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text)
 
 echo "$GET_RESP" | grep -q '"type": *"skill"' \
   && pass "Seeded doc has type=skill" \
@@ -131,7 +131,7 @@ echo "▸ 4. akb_help(topic='vault-skill', vault=<no-skill>)"
 
 # Create a vault then DELETE its vault-skill.md so it's missing.
 mcp akb_create_vault "{\"name\":\"$EMPTY_VAULT\",\"description\":\"e2e\"}" >/dev/null
-mcp akb_delete "{\"vault\":\"$EMPTY_VAULT\",\"doc_id\":\"overview/vault-skill.md\"}" >/dev/null
+mcp akb_delete "{\"uri\":\"akb://$EMPTY_VAULT/doc/overview/vault-skill.md\"}" >/dev/null
 
 H3=$(mcp akb_help "{\"topic\":\"vault-skill\",\"vault\":\"$EMPTY_VAULT\"}" | mcp_text)
 echo "$H3" | grep -q "No \`overview/vault-skill.md\` found" \
@@ -150,14 +150,14 @@ echo "$H3" | grep -q '\${{secrets.X}}' \
 echo "▸ 5. Owner can edit vault-skill, akb_help returns updated body"
 
 NEW_BODY="# Custom Vault Skill\n\nMy custom rules: report only."
-mcp akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"overview/vault-skill.md\",\"content\":\"$NEW_BODY\"}" >/dev/null
+mcp akb_update "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\",\"content\":\"$NEW_BODY\"}" >/dev/null
 
 H4=$(mcp akb_help "{\"topic\":\"vault-skill\",\"vault\":\"$VAULT\"}" | mcp_text)
 echo "$H4" | grep -q "My custom rules" \
   && pass "Edited body is returned" \
   || fail "T5.1" "edit did not propagate to akb_help"
 
-GET2=$(mcp akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"overview/vault-skill.md\"}" | mcp_text)
+GET2=$(mcp akb_get "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text)
 echo "$GET2" | grep -q '"type": *"skill"' \
   && pass "type=skill preserved across edit" \
   || fail "T5.2" "type changed after update"
@@ -179,7 +179,7 @@ echo "$GREP_RESP" | grep -q "overview/vault-skill.md" \
   || fail "T5b.1" "seeded doc not in chunk index"
 
 # Also verify frontmatter is present in git (akb_get returns parsed body, not raw)
-GET_FM=$(mcp akb_get "{\"vault\":\"$SEARCH_VAULT\",\"doc_id\":\"overview/vault-skill.md\"}" | mcp_text)
+GET_FM=$(mcp akb_get "{\"uri\":\"akb://$SEARCH_VAULT/doc/overview/vault-skill.md\"}" | mcp_text)
 echo "$GET_FM" | grep -q '"type": *"skill"' && pass "Seeded doc has frontmatter (type=skill visible)" \
   || fail "T5b.2" "no frontmatter on seeded doc (type missing)"
 

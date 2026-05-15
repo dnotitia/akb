@@ -47,26 +47,36 @@ R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=Pub%20test")
 [ "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)" = "$VAULT" ] \
   && pass "Vault created" || fail "Vault create" "$R"
 
-# Create a doc
+# Helper: parse the {uuid} out of an akb://{vault}/file/{uuid} URI.
+uri_file_id() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.rsplit('/',1)[-1] if u else '')"; }
+uri_doc_path() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.split('/doc/',1)[1] if '/doc/' in u else '')"; }
+
+# Create a doc. Backend response carries `uri` + `path` only — there is no
+# legacy `doc_id` field. REST routes that take a `doc_id` accept the doc
+# path verbatim via document_repo.find_by_ref().
 R=$(acurl -X POST "$BASE_URL/api/v1/documents" -H "Content-Type: application/json" \
   -d "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"Pub Doc\",\"content\":\"# Top\\n\\n## Alpha\\nAlpha content\\n\\n## Beta\\nBeta content\\n\\n## Gamma\\nGamma content\",\"type\":\"note\",\"tags\":[\"pub\",\"test\"]}")
-DOC_ID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
-[ -n "$DOC_ID" ] && pass "Doc created ($DOC_ID)" || fail "Doc create" "$R"
+DOC_PATH=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))' 2>/dev/null)
+DOC_URI=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+DOC_ID="$DOC_PATH"  # REST publications endpoint takes path-as-doc_id
+[ -n "$DOC_URI" ] && pass "Doc created ($DOC_URI)" || fail "Doc create" "$R"
 
 # Create a table
 R=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT" -H "Content-Type: application/json" \
   -d '{"name":"products","columns":[{"name":"name","type":"text","required":true},{"name":"category","type":"text"},{"name":"price","type":"number"}]}')
-[ -n "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)" ] \
+[ -n "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)" ] \
   && pass "Table created" || fail "Table create" "$R"
 
 acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
   -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('Apple', 'food', 1), ('Bagel', 'food', 2), ('Chair', 'furniture', 50), ('Desk', 'furniture', 200)\"}" >/dev/null
 pass "Table seeded"
 
-# Upload a JSON file
+# Upload a JSON file. The init response surfaces only `uri`; the file UUID
+# (required by the confirm round-trip) is the trailing segment.
 JSON_BODY='{"hello":"world","arr":[1,2,3],"nested":{"a":true}}'
 INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=data.json&collection=data&mime_type=application/json")
-FID=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)
+FILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+FID=$(printf '%s' "$FILE_URI" | uri_file_id)
 URL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
 echo "$JSON_BODY" | curl -sk -X PUT "$URL" -H "Content-Type: application/json" --data-binary @- > /dev/null
 acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$FID/confirm" > /dev/null
@@ -459,26 +469,27 @@ if m:
 "
 }
 
-# akb_publish (basic)
-R=$(mcp 10 akb_publish "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_ID\"}" | mcp_text)
-PID_FROM_MCP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("publication_id",""))' 2>/dev/null)
-[ -n "$PID_FROM_MCP" ] && pass "MCP akb_publish returns publication_id" || fail "MCP publish" "$R"
+# akb_publish (basic) — uses canonical URI
+DOC_URI_FOR_MCP="$DOC_URI"
+R=$(mcp 10 akb_publish "{\"uri\":\"$DOC_URI_FOR_MCP\"}" | mcp_text)
+SLUG_FROM_MCP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+[ -n "$SLUG_FROM_MCP" ] && pass "MCP akb_publish returns slug" || fail "MCP publish" "$R"
 
 # akb_publications (list)
 R=$(mcp 11 akb_publications "{\"vault\":\"$VAULT\"}" | mcp_text)
 PUB_TOTAL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("total",0))' 2>/dev/null)
 [ "$PUB_TOTAL" -gt 0 ] && pass "MCP akb_publications list ($PUB_TOTAL)" || fail "MCP list" "$R"
 
-# akb_publication_snapshot
-TQID_MCP=$(mcp 12 akb_publish "{\"vault\":\"$VAULT\",\"resource_type\":\"table_query\",\"query_sql\":\"SELECT name FROM products\"}" | mcp_text | python3 -c 'import json,sys; print(json.load(sys.stdin).get("publication_id",""))' 2>/dev/null)
-R=$(mcp 13 akb_publication_snapshot "{\"vault\":\"$VAULT\",\"publication_id\":\"$TQID_MCP\"}" | mcp_text)
+# akb_publication_snapshot — takes vault + slug
+TQ_SLUG_MCP=$(mcp 12 akb_publish "{\"vault\":\"$VAULT\",\"resource_type\":\"table_query\",\"query_sql\":\"SELECT name FROM products\"}" | mcp_text | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+R=$(mcp 13 akb_publication_snapshot "{\"vault\":\"$VAULT\",\"slug\":\"$TQ_SLUG_MCP\"}" | mcp_text)
 SS_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("snapshot_at",""))' 2>/dev/null)
 [ -n "$SS_AT" ] && pass "MCP akb_publication_snapshot" || fail "MCP snapshot" "$R"
 
 # akb_unpublish by slug
 R=$(mcp 14 akb_publications "{\"vault\":\"$VAULT\",\"resource_type\":\"document\"}" | mcp_text)
 ANY_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publications"][0]["slug"])' 2>/dev/null)
-R=$(mcp 15 akb_unpublish "{\"vault\":\"$VAULT\",\"slug\":\"$ANY_SLUG\"}" | mcp_text)
+R=$(mcp 15 akb_unpublish "{\"slug\":\"$ANY_SLUG\"}" | mcp_text)
 DEL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DEL" = "True" ] && pass "MCP akb_unpublish by slug" || fail "MCP unpublish" "$R"
 
@@ -607,7 +618,7 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLU
 # Cascade: document delete → publications cascade
 R=$(acurl -X POST "$BASE_URL/api/v1/documents" -H "Content-Type: application/json" \
   -d "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"To Delete\",\"content\":\"# tmp\",\"type\":\"note\"}")
-CASCADE_DOC=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["doc_id"])' 2>/dev/null)
+CASCADE_DOC=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' 2>/dev/null)
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"document\",\"doc_id\":\"$CASCADE_DOC\"}")
 DOC_CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)

@@ -116,7 +116,7 @@ D3=$(put "CascadeC" "GammaMarkerCascade more content." | jget "d['doc_id']")
 wait_for_search "GammaMarkerCascade" "$VAULT" >/dev/null
 
 # Link D1→D2 (creates edge). akb_link takes source/target URIs.
-mcp_call "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"akb://$VAULT/doc/x/cascadea.md\",\"target\":\"akb://$VAULT/doc/x/cascadeb.md\",\"relation\":\"depends_on\"}" >/dev/null
+mcp_call "akb_link" "{\"source\":\"akb://$VAULT/doc/x/cascadea.md\",\"target\":\"akb://$VAULT/doc/x/cascadeb.md\",\"relation\":\"depends_on\"}" >/dev/null
 sleep 2
 
 # Snapshot counts BEFORE delete
@@ -222,7 +222,7 @@ TGT_RESP=$(rcurl -X POST "$BASE/api/v1/documents" -H "Authorization: Bearer $PAT
 TGT=$(echo "$TGT_RESP" | jget "d['doc_id']")
 TGT_PATH=$(echo "$TGT_RESP" | jget "d['path']")
 
-mcp_call "akb_link" "{\"vault\":\"$VAULT4\",\"source\":\"akb://$VAULT4/doc/$SRC_PATH\",\"target\":\"akb://$VAULT4/doc/$TGT_PATH\",\"relation\":\"depends_on\"}" >/dev/null
+mcp_call "akb_link" "{\"source\":\"akb://$VAULT4/doc/$SRC_PATH\",\"target\":\"akb://$VAULT4/doc/$TGT_PATH\",\"relation\":\"depends_on\"}" >/dev/null
 sleep 2
 
 V4_ID=$(psql_q "SELECT id FROM vaults WHERE name='$VAULT4'")

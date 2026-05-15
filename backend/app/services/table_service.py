@@ -26,6 +26,7 @@ from app.repositories.events_repo import emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
+from app.services.uri_service import table_uri
 
 # Re-exported helpers used by publication_service for the
 # `table_query` share path. Other modules import directly from
@@ -162,7 +163,7 @@ async def create_table(
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
-        "id": str(tid),
+        "uri": table_uri(vault["name"], name),
         "vault": vault["name"],
         "collection": collection_path or None,
         "name": name,
@@ -188,7 +189,7 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
             count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
                 "kind": "table",
-                "id": str(r["id"]),
+                "uri": table_uri(vault["name"], r["name"]),
                 "vault": vault["name"],
                 "collection": r["collection"],
                 "name": r["name"],
@@ -252,7 +253,7 @@ async def drop_table(
     logger.info("Table dropped: %s (%s)", table_name, pg_name)
     return {
         "kind": "table",
-        "id": str(table_id),
+        "uri": table_uri(vault["name"], table_name),
         "vault": vault["name"],
         "collection": table.get("collection"),
         "name": table_name,
@@ -339,7 +340,7 @@ async def alter_table(
 
     return {
         "kind": "table",
-        "id": str(table["id"]),
+        "uri": table_uri(vault["name"], table_name),
         "vault": vault["name"],
         "name": table_name,
         "columns": columns,

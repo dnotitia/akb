@@ -140,8 +140,8 @@ D2_RESP=$(rcurl -X POST "$BASE/api/v1/documents" -H "Authorization: Bearer $PAT_
   -d "{\"vault\":\"$VAULT\",\"collection\":\"x\",\"title\":\"CirclB\",\"content\":\"circular source node B.\"}")
 P2=$(echo "$D2_RESP" | jget "d['path']")
 
-mcp_call "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"akb://$VAULT/doc/$P1\",\"target\":\"akb://$VAULT/doc/$P2\",\"relation\":\"related_to\"}" >/dev/null
-mcp_call "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"akb://$VAULT/doc/$P2\",\"target\":\"akb://$VAULT/doc/$P1\",\"relation\":\"related_to\"}" >/dev/null
+mcp_call "akb_link" "{\"source\":\"akb://$VAULT/doc/$P1\",\"target\":\"akb://$VAULT/doc/$P2\",\"relation\":\"related_to\"}" >/dev/null
+mcp_call "akb_link" "{\"source\":\"akb://$VAULT/doc/$P2\",\"target\":\"akb://$VAULT/doc/$P1\",\"relation\":\"related_to\"}" >/dev/null
 sleep 2
 
 HTTP=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 \
