@@ -52,7 +52,9 @@ async def user(pool):
     yield uid, uname
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
-        await conn.execute("DELETE FROM events WHERE ref_id = $1", str(uid))
+        # User-scoped events live without a resource_uri (users are not
+        # URI-addressable); identify them via actor_id instead.
+        await conn.execute("DELETE FROM events WHERE actor_id = $1", str(uid))
 
 
 async def test_change_password_success(pool, user):
@@ -100,11 +102,12 @@ async def test_change_password_emits_event(pool, user):
     await change_password(str(uid), "orig-12345", "new-secret-67")
     async with pool.acquire() as conn:
         ev = await conn.fetchrow(
-            "SELECT kind, ref_type, ref_id, actor_id "
-            "FROM events WHERE ref_id = $1 ORDER BY id DESC LIMIT 1",
+            "SELECT kind, resource_uri, actor_id "
+            "FROM events WHERE actor_id = $1 ORDER BY id DESC LIMIT 1",
             str(uid),
         )
     assert ev is not None
     assert ev["kind"] == "auth.password_changed"
-    assert ev["ref_type"] == "user"
+    # Users have no URI scheme; resource_uri stays NULL.
+    assert ev["resource_uri"] is None
     assert ev["actor_id"] == str(uid)

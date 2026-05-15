@@ -21,8 +21,9 @@ interface Publication {
   publication_id: string;
   slug: string;
   resource_type: "document" | "file" | "table_query";
-  document_id?: string;
-  file_id?: string;
+  // Canonical handle (akb://{vault}/{doc|file}/{...}). Null for
+  // table_query publications, which have no single addressable resource.
+  resource_uri?: string | null;
   title?: string;
   created_at?: string;
   expires_at?: string | null;
@@ -108,15 +109,17 @@ export default function PublicationsPage() {
     setTimeout(() => setCopiedId(null), 1500);
   }
 
-  // Link back into the app for the underlying resource. Tables/files use
-  // their id; docs use the doc id since we don't have the path here.
+  // Link back into the app for the underlying resource. The canonical
+  // handle is `resource_uri` (akb://...) — we parse the tail to route.
   function resourceHref(pub: Publication): string {
-    if (!name) return "#";
-    if (pub.resource_type === "document" && pub.document_id) {
-      return `/vault/${name}/doc/${encodeURIComponent(pub.document_id)}`;
+    if (!name || !pub.resource_uri) return `/vault/${name ?? ""}`;
+    if (pub.resource_type === "document") {
+      const docPath = pub.resource_uri.split("/doc/")[1];
+      return docPath ? `/vault/${name}/doc/${docPath}` : `/vault/${name}`;
     }
-    if (pub.resource_type === "file" && pub.file_id) {
-      return `/vault/${name}/file/${encodeURIComponent(pub.file_id)}`;
+    if (pub.resource_type === "file") {
+      const fileId = pub.resource_uri.split("/file/")[1];
+      return fileId ? `/vault/${name}/file/${fileId}` : `/vault/${name}`;
     }
     return `/vault/${name}`;
   }

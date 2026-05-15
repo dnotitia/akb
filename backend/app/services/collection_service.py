@@ -141,12 +141,14 @@ class CollectionService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # Collections are not URI-addressable resources (the URI
+                # scheme is doc/table/file only), so resource_uri stays
+                # None. Subscribers reconstruct identity from payload.path.
                 await emit_event(
                     conn,
                     "collection.create",
                     vault_id=vault_id,
-                    ref_type="collection",
-                    ref_id=norm,
+                    resource_uri=None,
                     actor_id=agent_id,
                     payload={"vault": vault, "path": norm, "created": created},
                 )
@@ -336,8 +338,7 @@ class CollectionService:
                     conn,
                     "collection.delete",
                     vault_id=vault_id,
-                    ref_type="collection",
-                    ref_id=norm,
+                    resource_uri=None,
                     actor_id=agent_id,
                     payload={
                         "vault": vault,

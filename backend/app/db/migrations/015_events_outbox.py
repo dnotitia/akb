@@ -38,6 +38,10 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    # Fresh installs land on the post-021 shape directly: a single
+    # `resource_uri` column instead of the legacy (ref_type, ref_id) pair.
+    # Migration 021 contains the upgrade path from older databases that
+    # still carry the pair columns.
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -45,8 +49,7 @@ async def _run(conn):
             occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             vault_id        UUID,
             kind            TEXT NOT NULL,
-            ref_type        TEXT,
-            ref_id          TEXT,
+            resource_uri    TEXT,
             -- TEXT mirrors documents.created_by — `agent_id` flows in
             -- as a username string (not a UUID) on the MCP path.
             actor_id        TEXT,

@@ -137,15 +137,24 @@ def _publication_row_to_dict(row) -> dict | None:
 
     Normalizations applied:
     - `id` is renamed to `publication_id` so callers never confuse it
-      with the underlying resource id (document_id / file_id).
+      with the underlying resource handle.
+    - `resource_uri` is built from the joined vault name + doc path /
+      file id (or left None for table_query publications, which have no
+      single addressable resource).
+    - Internal columns `document_id` / `file_id` and the join helpers
+      `_vault_name` / `_doc_path` are removed before the dict leaves
+      this function — clients see `uri` only.
     - `query_params` is parsed from JSON string into a dict.
     - UUID columns become strings.
     - Datetime columns become ISO strings.
 
     Returns None only if `row` is None. Otherwise the result is guaranteed
-    to contain `publication_id`, `slug`, and `resource_type`. Raises
-    PublicationError if `query_params` JSON is corrupted (data integrity).
+    to contain `publication_id`, `slug`, `resource_type`, and (where
+    applicable) `resource_uri`. Raises PublicationError if `query_params`
+    JSON is corrupted (data integrity).
     """
+    from app.services.uri_service import doc_uri, file_uri
+
     if row is None:
         return None
     d = dict(row)
@@ -165,7 +174,37 @@ def _publication_row_to_dict(row) -> dict | None:
             )
     if "id" in d:
         d["publication_id"] = d.pop("id")
+
+    # Build the canonical URI. We keep `document_id` and `file_id` in
+    # the internal dict so the resolution helpers (resolve_document_
+    # publication / resolve_file_publication) can fetch the underlying
+    # row without parsing the URI. The serialization layer
+    # (`_public_publication_view`) strips them before any client sees
+    # the dict.
+    vault_name = d.pop("_vault_name", None)
+    doc_path = d.pop("_doc_path", None)
+    resource_type = d.get("resource_type")
+    resource_uri: str | None = None
+    if vault_name:
+        if resource_type == "document" and doc_path:
+            resource_uri = doc_uri(vault_name, doc_path)
+        elif resource_type == "file" and d.get("file_id"):
+            resource_uri = file_uri(vault_name, d["file_id"])
+        # table_query: no single resource handle → resource_uri stays None.
+    d["resource_uri"] = resource_uri
     return d
+
+
+def public_view(d: dict | None) -> dict | None:
+    """Strip internal id columns from a publication dict before it
+    leaves the backend. Callers expose this view from MCP handlers and
+    REST routes that return publications to clients."""
+    if d is None:
+        return None
+    clean = dict(d)
+    clean.pop("document_id", None)
+    clean.pop("file_id", None)
+    return clean
 
 
 def to_uuid(value) -> uuid.UUID:
@@ -173,10 +212,6 @@ def to_uuid(value) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(str(value))
-
-
-# Backwards-compat alias (private name removed in next pass)
-_to_uuid = to_uuid
 
 
 # ============================================================
@@ -252,17 +287,28 @@ async def create_publication(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO publications (
-                slug, vault_id, resource_type, document_id, file_id,
-                query_sql, query_vault_names, query_params,
-                password_hash, max_views, expires_at,
-                mode, section_filter, allow_embed, title, created_by
+            WITH inserted AS (
+              INSERT INTO publications (
+                  slug, vault_id, resource_type, document_id, file_id,
+                  query_sql, query_vault_names, query_params,
+                  password_hash, max_views, expires_at,
+                  mode, section_filter, allow_embed, title, created_by
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+              RETURNING id, slug, vault_id, resource_type, document_id, file_id,
+                        query_sql, query_vault_names, query_params, max_views,
+                        view_count, expires_at, mode, section_filter, allow_embed,
+                        title, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            RETURNING id, slug, vault_id, resource_type, document_id, file_id,
-                      query_sql, query_vault_names, query_params, max_views,
-                      view_count, expires_at, mode, section_filter, allow_embed,
-                      title, created_at
+            SELECT i.id, i.slug, i.vault_id, i.resource_type, i.document_id, i.file_id,
+                   i.query_sql, i.query_vault_names, i.query_params, i.max_views,
+                   i.view_count, i.expires_at, i.mode, i.section_filter, i.allow_embed,
+                   i.title, i.created_at,
+                   v.name AS _vault_name,
+                   d.path AS _doc_path
+              FROM inserted i
+              JOIN vaults v ON v.id = i.vault_id
+              LEFT JOIN documents d ON d.id = i.document_id
             """,
             slug, vault_id, resource_type, document_id, file_id,
             query_sql, query_vault_names, json.dumps(query_params or {}),
@@ -383,13 +429,26 @@ async def delete_publications_for_document(document_id: uuid.UUID) -> int:
     return len(rows)
 
 
-# Columns selected for list/inspection queries (excludes large/sensitive fields).
+# SELECT clause used by every list/inspection query. Pulls the
+# publication row plus enough JOIN material (vault name, doc path, file
+# id) to build the canonical `resource_uri` in `_enrich_publication`.
+# Tables don't store a URI — they aren't publishable as single
+# resources (the table_query branch sets vault but no resource handle),
+# so we don't join `vault_tables` here.
 _PUBLICATION_LIST_COLUMNS = """
-    id, slug, vault_id, resource_type, document_id, file_id, title,
-    query_params, max_views, view_count, expires_at, mode, snapshot_at,
-    section_filter, allow_embed,
-    password_hash IS NOT NULL AS password_protected,
-    created_at
+    p.id, p.slug, p.vault_id, p.resource_type, p.document_id, p.file_id, p.title,
+    p.query_params, p.max_views, p.view_count, p.expires_at, p.mode, p.snapshot_at,
+    p.section_filter, p.allow_embed,
+    p.password_hash IS NOT NULL AS password_protected,
+    p.created_at,
+    v.name AS _vault_name,
+    d.path AS _doc_path
+"""
+
+_PUBLICATION_FROM_CLAUSE = """
+    publications p
+    JOIN vaults v ON v.id = p.vault_id
+    LEFT JOIN documents d ON d.id = p.document_id
 """
 
 
@@ -419,16 +478,16 @@ async def list_publications(vault_id: uuid.UUID, resource_type: str | None = Non
     async with pool.acquire() as conn:
         if resource_type:
             rows = await conn.fetch(
-                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM publications "
-                "WHERE vault_id = $1 AND resource_type = $2 "
-                "ORDER BY created_at DESC",
+                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
+                "WHERE p.vault_id = $1 AND p.resource_type = $2 "
+                "ORDER BY p.created_at DESC",
                 vault_id, resource_type,
             )
         else:
             rows = await conn.fetch(
-                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM publications "
-                "WHERE vault_id = $1 "
-                "ORDER BY created_at DESC",
+                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
+                "WHERE p.vault_id = $1 "
+                "ORDER BY p.created_at DESC",
                 vault_id,
             )
     return [_enrich_publication(_publication_row_to_dict(r)) for r in rows]
@@ -439,7 +498,8 @@ async def get_publication_by_slug(slug: str) -> dict | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM publications WHERE slug = $1",
+            f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
+            "WHERE p.slug = $1",
             slug,
         )
     if row is None:
@@ -481,9 +541,12 @@ async def resolve_publication(
                    s.password_hash, s.max_views, s.view_count, s.expires_at,
                    s.mode, s.snapshot_s3_key, s.snapshot_at,
                    s.section_filter, s.allow_embed, s.title, s.created_at,
-                   v.name AS vault_name
+                   v.name AS vault_name,
+                   v.name AS _vault_name,
+                   d.path AS _doc_path
             FROM publications s
             JOIN vaults v ON s.vault_id = v.id
+            LEFT JOIN documents d ON d.id = s.document_id
             WHERE s.slug = $1
             """,
             slug,

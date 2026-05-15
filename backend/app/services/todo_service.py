@@ -14,10 +14,15 @@ async def create_todo(
     title: str,
     note: str | None = None,
     vault_name: str | None = None,
-    ref_doc: str | None = None,
+    ref_uri: str | None = None,
     priority: str = "normal",
     due_date: str | None = None,
 ) -> dict:
+    """Create a todo. `ref_uri` (optional) is the canonical
+    `akb://{vault}/doc/{path}` handle for a related document — the
+    only resource type todos can link today. We resolve it to the
+    internal `ref_doc_id` for storage; the DB column name is
+    historical and stays as-is."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Resolve vault
@@ -27,15 +32,22 @@ async def create_todo(
             if v:
                 vault_id = v["id"]
 
-        # Resolve ref doc
+        # Resolve ref doc from URI.
         ref_doc_id = None
-        if ref_doc:
-            d = await conn.fetchrow(
-                "SELECT id FROM documents WHERE id::text = $1 OR metadata->>'id' = $1",
-                ref_doc,
-            )
-            if d:
-                ref_doc_id = d["id"]
+        if ref_uri:
+            from app.services.uri_service import parse_uri
+            parsed = parse_uri(ref_uri)
+            if parsed is not None and parsed[1] == "doc":
+                ref_vault, _rtype, ref_path = parsed
+                d = await conn.fetchrow(
+                    """
+                    SELECT d.id FROM documents d JOIN vaults v ON d.vault_id = v.id
+                     WHERE v.name = $1 AND d.path = $2
+                    """,
+                    ref_vault, ref_path,
+                )
+                if d:
+                    ref_doc_id = d["id"]
 
         # Parse due date
         due = None
@@ -60,17 +72,23 @@ async def list_todos(
 ) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # `ref_doc_vault` + `ref_doc_path` come from the LEFT JOIN; when
+        # the linked doc is in a different vault than the todo's own
+        # vault_id, the JOIN still works because documents carry their
+        # own vault_id. We build `ref_uri` from those two below.
         query = """
             SELECT t.id, t.title, t.note, t.priority, t.status, t.due_date,
                    t.created_at, t.completed_at,
                    u1.username as assignee, u2.username as created_by,
-                   v.name as vault, d.path as ref_doc_path,
-                   d.metadata->>'id' as ref_doc_id
+                   v.name as vault,
+                   dv.name as ref_doc_vault,
+                   d.path as ref_doc_path
             FROM todos t
             JOIN users u1 ON t.assignee_id = u1.id
             JOIN users u2 ON t.created_by = u2.id
             LEFT JOIN vaults v ON t.vault_id = v.id
             LEFT JOIN documents d ON t.ref_doc_id = d.id
+            LEFT JOIN vaults dv ON d.vault_id = dv.id
             WHERE t.assignee_id = $1
         """
         params: list = [uuid.UUID(assignee_id)]
@@ -105,8 +123,9 @@ async def list_todos(
                 todo["note"] = r["note"]
             if r["vault"]:
                 todo["vault"] = r["vault"]
-            if r["ref_doc_id"]:
-                todo["ref_doc"] = r["ref_doc_id"]
+            if r["ref_doc_vault"] and r["ref_doc_path"]:
+                from app.services.uri_service import doc_uri
+                todo["ref_uri"] = doc_uri(r["ref_doc_vault"], r["ref_doc_path"])
             if r["due_date"]:
                 todo["due_date"] = r["due_date"]
             if r["completed_at"]:

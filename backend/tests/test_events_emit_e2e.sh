@@ -2,9 +2,10 @@
 #
 # AKB Events Emit E2E
 # Verifies that each table/file write action emits the expected row
-# into the `events` outbox with the correct kind/ref_type/ref_id and
-# payload fields. Reads the events table directly via psql exec inside
-# the postgres pod (so this requires kubectl access — skip via env).
+# into the `events` outbox with the correct kind / resource_uri /
+# actor_id and payload fields. Reads the events table directly via
+# psql exec inside the postgres pod (so this requires kubectl access
+# — skip when kubectl is absent).
 #
 set -uo pipefail
 
@@ -70,17 +71,21 @@ CREATE_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"$TABLE\",\"description\":\"d\",\"columns\":[{\"name\":\"sku\",\"type\":\"text\"}]}")
-TABLE_ID=$(echo "$CREATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+TABLE_URI=$(echo "$CREATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["uri"])')
+EXPECTED_TABLE_URI="akb://$VAULT/table/$TABLE"
 
 [ "$(events_for table.create)" = "1" ] && pass "table.create count=1" || fail "table.create" "expected 1, got $(events_for table.create)"
 
-# ref fields
-ROW=$(run_psql "SELECT ref_type || '|' || ref_id || '|' || actor_id FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.create'")
-[ "$ROW" = "table|$TABLE_ID|$USER" ] && pass "table.create ref+actor match" || fail "table.create ref" "got $ROW"
+# Canonical URI + actor match
+ROW=$(run_psql "SELECT resource_uri || '|' || actor_id FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.create'")
+[ "$ROW" = "$EXPECTED_TABLE_URI|$USER" ] && pass "table.create resource_uri+actor match" || fail "table.create uri" "got $ROW (expected $EXPECTED_TABLE_URI|$USER)"
 
 # payload includes table_name
 TBL_PAYLOAD=$(run_psql "SELECT payload->>'table_name' FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.create'")
 [ "$TBL_PAYLOAD" = "$TABLE" ] && pass "table.create payload.table_name" || fail "table.create payload" "got $TBL_PAYLOAD"
+
+# Same URI is what the create response advertises (contract check)
+[ "$TABLE_URI" = "$EXPECTED_TABLE_URI" ] && pass "table create response.uri matches event.resource_uri" || fail "uri parity" "resp=$TABLE_URI"
 
 echo ""
 echo "▸ 2. table.drop event"
@@ -89,8 +94,8 @@ curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" -H "Authorization: Be
 
 [ "$(events_for table.drop)" = "1" ] && pass "table.drop count=1" || fail "table.drop" "expected 1, got $(events_for table.drop)"
 
-DROP_REF=$(run_psql "SELECT ref_id FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.drop'")
-[ "$DROP_REF" = "$TABLE_ID" ] && pass "table.drop ref_id matches created table_id" || fail "table.drop ref_id" "got $DROP_REF"
+DROP_URI=$(run_psql "SELECT resource_uri FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.drop'")
+[ "$DROP_URI" = "$EXPECTED_TABLE_URI" ] && pass "table.drop resource_uri matches" || fail "table.drop uri" "got $DROP_URI"
 
 echo ""
 echo "── Cleanup ──"

@@ -33,7 +33,7 @@ from app.exceptions import NotFoundError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources, resolve_doc_to_uri
-from app.services.uri_service import doc_uri, table_uri, file_uri, parse_uri
+from app.services.uri_service import doc_uri, table_uri, file_uri, parse_uri, split_uri
 from app.services.access_service import (
     check_vault_access, grant_access, revoke_access, list_vault_members,
     list_accessible_vaults, get_vault_info, search_users, transfer_ownership,
@@ -68,28 +68,9 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
         return await doc_repo.find_by_ref_with_conn(conn, vault["id"], doc_ref)
 
 
-def _split_uri(uri: str, expected_type: str | None = None) -> tuple[str, str]:
-    """Parse an akb:// URI and return (vault, identifier).
-
-    `identifier` is the path for a doc URI, the table name for a table
-    URI, the file UUID for a file URI. Raises ValueError if the URI is
-    malformed or its type doesn't match `expected_type`.
-
-    Handlers call this at entry so the rest of the body can stay
-    vault+identifier-shaped without the legacy `(vault, doc_id)` arg
-    pair leaking back in.
-    """
-    parsed = parse_uri(uri)
-    if parsed is None:
-        raise ValueError(
-            f"Invalid AKB URI: '{uri}'. Expected akb://<vault>/<type>/<id>."
-        )
-    vault, rtype, ident = parsed
-    if expected_type and rtype != expected_type:
-        raise ValueError(
-            f"Expected a {expected_type} URI; got {rtype}: '{uri}'."
-        )
-    return vault, ident
+# Re-export under the local name so the rest of this module stays
+# unchanged. The canonical implementation lives in `uri_service`.
+_split_uri = split_uri
 
 session_service = SessionService()
 
@@ -554,13 +535,10 @@ async def _handle_todo(args: dict, uid: str, user: _MCPUser) -> dict:
     else:
         assignee_id = uid
         assignee_username = user.username
-    # ref_uri is the canonical handle for a linked resource. We store it
-    # as-is in todos.ref_doc (legacy column name) so downstream stays
-    # untouched, but the client only ever sees `ref_uri`.
     result = await todo_service.create_todo(
         assignee_id=assignee_id, created_by=uid, title=args["title"],
         note=args.get("note"), vault_name=args.get("vault"),
-        ref_doc=args.get("ref_uri"), priority=args.get("priority", "normal"),
+        ref_uri=args.get("ref_uri"), priority=args.get("priority", "normal"),
         due_date=args.get("due_date"),
     )
     result["assignee"] = assignee_username
@@ -715,6 +693,7 @@ async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
     publications = await publication_service.list_publications(
         access["vault_id"], args.get("resource_type"),
     )
+    publications = [publication_service.public_view(p) for p in publications]
     return {"publications": publications, "total": len(publications)}
 
 

@@ -63,8 +63,8 @@ export function GraphDetailPanel({
     queryFn: () => getRelations(vault, docId),
   });
   const provQuery = useQuery({
-    queryKey: ["provenance", docId],
-    queryFn: () => getProvenance(docId),
+    queryKey: ["provenance", vault, docId],
+    queryFn: () => getProvenance(vault, docId),
     enabled: metaOpen,
   });
   const secQuery = useQuery({

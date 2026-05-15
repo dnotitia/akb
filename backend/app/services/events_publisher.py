@@ -102,8 +102,8 @@ async def _claim_batch(conn) -> list[dict]:
            SET next_attempt_at = NOW() + INTERVAL '10 minutes'
           FROM pending p
          WHERE e.id = p.id
-        RETURNING e.id, e.occurred_at, e.vault_id, e.kind, e.ref_type,
-                  e.ref_id, e.actor_id, e.payload, e.attempts
+        RETURNING e.id, e.occurred_at, e.vault_id, e.kind,
+                  e.resource_uri, e.actor_id, e.payload, e.attempts
         """,
         BATCH_SIZE, MAX_RETRIES,
     )
@@ -157,10 +157,11 @@ def _xadd_fields(row: dict) -> dict[bytes, bytes]:
     }
     if row.get("vault_id") is not None:
         fields[b"vault_id"] = str(row["vault_id"]).encode()
-    if row.get("ref_type"):
-        fields[b"ref_type"] = row["ref_type"].encode()
-    if row.get("ref_id"):
-        fields[b"ref_id"] = str(row["ref_id"]).encode()
+    if row.get("resource_uri"):
+        # Canonical handle — same shape MCP clients see. Stream
+        # consumers parse it with the standard akb:// regex to recover
+        # vault + type + identifier.
+        fields[b"resource_uri"] = row["resource_uri"].encode()
     if row.get("actor_id") is not None:
         fields[b"actor_id"] = str(row["actor_id"]).encode()
     return fields

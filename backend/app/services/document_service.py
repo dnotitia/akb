@@ -236,7 +236,8 @@ class DocumentService:
                 )
                 await emit_event(
                     conn, "document.put",
-                    vault_id=vault_id, ref_type="document", ref_id=doc_id,
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(req.vault, file_path),
                     actor_id=agent_id,
                     payload={
                         "vault": req.vault,
@@ -403,17 +404,12 @@ class DocumentService:
                     new_body,
                 )
 
-        # ref_id uses the user-facing d-prefixed id from metadata when
-        # available (subscribers reference docs by that, not the PG UUID).
-        # Fall back to the PG UUID — same shape as delete() — instead of
-        # `doc_ref` which is whatever string the caller happened to pass.
-        meta = ensure_dict(row.get("metadata"))
-        public_doc_id = meta.get("id") or str(pg_doc_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await emit_event(
                 conn, "document.update",
-                vault_id=vault_id, ref_type="document", ref_id=public_doc_id,
+                vault_id=vault_id,
+                resource_uri=doc_uri(vault, file_path),
                 actor_id=agent_id,
                 payload={
                     "vault": vault,
@@ -585,11 +581,6 @@ class DocumentService:
                 vault, file_path,
             )
 
-        # Capture the public d-id BEFORE the row is gone so subscribers
-        # see the same identifier they'd have used to fetch the doc.
-        meta = ensure_dict(row.get("metadata"))
-        public_doc_id = meta.get("id") or str(pg_doc_id)
-
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -597,7 +588,8 @@ class DocumentService:
                 await delete_document_relations(conn, vault, file_path)
                 await emit_event(
                     conn, "document.delete",
-                    vault_id=vault_id, ref_type="document", ref_id=public_doc_id,
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(vault, file_path),
                     actor_id=agent_id,
                     payload={
                         "vault": vault,
@@ -788,7 +780,7 @@ class DocumentService:
     @staticmethod
     def _browse_hint(vault: str, collection: str | None, items: list[BrowseItem]) -> str:
         if collection:
-            return f'Use akb_drill_down(vault="{vault}", doc_id="<doc_id>") to read sections, or akb_get() for full content.'
+            return 'Use akb_drill_down(uri=...) to read sections, or akb_get(uri=...) for full content. Pass the canonical `uri` from any item above.'
         if items:
             type_counts: dict[str, int] = {}
             for i in items:

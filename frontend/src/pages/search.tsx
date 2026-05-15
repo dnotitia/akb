@@ -12,7 +12,10 @@ type SourceType = "document" | "table" | "file";
 
 interface DenseResult {
   source_type?: SourceType;
-  source_id: string;
+  // Canonical handle — `akb://{vault}/{doc|table|file}/{identifier}`.
+  // Backend dropped the legacy `source_id`/`doc_id`/`file_id` shape;
+  // routing decisions here parse the URI tail.
+  uri: string;
   vault: string;
   path: string;
   title: string;
@@ -24,15 +27,18 @@ interface DenseResult {
 
 function resultHref(r: DenseResult): string {
   const type = r.source_type || "document";
-  const id = r.source_id;
   if (type === "table") {
     const name = (r.path || "").replace(/^_tables\//, "") || r.title;
     return `/vault/${r.vault}/table/${encodeURIComponent(name)}`;
   }
   if (type === "file") {
-    return `/vault/${r.vault}/file/${id}`;
+    // file URI tail is the UUID.
+    const fileId = r.uri.split("/file/")[1] || "";
+    return `/vault/${r.vault}/file/${fileId}`;
   }
-  return `/vault/${r.vault}/doc/${id}`;
+  // document URI tail is the path.
+  const docPath = r.uri.split("/doc/")[1] || r.path;
+  return `/vault/${r.vault}/doc/${docPath}`;
 }
 
 const TYPE_META: Record<
@@ -363,9 +369,9 @@ export default function SearchPage() {
           </header>
           <ol className="divide-y divide-border">
             {literalResults.map((r, i) => (
-              <li key={r.doc_id}>
+              <li key={r.uri}>
                 <Link
-                  to={`/vault/${r.vault}/doc/${r.doc_id}`}
+                  to={`/vault/${r.vault}/doc/${r.uri.split("/doc/")[1] || r.path}`}
                   className="block px-5 py-4 group hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   <div className="grid grid-cols-[32px_1fr_60px] gap-4 items-baseline">
@@ -415,7 +421,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
   return (
     <ol className="border border-border bg-surface divide-y divide-border">
       {items.map((r, i) => (
-        <li key={`${r.source_type || "document"}:${r.source_id}`}>
+        <li key={r.uri}>
           <Link
             to={resultHref(r)}
             className="block px-5 py-4 group hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"

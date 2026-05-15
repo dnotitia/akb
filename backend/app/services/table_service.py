@@ -135,7 +135,8 @@ async def create_table(
             )
             await emit_event(
                 conn, "table.create",
-                vault_id=vault_id, ref_type="table", ref_id=str(tid),
+                vault_id=vault_id,
+                resource_uri=table_uri(vault["name"], name),
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -234,7 +235,8 @@ async def drop_table(
 
             await emit_event(
                 conn, "table.drop",
-                vault_id=vault_id, ref_type="table", ref_id=str(table_id),
+                vault_id=vault_id,
+                resource_uri=table_uri(vault["name"], table_name),
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -327,7 +329,8 @@ async def alter_table(
 
             await emit_event(
                 conn, "table.alter",
-                vault_id=vault_id, ref_type="table", ref_id=str(table["id"]),
+                vault_id=vault_id,
+                resource_uri=table_uri(vault["name"], table_name),
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],

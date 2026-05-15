@@ -61,8 +61,7 @@ async def reset_password(
             await emit_event(
                 conn,
                 "auth.password_reset",
-                ref_type="user",
-                ref_id=str(row["id"]),
+                resource_uri=None,
                 actor_id=actor_id,
                 payload={
                     "user_id": str(row["id"]),
