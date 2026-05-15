@@ -392,7 +392,7 @@ async def get_provenance(doc_id: str, *, vault_id: uuid.UUID) -> dict:
                    d.current_commit, d.metadata, v.name as vault_name
             FROM documents d
             JOIN vaults v ON d.vault_id = v.id
-            WHERE (d.id::text = $1 OR d.metadata->>'id' = $1) AND d.vault_id = $2
+            WHERE d.id::text = $1 AND d.vault_id = $2
             """,
             doc_id, vault_id,
         )
@@ -568,7 +568,7 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
     """Resolve a document reference (doc_id, path, or metadata.id) to UUID."""
     # Full match pattern: UUID, metadata.id, or path substring
     row = await conn.fetchrow(
-        "SELECT id FROM documents WHERE vault_id = $1 AND (id::text = $2 OR metadata->>'id' = $2 OR path LIKE '%' || $2 || '%')",
+        "SELECT id FROM documents WHERE vault_id = $1 AND (id::text = $2 OR path LIKE '%' || $2 || '%')",
         vault_id, ref,
     )
     if row:

@@ -52,11 +52,14 @@ class DocumentRepository:
                 raise ConflictError(f"Document already exists at path: {path}") from e
         return doc_id
 
-    # Standard WHERE clause for flexible document lookup (UUID, d-prefix, path substring)
-    _MATCH_WHERE = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%' OR d.metadata->>'id' = $2)"
+    # Document lookup keys: PG UUID or path. The legacy d-prefix arm
+    # (`metadata->>'id' = $2`) was dropped — MCP / REST clients address
+    # documents by URI, which the handler splits into (vault, path) and
+    # passes path here.
+    _MATCH_WHERE = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%')"
 
     async def find_by_ref(self, vault_id: uuid.UUID, ref: str) -> dict | None:
-        """Find document by ID, metadata.id, or path substring."""
+        """Find document by UUID or path (substring match)."""
         async with self.pool.acquire() as conn:
             return await self.find_by_ref_with_conn(conn, vault_id, ref)
 

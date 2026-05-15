@@ -117,9 +117,12 @@ def _slugify(title: str) -> str:
     return slug[:80]
 
 
-def _build_frontmatter(req: DocumentPutRequest, doc_id: str, now: datetime) -> dict:
+def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
+    # Frontmatter no longer carries a `id:` line — the canonical handle
+    # is the akb:// URI (vault + path). Path is captured in the .md
+    # filename inside the vault's git tree, so a standalone clone of
+    # the repo still resolves which doc each file represents.
     fm = {
-        "id": doc_id,
         "title": req.title,
         "type": req.type,
         "status": "draft",
@@ -175,13 +178,12 @@ class DocumentService:
         if not vault_id:
             raise NotFoundError("Vault", req.vault)
 
-        doc_id = f"d-{uuid.uuid4().hex[:8]}"
         now = datetime.now(timezone.utc)
         slug = _slugify(req.title)
         normalized_collection = _normalize_collection(req.collection)
         file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
 
-        fm_dict = _build_frontmatter(req, doc_id, now)
+        fm_dict = _build_frontmatter(req, now)
         if agent_id:
             fm_dict["created_by"] = agent_id
         md_content = _compose_markdown(fm_dict, req.content)
@@ -202,7 +204,9 @@ class DocumentService:
         # `req.collection` here would create rows with leading/trailing
         # slashes or whitespace, diverging from the doc path under it.
         collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
-        metadata = {**(req.metadata or {}), "id": doc_id}
+        # No `id` key — canonical handle is the akb:// URI built from
+        # (vault, path), not a short hash.
+        metadata = dict(req.metadata or {})
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
             title=req.title, doc_type=req.type, status="draft",
