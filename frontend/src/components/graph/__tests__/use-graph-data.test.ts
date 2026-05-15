@@ -103,7 +103,7 @@ describe("bfsExpand", () => {
   it("walks depth-1 with one fetch and produces seed neighbors", async () => {
     const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
       doc_id: docId,
-      resource_uri: `akb://v/doc/${docId}`,
+      uri: `akb://v/doc/${docId}`,
       relations: [
         {
           direction: "outgoing" as const,
@@ -135,7 +135,7 @@ describe("bfsExpand", () => {
       if (docId === "d-1") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-1",
+          uri: "akb://v/doc/d-1",
           relations: [
             {
               direction: "outgoing" as const,
@@ -150,7 +150,7 @@ describe("bfsExpand", () => {
       if (docId === "d-2") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-2",
+          uri: "akb://v/doc/d-2",
           relations: [
             {
               direction: "outgoing" as const,
@@ -162,7 +162,7 @@ describe("bfsExpand", () => {
           ],
         };
       }
-      return { doc_id: docId, resource_uri: `akb://v/doc/${docId}`, relations: [] };
+      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
     });
     const out = await bfsExpand({
       vault: "v",
@@ -181,7 +181,7 @@ describe("bfsExpand", () => {
   it("does not re-fetch already-visited nodes", async () => {
     const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
       doc_id: docId,
-      resource_uri: `akb://v/doc/${docId}`,
+      uri: `akb://v/doc/${docId}`,
       relations: [
         {
           direction: "outgoing" as const,
@@ -201,7 +201,7 @@ describe("bfsExpand", () => {
   it("returns only the seed when entry has no neighbors", async () => {
     const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
       doc_id: docId,
-      resource_uri: `akb://v/doc/${docId}`,
+      uri: `akb://v/doc/${docId}`,
       relations: [],
     }));
     const out = await bfsExpand({
@@ -220,7 +220,7 @@ describe("bfsExpand", () => {
       if (docId === "d-1") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-1",
+          uri: "akb://v/doc/d-1",
           relations: [
             { direction: "outgoing" as const, relation: "depends_on",
               uri: "akb://v/doc/d-fail", name: "Fail", resource_type: "document" },
@@ -233,14 +233,14 @@ describe("bfsExpand", () => {
       if (docId === "d-ok") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-ok",
+          uri: "akb://v/doc/d-ok",
           relations: [
             { direction: "outgoing" as const, relation: "references",
               uri: "akb://v/doc/d-deep", name: "Deep", resource_type: "document" },
           ],
         };
       }
-      return { doc_id: docId, resource_uri: `akb://v/doc/${docId}`, relations: [] };
+      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
     });
     const out = await bfsExpand({
       vault: "v",
@@ -265,7 +265,7 @@ describe("bfsExpand", () => {
       if (docId === "d-1") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-1",
+          uri: "akb://v/doc/d-1",
           relations: [
             { direction: "outgoing" as const, relation: "depends_on",
               uri: "akb://v/doc/d-a", name: "A", resource_type: "document" },
@@ -277,7 +277,7 @@ describe("bfsExpand", () => {
       if (docId === "d-a" || docId === "d-b") {
         return {
           doc_id: docId,
-          resource_uri: `akb://v/doc/${docId}`,
+          uri: `akb://v/doc/${docId}`,
           relations: [
             { direction: "outgoing" as const, relation: "references",
               uri: "akb://v/doc/d-shared", name: "Shared", resource_type: "document" },
@@ -287,11 +287,11 @@ describe("bfsExpand", () => {
       if (docId === "d-shared") {
         return {
           doc_id: docId,
-          resource_uri: "akb://v/doc/d-shared",
+          uri: "akb://v/doc/d-shared",
           relations: [],
         };
       }
-      return { doc_id: docId, resource_uri: `akb://v/doc/${docId}`, relations: [] };
+      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
     });
     await bfsExpand({ vault: "v", entry: "d-1", depth: 3, fetchRelations });
     // d-shared is announced by both d-a and d-b in hop 1, but the visited set
@@ -305,10 +305,10 @@ describe("bfsExpand", () => {
     const fetchRelations = vi.fn(async (_v: string, docId: string) => {
       calls.push(docId);
       const next = { "A": "B", "B": "C", "C": "A" }[docId];
-      if (!next) return { doc_id: docId, resource_uri: `akb://v/doc/${docId}`, relations: [] };
+      if (!next) return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
       return {
         doc_id: docId,
-        resource_uri: `akb://v/doc/${docId}`,
+        uri: `akb://v/doc/${docId}`,
         relations: [
           { direction: "outgoing" as const, relation: "depends_on",
             uri: `akb://v/doc/${next}`, name: next, resource_type: "document" },

@@ -94,12 +94,12 @@ export function isDegraded(rawNodeCount: number): boolean {
 
 interface BfsExpandArgs {
   vault: string;
-  entry: string; // doc_id
+  entry: string; // doc path within the vault
   depth: 1 | 2 | 3;
   fetchRelations: (
     vault: string,
-    docId: string,
-  ) => Promise<{ resource_uri: string; relations: RelationRow[] }>;
+    docPath: string,
+  ) => Promise<{ uri: string; relations: RelationRow[] }>;
 }
 
 function rowToEdge(row: RelationRow, selfUri: string): GraphEdge | null {
@@ -136,7 +136,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
 
   const seedResp = await fetchRelations(vault, entry);
   const seedNode: GraphNode = {
-    uri: seedResp.resource_uri,
+    uri: seedResp.uri,
     name: entry,
     kind: "document",
     doc_id: entry,
@@ -171,7 +171,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   // claims the docId atomically), so duplicate entries in `frontier`
   // — e.g. siblings pointing at the same neighbor — collapse to a
   // single fetch on the next hop.
-  let frontier: string[] = ingest(seedResp.relations, seedResp.resource_uri);
+  let frontier: string[] = ingest(seedResp.relations, seedResp.uri);
 
   for (let hop = 1; hop < depth; hop++) {
     const toFetch = frontier.filter((docId) => {
@@ -186,7 +186,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
     const nextFrontier: string[] = [];
     for (const r of responses) {
       if (!r) continue;
-      nextFrontier.push(...ingest(r.relations, r.resource_uri));
+      nextFrontier.push(...ingest(r.relations, r.uri));
     }
     if (nextFrontier.length === 0) break;
     frontier = nextFrontier;
@@ -235,9 +235,9 @@ export function useNeighborhood(
         // `enabled: !!entry` above gates this query; entry is defined here.
         entry: entry!,
         depth,
-        fetchRelations: async (v, docId) => {
-          const r = await getRelations(v, docId);
-          return { resource_uri: r.resource_uri, relations: r.relations };
+        fetchRelations: async (v, docPath) => {
+          const r = await getRelations(v, docPath);
+          return { uri: r.uri, relations: r.relations };
         },
       }),
   });

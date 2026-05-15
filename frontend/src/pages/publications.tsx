@@ -70,11 +70,15 @@ export default function PublicationsPage() {
       // meaningful instead of the slug.
       const enriched = await Promise.all(
         pubs.map(async (p) => {
-          if (p.title || p.resource_type !== "document" || !p.document_id) {
+          if (p.title || p.resource_type !== "document" || !p.resource_uri) {
             return p;
           }
+          // Pull the doc path out of the canonical URI tail and look up
+          // the doc title for a friendlier list label.
+          const docPath = p.resource_uri.split("/doc/")[1];
+          if (!docPath) return p;
           try {
-            const doc = await getDocument(vault, p.document_id);
+            const doc = await getDocument(vault, docPath);
             return { ...p, title: doc.title || p.title };
           } catch {
             return p;
