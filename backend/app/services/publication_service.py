@@ -26,6 +26,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.services import file_service, table_service
 from app.services.document_service import DocumentService
+from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.publications")
 
@@ -269,8 +270,10 @@ async def create_publication(
             # lands first and delete cleans it, or delete commits first
             # and we abort with ResourceVanished.
             if resource_type == ResourceType.DOCUMENT and resource_uri:
-                # Doc resource_uri form: akb://{vault}/doc/{path}
-                doc_path_for_check = resource_uri.split("/doc/", 1)[1] if "/doc/" in resource_uri else None
+                parsed = parse_uri(resource_uri)
+                doc_path_for_check = (
+                    parsed[2] if parsed and parsed[1] == "doc" else None
+                )
                 if doc_path_for_check is not None:
                     found = await conn.fetchval(
                         "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2 FOR SHARE",

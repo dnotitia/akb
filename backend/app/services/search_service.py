@@ -19,7 +19,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
-from app.services.index_service import generate_embeddings
+from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import get_vector_store
 from app.services.rerank_service import RerankError, rerank
 from app.utils import ensure_dict
@@ -34,10 +34,10 @@ logger = logging.getLogger("akb.search")
 # content is shown to humans or agents. Requiring TWO header lines + a
 # `\n\n` body separator avoids stripping a user paragraph that happens
 # to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
-# body separator) and intentionally do not match.
-_CHUNK_HEADER_KEYS = "TITLE|SUMMARY|TAGS|PATH|TYPE|VAULT|MIME|SIZE|DESCRIPTION"
+# body separator) and intentionally do not match. Keys imported from
+# index_service so adding a new builder field can't silently drift.
 _CHUNK_HEADER_RE = re.compile(
-    rf"\ATITLE:[^\n]*\n(?:(?:{_CHUNK_HEADER_KEYS}):[^\n]*\n)+\n"
+    rf"\ATITLE:[^\n]*\n(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+\n"
 )
 
 
@@ -596,13 +596,10 @@ class SearchService:
 
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
+        from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Match by UUID, metadata.id (d- prefix), or path substring
-            # Exact path match — same reasoning as `find_by_ref`. The
-            # earlier substring `LIKE '%' || $2 || '%'` arm caused
-            # cross-doc section bleed when paths shared a substring.
-            doc_match = "(d.id::text = $2 OR d.path = $2)"
+            doc_match = DocumentRepository.match_clause(2)
             if section:
                 rows = await conn.fetch(
                     f"""

@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { listPublications, deletePublication, getDocument } from "@/lib/api";
+import { parseDocUri, parseFileUri } from "@/lib/uri";
 import { timeAgo } from "@/lib/utils";
 import { EmptyState } from "@/components/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -73,12 +74,7 @@ export default function PublicationsPage() {
           if (p.title || p.resource_type !== "document" || !p.resource_uri) {
             return p;
           }
-          // Pull the doc path out of the canonical URI by stripping the
-          // `akb://{vault}/doc/` prefix only — a plain `.split("/doc/")`
-          // would also split on any embedded `/doc/` segment inside the
-          // path (e.g. `archive/doc/legacy.md`), grabbing the wrong tail.
-          const match = p.resource_uri.match(/^akb:\/\/[^/]+\/doc\/(.+)$/);
-          const docPath = match ? match[1] : "";
+          const docPath = parseDocUri(p.resource_uri)?.id;
           if (!docPath) return p;
           try {
             const doc = await getDocument(vault, docPath);
@@ -121,14 +117,13 @@ export default function PublicationsPage() {
   function resourceHref(pub: Publication): string {
     if (!name || !pub.resource_uri) return `/vault/${name ?? ""}`;
     if (pub.resource_type === "document") {
-      const docPath = pub.resource_uri.split("/doc/")[1];
       // URL-encode the path so a hierarchical doc like
-      // `incidents/foo.md` survives as a single React Router param
-      // instead of being split at the embedded `/`.
+      // `incidents/foo.md` survives as a single React Router param.
+      const docPath = parseDocUri(pub.resource_uri)?.id;
       return docPath ? `/vault/${name}/doc/${encodeURIComponent(docPath)}` : `/vault/${name}`;
     }
     if (pub.resource_type === "file") {
-      const fileId = pub.resource_uri.split("/file/")[1];
+      const fileId = parseFileUri(pub.resource_uri)?.id;
       return fileId ? `/vault/${name}/file/${fileId}` : `/vault/${name}`;
     }
     return `/vault/${name}`;

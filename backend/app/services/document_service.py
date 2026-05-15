@@ -612,11 +612,9 @@ class DocumentService:
                         "path": file_path,
                     },
                 )
-                # Doc row delete inside the same TX. Previously this ran
-                # on a separate connection — a crash between the cascade
-                # commit and the row delete left an orphan documents row
-                # (no chunks/edges/publications). Recovery was possible
-                # via retry but the inconsistency was visible.
+                # Doc row delete must share the cascade TX so a crash
+                # between cascade commit and row delete can't leave an
+                # orphan `documents` row with no chunks/edges/publications.
                 await doc_repo.delete(pg_doc_id, conn=conn)
 
         if collection_id:

@@ -584,21 +584,11 @@ async def _resolve_doc_ref(conn, vault_id: uuid.UUID, ref: str) -> uuid.UUID | N
          several matches — but the suffix is anchored at `/`, so
          `api.md` cannot match `funapi.md`).
     """
-    # By UUID first — cheapest and unambiguous.
-    try:
-        uid = uuid.UUID(ref)
-        row = await conn.fetchrow(
-            "SELECT id FROM documents WHERE vault_id = $1 AND id = $2",
-            vault_id, uid,
-        )
-        if row:
-            return row["id"]
-    except ValueError:
-        pass
-
-    # Exact path.
+    # UUID + exact-path arms share the same predicate as `find_by_ref`
+    # / `drill_down` — keep the substring-match ban centralised.
+    from app.repositories.document_repo import DocumentRepository
     row = await conn.fetchrow(
-        "SELECT id FROM documents WHERE vault_id = $1 AND path = $2",
+        f"SELECT id FROM documents d WHERE vault_id = $1 AND {DocumentRepository.match_clause(2)}",
         vault_id, ref,
     )
     if row:
