@@ -135,26 +135,23 @@ def parse_expires_in(expires_in: str | None) -> datetime | None:
 def _publication_row_to_dict(row) -> dict | None:
     """Serialize an asyncpg publications row to a JSON-friendly dict.
 
+    The row's `resource_uri` column is the canonical handle — same
+    shape MCP clients and the event stream see. Internal database
+    UUID columns no longer exist on the row, so the dict surfaces
+    exactly what callers should consume.
+
     Normalizations applied:
     - `id` is renamed to `publication_id` so callers never confuse it
       with the underlying resource handle.
-    - `resource_uri` is built from the joined vault name + doc path /
-      file id (or left None for table_query publications, which have no
-      single addressable resource).
-    - Internal columns `document_id` / `file_id` and the join helpers
-      `_vault_name` / `_doc_path` are removed before the dict leaves
-      this function — clients see `uri` only.
     - `query_params` is parsed from JSON string into a dict.
     - UUID columns become strings.
     - Datetime columns become ISO strings.
 
-    Returns None only if `row` is None. Otherwise the result is guaranteed
-    to contain `publication_id`, `slug`, `resource_type`, and (where
-    applicable) `resource_uri`. Raises PublicationError if `query_params`
-    JSON is corrupted (data integrity).
+    Returns None only if `row` is None. Otherwise the result is
+    guaranteed to contain `publication_id`, `slug`, `resource_type`,
+    and (where applicable) `resource_uri`. Raises PublicationError if
+    `query_params` JSON is corrupted (data integrity).
     """
-    from app.services.uri_service import doc_uri, file_uri
-
     if row is None:
         return None
     d = dict(row)
@@ -174,37 +171,7 @@ def _publication_row_to_dict(row) -> dict | None:
             )
     if "id" in d:
         d["publication_id"] = d.pop("id")
-
-    # Build the canonical URI. We keep `document_id` and `file_id` in
-    # the internal dict so the resolution helpers (resolve_document_
-    # publication / resolve_file_publication) can fetch the underlying
-    # row without parsing the URI. The serialization layer
-    # (`_public_publication_view`) strips them before any client sees
-    # the dict.
-    vault_name = d.pop("_vault_name", None)
-    doc_path = d.pop("_doc_path", None)
-    resource_type = d.get("resource_type")
-    resource_uri: str | None = None
-    if vault_name:
-        if resource_type == "document" and doc_path:
-            resource_uri = doc_uri(vault_name, doc_path)
-        elif resource_type == "file" and d.get("file_id"):
-            resource_uri = file_uri(vault_name, d["file_id"])
-        # table_query: no single resource handle → resource_uri stays None.
-    d["resource_uri"] = resource_uri
     return d
-
-
-def public_view(d: dict | None) -> dict | None:
-    """Strip internal id columns from a publication dict before it
-    leaves the backend. Callers expose this view from MCP handlers and
-    REST routes that return publications to clients."""
-    if d is None:
-        return None
-    clean = dict(d)
-    clean.pop("document_id", None)
-    clean.pop("file_id", None)
-    return clean
 
 
 def to_uuid(value) -> uuid.UUID:
@@ -222,8 +189,7 @@ async def create_publication(
     *,
     vault_id: uuid.UUID,
     resource_type: str,
-    document_id: uuid.UUID | None = None,
-    file_id: uuid.UUID | None = None,
+    resource_uri: str | None = None,
     query_sql: str | None = None,
     query_vault_names: list[str] | None = None,
     query_params: dict | None = None,
@@ -240,6 +206,10 @@ async def create_publication(
 
     All validation lives here — routes are thin adapters that pass parsed
     arguments. Raises ValueError for any invalid input.
+
+    `resource_uri` is the canonical handle for the publishable resource.
+    Required for `resource_type ∈ {document, file}`. For `table_query`,
+    `resource_uri` stays None — the publishable surface is the SQL itself.
     """
     if resource_type not in ResourceType.ALL:
         raise ValueError(f"Invalid resource_type: {resource_type}")
@@ -247,10 +217,10 @@ async def create_publication(
         raise ValueError(f"Invalid mode: {mode}")
 
     # Validate that the right resource fields are present
-    if resource_type == ResourceType.DOCUMENT and not document_id:
-        raise ValueError("document_id is required for resource_type='document'")
-    if resource_type == ResourceType.FILE and not file_id:
-        raise ValueError("file_id is required for resource_type='file'")
+    if resource_type == ResourceType.DOCUMENT and not resource_uri:
+        raise ValueError("resource_uri is required for resource_type='document'")
+    if resource_type == ResourceType.FILE and not resource_uri:
+        raise ValueError("resource_uri is required for resource_type='file'")
     if resource_type == ResourceType.TABLE_QUERY:
         if not query_sql:
             raise ValueError("query_sql is required for resource_type='table_query'")
@@ -287,30 +257,19 @@ async def create_publication(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            WITH inserted AS (
-              INSERT INTO publications (
-                  slug, vault_id, resource_type, document_id, file_id,
-                  query_sql, query_vault_names, query_params,
-                  password_hash, max_views, expires_at,
-                  mode, section_filter, allow_embed, title, created_by
-              )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-              RETURNING id, slug, vault_id, resource_type, document_id, file_id,
-                        query_sql, query_vault_names, query_params, max_views,
-                        view_count, expires_at, mode, section_filter, allow_embed,
-                        title, created_at
+            INSERT INTO publications (
+                slug, vault_id, resource_type, resource_uri,
+                query_sql, query_vault_names, query_params,
+                password_hash, max_views, expires_at,
+                mode, section_filter, allow_embed, title, created_by
             )
-            SELECT i.id, i.slug, i.vault_id, i.resource_type, i.document_id, i.file_id,
-                   i.query_sql, i.query_vault_names, i.query_params, i.max_views,
-                   i.view_count, i.expires_at, i.mode, i.section_filter, i.allow_embed,
-                   i.title, i.created_at,
-                   v.name AS _vault_name,
-                   d.path AS _doc_path
-              FROM inserted i
-              JOIN vaults v ON v.id = i.vault_id
-              LEFT JOIN documents d ON d.id = i.document_id
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            RETURNING id, slug, vault_id, resource_type, resource_uri,
+                      query_sql, query_vault_names, query_params, max_views,
+                      view_count, expires_at, mode, section_filter, allow_embed,
+                      title, created_at
             """,
-            slug, vault_id, resource_type, document_id, file_id,
+            slug, vault_id, resource_type, resource_uri,
             query_sql, query_vault_names, json.dumps(query_params or {}),
             pwd_hash, max_views, expires_at,
             mode, section_filter, allow_embed, title, created_by,
@@ -353,27 +312,34 @@ async def create_publication_for_vault(
             raise ValueError(f"Vault not found: {vault_name}")
         vault_id = vault_row["id"]
 
-    document_uuid: uuid.UUID | None = None
-    file_uuid: uuid.UUID | None = None
+    from app.services.uri_service import doc_uri, file_uri
+
+    resource_uri: str | None = None
     resolved_query_vaults = query_vault_names
 
     if resource_type == ResourceType.DOCUMENT:
         if not doc_id:
             raise ValueError("doc_id required for resource_type='document'")
+        # Resolve the caller's `doc_id` (path, UUID, or d-prefix id —
+        # find_by_ref_with_conn handles all three) to the canonical
+        # path under this vault, then build the URI.
         from app.repositories.document_repo import DocumentRepository
         doc_repo = DocumentRepository(pool)
         async with pool.acquire() as conn:
             doc_row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_id)
         if not doc_row:
             raise ValueError(f"Document not found: {doc_id}")
-        document_uuid = doc_row["id"]
+        resource_uri = doc_uri(vault_name, doc_row["path"])
     elif resource_type == ResourceType.FILE:
         if not file_id:
             raise ValueError("file_id required for resource_type='file'")
         try:
-            file_uuid = uuid.UUID(file_id)
+            # Validate UUID format and round-trip back as a string
+            # for the URI tail.
+            uuid.UUID(file_id)
         except ValueError:
             raise ValueError("Invalid file_id format")
+        resource_uri = file_uri(vault_name, file_id)
     elif resource_type == ResourceType.TABLE_QUERY:
         if not resolved_query_vaults:
             resolved_query_vaults = [vault_name]
@@ -385,8 +351,7 @@ async def create_publication_for_vault(
     return await create_publication(
         vault_id=vault_id,
         resource_type=resource_type,
-        document_id=document_uuid,
-        file_id=file_uuid,
+        resource_uri=resource_uri,
         query_sql=query_sql,
         query_vault_names=resolved_query_vaults,
         query_params=query_params,
@@ -418,38 +383,63 @@ async def delete_publication(*, publication_id: uuid.UUID | None = None, slug: s
     return deleted
 
 
-async def delete_publications_for_document(document_id: uuid.UUID) -> int:
-    """Delete all publications for a given document. Returns count."""
+async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
+    """Delete all publications for a given document, identified by either
+    its canonical URI (preferred — keeps the URI canonical story end-to-end)
+    or, for backwards compatibility with internal callers that still hold
+    the doc's UUID, the PG UUID. UUID inputs trigger a one-row join to
+    materialize the URI then drive the DELETE.
+
+    Returns the number of publications deleted.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if isinstance(document_id, str) and document_id.startswith("akb://"):
+            uri = document_id
+        else:
+            # Materialize the URI from the PG UUID.
+            row = await conn.fetchrow(
+                """
+                SELECT 'akb://' || v.name || '/doc/' || d.path AS uri
+                  FROM documents d JOIN vaults v ON v.id = d.vault_id
+                 WHERE d.id = $1
+                """,
+                document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id)),
+            )
+            if not row:
+                return 0
+            uri = row["uri"]
         rows = await conn.fetch(
-            "DELETE FROM publications WHERE document_id = $1 RETURNING id",
-            document_id,
+            "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
+            uri,
         )
     return len(rows)
 
 
-# SELECT clause used by every list/inspection query. Pulls the
-# publication row plus enough JOIN material (vault name, doc path, file
-# id) to build the canonical `resource_uri` in `_enrich_publication`.
-# Tables don't store a URI — they aren't publishable as single
-# resources (the table_query branch sets vault but no resource handle),
-# so we don't join `vault_tables` here.
+async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str) -> int:
+    """Delete all publications for a given file (URI-based)."""
+    from app.services.uri_service import file_uri
+    uri = file_uri(vault_name, str(file_id))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
+            uri,
+        )
+    return len(rows)
+
+
+# SELECT clause used by every list/inspection query. resource_uri lives
+# on the row directly — no JOIN needed to surface the canonical handle.
 _PUBLICATION_LIST_COLUMNS = """
-    p.id, p.slug, p.vault_id, p.resource_type, p.document_id, p.file_id, p.title,
+    p.id, p.slug, p.vault_id, p.resource_type, p.resource_uri, p.title,
     p.query_params, p.max_views, p.view_count, p.expires_at, p.mode, p.snapshot_at,
     p.section_filter, p.allow_embed,
     p.password_hash IS NOT NULL AS password_protected,
-    p.created_at,
-    v.name AS _vault_name,
-    d.path AS _doc_path
+    p.created_at
 """
 
-_PUBLICATION_FROM_CLAUSE = """
-    publications p
-    JOIN vaults v ON v.id = p.vault_id
-    LEFT JOIN documents d ON d.id = p.document_id
-"""
+_PUBLICATION_FROM_CLAUSE = "publications p"
 
 
 def _enrich_publication(d: dict | None) -> dict | None:
@@ -536,17 +526,14 @@ async def resolve_publication(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT s.id, s.slug, s.vault_id, s.resource_type, s.document_id, s.file_id,
+            SELECT s.id, s.slug, s.vault_id, s.resource_type, s.resource_uri,
                    s.query_sql, s.query_vault_names, s.query_params,
                    s.password_hash, s.max_views, s.view_count, s.expires_at,
                    s.mode, s.snapshot_s3_key, s.snapshot_at,
                    s.section_filter, s.allow_embed, s.title, s.created_at,
-                   v.name AS vault_name,
-                   v.name AS _vault_name,
-                   d.path AS _doc_path
+                   v.name AS vault_name
             FROM publications s
             JOIN vaults v ON s.vault_id = v.id
-            LEFT JOIN documents d ON d.id = s.document_id
             WHERE s.slug = $1
             """,
             slug,
@@ -590,6 +577,14 @@ async def resolve_document_publication(publication: dict) -> dict:
     if publication["resource_type"] != ResourceType.DOCUMENT:
         raise PublicationError("Not a document publication", status_code=400)
 
+    # Parse the canonical URI to find the underlying doc row.
+    from app.services.uri_service import parse_uri
+    uri = publication.get("resource_uri")
+    parsed = parse_uri(uri) if uri else None
+    if parsed is None or parsed[1] != "doc":
+        raise NotFoundError("Document", str(uri))
+    uri_vault, _rtype, doc_path = parsed
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         doc_row = await conn.fetchrow(
@@ -599,12 +594,12 @@ async def resolve_document_publication(publication: dict) -> dict:
                    v.name AS vault_name
             FROM documents d
             JOIN vaults v ON d.vault_id = v.id
-            WHERE d.id = $1
+            WHERE v.name = $1 AND d.path = $2
             """,
-            to_uuid(publication["document_id"]),
+            uri_vault, doc_path,
         )
         if doc_row is None:
-            raise NotFoundError("Document", str(publication["document_id"]))
+            raise NotFoundError("Document", str(uri))
 
     body = ""
     content_unavailable = False
@@ -711,18 +706,27 @@ async def resolve_file_publication(publication: dict) -> dict:
     if publication["resource_type"] != ResourceType.FILE:
         raise PublicationError("Not a file publication", status_code=400)
 
+    from app.services.uri_service import parse_uri
+    uri = publication.get("resource_uri")
+    parsed = parse_uri(uri) if uri else None
+    if parsed is None or parsed[1] != "file":
+        raise NotFoundError("File", str(uri))
+    _uri_vault, _rtype, file_uuid_str = parsed
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
             """
-            SELECT f.name, f.s3_key, f.mime_type, f.size_bytes, f.collection
-            FROM vault_files f
-            WHERE f.id = $1
+            SELECT f.name, f.s3_key, f.mime_type, f.size_bytes,
+                   c.path AS collection
+              FROM vault_files f
+              LEFT JOIN collections c ON c.id = f.collection_id
+             WHERE f.id = $1
             """,
-            to_uuid(publication["file_id"]),
+            to_uuid(file_uuid_str),
         )
         if file_row is None:
-            raise NotFoundError("File", str(publication["file_id"]))
+            raise NotFoundError("File", str(uri))
 
     # Override stored Content-Type with DB value so the browser inline-renders
     # correctly even when the S3 object was uploaded as octet-stream (legacy
@@ -755,14 +759,21 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     if publication["resource_type"] != ResourceType.FILE:
         raise PublicationError("Not a file publication", status_code=400)
 
+    from app.services.uri_service import parse_uri
+    uri = publication.get("resource_uri")
+    parsed = parse_uri(uri) if uri else None
+    if parsed is None or parsed[1] != "file":
+        raise NotFoundError("File", str(uri))
+    _uri_vault, _rtype, file_uuid_str = parsed
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
             "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1",
-            to_uuid(publication["file_id"]),
+            to_uuid(file_uuid_str),
         )
     if file_row is None:
-        raise NotFoundError("File", str(publication["file_id"]))
+        raise NotFoundError("File", str(uri))
 
     return {
         "name": file_row["name"],

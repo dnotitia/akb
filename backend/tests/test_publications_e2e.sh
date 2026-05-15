@@ -88,7 +88,7 @@ echo ""
 echo "▸ 1. Document Publication"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\"}")
 DOC_PID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("publication_id",""))' 2>/dev/null)
 DOC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 [ -n "$DOC_PID" ] && pass "Create document publication" || fail "Create doc pub" "$R"
@@ -117,7 +117,7 @@ echo ""
 echo "▸ 2. Section filter"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"section\":\"Alpha\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"Alpha\"}")
 SEC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 
 R=$(curl -sk "$BASE_URL/api/v1/public/$SEC_SLUG")
@@ -131,7 +131,7 @@ SF=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("se
 
 # Non-existent section → fallback to full content
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"section\":\"Nonexistent\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"Nonexistent\"}")
 FAKE_SEC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 R=$(curl -sk "$BASE_URL/api/v1/public/$FAKE_SEC_SLUG")
 CONTENT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' 2>/dev/null)
@@ -144,7 +144,7 @@ echo "▸ 3. Expiration"
 
 # Create with 1h expiry
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"expires_in\":\"1h\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"expires_in\":\"1h\"}")
 EXP_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 EXP_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("expires_at",""))' 2>/dev/null)
 [ -n "$EXP_AT" ] && pass "expires_at populated" || fail "expires_at" "missing"
@@ -155,13 +155,13 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$EXP_SLU
 
 # Invalid expires_in format
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"expires_in\":\"banana\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"expires_in\":\"banana\"}")
 ERR=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("detail") or d.get("error",""))' 2>/dev/null)
 echo "$ERR" | grep -qi "invalid expires_in" && pass "Invalid expires_in rejected" || fail "Invalid expires_in" "$R"
 
 # 'never' produces no expiration
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"expires_in\":\"never\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"expires_in\":\"never\"}")
 EAT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("expires_at"))' 2>/dev/null)
 [ "$EAT" = "None" ] && pass "expires_in='never' → no expiry" || fail "Never expiry" "$EAT"
 
@@ -171,7 +171,7 @@ echo ""
 echo "▸ 4. Password protection"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"password\":\"secret123\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"secret123\"}")
 PW_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 PWPROT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password_protected"))' 2>/dev/null)
 [ "$PWPROT" = "True" ] && pass "password_protected flag" || fail "password_protected" "$PWPROT"
@@ -209,7 +209,7 @@ echo ""
 echo "▸ 5. Max views"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"max_views\":2}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"max_views\":2}")
 MV_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 
 curl -sk -o /dev/null "$BASE_URL/api/v1/public/$MV_SLUG"
@@ -219,7 +219,7 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_SLUG
 
 # /meta does NOT increment view count
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"max_views\":1}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"max_views\":1}")
 META_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 curl -sk -o /dev/null "$BASE_URL/api/v1/public/$META_SLUG/meta"
 curl -sk -o /dev/null "$BASE_URL/api/v1/public/$META_SLUG/meta"
@@ -321,7 +321,7 @@ echo "$ROWS" | grep -q "SnapTest" && fail "Snapshot freeze" "leaked new data" ||
 
 # snapshot only supported for table_query
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\"}")
 DOCPID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publication_id"])' 2>/dev/null)
 CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$DOCPID/snapshot" -o /dev/null -w "%{http_code}")
 [ "$CODE" = "400" ] && pass "Snapshot rejected for document publication" || fail "Snapshot doc" "HTTP $CODE"
@@ -332,7 +332,7 @@ echo ""
 echo "▸ 9. File publication"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"file\",\"file_id\":\"$FID\"}")
+  -d "{\"resource_type\":\"file\",\"uri\":\"$FILE_URI\"}")
 FILE_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 [ -n "$FILE_SLUG" ] && pass "Create file publication" || fail "File pub" "$R"
 
@@ -356,7 +356,7 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SL
 
 # Invalid file_id format
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"file\",\"file_id\":\"not-a-uuid\"}")
+  -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/not-a-uuid\"}")
 ERR=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail","") or json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR" ] && pass "Invalid file_id rejected" || fail "Invalid file_id" "$R"
 
@@ -377,7 +377,7 @@ TYPE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("
 
 # allow_embed=false → /embed → 403
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"allow_embed\":false}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"allow_embed\":false}")
 NOEMBED_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$NOEMBED_SLUG/embed")
 [ "$CODE" = "403" ] && pass "allow_embed=false → /embed 403" || fail "allow_embed" "HTTP $CODE"
@@ -406,12 +406,12 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/publications/$V
 
 # Create publication without auth → 401
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/publications/$VAULT/create" \
-  -H "Content-Type: application/json" -d '{"resource_type":"document","doc_id":"foo"}')
+  -H "Content-Type: application/json" -d "{\"resource_type\":\"document\",\"uri\":\"akb://$VAULT/doc/nonexistent-foo.md\"}")
 [ "$CODE" = "401" ] && pass "Create without auth → 401" || fail "Create no auth" "HTTP $CODE"
 
 # Non-existent doc_id
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"d-00000000\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"akb://$VAULT/doc/missing/nonexistent.md\"}")
 CODE=$?
 echo "$R" | grep -qi "not found\|404" && pass "Non-existent doc_id rejected" || fail "Bad doc_id" "$R"
 
@@ -500,7 +500,7 @@ echo "▸ 13. Additional edge cases"
 
 # Invalid mode value
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"mode\":\"banana\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"mode\":\"banana\"}")
 ERR=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("detail") or d.get("error",""))' 2>/dev/null)
 echo "$ERR" | grep -qi "invalid mode" && pass "Invalid mode rejected" || fail "Invalid mode" "$R"
 
@@ -534,7 +534,7 @@ echo "$ERR" | grep -qi "undeclared" && pass "Undeclared :param rejected at creat
 
 # HMAC token tampering — last char flipped
 PWR=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"password\":\"abc\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"abc\"}")
 PW_SLUG_T=$(echo "$PWR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 TR=$(curl -sk -X POST "$BASE_URL/api/v1/public/$PW_SLUG_T/auth" -H "Content-Type: application/json" -d '{"password":"abc"}')
 GOOD_TOKEN=$(echo "$TR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null)
@@ -544,14 +544,14 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG
 
 # Token from one slug doesn't work on another (slug binding)
 PWR2=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"password\":\"xyz\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"xyz\"}")
 PW_SLUG_2=$(echo "$PWR2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG_2?token=$GOOD_TOKEN")
 [ "$CODE" = "401" ] && pass "Token bound to original slug (cross-slug → 401)" || fail "Cross-slug token" "HTTP $CODE"
 
 # max_views=0 → immediately exhausted
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"max_views\":0}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"max_views\":0}")
 MV0_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 if [ -n "$MV0_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV0_SLUG")
@@ -561,12 +561,13 @@ fi
 # /raw on non-previewable MIME (PNG image) → 415
 echo -n "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9eMyf2QAAAAASUVORK5CYII=" | base64 -d > /tmp/edge.png
 INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.png&collection=img&mime_type=image/png")
-PFID=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)
+PFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+PFID=$(printf '%s' "$PFILE_URI" | uri_file_id)
 PURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
 curl -sk -X PUT "$PURL" -H "Content-Type: image/png" --data-binary @/tmp/edge.png > /dev/null
 acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$PFID/confirm" > /dev/null
 PNG_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"file\",\"file_id\":\"$PFID\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+  -d "{\"resource_type\":\"file\",\"uri\":\"$PFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PNG_PUB/raw")
 [ "$CODE" = "415" ] && pass "/raw on image → 415" || fail "/raw image" "HTTP $CODE"
 
@@ -609,7 +610,7 @@ ITEMS=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(l
 
 # Cascade: file delete → publications cascade
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"file\",\"file_id\":\"$FID\"}")
+  -d "{\"resource_type\":\"file\",\"uri\":\"$FILE_URI\"}")
 CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 acurl -X DELETE "$BASE_URL/api/v1/files/$VAULT/$FID" > /dev/null
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLUG")
@@ -620,7 +621,7 @@ R=$(acurl -X POST "$BASE_URL/api/v1/documents" -H "Content-Type: application/jso
   -d "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"To Delete\",\"content\":\"# tmp\",\"type\":\"note\"}")
 CASCADE_DOC=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' 2>/dev/null)
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$CASCADE_DOC\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"akb://$VAULT/doc/$CASCADE_DOC\"}")
 DOC_CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 acurl -X DELETE "$BASE_URL/api/v1/documents/$VAULT/$CASCADE_DOC" > /dev/null
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_CSC_SLUG")
@@ -632,7 +633,7 @@ pass "Empty vault deleted (cleanup)"
 
 # section_not_found field is True when filter missing
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"doc_id\":\"$DOC_ID\",\"section\":\"NoSuchHeading\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"NoSuchHeading\"}")
 SNF_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 SNF=$(curl -sk "$BASE_URL/api/v1/public/$SNF_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_not_found"))' 2>/dev/null)
 [ "$SNF" = "True" ] && pass "section_not_found=true when filter missing" || fail "section_not_found" "$SNF"
