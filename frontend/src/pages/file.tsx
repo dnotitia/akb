@@ -4,7 +4,7 @@ import { Download, File } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 interface FileInfo {
-  id: string;
+  uri: string;
   name: string;
   collection?: string;
   description?: string;
@@ -27,7 +27,13 @@ export default function FilePage() {
     fetch(`/api/v1/files/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
       .then((r) => r.json())
       .then((d) => {
-        const found = (d.items || []).find((x: any) => x.id === fileId);
+        // Backend rows carry a canonical `uri` (akb://{vault}/file/{id}) and
+        // no separate `id` field after the URI-canonical refactor. Match by
+        // the tail of `/file/` so this page survives `id` ever being dropped.
+        const found = (d.items || []).find((x: any) => {
+          const tail = (x.uri ?? "").split("/file/")[1];
+          return tail === fileId;
+        });
         if (found) setInfo(found);
         else setError("File not found in vault");
       })
