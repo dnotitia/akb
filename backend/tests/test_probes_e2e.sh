@@ -50,9 +50,24 @@ echo ""
 echo "▸ 3. /health"
 
 body=$(curl -sk "$BASE_URL/health")
-echo "$body" | grep -q '"embed_backfill"' && pass "embed_backfill present" || fail "embed_backfill" "$body"
 echo "$body" | grep -q '"vector_store"' && pass "vector_store section present" || fail "vector_store section" "$body"
-echo "$body" | grep -q '"bm25_vocab_size"' && pass "bm25_vocab_size present" || fail "bm25_vocab_size" "$body"
+# Indexing queue stats live under `vector_store.backfill` after the
+# embed+sparse+upsert single-stage refactor (no more standalone
+# `embed_backfill` top-level key).
+echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if 'upsert' in d['vector_store']['backfill'] else 1)" \
+  && pass "vector_store.backfill.upsert present" \
+  || fail "backfill stats" "$body"
+# BM25 stats block — added by the auto-refresh refactor; replaces
+# the flat `bm25_vocab_size` key.
+echo "$body" | python3 -c "
+import sys, json
+bm25 = json.load(sys.stdin)['vector_store'].get('bm25', {})
+required = {'total_docs', 'avgdl', 'tokenizer', 'vocab_size', 'last_recomputed_at'}
+missing = required - set(bm25.keys())
+sys.exit(0 if not missing else 1)
+" && pass "vector_store.bm25 has required keys" || fail "bm25 keys" "$body"
+echo "$body" | grep -q '"metadata_backfill"' && pass "metadata_backfill present" || fail "metadata_backfill" "$body"
+echo "$body" | grep -q '"external_git"' && pass "external_git present" || fail "external_git" "$body"
 
 # ── 4. /livez under concurrent load ──────────────────────────
 # The whole point of splitting /livez out of /health is that it must
