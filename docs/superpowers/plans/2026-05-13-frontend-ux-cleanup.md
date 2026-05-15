@@ -983,15 +983,15 @@ If Vite dev is running on `:5173`:
 ```bash
 git push origin main
 bash deploy/k8s/internal/deploy-internal.sh
-until curl -sf https://akb.agent.seahorse.dnotitia.com/livez >/dev/null 2>&1; do sleep 5; done
-curl -sk https://akb.agent.seahorse.dnotitia.com/livez
+until curl -sf <your-prod-host>/livez >/dev/null 2>&1; do sleep 5; done
+curl -sk <your-prod-host>/livez
 ```
 
 Expected: `{"status":"alive"}` from production.
 
 - [ ] **Step 5: Production smoke**
 
-Repeat Step 3's manual scenarios against `https://akb.agent.seahorse.dnotitia.com`.
+Repeat Step 3's manual scenarios against `<your-prod-host>`.
 
 ---
 

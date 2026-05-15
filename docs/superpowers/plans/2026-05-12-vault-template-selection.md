@@ -1063,7 +1063,7 @@ Expected: all green.
 
 ```bash
 bash deploy/k8s/internal/deploy-internal.sh
-curl -sk https://akb.agent.seahorse.dnotitia.com/livez
+curl -sk <your-prod-host>/livez
 ```
 Expected: `{"status":"alive"}`.
 
