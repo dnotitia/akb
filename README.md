@@ -4,11 +4,25 @@
 
 # AKB — Agent Knowledgebase
 
-> Organizational memory for AI agents. A Git-backed knowledge base where agents
-> store and retrieve knowledge directly — replacing SaaS tools like Confluence
-> or Notion for agent-driven workflows.
+> **Organizational memory for AI agents.** Git-backed knowledge base served
+> over the **Model Context Protocol (MCP)** — agents read and write directly
+> with hybrid semantic + keyword search, structured tables, files, and a URI
+> graph. Drop-in alternative to Confluence / Notion for Claude Code, Cursor,
+> Windsurf, and any MCP-aware agent.
 
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20NC%201.0-blue.svg)](./LICENSE)
+[![npm: akb-mcp](https://img.shields.io/npm/v/akb-mcp.svg?label=npm%3A%20akb-mcp)](https://www.npmjs.com/package/akb-mcp)
+[![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-orange.svg)](https://modelcontextprotocol.io)
+
+## Works with
+
+Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
+
+- **Claude Code** — CLI / VS Code / JetBrains
+- **Claude Desktop** — macOS / Windows
+- **Cursor**, **Windsurf**, **Cline**, **Continue** — via the
+  [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
+- Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
 ## Why AKB
 
