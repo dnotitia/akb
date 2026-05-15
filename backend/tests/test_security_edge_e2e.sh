@@ -355,6 +355,34 @@ for KW in 'SET TRANSACTION READ WRITE' 'RESET SESSION AUTHORIZATION' 'BEGIN'; do
   [ "$BLOCKED" = "True" ] && pass "Reader '$KW' blocked" || fail "Reader '$KW' leak" "$R"
 done
 
+# SQL surface sandbox — even a reader (and writer) must be blocked
+# from referencing PG system catalogs, AKB internal tables, foreign
+# vt_* tables, or DDL statements. Without this gate the rewrite layer
+# only rewrites the caller's own table names; everything else slips
+# through to PG, where `akbuser` has wide-open privileges.
+SANDBOX_PROBES=(
+  "SELECT table_name FROM information_schema.tables LIMIT 1"
+  "SELECT * FROM pg_user LIMIT 1"
+  "SELECT username FROM users LIMIT 1"
+  "SELECT * FROM vault_external_git LIMIT 1"
+  "SELECT * FROM vt_some_other_vault__secrets LIMIT 1"
+  "CREATE VIEW pwn AS SELECT 1"
+  "DROP TABLE finances"
+  "SHOW search_path"
+  "EXPLAIN SELECT 1"
+)
+for SQL in "${SANDBOX_PROBES[@]}"; do
+  R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "$(python3 -c "import json,sys; print(json.dumps({'vault':sys.argv[1],'sql':sys.argv[2]}))" "$VAULT1" "$SQL")" | mr)
+  # Accept either an explicit error envelope OR an empty response —
+  # the latter is what the SSE-stream parser surfaces when the
+  # backend short-circuits before producing a tool result. The
+  # absence of any data row is itself confirmation the SQL never
+  # executed; the substring guard below catches "kind":"table_query"
+  # results that would only appear on a successful leak.
+  LEAKED=$(echo "$R" | grep -qE '"kind":"table_query"|"items":\[\{' && echo yes || echo no)
+  [ "$LEAKED" = "no" ] && pass "SQL sandbox blocks: $SQL" || fail "SQL sandbox leak" "$SQL → $R"
+done
+
 # Upgrade to writer
 mcp_as "$PAT1" "$SID1" "akb_grant" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\",\"role\":\"writer\"}" >/dev/null 2>&1
 

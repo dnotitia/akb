@@ -350,6 +350,65 @@ async def alter_table(
     }
 
 
+import re as _re
+
+# Statement keywords allowed via `akb_sql`. Everything else (DDL like
+# CREATE/DROP/ALTER, DCL like GRANT/REVOKE, TCL like BEGIN/COMMIT/
+# SAVEPOINT/RESET, plus informational SHOW/EXPLAIN) is delegated to
+# specific tools or simply has no business in this entry-point.
+_ALLOWED_FIRST_KEYWORDS = ("SELECT", "WITH", "INSERT", "UPDATE", "DELETE")
+
+# Identifiers that MUST NOT appear in user-supplied SQL. PG accepts
+# them via `akbuser`'s broad privileges and would happily return
+# rows, but they cross trust boundaries (other vaults' vt_* tables,
+# AKB's own bookkeeping, PG system catalogs).
+_FORBIDDEN_TOKEN = _re.compile(
+    r"\b(?:"
+    # PG system catalogs / metadata
+    r"pg_catalog|information_schema|pg_authid|pg_user|pg_shadow|"
+    r"pg_proc|pg_class|pg_namespace|pg_database|pg_attribute|"
+    r"pg_roles|pg_settings|pg_stat_\w+|pg_tables|pg_views|"
+    # AKB internal bookkeeping. These are managed by the service
+    # layer; userland SQL must not read or write them directly.
+    r"users|vaults|documents|chunks|tokens|vault_access|"
+    r"bm25_vocab|bm25_stats|edges|events|publications|todos|"
+    r"vault_tables|vault_files|collections|memories|"
+    r"vault_external_git|vector_delete_outbox"
+    r")\b",
+    _re.IGNORECASE,
+)
+_VT_IDENTIFIER = _re.compile(r"\bvt_[a-z0-9_]+__[a-z0-9_]+\b", _re.IGNORECASE)
+
+
+def _validate_sql_surface(sql: str, allowed_pg_tables: set[str]) -> str | None:
+    """Return an error message if `sql` references anything outside the
+    caller's table whitelist or runs a non-DML statement type. None
+    means the surface is safe to hand to PG.
+
+    `allowed_pg_tables` is the set of fully-qualified `vt_<vault>__<t>`
+    names the caller can legitimately reach (i.e. `table_map.values()`).
+    """
+    stripped = sql.strip()
+    upper = stripped.upper()
+    # Statement-type whitelist: only DML (and SELECT/WITH).
+    if not upper.startswith(_ALLOWED_FIRST_KEYWORDS):
+        return (
+            "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
+            "akb_sql. Use akb_create_table / akb_alter_table / "
+            "akb_drop_table for schema changes."
+        )
+    # Foreign vt_* table references.
+    allowed_lower = {t.lower() for t in allowed_pg_tables}
+    for m in _VT_IDENTIFIER.finditer(sql):
+        if m.group(0).lower() not in allowed_lower:
+            return f"Reference to '{m.group(0)}' is not allowed."
+    # PG system catalogs + AKB internal tables.
+    bad = _FORBIDDEN_TOKEN.search(sql)
+    if bad:
+        return f"Reference to '{bad.group(0)}' is not allowed."
+    return None
+
+
 async def execute_sql(
     vault_names: list[str],
     sql: str,
@@ -370,6 +429,30 @@ async def execute_sql(
         sql_check = rewritten.rstrip(";").strip()
         if ";" in sql_check:
             return {"error": "Multi-statement SQL is not allowed. Send one statement at a time."}
+
+        # Sandbox the SQL surface to a tight whitelist before PG ever sees
+        # it. Two classes of bypass exist without this gate:
+        #
+        # (1) Foreign-vault data exfiltration. `rewrite_table_names` only
+        #     rewrites identifiers in `table_map` (the caller's vault's
+        #     tables). User-supplied SQL can name another vault's PG
+        #     table directly (`vt_<other>__<t>`) — those identifiers
+        #     reach PG untouched and `akbuser` (the backend's
+        #     superuser-class role) returns the rows. ALSO catches
+        #     reads against AKB internal tables (`users`, `vaults`,
+        #     `tokens`, `chunks`, `bm25_*`, `edges`, ...) and PG
+        #     system catalogs (`pg_catalog.*`, `information_schema.*`,
+        #     `pg_user`, `pg_authid`, ...).
+        #
+        # (2) DDL-driven side channels. Even a writer must not be able
+        #     to `CREATE VIEW`, `CREATE FUNCTION`, etc. — those bypass
+        #     the table whitelist (a view can SELECT from anywhere)
+        #     and outlive the request. DDL is delegated to specific
+        #     tools (`akb_create_table` / `akb_alter_table` /
+        #     `akb_drop_table`). `akb_sql` is DML-only.
+        deny = _validate_sql_surface(rewritten, set(table_map.values()))
+        if deny:
+            return {"error": deny}
 
         is_select = rewritten.strip().upper().startswith(("SELECT", "WITH"))
 
