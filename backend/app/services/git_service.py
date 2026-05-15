@@ -525,12 +525,28 @@ class GitService:
         """Legacy clone/push path, used only for the very first commit on
         an empty bare repo (before any branch exists — worktree add can't
         attach without a branch). One-shot cost at vault creation.
+
+        GitPython's ``Repo.clone_from`` calls ``os.getcwd()`` internally
+        to bootstrap the Git wrapper. If a previous call left the
+        process working directory pointing at a now-deleted
+        ``TemporaryDirectory``, that getcwd raises ``FileNotFoundError``
+        and every subsequent vault-creation request 500s. Use plain
+        ``subprocess`` with an explicit ``cwd`` so the call never reads
+        the process cwd.
         """
+        import subprocess
         import tempfile
         bare_path = self._bare_path(vault_name)
         author = Actor(author_name, author_email)
-        with tempfile.TemporaryDirectory() as tmp:
-            work_repo = Repo.clone_from(str(bare_path), tmp)
+        # Stable parent for the tmp dir so we don't depend on the
+        # process cwd to resolve a relative name. ``storage_path``
+        # always exists on a healthy deploy.
+        with tempfile.TemporaryDirectory(dir=str(self.storage_path)) as tmp:
+            subprocess.run(
+                ["git", "clone", "--quiet", str(bare_path), tmp],
+                check=True, cwd=tmp,
+            )
+            work_repo = Repo(tmp)
             full_path = Path(tmp) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
