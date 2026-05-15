@@ -17,7 +17,11 @@ interface BrowseItem {
   type: NodeKind;
   name: string;
   path: string;
-  file_id?: string;
+  /** Canonical `akb://{vault}/{type}/{id}` handle (null for collections,
+   *  which aren't URI-addressable). Used as the routing key for tree
+   *  nodes — the legacy `file_id` field was removed when the MCP /
+   *  REST surface collapsed onto `uri`. */
+  uri?: string | null;
   /** Path of the collection this resource lives in, or null for vault root.
    *  Documents encode collection in `path` and leave this null. */
   collection?: string | null;
@@ -129,8 +133,12 @@ export function buildTree(items: BrowseItem[]): TreeNode[] {
     );
   }
   for (const f of items.filter((i) => i.type === "file")) {
+    // File path uses the URI tail (the file UUID) — the legacy
+    // `file_id` browse field is gone after the URI cutover. Fall back
+    // to `path` for any defensive case where uri is missing.
+    const fileTail = f.uri ? f.uri.split("/file/")[1] : null;
     attachToCollection(
-      { kind: "file", name: f.name, path: f.file_id || f.path, raw: f },
+      { kind: "file", name: f.name, path: fileTail || f.path, raw: f },
       f.collection,
     );
   }

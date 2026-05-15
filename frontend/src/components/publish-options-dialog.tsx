@@ -63,7 +63,7 @@ export function PublishOptionsDialog({
       // singular ("/p/<slug>"); avoiding duplicates keeps that contract.
       const doc = await getDocument(vault, docId);
       const { publications } = await listPublications(vault, "document");
-      const existing = publications.find((p: any) => p.document_id === doc.id);
+      const existing = publications.find((p: any) => p.resource_uri === doc.uri);
       if (existing) {
         onPublished(existing.slug);
         onOpenChange(false);
@@ -73,7 +73,7 @@ export function PublishOptionsDialog({
       const max = maxViews.trim();
       const result = await createPublication(vault, {
         resource_type: "document",
-        doc_id: docId,
+        uri: doc.uri,
         password: requirePassword && password ? password : undefined,
         expires_in: expiresIn || undefined,
         max_views: max ? Number(max) : undefined,

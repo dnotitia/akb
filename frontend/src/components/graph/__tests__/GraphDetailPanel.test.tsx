@@ -41,7 +41,7 @@ describe("GraphDetailPanel · document node", () => {
     });
     getRelations.mockResolvedValue({
       doc_id: "d-1",
-      resource_uri: "akb://akb/doc/x",
+      uri: "akb://akb/doc/x",
       relations: [
         {
           direction: "outgoing",
@@ -78,7 +78,7 @@ describe("GraphDetailPanel · document node", () => {
     getDocument.mockResolvedValue({ doc_id: "d-1", title: "x", content: "" });
     getRelations.mockResolvedValue({
       doc_id: "d-1",
-      resource_uri: "u",
+      uri: "u",
       relations: [],
     });
     getProvenance.mockResolvedValue({ provenance: { source: "manual" } });
@@ -100,7 +100,7 @@ describe("GraphDetailPanel · document node", () => {
     await screen.findByText("x");
     expect(getProvenance).not.toHaveBeenCalled();
     await u.click(screen.getByRole("button", { name: /toggle meta/i }));
-    await waitFor(() => expect(getProvenance).toHaveBeenCalledWith("d-1"));
+    await waitFor(() => expect(getProvenance).toHaveBeenCalledWith("akb", "d-1"));
   });
 });
 
@@ -112,7 +112,7 @@ describe("GraphDetailPanel · table node", () => {
       columns: ["a", "b"],
       type: "table",
     });
-    getRelations.mockResolvedValue({ doc_id: "t-1", resource_uri: "u", relations: [] });
+    getRelations.mockResolvedValue({ doc_id: "t-1", uri: "u", relations: [] });
     render(
       wrap(
         <GraphDetailPanel

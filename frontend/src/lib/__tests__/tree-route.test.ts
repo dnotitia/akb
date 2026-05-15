@@ -8,7 +8,7 @@ const t: TreeNode[] = [
     name: "architecture",
     path: "architecture",
     children: [
-      { kind: "document", name: "Schema", path: "architecture/schema.md", raw: { id: "uuid-1" } },
+      { kind: "document", name: "Schema", path: "architecture/schema.md", raw: { uri: "akb://v/doc/architecture/schema.md" } },
       { kind: "document", name: "System", path: "architecture/system.md", raw: {} },
     ],
   },
@@ -19,8 +19,8 @@ describe("findDoc", () => {
   it("matches by path", () => {
     expect(findDoc(t, "architecture/schema.md")?.name).toBe("Schema");
   });
-  it("matches by raw.id", () => {
-    expect(findDoc(t, "uuid-1")?.name).toBe("Schema");
+  it("matches by raw.uri", () => {
+    expect(findDoc(t, "akb://v/doc/architecture/schema.md")?.name).toBe("Schema");
   });
   it("returns null on miss", () => {
     expect(findDoc(t, "nope")).toBeNull();
