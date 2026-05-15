@@ -181,6 +181,17 @@ R=$(mcp_call akb_get "{\"uri\":\"${DOC_URI}/\"}" | mcp_result)
 GOT_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('path','MISSING'))" 2>/dev/null)
 [ "$GOT_PATH" = "specs/mcp-created-spec.md" ] && pass "akb_get tolerates trailing slash on URI" || fail "trailing slash" "got path: $GOT_PATH"
 
+# Put conflict atomicity — putting twice at the same path must error
+# out cleanly without mutating the existing doc. Earlier git.commit
+# fired before the DB pre-check, so the second put's body landed on
+# disk even though the response was a conflict error.
+mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"conflict probe\",\"content\":\"BODY_FIRST\"}" >/dev/null
+SECOND=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"conflict probe\",\"content\":\"BODY_SECOND\"}" | mcp_result)
+IS_ERR=$(echo "$SECOND" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d)" 2>/dev/null)
+GOT=$(mcp_call akb_get "{\"uri\":\"akb://$VAULT/doc/specs/conflict-probe.md\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
+KEPT=$(echo "$GOT" | grep -q "BODY_FIRST" && ! echo "$GOT" | grep -q "BODY_SECOND" && echo yes || echo no)
+[ "$IS_ERR" = "True" ] && [ "$KEPT" = "yes" ] && pass "akb_put conflict atomicity (no partial overwrite)" || fail "put conflict" "got err=$IS_ERR kept=$KEPT"
+
 # find_by_ref must not return a wrong doc when one path is a prefix
 # of another. Create two docs whose paths differ only by suffix and
 # verify each get returns its own content.

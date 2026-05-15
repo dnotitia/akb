@@ -183,6 +183,18 @@ class DocumentService:
         normalized_collection = _normalize_collection(req.collection)
         file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
 
+        # Conflict pre-check — keep `git.commit_file` from overwriting an
+        # existing doc when the path would collide. Without this the git
+        # write lands first, the subsequent INSERT fails on the
+        # unique(vault_id, path) constraint, and the caller gets an
+        # error response while the on-disk body is already mutated.
+        # Concurrent puts can still race past this gate; the unique
+        # index is the final backstop and the rare partial-write that
+        # results is rolled back by a future explicit-update workflow.
+        if await doc_repo.find_by_path(vault_id, file_path):
+            from app.exceptions import ConflictError
+            raise ConflictError(f"Document already exists at path: {file_path}")
+
         fm_dict = _build_frontmatter(req, now)
         if agent_id:
             fm_dict["created_by"] = agent_id
