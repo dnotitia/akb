@@ -255,25 +255,66 @@ async def create_publication(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO publications (
+        async with conn.transaction():
+            # Re-check resource existence INSIDE the publish TX, against
+            # the canonical resource_uri the caller resolved. Closes the
+            # publish/delete race: without this, `document_service.delete`
+            # could cascade-clean publications (zero rows) before we
+            # INSERT below, leaving an orphan publication that points
+            # at a now-gone resource.
+            #
+            # The check holds the row in a snapshot for the duration of
+            # the TX. Concurrent delete blocks on the row lock until
+            # after our INSERT commits — meaning either the publication
+            # lands first and delete cleans it, or delete commits first
+            # and we abort with ResourceVanished.
+            if resource_type == ResourceType.DOCUMENT and resource_uri:
+                # Doc resource_uri form: akb://{vault}/doc/{path}
+                doc_path_for_check = resource_uri.split("/doc/", 1)[1] if "/doc/" in resource_uri else None
+                if doc_path_for_check is not None:
+                    found = await conn.fetchval(
+                        "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2 FOR SHARE",
+                        vault_id, doc_path_for_check,
+                    )
+                    if not found:
+                        raise ValueError(
+                            f"Document not found (resource was deleted concurrently): {resource_uri}"
+                        )
+            elif resource_type == ResourceType.FILE and resource_uri:
+                file_uuid_for_check = resource_uri.rsplit("/", 1)[-1]
+                try:
+                    file_uuid_obj = uuid.UUID(file_uuid_for_check)
+                except ValueError:
+                    file_uuid_obj = None
+                if file_uuid_obj is not None:
+                    found = await conn.fetchval(
+                        "SELECT 1 FROM vault_files WHERE id = $1 FOR SHARE",
+                        file_uuid_obj,
+                    )
+                    if not found:
+                        raise ValueError(
+                            f"File not found (resource was deleted concurrently): {resource_uri}"
+                        )
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO publications (
+                    slug, vault_id, resource_type, resource_uri,
+                    query_sql, query_vault_names, query_params,
+                    password_hash, max_views, expires_at,
+                    mode, section_filter, allow_embed, title, created_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                RETURNING id, slug, vault_id, resource_type, resource_uri,
+                          query_sql, query_vault_names, query_params, max_views,
+                          view_count, expires_at, mode, section_filter, allow_embed,
+                          title, created_at
+                """,
                 slug, vault_id, resource_type, resource_uri,
-                query_sql, query_vault_names, query_params,
-                password_hash, max_views, expires_at,
-                mode, section_filter, allow_embed, title, created_by
+                query_sql, query_vault_names, json.dumps(query_params or {}),
+                pwd_hash, max_views, expires_at,
+                mode, section_filter, allow_embed, title, created_by,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING id, slug, vault_id, resource_type, resource_uri,
-                      query_sql, query_vault_names, query_params, max_views,
-                      view_count, expires_at, mode, section_filter, allow_embed,
-                      title, created_at
-            """,
-            slug, vault_id, resource_type, resource_uri,
-            query_sql, query_vault_names, json.dumps(query_params or {}),
-            pwd_hash, max_views, expires_at,
-            mode, section_filter, allow_embed, title, created_by,
-        )
 
     result = _enrich_publication(_publication_row_to_dict(row)) or {}
     result["password_protected"] = pwd_hash is not None

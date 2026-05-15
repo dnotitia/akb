@@ -568,7 +568,10 @@ class SearchService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             # Match by UUID, metadata.id (d- prefix), or path substring
-            doc_match = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%')"
+            # Exact path match — same reasoning as `find_by_ref`. The
+            # earlier substring `LIKE '%' || $2 || '%'` arm caused
+            # cross-doc section bleed when paths shared a substring.
+            doc_match = "(d.id::text = $2 OR d.path = $2)"
             if section:
                 rows = await conn.fetch(
                     f"""
