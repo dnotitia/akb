@@ -27,13 +27,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KUSTOMIZE_DIR="${KUSTOMIZE_DIR:-${SCRIPT_DIR}}"
 ROOT_DIR="${SCRIPT_DIR}/../.."
 
-echo "=== Building Docker images (linux/amd64) ==="
+# Product version is the single source of truth in backend/pyproject.toml.
+# Each build publishes :${VERSION} (immutable, for rollback / pin) and :latest
+# (what the running Deployment references, so `kubectl rollout restart`
+# picks it up under imagePullPolicy: Always).
+VERSION="$(awk -F'"' '/^version = /{print $2; exit}' "${ROOT_DIR}/backend/pyproject.toml")"
+: "${VERSION:?Could not read [project].version from backend/pyproject.toml}"
+
+echo "=== Building Docker images (linux/amd64) — version ${VERSION} ==="
 docker buildx build --platform linux/amd64 \
+  -t "${REGISTRY}/akb-backend:${VERSION}" \
   -t "${REGISTRY}/akb-backend:latest" \
   --push \
   "${ROOT_DIR}/backend/"
 
 docker buildx build --platform linux/amd64 \
+  -t "${REGISTRY}/akb-frontend:${VERSION}" \
   -t "${REGISTRY}/akb-frontend:latest" \
   --push \
   "${ROOT_DIR}/frontend/"

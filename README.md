@@ -54,10 +54,14 @@ letting the indexing worker re-populate.
 |------|-------------|
 | `akb_list_vaults` / `akb_create_vault` | Vault management |
 | `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (Git commit + indexing) |
+| `akb_put_file` / `akb_get_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
+| `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
 | `akb_browse` | Tree traversal (collection → docs) |
-| `akb_search` | Hybrid search (dense + BM25) |
+| `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
 | `akb_drill_down` | Section-level retrieval |
-| `akb_relations` / `akb_link` / `akb_unlink` | Knowledge graph |
+| `akb_relations` / `akb_link` / `akb_unlink` / `akb_graph` | Knowledge graph |
+| `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, Git history |
+| `akb_grant` / `akb_revoke` / `akb_set_public` | Permission boundaries — per-user, per-org, public |
 | `akb_remember` / `akb_recall` / `akb_forget` | Agent memory |
 | `akb_session_start` / `akb_session_end` | Session lifecycle |
 | `akb_publish` / `akb_unpublish` | Public publication |
@@ -66,17 +70,19 @@ The full tool catalogue is exposed via `akb_help()` from any MCP client.
 
 ## Document Format
 
+Documents are addressed by URI — `akb://{vault}/{path}` is the canonical
+handle used by every tool and stored in relations.
+
 ```yaml
 ---
-id: "d-3f8a1b2c"
 title: "Payment API v2 migration plan"
 type: plan              # note | report | decision | spec | plan | session | task | reference
 status: active          # draft | active | archived | superseded
 tags: [payments, api]
 domain: engineering
 summary: "REST → gRPC transition plan."
-depends_on: ["d-api-spec-id"]
-related_to: ["d-meeting-notes-id"]
+depends_on: ["akb://eng/specs/payment-api-v2"]
+related_to: ["akb://eng/meetings/2026-05-01-payments"]
 ---
 
 # Payment API v2 migration plan
@@ -202,7 +208,7 @@ akb/
 │   └── secret.yaml.example   # API keys, passwords (gitignored when not .example)
 ├── deploy/
 │   └── k8s/                  # Generic kustomize base for Kubernetes
-└── docker-compose.yaml       # 4-container local stack
+└── docker-compose.yaml       # 3-container local stack (postgres + backend + frontend)
 ```
 
 ## Tech Stack
@@ -216,6 +222,18 @@ akb/
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
 - **Auth**: JWT + Personal Access Tokens (PATs)
 - **MCP**: Streamable HTTP (backend) + stdio proxy (`akb-mcp` on npm)
+
+## Versioning
+
+AKB follows [SemVer](https://semver.org/). The product version lives in
+`backend/pyproject.toml` (`[project].version`) and is mirrored to
+`frontend/package.json` via `scripts/bump-version.sh <x.y.z>`. Each
+`deploy/k8s/deploy.sh` run tags the Docker images with both the explicit
+version (`:${VERSION}`) and `:latest`, so historical builds remain
+pullable for rollback.
+
+`packages/akb-mcp-client` (the `akb-mcp` npm proxy) follows its own npm
+semver lifecycle and is **not** tied to the product version.
 
 ## License
 
