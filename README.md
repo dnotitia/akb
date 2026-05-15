@@ -32,6 +32,17 @@ explicit relations, and full version history. AKB gives agents a single set of
 tools (`akb_put`, `akb_search`, `akb_browse`, `akb_relations`, …) over a
 backing store of Git bare repos and a PostgreSQL hybrid index.
 
+## Design philosophy
+
+**Core stays small; flexibility comes from extension, not built-in
+automation.** AKB does not ship its own consolidator, summariser, or
+"knowledge gardener" — instead every write emits a structured event to a
+Redis Stream (`akb:events`). Operators wire any external consumer
+(periodic synthesis bot, doc-rot reaper, weekly-digest agent, audit
+trail, …) on top, with no patches to the core. The base contract is a
+read/write store; opinions about *what to do with* the knowledge live
+outside.
+
 ## Architecture
 
 ```
