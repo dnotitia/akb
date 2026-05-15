@@ -1,0 +1,63 @@
+# AKB all-in-one config. Everything points at localhost services started
+# by supervisord inside the same container. Override via ENV vars at
+# `docker run` time (handled by entrypoint.sh).
+
+# === Database ===
+db_host: 127.0.0.1
+db_port: 5432
+db_name: akb
+db_user: akb
+
+# === Git storage ===
+git_storage_path: /data/vaults
+
+# === Embedding (defaults to OpenAI — override via EMBED_* env vars) ===
+embed_base_url: https://api.openai.com/v1
+embed_model: text-embedding-3-small
+embed_dimensions: 1536
+
+# === LLM (optional; disabled unless LLM_BASE_URL set) ===
+llm_base_url: ""
+llm_model: ""
+
+# === Reranker (off by default) ===
+rerank_enabled: false
+rerank_provider: cohere
+rerank_model: cohere/rerank-v3.5
+rerank_base_url: ""
+rerank_prefetch: 30
+
+# === S3 (in-container MinIO) ===
+s3_endpoint_url: http://127.0.0.1:9000
+s3_public_url: ""
+s3_bucket: akb-files
+s3_region: us-east-1
+
+# === Auth ===
+jwt_algorithm: HS256
+jwt_expire_hours: 24
+
+# === Server ===
+host: 0.0.0.0
+port: 8000
+public_base_url: ""
+
+# === Vector store — pgvector reusing the in-container PG ===
+vector_store_driver: pgvector
+vector_store_dsn: ""
+vector_store_schema: vector_index
+vector_store_sparse_shape: posting
+vector_url: ""
+vector_collection: chunks
+
+# === Indexing worker ===
+indexing_batch_size: 16
+
+# === BM25 ===
+bm25_k1: 1.5
+bm25_b: 0.75
+
+# === Redis event fanout (in-container Redis) ===
+redis_url: redis://127.0.0.1:6379/0
+redis_event_stream: akb:events
+redis_stream_maxlen: 100000
