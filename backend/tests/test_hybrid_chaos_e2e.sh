@@ -63,7 +63,7 @@ search() {
 echo ""
 echo "▸ C1. Vocab write race (20 parallel new terms)"
 
-V_BEFORE=$(rcurl "$BASE/health" | jget "d['vector_store']['bm25_vocab_size']")
+V_BEFORE=$(rcurl "$BASE/health" | jget "d['vector_store']['bm25']['vocab_size']")
 for i in $(seq 1 20); do
   HEX=$(python3 -c "import secrets; print(''.join(secrets.choice('abcdef') for _ in range(10)))")
   ( put "Race$i" "RaceTerm$HEX content for race test." >/dev/null ) &
@@ -71,7 +71,7 @@ done
 wait
 sleep "$WAIT"
 
-V_AFTER=$(rcurl "$BASE/health" | jget "d['vector_store']['bm25_vocab_size']")
+V_AFTER=$(rcurl "$BASE/health" | jget "d['vector_store']['bm25']['vocab_size']")
 DIFF=$((V_AFTER - V_BEFORE))
 # Each put adds at least 2 new terms (racetermXXX + content-ish). 20 puts → ~20-40 new terms.
 [ "$DIFF" -ge 20 ] 2>/dev/null && pass "vocab grew by $DIFF under parallel writes" || fail "C1" "only grew by $DIFF"

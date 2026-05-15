@@ -164,6 +164,43 @@ R=$(mcp_call akb_drill_down "{\"uri\":\"$DOC_URI\"}" | mcp_result)
 SECT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['sections']))" 2>/dev/null)
 [ "$SECT_COUNT" -ge 1 ] 2>/dev/null && pass "akb_drill_down: $SECT_COUNT sections" || fail "akb_drill_down" "expected >=1"
 
+# Chunk header strip — drill_down content must not leak the
+# indexing-time enrichment header (TITLE:/SUMMARY:/TAGS:/PATH:/TYPE:).
+HEADER_LEAKED=$(echo "$R" | python3 -c "
+import sys, json, re
+d = json.load(sys.stdin)
+leaked = any(re.match(r'^(TITLE|SUMMARY|TAGS|PATH|TYPE):', (s.get('content') or ''))
+             for s in d.get('sections', []))
+print(leaked)
+" 2>/dev/null)
+[ "$HEADER_LEAKED" = "False" ] && pass "drill_down strips chunk header" || fail "drill_down header leak" "TITLE:/SUMMARY: visible in response"
+
+# URI trailing-slash normalization — akb_get must resolve the same
+# doc whether the URI has a trailing slash or not.
+R=$(mcp_call akb_get "{\"uri\":\"${DOC_URI}/\"}" | mcp_result)
+GOT_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('path','MISSING'))" 2>/dev/null)
+[ "$GOT_PATH" = "specs/mcp-created-spec.md" ] && pass "akb_get tolerates trailing slash on URI" || fail "trailing slash" "got path: $GOT_PATH"
+
+# find_by_ref must not return a wrong doc when one path is a prefix
+# of another. Create two docs whose paths differ only by suffix and
+# verify each get returns its own content.
+mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"api\",\"content\":\"## v1\\n\\nFIRST_ONLY_TAG\"}" >/dev/null
+mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"api v2\",\"content\":\"## v2\\n\\nSECOND_ONLY_TAG\"}" >/dev/null
+R=$(mcp_call akb_get "{\"uri\":\"akb://$VAULT/doc/specs/api.md\"}" | mcp_result)
+HAS_FIRST=$(echo "$R" | python3 -c "import sys,json; print('FIRST_ONLY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+NO_SECOND=$(echo "$R" | python3 -c "import sys,json; print('SECOND_ONLY_TAG' not in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+[ "$HAS_FIRST" = "True" ] && [ "$NO_SECOND" = "True" ] && pass "find_by_ref: exact path match (api.md ≠ api-v2.md)" || fail "find_by_ref bleed" "wrong-doc match on prefix overlap"
+
+# Versioned akb_get must strip YAML frontmatter from the historical
+# body — older commits stored the `---\n…\n---` block inline.
+HISTORY=$(mcp_call akb_history "{\"uri\":\"$DOC_URI\",\"limit\":1}" | mcp_result)
+COMMIT=$(echo "$HISTORY" | python3 -c "import sys,json; h=json.load(sys.stdin).get('history',[]); print(h[0]['hash'] if h else '')" 2>/dev/null)
+if [ -n "$COMMIT" ]; then
+  R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\",\"version\":\"$COMMIT\"}" | mcp_result)
+  CLEAN=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print(not c.lstrip().startswith('---'))" 2>/dev/null)
+  [ "$CLEAN" = "True" ] && pass "akb_get(version=…) strips frontmatter" || fail "versioned frontmatter leak" "content starts with ---"
+fi
+
 # ── 6. Relations & Graph ─────────────────────────────────────
 echo ""
 echo "▸ 6. Relations & Graph via MCP"

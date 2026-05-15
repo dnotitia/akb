@@ -134,6 +134,17 @@ HAS_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print
 R=$(mcp_as "$PAT1" "$SID1" "akb_graph" "{\"vault\":\"$VAULT1\"}" | mr)
 echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'nodes' in d and 'edges' in d" 2>/dev/null && pass "User1 can call akb_graph on own vault" || fail "Graph self" "$R"
 
+# REST /drill-down — the MCP handler runs through check_vault_access,
+# the REST entry-point used to skip it. Regression guard: any
+# authenticated user (here: user2) must be blocked from a private
+# vault's drill-down even though they have a valid PAT.
+DOC1_TAIL=$(echo "$DOC1_URI" | python3 -c "import sys; u=sys.stdin.read().strip(); print(u.split('/doc/',1)[1] if '/doc/' in u else '')")
+HTTP=$(curl -sS -k -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer $PAT2" \
+  --get --data-urlencode "uri=$DOC1_URI" \
+  "$BASE_URL/api/v1/drill-down")
+[ "$HTTP" = "403" ] && pass "User2 blocked from REST /drill-down (403)" || fail "REST drill-down ACL" "got HTTP $HTTP"
+
 # ── 1c. Vault-scoped health ACL ──────────────────────────────
 echo ""
 echo "▸ 1c. Vault-scoped health ACL"
