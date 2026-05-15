@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { Download, File } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { parseFileUri } from "@/lib/uri";
 
 interface FileInfo {
   uri: string;
@@ -28,12 +29,10 @@ export default function FilePage() {
       .then((r) => r.json())
       .then((d) => {
         // Backend rows carry a canonical `uri` (akb://{vault}/file/{id}) and
-        // no separate `id` field after the URI-canonical refactor. Match by
-        // the tail of `/file/` so this page survives `id` ever being dropped.
-        const found = (d.items || []).find((x: any) => {
-          const tail = (x.uri ?? "").split("/file/")[1];
-          return tail === fileId;
-        });
+        // no separate `id` field after the URI-canonical refactor.
+        const found = (d.items || []).find(
+          (x: any) => parseFileUri(x.uri)?.id === fileId,
+        );
         if (found) setInfo(found);
         else setError("File not found in vault");
       })

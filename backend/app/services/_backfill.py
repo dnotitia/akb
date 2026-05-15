@@ -42,9 +42,15 @@ class BackfillRunner:
     graceful stop.
     """
 
-    def __init__(self, name: str, process_once: Callable[[], Awaitable[int]]):
+    def __init__(
+        self,
+        name: str,
+        process_once: Callable[[], Awaitable[int]],
+        idle_secs: int = IDLE_INTERVAL_SECS,
+    ):
         self._name = name
         self._process_once = process_once
+        self._idle_secs = idle_secs
         self._task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
@@ -69,7 +75,7 @@ class BackfillRunner:
     async def _loop(self) -> None:
         assert self._stop_event is not None
         self._log.info("%s loop started (idle=%ds, max_retries=%d)",
-                       self._name, IDLE_INTERVAL_SECS, MAX_RETRIES)
+                       self._name, self._idle_secs, MAX_RETRIES)
         while not self._stop_event.is_set():
             try:
                 done = await self._process_once()
@@ -79,7 +85,7 @@ class BackfillRunner:
 
             if done == 0:
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=IDLE_INTERVAL_SECS)
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=self._idle_secs)
                 except asyncio.TimeoutError:
                     pass
             else:

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { browseVault } from "@/lib/api";
+import { parseFileUri } from "@/lib/uri";
 
 export type NodeKind = "collection" | "document" | "table" | "file";
 
@@ -136,7 +137,7 @@ export function buildTree(items: BrowseItem[]): TreeNode[] {
     // File path uses the URI tail (the file UUID) — the legacy
     // `file_id` browse field is gone after the URI cutover. Fall back
     // to `path` for any defensive case where uri is missing.
-    const fileTail = f.uri ? f.uri.split("/file/")[1] : null;
+    const fileTail = parseFileUri(f.uri)?.id ?? null;
     attachToCollection(
       { kind: "file", name: f.name, path: fileTail || f.path, raw: f },
       f.collection,

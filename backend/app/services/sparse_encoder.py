@@ -399,58 +399,71 @@ async def vocab_size() -> int:
 # stuck at zero, then on a fixed cadence so a long-running deploy
 # stays in sync as docs are added/removed/updated.
 
-import asyncio  # noqa: E402  (placed here so the module's surface above stays import-light)
+# Skip a tick when the indexable chunk count hasn't moved by this many
+# rows since the last recompute. Tokenizing a 600k-row corpus through
+# Kiwi is minutes of CPU, so an unconditional cadence wastes work on a
+# steady-state vault.
+_BM25_RECOMPUTE_DELTA_THRESHOLD = 50
 
-_refresher_task: asyncio.Task | None = None
-_refresher_stop: asyncio.Event | None = None
+
+async def _should_recompute() -> bool:
+    """True if the chunk count has drifted enough from the stored
+    `total_docs` to warrant a fresh recompute. Cheap COUNT(*) probe."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        live = await conn.fetchval(
+            "SELECT COUNT(*) FROM chunks WHERE content IS NOT NULL"
+        )
+        stored = await conn.fetchval(
+            "SELECT total_docs FROM bm25_stats WHERE id = 1"
+        )
+    return abs(int(live or 0) - int(stored or 0)) >= _BM25_RECOMPUTE_DELTA_THRESHOLD
 
 
-async def _refresher_loop(interval_secs: int) -> None:
-    """Run recompute_stats on startup, then every interval_secs."""
-    # First pass — fire as soon as we start. Fresh installs (and any
-    # deploy where recompute hasn't run) need stats populated before
-    # the first query lands.
-    try:
+async def _refresh_tick() -> int:
+    """One refresher iteration. Returns 0 so `BackfillRunner` always
+    treats us as idle and respects the configured `idle_secs` cadence
+    rather than busy-looping."""
+    if await _should_recompute():
         await recompute_stats()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("BM25 stats refresh failed at startup: %s", e)
+    return 0
 
-    while True:
-        try:
-            assert _refresher_stop is not None
-            await asyncio.wait_for(_refresher_stop.wait(), timeout=interval_secs)
-            return  # stop signalled
-        except asyncio.TimeoutError:
-            pass
-        try:
-            await recompute_stats()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("BM25 stats refresh failed: %s", e)
+
+from app.services._backfill import BackfillRunner  # noqa: E402
+
+_refresher = BackfillRunner("bm25_stats_refresher", _refresh_tick, idle_secs=1)
 
 
 def start_stats_refresher(interval_secs: int = 1800) -> None:
-    """Launch the periodic stats refresher. Idempotent."""
-    global _refresher_task, _refresher_stop
-    if _refresher_task and not _refresher_task.done():
-        return
-    _refresher_stop = asyncio.Event()
-    _refresher_task = asyncio.create_task(
-        _refresher_loop(interval_secs), name="bm25_stats_refresher",
+    """Launch the periodic stats refresher. Idempotent.
+
+    Always fires `recompute_stats` once at startup (bypassing the delta
+    gate) so a fresh install isn't stuck at total_docs=0; subsequent
+    ticks honour the gate.
+    """
+    global _refresher
+    _refresher = BackfillRunner(
+        "bm25_stats_refresher", _refresh_tick, idle_secs=interval_secs,
     )
+    # Bootstrap: force one recompute on startup regardless of delta so
+    # a brand-new DB doesn't have to wait `interval_secs` for usable
+    # sparse weights. Wrapped in a task so startup isn't blocked.
+    import asyncio as _asyncio
+    _asyncio.create_task(_bootstrap_recompute(), name="bm25_stats_bootstrap")
+    _refresher.start()
+
+
+async def _bootstrap_recompute() -> None:
+    try:
+        await recompute_stats()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("BM25 bootstrap recompute failed: %s", e)
 
 
 async def stop_stats_refresher() -> None:
-    """Signal stop and await the task. Safe to call when not started."""
-    global _refresher_task, _refresher_stop
-    if _refresher_stop is not None:
-        _refresher_stop.set()
-    if _refresher_task is not None:
-        try:
-            await _refresher_task
-        except asyncio.CancelledError:
-            pass
-    _refresher_task = None
-    _refresher_stop = None
+    """Signal stop and await the runner. Safe to call when not started."""
+    if _refresher is not None:
+        await _refresher.stop()
 
 
 async def stats_snapshot() -> dict:

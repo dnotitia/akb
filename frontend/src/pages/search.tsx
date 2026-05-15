@@ -6,6 +6,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { parseUri } from "@/lib/uri";
 
 type Mode = "dense" | "literal";
 type SourceType = "document" | "table" | "file";
@@ -31,15 +32,13 @@ function resultHref(r: DenseResult): string {
     const name = (r.path || "").replace(/^_tables\//, "") || r.title;
     return `/vault/${r.vault}/table/${encodeURIComponent(name)}`;
   }
+  const parsed = parseUri(r.uri);
   if (type === "file") {
-    // file URI tail is the UUID.
-    const fileId = r.uri.split("/file/")[1] || "";
-    return `/vault/${r.vault}/file/${fileId}`;
+    return `/vault/${r.vault}/file/${parsed?.id ?? ""}`;
   }
-  // document URI tail is the path. URL-encode it so a hierarchical
-  // doc path like `incidents/foo.md` survives as a single React Router
-  // param instead of being split at the embedded `/`.
-  const docPath = r.uri.split("/doc/")[1] || r.path;
+  // URL-encode the doc path so a hierarchical id like `incidents/foo.md`
+  // survives as a single React Router param.
+  const docPath = parsed?.id ?? r.path;
   return `/vault/${r.vault}/doc/${encodeURIComponent(docPath)}`;
 }
 
@@ -373,7 +372,7 @@ export default function SearchPage() {
             {literalResults.map((r, i) => (
               <li key={r.uri}>
                 <Link
-                  to={`/vault/${r.vault}/doc/${encodeURIComponent(r.uri.split("/doc/")[1] || r.path)}`}
+                  to={`/vault/${r.vault}/doc/${encodeURIComponent(parseUri(r.uri)?.id ?? r.path)}`}
                   className="block px-5 py-4 group hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   <div className="grid grid-cols-[32px_1fr_60px] gap-4 items-baseline">

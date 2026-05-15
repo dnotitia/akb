@@ -62,6 +62,15 @@ class DocumentRepository:
     # that class of bug.
     _MATCH_WHERE = "(d.id::text = $2 OR d.path = $2)"
 
+    @staticmethod
+    def match_clause(param_index: int, alias: str = "d") -> str:
+        """Doc lookup predicate against `<alias>.id` OR `<alias>.path`,
+        parameter-positional so callers can compose the clause inside
+        a larger query with its own placeholder numbering. Mirrors
+        `_MATCH_WHERE` so a single source defines the substring-match
+        ban — adding new lookup arms here propagates to every caller."""
+        return f"({alias}.id::text = ${param_index} OR {alias}.path = ${param_index})"
+
     async def find_by_ref(self, vault_id: uuid.UUID, ref: str) -> dict | None:
         """Find document by UUID or exact path."""
         async with self.pool.acquire() as conn:
