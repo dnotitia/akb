@@ -278,7 +278,7 @@ class DocumentService:
         # Derive published state from the publications table. We pick the
         # newest matching publication so the UI is consistent with publishDoc()
         # which reuses the first entry returned by listPublications (DESC order).
-        public_slug = await self._get_public_slug(row["id"])
+        public_slug = await self._get_public_slug(row["vault_name"], row["path"])
 
         return DocumentResponse(
             uri=doc_uri(row["vault_name"], row["path"]),
@@ -293,18 +293,20 @@ class DocumentService:
             public_slug=public_slug,
         )
 
-    async def _get_public_slug(self, doc_id: uuid.UUID) -> str | None:
-        """Return the newest publication slug for a document, or None."""
+    async def _get_public_slug(self, vault_name: str, doc_path: str) -> str | None:
+        """Return the newest publication slug for a document, or None.
+        Looks up by the canonical resource_uri rather than the dropped
+        `publications.document_id` FK column."""
         pool = await get_pool()
         async with pool.acquire() as conn:
             return await conn.fetchval(
                 """
                 SELECT slug FROM publications
-                WHERE document_id = $1 AND resource_type = 'document'
+                WHERE resource_uri = $1 AND resource_type = 'document'
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                doc_id,
+                doc_uri(vault_name, doc_path),
             )
 
     # ── Update ────────────────────────────────────────────────
@@ -586,6 +588,15 @@ class DocumentService:
             async with conn.transaction():
                 await delete_document_chunks(conn, str(pg_doc_id))
                 await delete_document_relations(conn, vault, file_path)
+                # App-level publication cascade. Previously this rode
+                # on `publications.document_id` ON DELETE CASCADE; that
+                # FK column is gone after migration 022, so we wipe
+                # publications by canonical URI before the doc row
+                # itself goes.
+                await conn.execute(
+                    "DELETE FROM publications WHERE resource_uri = $1",
+                    doc_uri(vault, file_path),
+                )
                 await emit_event(
                     conn, "document.delete",
                     vault_id=vault_id,

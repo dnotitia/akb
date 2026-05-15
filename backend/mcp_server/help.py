@@ -78,18 +78,18 @@ akb_browse(vault="engineering", collection="decisions")
 
 ### Step 3: Read
 ```
-akb_get(vault="engineering", doc_id="decisions/use-grpc.md")
+akb_get(uri="akb://engineering/doc/decisions/use-grpc.md")
 → full document with metadata
 
-akb_drill_down(vault="engineering", doc_id="decisions/use-grpc.md", section="Background")
+akb_drill_down(uri="akb://engineering/doc/decisions/use-grpc.md", section="Background")
 → just the Background section
 ```
-`doc_id` accepts a full UUID, a short `d-xxx` id, or a path substring.
+The `uri` is an AKB URI of the form `akb://{vault}/{type}/{identifier}`.
 
 ### Step 4: Search
 ```
 akb_search(query="authentication flow")
-→ ranked results (documents + tables + files) with source_type, source_id, score
+→ ranked results (documents + tables + files) with source_type, uri, score
 ```
 
 ### Step 5: Write
@@ -101,7 +101,7 @@ akb_put(
   content="## Decision\\n\\nWe're switching...",
   type="decision",
   tags=["auth", "security"],
-  related_to=["d-abc123"]  # link to related doc
+  related_to=["akb://engineering/doc/decisions/oauth-research.md"]  # link to related doc
 )
 ```
 
@@ -137,24 +137,24 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 
 **Create with relationships:**
 ```
-akb_put(..., related_to=["d-xxx"], depends_on=["d-yyy"])
+akb_put(..., related_to=["akb://v/doc/path/to/related.md"], depends_on=["akb://v/doc/path/to/prereq.md"])
 ```
 
 **Partial read (save tokens):**
 ```
 akb_browse(vault="v")           # L1: collection names
 akb_browse(vault="v", depth=2)  # L2: + document summaries
-akb_drill_down(vault="v", doc_id="d-xxx", section="API")  # L3: one section
+akb_drill_down(uri="akb://v/doc/path/to/file.md", section="API")  # L3: one section
 ```
 
 **Update only what changed:**
 ```
-akb_update(vault="v", doc_id="d-xxx", tags=["urgent"], message="Mark as urgent")
+akb_update(uri="akb://v/doc/path/to/file.md", tags=["urgent"], message="Mark as urgent")
 ```
 
 **Partial content edit (exact text replacement):**
 ```
-akb_edit(vault="v", doc_id="d-xxx", old_string="old text", new_string="new text")
+akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="new text")
 ```
 
 💡 Details: `akb_help(topic="akb_put")`, `akb_help(topic="akb_edit")`, `akb_help(topic="akb_browse")`""",
@@ -186,8 +186,8 @@ akb_search(query="invoice", tags=["finance"])
 - `title`, `summary`: overview
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"` — **dispatch follow-up tool accordingly**
-- `source_id`: pass to `akb_get` / `akb_drill_down` for documents,
-               `akb_query_table` for tables, `akb_get_file` for files
+- `uri`: pass to `akb_get` / `akb_drill_down` for documents,
+        `akb_sql` for tables, `akb_get_file` for files
 - `vault`, `path`, `tags`, `doc_type`: metadata
 
 `akb_search` surfaces documents **and** tables **and** files in one
@@ -206,8 +206,8 @@ akb_browse(vault="v", depth=2)               # Everything at once
 When a document is long and you only need one part:
 
 ```
-akb_drill_down(vault="v", doc_id="d-xxx")                    # All sections
-akb_drill_down(vault="v", doc_id="d-xxx", section="Setup")   # Just "Setup"
+akb_drill_down(uri="akb://v/doc/path/to/file.md")                    # All sections
+akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
 ```
 
 ## Search → Read Pattern
@@ -218,12 +218,12 @@ r = results[0]
 # Dispatch by source_type — documents, tables, and files share the search
 # surface but need different read tools.
 if r.source_type == "document":
-    doc = akb_get(vault=r.vault, doc_id=r.source_id)
-    section = akb_drill_down(vault=r.vault, doc_id=r.source_id, section="Steps")
+    doc = akb_get(uri=r.uri)
+    section = akb_drill_down(uri=r.uri, section="Steps")
 elif r.source_type == "table":
-    rows = akb_query_table(vault=r.vault, table=r.title)
+    rows = akb_sql(vault=r.vault, sql=f"SELECT * FROM {r.title}")
 elif r.source_type == "file":
-    file = akb_get_file(vault=r.vault, file_id=r.source_id)
+    file = akb_get_file(uri=r.uri)
 ```
 
 💡 Tip: search works across ALL vaults you have access to. Use `vault=` to narrow down.""",
@@ -344,7 +344,7 @@ akb_todos()
 
 **Assign a task to someone:**
 ```
-akb_todo(title="API 스펙 리뷰해줘", assignee="kim", vault="eng", ref_doc="d-xxx", priority="high")
+akb_todo(title="API 스펙 리뷰해줘", assignee="kim", vault="eng", ref_uri="akb://eng/doc/specs/api.md", priority="high")
 ```
 
 **Mark as done:**
@@ -389,7 +389,7 @@ akb_activity(vault="eng", since="2026-04-01", limit=5) # Recent 5 since April
 
 ## Content Diff
 ```
-akb_diff(vault="eng", doc_id="d-xxx", commit="abc123")  # What changed in this commit?
+akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123")  # What changed in this commit?
 ```""",
 
     "publishing": """# Public Sharing — Documents, Tables, and Files
@@ -400,14 +400,14 @@ section filters.
 
 ## Document share (default)
 ```
-akb_publish(vault="eng", doc_id="d-xxx")
+akb_publish(uri="akb://eng/doc/specs/api.md")
 → {"slug": "abc123", "public_url": "/p/abc123"}
 ```
 
 ## Document share with options
 ```
 akb_publish(
-    vault="eng", doc_id="d-xxx",
+    uri="akb://eng/doc/specs/api.md",
     expires_in="7d",       # auto-expire
     password="secret",     # bcrypt-hashed
     max_views=100,         # limit
@@ -433,7 +433,7 @@ akb_publish(
 
 ## File share
 ```
-akb_publish(vault="docs", resource_type="file", file_id="<file_uuid>")
+akb_publish(uri="akb://docs/file/<file_uuid>", resource_type="file")
 # /p/{slug} returns metadata; /p/{slug}/download → 302 to S3 presigned URL
 ```
 
@@ -442,8 +442,8 @@ akb_publish(vault="docs", resource_type="file", file_id="<file_uuid>")
 akb_publications(vault="eng")                            # All publications in vault
 akb_publications(vault="eng", resource_type="file")      # Filter by type
 
-akb_unpublish(vault="eng", slug="abc123")          # Remove specific share
-akb_unpublish(vault="eng", doc_id="d-xxx")         # Remove all shares for a doc
+akb_unpublish(slug="abc123")                       # Remove specific share
+akb_unpublish(uri="akb://eng/doc/specs/api.md")    # Remove all shares for a doc
 ```
 
 ## Snapshot mode (table_query only)
@@ -453,7 +453,7 @@ load. Subsequent /p/{slug} returns the cached snapshot.
 akb_publish(vault="sales", resource_type="table_query",
             query_sql="SELECT ...", mode="snapshot")
 # Or convert an existing share to snapshot:
-akb_publication_snapshot(vault="sales", publication_id="<uuid>")
+akb_publication_snapshot(vault="sales", slug="abc123")
 ```
 
 💡 Shares can be embedded via `<iframe src="/p/{slug}/embed">` or
@@ -482,12 +482,12 @@ Browse results include the `uri` field for each resource.
 
 **Explicit (any resource type):**
 ```
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/doc/specs/api.md",
   target="akb://eng/table/api-endpoints",
   relation="references")
 
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/file/abc123",
   target="akb://eng/doc/specs/api.md",
   relation="attached_to")
@@ -495,7 +495,7 @@ akb_link(vault="eng",
 
 **When creating a document (doc→doc only):**
 ```
-akb_put(..., depends_on=["d-spec1"], related_to=["d-note2"])
+akb_put(..., depends_on=["akb://eng/doc/specs/spec1.md"], related_to=["akb://eng/doc/notes/note2.md"])
 ```
 
 **Via markdown links in content:**
@@ -505,31 +505,31 @@ See the [experiment results](akb://eng/table/experiments) for details.
 
 ## Removing Links
 ```
-akb_unlink(vault="eng",
+akb_unlink(
   source="akb://eng/doc/specs/api.md",
   target="akb://eng/table/api-endpoints",
   relation="references")
 
-akb_unlink(vault="eng",
+akb_unlink(
   source="akb://eng/doc/specs/api.md",
   target="akb://eng/table/api-endpoints")  # removes ALL relations between them
 ```
 
 ## Querying Relations
 ```
-akb_relations(vault="eng", resource_uri="akb://eng/doc/specs/api.md")
-akb_relations(vault="eng", resource_uri="akb://eng/table/experiments", direction="incoming")
+akb_relations(uri="akb://eng/doc/specs/api.md")
+akb_relations(uri="akb://eng/table/experiments", direction="incoming")
 ```
 
 ## Graph View
 ```
 akb_graph(vault="eng")                           # Full vault graph (all types)
-akb_graph(vault="eng", resource_uri="akb://eng/doc/specs/api.md", depth=2)
+akb_graph(uri="akb://eng/doc/specs/api.md", depth=2)
 ```
 
 ## Provenance
 ```
-akb_provenance(doc_id="d-xxx")
+akb_provenance(uri="akb://eng/doc/specs/api.md")
 → who created it, when, all relations (including cross-type)
 ```""",
 
@@ -550,19 +550,19 @@ akb_browse(vault="eng")
 ### Step 2: Create explicit links with akb_link
 ```
 # Link a design doc to the experiment results table
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/doc/specs/experiment-design.md",
   target="akb://eng/table/experiment-results",
   relation="references")
 
 # Attach a diagram file to a spec
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/file/arch-diagram-abc123",
   target="akb://eng/doc/specs/architecture.md",
   relation="attached_to")
 
 # Mark a report as derived from a data table
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/doc/reports/q1-summary.md",
   target="akb://eng/table/quarterly-metrics",
   relation="derived_from")
@@ -570,20 +570,21 @@ akb_link(vault="eng",
 
 ### Step 3: Create document with doc→doc links
 ```
-akb_put(vault="eng", collection="decisions", title="API Redesign",
+result = akb_put(vault="eng", collection="decisions", title="API Redesign",
   content="Based on [experiment results](akb://eng/table/experiments)...",
-  depends_on=["d-spec1"], related_to=["d-review"])
+  depends_on=["akb://eng/doc/specs/spec1.md"], related_to=["akb://eng/doc/reviews/review.md"])
+# result["uri"] → "akb://eng/doc/decisions/api-redesign.md"
 ```
 
 ### Step 4: Verify the graph
 ```
-akb_relations(vault="eng", resource_uri="akb://eng/doc/specs/experiment-design.md")
-akb_graph(vault="eng", resource_uri="akb://eng/doc/specs/experiment-design.md", depth=2)
+akb_relations(uri="akb://eng/doc/specs/experiment-design.md")
+akb_graph(uri="akb://eng/doc/specs/experiment-design.md", depth=2)
 ```
 
 ### Step 5: Remove a link if needed
 ```
-akb_unlink(vault="eng",
+akb_unlink(
   source="akb://eng/doc/specs/experiment-design.md",
   target="akb://eng/table/experiment-results",
   relation="references")
@@ -597,29 +598,31 @@ akb_unlink(vault="eng",
 
 ### Step 1: Broad search
 ```
-akb_search(query="authentication")
+results = akb_search(query="authentication")
+# Each result has a `uri` field — pass that to follow-up tools.
 ```
 
 ### Step 2: Read the top results
 ```
-akb_get(vault="eng", doc_id="d-top1")
-akb_drill_down(vault="eng", doc_id="d-top2", section="Implementation")
+akb_get(uri="akb://eng/doc/specs/top1.md")
+akb_drill_down(uri="akb://eng/doc/specs/top2.md", section="Implementation")
 ```
 
 ### Step 3: Check related documents
 ```
-akb_relations(vault="eng", resource_uri="akb://eng/doc/specs/top1.md")
+akb_relations(uri="akb://eng/doc/specs/top1.md")
 # Follow the links for more context
 ```
 
 ### Step 4: Write a summary
 ```
-akb_put(vault="eng", collection="reports",
+summary = akb_put(vault="eng", collection="reports",
   title="Authentication System Overview",
   type="report",
   content="## Summary\\n\\nBased on ...",
-  related_to=["d-top1", "d-top2"],
+  related_to=["akb://eng/doc/specs/top1.md", "akb://eng/doc/specs/top2.md"],
   tags=["auth", "research"])
+# summary["uri"] → use with akb_link, akb_relations, akb_publish, etc.
 ```""",
 
     "onboarding": """# Workflow: Set Up a New Project Vault
@@ -707,8 +710,8 @@ akb_help(topic="link-resources")    # Workflow guide
 | tags | | ["auth", "api"] |
 | domain | | engineering, product, ops, legal, etc. |
 | summary | | Brief summary (auto-generated if omitted) |
-| depends_on | | ["d-xxx"] — IDs of prerequisite documents |
-| related_to | | ["d-yyy"] — IDs of related documents |
+| depends_on | | ["akb://vault/doc/path"] — URIs of prerequisite documents |
+| related_to | | ["akb://vault/doc/path"] — URIs of related documents |
 
 ## Examples
 
@@ -723,13 +726,13 @@ akb_put(vault="eng", collection="notes", title="Meeting Notes 2026-04-03",
 akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
   type="decision", tags=["grpc", "api"],
   content="## Context\\n...\\n## Decision\\n...\\n## Consequences\\n...",
-  depends_on=["d-api-spec"],
-  related_to=["d-rest-analysis"])
+  depends_on=["akb://eng/doc/specs/api-spec.md"],
+  related_to=["akb://eng/doc/analysis/rest-analysis.md"])
 ```
 
 ## Returns
 ```json
-{"doc_id": "d-abc123", "path": "decisions/adopt-grpc.md", "chunks_indexed": 5}
+{"uri": "akb://eng/doc/decisions/adopt-grpc.md", "path": "decisions/adopt-grpc.md", "chunks_indexed": 5}
 ```""",
 
     "akb_get": """# akb_get — Retrieve a Document
@@ -737,16 +740,14 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| doc_id | ✓ | Document ID (`d-xxx`) or file path (`decisions/my-doc.md`) |
+| uri | ✓ | Document AKB URI (`akb://{vault}/doc/{path}`) |
 
 ## Returns
 Full document: title, content, metadata (type, tags, status, created_by, dates), relations.
 
 ## Examples
 ```
-akb_get(vault="eng", doc_id="d-abc123")       # by ID
-akb_get(vault="eng", doc_id="decisions/adopt-grpc.md")  # by path
+akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md")
 ```
 
 💡 For large documents, use `akb_drill_down` to read specific sections.""",
@@ -758,24 +759,23 @@ Only send fields you want to change. Unspecified fields remain unchanged.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| doc_id | ✓ | Document ID |
+| uri | ✓ | Document AKB URI |
 | content | | New Markdown body (replaces existing) |
 | title | | New title |
 | status | | draft, active, archived, superseded |
 | tags | | New tag list (replaces existing) |
 | summary | | New summary |
-| depends_on | | Update dependency list (doc IDs or akb:// URIs) |
-| related_to | | Update related list (doc IDs or akb:// URIs) |
+| depends_on | | Update dependency list (akb:// URIs) |
+| related_to | | Update related list (akb:// URIs) |
 | message | | Git commit message |
 
 ## Examples
 ```
-akb_update(vault="eng", doc_id="d-xxx", tags=["urgent", "reviewed"],
+akb_update(uri="akb://eng/doc/specs/api.md", tags=["urgent", "reviewed"],
   message="Mark as urgent and reviewed")
 
-akb_update(vault="eng", doc_id="d-xxx", status="archived",
-  message="Superseded by d-yyy")
+akb_update(uri="akb://eng/doc/specs/api.md", status="archived",
+  message="Superseded by akb://eng/doc/specs/api-v2.md")
 ```""",
 
     "akb_edit": """# akb_edit — Edit a Document by Exact Text Replacement
@@ -790,8 +790,7 @@ Use akb_update for metadata changes (title, tags, status, etc.).
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| doc_id | ✓ | Document ID |
+| uri | ✓ | Document AKB URI |
 | old_string | ✓ | Exact text to find (must be unique unless replace_all=true) |
 | new_string | ✓ | Replacement text (can be empty to delete) |
 | replace_all | | If true, replaces every occurrence (default: false) |
@@ -803,9 +802,9 @@ If it appears multiple times, include more surrounding context to make it unique
 or set `replace_all=true` to replace every occurrence.
 
 ## Workflow
-1. `akb_get(vault, doc_id)` → read current content
+1. `akb_get(uri)` → read current content
 2. Pick a distinctive piece of text you want to change
-3. `akb_edit(vault, doc_id, old_string="...", new_string="...")` → apply
+3. `akb_edit(uri, old_string="...", new_string="...")` → apply
 
 ## Error Handling
 Errors return `error: "edit_failed"` with a message explaining:
@@ -816,24 +815,24 @@ Errors return `error: "edit_failed"` with a message explaining:
 ## Examples
 ```
 # Fix a typo
-akb_edit(vault="eng", doc_id="d-abc123",
+akb_edit(uri="akb://eng/doc/notes/notes.md",
   old_string="teh old typo",
   new_string="the old typo",
   message="Fix typo")
 
 # Replace a whole paragraph (include enough context to be unique)
-akb_edit(vault="eng", doc_id="d-abc123",
+akb_edit(uri="akb://eng/doc/notes/notes.md",
   old_string="## Section A\\n\\nOriginal content of section A.",
   new_string="## Section A\\n\\nUpdated content with more details.",
   message="Rewrite section A")
 
 # Delete a line (empty new_string)
-akb_edit(vault="eng", doc_id="d-abc123",
+akb_edit(uri="akb://eng/doc/notes/notes.md",
   old_string="\\nTODO: remove this line\\n",
   new_string="\\n")
 
 # Replace every occurrence of a term
-akb_edit(vault="eng", doc_id="d-abc123",
+akb_edit(uri="akb://eng/doc/notes/notes.md",
   old_string="PostgreSQL 14",
   new_string="PostgreSQL 16",
   replace_all=true,
@@ -887,10 +886,11 @@ akb_search(query="budget", tags=["finance"], limit=5)
 ```
 
 ## Result Fields
-- `doc_id`: use with akb_get or akb_drill_down
+- `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)
 - `title`, `summary`: overview
 - `score`: relevance (0.0-1.0)
 - `matched_section`: the most relevant chunk
+- `source_type`: `"document"`, `"table"`, or `"file"`
 - `vault`, `collection`, `type`, `tags`: metadata""",
 
     "akb_grep": """# akb_grep — Exact Text / Regex Search & Replace
@@ -942,7 +942,7 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 Each replaced document gets its own git commit and is re-indexed for search.
 
 ## Result Structure
-Each result includes `doc_id`, `vault`, `path`, `title`, and `matches` — a list of
+Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
 `{section, text}` showing the section path and matched line.
 When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
 
@@ -953,15 +953,14 @@ Read specific sections of a document without loading everything.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| doc_id | ✓ | Document ID |
+| uri | ✓ | Document AKB URI |
 | section | | Section name filter (partial match) |
 
 ## Examples
 ```
-akb_drill_down(vault="eng", doc_id="d-xxx")                    # All section headings
-akb_drill_down(vault="eng", doc_id="d-xxx", section="Setup")   # Just "Setup" section
-akb_drill_down(vault="eng", doc_id="d-xxx", section="API")     # Sections containing "API"
+akb_drill_down(uri="akb://eng/doc/specs/api.md")                    # All section headings
+akb_drill_down(uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
+akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
 ```
 
 💡 Token-efficient: read summaries via browse, then drill into the section you need.""",
@@ -1075,12 +1074,11 @@ Requires writer role.""",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| doc_id | ✓ | Document ID or path |
+| uri | ✓ | Document AKB URI |
 
 ## Example
 ```
-akb_delete(vault="eng", doc_id="d-xxx")
+akb_delete(uri="akb://eng/doc/specs/api.md")
 ```
 
 Requires writer role. All edges referencing this document are automatically cleaned up.""",
@@ -1090,15 +1088,14 @@ Requires writer role. All edges referencing this document are automatically clea
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| resource_uri | ✓ | AKB URI (from akb_browse results) |
+| uri | ✓ | Resource AKB URI (from akb_browse results) |
 | direction | | incoming, outgoing, both (default) |
 | type | | depends_on, related_to, implements, references, attached_to, derived_from |
 
 ## Examples
 ```
-akb_relations(vault="eng", resource_uri="akb://eng/doc/specs/api.md")
-akb_relations(vault="eng", resource_uri="akb://eng/table/experiments", direction="incoming")
+akb_relations(uri="akb://eng/doc/specs/api.md")
+akb_relations(uri="akb://eng/table/experiments", direction="incoming")
 ```""",
 
     "akb_graph": """# akb_graph — Knowledge Graph (Cross-Type)
@@ -1108,16 +1105,18 @@ Shows nodes (documents, tables, files) and edges (all relation types).
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| resource_uri | | Center node URI (omit for full vault graph) |
+| vault | | Vault name (use for full-vault graph) |
+| uri | | Center node AKB URI (use to anchor on a specific resource) |
 | depth | | BFS traversal depth (1-5, default 2) |
 | limit | | Max nodes (1-200, default 50) |
 
+Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource).
+
 ## Examples
 ```
-akb_graph(vault="eng")                                                    # Full vault graph
-akb_graph(vault="eng", resource_uri="akb://eng/table/experiments", depth=2)  # From a table
-akb_graph(vault="eng", resource_uri="akb://eng/doc/specs/api.md", depth=3)  # 3-hop from doc
+akb_graph(vault="eng")                                            # Full vault graph
+akb_graph(uri="akb://eng/table/experiments", depth=2)             # From a table
+akb_graph(uri="akb://eng/doc/specs/api.md", depth=3)              # 3-hop from doc
 ```""",
 
     "akb_provenance": """# akb_provenance — Document Provenance
@@ -1127,21 +1126,21 @@ Shows who created a document, when, and all its relations (including cross-type)
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| doc_id | ✓ | Document ID |
+| uri | ✓ | Document AKB URI |
 
 ## Example
 ```
-akb_provenance(doc_id="d-xxx")
+akb_provenance(uri="akb://eng/doc/specs/api.md")
 → {title, path, vault, uri, created_by, created_at, updated_at, relations: [...]}
 ```""",
 
     "akb_history": """# akb_history — Document Version History
 
 ```
-akb_history(vault="eng", doc_id="d-xxx")
+akb_history(uri="akb://eng/doc/specs/api.md")
 → [{"hash": "abc123def456", "date": "2026-04-03T12:00:00", "author": "admin", "message": "Update specs"}]
 
-akb_get(vault="eng", doc_id="d-xxx", version="abc123def456")
+akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
 → content at that specific version
 ```
 
@@ -1180,14 +1179,14 @@ Each entry includes:
 - summary: change description
 - files: [{path, change: added/modified/deleted}]
 
-Use `akb_diff(vault, doc_id, commit=hash)` to see the actual content diff.""",
+Use `akb_diff(uri, commit=hash)` to see the actual content diff.""",
 
     "akb_diff": """# akb_diff — Document Content Diff
 
 Shows what was added/removed in a specific commit.
 
 ```
-akb_diff(vault="eng", doc_id="d-xxx", commit="abc123def456")
+akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123def456")
 ```
 
 Returns:
@@ -1196,7 +1195,7 @@ Returns:
 - diff: unified diff (+ for additions, - for removals)
 
 Find commit hashes via:
-- akb_history(vault, doc_id) → per-document versions
+- akb_history(uri) → per-document versions
 - akb_activity(vault) → vault-wide activity""",
 
     "akb_remember": """# akb_remember — Store Memory
@@ -1231,7 +1230,7 @@ Get memory IDs from `akb_recall()` results.""",
 | assignee | | Username (omit = yourself) |
 | vault | | Related vault |
 | note | | Additional details |
-| ref_doc | | Related document ID |
+| ref_uri | | Related resource AKB URI |
 | priority | | low, normal, high, urgent |
 | due_date | | YYYY-MM-DD |
 
@@ -1239,7 +1238,7 @@ Get memory IDs from `akb_recall()` results.""",
 ```
 akb_todo(title="Fix login bug")
 akb_todo(title="Review PR #45", assignee="kim", priority="high", due_date="2026-04-05")
-akb_todo(title="Update API docs", vault="eng", ref_doc="d-xxx")
+akb_todo(title="Update API docs", vault="eng", ref_uri="akb://eng/doc/specs/api.md")
 ```""",
 
     "akb_todos": """# akb_todos — List Todos
@@ -1268,11 +1267,11 @@ documents, table queries, and files.
 
 ## Document
 ```
-akb_publish(vault="v", doc_id="d-xxx")
+akb_publish(uri="akb://v/doc/specs/api.md")
 → {"slug": "abc123", "public_url": "/p/abc123", "publication_id": "..."}
 
 # With options
-akb_publish(vault="v", doc_id="d-xxx",
+akb_publish(uri="akb://v/doc/specs/api.md",
             expires_in="7d", password="secret",
             max_views=100, section="Architecture")
 ```
@@ -1287,7 +1286,7 @@ akb_publish(vault="sales", resource_type="table_query",
 
 ## File
 ```
-akb_publish(vault="docs", resource_type="file", file_id="<uuid>")
+akb_publish(uri="akb://docs/file/<uuid>", resource_type="file")
 # /p/{slug} returns metadata; /p/{slug}/download → 302 to S3
 ```
 
@@ -1305,8 +1304,8 @@ akb_publish(vault="docs", resource_type="file", file_id="<uuid>")
     "akb_unpublish": """# akb_unpublish — Delete a Public Share
 
 ```
-akb_unpublish(vault="v", slug="abc123")        # Remove specific share
-akb_unpublish(vault="v", doc_id="d-xxx")       # Remove all shares for a document
+akb_unpublish(slug="abc123")                       # Remove specific share
+akb_unpublish(uri="akb://v/doc/specs/api.md")      # Remove all shares for a document
 ```
 
 The shareable URL stops working immediately.""",
@@ -1330,7 +1329,7 @@ Subsequent /p/{slug} returns the cached snapshot — survives backend
 restarts and reduces DB load.
 
 ```
-akb_publication_snapshot(vault="sales", publication_id="<uuid>")
+akb_publication_snapshot(vault="sales", slug="abc123")
 → {"snapshot_s3_key": "snapshots/<uuid>.json",
    "snapshot_at": "2026-04-11T...",
    "rows": 123}
@@ -1440,15 +1439,14 @@ The `confirm` parameter must match the vault name. Owner only.""",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| table | ✓ | Table name |
+| uri | ✓ | Table AKB URI (`akb://{vault}/table/{name}`) |
 | add_columns | | Columns to add: [{"name": "col", "type": "text"}] |
 | drop_columns | | Column names to remove: ["old_col"] |
 | rename_columns | | Rename map: {"old_name": "new_name"} |
 
 ## Example
 ```
-akb_alter_table(vault="eng", table="tasks",
+akb_alter_table(uri="akb://eng/table/tasks",
   add_columns=[{"name": "priority", "type": "number"}],
   drop_columns=["old_field"],
   rename_columns={"desc": "description"})
@@ -1461,7 +1459,7 @@ Requires admin role.""",
 ⚠️ **Permanent.** Deletes the table, all rows, and all edges referencing it.
 
 ```
-akb_drop_table(vault="eng", table="old-experiments")
+akb_drop_table(uri="akb://eng/table/old-experiments")
 ```
 
 Requires admin role.""",
@@ -1473,13 +1471,12 @@ Downloads from S3 to a local path. Handled by akb-mcp stdio proxy.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
-| file_id | ✓ | File ID (from akb_browse) |
+| uri | ✓ | File AKB URI (`akb://{vault}/file/{id}`, from akb_browse) |
 | save_to | ✓ | Local directory or file path |
 
 ## Example
 ```
-akb_get_file(vault="eng", file_id="abc123", save_to="/tmp/downloads/")
+akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
 → {"name": "diagram.png", "save_to": "/tmp/downloads/diagram.png", "size_bytes": 45000}
 ```""",
 
@@ -1488,7 +1485,7 @@ akb_get_file(vault="eng", file_id="abc123", save_to="/tmp/downloads/")
 Removes from S3, database, and cleans up all edges referencing the file.
 
 ```
-akb_delete_file(vault="eng", file_id="abc123")
+akb_delete_file(uri="akb://eng/file/abc123")
 ```
 
 Requires writer role.""",
@@ -1538,20 +1535,20 @@ they are handled by the akb-mcp stdio proxy which streams files directly to/from
 
 ## Upload
 ```
-akb_put_file(vault="eng", file_path="/path/to/diagram.png", collection="diagrams",
+result = akb_put_file(vault="eng", file_path="/path/to/diagram.png", collection="diagrams",
   description="Architecture diagram")
-# → {name: "diagram.png", s3_key: "eng/diagrams/abc_diagram.png", size_bytes: 45000}
+# → {uri: "akb://eng/file/abc123", name: "diagram.png", s3_key: "eng/diagrams/abc_diagram.png", size_bytes: 45000}
 ```
 
 ## Download
 ```
-akb_get_file(vault="eng", file_id="abc123", save_to="/tmp/downloads/")
+akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
 # → {name: "diagram.png", save_to: "/tmp/downloads/diagram.png", size_bytes: 45000}
 ```
 
 ## Link a file to a document
 ```
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/file/abc123",
   target="akb://eng/doc/specs/architecture.md",
   relation="attached_to")
@@ -1573,19 +1570,19 @@ Uploads a file from local disk to vault storage. Handled by akb-mcp proxy (strea
 ```
 akb_put_file(vault="eng", file_path="/path/to/report.pdf", collection="reports",
   description="Q1 analysis report")
-→ {"name": "report.pdf", "collection": "reports", "size_bytes": 128000}
+→ {"uri": "akb://eng/file/abc123", "name": "report.pdf", "collection": "reports", "size_bytes": 128000}
 ```
 
-After upload, the file appears in `akb_browse` and can be linked with `akb_link`.""",
+After upload, the file appears in `akb_browse` and can be linked with `akb_link` (use the returned `uri`).""",
 
     "akb_link": """# akb_link — Connect Any Two Resources
 
 Create a typed relation between documents, tables, and/or files using AKB URIs.
+The vault is inferred from the URIs — no separate `vault` arg.
 
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
 | source | ✓ | Source AKB URI |
 | target | ✓ | Target AKB URI |
 | relation | ✓ | depends_on, related_to, implements, references, attached_to, derived_from |
@@ -1598,19 +1595,19 @@ Create a typed relation between documents, tables, and/or files using AKB URIs.
 ## Examples
 ```
 # Link a document to a data table
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/doc/reports/analysis.md",
   target="akb://eng/table/experiment-results",
   relation="references")
 
 # Attach a file to a document
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/file/diagram-abc123",
   target="akb://eng/doc/specs/architecture.md",
   relation="attached_to")
 
 # Mark data lineage
-akb_link(vault="eng",
+akb_link(
   source="akb://eng/table/summary-stats",
   target="akb://eng/table/raw-data",
   relation="derived_from")
@@ -1620,22 +1617,23 @@ akb_link(vault="eng",
 
     "akb_unlink": """# akb_unlink — Remove a Relation
 
+The vault is inferred from the URIs — no separate `vault` arg.
+
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
 | source | ✓ | Source AKB URI |
 | target | ✓ | Target AKB URI |
 | relation | | Specific type to remove (omit = remove ALL between source/target) |
 
 ## Examples
 ```
-akb_unlink(vault="eng",
+akb_unlink(
   source="akb://eng/doc/specs/api.md",
   target="akb://eng/table/endpoints",
   relation="references")
 
-akb_unlink(vault="eng",
+akb_unlink(
   source="akb://eng/doc/specs/api.md",
   target="akb://eng/table/endpoints")  # removes ALL relations
 ```""",

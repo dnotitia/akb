@@ -254,9 +254,14 @@ CREATE TABLE IF NOT EXISTS publications (
     vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
     resource_type TEXT NOT NULL CHECK(resource_type IN ('document', 'table_query', 'file')),
 
-    -- Resource references (exactly one is non-null per resource_type)
-    document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
-    file_id UUID REFERENCES vault_files(id) ON DELETE CASCADE,
+    -- Canonical resource handle — `akb://{vault}/{type}/{identifier}`.
+    -- NULL only for table_query publications, which surface a SQL query
+    -- rather than a single addressable resource. The cascade on
+    -- vault/document/file delete still works because vault_id has
+    -- ON DELETE CASCADE; document/file deletion bumps publications
+    -- via app-level cleanup (delete_publications_for_document /
+    -- delete_publications_for_file).
+    resource_uri TEXT,
 
     -- For table_query type: stored canned SQL with :param placeholders
     query_sql TEXT,
@@ -287,8 +292,7 @@ CREATE TABLE IF NOT EXISTS publications (
 
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
-CREATE INDEX IF NOT EXISTS idx_publications_document ON publications(document_id) WHERE document_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_publications_file ON publications(file_id) WHERE file_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================

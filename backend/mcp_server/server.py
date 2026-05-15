@@ -68,9 +68,6 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
         return await doc_repo.find_by_ref_with_conn(conn, vault["id"], doc_ref)
 
 
-# Re-export under the local name so the rest of this module stays
-# unchanged. The canonical implementation lives in `uri_service`.
-_split_uri = split_uri
 
 session_service = SessionService()
 
@@ -198,7 +195,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_get")
 async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
     if version:
@@ -225,7 +222,7 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_update")
 async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="writer")
     req = DocumentUpdateRequest(
         content=args.get("content"),
@@ -245,7 +242,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_edit")
 async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="writer")
     try:
         result = await doc_service.edit(
@@ -267,7 +264,7 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_delete")
 async def _handle_delete(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="writer")
     success = await doc_service.delete(vault, doc_path, agent_id=user.username)
     return {"deleted": success}
@@ -327,7 +324,7 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_drill_down")
 async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     sections = await search_service.drill_down(
         vault, doc_path, section=args.get("section"),
@@ -369,7 +366,7 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_diff")
 async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:
@@ -455,7 +452,7 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_provenance")
 async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:
@@ -499,7 +496,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_drop_table")
 async def _handle_drop_table(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, table_name = _split_uri(args["uri"], expected_type="table")
+    vault, table_name = split_uri(args["uri"], expected_type="table")
     access = await check_vault_access(uid, vault, required_role="admin")
     try:
         return await table_service.drop_table(
@@ -511,7 +508,7 @@ async def _handle_drop_table(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_alter_table")
 async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, table_name = _split_uri(args["uri"], expected_type="table")
+    vault, table_name = split_uri(args["uri"], expected_type="table")
     access = await check_vault_access(uid, vault, required_role="admin")
     try:
         return await table_service.alter_table(
@@ -604,11 +601,11 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
     if resource_type == "document":
         if not uri:
             return {"error": "`uri` is required for resource_type=document"}
-        vault_name, doc_path = _split_uri(uri, expected_type="doc")
+        vault_name, doc_path = split_uri(uri, expected_type="doc")
     elif resource_type == "file":
         if not uri:
             return {"error": "`uri` is required for resource_type=file"}
-        vault_name, file_id = _split_uri(uri, expected_type="file")
+        vault_name, file_id = split_uri(uri, expected_type="file")
     elif resource_type == "table_query":
         vault_name = args.get("vault")
         if not vault_name:
@@ -675,12 +672,11 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
         return {"published": False, "deleted": deleted}
 
     if args.get("uri"):
-        vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+        vault, _doc_path = split_uri(args["uri"], expected_type="doc")
         await check_vault_access(uid, vault, required_role="writer")
-        doc = await _find_doc(vault, doc_path)
-        if not doc:
-            return {"error": "Document not found"}
-        count = await publication_service.delete_publications_for_document(doc["id"])
+        # Pass the URI directly — delete_publications_for_document
+        # accepts canonical akb:// strings.
+        count = await publication_service.delete_publications_for_document(args["uri"])
         return {"published": False, "deleted_publications": count}
 
     return {"error": "Either slug or uri is required"}
@@ -693,7 +689,6 @@ async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
     publications = await publication_service.list_publications(
         access["vault_id"], args.get("resource_type"),
     )
-    publications = [publication_service.public_view(p) for p in publications]
     return {"publications": publications, "total": len(publications)}
 
 
@@ -845,7 +840,7 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
 
 @_h("akb_history")
 async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = _split_uri(args["uri"], expected_type="doc")
+    vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:

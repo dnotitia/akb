@@ -186,7 +186,7 @@ async def create_publication_route(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return publication_service.public_view(result)
+    return result
 
 
 @router.delete("/publications/{vault}/{publication_id}", summary="Delete a public publication")
@@ -212,7 +212,6 @@ async def list_publications_route(
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     publications = await publication_service.list_publications(access["vault_id"], resource_type)
-    publications = [publication_service.public_view(p) for p in publications]
     return {"publications": publications}
 
 
@@ -309,19 +308,25 @@ async def publication_meta(slug: str, request: Request):
     }
 
     if rt == ResourceType.FILE:
-        # Get file basic info without presigned URL
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            file_row = await conn.fetchrow(
-                "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1",
-                to_uuid(publication["file_id"]),
-            )
-        if file_row:
-            meta.update({
-                "name": file_row["name"],
-                "mime_type": file_row["mime_type"],
-                "size_bytes": file_row["size_bytes"],
-            })
+        # Get file basic info without presigned URL. Pull the UUID
+        # tail off the canonical URI rather than reading a separate
+        # column — there is no separate column anymore.
+        from app.services.uri_service import parse_uri
+        parsed = parse_uri(publication.get("resource_uri") or "")
+        file_uuid_str = parsed[2] if parsed and parsed[1] == "file" else None
+        if file_uuid_str:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                file_row = await conn.fetchrow(
+                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1",
+                    to_uuid(file_uuid_str),
+                )
+            if file_row:
+                meta.update({
+                    "name": file_row["name"],
+                    "mime_type": file_row["mime_type"],
+                    "size_bytes": file_row["size_bytes"],
+                })
     elif rt == ResourceType.DOCUMENT:
         meta["title"] = publication.get("title")
     elif rt == ResourceType.TABLE_QUERY:
@@ -363,11 +368,17 @@ async def publication_raw(slug: str, request: Request):
     if publication["resource_type"] != ResourceType.FILE:
         raise HTTPException(status_code=400, detail="Not a file publication")
 
+    from app.services.uri_service import parse_uri
+    parsed = parse_uri(publication.get("resource_uri") or "")
+    if not parsed or parsed[1] != "file":
+        raise HTTPException(status_code=404, detail="File not found")
+    _v, _t, file_uuid_str = parsed
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
             "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1",
-            to_uuid(publication["file_id"]),
+            to_uuid(file_uuid_str),
         )
     if not file_row:
         raise HTTPException(status_code=404, detail="File not found")
@@ -618,24 +629,32 @@ async def oembed(url: str, format: str = "json"):
 
     rt = publication["resource_type"]
 
-    # Resolve a useful title
+    # Resolve a useful title. Parse the canonical URI to recover the
+    # resource handle — there are no separate id columns anymore.
+    from app.services.uri_service import parse_uri
+    parsed = parse_uri(publication.get("resource_uri") or "")
     title = publication.get("title")
     if not title:
-        if rt == ResourceType.DOCUMENT and publication.get("document_id"):
+        if rt == ResourceType.DOCUMENT and parsed and parsed[1] == "doc":
+            uri_vault, _t, doc_path = parsed
             pool = await get_pool()
             async with pool.acquire() as conn:
                 doc_row = await conn.fetchrow(
-                    "SELECT title FROM documents WHERE id = $1",
-                    to_uuid(publication["document_id"]),
+                    """
+                    SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
+                     WHERE v.name = $1 AND d.path = $2
+                    """,
+                    uri_vault, doc_path,
                 )
                 if doc_row:
                     title = doc_row["title"]
-        elif rt == ResourceType.FILE and publication.get("file_id"):
+        elif rt == ResourceType.FILE and parsed and parsed[1] == "file":
+            _v, _t, file_uuid_str = parsed
             pool = await get_pool()
             async with pool.acquire() as conn:
                 f_row = await conn.fetchrow(
                     "SELECT name FROM vault_files WHERE id = $1",
-                    to_uuid(publication["file_id"]),
+                    to_uuid(file_uuid_str),
                 )
                 if f_row:
                     title = f_row["name"]

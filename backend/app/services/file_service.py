@@ -402,6 +402,12 @@ class FileService:
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
                     )
+                    # App-level publication cascade — `publications.
+                    # file_id` FK is gone after migration 022.
+                    await conn.execute(
+                        "DELETE FROM publications WHERE resource_uri = $1",
+                        f_uri,
+                    )
 
                 # Drop the metadata chunk (outbox-driven vector-store delete).
                 try:
