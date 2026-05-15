@@ -222,12 +222,14 @@ class ExternalGitService:
         domain = fm_dict.get("domain")
         doc_type = fm_dict.get("type")
 
-        # Stable d-id derived from the blob fingerprint of the path so
-        # cross-session URLs remain meaningful even after re-syncs.
-        doc_short_id = f"d-{uuid.uuid5(uuid.NAMESPACE_URL, f'{vault_id}/{path}').hex[:8]}"
+        # No short `id` field — idempotency across re-syncs is already
+        # guaranteed by `documents UNIQUE(vault_id, path)`, and the
+        # canonical handle is the akb:// URI built from (vault, path).
+        # `external_path` keeps the upstream-side path so subscribers
+        # can map back to the source repo.
         metadata = {**{k: v for k, v in fm_dict.items() if k not in {
             "title", "type", "tags", "summary", "domain", "source",
-        }}, "id": doc_short_id, "external_path": path}
+        }}, "external_path": path}
 
         # Per-file last-touch commit — keeps `documents.current_commit`
         # meaningful across multiple syncs. Cheap compared to the cat-blob

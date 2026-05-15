@@ -568,7 +568,7 @@ class SearchService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             # Match by UUID, metadata.id (d- prefix), or path substring
-            doc_match = "(d.id::text = $2 OR d.metadata->>'id' = $2 OR d.path LIKE '%' || $2 || '%')"
+            doc_match = "(d.id::text = $2 OR d.path LIKE '%' || $2 || '%')"
             if section:
                 rows = await conn.fetch(
                     f"""

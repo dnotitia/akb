@@ -199,20 +199,32 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
     if version:
-        # Read specific version from Git
+        # Read specific version from Git. Strip frontmatter (yaml meta
+        # block at top) before returning content — the un-versioned
+        # akb_get path does the same via doc_service.get, and any
+        # internal-id fields living in old frontmatter (legacy d-prefix)
+        # must not leak out of the MCP boundary.
+        import frontmatter as _fm
         doc = await _find_doc(vault, doc_path)
         if not doc:
             return {"error": "Document not found"}
         from app.services.git_service import GitService
         git = GitService()
-        content = git.read_file(vault, doc["path"], commit=version)
-        if content is None:
+        raw = git.read_file(vault, doc["path"], commit=version)
+        if raw is None:
             return {"error": f"Version not found: {version}"}
+        try:
+            body = _fm.loads(raw).content
+        except Exception:
+            # If frontmatter parsing fails (malformed legacy commits),
+            # fall back to the raw string — better to ship something
+            # than 500. The caller is reading historical content.
+            body = raw
         return {
             "title": doc["title"],
             "uri": doc_uri(vault, doc["path"]),
             "version": version,
-            "content": content,
+            "content": body,
         }
     doc = await doc_service.get(vault, doc_path)
     if not doc:
