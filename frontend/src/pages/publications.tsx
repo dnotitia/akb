@@ -122,7 +122,10 @@ export default function PublicationsPage() {
     if (!name || !pub.resource_uri) return `/vault/${name ?? ""}`;
     if (pub.resource_type === "document") {
       const docPath = pub.resource_uri.split("/doc/")[1];
-      return docPath ? `/vault/${name}/doc/${docPath}` : `/vault/${name}`;
+      // URL-encode the path so a hierarchical doc like
+      // `incidents/foo.md` survives as a single React Router param
+      // instead of being split at the embedded `/`.
+      return docPath ? `/vault/${name}/doc/${encodeURIComponent(docPath)}` : `/vault/${name}`;
     }
     if (pub.resource_type === "file") {
       const fileId = pub.resource_uri.split("/file/")[1];
