@@ -387,3 +387,97 @@ async def vocab_size() -> int:
     async with pool.acquire() as conn:
         n = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
     return int(n or 0)
+
+
+# ── Stats refresher background task ───────────────────────────────
+#
+# `recompute_stats()` rebuilds bm25_stats(total_docs, avgdl) and
+# bm25_vocab.df from the live chunks corpus. Without it the encoder
+# falls back to total_docs=0 (encode_query returns uniform 1.0 weights),
+# which degrades the sparse leg of hybrid search — silently. The
+# refresher runs the recompute on startup so a fresh install isn't
+# stuck at zero, then on a fixed cadence so a long-running deploy
+# stays in sync as docs are added/removed/updated.
+
+import asyncio  # noqa: E402  (placed here so the module's surface above stays import-light)
+
+_refresher_task: asyncio.Task | None = None
+_refresher_stop: asyncio.Event | None = None
+
+
+async def _refresher_loop(interval_secs: int) -> None:
+    """Run recompute_stats on startup, then every interval_secs."""
+    # First pass — fire as soon as we start. Fresh installs (and any
+    # deploy where recompute hasn't run) need stats populated before
+    # the first query lands.
+    try:
+        await recompute_stats()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("BM25 stats refresh failed at startup: %s", e)
+
+    while True:
+        try:
+            assert _refresher_stop is not None
+            await asyncio.wait_for(_refresher_stop.wait(), timeout=interval_secs)
+            return  # stop signalled
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await recompute_stats()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("BM25 stats refresh failed: %s", e)
+
+
+def start_stats_refresher(interval_secs: int = 1800) -> None:
+    """Launch the periodic stats refresher. Idempotent."""
+    global _refresher_task, _refresher_stop
+    if _refresher_task and not _refresher_task.done():
+        return
+    _refresher_stop = asyncio.Event()
+    _refresher_task = asyncio.create_task(
+        _refresher_loop(interval_secs), name="bm25_stats_refresher",
+    )
+
+
+async def stop_stats_refresher() -> None:
+    """Signal stop and await the task. Safe to call when not started."""
+    global _refresher_task, _refresher_stop
+    if _refresher_stop is not None:
+        _refresher_stop.set()
+    if _refresher_task is not None:
+        try:
+            await _refresher_task
+        except asyncio.CancelledError:
+            pass
+    _refresher_task = None
+    _refresher_stop = None
+
+
+async def stats_snapshot() -> dict:
+    """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
+    so a stuck refresher (total_docs=0 while chunks exist) is visible."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT total_docs, avgdl, tokenizer_name, tokenizer_version, updated_at
+              FROM bm25_stats WHERE id = 1
+            """
+        )
+        vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
+    if not row:
+        return {
+            "total_docs": 0, "avgdl": 0.0,
+            "tokenizer": "kiwi@0",
+            "vocab_size": int(vocab or 0),
+            "last_recomputed_at": None,
+        }
+    return {
+        "total_docs": int(row["total_docs"] or 0),
+        "avgdl": float(row["avgdl"] or 0.0),
+        "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
+        "vocab_size": int(vocab or 0),
+        "last_recomputed_at": (
+            row["updated_at"].isoformat() if row["updated_at"] else None
+        ),
+    }
