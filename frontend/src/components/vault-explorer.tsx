@@ -27,28 +27,19 @@ import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
-/** Soft cap on rendered rows per section to keep first paint fast on
- *  very large vaults. Users can opt into rendering all rows; the
- *  cap is per-vault per-section so opting in for one section doesn't
- *  drag the others. */
-const SECTION_RENDER_CAP = 300;
-
-type SectionKind = "documents" | "tables" | "files";
-
-const SECTION_LABEL: Record<SectionKind, string> = {
-  documents: "DOCUMENTS",
-  tables: "TABLES",
-  files: "FILES",
-};
+/** Soft cap on rendered rows to keep first paint fast on very large
+ *  vaults. Users can opt into rendering all rows. */
+const TREE_RENDER_CAP = 300;
 
 /**
- * Left-rail explorer. Partitions the browse tree into three kind-based
- * sections (documents / tables / files) so categories are visually distinct
- * rather than interleaved in one flat list.
+ * Left-rail explorer — single collection-rooted tree. Documents, tables,
+ * and files all live as children of their owning collection (or at the
+ * vault root). No kind-based section partitioning: the same collection's
+ * docs + tables + files appear together so the user sees one cohesive
+ * hierarchy rather than three parallel lists.
  *
- * Keyboard nav still operates across sections as a single focusable list:
- * all visible rows are concatenated in section order (documents → tables →
- * files) for arrow/home/end/typeahead purposes.
+ * Keyboard nav (arrow/home/end/typeahead) operates over the flattened
+ * visible rows in tree order.
  */
 export interface VaultExplorerProps {
   vault: string;
@@ -90,12 +81,7 @@ export function VaultExplorer({
   const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
   const { pathname } = useLocation();
   const [filter, setFilter] = useState("");
-  const [sectionOpen, setSectionOpen] = useSectionCollapseState(vault);
-  const [uncapped, setUncapped] = useState<Record<SectionKind, boolean>>({
-    documents: false,
-    tables: false,
-    files: false,
-  });
+  const [uncapped, setUncapped] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   // Role-gated affordances. We fetch the role on mount/vault-change rather
@@ -154,71 +140,32 @@ export function VaultExplorer({
 
   const forceOpen = filter.length > 0;
 
-  /** Partition root-level nodes by kind. Collections + docs → documents;
-   *  tables/files become their own flat sections. */
-  const sections = useMemo<Record<SectionKind, TreeNode[]>>(() => {
-    const s: Record<SectionKind, TreeNode[]> = {
-      documents: [],
-      tables: [],
-      files: [],
-    };
-    if (!filtered) return s;
-    for (const n of filtered) {
-      if (n.kind === "collection" || n.kind === "document") s.documents.push(n);
-      else if (n.kind === "table") s.tables.push(n);
-      else if (n.kind === "file") s.files.push(n);
-    }
-    return s;
-  }, [filtered]);
-
-  /** Cached counts from the unfiltered tree so section headers show the
-   *  true size of each kind, not the filtered subset. */
-  const counts = useMemo<Record<SectionKind, number>>(() => {
-    const c = { documents: 0, tables: 0, files: 0 };
-    if (!tree) return c;
+  /** Total row count (unfiltered) for the empty-state check. */
+  const total = useMemo<number>(() => {
+    if (!tree) return 0;
+    let c = 0;
     for (const n of tree) {
-      if (n.kind === "collection") c.documents += countDocs(n);
-      else if (n.kind === "document") c.documents += 1;
-      else if (n.kind === "table") c.tables += 1;
-      else if (n.kind === "file") c.files += 1;
+      if (n.kind === "collection") c += countDocs(n);
+      else c += 1;
     }
     return c;
   }, [tree]);
 
-  const fullSectionRows = useMemo<Record<SectionKind, FlatRow[]>>(() => ({
-    documents: flattenVisible(sections.documents, expanded, forceOpen),
-    tables: flattenVisible(sections.tables, expanded, forceOpen),
-    files: flattenVisible(sections.files, expanded, forceOpen),
-  }), [sections, expanded, forceOpen]);
-
-  /** Apply the soft cap unless the user has explicitly expanded a
-   *  section. We never cap during an active filter — the user is
-   *  hunting for a specific match and a cap could hide it. */
-  const sectionRows = useMemo<Record<SectionKind, FlatRow[]>>(() => {
-    const out: Record<SectionKind, FlatRow[]> = {
-      documents: fullSectionRows.documents,
-      tables: fullSectionRows.tables,
-      files: fullSectionRows.files,
-    };
-    if (filter) return out;
-    for (const k of ["documents", "tables", "files"] as SectionKind[]) {
-      if (!uncapped[k] && out[k].length > SECTION_RENDER_CAP) {
-        out[k] = out[k].slice(0, SECTION_RENDER_CAP);
-      }
-    }
-    return out;
-  }, [fullSectionRows, uncapped, filter]);
-
-  // Concatenated visible rows for keyboard nav / signature matching.
-  // Rows in a collapsed section are excluded so keyboard nav skips them.
-  // We use the *capped* rows so keyboard nav can't focus a hidden row.
-  const visibleRows = useMemo<FlatRow[]>(
-    () =>
-      (["documents", "tables", "files"] as SectionKind[]).flatMap((k) =>
-        sectionOpen[k] ? sectionRows[k] : [],
-      ),
-    [sectionRows, sectionOpen],
+  /** Full flattened row list (without cap). */
+  const fullRows = useMemo<FlatRow[]>(
+    () => (filtered ? flattenVisible(filtered, expanded, forceOpen) : []),
+    [filtered, expanded, forceOpen],
   );
+
+  /** Capped rows — soft cap applied unless the user opts in, or unless
+   *  a filter is active (the user is hunting for a specific match and a
+   *  cap could hide it). */
+  const visibleRows = useMemo<FlatRow[]>(() => {
+    if (filter || uncapped) return fullRows;
+    return fullRows.length > TREE_RENDER_CAP
+      ? fullRows.slice(0, TREE_RENDER_CAP)
+      : fullRows;
+  }, [fullRows, uncapped, filter]);
 
   const focusAt = useCallback((i: number) => {
     const clamped = Math.max(0, Math.min(i, visibleRows.length - 1));
@@ -330,100 +277,72 @@ export function VaultExplorer({
       >
         {loading && <div className="coord px-3 py-3">— LOADING —</div>}
         {error && <div className="coord-spark px-3 py-3">⚠ {error}</div>}
-        {/* Only show the top-level empty row when the vault has NO items at all
-            (distinct from 'everything collapsed' or 'filter matches nothing' —
-            those are handled per-section below). */}
+        {!loading && !error && total === 0 && (
+          <div className="coord px-3 py-3">— EMPTY —</div>
+        )}
+        {!loading && !error && total > 0 && visibleRows.length === 0 && filter && (
+          <div className="coord px-3 py-1.5 opacity-60">— NO MATCHES —</div>
+        )}
+
         {!loading && !error &&
-          counts.documents + counts.tables + counts.files === 0 && (
-            <div className="coord px-3 py-3">— EMPTY —</div>
+          visibleRows.map((r) => (
+            <TreeRow
+              key={r.sig}
+              node={r.node}
+              depth={r.depth}
+              sig={r.sig}
+              isOpen={r.isOpen}
+              isActive={r.sig === activeSig}
+              vault={vault}
+              onToggle={toggle}
+              canWrite={canWrite}
+              onCreateSubCollection={(node) => openCreate(node.path)}
+              onDeleteCollection={(node) =>
+                setDeleteTarget({
+                  path: node.path,
+                  docCount: countDocs(node),
+                  // TODO: the in-memory tree currently flattens files
+                  // to vault root (see use-vault-tree.ts buildTree),
+                  // so a collection's true file count isn't available
+                  // client-side. The server's 409 response will
+                  // surface the real count if the user picks
+                  // empty-mode on a collection that secretly has files.
+                  fileCount: 0,
+                  // The tree already nests sub-collections under their
+                  // parent, so this is a pure local walk. Critical for
+                  // the nested-parent case: when the user clicks trash
+                  // on a synthesized parent, this drives the dialog into
+                  // cascade mode and shows the strengthened banner.
+                  subCollectionCount: countSubCollections(node),
+                })
+              }
+            />
+          ))}
+
+        {!loading && !error && !filter && !uncapped &&
+          fullRows.length > visibleRows.length && (
+            <button
+              type="button"
+              onClick={() => setUncapped(true)}
+              className="w-full coord px-3 py-2 text-left hover:bg-surface-muted hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+            >
+              ↓ SHOW {fullRows.length - visibleRows.length} MORE
+            </button>
           )}
 
-        {!loading && !error && (["documents", "tables", "files"] as SectionKind[]).map((kind) => {
-          const rows = sectionRows[kind];
-          const total = counts[kind];
-          const open = sectionOpen[kind];
-          return (
-            <div key={kind}>
-              <SectionHeader
-                label={SECTION_LABEL[kind]}
-                count={total}
-                open={open}
-                onToggle={() =>
-                  setSectionOpen({ ...sectionOpen, [kind]: !open })
-                }
-              />
-              {open && rows.length === 0 && filter && total > 0 && (
-                <div className="coord px-3 py-1.5 opacity-60">— NO MATCHES —</div>
-              )}
-              {open &&
-                rows.map((r) => (
-                  <TreeRow
-                    key={r.sig}
-                    node={r.node}
-                    depth={r.depth}
-                    sig={r.sig}
-                    isOpen={r.isOpen}
-                    isActive={r.sig === activeSig}
-                    vault={vault}
-                    onToggle={toggle}
-                    canWrite={canWrite}
-                    onCreateSubCollection={(node) => openCreate(node.path)}
-                    onDeleteCollection={(node) =>
-                      setDeleteTarget({
-                        path: node.path,
-                        docCount: countDocs(node),
-                        // TODO: the in-memory tree currently flattens files
-                        // to vault root (see use-vault-tree.ts buildTree),
-                        // so a collection's true file count isn't available
-                        // client-side. The server's 409 response will
-                        // surface the real count if the user picks
-                        // empty-mode on a collection that secretly has
-                        // files. Revisit when the tree carries
-                        // file→collection relationships.
-                        fileCount: 0,
-                        // The tree already nests sub-collections under
-                        // their parent, so this is a pure local walk.
-                        // Critical for the nested-parent case: when the
-                        // user clicks trash on a synthesized parent
-                        // (no row but with descendant collection rows),
-                        // this drives the dialog into cascade mode and
-                        // shows the strengthened banner.
-                        subCollectionCount: countSubCollections(node),
-                      })
-                    }
-                  />
-                ))}
-              {open &&
-                !filter &&
-                !uncapped[kind] &&
-                fullSectionRows[kind].length > rows.length && (
-                  <button
-                    type="button"
-                    onClick={() => setUncapped({ ...uncapped, [kind]: true })}
-                    className="w-full coord px-3 py-2 text-left hover:bg-surface-muted hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
-                  >
-                    ↓ SHOW {fullSectionRows[kind].length - rows.length} MORE
-                  </button>
-                )}
-              {/* Always-visible "new collection" ghost row at the bottom
-                  of the DOCUMENTS section. Pairs the discoverable bottom-
-                  of-list affordance with the existing header shortcut and
-                  the row-hover sub-collection `+`. Only renders for
-                  writer+ and only in the DOCUMENTS section, since
-                  collections live under documents. */}
-              {open && kind === "documents" && canWrite && (
-                <button
-                  type="button"
-                  onClick={() => openCreate(null)}
-                  className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                >
-                  <FolderPlus className="h-3 w-3" aria-hidden />
-                  <span className="coord">+ NEW COLLECTION</span>
-                </button>
-              )}
-            </div>
-          );
-        })}
+        {/* Always-visible "+ NEW COLLECTION" affordance at the bottom of
+            the tree. Pairs the discoverable bottom-of-list button with
+            the row-hover sub-collection `+`. Writer+ only. */}
+        {!loading && !error && canWrite && (
+          <button
+            type="button"
+            onClick={() => openCreate(null)}
+            className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            <FolderPlus className="h-3 w-3" aria-hidden />
+            <span className="coord">+ NEW COLLECTION</span>
+          </button>
+        )}
       </div>
 
       {/* Mutation dialogs. Mounted unconditionally so portals stay
@@ -459,45 +378,6 @@ export function VaultExplorer({
         }}
       />
     </aside>
-  );
-}
-
-function SectionHeader({
-  label,
-  count,
-  open,
-  onToggle,
-}: {
-  label: string;
-  count: number;
-  open: boolean;
-  onToggle: () => void;
-}) {
-  const empty = count === 0;
-  const disabled = empty; // no content to show/hide
-  const Chevron = open ? ChevronDown : ChevronRight;
-  return (
-    <button
-      type="button"
-      onClick={disabled ? undefined : onToggle}
-      disabled={disabled}
-      aria-expanded={open}
-      aria-controls={`section-${label.toLowerCase()}`}
-      className={`w-full flex items-center justify-between px-3 py-1.5 border-t border-border first:border-t-0 bg-surface-muted transition-colors ${
-        disabled ? "cursor-default" : "cursor-pointer hover:bg-surface-muted/60"
-      } ${empty ? "opacity-60" : ""} focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface`}
-    >
-      <span className="flex items-center gap-1.5">
-        {!disabled && (
-          <Chevron
-            className="h-3 w-3 text-foreground-muted shrink-0"
-            aria-hidden
-          />
-        )}
-        <span className={empty ? "coord" : "coord-ink"}>{label}</span>
-      </span>
-      <span className="coord tabular-nums">[{count}]</span>
-    </button>
   );
 }
 
@@ -644,44 +524,3 @@ function cssEscape(s: string): string {
   return s.replace(/([^\w-])/g, "\\$1");
 }
 
-/* ── Section collapse state (per-vault, persisted) ────────────────────────── */
-
-type SectionState = Record<SectionKind, boolean>;
-const DEFAULT_SECTION_STATE: SectionState = {
-  documents: true,
-  tables: true,
-  files: true,
-};
-
-function sectionStorageKey(vault: string) {
-  return `akb-explorer-sections:${vault}`;
-}
-
-function useSectionCollapseState(
-  vault: string,
-): [SectionState, (next: SectionState) => void] {
-  const [state, setState] = useState<SectionState>(DEFAULT_SECTION_STATE);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(sectionStorageKey(vault));
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setState({ ...DEFAULT_SECTION_STATE, ...parsed });
-      } else {
-        setState(DEFAULT_SECTION_STATE);
-      }
-    } catch {
-      setState(DEFAULT_SECTION_STATE);
-    }
-  }, [vault]);
-
-  const update = (next: SectionState) => {
-    setState(next);
-    try {
-      localStorage.setItem(sectionStorageKey(vault), JSON.stringify(next));
-    } catch {}
-  };
-
-  return [state, update];
-}
