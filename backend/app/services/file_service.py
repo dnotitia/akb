@@ -235,12 +235,17 @@ class FileService:
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )
+                vault_name_for_event = vault_row["name"] if vault_row else None
                 await emit_event(
                     conn, "file.put",
-                    vault_id=vault_id, ref_type="file", ref_id=file_id,
+                    vault_id=vault_id,
+                    resource_uri=(
+                        file_uri(vault_name_for_event, file_id)
+                        if vault_name_for_event else None
+                    ),
                     actor_id=actor_id,
                     payload={
-                        "vault": vault_row["name"] if vault_row else None,
+                        "vault": vault_name_for_event,
                         "collection": row["collection"],
                         "name": row["name"],
                         "mime_type": row["mime_type"],
@@ -408,7 +413,10 @@ class FileService:
 
                 await emit_event(
                     conn, "file.delete",
-                    vault_id=vault_id, ref_type="file", ref_id=file_id,
+                    vault_id=vault_id,
+                    resource_uri=(
+                        file_uri(vault_name, file_id) if vault_name else None
+                    ),
                     actor_id=actor_id,
                     payload={
                         "vault": vault_name,

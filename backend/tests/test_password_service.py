@@ -55,7 +55,12 @@ async def user(pool):
     yield uid, uname
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
-        await conn.execute("DELETE FROM events WHERE ref_id = $1", str(uid))
+        # User events carry no resource_uri (users aren't vault
+        # resources); filter by the payload user_id instead.
+        await conn.execute(
+            "DELETE FROM events WHERE payload->>'user_id' = $1",
+            str(uid),
+        )
 
 
 def test_generate_temp_password_format():
@@ -91,13 +96,13 @@ async def test_reset_password_updates_hash_and_emits_event(pool, user):
 
     async with pool.acquire() as conn:
         ev = await conn.fetchrow(
-            "SELECT kind, ref_type, ref_id, actor_id, payload::text AS payload "
-            "FROM events WHERE ref_id = $1 ORDER BY id DESC LIMIT 1",
+            "SELECT kind, resource_uri, actor_id, payload::text AS payload "
+            "FROM events WHERE payload->>'user_id' = $1 ORDER BY id DESC LIMIT 1",
             str(uid),
         )
     assert ev is not None
     assert ev["kind"] == "auth.password_reset"
-    assert ev["ref_type"] == "user"
+    assert ev["resource_uri"] is None  # users have no URI scheme
     assert ev["actor_id"] == "admin-uuid"
     import json
     payload = json.loads(ev["payload"])
@@ -113,7 +118,7 @@ async def test_reset_password_cli_method_records_null_actor(pool, user):
     async with pool.acquire() as conn:
         ev = await conn.fetchrow(
             "SELECT actor_id, payload::text AS payload FROM events "
-            "WHERE ref_id = $1 ORDER BY id DESC LIMIT 1",
+            "WHERE payload->>'user_id' = $1 ORDER BY id DESC LIMIT 1",
             str(uid),
         )
     assert ev["actor_id"] is None

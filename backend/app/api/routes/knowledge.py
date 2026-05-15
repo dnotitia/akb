@@ -1,4 +1,10 @@
-"""REST API routes for knowledge graph, relations, and provenance."""
+"""REST API routes for knowledge graph, relations, and provenance.
+
+URI-canonical: every resource is addressed by its `uri` query param —
+the same `akb://{vault}/{doc|table|file}/{...}` handle MCP clients use.
+The frontend constructs the URI from `vault` + `path` (or file uuid)
+before calling these endpoints.
+"""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -6,65 +12,90 @@ from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services.kg_service import get_resource_relations, get_graph, get_provenance, resolve_doc_to_uri
+from app.services.kg_service import get_resource_relations, get_graph, get_provenance
+from app.services.uri_service import parse_uri
 
 router = APIRouter()
 
 
-@router.get("/relations/{vault}/{doc_id:path}", summary="Get resource relations (1-hop)")
-async def document_relations(
-    vault: str,
-    doc_id: str,
+def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str, str, str]:
+    """Parse akb:// URI → (vault, type, identifier). Raise 400 on error.
+
+    `expected_type`, when given, must match the URI's scheme tag.
+    """
+    parsed = parse_uri(uri)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid AKB URI: {uri!r}. Expected akb://<vault>/<type>/<id>.",
+        )
+    vault, rtype, ident = parsed
+    if expected_type and rtype != expected_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected a {expected_type} URI; got {rtype}.",
+        )
+    return vault, rtype, ident
+
+
+@router.get("/relations", summary="Get resource relations (1-hop)")
+async def resource_relations(
+    uri: str = Query(..., description="Resource URI"),
     direction: str = Query("both", enum=["incoming", "outgoing", "both"]),
     type: str | None = Query(None),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    vault, _rtype, _ident = _parse_resource_uri(uri)
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    resource_uri = await resolve_doc_to_uri(vault, doc_id)
-    if not resource_uri:
-        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
     relations = await get_resource_relations(
-        vault, resource_uri,
+        vault, uri,
         vault_id=access["vault_id"],
         direction=direction, relation_type=type,
     )
-    return {"doc_id": doc_id, "resource_uri": resource_uri, "relations": relations}
+    return {"uri": uri, "relations": relations}
 
 
-@router.get("/graph/{vault}", summary="Get knowledge graph (nodes + edges)")
+@router.get("/graph", summary="Get knowledge graph (nodes + edges)")
 async def vault_graph(
-    vault: str,
-    doc_id: str | None = Query(None, description="Center node (omit for full vault graph)"),
+    uri: str | None = Query(None, description="Center resource URI (omit + pass vault for full vault graph)"),
+    vault: str | None = Query(None, description="Vault name (only when uri is omitted)"),
     depth: int = Query(2, ge=1, le=5),
     limit: int = Query(50, ge=1, le=200),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    access = await check_vault_access(user.user_id, vault, required_role="reader")
-    resource_uri = None
-    if doc_id:
-        resource_uri = await resolve_doc_to_uri(vault, doc_id)
+    if uri:
+        center_vault, _rtype, _ident = _parse_resource_uri(uri)
+        vault_name = center_vault
+    else:
+        if not vault:
+            raise HTTPException(
+                status_code=400, detail="Either `uri` or `vault` is required",
+            )
+        vault_name = vault
+    access = await check_vault_access(user.user_id, vault_name, required_role="reader")
     return await get_graph(
-        vault, resource_uri=resource_uri, depth=depth, limit=limit,
+        vault_name, resource_uri=uri, depth=depth, limit=limit,
         vault_id=access["vault_id"],
     )
 
 
-@router.get("/provenance/{doc_id}", summary="Get document provenance")
+@router.get("/provenance", summary="Get document provenance")
 async def document_provenance(
-    doc_id: str,
+    uri: str = Query(..., description="Document URI"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    vault, _rtype, doc_path = _parse_resource_uri(uri, expected_type="doc")
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT v.name AS vault_name, v.id AS vault_id
-            FROM documents d JOIN vaults v ON d.vault_id = v.id
-            WHERE d.id::text = $1 OR d.metadata->>'id' = $1
+            SELECT v.id AS vault_id, d.id AS doc_pk
+              FROM documents d JOIN vaults v ON d.vault_id = v.id
+             WHERE v.name = $1 AND d.path = $2
             """,
-            doc_id,
+            vault, doc_path,
         )
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
-    await check_vault_access(user.user_id, row["vault_name"], required_role="reader")
-    return await get_provenance(doc_id, vault_id=row["vault_id"])
+    await check_vault_access(user.user_id, vault, required_role="reader")
+    return await get_provenance(str(row["doc_pk"]), vault_id=row["vault_id"])

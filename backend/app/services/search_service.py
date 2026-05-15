@@ -273,7 +273,7 @@ class SearchService:
                         "tags": [],
                     }
 
-        from app.services.uri_service import make_uri
+        from app.services.uri_service import doc_uri, table_uri, file_uri
 
         results: list[SearchResult] = []
         for h in hits:
@@ -285,11 +285,11 @@ class SearchService:
             # the internal handle we use to fetch metadata; it never
             # leaves this function — the client only sees `uri`.
             if h.source_type == "document":
-                uri = make_uri(m["vault"], "doc", m["path"])
+                uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
-                uri = make_uri(m["vault"], "table", m["title"])
+                uri = table_uri(m["vault"], m["title"])
             elif h.source_type == "file":
-                uri = make_uri(m["vault"], "file", h.source_id)
+                uri = file_uri(m["vault"], h.source_id)
             else:
                 continue
             results.append(
@@ -448,13 +448,17 @@ class SearchService:
                 *params,
             )
 
-        # Group by document and extract matching lines
+        # Group by document and extract matching lines. `_doc_pk` is
+        # the internal PG UUID — kept only as a dedup key while building
+        # results; stripped before the response leaves this function.
+        from app.services.uri_service import doc_uri as _doc_uri
         docs: dict[str, dict] = {}
         for r in rows:
             doc_key = r["doc_id"]
             if doc_key not in docs:
                 docs[doc_key] = {
-                    "doc_id": r["doc_id"],
+                    "_doc_pk": r["doc_id"],
+                    "uri": _doc_uri(r["vault"], r["path"]),
                     "vault": r["vault"],
                     "path": r["path"],
                     "title": r["title"],
@@ -482,20 +486,23 @@ class SearchService:
         result_docs = list(docs.values())[:limit]
         total_matches = sum(len(d["matches"]) for d in result_docs)
 
-        # Replace mode: apply find-and-replace on each matching document
+        # Replace mode: apply find-and-replace on each matching document.
+        # Service-layer `doc_service.update` still wants the doc path
+        # (which find_by_ref accepts) — we pass `path` rather than re-
+        # parsing the URI we just built.
         replaced: list[dict] = []
         if replace is not None and result_docs and doc_service:
             re_flags = 0 if case_sensitive else _re.IGNORECASE
 
             for doc_info in result_docs:
-                meta = ensure_dict(doc_info.get("metadata"))
-                doc_ref = meta.get("id") or doc_info["doc_id"]
                 doc_vault = doc_info["vault"]
+                doc_path = doc_info["path"]
+                doc_uri_str = doc_info["uri"]
 
                 try:
-                    doc = await doc_service.get(doc_vault, doc_ref)
+                    doc = await doc_service.get(doc_vault, doc_path)
                 except Exception:
-                    replaced.append({"doc_id": doc_ref, "vault": doc_vault, "error": "not found"})
+                    replaced.append({"uri": doc_uri_str, "error": "not found"})
                     continue
 
                 body = doc.content or ""
@@ -517,18 +524,18 @@ class SearchService:
                     content=new_body,
                     message=f"grep replace: '{pattern}' → '{replace}'",
                 )
-                result = await doc_service.update(doc_vault, doc_ref, req, agent_id=agent_id)
+                result = await doc_service.update(doc_vault, doc_path, req, agent_id=agent_id)
                 replaced.append({
-                    "doc_id": doc_ref,
-                    "vault": doc_vault,
-                    "path": doc_info["path"],
+                    "uri": doc_uri_str,
+                    "path": doc_path,
                     "title": doc_info["title"],
                     "commit": result.commit_hash,
                 })
 
-        # Build response — strip internal metadata before returning
+        # Build response — strip internal handles (`_doc_pk`, `metadata`)
+        # so the client only sees `uri`.
         clean_results = [
-            {k: v for k, v in d.items() if k != "metadata"}
+            {k: v for k, v in d.items() if k not in ("_doc_pk", "metadata")}
             for d in result_docs
         ]
 

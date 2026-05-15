@@ -158,11 +158,13 @@ async def change_password(user_id: str, current: str, new: str) -> None:
                 hash_password(new),
                 uuid.UUID(user_id),
             )
+            # Users are not URI-addressable resources (the URI scheme
+            # covers in-vault resources only). Subscribers identify the
+            # user via `actor_id` + payload.user_id.
             await emit_event(
                 conn,
                 "auth.password_changed",
-                ref_type="user",
-                ref_id=user_id,
+                resource_uri=None,
                 actor_id=user_id,
                 payload={"user_id": user_id},
             )

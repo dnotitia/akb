@@ -44,3 +44,26 @@ def table_uri(vault: str, name: str) -> str:
 def file_uri(vault: str, file_id: str) -> str:
     """Shorthand for file URI."""
     return make_uri(vault, "file", file_id)
+
+
+def split_uri(uri: str, expected_type: str | None = None) -> tuple[str, str]:
+    """Parse an akb:// URI and return (vault, identifier).
+
+    `identifier` is the path for a doc URI, the table name for a table
+    URI, the file UUID for a file URI. Raises ValueError if the URI is
+    malformed or its type doesn't match `expected_type`.
+
+    Shared helper for MCP handlers and REST routes — both need the same
+    parse-and-validate flow before dispatching to the service layer.
+    """
+    parsed = parse_uri(uri)
+    if parsed is None:
+        raise ValueError(
+            f"Invalid AKB URI: '{uri}'. Expected akb://<vault>/<type>/<id>."
+        )
+    vault, rtype, ident = parsed
+    if expected_type and rtype != expected_type:
+        raise ValueError(
+            f"Expected a {expected_type} URI; got {rtype}: '{uri}'."
+        )
+    return vault, ident

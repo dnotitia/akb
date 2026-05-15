@@ -232,7 +232,7 @@ export interface GrepMatch {
   text: string;
 }
 export interface GrepDoc {
-  doc_id: string;
+  uri: string;
   vault: string;
   path: string;
   title: string;
@@ -261,17 +261,26 @@ export interface GraphApiEdge {
   target: string;
   relation?: string;
 }
-export const getGraph = (vault: string, docId?: string, depth = 2, limit = 50) => {
+// `docPath` is the doc filesystem path (e.g. `specs/api.md`). The
+// frontend currently routes by `:doc_id` segments — the helpers here
+// build the canonical URI from (vault, path) before calling REST so
+// every call site presents the unified shape to the backend.
+function _docUri(vault: string, docPath: string): string {
+  return `akb://${vault}/doc/${docPath}`;
+}
+
+export const getGraph = (vault: string, docPath?: string, depth = 2, limit = 50) => {
   const p = new URLSearchParams({ depth: String(depth), limit: String(limit) });
-  if (docId) p.set("doc_id", docId);
-  return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph/${vault}?${p}`);
+  if (docPath) p.set("uri", _docUri(vault, docPath));
+  else p.set("vault", vault);
+  return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
 };
 
 // ── Drill Down ──
-export const drillDown = (vault: string, docId: string, section?: string) => {
-  const p = new URLSearchParams();
+export const drillDown = (vault: string, docPath: string, section?: string) => {
+  const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
   if (section) p.set("section", section);
-  return api<{ sections: any[] }>(`/drill-down/${vault}/${docId}?${p}`);
+  return api<{ sections: any[] }>(`/drill-down?${p}`);
 };
 
 // ── Relations ──
@@ -282,10 +291,10 @@ export interface RelationRow {
   resource_type?: string;
   name?: string;
 }
-export const getRelations = (vault: string, docId: string) =>
-  api<{ doc_id: string; resource_uri: string; relations: RelationRow[] }>(
-    `/relations/${vault}/${encodeURIComponent(docId)}`,
-  );
+export const getRelations = (vault: string, docPath: string) => {
+  const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
+  return api<{ uri: string; relations: RelationRow[] }>(`/relations?${p}`);
+};
 
 // ── Recent ──
 export const getRecent = (vault?: string, limit = 20) => {
@@ -316,20 +325,16 @@ export const getVaultActivity = (
   );
 };
 
-// ── Users ──
 // ── Document publish helpers (wrap createPublication/listPublications/deletePublication) ──
 //
-// publications.document_id is the underlying UUID. The user-facing doc_id can
-// be a UUID, a "d-XXXXXXXX" hash from metadata, or a path substring — we
-// resolve it via getDocument() once and then match exclusively by UUID.
-//
-// All publication objects use `publication_id` (not `id`) — backend normalizes
-// this in publication_service._row_to_dict so frontend can rely on it everywhere.
+// The user-facing `doc_id` in this module is the URL-shaped doc path
+// (e.g. `specs/api.md`). We resolve it via getDocument() to recover the
+// canonical `uri`, then match publications by `resource_uri` — the
+// single shape the backend now exposes for both documents and files.
 export const publishDoc = async (vault: string, doc_id: string) => {
-  // Idempotent: reuse the first existing publication for this doc, else create one.
   const doc = await getDocument(vault, doc_id);
   const { publications } = await listPublications(vault, "document");
-  const existing = publications.find((s: any) => s.document_id === doc.id);
+  const existing = publications.find((s: any) => s.resource_uri === doc.uri);
   if (existing) {
     return {
       published: true,
@@ -338,7 +343,7 @@ export const publishDoc = async (vault: string, doc_id: string) => {
       publication_id: existing.publication_id,
     };
   }
-  const result = await createPublication(vault, { resource_type: "document", doc_id });
+  const result = await createPublication(vault, { resource_type: "document", uri: doc.uri });
   return {
     published: true,
     public_url: result.public_url,
@@ -350,7 +355,7 @@ export const publishDoc = async (vault: string, doc_id: string) => {
 export const unpublishDoc = async (vault: string, doc_id: string) => {
   const doc = await getDocument(vault, doc_id);
   const { publications } = await listPublications(vault, "document");
-  const matches = publications.filter((s: any) => s.document_id === doc.id);
+  const matches = publications.filter((s: any) => s.resource_uri === doc.uri);
   let deleted = 0;
   for (const s of matches) {
     await deletePublication(vault, s.publication_id);
@@ -496,8 +501,10 @@ export function publicationCsvUrl(slug: string, params?: Record<string, string>)
 // ── Publications CRUD (authenticated) ──
 export interface CreatePublicationRequest {
   resource_type: "document" | "table_query" | "file";
-  doc_id?: string;
-  file_id?: string;
+  // For document/file publications, pass the canonical akb:// URI.
+  // table_query publications still scope by `vault` (route path) and
+  // use `query_sql`.
+  uri?: string;
   query_sql?: string;
   query_vault_names?: string[];
   query_params?: Record<string, { type?: string; default?: any; required?: boolean }>;
@@ -573,5 +580,9 @@ export const adminResetPassword = (userId: string) =>
   );
 
 // ── Provenance / drill-down ──
-export const getProvenance = (docId: string) =>
-  api<{ provenance: any }>(`/provenance/${encodeURIComponent(docId)}`);
+// Callers pass the doc path under its vault; the helper builds the
+// canonical URI before calling the URI-only REST endpoint.
+export const getProvenance = (vault: string, docPath: string) => {
+  const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
+  return api<{ provenance: any }>(`/provenance?${p}`);
+};

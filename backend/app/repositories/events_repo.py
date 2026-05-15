@@ -22,8 +22,7 @@ async def emit_event(
     kind: str,
     *,
     vault_id: uuid.UUID | str | None = None,
-    ref_type: str | None = None,
-    ref_id: str | None = None,
+    resource_uri: str | None = None,
     actor_id: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> int:
@@ -36,6 +35,13 @@ async def emit_event(
     (e.g. `document.put`, `document.update`, `document.delete`,
     `vault.grant`, `publication.publish`). Keep it short and stable;
     subscribers will filter on it.
+
+    `resource_uri` is the canonical akb:// handle for the resource the
+    event is about — same format MCP clients see. Use the doc_uri /
+    table_uri / file_uri helpers from `app.services.uri_service` to
+    build it. Pass None for events that don't reference an in-vault
+    resource (user / vault / collection — collections aren't URI-
+    addressable; their identity goes in `payload.path` if needed).
 
     `actor_id` is TEXT — mirrors `documents.created_by`. The MCP path
     passes a username, not a UUID, so we don't try to coerce.
@@ -50,11 +56,11 @@ async def emit_event(
     payload_json = json.dumps(payload or {})
     return await conn.fetchval(
         """
-        INSERT INTO events (vault_id, kind, ref_type, ref_id, actor_id, payload)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
         RETURNING id
         """,
-        vault_uuid, kind, ref_type, ref_id, actor_id, payload_json,
+        vault_uuid, kind, resource_uri, actor_id, payload_json,
     )
 
 

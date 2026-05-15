@@ -105,6 +105,7 @@ async def _apply_migrations() -> None:
         "018_drop_redundant_pending_index.py",  # idx_chunks_vector_pending is dead weight after 017
         "019_s3_delete_outbox.py",              # s3_delete_outbox + indices for atomic file deletion
         "020_unify_collection_membership.py",   # vault_tables/vault_files collection_id FK; drop legacy vault_files.collection TEXT
+        "021_events_resource_uri.py",           # collapse events (ref_type, ref_id) → events.resource_uri (URI canonical)
     ):
         module = _load_migration(filename)
         if module is None:

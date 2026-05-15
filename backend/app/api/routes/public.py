@@ -85,9 +85,16 @@ def _verify_token(slug: str, token: str) -> bool:
 # ============================================================
 
 class CreatePublicationRequest(NFCModel):
+    """Request body for `POST /publications/{vault}/create`.
+
+    URI-canonical: for document/file publications, pass the resource
+    `uri` (`akb://{vault}/doc/{path}` or `akb://{vault}/file/{id}`).
+    For table_query publications, pass `query_sql` plus optional
+    `query_vault_names`; no per-resource handle is needed since the
+    query is the publishable surface.
+    """
     resource_type: str = "document"  # 'document','table_query','file'
-    doc_id: str | None = None
-    file_id: str | None = None
+    uri: str | None = None
     query_sql: str | None = None
     query_vault_names: list[str] | None = None
     query_params: dict | None = None
@@ -123,12 +130,48 @@ async def create_publication_route(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="writer")
+    # Split the canonical URI into the service-layer args
+    # (doc path / file uuid). Reject mismatches between resource_type
+    # and URI scheme so callers can't smuggle a doc URI into a file
+    # publication or vice versa.
+    doc_id: str | None = None
+    file_id: str | None = None
+    if req.resource_type in ("document", "file"):
+        if not req.uri:
+            raise HTTPException(
+                status_code=400,
+                detail=f"`uri` is required for resource_type={req.resource_type!r}",
+            )
+        from app.services.uri_service import parse_uri
+        parsed = parse_uri(req.uri)
+        if parsed is None:
+            raise HTTPException(status_code=400, detail=f"Invalid AKB URI: {req.uri!r}")
+        uri_vault, uri_type, uri_ident = parsed
+        if uri_vault != vault:
+            raise HTTPException(
+                status_code=400,
+                detail=f"URI vault {uri_vault!r} does not match route vault {vault!r}",
+            )
+        if req.resource_type == "document":
+            if uri_type != "doc":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"resource_type=document needs a doc URI, got {uri_type}",
+                )
+            doc_id = uri_ident
+        else:  # file
+            if uri_type != "file":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"resource_type=file needs a file URI, got {uri_type}",
+                )
+            file_id = uri_ident
     try:
-        return await publication_service.create_publication_for_vault(
+        result = await publication_service.create_publication_for_vault(
             vault_name=vault,
             resource_type=req.resource_type,
-            doc_id=req.doc_id,
-            file_id=req.file_id,
+            doc_id=doc_id,
+            file_id=file_id,
             query_sql=req.query_sql,
             query_vault_names=req.query_vault_names,
             query_params=req.query_params,
@@ -143,6 +186,7 @@ async def create_publication_route(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return publication_service.public_view(result)
 
 
 @router.delete("/publications/{vault}/{publication_id}", summary="Delete a public publication")
@@ -168,6 +212,7 @@ async def list_publications_route(
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     publications = await publication_service.list_publications(access["vault_id"], resource_type)
+    publications = [publication_service.public_view(p) for p in publications]
     return {"publications": publications}
 
 

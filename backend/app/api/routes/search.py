@@ -1,11 +1,12 @@
 """REST API routes for search."""
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
 from app.models.document import SearchResponse
 from app.services.auth_service import AuthenticatedUser
 from app.services.search_service import SearchService
+from app.services.uri_service import parse_uri
 
 router = APIRouter()
 search_service = SearchService()
@@ -28,15 +29,18 @@ async def search_documents(
     )
 
 
-@router.get("/drill-down/{vault}/{doc_id:path}", summary="Drill down to document sections")
+@router.get("/drill-down", summary="Drill down to document sections")
 async def drill_down(
-    vault: str,
-    doc_id: str,
+    uri: str = Query(..., description="Document URI"),
     section: str | None = Query(None),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    sections = await search_service.drill_down(vault, doc_id, section)
-    return {"doc_id": doc_id, "vault": vault, "sections": sections}
+    parsed = parse_uri(uri)
+    if parsed is None or parsed[1] != "doc":
+        raise HTTPException(status_code=400, detail=f"Expected a doc URI, got {uri!r}")
+    vault, _rtype, doc_path = parsed
+    sections = await search_service.drill_down(vault, doc_path, section)
+    return {"uri": uri, "sections": sections}
 
 
 @router.get("/grep", summary="Literal substring / regex search across documents")

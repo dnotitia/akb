@@ -213,10 +213,10 @@ async def test_create_emits_event(service, vault_name, pool, vault_id):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT kind, ref_type, ref_id, actor_id, payload
+            SELECT kind, resource_uri, actor_id, payload
               FROM events
              WHERE vault_id = $1 AND kind = 'collection.create'
-                   AND ref_id = $2
+                   AND payload->>'path' = $2
              ORDER BY id DESC
              LIMIT 1
             """,
@@ -224,8 +224,8 @@ async def test_create_emits_event(service, vault_name, pool, vault_id):
         )
     assert row is not None
     assert row["kind"] == "collection.create"
-    assert row["ref_type"] == "collection"
-    assert row["ref_id"] == "events/probe"
+    # Collections are not URI-addressable; identity lives in payload.path.
+    assert row["resource_uri"] is None
     assert row["actor_id"] == "bob"
 
 
@@ -439,10 +439,10 @@ async def test_delete_cascade_emits_event(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT kind, ref_type, ref_id, actor_id, payload
+            SELECT kind, resource_uri, actor_id, payload
               FROM events
              WHERE vault_id = $1 AND kind = 'collection.delete'
-                   AND ref_id = $2
+                   AND payload->>'path' = $2
              ORDER BY id DESC
              LIMIT 1
             """,
@@ -450,8 +450,7 @@ async def test_delete_cascade_emits_event(
         )
     assert row is not None
     assert row["kind"] == "collection.delete"
-    assert row["ref_type"] == "collection"
-    assert row["ref_id"] == "loud"
+    assert row["resource_uri"] is None
     assert row["actor_id"] == "bob"
     # Payload is JSON text on this column — decode and assert counts.
     import json
