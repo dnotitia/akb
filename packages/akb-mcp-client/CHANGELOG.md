@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.0.0 — URI-canonical hard cutover (BREAKING)
+
+The backend MCP contract is now URI-canonical: every resource handle
+collapses onto a single `uri` of the form `akb://{vault}/<type>/<id>`.
+Tool inputs no longer accept the legacy `(vault, doc_id)` / `(vault,
+file_id)` pairs, and responses no longer surface internal UUIDs.
+
+### File tools — input shape
+
+- `akb_get_file` and `akb_delete_file` take `{ uri, save_to? }` instead of
+  `{ vault, file_id, save_to? }`. Pass the URI from akb_browse or
+  `akb_put_file`'s response.
+- `akb_put_file` is unchanged from the caller's perspective (still
+  `{ vault, file_path, collection?, ... }`) — but the response now carries
+  the canonical `uri`.
+
+### Backend response envelope
+
+`akb_put`, `akb_get`, `akb_update`, `akb_edit`, `akb_create_table`,
+`akb_put_file` (and friends) all return `uri` as the sole identifier.
+`id` / `doc_id` / `file_id` / `source_id` / `vault_id` have been removed
+from MCP payloads. The corresponding REST endpoints used by the proxy
+internally are unaffected — only what reaches the MCP client changed.
+
+### Compatibility
+
+This is a hard cutover with no opt-out. A 1.x proxy talking to a 2.0
+backend (or vice versa) will fail at the tools/list contract — schemas
+no longer line up. Pair akb-mcp 2.x with a backend built from
+`feat/uri-canonical-hard-cutover` (or its merge into main) onwards.
+
 ## 1.0.0
 
 Backend contract refresh — first stable major. Pair with backend
