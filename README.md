@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/akb-hero.png" alt="AKB — agents reading and writing into a permissioned knowledge vault of docs, tables, and files, linked by a URI graph" width="100%">
+</p>
+
 # AKB — Agent Knowledgebase
 
 > Organizational memory for AI agents. A Git-backed knowledge base where agents
