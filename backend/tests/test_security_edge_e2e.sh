@@ -344,6 +344,17 @@ R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"DELETE FR
 READER_DELETE_DENIED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'denied' in str(d).lower() or 'Access' in str(d))" 2>/dev/null)
 [ "$READER_DELETE_DENIED" = "True" ] && pass "Reader DELETE blocked" || fail "Reader DELETE" "should be denied: $R"
 
+# Reader must not be able to slip non-SELECT statements past
+# `SET TRANSACTION READ ONLY`. Transaction-control (SET, BEGIN,
+# RESET, ROLLBACK, SAVEPOINT) and informational (SHOW, EXPLAIN)
+# statements all return success at PG level even inside a read-only
+# TX — the service must reject them based on statement type.
+for KW in 'SET TRANSACTION READ WRITE' 'RESET SESSION AUTHORIZATION' 'BEGIN'; do
+  R=$(mcp_as "$PAT2" "$SID2" "akb_sql" "{\"vault\":\"$VAULT1\",\"sql\":\"$KW\"}" | mr)
+  BLOCKED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d)" 2>/dev/null)
+  [ "$BLOCKED" = "True" ] && pass "Reader '$KW' blocked" || fail "Reader '$KW' leak" "$R"
+done
+
 # Upgrade to writer
 mcp_as "$PAT1" "$SID1" "akb_grant" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\",\"role\":\"writer\"}" >/dev/null 2>&1
 

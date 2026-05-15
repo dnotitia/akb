@@ -373,6 +373,15 @@ async def execute_sql(
 
         is_select = rewritten.strip().upper().startswith(("SELECT", "WITH"))
 
+        # Read-only access must reject anything that isn't a SELECT or
+        # WITH query. PG's `SET TRANSACTION READ ONLY` blocks data
+        # mutations (INSERT/UPDATE/DELETE/DDL) but transaction-control
+        # statements (SET/BEGIN/RESET/COMMIT/ROLLBACK/SAVEPOINT) and
+        # informational statements (SHOW/EXPLAIN) slip through. None of
+        # them are useful to a reader and several change session state.
+        if read_only and not is_select:
+            return {"error": "Read-only access: only SELECT / WITH queries are allowed."}
+
         try:
             async with conn.transaction():
                 # PostgreSQL enforces read-only: blocks INSERT/UPDATE/DELETE/
