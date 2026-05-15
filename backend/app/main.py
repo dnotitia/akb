@@ -184,9 +184,9 @@ async def health():
     except Exception as e:  # noqa: BLE001
         vs_info["backfill_error"] = str(e)
     try:
-        vs_info["bm25_vocab_size"] = await sparse_encoder.vocab_size()
+        vs_info["bm25"] = await sparse_encoder.stats_snapshot()
     except Exception as e:  # noqa: BLE001
-        vs_info["bm25_vocab_error"] = str(e)
+        vs_info["bm25_error"] = str(e)
 
     async def _safe(fn):
         try:

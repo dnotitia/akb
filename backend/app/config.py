@@ -126,6 +126,13 @@ class Settings(BaseModel):
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
+    # How often to recompute `bm25_stats(total_docs, avgdl)` + per-term
+    # df from the live chunks corpus. The recompute also runs once at
+    # startup, so this controls the steady-state cadence. Lower = stats
+    # track new docs faster (better sparse ranking for fresh content);
+    # higher = less work on the DB. 30 min is a safe default for a
+    # mixed read/write workload.
+    bm25_recompute_interval_secs: int = 1800
 
     # Event stream — optional Redis Streams fanout. PG outbox (`events`
     # table) is always the source of truth; when redis_url is set the

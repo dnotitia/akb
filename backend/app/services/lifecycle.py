@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
-from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker
+from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
 from app.services.git_service import GitService
 from app.services.vector_store import get_vector_store
 
@@ -54,7 +54,13 @@ def start_workers() -> None:
     embed_worker.start()
     delete_worker.start()
     external_git_poller.start()
-    started = ["embed_worker", "delete_worker", "external_git_poller"]
+    # BM25 corpus stats (total_docs, avgdl, per-term df) only become
+    # non-degenerate after `recompute_stats()` runs. The refresher fires
+    # once at startup and then on a configurable cadence so the sparse
+    # leg of hybrid search isn't silently degraded on fresh installs or
+    # after long periods without manual init.
+    sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
+    started = ["embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher"]
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -90,6 +96,7 @@ async def stop_workers() -> None:
     await s3_delete_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()
+    await sparse_encoder.stop_stats_refresher()
 
 
 async def shutdown_storage() -> None:
