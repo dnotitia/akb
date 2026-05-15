@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
 from app.models.document import SearchResponse
+from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.search_service import SearchService
 from app.services.uri_service import parse_uri
@@ -39,6 +40,10 @@ async def drill_down(
     if parsed is None or parsed[1] != "doc":
         raise HTTPException(status_code=400, detail=f"Expected a doc URI, got {uri!r}")
     vault, _rtype, doc_path = parsed
+    # MCP `akb_drill_down` enforces vault ACL via check_vault_access; the
+    # REST entry-point used to skip it, letting any authenticated user
+    # read chunk content from any vault they don't belong to.
+    await check_vault_access(user.user_id, vault, required_role="reader")
     sections = await search_service.drill_down(vault, doc_path, section)
     return {"uri": uri, "sections": sections}
 
