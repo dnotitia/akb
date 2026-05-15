@@ -61,9 +61,10 @@ class DocumentUpdateRequest(NFCModel):
 
 
 class DocumentResponse(BaseModel):
-    """Response for a single document."""
+    """Response for a single document. Internal IDs are never exposed — `uri`
+    is the sole identifier for the resource."""
 
-    id: str
+    uri: str  # canonical akb://{vault}/doc/{path} — single source of truth
     vault: str
     path: str
     title: str
@@ -84,7 +85,7 @@ class DocumentResponse(BaseModel):
 class DocumentPutResponse(BaseModel):
     """Response after akb_put."""
 
-    doc_id: str
+    uri: str  # canonical akb://{vault}/doc/{path}
     vault: str
     path: str
     commit_hash: str
@@ -93,12 +94,19 @@ class DocumentPutResponse(BaseModel):
 
 
 class BrowseItem(BaseModel):
-    """Single item in browse results — documents, collections, tables, or files."""
+    """Single item in browse results — documents, collections, tables, or files.
+
+    For document / table / file rows the canonical handle is `uri`; the
+    pre-URI `id`/`doc_id`/`file_id` columns are intentionally omitted
+    so callers cannot drift back into UUID-shaped references.
+    Collections do not have a URI (they are not addressable resources);
+    callers reference a collection by its `path` and the parent `vault`.
+    """
 
     name: str
     path: str
     type: str  # "collection", "document", "table", "file"
-    uri: str | None = None  # akb:// URI for this resource
+    uri: str | None = None  # akb:// URI for this resource (null for collections)
     summary: str | None = None
     # Collection membership — set on tables/files (documents encode it
     # in `path`). NULL for resources at vault root. Frontend tree
@@ -114,7 +122,6 @@ class BrowseItem(BaseModel):
     row_count: int | None = None
     columns: list[dict] | None = None
     # File fields
-    file_id: str | None = None
     mime_type: str | None = None
     size_bytes: int | None = None
 
@@ -130,10 +137,11 @@ class BrowseResponse(BaseModel):
 
 class SearchResult(BaseModel):
     """Single search result. Unifies document / table / file results;
-    `source_type` discriminates how the frontend renders the row."""
+    `source_type` discriminates how the frontend renders the row.
+    `uri` is the only canonical handle — internal IDs are not exposed."""
 
     source_type: str                                  # 'document' | 'table' | 'file'
-    source_id: str                                    # canonical id for the row
+    uri: str                                          # canonical akb:// URI
     vault: str
     path: str
     title: str

@@ -101,7 +101,9 @@ T=$(echo "$R" | jget "d.get('total', 0)")
 echo ""
 echo "▸ M3. akb_edit + search"
 
-DOC_EDIT=$(put_doc "EditProbe" "InitialEditMarkerAlpha content here." | jget "d['doc_id']")
+EDIT_RESP=$(put_doc "EditProbe" "InitialEditMarkerAlpha content here.")
+DOC_EDIT_PATH=$(echo "$EDIT_RESP" | jget "d['path']")
+DOC_EDIT_URI="akb://$VAULT/doc/$DOC_EDIT_PATH"
 wait_for_search "InitialEditMarkerAlpha" "$VAULT" >/dev/null
 
 # Edit: replace Alpha → Beta via MCP
@@ -118,7 +120,7 @@ rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
 rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -H "mcp-session-id: $SID" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_edit\",\"arguments\":{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC_EDIT\",\"old_string\":\"InitialEditMarkerAlpha\",\"new_string\":\"RevisedEditMarkerBeta\"}}}" >/dev/null
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_edit\",\"arguments\":{\"uri\":\"$DOC_EDIT_URI\",\"old_string\":\"InitialEditMarkerAlpha\",\"new_string\":\"RevisedEditMarkerBeta\"}}}" >/dev/null
 
 # Wait for re-index
 DEADLINE=$(($(date +%s) + 60))

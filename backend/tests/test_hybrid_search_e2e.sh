@@ -110,7 +110,7 @@ echo "▸ 2. Seed docs"
 mcp_call akb_put "{\"vault\":\"$VAULT_A\",\"collection\":\"notes\",\"title\":\"Kubernetes Introduction\",\"content\":\"## Overview\\n\\nKubernetes is a container orchestration system. Pods are the smallest deployable unit. 쿠버네티스 파드는 컨테이너를 그룹화한다.\",\"type\":\"note\",\"tags\":[\"k8s\"]}" >/dev/null
 mcp_call akb_put "{\"vault\":\"$VAULT_A\",\"collection\":\"notes\",\"title\":\"PostgreSQL Performance Tuning\",\"content\":\"## Tuning\\n\\nTuning PostgreSQL requires attention to shared_buffers, work_mem, and checkpoint settings. WAL archiving affects replication.\",\"type\":\"note\",\"tags\":[\"db\"]}" >/dev/null
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT_A\",\"collection\":\"notes\",\"title\":\"GraphQL Basics\",\"content\":\"## Intro\\n\\nGraphQL is a query language for APIs. Resolvers map types to data sources. Schema-first design is common.\",\"type\":\"note\",\"tags\":[\"api\"]}" | mcp_result)
-GQL_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+GQL_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 
 mcp_call akb_put "{\"vault\":\"$VAULT_B\",\"collection\":\"notes\",\"title\":\"Vault B private doc\",\"content\":\"## Private\\n\\nThis document should only appear when searching within vault B, never vault A.\",\"type\":\"note\",\"tags\":[\"secret\"]}" >/dev/null
 
@@ -189,8 +189,8 @@ fi
 echo ""
 echo "▸ 6. Reindex-after-update"
 
-if [ -n "$GQL_DOC_ID" ]; then
-  mcp_call akb_update "{\"vault\":\"$VAULT_A\",\"doc_id\":\"$GQL_DOC_ID\",\"content\":\"## Intro\\n\\nGraphQL is a query language. Updated content now mentions Apollo and Relay clients. Federation allows composing services.\",\"message\":\"test re-index\"}" >/dev/null
+if [ -n "$GQL_DOC_URI" ]; then
+  mcp_call akb_update "{\"uri\":\"$GQL_DOC_URI\",\"content\":\"## Intro\\n\\nGraphQL is a query language. Updated content now mentions Apollo and Relay clients. Federation allows composing services.\",\"message\":\"test re-index\"}" >/dev/null
   echo "    waiting ${INDEX_WAIT}s for re-index…"
   sleep "$INDEX_WAIT"
 
@@ -201,15 +201,15 @@ if [ -n "$GQL_DOC_ID" ]; then
     fail "reindex" "expected GraphQL doc for 'Apollo', got: $TITLES"
   fi
 else
-  fail "reindex" "no GraphQL doc_id captured, skipping"
+  fail "reindex" "no GraphQL uri captured, skipping"
 fi
 
 # ── 7. Delete propagation ────────────────────────────────────
 echo ""
 echo "▸ 7. Delete propagation"
 
-if [ -n "$GQL_DOC_ID" ]; then
-  mcp_call akb_delete "{\"vault\":\"$VAULT_A\",\"doc_id\":\"$GQL_DOC_ID\"}" >/dev/null
+if [ -n "$GQL_DOC_URI" ]; then
+  mcp_call akb_delete "{\"uri\":\"$GQL_DOC_URI\"}" >/dev/null
   echo "    waiting 8s for outbox + pre-filter…"
   sleep 8
   TITLES=$(search_titles "Apollo" "$VAULT_A")

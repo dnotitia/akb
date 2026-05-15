@@ -65,7 +65,7 @@ async def list_files(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    files = await file_service.list_files(access["vault_id"], collection, limit)
+    files = await file_service.list_files(access["vault_id"], vault, collection, limit)
     return {"kind": "file", "vault": vault, "items": files, "total": len(files)}
 
 

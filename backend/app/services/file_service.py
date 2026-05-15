@@ -29,6 +29,7 @@ from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
 )
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
+from app.services.uri_service import file_uri
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -186,7 +187,7 @@ class FileService:
         )
         return {
             "kind": "file",
-            "id": str(file_id),
+            "uri": file_uri(vault_name, str(file_id)),
             "vault": vault_name,
             "collection": collection_path or None,
             "upload_url": presigned_url,
@@ -263,10 +264,11 @@ class FileService:
             logger.warning("file metadata indexing failed for %s: %s", file_id, e)
 
         logger.info("Upload confirmed: %s (%d bytes)", row["name"], size_bytes)
+        vault_name = vault_row["name"] if vault_row else None
         return {
             "kind": "file",
-            "id": file_id,
-            "vault": vault_row["name"] if vault_row else None,
+            "uri": file_uri(vault_name, file_id) if vault_name else None,
+            "vault": vault_name,
             "name": row["name"],
             "collection": row["collection"],
             "mime_type": row["mime_type"],
@@ -294,9 +296,12 @@ class FileService:
             response_content_type=ct,
         )
 
+        # `get_download_url` is called by the HTTP route that the proxy
+        # invokes after parsing the URI client-side; the returned dict is
+        # consumed by the proxy, not the end user. We still surface the
+        # URI for symmetry with confirm_upload.
         return {
             "kind": "file",
-            "id": file_id,
             "name": row["name"],
             "download_url": presigned_url,
             "mime_type": row["mime_type"],
@@ -307,13 +312,15 @@ class FileService:
     async def list_files(
         self,
         vault_id: uuid.UUID,
+        vault_name: str,
         collection: str | None = None,
         limit: int = 50,
     ) -> list[dict]:
         """List files in a vault. When `collection` is set (path string),
         only files in that exact collection (NULL collection_id for empty
         path = vault root) are returned. The path is resolved to a
-        collection_id at query time."""
+        collection_id at query time. `vault_name` is required so each
+        row's canonical `uri` can be built without a second join."""
         pool = await get_pool()
         async with pool.acquire() as conn:
             if collection is None:
@@ -342,7 +349,7 @@ class FileService:
         return [
             {
                 "kind": "file",
-                "id": str(r["id"]),
+                "uri": file_uri(vault_name, str(r["id"])),
                 "collection": r["collection"],
                 "name": r["name"],
                 "mime_type": r["mime_type"],
@@ -415,7 +422,7 @@ class FileService:
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
         return {
             "kind": "file",
-            "id": file_id,
+            "uri": file_uri(vault_name, file_id) if vault_name else None,
             "vault": vault_name,
             "collection": row.get("collection"),
             "name": row["name"],

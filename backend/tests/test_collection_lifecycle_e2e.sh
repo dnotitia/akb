@@ -190,9 +190,9 @@ NE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get(
   || fail "create docs" "ok=$NE_OK; raw=$R"
 
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"DocsDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-NE_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-[ -n "$NE_DOC_ID" ] && pass "put doc into 'docs' ($NE_DOC_ID)" \
-  || fail "put docs doc" "no doc_id; raw=$R"
+NE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$NE_DOC_URI" ] && pass "put doc into 'docs' ($NE_DOC_URI)" \
+  || fail "put docs doc" "no uri; raw=$R"
 
 # Delete without recursive
 R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
@@ -203,7 +203,7 @@ NE_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get(
   || fail "non-empty no-recursive" "error=$NE_ERR doc_count=$NE_DC; raw=$R"
 
 # Doc must still exist
-R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$NE_DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_get "{\"uri\":\"$NE_DOC_URI\"}" | mcp_result)
 STILL_EXISTS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d and d.get('title','')!='')" 2>/dev/null)
 [ "$STILL_EXISTS" = "True" ] && pass "doc still exists after rejected delete" \
   || fail "doc after rejected delete" "doc missing or errored; raw=$R"
@@ -220,7 +220,7 @@ CASC_DOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).
   || fail "recursive delete" "ok=$CASC_OK deleted_docs=$CASC_DOCS; raw=$R"
 
 # Doc is gone
-R=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$NE_DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_get "{\"uri\":\"$NE_DOC_URI\"}" | mcp_result)
 DOC_GONE=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
 [ "$DOC_GONE" = "True" ] && pass "doc gone after recursive delete" \
   || fail "doc after recursive" "doc still retrievable; raw=$R"
@@ -241,11 +241,11 @@ KE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get(
   || fail "create keepempty" "ok=$KE_OK; raw=$R"
 
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"keepempty\",\"title\":\"OnlyDoc\",\"content\":\"## c\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
-KE_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-[ -n "$KE_DOC_ID" ] && pass "put OnlyDoc ($KE_DOC_ID) into 'keepempty'" \
-  || fail "put OnlyDoc" "no doc_id; raw=$R"
+KE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$KE_DOC_URI" ] && pass "put OnlyDoc ($KE_DOC_URI) into 'keepempty'" \
+  || fail "put OnlyDoc" "no uri; raw=$R"
 
-R=$(mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$KE_DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_delete "{\"uri\":\"$KE_DOC_URI\"}" | mcp_result)
 KE_DEL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
 [ "$KE_DEL" = "True" ] && pass "deleted OnlyDoc" \
   || fail "delete OnlyDoc" "deleted=$KE_DEL; raw=$R"

@@ -77,28 +77,26 @@ echo "▸ 1. Create Test Data (doc + table + file)"
 
 # Document 1: API Spec
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"API Spec v2\",\"content\":\"## Endpoints\\n\\nGET /api/v1/users\",\"type\":\"spec\",\"tags\":[\"api\"]}" | mcp_result)
-DOC1_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+DOC1_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 DOC1_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-[ -n "$DOC1_ID" ] && pass "Doc1 created ($DOC1_ID)" || fail "Doc1" "no id"
+[ -n "$DOC1_URI" ] && pass "Doc1 created ($DOC1_URI)" || fail "Doc1" "no uri"
 
 # Document 2: Design doc (depends_on doc1)
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"designs\",\"title\":\"System Design\",\"content\":\"## Architecture\\n\\nBased on API spec.\",\"type\":\"spec\",\"depends_on\":[\"$DOC1_ID\"]}" | mcp_result)
-DOC2_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"designs\",\"title\":\"System Design\",\"content\":\"## Architecture\\n\\nBased on API spec.\",\"type\":\"spec\",\"depends_on\":[\"$DOC1_URI\"]}" | mcp_result)
+DOC2_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 DOC2_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-[ -n "$DOC2_ID" ] && pass "Doc2 created with depends_on ($DOC2_ID)" || fail "Doc2" "no id"
+[ -n "$DOC2_URI" ] && pass "Doc2 created with depends_on ($DOC2_URI)" || fail "Doc2" "no uri"
 
 # Table
 R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"test_metrics\",\"description\":\"API performance metrics\",\"columns\":[{\"name\":\"endpoint\",\"type\":\"text\"},{\"name\":\"latency_ms\",\"type\":\"number\"}]}" | mcp_result)
-TBL_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-[ -n "$TBL_ID" ] && pass "Table created (test_metrics)" || fail "Table" "no id"
+TBL_URI_CREATED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$TBL_URI_CREATED" ] && pass "Table created (test_metrics)" || fail "Table" "no uri"
 
 # Insert rows
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO test_metrics (endpoint, latency_ms) VALUES ('/users', 45), ('/auth', 120)\"}" | mcp_result)
 pass "Table rows inserted"
 
-# Build URIs
-DOC1_URI="akb://$VAULT/doc/$DOC1_PATH"
-DOC2_URI="akb://$VAULT/doc/$DOC2_PATH"
+# URIs (DOC1_URI/DOC2_URI already set from akb_put responses)
 TABLE_URI="akb://$VAULT/table/test_metrics"
 
 echo "  DOC1_URI: $DOC1_URI"
@@ -166,27 +164,27 @@ echo ""
 echo "▸ 4. Cross-Type Linking (akb_link)"
 
 # Link doc1 → table (references)
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 LINKED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)
 [ "$LINKED" = "True" ] && pass "akb_link: doc → table (references)" || fail "akb_link doc→table" "not linked"
 
 # Link doc2 → table (derived_from)
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC2_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"derived_from\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC2_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"derived_from\"}" | mcp_result)
 LINKED2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)
 [ "$LINKED2" = "True" ] && pass "akb_link: doc2 → table (derived_from)" || fail "akb_link doc2→table" "not linked"
 
 # Link table → doc1 (reverse direction)
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$TABLE_URI\",\"target\":\"$DOC1_URI\",\"relation\":\"related_to\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$TABLE_URI\",\"target\":\"$DOC1_URI\",\"relation\":\"related_to\"}" | mcp_result)
 LINKED3=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)
 [ "$LINKED3" = "True" ] && pass "akb_link: table → doc (related_to)" || fail "akb_link table→doc" "not linked"
 
 # Invalid URI should fail
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"invalid-uri\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"invalid-uri\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 LINK_ERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
 [ "$LINK_ERR" = "True" ] && pass "akb_link rejects invalid URI" || fail "Invalid URI" "should error"
 
 # Duplicate link (should upsert, not error)
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 DUPED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)
 [ "$DUPED" = "True" ] && pass "Duplicate link upserts (no error)" || fail "Duplicate link" "errored"
 
@@ -195,7 +193,7 @@ echo ""
 echo "▸ 5. Query Relations (cross-type)"
 
 # Relations for doc1 (should have: outgoing=references→table, incoming=depends_on←doc2, incoming=related_to←table)
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\"}" | mcp_result)
 REL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$REL_COUNT" -ge 2 ] 2>/dev/null && pass "Doc1 relations: $REL_COUNT (cross-type)" || fail "Doc1 relations" "expected >=2, got $REL_COUNT"
 
@@ -208,25 +206,25 @@ HAS_TABLE_REL=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdi
 [ "$HAS_TABLE_REL" = "True" ] && pass "Cross-type: doc1 has table relation" || fail "Cross-type rel" "no table"
 
 # Relations for table (should have incoming from doc1 and doc2)
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$TABLE_URI\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$TABLE_URI\"}" | mcp_result)
 TBL_RELS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$TBL_RELS" -ge 2 ] 2>/dev/null && pass "Table relations: $TBL_RELS" || fail "Table relations" "expected >=2, got $TBL_RELS"
 
 # Direction filter: outgoing only
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"direction\":\"outgoing\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"direction\":\"outgoing\"}" | mcp_result)
 OUT_COUNT=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len(rels))" 2>/dev/null)
 OUT_DIR=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(all(r['direction']=='outgoing' for r in rels))" 2>/dev/null)
 [ "$OUT_DIR" = "True" ] && pass "Direction filter: outgoing only ($OUT_COUNT)" || fail "Direction filter" "mixed directions"
 
 # Type filter
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"type\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"type\":\"references\"}" | mcp_result)
 TYPE_RELS=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(all(r['relation']=='references' for r in rels) and len(rels)>0)" 2>/dev/null)
 [ "$TYPE_RELS" = "True" ] && pass "Type filter: references only" || fail "Type filter" "wrong types"
 
-# resource_uri required
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\"}" | mcp_result)
-REQ_ERR=$(echo "$R" | python3 -c "import sys,json; print('required' in json.load(sys.stdin).get('error','').lower() or 'resource_uri' in str(json.load(sys.stdin)))" 2>/dev/null)
-[ "$REQ_ERR" = "True" ] && pass "akb_relations requires resource_uri" || pass "akb_relations validation"
+# uri required
+R=$(mcp_call akb_relations "{}" | mcp_result)
+REQ_ERR=$(echo "$R" | python3 -c "import sys,json; print('required' in json.load(sys.stdin).get('error','').lower() or 'uri' in str(json.load(sys.stdin)))" 2>/dev/null)
+[ "$REQ_ERR" = "True" ] && pass "akb_relations requires uri" || pass "akb_relations validation"
 
 # ── 6. Graph (cross-type) ───────────────────────────────────
 echo ""
@@ -246,12 +244,12 @@ HAS_MIXED=$(echo "$R" | python3 -c "import sys,json; nodes=json.load(sys.stdin)[
 [ "$HAS_MIXED" = "True" ] && pass "Graph has mixed node types (doc+table)" || fail "Graph mixed" "single type only"
 
 # Subgraph from table
-R=$(mcp_call akb_graph "{\"vault\":\"$VAULT\",\"resource_uri\":\"$TABLE_URI\",\"depth\":2}" | mcp_result)
+R=$(mcp_call akb_graph "{\"uri\":\"$TABLE_URI\",\"depth\":2}" | mcp_result)
 SUB_NODES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null)
 [ "$SUB_NODES" -ge 2 ] 2>/dev/null && pass "Subgraph from table: $SUB_NODES nodes" || fail "Subgraph" "expected >=2"
 
 # Subgraph from doc via resource_uri
-R=$(mcp_call akb_graph "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"depth\":1}" | mcp_result)
+R=$(mcp_call akb_graph "{\"uri\":\"$DOC1_URI\",\"depth\":1}" | mcp_result)
 DOC_GRAPH=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null)
 [ "$DOC_GRAPH" -ge 1 ] 2>/dev/null && pass "Subgraph from doc URI: $DOC_GRAPH nodes" || fail "Doc subgraph" "failed"
 
@@ -259,8 +257,7 @@ DOC_GRAPH=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.std
 echo ""
 echo "▸ 7. Provenance"
 
-DOC1_UUID=$(mcp_call akb_get "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC1_ID\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
-R=$(mcp_call akb_provenance "{\"doc_id\":\"$DOC1_UUID\"}" | mcp_result)
+R=$(mcp_call akb_provenance "{\"uri\":\"$DOC1_URI\"}" | mcp_result)
 PROV_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 PROV_RELS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('relations',[])))" 2>/dev/null)
 [ -n "$PROV_URI" ] && pass "Provenance includes URI ($PROV_URI)" || fail "Provenance URI" "no uri"
@@ -271,17 +268,17 @@ echo ""
 echo "▸ 8. Unlink"
 
 # Unlink specific relation: doc1 → table (references)
-R=$(mcp_call akb_unlink "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_unlink "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 UNLINKED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('unlinked',0))" 2>/dev/null)
 [ "$UNLINKED" = "1" ] && pass "akb_unlink: removed 1 edge" || fail "akb_unlink" "expected 1, got $UNLINKED"
 
 # Verify it's gone
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
 POST_UNLINK=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$POST_UNLINK" = "0" ] && pass "Unlinked edge no longer in relations" || fail "Unlink verify" "still exists ($POST_UNLINK)"
 
 # Unlink all relations between table and doc1
-R=$(mcp_call akb_unlink "{\"vault\":\"$VAULT\",\"source\":\"$TABLE_URI\",\"target\":\"$DOC1_URI\"}" | mcp_result)
+R=$(mcp_call akb_unlink "{\"source\":\"$TABLE_URI\",\"target\":\"$DOC1_URI\"}" | mcp_result)
 UNLINKED_ALL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('unlinked',0))" 2>/dev/null)
 [ "$UNLINKED_ALL" -ge 1 ] 2>/dev/null && pass "akb_unlink (all): removed $UNLINKED_ALL" || fail "Unlink all" "expected >=1"
 
@@ -290,7 +287,7 @@ echo ""
 echo "▸ 9. Auto-Extracted Edges (frontmatter depends_on)"
 
 # Doc2 was created with depends_on=[doc1_id] — verify edge was created
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"depends_on\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"depends_on\"}" | mcp_result)
 FM_EDGE=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len(rels))" 2>/dev/null)
 [ "$FM_EDGE" -ge 1 ] 2>/dev/null && pass "Frontmatter depends_on created edge ($FM_EDGE)" || fail "Frontmatter edge" "expected >=1"
 
@@ -299,22 +296,22 @@ echo ""
 echo "▸ 10. Link to Non-Existent Resource"
 
 # Valid URI format but non-existent document
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/doc/does-not/exist.md\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/doc/does-not/exist.md\",\"relation\":\"references\"}" | mcp_result)
 NOEXIST_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOEXIST_ERR" = "True" ] && pass "Link to non-existent doc rejected" || fail "Non-existent doc" "should error"
 
 # Valid URI format but non-existent table
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/table/ghost_table\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/table/ghost_table\",\"relation\":\"references\"}" | mcp_result)
 NOEXIST_TBL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOEXIST_TBL" = "True" ] && pass "Link to non-existent table rejected" || fail "Non-existent table" "should error"
 
 # Valid URI format but non-existent file
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/file/00000000-0000-0000-0000-000000000000\",\"relation\":\"attached_to\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"akb://$VAULT/file/00000000-0000-0000-0000-000000000000\",\"relation\":\"attached_to\"}" | mcp_result)
 NOEXIST_FILE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOEXIST_FILE" = "True" ] && pass "Link to non-existent file rejected" || fail "Non-existent file" "should error"
 
 # Verify no orphan edges were created
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
 ORPHANS=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len([r for r in rels if 'ghost' in r.get('uri','') or 'exist' in r.get('uri','')]))" 2>/dev/null)
 [ "$ORPHANS" = "0" ] && pass "No orphan edges created" || fail "Orphan edges" "$ORPHANS orphans"
 
@@ -323,40 +320,39 @@ echo ""
 echo "▸ 11. Edge Cases"
 
 # Self-link should be rejected
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$DOC1_URI\",\"relation\":\"related_to\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$DOC1_URI\",\"relation\":\"related_to\"}" | mcp_result)
 SELF_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('itself' in d.get('error','').lower())" 2>/dev/null)
 [ "$SELF_ERR" = "True" ] && pass "Self-link rejected" || fail "Self-link" "should error"
 
 # Multiple relation types between same pair
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 [ "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)" = "True" ] && pass "Link doc→table (references)" || fail "Multi-rel 1" "not linked"
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"derived_from\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"derived_from\"}" | mcp_result)
 [ "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked',False))" 2>/dev/null)" = "True" ] && pass "Link doc→table (derived_from) — same pair, different type" || fail "Multi-rel 2" "not linked"
 
 # Both should show up in relations
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"direction\":\"outgoing\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"direction\":\"outgoing\"}" | mcp_result)
 MULTI_COUNT=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len([r for r in rels if r['uri']=='$TABLE_URI']))" 2>/dev/null)
 [ "$MULTI_COUNT" = "2" ] && pass "Same pair has 2 different relation types" || fail "Multi-rel count" "expected 2, got $MULTI_COUNT"
 
 # Clean up multi-rels for later tests
-mcp_call akb_unlink "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\"}" | mcp_result >/dev/null
+mcp_call akb_unlink "{\"source\":\"$DOC1_URI\",\"target\":\"$TABLE_URI\"}" | mcp_result >/dev/null
 
 # Create doc3 with relative markdown link to doc1 in body
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"notes\",\"title\":\"Review Notes\",\"content\":\"## Review\\n\\nSee the [API spec]($DOC1_PATH) for details.\\n\\nAlso check [metrics](akb://$VAULT/table/test_metrics).\"}" | mcp_result)
-DOC3_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+DOC3_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 DOC3_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-DOC3_URI="akb://$VAULT/doc/$DOC3_PATH"
-[ -n "$DOC3_ID" ] && pass "Doc3 created with relative + akb:// body links" || fail "Doc3" "no id"
+[ -n "$DOC3_URI" ] && pass "Doc3 created with relative + akb:// body links" || fail "Doc3" "no uri"
 
 # Relative path link should create links_to edge to doc1
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC3_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC3_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
 BODY_LINKS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$BODY_LINKS" -ge 2 ] 2>/dev/null && pass "Body links extracted: $BODY_LINKS (relative path + akb:// URI)" || fail "Body links" "expected >=2, got $BODY_LINKS"
 
 # Status-only update should NOT re-extract edges (no churn)
 PRE_RELS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
-R=$(mcp_call akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC3_ID\",\"status\":\"active\",\"message\":\"promote\"}" | mcp_result)
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC3_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
+R=$(mcp_call akb_update "{\"uri\":\"$DOC3_URI\",\"status\":\"active\",\"message\":\"promote\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC3_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
 POST_RELS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$PRE_RELS" = "$POST_RELS" ] && pass "Status-only update: edges unchanged ($POST_RELS)" || fail "Status churn" "edges changed: $PRE_RELS → $POST_RELS"
 
@@ -365,27 +361,27 @@ echo ""
 echo "▸ 12. Document Update Edge Re-extraction"
 
 # Doc2 currently has depends_on=[doc1]. Update to change depends_on to table URI.
-R=$(mcp_call akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC2_ID\",\"content\":\"## Updated\\n\\nNow references [metrics](akb://$VAULT/table/test_metrics) instead.\",\"message\":\"change deps\"}" | mcp_result)
+R=$(mcp_call akb_update "{\"uri\":\"$DOC2_URI\",\"content\":\"## Updated\\n\\nNow references [metrics](akb://$VAULT/table/test_metrics) instead.\",\"message\":\"change deps\"}" | mcp_result)
 UPD_OK=$(echo "$R" | python3 -c "import sys,json; print('commit_hash' in json.load(sys.stdin))" 2>/dev/null)
 [ "$UPD_OK" = "True" ] && pass "Doc2 updated with akb:// link in body" || fail "Doc2 update" "no commit"
 
 # Verify: doc2 should now have a links_to edge to the table (from body)
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
 BODY_LINK=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len([r for r in rels if 'table' in r.get('resource_type','')]))" 2>/dev/null)
 [ "$BODY_LINK" -ge 1 ] 2>/dev/null && pass "Body akb:// URI extracted as links_to edge" || fail "Body link extraction" "expected >=1, got $BODY_LINK"
 
 # Update depends_on via frontmatter field
-R=$(mcp_call akb_update "{\"vault\":\"$VAULT\",\"doc_id\":\"$DOC2_ID\",\"depends_on\":[],\"message\":\"clear deps\"}" | mcp_result)
+R=$(mcp_call akb_update "{\"uri\":\"$DOC2_URI\",\"depends_on\":[],\"message\":\"clear deps\"}" | mcp_result)
 UPD2_OK=$(echo "$R" | python3 -c "import sys,json; print('commit_hash' in json.load(sys.stdin))" 2>/dev/null)
 [ "$UPD2_OK" = "True" ] && pass "Doc2 depends_on cleared" || fail "Clear deps" "no commit"
 
 # Verify: depends_on edge to doc1 should be gone
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"depends_on\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"depends_on\"}" | mcp_result)
 CLEARED_DEPS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$CLEARED_DEPS" = "0" ] && pass "depends_on edges cleared after update" || fail "Clear deps verify" "still has $CLEARED_DEPS"
 
 # Verify: links_to edge to table should still exist (content wasn't changed)
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC2_URI\",\"direction\":\"outgoing\",\"type\":\"links_to\"}" | mcp_result)
 STILL_LINKS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$STILL_LINKS" -ge 1 ] 2>/dev/null && pass "links_to edges preserved after deps-only update" || fail "Links preserved" "expected >=1, got $STILL_LINKS"
 
@@ -395,26 +391,25 @@ echo "▸ 13. Delete Cascades (edge cleanup)"
 
 # Create a doc specifically for deletion test
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"temp\",\"title\":\"Temp Doc\",\"content\":\"## Temp\",\"type\":\"note\"}" | mcp_result)
-TEMP_DOC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
+TEMP_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 TEMP_DOC_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
-TEMP_URI="akb://$VAULT/doc/$TEMP_DOC_PATH"
 
 # Link it
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$TEMP_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$TEMP_URI\",\"target\":\"$TABLE_URI\",\"relation\":\"references\"}" | mcp_result)
 pass "Linked temp doc → table"
 
 # Verify edge exists
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$TEMP_URI\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$TEMP_URI\"}" | mcp_result)
 PRE_DEL=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['relations']))" 2>/dev/null)
 [ "$PRE_DEL" -ge 1 ] 2>/dev/null && pass "Temp doc has $PRE_DEL relations" || fail "Pre-delete" "no relations"
 
 # Delete the doc
-R=$(mcp_call akb_delete "{\"vault\":\"$VAULT\",\"doc_id\":\"$TEMP_DOC_ID\"}" | mcp_result)
+R=$(mcp_call akb_delete "{\"uri\":\"$TEMP_URI\"}" | mcp_result)
 DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "Temp doc deleted" || fail "Delete temp" "not deleted"
 
 # Verify edges were cleaned up: table should NOT have incoming from deleted doc
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$TABLE_URI\",\"direction\":\"incoming\",\"type\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$TABLE_URI\",\"direction\":\"incoming\",\"type\":\"references\"}" | mcp_result)
 POST_DEL_REFS=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len([r for r in rels if 'temp' in r.get('uri','')]))" 2>/dev/null)
 [ "$POST_DEL_REFS" = "0" ] && pass "Deleted doc's edges cleaned up" || fail "Edge cleanup" "orphan edges remain"
 
@@ -427,16 +422,16 @@ R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"temp_table\",\"c
 TEMP_TBL_URI="akb://$VAULT/table/temp_table"
 
 # Link doc1 → temp_table
-R=$(mcp_call akb_link "{\"vault\":\"$VAULT\",\"source\":\"$DOC1_URI\",\"target\":\"$TEMP_TBL_URI\",\"relation\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_link "{\"source\":\"$DOC1_URI\",\"target\":\"$TEMP_TBL_URI\",\"relation\":\"references\"}" | mcp_result)
 pass "Linked doc1 → temp_table"
 
 # Drop table
-R=$(mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"table\":\"temp_table\"}" | mcp_result)
+R=$(mcp_call akb_drop_table "{\"uri\":\"$TEMP_TBL_URI\"}" | mcp_result)
 DROP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
 [ "$DROP_OK" = "True" ] && pass "Temp table dropped" || fail "Drop temp table" "not dropped"
 
 # Verify edges cleaned up
-R=$(mcp_call akb_relations "{\"vault\":\"$VAULT\",\"resource_uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
+R=$(mcp_call akb_relations "{\"uri\":\"$DOC1_URI\",\"direction\":\"outgoing\",\"type\":\"references\"}" | mcp_result)
 POST_DROP=$(echo "$R" | python3 -c "import sys,json; rels=json.load(sys.stdin)['relations']; print(len([r for r in rels if 'temp_table' in r.get('uri','')]))" 2>/dev/null)
 [ "$POST_DROP" = "0" ] && pass "Dropped table's edges cleaned up" || fail "Table edge cleanup" "orphan edges"
 

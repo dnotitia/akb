@@ -79,11 +79,11 @@ const FILE_TOOLS = [
   {
     name: "akb_put_file",
     description:
-      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. MIME type is auto-detected from the filename extension unless overridden.",
+      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` (akb://{vault}/file/{id}) — pass that to akb_get_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
     inputSchema: {
       type: "object",
       properties: {
-        vault: { type: "string", description: "Vault name" },
+        vault: { type: "string", description: "Vault name (new files are not URI-addressable yet, so the placement vault is named explicitly)" },
         file_path: {
           type: "string",
           description: "Absolute path to the local file to upload",
@@ -110,39 +110,49 @@ const FILE_TOOLS = [
   },
   {
     name: "akb_get_file",
-    description: "Download a file from vault storage to a local path.",
+    description: "Download a file from vault storage to a local path. Pass the file URI (akb://{vault}/file/{id}) from akb_browse or akb_put_file.",
     inputSchema: {
       type: "object",
       properties: {
-        vault: { type: "string", description: "Vault name" },
-        file_id: {
+        uri: {
           type: "string",
-          description: "File ID (from akb_browse)",
+          description: "File URI (akb://{vault}/file/{id})",
         },
         save_to: {
           type: "string",
           description: "Local directory or file path to save to",
         },
       },
-      required: ["vault", "file_id", "save_to"],
+      required: ["uri", "save_to"],
     },
   },
   {
     name: "akb_delete_file",
-    description: "Delete a file from vault storage.",
+    description: "Delete a file from vault storage by its URI.",
     inputSchema: {
       type: "object",
       properties: {
-        vault: { type: "string", description: "Vault name" },
-        file_id: {
+        uri: {
           type: "string",
-          description: "File ID to delete",
+          description: "File URI (akb://{vault}/file/{id})",
         },
       },
-      required: ["vault", "file_id"],
+      required: ["uri"],
     },
   },
 ];
+
+// Parse an akb://{vault}/file/{id} URI into (vault, id). Throws if malformed.
+function parseFileUri(uri) {
+  if (typeof uri !== "string") throw new Error("uri must be a string");
+  const m = uri.match(/^akb:\/\/([^/]+)\/file\/(.+)$/);
+  if (!m) {
+    throw new Error(
+      `Invalid file URI: '${uri}'. Expected akb://<vault>/file/<id>.`,
+    );
+  }
+  return { vault: m[1], id: m[2] };
+}
 
 const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
 
@@ -348,8 +358,11 @@ export class AKBProxy {
     // Resolve MIME type: explicit override wins, otherwise guess from extension.
     const mimeType = args.mime_type || guessMime(filename);
 
-    // 1. Get presigned upload URL from AKB (mime_type is signed into the URL,
-    //    so the S3 PUT below must use the same Content-Type header).
+    // 1. Get presigned upload URL from AKB. The backend returns the
+    //    canonical `uri` plus a transient `s3_key` + presigned upload
+    //    URL. We parse the URI to recover the file UUID (needed only
+    //    for the internal `/confirm` round-trip below); it never
+    //    leaves this function.
     const params = new URLSearchParams({
       filename,
       collection,
@@ -360,14 +373,16 @@ export class AKBProxy {
       "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/upload?${params}`,
     );
-    const { id: fileId, upload_url } = JSON.parse(initResp.text);
+    const initBody = JSON.parse(initResp.text);
+    const { uri, upload_url } = initBody;
+    const { id: fileId } = parseFileUri(uri);
 
     // 2. Upload directly to S3 via presigned URL (streaming).
     //    Content-Type MUST match the mime_type sent to /upload above, since
     //    boto3 generate_presigned_url includes it in X-Amz-SignedHeaders.
     await this._uploadToS3(upload_url, file_path, fileSize, mimeType);
 
-    // 3. Confirm upload with AKB
+    // 3. Confirm upload with AKB.
     const confirmResp = await this._http(
       "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/${fileId}/confirm`,
@@ -376,14 +391,14 @@ export class AKBProxy {
   }
 
   async _getFile(args) {
-    const { vault, file_id, save_to } = args;
-    if (!vault || !file_id || !save_to)
-      throw new Error("vault, file_id, and save_to required");
+    const { uri, save_to } = args;
+    if (!uri || !save_to) throw new Error("uri and save_to required");
+    const { vault, id: fileId } = parseFileUri(uri);
 
     // 1. Get presigned download URL from AKB
     const resp = await this._http(
       "GET",
-      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(file_id)}/download`,
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
     );
     const { name: filename, download_url, size_bytes } = JSON.parse(resp.text);
 
@@ -400,16 +415,17 @@ export class AKBProxy {
     await mkdir(dirname(savePath), { recursive: true });
     const bytesWritten = await this._downloadFromS3(download_url, savePath);
 
-    return { name: filename, save_to: savePath, size_bytes: bytesWritten };
+    return { name: filename, save_to: savePath, size_bytes: bytesWritten, uri };
   }
 
   async _deleteFile(args) {
-    const { vault, file_id } = args;
-    if (!vault || !file_id) throw new Error("vault and file_id required");
+    const { uri } = args;
+    if (!uri) throw new Error("uri required");
+    const { vault, id: fileId } = parseFileUri(uri);
 
     const resp = await this._http(
       "DELETE",
-      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(file_id)}`,
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
     );
     return JSON.parse(resp.text);
   }
@@ -582,7 +598,7 @@ export class AKBProxy {
             await this._rpc("initialize", {
               protocolVersion: "2025-03-26",
               capabilities: {},
-              clientInfo: { name: "akb-mcp-client", version: "0.6.0" },
+              clientInfo: { name: "akb-mcp-client", version: "2.0.0" },
             });
             this._initialized = true;
             process.stderr.write("[akb-mcp] Reconnected.\n");

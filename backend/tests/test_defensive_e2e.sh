@@ -77,8 +77,8 @@ echo "▸ 1. Delete + Search/Grep Cleanup"
 
 # Create a doc with distinctive content
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"cleanup\",\"title\":\"Ephemeral Doc\",\"content\":\"# Ephemeral\\nUNIQUE_MARKER_XJ7K9Q for search verification\",\"tags\":[\"ephemeral\"]}")
-EPH_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-[ -n "$EPH_DOC" ] && pass "Ephemeral doc created ($EPH_DOC)" || fail "Create" "$R"
+EPH_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$EPH_DOC_URI" ] && pass "Ephemeral doc created ($EPH_DOC_URI)" || fail "Create" "$R"
 
 # Verify searchable
 source "$(dirname "$0")/_wait_for_indexing.sh"
@@ -93,7 +93,7 @@ GREP_BEFORE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin
 [ "$GREP_BEFORE" -ge 1 ] 2>/dev/null && pass "Greppable before delete ($GREP_BEFORE)" || fail "Grep before" "$R"
 
 # Delete
-R=$(m "akb_delete" "{\"vault\":\"$VAULT\",\"doc_id\":\"$EPH_DOC\"}")
+R=$(m "akb_delete" "{\"uri\":\"$EPH_DOC_URI\"}")
 DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted',False))" 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "Document deleted" || fail "Delete" "$R"
 
@@ -109,7 +109,7 @@ GREP_AFTER=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)
 [ "$GREP_AFTER" = "0" ] && pass "Not greppable after delete (0 matches)" || fail "Grep after delete" "still $GREP_AFTER matches"
 
 # Verify get returns not found
-R=$(m "akb_get" "{\"vault\":\"$VAULT\",\"doc_id\":\"$EPH_DOC\"}")
+R=$(m "akb_get" "{\"uri\":\"$EPH_DOC_URI\"}")
 GET_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$GET_ERROR" = "True" ] && pass "Get returns not found after delete" || fail "Get after delete" "$R"
 
@@ -117,23 +117,25 @@ GET_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 echo ""
 echo "▸ 2. Nonexistent Resource Operations"
 
+NONEXIST_URI="akb://$VAULT/doc/nonexistent/missing.md"
+
 # Update nonexistent doc
-R=$(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"d-nonexistent-00000000\",\"content\":\"# Nope\"}")
+R=$(m "akb_update" "{\"uri\":\"$NONEXIST_URI\",\"content\":\"# Nope\"}")
 UPDATE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$UPDATE_ERR" = "True" ] && pass "Update nonexistent doc → error" || fail "Update nonexistent" "$R"
 
 # Edit nonexistent doc
-R=$(m "akb_edit" "{\"vault\":\"$VAULT\",\"doc_id\":\"d-nonexistent-00000000\",\"old_string\":\"old\",\"new_string\":\"new\"}")
+R=$(m "akb_edit" "{\"uri\":\"$NONEXIST_URI\",\"old_string\":\"old\",\"new_string\":\"new\"}")
 EDIT_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$EDIT_ERR" = "True" ] && pass "Edit nonexistent doc → error" || fail "Edit nonexistent" "$R"
 
 # Delete nonexistent doc
-R=$(m "akb_delete" "{\"vault\":\"$VAULT\",\"doc_id\":\"d-nonexistent-00000000\"}")
+R=$(m "akb_delete" "{\"uri\":\"$NONEXIST_URI\"}")
 DEL_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('deleted') == False or 'error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$DEL_ERR" = "True" ] && pass "Delete nonexistent doc → error/false" || fail "Delete nonexistent" "$R"
 
 # History nonexistent doc
-R=$(m "akb_history" "{\"vault\":\"$VAULT\",\"doc_id\":\"d-nonexistent-00000000\"}")
+R=$(m "akb_history" "{\"uri\":\"$NONEXIST_URI\"}")
 HIST_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$HIST_ERR" = "True" ] && pass "History nonexistent doc → error" || fail "History nonexistent" "$R"
 
@@ -147,11 +149,11 @@ echo ""
 echo "▸ 3. Publish → View → Unpublish → Verify Inaccessible"
 
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"public\",\"title\":\"Public Test Doc\",\"content\":\"# Public Content\\nThis should be viewable via slug\"}")
-PUB_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-[ -n "$PUB_DOC" ] && pass "Doc for publishing ($PUB_DOC)" || fail "Pub doc create" "$R"
+PUB_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$PUB_DOC_URI" ] && pass "Doc for publishing ($PUB_DOC_URI)" || fail "Pub doc create" "$R"
 
 # Publish
-R=$(m "akb_publish" "{\"vault\":\"$VAULT\",\"doc_id\":\"$PUB_DOC\"}")
+R=$(m "akb_publish" "{\"uri\":\"$PUB_DOC_URI\"}")
 SLUG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('slug',''))" 2>/dev/null)
 [ -n "$SLUG" ] && pass "Published (slug=$SLUG)" || fail "Publish" "$R"
 
@@ -164,7 +166,7 @@ PUB_CONTENT=$(curl -sk "$BASE_URL/api/v1/public/$SLUG" | python3 -c "import sys,
 [ "$PUB_CONTENT" = "True" ] && pass "Public content correct" || fail "Public content" "missing"
 
 # Unpublish
-R=$(m "akb_unpublish" "{\"vault\":\"$VAULT\",\"doc_id\":\"$PUB_DOC\"}")
+R=$(m "akb_unpublish" "{\"uri\":\"$PUB_DOC_URI\"}")
 UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('published') == False)" 2>/dev/null)
 [ "$UNPUB" = "True" ] && pass "Unpublished" || fail "Unpublish" "$R"
 
@@ -253,9 +255,9 @@ DUP_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print
 
 # Publish already published doc (should be idempotent)
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"idem\",\"title\":\"Idem Doc\",\"content\":\"# Idem\"}")
-IDEM_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-m "akb_publish" "{\"vault\":\"$VAULT\",\"doc_id\":\"$IDEM_DOC\"}" >/dev/null
-R=$(m "akb_publish" "{\"vault\":\"$VAULT\",\"doc_id\":\"$IDEM_DOC\"}")
+IDEM_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+m "akb_publish" "{\"uri\":\"$IDEM_DOC_URI\"}" >/dev/null
+R=$(m "akb_publish" "{\"uri\":\"$IDEM_DOC_URI\"}")
 IDEM_PUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('published',False))" 2>/dev/null)
 [ "$IDEM_PUB" = "True" ] && pass "Re-publish is idempotent" || fail "Re-publish" "$R"
 

@@ -142,13 +142,13 @@ echo "Hello from stdio E2E test — file 1" > "$TEST_FILE1"
 dd if=/dev/urandom bs=1024 count=10 of="$TEST_FILE2" 2>/dev/null  # 10KB binary
 
 UPLOAD1=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_path\":\"$TEST_FILE1\",\"collection\":\"docs\",\"description\":\"Test text file\"}}")
-FILE1_ID=$(tool_result "$UPLOAD1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
-[ -n "$FILE1_ID" ] && pass "Uploaded text file ($FILE1_ID)" || fail "Upload text" "no id"
+FILE1_URI=$(tool_result "$UPLOAD1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$FILE1_URI" ] && pass "Uploaded text file ($FILE1_URI)" || fail "Upload text" "no uri"
 
 UPLOAD2=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_path\":\"$TEST_FILE2\",\"collection\":\"data\",\"description\":\"Test binary file\"}}")
-FILE2_ID=$(tool_result "$UPLOAD2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+FILE2_URI=$(tool_result "$UPLOAD2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
 FILE2_SIZE=$(tool_result "$UPLOAD2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("size_bytes",0))' 2>/dev/null)
-[ -n "$FILE2_ID" ] && pass "Uploaded binary file ($FILE2_SIZE bytes)" || fail "Upload binary" "no id"
+[ -n "$FILE2_URI" ] && pass "Uploaded binary file ($FILE2_SIZE bytes)" || fail "Upload binary" "no uri"
 
 # ── 5. Browse files (replaces akb_list_files) ────────────────
 echo ""
@@ -168,7 +168,7 @@ echo "▸ 6. Download file"
 
 DL_PATH="/tmp/akb-stdio-dl"
 mkdir -p "$DL_PATH"
-DL1=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_id\":\"$FILE1_ID\",\"save_to\":\"$DL_PATH\"}}")
+DL1=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"save_to\":\"$DL_PATH\"}}")
 DL1_PATH=$(tool_result "$DL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("save_to",""))' 2>/dev/null)
 
 if [ -f "$DL1_PATH" ]; then
@@ -177,7 +177,7 @@ else
   fail "Download text" "file not saved to $DL1_PATH"
 fi
 
-DL2=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_id\":\"$FILE2_ID\",\"save_to\":\"$DL_PATH\"}}")
+DL2=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$FILE2_URI\",\"save_to\":\"$DL_PATH\"}}")
 DL2_PATH=$(tool_result "$DL2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("save_to",""))' 2>/dev/null)
 
 if [ -f "$DL2_PATH" ]; then
@@ -190,7 +190,7 @@ fi
 echo ""
 echo "▸ 7. Delete file"
 
-DEL1=$(rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_id\":\"$FILE1_ID\"}}")
+DEL1=$(rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri\":\"$FILE1_URI\"}}")
 DELETED=$(tool_result "$DEL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted",False))' 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "Deleted text file" || fail "Delete" "expected True, got $DELETED"
 
@@ -206,7 +206,7 @@ ERR_UPLOAD=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"
 ERR_MSG=$(tool_result "$ERR_UPLOAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_MSG" ] && pass "Upload nonexistent file returns error" || fail "Error case" "no error for missing file"
 
-ERR_DL=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_id\":\"00000000-0000-0000-0000-000000000000\",\"save_to\":\"/tmp\"}}")
+ERR_DL=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"akb://$VAULT/file/00000000-0000-0000-0000-000000000000\",\"save_to\":\"/tmp\"}}")
 ERR_DL_MSG=$(tool_result "$ERR_DL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_DL_MSG" ] && pass "Download nonexistent file returns error" || fail "Error case" "no error for missing file"
 
@@ -221,14 +221,14 @@ rpc_call "tools/call" "{\"name\":\"akb_create_vault\",\"arguments\":{\"name\":\"
 CLEANUP_FILE="/tmp/akb-stdio-cleanup.txt"
 echo "cleanup test file" > "$CLEANUP_FILE"
 UPLOAD_CL=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"vault\":\"$VAULT2\",\"file_path\":\"$CLEANUP_FILE\",\"collection\":\"test\"}}")
-CL_FILE_ID=$(tool_result "$UPLOAD_CL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
-[ -n "$CL_FILE_ID" ] && pass "Uploaded file to cleanup vault" || fail "Cleanup upload" "no id"
+CL_FILE_URI=$(tool_result "$UPLOAD_CL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$CL_FILE_URI" ] && pass "Uploaded file to cleanup vault" || fail "Cleanup upload" "no uri"
 
 # Delete the vault (should cascade-delete S3 files too)
 rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT2\"}}" >/dev/null
 
 # Try to download the deleted file's presigned URL — should fail
-ERR_GONE=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"vault\":\"$VAULT2\",\"file_id\":\"$CL_FILE_ID\",\"save_to\":\"/tmp\"}}")
+ERR_GONE=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$CL_FILE_URI\",\"save_to\":\"/tmp\"}}")
 ERR_GONE_MSG=$(tool_result "$ERR_GONE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_GONE_MSG" ] && pass "Deleted vault's files are inaccessible" || fail "Vault cleanup" "file still accessible after vault delete"
 rm -f "$CLEANUP_FILE"
@@ -238,7 +238,7 @@ echo ""
 echo "▸ 10. Cleanup"
 
 # Delete remaining file from original vault
-rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_id\":\"$FILE2_ID\"}}" >/dev/null
+rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri\":\"$FILE2_URI\"}}" >/dev/null
 # Delete vault
 rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT\"}}" >/dev/null
 pass "Cleanup done"

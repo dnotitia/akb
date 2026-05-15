@@ -98,8 +98,8 @@ D_RESP=$(curl -sk -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"Spec A\",\"type\":\"spec\",\"content\":\"# A\n\nbody\"}")
-D_ID=$(echo "$D_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("doc_id",""))' 2>/dev/null)
-[ -n "$D_ID" ] && pass "doc created in 'specs' ($D_ID)" || fail "doc put" "$D_RESP"
+D_URI=$(echo "$D_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+[ -n "$D_URI" ] && pass "doc created in 'specs' ($D_URI)" || fail "doc put" "$D_RESP"
 
 # ── 4. Initiate file upload into 'specs' (skip actual S3 upload) ─
 echo ""

@@ -91,8 +91,8 @@ echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev
 
 # Put a doc with secret content in vault1
 R=$(mcp_as "$PAT1" "$SID1" "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"secrets\",\"title\":\"Secret Doc\",\"content\":\"# Secret\\nThe password is XYZZY-SECRET-12345\"}" | mr)
-DOC1=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-[ -n "$DOC1" ] && pass "Secret doc created ($DOC1)" || fail "Secret doc" "$R"
+DOC1_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$DOC1_URI" ] && pass "Secret doc created ($DOC1_URI)" || fail "Secret doc" "$R"
 
 # ── 1. Grep Access Control ───────────────────────────────────
 echo ""
@@ -117,10 +117,8 @@ LEAK_DOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).
 echo ""
 echo "▸ 1b. Knowledge graph access control"
 
-DOC1_URI="akb://$VAULT1/doc/secrets/secret-doc.md"
-
 # User2 must NOT be able to query relations on user1's vault
-R=$(mcp_as "$PAT2" "$SID2" "akb_relations" "{\"vault\":\"$VAULT1\",\"resource_uri\":\"$DOC1_URI\"}" | mr)
+R=$(mcp_as "$PAT2" "$SID2" "akb_relations" "{\"uri\":\"$DOC1_URI\"}" | mr)
 HAS_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'Access denied' in str(d) or 'forbidden' in str(d).lower())" 2>/dev/null)
 [ "$HAS_ERR" = "True" ] && pass "User2 blocked from akb_relations on private vault" || fail "Relations ACL" "User2 got relations on private vault: $R"
 
@@ -128,7 +126,7 @@ R=$(mcp_as "$PAT2" "$SID2" "akb_graph" "{\"vault\":\"$VAULT1\"}" | mr)
 HAS_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'Access denied' in str(d) or 'forbidden' in str(d).lower())" 2>/dev/null)
 [ "$HAS_ERR" = "True" ] && pass "User2 blocked from akb_graph on private vault" || fail "Graph ACL" "User2 got graph on private vault: $R"
 
-R=$(mcp_as "$PAT2" "$SID2" "akb_provenance" "{\"doc_id\":\"$DOC1\"}" | mr)
+R=$(mcp_as "$PAT2" "$SID2" "akb_provenance" "{\"uri\":\"$DOC1_URI\"}" | mr)
 HAS_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'Access denied' in str(d) or 'forbidden' in str(d).lower() or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$HAS_ERR" = "True" ] && pass "User2 blocked from akb_provenance on private doc" || fail "Provenance ACL" "User2 got provenance on private doc: $R"
 
@@ -176,31 +174,31 @@ echo "▸ 3. Edit Edge Cases"
 
 # Create a doc to edit — Line 1 repeated twice to test uniqueness
 R=$(mcp_as "$PAT1" "$SID1" "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"docs\",\"title\":\"Edit Test\",\"content\":\"# Edit Test\\n\\nAlpha unique line\\nBeta repeated\\nGamma line\\nBeta repeated\\nDelta unique line\"}" | mr)
-EDIT_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['doc_id'])" 2>/dev/null)
-[ -n "$EDIT_DOC" ] && pass "Edit test doc created" || fail "Edit doc" "$R"
+EDIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$EDIT_DOC_URI" ] && pass "Edit test doc created" || fail "Edit doc" "$R"
 
 # 3a. Edit: old_string not found → error
-R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$EDIT_DOC\",\"old_string\":\"NOTHING LIKE THIS EXISTS\",\"new_string\":\"whatever\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"NOTHING LIKE THIS EXISTS\",\"new_string\":\"whatever\"}" | mr)
 NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'not found' in d.get('message','').lower())" 2>/dev/null)
 [ "$NOT_FOUND_ERR" = "True" ] && pass "Edit: old_string not found rejected" || fail "Edit not found" "$R"
 
 # 3b. Edit: old_string not unique → error
-R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$EDIT_DOC\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta replaced\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta replaced\"}" | mr)
 NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'appears' in d.get('message',''))" 2>/dev/null)
 [ "$NOT_UNIQUE_ERR" = "True" ] && pass "Edit: non-unique old_string rejected" || fail "Edit non-unique" "$R"
 
 # 3c. Edit: valid single replacement
-R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$EDIT_DOC\",\"old_string\":\"Alpha unique line\",\"new_string\":\"Alpha MODIFIED\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"Alpha unique line\",\"new_string\":\"Alpha MODIFIED\"}" | mr)
 EDIT_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_hash',''))" 2>/dev/null)
 [ -n "$EDIT_COMMIT" ] && pass "Valid edit applied (commit=${EDIT_COMMIT:0:8})" || fail "Valid edit" "$R"
 
 # 3d. Edit: replace_all works for duplicates
-R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$EDIT_DOC\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta fixed\",\"replace_all\":true}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta fixed\",\"replace_all\":true}" | mr)
 EDIT_ALL_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_hash',''))" 2>/dev/null)
 [ -n "$EDIT_ALL_COMMIT" ] && pass "Edit replace_all works (commit=${EDIT_ALL_COMMIT:0:8})" || fail "Edit replace_all" "$R"
 
 # 3e. Edit: empty old_string rejected
-R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$EDIT_DOC\",\"old_string\":\"\",\"new_string\":\"x\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"\",\"new_string\":\"x\"}" | mr)
 EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'empty' in d.get('message','').lower())" 2>/dev/null)
 [ "$EMPTY_ERR" = "True" ] && pass "Edit: empty old_string rejected" || fail "Empty old_string" "$R"
 
@@ -246,10 +244,10 @@ pass "Memories cleaned up"
 echo ""
 echo "▸ 5. Todo Edge Cases"
 
-# Todo with vault + ref_doc
-R=$(mcp_as "$PAT1" "$SID1" "akb_todo" "{\"title\":\"Review secret doc\",\"vault\":\"$VAULT1\",\"ref_doc\":\"$DOC1\",\"priority\":\"urgent\",\"due_date\":\"2026-04-15\"}" | mr)
+# Todo with vault + ref_uri
+R=$(mcp_as "$PAT1" "$SID1" "akb_todo" "{\"title\":\"Review secret doc\",\"vault\":\"$VAULT1\",\"ref_uri\":\"$DOC1_URI\",\"priority\":\"urgent\",\"due_date\":\"2026-04-15\"}" | mr)
 TODO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['todo_id'])" 2>/dev/null)
-[ -n "$TODO_ID" ] && pass "Todo with vault+ref_doc+priority+due ($TODO_ID)" || fail "Todo create" "$R"
+[ -n "$TODO_ID" ] && pass "Todo with vault+ref_uri+priority+due ($TODO_ID)" || fail "Todo create" "$R"
 
 # List with vault filter
 R=$(mcp_as "$PAT1" "$SID1" "akb_todos" "{\"vault\":\"$VAULT1\"}" | mr)
@@ -274,12 +272,12 @@ OPEN_REMAINING=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sy
 echo ""
 echo "▸ 6. Drill-down ID resolution"
 
-R=$(mcp_as "$PAT1" "$SID1" "akb_drill_down" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$DOC1\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_drill_down" "{\"uri\":\"$DOC1_URI\"}" | mr)
 DD_SECTIONS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('sections',[])))" 2>/dev/null)
-[ "$DD_SECTIONS" -ge 1 ] 2>/dev/null && pass "Drill-down with d- prefix ID: $DD_SECTIONS sections" || fail "Drill-down" "0 sections, response=$R"
+[ "$DD_SECTIONS" -ge 1 ] 2>/dev/null && pass "Drill-down with URI: $DD_SECTIONS sections" || fail "Drill-down" "0 sections, response=$R"
 
 # Filter by section
-R=$(mcp_as "$PAT1" "$SID1" "akb_drill_down" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$DOC1\",\"section\":\"Secret\"}" | mr)
+R=$(mcp_as "$PAT1" "$SID1" "akb_drill_down" "{\"uri\":\"$DOC1_URI\",\"section\":\"Secret\"}" | mr)
 DD_FILTERED=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('sections',[])))" 2>/dev/null)
 [ "$DD_FILTERED" -ge 1 ] 2>/dev/null && pass "Drill-down section filter works" || fail "Drill-down filter" "$R"
 
@@ -289,7 +287,7 @@ echo "▸ 7. SQL Table Access Control"
 
 # User1 creates a table in vault1
 R=$(mcp_as "$PAT1" "$SID1" "akb_create_table" "{\"vault\":\"$VAULT1\",\"name\":\"finances\",\"description\":\"Sensitive data\",\"columns\":[{\"name\":\"item\",\"type\":\"text\",\"required\":true},{\"name\":\"amount\",\"type\":\"number\"}]}" | mr)
-TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('id') or d.get('name')=='finances'))" 2>/dev/null)
+TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('uri') or d.get('name')=='finances'))" 2>/dev/null)
 [ "$TABLE_OK" = "True" ] && pass "Table created in private vault" || fail "Table create" "$R"
 
 # User1 inserts data

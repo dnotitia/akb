@@ -187,7 +187,7 @@ GREP_INJ_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); p
 
 # Tag with SQL
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"sql\",\"title\":\"SQL Tag Test\",\"content\":\"# SQL\\nbody\",\"tags\":[\"normal\",\"'; DELETE FROM tags --\"]}")
-TAG_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+TAG_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 [ -n "$TAG_DOC" ] && pass "Tags with SQL chars stored as literal text" || fail "SQL tag" "$R"
 
 # ── 4. Dynamic Permission Changes ────────────────────────────
@@ -202,7 +202,7 @@ INITIAL_DENIED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin)
 # Grant writer
 m1 "akb_grant" "{\"vault\":\"$VAULT\",\"user\":\"$USER2\",\"role\":\"writer\"}" >/dev/null
 R=$(m2 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"perm\",\"title\":\"After Grant\",\"content\":\"# Y\"}")
-AFTER_GRANT=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+AFTER_GRANT=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$AFTER_GRANT" = "True" ] && pass "User2 can write immediately after grant" || fail "Post-grant write" "$R"
 
 # Downgrade to reader
@@ -227,11 +227,11 @@ echo ""
 echo "▸ 5. Title Collision"
 
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"collide\",\"title\":\"Same Title\",\"content\":\"# First\"}")
-DOC_A=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+DOC_A=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 [ -n "$DOC_A" ] && pass "First doc with title 'Same Title'" || fail "Title doc 1" "$R"
 
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"collide\",\"title\":\"Same Title\",\"content\":\"# Second\"}")
-DOC_B=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+DOC_B=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 
 if [ -n "$DOC_B" ] && [ "$DOC_A" != "$DOC_B" ]; then
   pass "Second doc with same title got different ID ($DOC_B)"
@@ -239,7 +239,7 @@ elif [ -z "$DOC_B" ]; then
   ERR_MSG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
   pass "Second doc with same title rejected ($ERR_MSG)"
 else
-  fail "Title collision" "same doc_id returned: $DOC_A == $DOC_B"
+  fail "Title collision" "same uri returned: $DOC_A == $DOC_B"
 fi
 
 # Both docs accessible
@@ -253,12 +253,12 @@ echo "▸ 6. Collection Path Edge Cases"
 
 # Trailing slash
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"path-test/\",\"title\":\"Trailing Slash\",\"content\":\"# X\"}")
-TRAIL_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+TRAIL_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$TRAIL_OK" = "True" ] && pass "Collection with trailing slash accepted" || fail "Trailing slash" "$R"
 
 # Nested path
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"deep/nested/path\",\"title\":\"Nested\",\"content\":\"# X\"}")
-NESTED_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+NESTED_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$NESTED_OK" = "True" ] && pass "Nested collection path accepted" || fail "Nested path" "$R"
 
 # Path traversal attempt
@@ -269,7 +269,7 @@ d = json.load(sys.stdin)
 # Either rejected (error) or sanitized (doc created but path doesn't escape)
 if 'error' in d:
     print('rejected')
-elif 'doc_id' in d:
+elif 'uri' in d:
     # Verify path was sanitized — should not contain ..
     print('sanitized' if '..' not in d.get('path','') else 'escaped')
 else:
@@ -279,7 +279,7 @@ else:
 
 # Empty collection
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"\",\"title\":\"Empty Coll\",\"content\":\"# X\"}")
-EMPTY_COLL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'doc_id' in d)" 2>/dev/null)
+EMPTY_COLL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'uri' in d)" 2>/dev/null)
 [ "$EMPTY_COLL" = "True" ] && pass "Empty collection: handled (error or root)" || fail "Empty coll" "$R"
 
 # ── 7. Long Values ───────────────────────────────────────────
@@ -289,13 +289,13 @@ echo "▸ 7. Long Values"
 # Very long title (1000 chars)
 LONG_TITLE=$(python3 -c "print('A' * 1000)")
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"long\",\"title\":\"$LONG_TITLE\",\"content\":\"# X\"}")
-LONG_HANDLED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('doc_id' in d or 'error' in d)" 2>/dev/null)
+LONG_HANDLED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('uri' in d or 'error' in d)" 2>/dev/null)
 [ "$LONG_HANDLED" = "True" ] && pass "Very long title (1000ch) handled" || fail "Long title" "$R"
 
 # Many tags (50)
 MANY_TAGS=$(python3 -c "import json; print(json.dumps(['tag-' + str(i) for i in range(50)]))")
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"long\",\"title\":\"Many Tags\",\"content\":\"# X\",\"tags\":$MANY_TAGS}")
-TAGS_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+TAGS_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$TAGS_OK" = "True" ] && pass "50 tags accepted" || fail "Many tags" "$R"
 
 # ── 8. Limit Boundaries ──────────────────────────────────────

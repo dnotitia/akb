@@ -122,22 +122,22 @@ echo ""
 echo "▸ 4. Put documents (each in own vault)"
 
 R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 12 akb_put "{\"vault\":\"$ALICE_VAULT\",\"collection\":\"notes\",\"title\":\"Alice Note\",\"content\":\"## Alice\\n\\nWritten by Alice.\",\"type\":\"note\",\"tags\":[]}")
-ALICE_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['doc_id'])" 2>/dev/null)
-[ -n "$ALICE_DOC" ] && pass "Alice put document" || fail "Alice put" "failed"
+ALICE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['uri'])" 2>/dev/null)
+[ -n "$ALICE_DOC_URI" ] && pass "Alice put document" || fail "Alice put" "failed"
 
 R=$(mcp_call "$BOB_PAT" "$BOB_SID" 12 akb_put "{\"vault\":\"$BOB_VAULT\",\"collection\":\"notes\",\"title\":\"Bob Note\",\"content\":\"## Bob\\n\\nWritten by Bob.\",\"type\":\"note\",\"tags\":[]}")
-BOB_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['doc_id'])" 2>/dev/null)
-[ -n "$BOB_DOC" ] && pass "Bob put document" || fail "Bob put" "failed"
+BOB_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['uri'])" 2>/dev/null)
+[ -n "$BOB_DOC_URI" ] && pass "Bob put document" || fail "Bob put" "failed"
 
 # ── 5. Verify created_by is correct ─────────────────────────
 echo ""
 echo "▸ 5. Verify created_by attribution"
 
-R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 13 akb_get "{\"vault\":\"$ALICE_VAULT\",\"doc_id\":\"$ALICE_DOC\"}")
+R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 13 akb_get "{\"uri\":\"$ALICE_DOC_URI\"}")
 ALICE_AUTHOR=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text']).get('created_by',''))" 2>/dev/null)
 [ "$ALICE_AUTHOR" = "$ALICE" ] && pass "Alice's doc created_by='$ALICE'" || fail "Alice attribution" "created_by='$ALICE_AUTHOR'"
 
-R=$(mcp_call "$BOB_PAT" "$BOB_SID" 13 akb_get "{\"vault\":\"$BOB_VAULT\",\"doc_id\":\"$BOB_DOC\"}")
+R=$(mcp_call "$BOB_PAT" "$BOB_SID" 13 akb_get "{\"uri\":\"$BOB_DOC_URI\"}")
 BOB_AUTHOR=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text']).get('created_by',''))" 2>/dev/null)
 [ "$BOB_AUTHOR" = "$BOB" ] && pass "Bob's doc created_by='$BOB'" || fail "Bob attribution" "created_by='$BOB_AUTHOR'"
 

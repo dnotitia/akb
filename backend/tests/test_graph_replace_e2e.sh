@@ -92,11 +92,11 @@ echo ""
 echo "▸ 1. Unicode / 한글"
 
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"한글컬렉션\",\"title\":\"제안요청서 분석 📄\",\"content\":\"# 한글 제목\\n\\n본문에 한글과 이모지 🎉 포함\\n\\n## 기술 요건\\n- 가나다라\\n- αβγδ\\n- 中文テスト\",\"tags\":[\"한글\",\"테스트\",\"유니코드\"]}")
-DOC_KR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-[ -n "$DOC_KR" ] && pass "한글 제목+컬렉션+태그 문서 생성 ($DOC_KR)" || fail "Unicode put" "$R"
+DOC_KR_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$DOC_KR_URI" ] && pass "한글 제목+컬렉션+태그 문서 생성 ($DOC_KR_URI)" || fail "Unicode put" "$R"
 
 # Verify content preserved
-R=$(m1 "akb_get" "{\"vault\":\"$VAULT1\",\"doc_id\":\"$DOC_KR\"}")
+R=$(m1 "akb_get" "{\"uri\":\"$DOC_KR_URI\"}")
 HAS_KOREAN=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print('가나다라' in c and '中文' in c)" 2>/dev/null)
 [ "$HAS_KOREAN" = "True" ] && pass "한글+CJK 내용 보존 확인" || fail "Unicode content" "$R"
 
@@ -118,10 +118,10 @@ echo "▸ 2. Knowledge Graph (link/unlink/relations)"
 
 # Create two documents to link
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"API Spec\",\"content\":\"# API Spec\\nEndpoint definitions\"}")
-DOC_A=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+DOC_A_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 R=$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Data Model\",\"content\":\"# Data Model\\nSchema definitions\"}")
-DOC_B=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-[ -n "$DOC_A" ] && [ -n "$DOC_B" ] && pass "2 docs for linking ($DOC_A, $DOC_B)" || fail "Docs create" "missing IDs"
+DOC_B_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$DOC_A_URI" ] && [ -n "$DOC_B_URI" ] && pass "2 docs for linking ($DOC_A_URI, $DOC_B_URI)" || fail "Docs create" "missing URIs"
 
 # Get URIs from browse
 R=$(m1 "akb_browse" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"depth\":2}")
@@ -141,28 +141,28 @@ for it in items:
 " 2>/dev/null)
 
 # Link A → B (depends_on)
-R=$(m1 "akb_link" "{\"vault\":\"$VAULT1\",\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}")
+R=$(m1 "akb_link" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}")
 LINKED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('linked',False) or d.get('created',False) or d.get('edge_id','')!='')" 2>/dev/null)
 [ "$LINKED" = "True" ] && pass "Link created: A depends_on B" || fail "Link" "$R"
 
 # Check relations from A
-R=$(m1 "akb_relations" "{\"vault\":\"$VAULT1\",\"resource_uri\":\"$URI_A\"}")
+R=$(m1 "akb_relations" "{\"uri\":\"$URI_A\"}")
 REL_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('outgoing',[]) + d.get('relations',[])))" 2>/dev/null)
 [ "$REL_COUNT" -ge 1 ] 2>/dev/null && pass "Relations visible from A ($REL_COUNT)" || fail "Relations" "$R"
 
 # Check graph
-R=$(m1 "akb_graph" "{\"vault\":\"$VAULT1\",\"resource_uri\":\"$URI_A\",\"depth\":1}")
+R=$(m1 "akb_graph" "{\"uri\":\"$URI_A\",\"depth\":1}")
 NODES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('nodes',[])))" 2>/dev/null)
 EDGES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('edges',[])))" 2>/dev/null)
 [ "$NODES" -ge 2 ] 2>/dev/null && pass "Graph: $NODES nodes, $EDGES edges" || fail "Graph" "$R"
 
 # Unlink
-R=$(m1 "akb_unlink" "{\"vault\":\"$VAULT1\",\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}")
+R=$(m1 "akb_unlink" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}")
 UNLINKED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('unlinked',0) >= 1 or d.get('removed',0) >= 1 or d.get('deleted',False))" 2>/dev/null)
 [ "$UNLINKED" = "True" ] && pass "Unlink: relation removed" || fail "Unlink" "$R"
 
 # Verify relation gone
-R=$(m1 "akb_relations" "{\"vault\":\"$VAULT1\",\"resource_uri\":\"$URI_A\"}")
+R=$(m1 "akb_relations" "{\"uri\":\"$URI_A\"}")
 REMAINING=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('outgoing',[]) + d.get('relations',[])))" 2>/dev/null)
 [ "$REMAINING" = "0" ] && pass "Relation confirmed removed" || fail "Unlink verify" "still $REMAINING relations"
 
@@ -208,8 +208,8 @@ TRANSFERRED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); p
 
 # User2 should now be owner — can write
 R=$(m2 "akb_put" "{\"vault\":\"$VAULT2\",\"collection\":\"owned\",\"title\":\"I own this now\",\"content\":\"# Mine\"}")
-NEW_OWNER_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
-[ -n "$NEW_OWNER_DOC" ] && pass "New owner can write to transferred vault" || fail "New owner write" "$R"
+NEW_OWNER_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$NEW_OWNER_DOC_URI" ] && pass "New owner can write to transferred vault" || fail "New owner write" "$R"
 
 # User1 should no longer be owner — but may still have access depending on implementation
 # At minimum, user1 should not be able to transfer again

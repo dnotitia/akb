@@ -71,17 +71,17 @@ echo "▸ 1. Empty/Whitespace Content"
 
 # Empty content string
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"empty\",\"title\":\"Empty Body\",\"content\":\"\"}")
-EMPTY_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'doc_id' in d)" 2>/dev/null)
+EMPTY_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'uri' in d)" 2>/dev/null)
 [ "$EMPTY_RESULT" = "True" ] && pass "Empty content: handled (error or accepted)" || fail "Empty content" "$R"
 
 # Whitespace only
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"empty\",\"title\":\"Whitespace Body\",\"content\":\"   \\n  \\n   \"}")
-WS_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'doc_id' in d)" 2>/dev/null)
+WS_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'uri' in d)" 2>/dev/null)
 [ "$WS_RESULT" = "True" ] && pass "Whitespace-only content: handled" || fail "Whitespace content" "$R"
 
 # Only newlines
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"empty\",\"title\":\"Newlines Body\",\"content\":\"\\n\\n\\n\"}")
-NL_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'doc_id' in d)" 2>/dev/null)
+NL_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'uri' in d)" 2>/dev/null)
 [ "$NL_RESULT" = "True" ] && pass "Newlines-only content: handled" || fail "Newlines content" "$R"
 
 # ── 2. Markdown Edge Cases ───────────────────────────────────
@@ -90,22 +90,22 @@ echo "▸ 2. Markdown Edge Cases"
 
 # Frontmatter-like content inside body (not actual frontmatter)
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"md\",\"title\":\"FM in Body\",\"content\":\"# Real Title\\n\\nBody text.\\n\\n\`\`\`yaml\\n---\\nfake_title: Should Not Override\\n---\\n\`\`\`\\n\\nMore body.\"}")
-FM_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+FM_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 [ -n "$FM_DOC" ] && pass "Frontmatter-like in code block accepted" || fail "FM body" "$R"
 
 # Verify title is preserved (not overridden by fake frontmatter)
-R=$(m "akb_get" "{\"vault\":\"$VAULT\",\"doc_id\":\"$FM_DOC\"}")
+R=$(m "akb_get" "{\"uri\":\"$FM_DOC\"}")
 TITLE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('title','')=='FM in Body')" 2>/dev/null)
 [ "$TITLE_OK" = "True" ] && pass "Title not overridden by code block" || fail "Title" "$R"
 
 # Nested code blocks (4 backticks)
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"md\",\"title\":\"Nested Code\",\"content\":\"# Nested\\n\\n\`\`\`\`markdown\\n\`\`\`python\\nprint('hi')\\n\`\`\`\\n\`\`\`\`\"}")
-NEST_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+NEST_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$NEST_OK" = "True" ] && pass "Nested code blocks accepted" || fail "Nested code" "$R"
 
 # Document with only headings, no paragraphs
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"md\",\"title\":\"Headings Only\",\"content\":\"# H1\\n\\n## H2\\n\\n### H3\"}")
-HEAD_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('doc_id','')))" 2>/dev/null)
+HEAD_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('uri','')))" 2>/dev/null)
 [ "$HEAD_OK" = "True" ] && pass "Headings-only document accepted" || fail "Headings only" "$R"
 
 # ── 3. Search Filter Combinations ────────────────────────────
@@ -148,16 +148,16 @@ echo ""
 echo "▸ 4. Update Tags Only"
 
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"upd\",\"title\":\"Tag Update Test\",\"content\":\"# Test\\nOriginal body\",\"tags\":[\"original\"]}")
-UPD_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+UPD_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 [ -n "$UPD_DOC" ] && pass "Doc for tag update created" || fail "Tag upd doc" "$R"
 
 # Update only tags
-R=$(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"$UPD_DOC\",\"tags\":[\"renamed\",\"updated\"]}")
+R=$(m "akb_update" "{\"uri\":\"$UPD_DOC\",\"tags\":[\"renamed\",\"updated\"]}")
 UPD_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('commit_hash','')))" 2>/dev/null)
 [ "$UPD_OK" = "True" ] && pass "Tags-only update succeeded" || fail "Tag update" "$R"
 
 # Verify tags changed and content preserved
-R=$(m "akb_get" "{\"vault\":\"$VAULT\",\"doc_id\":\"$UPD_DOC\"}")
+R=$(m "akb_get" "{\"uri\":\"$UPD_DOC\"}")
 TAG_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tags',[]); print('renamed' in t and 'updated' in t and 'original' not in t and 'Original body' in d.get('content',''))" 2>/dev/null)
 [ "$TAG_OK" = "True" ] && pass "Tags updated, content preserved" || fail "Tag verify" "$R"
 
@@ -166,21 +166,21 @@ echo ""
 echo "▸ 5. Status Transitions"
 
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"status\",\"title\":\"Status Test\",\"content\":\"# X\"}")
-ST_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+ST_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 [ -n "$ST_DOC" ] && pass "Status test doc created" || fail "Status doc" "$R"
 
 # Default should be draft
-R=$(m "akb_get" "{\"vault\":\"$VAULT\",\"doc_id\":\"$ST_DOC\"}")
+R=$(m "akb_get" "{\"uri\":\"$ST_DOC\"}")
 DEFAULT_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
 [ "$DEFAULT_STATUS" = "draft" ] && pass "Default status is 'draft'" || fail "Default status" "$DEFAULT_STATUS"
 
 # Transition draft → active
-R=$(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"$ST_DOC\",\"status\":\"active\"}")
+R=$(m "akb_update" "{\"uri\":\"$ST_DOC\",\"status\":\"active\"}")
 ACT_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('commit_hash','')))" 2>/dev/null)
 [ "$ACT_OK" = "True" ] && pass "draft → active" || fail "Activate" "$R"
 
 # Transition active → archived
-R=$(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"$ST_DOC\",\"status\":\"archived\"}")
+R=$(m "akb_update" "{\"uri\":\"$ST_DOC\",\"status\":\"archived\"}")
 ARCH_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('commit_hash','')))" 2>/dev/null)
 [ "$ARCH_OK" = "True" ] && pass "active → archived" || fail "Archive doc" "$R"
 
@@ -188,7 +188,7 @@ ARCH_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdi
 R=$(MCP_ID=$((MCP_ID+1)); curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $SID" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_update\",\"arguments\":{\"vault\":\"$VAULT\",\"doc_id\":\"$ST_DOC\",\"status\":\"INVALID\"}}}" 2>&1)
+  -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_update\",\"arguments\":{\"uri\":\"$ST_DOC\",\"status\":\"INVALID\"}}}" 2>&1)
 INV_REJ=$(echo "$R" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('error' in d or 'enum' in str(d).lower() or 'not one of' in str(d).lower())" 2>/dev/null)
 [ "$INV_REJ" = "True" ] && pass "Invalid status rejected" || fail "Invalid status" "$R"
 
@@ -198,11 +198,11 @@ echo "▸ 6. Concurrent Writes"
 
 # Two parallel updates to the same doc
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"race\",\"title\":\"Race Doc\",\"content\":\"# Initial\"}")
-RACE_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_id',''))" 2>/dev/null)
+RACE_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 
 # Fire two updates in parallel
-(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"$RACE_DOC\",\"content\":\"# Update A\"}" > /tmp/race_a.txt) &
-(m "akb_update" "{\"vault\":\"$VAULT\",\"doc_id\":\"$RACE_DOC\",\"content\":\"# Update B\"}" > /tmp/race_b.txt) &
+(m "akb_update" "{\"uri\":\"$RACE_DOC\",\"content\":\"# Update A\"}" > /tmp/race_a.txt) &
+(m "akb_update" "{\"uri\":\"$RACE_DOC\",\"content\":\"# Update B\"}" > /tmp/race_b.txt) &
 wait
 
 A_OK=$(grep -c "commit_hash" /tmp/race_a.txt 2>/dev/null || echo 0)
@@ -210,7 +210,7 @@ B_OK=$(grep -c "commit_hash" /tmp/race_b.txt 2>/dev/null || echo 0)
 ( [ "$A_OK" -ge 1 ] || [ "$B_OK" -ge 1 ] ) && pass "Concurrent updates: at least one succeeded (A=$A_OK B=$B_OK)" || fail "Concurrent writes" "both failed"
 
 # Verify final state is consistent (one of A or B)
-R=$(m "akb_get" "{\"vault\":\"$VAULT\",\"doc_id\":\"$RACE_DOC\"}")
+R=$(m "akb_get" "{\"uri\":\"$RACE_DOC\"}")
 FINAL=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print('Update A' in c or 'Update B' in c)" 2>/dev/null)
 [ "$FINAL" = "True" ] && pass "Race result is consistent (one update won)" || fail "Race consistency" "$R"
 rm -f /tmp/race_a.txt /tmp/race_b.txt
@@ -228,14 +228,14 @@ URI_B="akb://$VAULT/doc/graph/node-b.md"
 URI_C="akb://$VAULT/doc/graph/node-c.md"
 
 # Create cycle: A→B→C→A
-m "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}" >/dev/null
-m "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"$URI_B\",\"target\":\"$URI_C\",\"relation\":\"depends_on\"}" >/dev/null
-R=$(m "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"$URI_C\",\"target\":\"$URI_A\",\"relation\":\"depends_on\"}")
+m "akb_link" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}" >/dev/null
+m "akb_link" "{\"source\":\"$URI_B\",\"target\":\"$URI_C\",\"relation\":\"depends_on\"}" >/dev/null
+R=$(m "akb_link" "{\"source\":\"$URI_C\",\"target\":\"$URI_A\",\"relation\":\"depends_on\"}")
 CYCLE_LINKED=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin).get('linked',False)))" 2>/dev/null)
 [ "$CYCLE_LINKED" = "True" ] && pass "Cycle A→B→C→A created (3 edges)" || fail "Cycle link" "$R"
 
 # Graph traversal should not infinite loop
-R=$(m "akb_graph" "{\"vault\":\"$VAULT\",\"resource_uri\":\"$URI_A\",\"depth\":5}")
+R=$(m "akb_graph" "{\"uri\":\"$URI_A\",\"depth\":5}")
 NODES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('nodes',[])))" 2>/dev/null)
 [ "$NODES" -ge 3 ] 2>/dev/null && pass "Graph traversal handles cycle ($NODES nodes)" || fail "Cycle traversal" "$R"
 
@@ -250,7 +250,7 @@ m "akb_put" "{\"vault\":\"$VAULT2\",\"collection\":\"x\",\"title\":\"Remote Doc\
 URI_REMOTE="akb://$VAULT2/doc/x/remote-doc.md"
 
 # Try to link from vault1 doc to vault2 doc
-R=$(m "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"$URI_A\",\"target\":\"$URI_REMOTE\",\"relation\":\"references\"}")
+R=$(m "akb_link" "{\"source\":\"$URI_A\",\"target\":\"$URI_REMOTE\",\"relation\":\"references\"}")
 CROSS_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('linked' in d or 'error' in d)" 2>/dev/null)
 [ "$CROSS_RESULT" = "True" ] && pass "Cross-vault link: handled (allowed or rejected)" || fail "Cross link" "$R"
 
@@ -337,7 +337,7 @@ echo ""
 echo "▸ 12. Self-Reference"
 
 # Try to link a doc to itself
-R=$(m "akb_link" "{\"vault\":\"$VAULT\",\"source\":\"$URI_A\",\"target\":\"$URI_A\",\"relation\":\"related_to\"}")
+R=$(m "akb_link" "{\"source\":\"$URI_A\",\"target\":\"$URI_A\",\"relation\":\"related_to\"}")
 SELF_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('linked' in d or 'error' in d)" 2>/dev/null)
 [ "$SELF_RESULT" = "True" ] && pass "Self-link: handled (allowed or rejected)" || fail "Self link" "$R"
 

@@ -125,8 +125,12 @@ V=$(echo "$R" | jget "d.get('results', [{}])[0].get('vault','')")
 echo ""
 echo "▸ INT5. Knowledge graph link doesn't pollute search"
 
-D1=$(put "$VAULT_A" "x" "LinkSrc" "OstrichBeakRatio measurement." | jget "d['doc_id']")
-D2=$(put "$VAULT_A" "x" "LinkDst" "OstrichBeakRatio reference doc." | jget "d['doc_id']")
+D1_RESP=$(put "$VAULT_A" "x" "LinkSrc" "OstrichBeakRatio measurement.")
+D2_RESP=$(put "$VAULT_A" "x" "LinkDst" "OstrichBeakRatio reference doc.")
+D1_PATH=$(echo "$D1_RESP" | jget "d['path']")
+D2_PATH=$(echo "$D2_RESP" | jget "d['path']")
+D1_URI="akb://$VAULT_A/doc/$D1_PATH"
+D2_URI="akb://$VAULT_A/doc/$D2_PATH"
 sleep "$WAIT"
 
 # Link via MCP
@@ -143,7 +147,7 @@ if [ -n "$SID" ]; then
   rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_link\",\"arguments\":{\"vault\":\"$VAULT_A\",\"from_doc\":\"$D1\",\"to_doc\":\"$D2\",\"relation\":\"depends_on\"}}}" >/dev/null
+    -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_link\",\"arguments\":{\"source\":\"$D1_URI\",\"target\":\"$D2_URI\",\"relation\":\"depends_on\"}}}" >/dev/null
 fi
 sleep 3
 
