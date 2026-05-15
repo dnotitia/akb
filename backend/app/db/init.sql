@@ -292,8 +292,11 @@ CREATE TABLE IF NOT EXISTS publications (
 
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
-CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
+-- idx_publications_resource_uri is created by migration 022 (the same
+-- migration that adds the column). Leaving it out of init.sql lets the
+-- backend boot on a pre-022 DB without `resource_uri` existing yet —
+-- migration 022 then adds both the column and the index.
 
 -- ============================================================
 -- Todos (per-user task assignments)

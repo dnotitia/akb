@@ -96,11 +96,23 @@ async def _already_applied(conn) -> bool:
     return bool(has_uri and not has_document_id and not has_file_id)
 
 
+async def _ensure_index(conn) -> None:
+    """Create the partial index on the new column. Runs unconditionally
+    so fresh installs (where the migration body skips via _already_applied)
+    still end up with the index."""
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publications_resource_uri "
+        "ON publications (resource_uri) "
+        "WHERE resource_uri IS NOT NULL"
+    )
+
+
 async def _run(conn):
     if await _already_applied(conn):
+        await _ensure_index(conn)
         logger.info(
             "Migration 022 already applied "
-            "(resource_uri present, document_id/file_id removed); skipping"
+            "(resource_uri present, document_id/file_id removed); index ensured"
         )
         return
 
