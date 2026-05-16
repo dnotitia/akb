@@ -94,6 +94,8 @@ describe("GraphSidebar · entry search", () => {
     mockedSearchDocs.mockResolvedValue({
       query: "road",
       total: 1,
+      returned: 1,
+      total_matches: 1,
       results: [
         { doc_id: "d-1", title: "Roadmap", resource_type: "document" },
       ],
@@ -127,6 +129,8 @@ describe("GraphSidebar · entry search", () => {
     mockedSearchDocs.mockResolvedValue({
       query: "road",
       total: 1,
+      returned: 1,
+      total_matches: 1,
       results: [{ doc_id: "d-1", title: "Roadmap", resource_type: "document" }],
     });
     const u = userEvent.setup();

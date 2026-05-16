@@ -222,10 +222,23 @@ export const browseVault = (vault: string, collection?: string, depth = 1) => {
 };
 
 // ── Search ──
+// `total` is the legacy alias of `returned` (kept until the SPA / agent
+// prompts stop reading it). New fields per backend PR #39:
+//   - returned: items in `results` after limit + rerank
+//   - total_matches: unique hits seen in the prefetch window before limit
+// When `total_matches > returned`, surface "first N of more" rather than
+// treating `returned` as the population.
+export interface SearchResponse {
+  query: string;
+  total: number;
+  returned: number;
+  total_matches: number;
+  results: any[];
+}
 export const searchDocs = (query: string, vault?: string, limit = 10) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   if (vault) p.set("vault", vault);
-  return api<{ query: string; total: number; results: any[] }>(`/search?${p}`);
+  return api<SearchResponse>(`/search?${p}`);
 };
 
 export interface GrepMatch {

@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   static:
-    name: Static analysis (ruff + tsc)
+    name: Static analysis (ruff + tsc + vitest + secrets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,13 +21,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # No cache — the only python dep we need here is ruff,
-          # installed in the next step.
-      - name: Install backend lint/type/sec tools
+          # No cache — the only python deps we need here are listed
+          # in the next step; full backend runtime isn't installed.
+      - name: Install backend lint/type/sec tools + detect-secrets
         # Same versions as backend/pyproject.toml [project.optional-dependencies] dev.
-        run: pip install 'ruff>=0.6.0' 'mypy>=1.10.0' 'bandit[toml]>=1.7.0'
+        run: pip install 'ruff>=0.6.0' 'mypy>=1.10.0' 'bandit[toml]>=1.7.0' 'detect-secrets>=1.5.0'
 
-      # ── Node / pnpm (for `tsc --noEmit` in scripts/check.sh) ───
+      # ── Node / pnpm (for tsc + vitest in scripts/check.sh) ────
       - uses: pnpm/action-setup@v4
         with:
           version: latest
@@ -38,7 +38,12 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
       - name: Install frontend deps
         working-directory: frontend
-        run: pnpm install --frozen-lockfile
+        # `--ignore-scripts` skips package postinstall hooks. We don't need
+        # them in CI — msw's postinstall registers a browser service-worker
+        # bundle that node-only vitest/RTL never touches — and pnpm 10+
+        # exits non-zero on any unapproved build script even with
+        # `pnpm.onlyBuiltDependencies` set when run via the action.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
