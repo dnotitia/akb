@@ -10,7 +10,7 @@ backend + frontend behind nginx). Use cases:
 ## Quick start (pre-built image)
 
 ```bash
-docker run --rm -p 8080:8080 dnotitia/akb
+docker run --rm -p 8080:8080 dnseahorse/akb
 ```
 
 | What                   | URL                                                 |
@@ -27,8 +27,8 @@ The container prints the demo `DEMO_PAT` on first boot — grep
 ## Build locally
 
 ```bash
-docker build -f deploy/all-in-one/Dockerfile -t dnotitia/akb .
-docker run --rm -p 8080:8080 dnotitia/akb
+docker build -f deploy/all-in-one/Dockerfile -t dnseahorse/akb .
+docker run --rm -p 8080:8080 dnseahorse/akb
 ```
 
 ## With embeddings + search enabled
@@ -41,7 +41,7 @@ docker run --rm -p 8080:8080 \
     -e EMBED_API_KEY=sk-... \
     -v akb-data:/data \
     -v akb-state:/var/lib/akb \
-    dnotitia/akb
+    dnseahorse/akb
 ```
 
 Mounting `/data` and `/var/lib/akb` makes the demo state (PG cluster,
@@ -54,7 +54,7 @@ Pin the PAT (handy when registering the container as a Glama Connector):
 ```bash
 docker run --rm -p 8080:8080 \
     -e DEMO_PAT=akb_my-fixed-token-for-glama \
-    dnotitia/akb
+    dnseahorse/akb
 ```
 
 Any of `DEMO_USERNAME`, `DEMO_EMAIL`, `DEMO_PASSWORD`, `DEMO_VAULT`,
