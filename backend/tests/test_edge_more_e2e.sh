@@ -256,30 +256,6 @@ CROSS_RESULT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); 
 
 m "akb_delete_vault" "{\"name\":\"$VAULT2\"}" >/dev/null 2>&1
 
-# ── 9. Session Lifecycle Edge Cases ──────────────────────────
-echo ""
-echo "▸ 9. Session Lifecycle"
-
-# End nonexistent session
-R=$(m "akb_session_end" "{\"session_id\":\"00000000-0000-0000-0000-000000000000\",\"summary\":\"test\"}")
-END_INVALID=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
-[ "$END_INVALID" = "True" ] && pass "End nonexistent session → error" || fail "End invalid" "$R"
-
-# Start session normally
-R=$(m "akb_session_start" "{\"vault\":\"$VAULT\",\"agent_id\":\"test-agent\",\"context\":\"testing\"}")
-SES_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-[ -n "$SES_ID" ] && pass "Session started ($SES_ID)" || fail "Session start" "$R"
-
-# End it
-R=$(m "akb_session_end" "{\"session_id\":\"$SES_ID\",\"summary\":\"done\"}")
-END_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ended' in d or 'session_id' in d or 'summary' in d)" 2>/dev/null)
-[ "$END_OK" = "True" ] && pass "Session ended" || fail "Session end" "$R"
-
-# Double-end same session
-R=$(m "akb_session_end" "{\"session_id\":\"$SES_ID\",\"summary\":\"again\"}")
-DOUBLE_END=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'already' in str(d).lower() or 'ended' in d)" 2>/dev/null)
-[ "$DOUBLE_END" = "True" ] && pass "Double-end session: handled" || fail "Double end" "$R"
-
 # ── 10. Table Validation Edge Cases ──────────────────────────
 echo ""
 echo "▸ 10. Table Validation"

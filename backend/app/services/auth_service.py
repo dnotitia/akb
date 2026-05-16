@@ -14,12 +14,13 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
+import asyncpg
 import bcrypt
 import jwt
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AuthenticationError, ConflictError, NotFoundError
+from app.exceptions import AuthenticationError, ConflictError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
 
 
@@ -168,6 +169,53 @@ async def change_password(user_id: str, current: str, new: str) -> None:
                 actor_id=user_id,
                 payload={"user_id": user_id},
             )
+
+
+async def update_profile(
+    user_id: str,
+    *,
+    display_name: str | None = None,
+    email: str | None = None,
+) -> dict:
+    """Update own display_name and/or email. At least one field required.
+
+    Returns the post-update row (username + display_name + email) for the
+    caller to refresh local state. Username is immutable here — change
+    it requires a separate admin flow.
+    """
+    sets, params, idx = [], [], 1
+    if display_name is not None:
+        sets.append(f"display_name = ${idx}")
+        params.append(display_name)
+        idx += 1
+    if email is not None:
+        sets.append(f"email = ${idx}")
+        params.append(email)
+        idx += 1
+    if not sets:
+        raise ValidationError("Nothing to update — pass display_name or email")
+
+    sets.append("updated_at = NOW()")
+    params.append(uuid.UUID(user_id))
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx} "
+                f"RETURNING username, display_name, email",
+                *params,
+            )
+        except asyncpg.UniqueViolationError:
+            raise ConflictError("Email already in use") from None
+        if row is None:
+            raise NotFoundError("User", user_id)
+        return {
+            "updated": True,
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "email": row["email"],
+        }
 
 
 # ── PAT operations ──────────────────────────────────────────

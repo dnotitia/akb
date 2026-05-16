@@ -12,6 +12,7 @@ from app.services.auth_service import (
     create_pat,
     list_pats,
     revoke_pat,
+    update_profile,
 )
 from app.util.text import NFCModel
 
@@ -41,6 +42,11 @@ class ChangePasswordRequest(NFCModel):
     new_password: str
 
 
+class UpdateProfileRequest(NFCModel):
+    display_name: str | None = None
+    email: str | None = None
+
+
 @router.post("/auth/register", summary="Register a new user")
 async def register_user(req: RegisterRequest):
     return await register(req.username, req.email, req.password, req.display_name)
@@ -61,6 +67,16 @@ async def me(user: AuthenticatedUser = Depends(get_current_user)):
         "is_admin": user.is_admin,
         "auth_method": user.auth_method,
     }
+
+
+@router.patch("/auth/me", summary="Update own profile (display_name / email)")
+async def update_my_profile(
+    req: UpdateProfileRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    return await update_profile(
+        user.user_id, display_name=req.display_name, email=req.email,
+    )
 
 
 @router.post("/auth/tokens", summary="Create a Personal Access Token")

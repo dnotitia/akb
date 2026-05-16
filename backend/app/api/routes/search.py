@@ -56,10 +56,13 @@ async def grep_documents(
     regex: bool = Query(False),
     case_sensitive: bool = Query(False),
     limit: int = Query(20, ge=1, le=100),
+    count_only: bool = Query(False, description="grep -c — per-doc counts + total"),
+    files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     return await search_service.grep(
         pattern=q, vault=vault, collection=collection,
         regex=regex, case_sensitive=case_sensitive, limit=limit,
+        count_only=count_only, files_with_matches=files_with_matches,
         user_id=user.user_id,
     )

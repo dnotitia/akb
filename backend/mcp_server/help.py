@@ -324,60 +324,10 @@ akb_forget(memory_id="mem-xxx")       # Delete one
 - `akb_remember(category="work")` at session end to log what you did
 - Store non-obvious learnings: "vault X uses Korean collection names" """,
 
-    "todos": """# Todos — Personal Task Management
+    "activity": """# Activity & Diff — Vault History
 
-Todos are lightweight task items. You can create them for yourself or assign to others.
-
-## Tools
-| Tool | Description |
-|------|-------------|
-| `akb_todo` | Create a todo (for yourself or someone else) |
-| `akb_todos` | List todos (open by default) |
-| `akb_todo_update` | Mark done, change priority, reassign |
-
-## Examples
-
-**Check your pending work:**
-```
-akb_todos()
-```
-
-**Assign a task to someone:**
-```
-akb_todo(title="API 스펙 리뷰해줘", assignee="kim", vault="eng", ref_uri="akb://eng/doc/specs/api.md", priority="high")
-```
-
-**Mark as done:**
-```
-akb_todo_update(todo_id="t-xxx", status="done")
-```
-
-**Reassign:**
-```
-akb_todo_update(todo_id="t-xxx", assignee="lee")
-```
-
-## Session Start Pattern
-```
-akb_recall()    → memories from last session
-akb_todos()     → what needs my attention
-akb_activity()  → what others have been doing
-```""",
-
-    "sessions": """# Agent Work Sessions
-
-Sessions track what an agent does during a work period.
-
-## Workflow
-```
-# Start session
-s = akb_session_start(vault="eng", agent_id="claude", context="Reviewing API docs")
-
-# ... do work (put, update, search, etc.) ...
-
-# End session
-akb_session_end(session_id=s.session_id, summary="Reviewed 5 API docs, updated 2")
-```
+Audit who changed what and when via Git history. Use `akb_diff` to
+inspect the actual content change for a specific commit.
 
 ## Activity History (Git-based)
 ```
@@ -1146,20 +1096,6 @@ akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
 
 Each document change creates a Git commit. Use akb_history to see all versions, then akb_get with version= to read any past version.""",
 
-    "akb_session_start": """# akb_session_start
-
-```
-akb_session_start(vault="eng", agent_id="claude", context="Reviewing API docs")
-→ {"session_id": "s-xxx"}
-```
-Documents created during the session are auto-linked.""",
-
-    "akb_session_end": """# akb_session_end
-
-```
-akb_session_end(session_id="s-xxx", summary="Reviewed 5 docs, updated 2")
-```""",
-
     "akb_activity": """# akb_activity — Vault Activity History (Git-based)
 
 Shows who changed what, when, and why. Each entry is a Git commit.
@@ -1220,45 +1156,6 @@ akb_forget(memory_id="mem-xxx")
 ```
 
 Get memory IDs from `akb_recall()` results.""",
-
-    "akb_todo": """# akb_todo — Create a Todo
-
-## Parameters
-| Param | Required | Description |
-|-------|----------|-------------|
-| title | ✓ | What needs to be done |
-| assignee | | Username (omit = yourself) |
-| vault | | Related vault |
-| note | | Additional details |
-| ref_uri | | Related resource AKB URI |
-| priority | | low, normal, high, urgent |
-| due_date | | YYYY-MM-DD |
-
-## Examples
-```
-akb_todo(title="Fix login bug")
-akb_todo(title="Review PR #45", assignee="kim", priority="high", due_date="2026-04-05")
-akb_todo(title="Update API docs", vault="eng", ref_uri="akb://eng/doc/specs/api.md")
-```""",
-
-    "akb_todos": """# akb_todos — List Todos
-
-```
-akb_todos()                          # My open todos
-akb_todos(status="all")              # Including done
-akb_todos(assignee="kim")            # Kim's todos
-akb_todos(vault="eng")               # Only eng vault
-```
-Sorted by priority (urgent first), then by creation date.""",
-
-    "akb_todo_update": """# akb_todo_update — Update a Todo
-
-```
-akb_todo_update(todo_id="t-xxx", status="done")         # Mark done
-akb_todo_update(todo_id="t-xxx", priority="urgent")     # Escalate
-akb_todo_update(todo_id="t-xxx", assignee="lee")        # Reassign
-akb_todo_update(todo_id="t-xxx", due_date="2026-04-10") # Set deadline
-```""",
 
     "akb_publish": """# akb_publish — Create a Public Share
 
@@ -1414,15 +1311,6 @@ akb_whoami()
 
 Returns your current profile: username, display name, email, admin status, account creation date.
 Use this to verify who you are authenticated as.""",
-
-    "akb_update_profile": """# akb_update_profile — Update Your Profile
-
-```
-akb_update_profile(display_name="Kim Younro")
-akb_update_profile(email="kim@example.com")
-```
-
-Updates display name and/or email for the authenticated user.""",
 
     "akb_delete_vault": """# akb_delete_vault — Delete Vault
 

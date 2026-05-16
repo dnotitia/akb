@@ -573,6 +573,11 @@ export const changePassword = (current_password: string, new_password: string) =
     method: "POST",
     body: JSON.stringify({ current_password, new_password }),
   });
+export const updateProfile = (patch: { display_name?: string; email?: string }) =>
+  api<{ updated: true; username: string; display_name: string | null; email: string }>(
+    "/auth/me",
+    { method: "PATCH", body: JSON.stringify(patch) },
+  );
 export const adminResetPassword = (userId: string) =>
   api<{ temporary_password: string; username: string }>(
     `/admin/users/${encodeURIComponent(userId)}/reset-password`,

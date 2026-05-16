@@ -243,7 +243,10 @@ TOOLS = [
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
             "Returns matching documents (each with its `uri`) and matched lines. "
-            "Optionally pass `replace` to find-and-replace across all matching documents."
+            "Optionally pass `replace` to find-and-replace across all matching documents. "
+            "Three response shapes (mutually exclusive): default lines, `count_only=true` "
+            "(grep -c — per-doc counts + total, no snippets), `files_with_matches=true` "
+            "(grep -l — just the URIs that contain the pattern)."
         ),
         inputSchema={
             "type": "object",
@@ -255,6 +258,8 @@ TOOLS = [
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
                 "replace": {"type": "string", "description": "Replacement string. If provided, replaces all matches in EVERY matching document across the search scope (git commit + re-index per doc). Supports regex backreferences (\\1, \\2) when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return"},
+                "count_only": {"type": "boolean", "default": False, "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."},
+                "files_with_matches": {"type": "boolean", "default": False, "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."},
             },
             "required": ["pattern"],
         },
@@ -273,31 +278,6 @@ TOOLS = [
                 "section": {"type": "string", "description": "Section path filter (partial match, e.g. 'Background')"},
             },
             "required": ["uri"],
-        },
-    ),
-    Tool(
-        name="akb_session_start",
-        description="Start an agent work session. Documents created during the session are automatically linked.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "agent_id": {"type": "string", "description": "Agent identifier"},
-                "context": {"type": "string", "description": "What this session is about"},
-            },
-            "required": ["vault", "agent_id"],
-        },
-    ),
-    Tool(
-        name="akb_session_end",
-        description="End an agent work session and record a summary.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string", "description": "Session ID from akb_session_start"},
-                "summary": {"type": "string", "description": "Summary of what was done"},
-            },
-            "required": ["session_id"],
         },
     ),
     Tool(
@@ -519,61 +499,6 @@ TOOLS = [
                 },
             },
             "required": ["uri"],
-        },
-    ),
-    Tool(
-        name="akb_todo",
-        description=(
-            "Create a todo for yourself or someone else. "
-            "Todos are personal task items — like assigning a ticket. "
-            "Use akb_todos to check your pending items."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "What needs to be done"},
-                "assignee": {"type": "string", "description": "Username to assign to (omit = yourself)"},
-                "vault": {"type": "string", "description": "Related vault (optional)"},
-                "note": {"type": "string", "description": "Additional details"},
-                "ref_uri": {"type": "string", "description": "Related resource URI (optional)"},
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
-                "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)"},
-            },
-            "required": ["title"],
-        },
-    ),
-    Tool(
-        name="akb_todos",
-        description=(
-            "List todos — yours or someone else's. "
-            "Call at session start to see what needs your attention. "
-            "Shows open todos by default."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "assignee": {"type": "string", "description": "Username (omit = yourself)"},
-                "status": {"type": "string", "enum": ["open", "done", "all"], "default": "open"},
-                "vault": {"type": "string", "description": "Filter by vault"},
-                "limit": {"type": "integer", "default": 20},
-            },
-        },
-    ),
-    Tool(
-        name="akb_todo_update",
-        description="Update a todo — mark as done, change priority, reassign, or edit.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "todo_id": {"type": "string", "description": "Todo ID"},
-                "status": {"type": "string", "enum": ["open", "done"]},
-                "title": {"type": "string"},
-                "note": {"type": "string"},
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
-                "assignee": {"type": "string", "description": "Reassign to another user"},
-                "due_date": {"type": "string"},
-            },
-            "required": ["todo_id"],
         },
     ),
     Tool(
@@ -800,17 +725,6 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {},
-        },
-    ),
-    Tool(
-        name="akb_update_profile",
-        description="Update your display name or email.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "display_name": {"type": "string", "description": "New display name"},
-                "email": {"type": "string", "description": "New email address"},
-            },
         },
     ),
     Tool(

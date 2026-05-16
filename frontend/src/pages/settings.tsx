@@ -22,6 +22,7 @@ import {
   adminListUsers,
   adminDeleteUser,
   changePassword,
+  updateProfile,
   type AdminUser,
 } from "@/lib/api";
 import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
@@ -83,7 +84,44 @@ export default function SettingsPage() {
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
   const [pwOk, setPwOk] = useState(false);
+  const [profileDisplayName, setProfileDisplayName] = useState("");
+  const [profileEmail, setProfileEmail] = useState("");
+  const [profileError, setProfileError] = useState("");
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileOk, setProfileOk] = useState(false);
   const { theme } = useTheme();
+
+  // Sync local edit state when user payload arrives.
+  useEffect(() => {
+    if (user) {
+      setProfileDisplayName(user.display_name ?? "");
+      setProfileEmail(user.email ?? "");
+    }
+  }, [user]);
+
+  async function handleSaveProfile(e: React.FormEvent) {
+    e.preventDefault();
+    if (!user) return;
+    setProfileError("");
+    setProfileOk(false);
+    const patch: { display_name?: string; email?: string } = {};
+    if ((user.display_name ?? "") !== profileDisplayName) patch.display_name = profileDisplayName;
+    if (user.email !== profileEmail) patch.email = profileEmail;
+    if (!Object.keys(patch).length) {
+      setProfileError("No changes to save");
+      return;
+    }
+    setProfileBusy(true);
+    try {
+      const res = await updateProfile(patch);
+      setUser({ ...user, display_name: res.display_name ?? undefined, email: res.email });
+      setProfileOk(true);
+    } catch (err) {
+      setProfileError(err instanceof Error ? err.message : "Failed to save");
+    } finally {
+      setProfileBusy(false);
+    }
+  }
 
   async function handleChangePassword(e: React.FormEvent) {
     e.preventDefault();
@@ -314,21 +352,44 @@ export default function SettingsPage() {
 
         {/* Profile — read-only account info */}
         <TabsContent value="profile" className="pt-6 max-w-4xl space-y-6">
-          <div className="border border-border bg-surface">
+          <form onSubmit={handleSaveProfile} className="border border-border bg-surface">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4 p-6">
               <ReadOnlyField label="USERNAME" value={user.username} />
-              <ReadOnlyField label="EMAIL" value={user.email} />
-              <ReadOnlyField
-                label="DISPLAY NAME"
-                value={user.display_name || "—"}
-              />
               <ReadOnlyField
                 label="ROLE"
                 value={user.is_admin ? "ADMIN" : "USER"}
                 accent={user.is_admin}
               />
+              <div>
+                <Label htmlFor="profile-display-name">DISPLAY NAME</Label>
+                <Input
+                  id="profile-display-name"
+                  value={profileDisplayName}
+                  onChange={(e) => setProfileDisplayName(e.target.value)}
+                  placeholder="—"
+                />
+              </div>
+              <div>
+                <Label htmlFor="profile-email">EMAIL</Label>
+                <Input
+                  id="profile-email"
+                  type="email"
+                  value={profileEmail}
+                  onChange={(e) => setProfileEmail(e.target.value)}
+                  required
+                />
+              </div>
             </div>
-          </div>
+            <div className="flex items-center gap-3 px-6 pb-6">
+              <Button type="submit" disabled={profileBusy}>
+                {profileBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save profile"}
+              </Button>
+              {profileOk && <span className="text-sm text-green-600">Saved</span>}
+              {profileError && (
+                <span className="text-sm text-destructive">{profileError}</span>
+              )}
+            </div>
+          </form>
 
           <section
             className="space-y-3 pt-6 border-t border-border"

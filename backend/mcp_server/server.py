@@ -7,7 +7,6 @@ Provides MCP tools for:
 - akb_link/unlink: Create/remove cross-type relations (doc↔table↔file)
 - akb_relations/graph: Query the knowledge graph
 - akb_create_table/sql: Structured data tables
-- akb_session_start/end: Agent work sessions
 - akb_activity/diff/history: Version history
 """
 
@@ -43,8 +42,6 @@ from app.services.auth_service import resolve_token
 from app.services.memory_service import remember, recall, forget
 from app.services import publication_service, table_service
 from app.services.publication_service import parse_expires_in
-from app.services.session_service import SessionService
-from app.services import todo_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
@@ -68,8 +65,6 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
         return await doc_repo.find_by_ref_with_conn(conn, vault["id"], doc_ref)
 
 
-
-session_service = SessionService()
 
 server = Server("akb", instructions=INSTRUCTIONS)
 
@@ -337,6 +332,8 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         agent_id=user.username if replace is not None else None,
         user_id=uid,
         limit=args.get("limit", 20),
+        count_only=args.get("count_only", False),
+        files_with_matches=args.get("files_with_matches", False),
     )
     return result
 
@@ -349,20 +346,6 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
         vault, doc_path, section=args.get("section"),
     )
     return {"uri": args["uri"], "sections": sections}
-
-
-@_h("akb_session_start")
-async def _handle_session_start(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await session_service.start_session(
-        args["vault"], args["agent_id"], args.get("context"),
-    )
-
-
-@_h("akb_session_end")
-async def _handle_session_end(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await session_service.end_session(
-        args["session_id"], args.get("summary"), user_id=uid,
-    )
 
 
 @_h("akb_activity")
@@ -539,51 +522,6 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
         )
     except NotFoundError as e:
         return {"error": str(e)}
-
-
-@_h("akb_todo")
-async def _handle_todo(args: dict, uid: str, user: _MCPUser) -> dict:
-    assignee_username = args.get("assignee")
-    if assignee_username:
-        assignee_id = await todo_service.resolve_user_id(assignee_username)
-        if not assignee_id:
-            return {"error": f"User not found: {assignee_username}"}
-    else:
-        assignee_id = uid
-        assignee_username = user.username
-    result = await todo_service.create_todo(
-        assignee_id=assignee_id, created_by=uid, title=args["title"],
-        note=args.get("note"), vault_name=args.get("vault"),
-        ref_uri=args.get("ref_uri"), priority=args.get("priority", "normal"),
-        due_date=args.get("due_date"),
-    )
-    result["assignee"] = assignee_username
-    return result
-
-
-@_h("akb_todos")
-async def _handle_todos(args: dict, uid: str, user: _MCPUser) -> dict:
-    if args.get("assignee"):
-        assignee_id = await todo_service.resolve_user_id(args["assignee"])
-        if not assignee_id:
-            return {"error": f"User not found: {args['assignee']}"}
-    else:
-        assignee_id = uid
-    return await todo_service.list_todos(
-        assignee_id=assignee_id, status=args.get("status", "open"),
-        vault_name=args.get("vault"), limit=args.get("limit", 20),
-    )
-
-
-@_h("akb_todo_update")
-async def _handle_todo_update(args: dict, uid: str, user: _MCPUser) -> dict:
-    update_args = {k: v for k, v in args.items() if k != "todo_id"}
-    if "assignee" in update_args:
-        aid = await todo_service.resolve_user_id(update_args.pop("assignee"))
-        if not aid:
-            return {"error": f"User not found"}
-        update_args["assignee_id"] = aid
-    return await todo_service.update_todo(args["todo_id"], **update_args)
 
 
 @_h("akb_remember")
@@ -776,27 +714,6 @@ async def _handle_whoami(args: dict, uid: str, user: _MCPUser) -> dict:
             "is_admin": row["is_admin"],
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         }
-
-
-@_h("akb_update_profile")
-async def _handle_update_profile(args: dict, uid: str, user: _MCPUser) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        sets, params, idx = [], [], 1
-        if "display_name" in args:
-            sets.append(f"display_name = ${idx}")
-            params.append(args["display_name"])
-            idx += 1
-        if "email" in args:
-            sets.append(f"email = ${idx}")
-            params.append(args["email"])
-            idx += 1
-        if not sets:
-            return {"error": "Nothing to update"}
-        params.append(uid)
-        await conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx}", *params)
-        row = await conn.fetchrow("SELECT username, display_name, email FROM users WHERE id = $1", uid)
-        return {"updated": True, "username": row["username"], "display_name": row["display_name"], "email": row["email"]}
 
 
 @_h("akb_transfer_ownership")
