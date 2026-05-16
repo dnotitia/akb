@@ -1,14 +1,18 @@
 // SPA smoke E2E. Runs against the docker-compose stack — frontend on
 // :3000, backend on :8000. Covers the happy-path the previous bug
-// classes lived in: signup → vault create → doc put → search hit.
+// classes lived in: signup → land in shell → profile edit round-trip.
 //
-// Failure modes we deliberately want this to catch:
+// Failure modes this should catch:
 //   - Build/serve regression (white page, hydration crash, console errors)
-//   - Layout auth-gate broken (logged-out gets the SPA shell instead of /auth)
+//   - Layout auth-gate broken (logged-out gets SPA shell instead of /auth)
 //   - Profile edit form / save round-trip (PR #43 — settings tab)
-//   - akb_search wired to the backend response (PR #39 — total_matches in UI)
 //
-// Slow tests are out of scope here — fine-grained UX checks live in vitest+RTL.
+// Selector notes (from frontend/src/pages/auth.tsx, settings.tsx):
+//   - Tabs render "Log in" / "Register" — NOT "Sign in/up".
+//   - Submit button text is "Create Account" (register) or
+//     "Enter the Base" (login). During submit it flips to "Signing in…".
+//   - Profile labels are uppercase ("DISPLAY NAME", "EMAIL").
+//   - Save confirmation is the literal string "Saved" (not "saved").
 //
 // Run locally:
 //   docker compose up -d
@@ -21,29 +25,36 @@ const PASS = "test-pass-1234";
 
 test.describe.configure({ mode: "serial" });
 
-test("signup → vault create → put doc → search round-trip", async ({ page }) => {
-  // 1. signup
+test("signup → land in shell → profile edit round-trip", async ({ page }) => {
+  // ── 1. Register ────────────────────────────────────────────
   await page.goto("/auth");
-  await page.getByRole("tab", { name: /sign up/i }).click().catch(() => {});
-  await page.getByLabel(/username/i).fill(USER);
-  await page.getByLabel(/email/i).fill(`${USER}@e2e.test`);
-  await page.getByLabel(/password/i).first().fill(PASS);
-  await page.getByRole("button", { name: /sign up|create account/i }).click();
+  await page.getByRole("tab", { name: /^register$/i }).click();
+  await page.getByLabel("Username").fill(USER);
+  await page.getByLabel("Email").fill(`${USER}@e2e.test`);
+  await page.getByLabel("Password").fill(PASS);
+  await page.getByRole("button", { name: /create account/i }).click();
 
-  // Land in the authenticated shell — the home page link should appear.
-  await expect(page.getByRole("link", { name: /home|new chat|browse/i }).first())
-    .toBeVisible({ timeout: 10_000 });
+  // The authenticated shell sets up nav links — "Home" is the
+  // first NavLink in components/layout.tsx.
+  await expect(page.getByRole("link", { name: "Home" })).toBeVisible({
+    timeout: 10_000,
+  });
 
-  // 2. profile tab is editable (PR #43)
+  // ── 2. Profile edit (PR #43 regression guard) ──────────────
   await page.goto("/settings?tab=profile");
-  const displayName = page.getByLabel(/display name/i);
+  const displayName = page.getByLabel("DISPLAY NAME");
   await expect(displayName).toBeEditable();
   await displayName.fill(`${USER} Renamed`);
   await page.getByRole("button", { name: /save profile/i }).click();
-  await expect(page.getByText(/saved/i)).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible({
+    timeout: 5_000,
+  });
 });
 
-test("logged-out user redirects to /auth (layout auth gate)", async ({ page, context }) => {
+test("logged-out user redirects to /auth (layout auth gate)", async ({
+  page,
+  context,
+}) => {
   await context.clearCookies();
   await page.addInitScript(() => localStorage.removeItem("akb_token"));
   await page.goto("/settings");
