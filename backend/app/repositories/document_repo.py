@@ -500,6 +500,7 @@ class CollectionRepository:
         """
         bare = path.rstrip("/")
         like = self._like_escape(bare) + "/%"
+        args: tuple
         if exclude_self:
             sql = (
                 "SELECT id, path, name, summary, doc_count, last_updated "

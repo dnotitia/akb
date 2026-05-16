@@ -49,10 +49,10 @@ export function Layout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname, searchParams]);
 
-  if (!getToken()) {
-    return <Navigate to="/auth" replace />;
-  }
-
+  // All hooks must run unconditionally on every render — the auth gate
+  // below short-circuits to <Navigate>, so calling hooks AFTER it would
+  // violate rules-of-hooks the first time the component mounts logged-in
+  // and then logs out.
   const wide = isVaultShellRoute(location.pathname);
   const [headerRef, headerHeight] = useMeasuredHeight();
 
@@ -68,6 +68,10 @@ export function Layout() {
   // Abandoned rows are reaped by delete_worker after a grace window;
   // until then they're surfaced through the separate `abandoned` chip.
   const { data: health } = useHealth(!!getToken());
+
+  if (!getToken()) {
+    return <Navigate to="/auth" replace />;
+  }
   const upsert = health?.vector_store?.backfill?.upsert;
   const indexingPending: number | null = upsert
     ? Math.max(0, (upsert.pending || 0) - (upsert.abandoned || 0))

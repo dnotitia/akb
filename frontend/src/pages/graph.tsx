@@ -195,7 +195,8 @@ export default function GraphPage() {
           onTogglePin={() => {
             setPinned((prev) => {
               const next = new Set(prev);
-              next.has(selectedNode.uri) ? next.delete(selectedNode.uri) : next.add(selectedNode.uri);
+              if (next.has(selectedNode.uri)) next.delete(selectedNode.uri);
+              else next.add(selectedNode.uri);
               return next;
             });
           }}

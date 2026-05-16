@@ -145,7 +145,9 @@ export default function HomePage() {
       setShowPat(true);
       setNewName("");
       loadPATs();
-    } catch {}
+    } catch {
+      // surfaced via toast in higher-level error boundary
+    }
     setCreating(false);
   }
 

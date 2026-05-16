@@ -369,7 +369,7 @@ class GitService:
             except KeyError:
                 return []
 
-        results = []
+        results: list[str] = []
         self._walk_tree(tree, directory, extension, results)
         return results
 
@@ -583,7 +583,7 @@ class GitService:
         """
         repo = self._get_repo(vault_name)
         try:
-            kwargs = {"max_count": max_count}
+            kwargs: dict = {"max_count": max_count}
             if since:
                 kwargs["since"] = since
             if path:

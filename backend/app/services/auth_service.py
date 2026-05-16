@@ -183,7 +183,9 @@ async def update_profile(
     caller to refresh local state. Username is immutable here — change
     it requires a separate admin flow.
     """
-    sets, params, idx = [], [], 1
+    sets: list[str] = []
+    params: list = []  # mixed: str display_name/email + UUID at the end
+    idx = 1
     if display_name is not None:
         sets.append(f"display_name = ${idx}")
         params.append(display_name)

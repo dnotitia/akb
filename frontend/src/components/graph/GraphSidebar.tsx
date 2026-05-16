@@ -78,13 +78,15 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
 
   function toggleType(k: NodeKind) {
     const next = new Set(view.types);
-    next.has(k) ? next.delete(k) : next.add(k);
+    if (next.has(k)) next.delete(k);
+    else next.add(k);
     onChange({ ...view, types: next });
   }
 
   function toggleRelation(r: RelationKind) {
     const next = new Set(view.relations);
-    next.has(r) ? next.delete(r) : next.add(r);
+    if (next.has(r)) next.delete(r);
+    else next.add(r);
     onChange({ ...view, relations: next });
   }
 

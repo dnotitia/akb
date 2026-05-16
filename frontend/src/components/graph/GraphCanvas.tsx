@@ -31,9 +31,10 @@ interface Props {
   ) => void;
 }
 
-interface RenderNode extends GraphNode {
-  // react-force-graph mutates these
-}
+// react-force-graph mutates extra fields onto the node objects at
+// runtime; we keep the alias so call sites read self-documenting,
+// but it's structurally identical to GraphNode.
+type RenderNode = GraphNode;
 // RenderEdge cannot extend GraphEdge directly because react-force-graph
 // resolves source/target from string IDs to node objects during simulation.
 interface RenderEdge {

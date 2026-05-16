@@ -365,6 +365,7 @@ class SeahorseStore:
             ),
         }
         if has_dense:
+            assert query_dense is not None  # narrowed by has_dense; for mypy
             body["dense"] = {
                 "column": COL_DENSE,
                 "vector": [list(query_dense)],

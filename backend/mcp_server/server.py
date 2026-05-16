@@ -395,6 +395,7 @@ async def _handle_relations(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_graph")
 async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
+    vault: str
     uri = args.get("uri")
     if uri:
         parsed = parse_uri(uri)
@@ -402,9 +403,10 @@ async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
             return {"error": f"Invalid AKB URI: '{uri}'"}
         vault = parsed[0]
     else:
-        vault = args.get("vault")
-        if not vault:
+        v = args.get("vault")
+        if not v:
             return {"error": "Either `uri` or `vault` is required"}
+        vault = v
     access = await check_vault_access(uid, vault, required_role="reader")
     return await get_graph(
         vault,
