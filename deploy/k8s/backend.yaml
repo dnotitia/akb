@@ -76,6 +76,14 @@ metadata:
   namespace: akb
 spec:
   replicas: 1
+  # vaultdata PVC is ReadWriteOnce. The default RollingUpdate strategy
+  # tries to bring the new pod up before the old one terminates, which
+  # fails with Multi-Attach on a single-node-bound EBS volume. Recreate
+  # terminates the old pod first, accepts the ~10s downtime window, and
+  # avoids the race. Caught when an AWS demo rollout left the new pod
+  # Pending for 10+ minutes while the old one held the volume.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: akb-backend
