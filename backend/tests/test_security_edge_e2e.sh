@@ -251,34 +251,6 @@ mcp_as "$PAT1" "$SID1" "akb_forget" "{\"memory_id\":\"$MEM_LEARN\"}" >/dev/null 
 mcp_as "$PAT1" "$SID1" "akb_forget" "{\"memory_id\":\"$MEM_CTX\"}" >/dev/null 2>&1
 pass "Memories cleaned up"
 
-# ── 5. Todo Edge Cases ───────────────────────────────────────
-echo ""
-echo "▸ 5. Todo Edge Cases"
-
-# Todo with vault + ref_uri
-R=$(mcp_as "$PAT1" "$SID1" "akb_todo" "{\"title\":\"Review secret doc\",\"vault\":\"$VAULT1\",\"ref_uri\":\"$DOC1_URI\",\"priority\":\"urgent\",\"due_date\":\"2026-04-15\"}" | mr)
-TODO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['todo_id'])" 2>/dev/null)
-[ -n "$TODO_ID" ] && pass "Todo with vault+ref_uri+priority+due ($TODO_ID)" || fail "Todo create" "$R"
-
-# List with vault filter
-R=$(mcp_as "$PAT1" "$SID1" "akb_todos" "{\"vault\":\"$VAULT1\"}" | mr)
-VAULT_TODOS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['todos']))" 2>/dev/null)
-[ "$VAULT_TODOS" -ge 1 ] 2>/dev/null && pass "Todo vault filter: $VAULT_TODOS todos" || fail "Todo vault filter" "$R"
-
-# Update: reassign + change priority
-R=$(mcp_as "$PAT1" "$SID1" "akb_todo_update" "{\"todo_id\":\"$TODO_ID\",\"priority\":\"low\",\"note\":\"Deprioritized\"}" | mr)
-UPDATED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('updated',False))" 2>/dev/null)
-[ "$UPDATED" = "True" ] && pass "Todo updated (priority+note)" || fail "Todo update" "$R"
-
-# Mark done
-R=$(mcp_as "$PAT1" "$SID1" "akb_todo_update" "{\"todo_id\":\"$TODO_ID\",\"status\":\"done\"}" | mr)
-pass "Todo marked done"
-
-# Done todo should not appear in open list
-R=$(mcp_as "$PAT1" "$SID1" "akb_todos" "{\"status\":\"open\",\"vault\":\"$VAULT1\"}" | mr)
-OPEN_REMAINING=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['todos']))" 2>/dev/null)
-[ "$OPEN_REMAINING" = "0" ] && pass "Done todo not in open list" || fail "Todo status" "still $OPEN_REMAINING open"
-
 # ── 6. Drill-down with d- prefix ID ─────────────────────────
 echo ""
 echo "▸ 6. Drill-down ID resolution"

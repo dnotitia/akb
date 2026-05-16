@@ -229,17 +229,9 @@ R=$(mcp_call akb_provenance "{\"uri\":\"$DOC2_URI\"}" | mcp_result)
 PROV_TITLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['title'])" 2>/dev/null)
 [ -n "$PROV_TITLE" ] && pass "akb_provenance: $PROV_TITLE" || fail "akb_provenance" "no title"
 
-# ── 7. Session & Recent ──────────────────────────────────────
+# ── 7. Activity ──────────────────────────────────────────────
 echo ""
-echo "▸ 7. Session & Recent via MCP"
-
-R=$(mcp_call akb_session_start "{\"vault\":\"$VAULT\",\"agent_id\":\"mcp-test-agent\",\"context\":\"MCP E2E\"}" | mcp_result)
-SESS_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])" 2>/dev/null)
-[ -n "$SESS_ID" ] && pass "akb_session_start ($SESS_ID)" || fail "akb_session_start" "no session_id"
-
-R=$(mcp_call akb_session_end "{\"session_id\":\"$SESS_ID\",\"summary\":\"MCP E2E done\"}" | mcp_result)
-ENDED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['ended_at'])" 2>/dev/null)
-[ -n "$ENDED" ] && pass "akb_session_end" || fail "akb_session_end" "no ended_at"
+echo "▸ 7. Activity via MCP"
 
 # Activity (Git-based, replaces akb_recent)
 R=$(mcp_call akb_activity "{\"vault\":\"$VAULT\"}" | mcp_result)
@@ -399,58 +391,26 @@ R=$(mcp_call akb_unpublish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
 UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['published'])" 2>/dev/null)
 [ "$UNPUB" = "False" ] && pass "akb_unpublish" || fail "akb_unpublish" "expected False"
 
-# ── 13. Todos via MCP ────────────────────────────────────────
+# ── 13. Second-user setup (for access-control + cross-user tests below) ─
 echo ""
-echo "▸ 13. Todos (single user)"
+echo "▸ 13. Second-user setup"
 
-# Create todo for self
-R=$(mcp_call akb_todo '{"title":"E2E self-assigned todo","priority":"high"}' | mcp_result)
-TODO1=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['todo_id'])" 2>/dev/null)
-[ -n "$TODO1" ] && pass "akb_todo self ($TODO1)" || fail "akb_todo self" "no id"
-
-# List todos
-R=$(mcp_call akb_todos '{}' | mcp_result)
-TODO_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$TODO_COUNT" -ge 1 ] 2>/dev/null && pass "akb_todos: $TODO_COUNT" || fail "akb_todos" "expected >=1"
-
-# Mark done
-R=$(mcp_call akb_todo_update "{\"todo_id\":\"$TODO1\",\"status\":\"done\"}" | mcp_result)
-UPDATED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['updated'])" 2>/dev/null)
-[ "$UPDATED" = "True" ] && pass "akb_todo_update done" || fail "akb_todo_update" "not updated"
-
-# Verify done
-R=$(mcp_call akb_todos '{"status":"open"}' | mcp_result)
-OPEN_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len([t for t in d['todos'] if t['title']=='E2E self-assigned todo']))" 2>/dev/null)
-[ "$OPEN_COUNT" = "0" ] && pass "Completed todo not in open list" || fail "Todo status" "still showing as open"
-
-# ── 14. Cross-user Todos ─────────────────────────────────────
-echo ""
-echo "▸ 14. Cross-user Todos"
-
-# Register second user
-TODO_USER="e2e-todo-$(date +%s)"
+TODO_USER="e2e-u2-$(date +%s)"
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H 'Content-Type: application/json' \
   -d "{\"username\":\"$TODO_USER\",\"email\":\"${TODO_USER}@test.com\",\"password\":\"test1234\"}" >/dev/null 2>&1
 
-# User1 creates todo for User2
-R=$(mcp_call akb_todo "{\"title\":\"Review PR for user2\",\"assignee\":\"$TODO_USER\",\"priority\":\"urgent\"}" | mcp_result)
-TODO2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['todo_id'])" 2>/dev/null)
-ASSIGNEE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['assignee'])" 2>/dev/null)
-[ "$ASSIGNEE" = "$TODO_USER" ] && pass "Cross-assign todo to $TODO_USER" || fail "Cross-assign" "wrong assignee: $ASSIGNEE"
-
-# Login as User2, create PAT, start MCP session
 JWT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H 'Content-Type: application/json' \
   -d "{\"username\":\"$TODO_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 PAT2=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" -H "Authorization: Bearer $JWT2" -H 'Content-Type: application/json' \
-  -d '{"name":"todo-test"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+  -d '{"name":"u2-test"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-# Init MCP session for User2
 INIT2=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT2" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"user2","version":"1.0"}}}' 2>&1)
 SID2=$(echo "$INIT2" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
+[ -n "$SID2" ] && pass "User2 registered + MCP session" || fail "User2 setup" "no SID"
 
 mcp_call2() {
   curl -sk -X POST "$BASE_URL/mcp/" \
@@ -462,27 +422,7 @@ mcp_call2() {
 }
 mcp_result2() { python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['content'][0]['text'])" 2>/dev/null; }
 
-# User2 sees the assigned todo
-R=$(mcp_call2 akb_todos '{}' | mcp_result2)
-U2_TODOS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total'])" 2>/dev/null)
-U2_TITLE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['todos'][0]['title'] if d['todos'] else '')" 2>/dev/null)
-[ "$U2_TITLE" = "Review PR for user2" ] && pass "User2 sees assigned todo" || fail "User2 todos" "expected 'Review PR for user2', got '$U2_TITLE'"
-
-# User2 sees it was created by User1 (admin)
-U2_CREATED_BY=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['todos'][0]['created_by'] if d['todos'] else '')" 2>/dev/null)
-[ -n "$U2_CREATED_BY" ] && pass "Todo shows created_by=$U2_CREATED_BY" || fail "created_by" "empty"
-
-# User2 marks it done
-R=$(mcp_call2 akb_todo_update "{\"todo_id\":\"$TODO2\",\"status\":\"done\"}" | mcp_result2)
-U2_DONE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['updated'])" 2>/dev/null)
-[ "$U2_DONE" = "True" ] && pass "User2 marks todo done" || fail "User2 done" "not updated"
-
-# User1 can verify User2's todo is done by checking with assignee filter
-R=$(mcp_call akb_todos "{\"assignee\":\"$TODO_USER\",\"status\":\"done\"}" | mcp_result)
-U1_CHECK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len([t for t in d['todos'] if t['title']=='Review PR for user2']))" 2>/dev/null)
-[ "$U1_CHECK" = "1" ] && pass "User1 sees User2's completed todo" || fail "Cross-user check" "not found"
-
-# ── 15. Access Control (grant/revoke, reader vs writer) ──────
+# ── 14. Access Control (grant/revoke, reader vs writer) ──────
 echo ""
 echo "▸ 15. Access Control"
 
@@ -625,13 +565,16 @@ else
   fail "Create lifecycle vault" "no vault_id"
 fi
 
-# ── 20. Profile Update ──────────────────────────────────────
+# ── 20. Profile Update (REST PATCH /auth/me) ────────────────
 echo ""
 echo "▸ 20. Profile Update"
 
-R=$(mcp_call akb_update_profile "{\"display_name\":\"E2E Test User\"}" | mcp_result)
+R=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
+  -H "Authorization: Bearer $JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name":"E2E Test User"}')
 PROF_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('updated',False))" 2>/dev/null)
-[ "$PROF_OK" = "True" ] && pass "Update profile" || fail "Update profile" "not updated"
+[ "$PROF_OK" = "True" ] && pass "Update profile via REST PATCH /auth/me" || fail "Update profile" "not updated"
 
 # ── 21. Table DDL (alter + drop) ─────────────────────────────
 echo ""

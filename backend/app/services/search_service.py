@@ -418,14 +418,36 @@ class SearchService:
         agent_id: str | None = None,
         user_id: str | None = None,
         limit: int = 20,
+        count_only: bool = False,
+        files_with_matches: bool = False,
     ) -> dict:
-        """Exact text / regex search (and optional replace) across document content.
+        """Exact text / regex search across document content.
 
-        Searches chunk content in PostgreSQL. Returns matching documents
-        with matched lines. If `replace` is provided, performs find-and-replace
-        on matching documents' bodies and commits via the standard pipeline.
+        Three response shapes (mutually exclusive):
+
+        * default: matched lines + their containing docs.
+        * ``count_only=True`` (``grep -c``): per-doc match count + total,
+          no snippet payload.
+        * ``files_with_matches=True`` (``grep -l``): just the doc URIs
+          that contain the pattern, no per-line detail.
+
+        If ``replace`` is provided, performs find-and-replace on matching
+        documents' bodies and commits via the standard pipeline (only
+        valid with the default response shape).
         """
         import re as _re
+
+        # Mutual exclusion — issue #41.
+        if count_only and files_with_matches:
+            return {
+                "error": "count_only and files_with_matches are mutually exclusive",
+                "pattern": pattern,
+            }
+        if replace is not None and (count_only or files_with_matches):
+            return {
+                "error": "replace= is incompatible with count_only / files_with_matches",
+                "pattern": pattern,
+            }
 
         # Validate regex pattern early to give a clear error
         if regex:
@@ -534,7 +556,36 @@ class SearchService:
                         "text": line.strip(),
                     })
 
-        # Apply document limit
+        # ── count_only (grep -c) — issue #41 ─────────────────────────
+        # `limit` is a *snippet-output* knob. For count/files modes we
+        # want the populations the agent is really asking about ("X가 등장하는
+        # 사고가 몇 건"), so we count across all docs that matched — capped only
+        # by the SQL prefetch (`limit * 5`), which is generous and unconditional.
+        if count_only:
+            by_doc = {
+                d["uri"]: len(d["matches"])
+                for d in docs.values()
+                if d["matches"]
+            }
+            return {
+                "pattern": pattern,
+                "regex": regex,
+                "total_matches": sum(by_doc.values()),
+                "total_docs": len(by_doc),
+                "by_doc": by_doc,
+            }
+
+        # ── files_with_matches (grep -l) — issue #41 ─────────────────
+        if files_with_matches:
+            files = [d["uri"] for d in docs.values() if d["matches"]]
+            return {
+                "pattern": pattern,
+                "regex": regex,
+                "n_files": len(files),
+                "files": files,
+            }
+
+        # Apply document limit (default response shape only)
         result_docs = list(docs.values())[:limit]
         total_matches = sum(len(d["matches"]) for d in result_docs)
 

@@ -198,8 +198,8 @@ if [ -n "$GQL_DOC_URI" ]; then
   mcp_call akb_update "{\"uri\":\"$GQL_DOC_URI\",\"content\":\"## Intro\\n\\nGraphQL is a query language. Updated content now mentions Apollo and Relay clients. Federation allows composing services.\",\"message\":\"test re-index\"}" >/dev/null
   echo "    waiting ${INDEX_WAIT}s for re-index…"
   sleep "$INDEX_WAIT"
-  curl -sk -X POST "$BASE_URL/api/v1/search/bm25/recompute" \
-    -H "Authorization: Bearer $JWT" >/dev/null 2>&1
+  ${AKB_RECOMPUTE_CMD:-docker compose exec -T backend python -m scripts.init_bm25_vocab} \
+    >/dev/null 2>&1 || true
 
   TITLES=$(search_titles "Apollo" "$VAULT_A")
   if echo "$TITLES" | grep -q "GraphQL"; then
@@ -255,6 +255,30 @@ echo "▸ 9. akb_grep regression"
 R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\"}" | mcp_result)
 GREP_TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches', 0))" 2>/dev/null)
 [ "$GREP_TOTAL" -ge 1 ] 2>/dev/null && pass "akb_grep still finds literal string" || fail "grep" "total_matches=$GREP_TOTAL"
+
+# count_only (grep -c) — issue #41
+R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
+CO_TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches', 0))" 2>/dev/null)
+HAS_BY_DOC=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'by_doc' in d and 'results' not in d else 'no')" 2>/dev/null)
+[ "$CO_TOTAL" -ge 1 ] 2>/dev/null && [ "$HAS_BY_DOC" = "yes" ] \
+  && pass "akb_grep count_only ($CO_TOTAL via by_doc)" \
+  || fail "grep count_only" "total=$CO_TOTAL has_by_doc=$HAS_BY_DOC"
+
+# files_with_matches (grep -l) — issue #41
+R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"files_with_matches\":true}" | mcp_result)
+N_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('n_files', 0))" 2>/dev/null)
+HAS_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'files' in d and 'results' not in d else 'no')" 2>/dev/null)
+[ "$N_FILES" -ge 1 ] 2>/dev/null && [ "$HAS_FILES" = "yes" ] \
+  && pass "akb_grep files_with_matches ($N_FILES files)" \
+  || fail "grep files_with_matches" "n=$N_FILES has_files=$HAS_FILES"
+
+# Mutual exclusion error
+R=$(mcp_call akb_grep "{\"pattern\":\"x\",\"vault\":\"$VAULT_A\",\"count_only\":true,\"files_with_matches\":true}" | mcp_result)
+ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
+case "$ERR" in
+  *"mutually exclusive"*) pass "akb_grep count_only + files_with_matches blocked" ;;
+  *) fail "grep mutual excl" "got err=$ERR" ;;
+esac
 
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
