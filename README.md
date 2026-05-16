@@ -267,9 +267,23 @@ semver lifecycle and is **not** tied to the product version.
 ## License
 
 [PolyForm Noncommercial 1.0](./LICENSE) — free for noncommercial use,
-modification, and distribution. Attribution required.
+modification, and distribution within the license's noncommercial scope.
+Attribution required.
 
-For commercial licensing, contact **opensource@dnotitia.com**.
+**Trademarks** — "AKB", "Dnotitia", and "Seahorse" are trademarks of
+Dnotitia, Inc. The software license does not grant trademark rights.
+Forks and derivative works must be distributed under a different name.
+See [TRADEMARKS.md](./TRADEMARKS.md).
+
+**Commercial use** — a commercial license is required to:
+
+- Deploy AKB in any for-profit company's internal or production systems.
+- Offer AKB (modified or not) as a hosted service, on-premises product,
+  embedded component, or rebranded distribution to third parties.
+- Bundle AKB into a commercial product or service.
+
+For commercial licensing or trademark permission requests, contact
+**opensource@dnotitia.com**.
 
 ## Security
 

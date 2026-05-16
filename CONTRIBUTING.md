@@ -1,8 +1,32 @@
 # Contributing to AKB
 
-Thanks for considering a contribution. AKB is licensed under
-[PolyForm Noncommercial 1.0](./LICENSE) — by submitting a contribution you
-agree that it is licensed under the same terms.
+Thanks for considering a contribution.
+
+## Contributor Terms
+
+By submitting a contribution (pull request, patch, or any code/content
+addition) to this repository, you agree that:
+
+1. Your contribution is licensed to Dnotitia, Inc. and downstream users
+   under [PolyForm Noncommercial 1.0](./LICENSE) — the same terms as the
+   rest of the project.
+2. You grant Dnotitia, Inc. and downstream users a perpetual, worldwide,
+   non-exclusive, royalty-free, irrevocable patent license to make, use,
+   sell, offer for sale, import, and otherwise transfer your contribution,
+   limited to patent claims you can license that would necessarily be
+   infringed by your contribution alone or in combination with the project.
+3. You grant Dnotitia, Inc. the right to relicense your contribution under
+   any future license adopted by the AKB project — including a more
+   permissive open-source license. This preserves the project's ability
+   to evolve its licensing without re-negotiating with every contributor.
+4. You retain copyright on your contribution.
+5. You have the right to submit the contribution under these terms — i.e.
+   you wrote it yourself, or it comes from sources whose licenses permit
+   inclusion in this project.
+
+The "AKB", "Dnotitia", and "Seahorse" names and logos are trademarks of
+Dnotitia, Inc. and are not covered by the software license. See
+[TRADEMARKS.md](./TRADEMARKS.md) for the trademark policy.
 
 ## Development Setup
 
