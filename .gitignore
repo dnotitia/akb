@@ -36,6 +36,7 @@ htmlcov/
 
 # AKB config (yaml — single source of runtime config; only .example is tracked)
 /config/*.yaml
+/config/*.bak
 !/config/*.yaml.example
 # Test-bootstrap copy of app.yaml — materialised by backend/tests/conftest.py
 # so `app.config` can import when pytest runs from `backend/` (CWD-relative
