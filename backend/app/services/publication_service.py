@@ -524,7 +524,7 @@ async def list_publications(vault_id: uuid.UUID, resource_type: str | None = Non
                 "ORDER BY p.created_at DESC",
                 vault_id,
             )
-    return [_enrich_publication(_publication_row_to_dict(r)) for r in rows]
+    return [p for r in rows if (p := _enrich_publication(_publication_row_to_dict(r))) is not None]
 
 
 async def get_publication_by_slug(slug: str) -> dict | None:
@@ -603,7 +603,11 @@ async def resolve_publication(
                 row["id"],
             )
 
-    return _enrich_publication(_publication_row_to_dict(row))
+    # `row` is non-None here (PublicationNotFound raised above), so both
+    # helpers return non-None — assert for mypy's benefit.
+    result = _enrich_publication(_publication_row_to_dict(row))
+    assert result is not None
+    return result
 
 
 # ============================================================
@@ -992,6 +996,7 @@ async def create_snapshot(publication_id: uuid.UUID) -> dict:
             raise PublicationNotFound(str(publication_id))
 
     publication = _publication_row_to_dict(row)
+    assert publication is not None  # row is non-None
     if publication["resource_type"] != ResourceType.TABLE_QUERY:
         raise PublicationError("Snapshots only supported for table_query publications", status_code=400)
 

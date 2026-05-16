@@ -52,7 +52,9 @@ export function AdminResetPasswordDialog({ userId, username, open, onOpenChange 
       await navigator.clipboard.writeText(tempPassword);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {}
+    } catch {
+      // clipboard failure is silent — user can re-click
+    }
   }
 
   return (

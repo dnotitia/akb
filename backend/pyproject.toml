@@ -28,6 +28,8 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.6.0",
+    "mypy>=1.10.0",
+    "bandit[toml]>=1.7.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -50,6 +52,29 @@ line-length = 120
 #   E701/E702 — single-line `if x: do_y` and `x = …; y = …` are kept for
 #          tight setup blocks; splitting hurts readability more than it helps.
 ignore = ["E402", "E701", "E702"]
+
+[tool.mypy]
+python_version = "3.11"
+# Most of our third-party deps (asyncpg, kiwipiepy, redis, qdrant-client, …)
+# don't ship type stubs. Treat them as Any rather than erroring out — we
+# still get value from intra-codebase type checks.
+ignore_missing_imports = true
+# Gradual typing: untyped function bodies are not type-checked. Tightening
+# to `check_untyped_defs = true` is a follow-up once newer services are
+# fully annotated.
+check_untyped_defs = false
+
+[tool.bandit]
+# Skip checks that are false-positives for our codebase:
+#   B104 — uvicorn `host = "0.0.0.0"` is the intended bind for the API
+#          container. The boundary is the ingress/firewall, not the app.
+#   B608 — "hardcoded SQL" reports fire on f-string SQL where the only
+#          interpolated values are *schema/table identifiers from our own
+#          config* (vector_store_schema, vault-scoped vt_* names) plus
+#          static DDL in migrations. Every user-controlled value reaches
+#          PG via asyncpg `$N` placeholders. The real `akb_sql`
+#          user-supplied path is sandboxed in table_service._validate_sql_surface.
+skips = ["B104", "B608"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

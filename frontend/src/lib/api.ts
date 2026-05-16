@@ -4,7 +4,8 @@ let _token: string | null = null;
 
 export function setToken(t: string | null) {
   _token = t;
-  t ? localStorage.setItem("akb_token", t) : localStorage.removeItem("akb_token");
+  if (t) localStorage.setItem("akb_token", t);
+  else localStorage.removeItem("akb_token");
 }
 
 export function getToken(): string | null {

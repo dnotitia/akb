@@ -1527,7 +1527,7 @@ akb_unlink(
 ```""",
 
     # ── Vault skill ───────────────────────────────────────────
-    "vault-skill": None,  # populated after VAULT_SKILL_TOPIC_BODY is defined below
+    "vault-skill": "",  # populated after VAULT_SKILL_TOPIC_BODY is defined below
 
 }
 

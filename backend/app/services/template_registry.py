@@ -72,11 +72,14 @@ def _scan() -> None:
         summaries.append(
             TemplateSummary(
                 name=name,
-                display_name=data.get("display_name", name),
-                description=data.get("description", ""),
+                display_name=str(data.get("display_name") or name),
+                description=str(data.get("description") or ""),
                 collection_count=len(collections),
                 collections=[
-                    CollectionSummary(path=c["path"], name=c.get("name", c["path"]))
+                    CollectionSummary(
+                        path=c["path"],
+                        name=str(c.get("name") or c["path"]),
+                    )
                     for c in collections
                     if isinstance(c, dict) and "path" in c
                 ],

@@ -477,7 +477,7 @@ async def execute_sql(
                     rows = await conn.fetch(rewritten)
                     result_rows = []
                     for r in rows:
-                        row = {}
+                        row: dict = {}
                         for k, v in dict(r).items():
                             if isinstance(v, uuid.UUID):
                                 row[k] = str(v)

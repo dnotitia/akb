@@ -386,6 +386,7 @@ class PgvectorStore:
         pool = await self._pool()
 
         async def _dense_leg() -> list[str]:
+            assert query_dense is not None  # gated by has_dense in caller; for mypy
             async with pool.acquire() as c:
                 await self._ensure_codec(c)
                 return await self._search_dense(

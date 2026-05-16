@@ -23,8 +23,9 @@ jobs:
           python-version: '3.11'
           # No cache — the only python dep we need here is ruff,
           # installed in the next step.
-      - name: Install ruff
-        run: pip install 'ruff>=0.6.0'
+      - name: Install backend lint/type/sec tools
+        # Same versions as backend/pyproject.toml [project.optional-dependencies] dev.
+        run: pip install 'ruff>=0.6.0' 'mypy>=1.10.0' 'bandit[toml]>=1.7.0'
 
       # ── Node / pnpm (for `tsc --noEmit` in scripts/check.sh) ───
       - uses: pnpm/action-setup@v4

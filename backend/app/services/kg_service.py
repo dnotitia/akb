@@ -467,9 +467,9 @@ async def _batch_resolve_names(
             doc_paths, vault_id,
         )
         for r in rows:
-            uri = doc_uris.get(r["path"])
-            if uri:
-                names[uri] = r["title"]
+            doc_uri_opt = doc_uris.get(r["path"])
+            if doc_uri_opt:
+                names[doc_uri_opt] = r["title"]
         # Fallback for unresolved (cross-vault or genuinely missing): use
         # the path/identifier so the visualization still renders something.
         for path, uri in doc_uris.items():
@@ -483,9 +483,9 @@ async def _batch_resolve_names(
             table_names, vault_id,
         )
         for r in rows:
-            uri = table_uris.get(r["name"])
-            if uri:
-                names[uri] = r["description"] if r["description"] else r["name"]
+            tbl_uri_opt = table_uris.get(r["name"])
+            if tbl_uri_opt:
+                names[tbl_uri_opt] = r["description"] if r["description"] else r["name"]
         for tname, uri in table_uris.items():
             if uri not in names:
                 names[uri] = tname
@@ -497,9 +497,9 @@ async def _batch_resolve_names(
             file_ids, vault_id,
         )
         for r in rows:
-            uri = file_uris.get(r["id"])
-            if uri:
-                names[uri] = r["name"]
+            file_uri_opt = file_uris.get(r["id"])
+            if file_uri_opt:
+                names[file_uri_opt] = r["name"]
         for fid, uri in file_uris.items():
             if uri not in names:
                 names[uri] = fid

@@ -16,6 +16,21 @@ step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 step "ruff (backend)"
 ruff check backend/
 
+# ─── backend: mypy (types) ─────────────────────────────────────────
+step "mypy (backend)"
+(cd backend && mypy app/ mcp_server/)
+
+# ─── backend: bandit (security) ────────────────────────────────────
+# Gate at medium severity — low-level findings on `random`, `try/except
+# pass`, etc. would drown out the real signals. The pyproject [tool.bandit]
+# section explains the two skipped tests (B104, B608).
+step "bandit (backend)"
+(cd backend && bandit -r app/ mcp_server/ -c pyproject.toml --severity-level medium -q)
+
+# ─── frontend: eslint (lint) ──────────────────────────────────────
+step "eslint (frontend)"
+(cd frontend && npx --no-install eslint src)
+
 # ─── frontend: tsc --noEmit (type) ────────────────────────────────
 # `frontend/` has its own tsconfig; running tsc from inside the dir
 # picks it up automatically. node_modules must already be installed —
