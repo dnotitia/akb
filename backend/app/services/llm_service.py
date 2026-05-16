@@ -12,7 +12,6 @@ import json
 import logging
 from typing import Any
 
-import httpx
 
 from app.config import settings
 from app.services import http_pool

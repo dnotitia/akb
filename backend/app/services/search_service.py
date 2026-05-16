@@ -22,7 +22,6 @@ from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import get_vector_store
 from app.services.rerank_service import RerankError, rerank
-from app.utils import ensure_dict
 
 logger = logging.getLogger("akb.search")
 

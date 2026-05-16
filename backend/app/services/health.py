@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from app.services import delete_worker, embed_worker, metadata_worker
+from app.services import embed_worker, metadata_worker
 
 
 async def vault_health(vault_id: uuid.UUID) -> dict:

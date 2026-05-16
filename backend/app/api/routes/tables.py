@@ -1,7 +1,6 @@
 """REST API routes for vault tables (structured data)."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access

@@ -218,7 +218,8 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
     vocab = await get_or_create_term_ids(term_counts.keys())
 
     stats = await load_stats()
-    total_docs = int(stats.get("total_docs") or 0)
+    # total_docs is only needed for query-side IDF (see encode_query); doc
+    # encoding works on TF saturation + dl normalization only.
     avgdl_raw = float(stats.get("avgdl") or 0)
     avgdl = avgdl_raw if avgdl_raw > 0 else 1.0
     k1 = float(stats.get("k1") or settings.bm25_k1)

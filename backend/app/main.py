@@ -14,7 +14,7 @@ from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.api.routes import access, auth, documents, files, memory, public, search, collections, knowledge, sessions, tables
-from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, metadata_worker
+from app.services import embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.health import vault_health

@@ -41,5 +41,15 @@ build-backend = "hatchling.build"
 target-version = "py311"
 line-length = 120
 
+[tool.ruff.lint]
+# Default ruleset is `[E, F]`. The three style rules below are routinely
+# the wrong call for this codebase:
+#   E402 — lazy/conditional imports (heavy ML/Kiwi/embedding modules) are
+#          deliberately deferred past the file top to keep import-time
+#          fast and side-effect-free.
+#   E701/E702 — single-line `if x: do_y` and `x = …; y = …` are kept for
+#          tight setup blocks; splitting hurts readability more than it helps.
+ignore = ["E402", "E701", "E702"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

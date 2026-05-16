@@ -1,7 +1,6 @@
 """REST API routes for vault access management."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.services.auth_service import AuthenticatedUser

@@ -19,7 +19,7 @@ import re
 import uuid
 
 from app.db.postgres import get_pool
-from app.services.uri_service import parse_uri, doc_uri, table_uri, file_uri
+from app.services.uri_service import parse_uri, doc_uri
 
 logger = logging.getLogger("akb.graph")
 

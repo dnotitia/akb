@@ -168,7 +168,7 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
         if vault["owner_id"] == target["id"]:
             raise ForbiddenError("Cannot revoke owner's access. Use transfer_ownership instead.")
 
-        result = await conn.execute(
+        await conn.execute(
             "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
             vault["id"], target["id"],
         )
@@ -364,8 +364,6 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
         # `vt_<sanitised>__<sanitised>` PG identifiers.
         from app.repositories.table_data_repo import pg_table_name
         pg_names = [pg_table_name(vault_name, r["name"]) for r in registry]
-        # Map back PG name → registry short name for output.
-        short_by_pg = {pg_table_name(vault_name, r["name"]): r["name"] for r in registry}
         col_rows = await conn.fetch(
             """
             SELECT c.relname AS table_name, a.attname AS name,

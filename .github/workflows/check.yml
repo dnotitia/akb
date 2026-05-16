@@ -1,0 +1,44 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs on the same ref — only the latest PR push matters.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Static analysis (ruff + tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python ─────────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # No cache — the only python dep we need here is ruff,
+          # installed in the next step.
+      - name: Install ruff
+        run: pip install 'ruff>=0.6.0'
+
+      # ── Node / pnpm (for `tsc --noEmit` in scripts/check.sh) ───
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend deps
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      # ── Single entry point so CI and local pre-commit stay in sync ──
+      - name: Run scripts/check.sh
+        run: bash scripts/check.sh
