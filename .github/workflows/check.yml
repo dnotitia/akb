@@ -38,7 +38,12 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
       - name: Install frontend deps
         working-directory: frontend
-        run: pnpm install --frozen-lockfile
+        # `--ignore-scripts` skips package postinstall hooks. We don't need
+        # them in CI — msw's postinstall registers a browser service-worker
+        # bundle that node-only vitest/RTL never touches — and pnpm 10+
+        # exits non-zero on any unapproved build script even with
+        # `pnpm.onlyBuiltDependencies` set when run via the action.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh
