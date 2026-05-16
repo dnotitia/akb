@@ -12,6 +12,19 @@
 # 7. Nonsense query returns 0 cleanly
 # 8. /grep keeps working (sanity regression)
 #
+# Known flakiness (issue #42):
+# ---------------------------
+# Scenarios 3/4 (Korean/English BM25 recall) and 5 (reindex) intermittently
+# fail when run against the Seahorse-managed validation tier. Root cause is
+# *not* in this codebase — Seahorse indexes asynchronously and an upserted
+# point's visibility to /v2/data/search varies from ~5s to >300s on
+# different batches. We mitigate with `wait_for_indexing` (#47, 60s buffer)
+# and `search_until_hit` (#56, 10×20s polling), which gets stability to
+# ~60% on the validation tier; the remaining flake is upstream and
+# accepted. Re-run a failed run before treating it as a regression.
+# Production agent flows aren't affected — they tolerate the indexing
+# lag by design.
+#
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
@@ -136,11 +149,47 @@ search_total() {
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total', 0))" 2>/dev/null
 }
 
+# Issue one akb_search and return pipe-joined titles. Used by tests
+# that expect 0 hits (isolation, nonsense) — no retry, the empty
+# response is the assertion.
 search_titles() {
   local q=$1 vault=$2
   local R
   R=$(mcp_call akb_search "{\"query\":\"$q\",\"vault\":\"$vault\",\"limit\":10}" | mcp_result)
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join([r.get('title','') for r in d.get('results', [])]))" 2>/dev/null
+}
+
+# Polls akb_search until `expected_substr` appears in the result
+# titles, up to `AKB_SEARCH_RETRIES` times with `AKB_SEARCH_RETRY_INTERVAL`s
+# spacing. Returns the latest titles (may not contain the substring
+# on timeout — caller's grep assertion catches that).
+#
+# E2E only. Seahorse's async indexing means a fresh upsert can be
+# invisible to /v2/data/search for tens of seconds; merely checking
+# "non-empty" isn't enough because an unrelated doc (e.g. the auto-
+# seeded Vault Skill) can satisfy that while the doc-under-test is
+# still propagating. Polling for the specific expected substring
+# closes that hole without adding a fixed long sleep.
+search_until_hit() {
+  local q=$1 vault=$2 expected=$3
+  local titles=""
+  # Defaults sized for Seahorse-managed validation tier: most fresh
+  # upserts surface within ~30s, but P99 outlier batches push past
+  # 150s. 10×20s = 200s gives the slow batches headroom while the
+  # fast path still returns after the first probe.
+  local retries="${AKB_SEARCH_RETRIES:-10}"
+  local interval="${AKB_SEARCH_RETRY_INTERVAL:-20}"
+  local i=0
+  while [ "$i" -le "$retries" ]; do
+    titles=$(search_titles "$q" "$vault")
+    if echo "$titles" | grep -q "$expected"; then
+      echo "$titles"
+      return 0
+    fi
+    i=$((i + 1))
+    [ "$i" -le "$retries" ] && sleep "$interval"
+  done
+  echo "$titles"
 }
 
 # ── 3. Dense recall ──────────────────────────────────────────
@@ -152,7 +201,7 @@ search_titles() {
 echo ""
 echo "▸ 3. Dense recall (natural-language with keyword anchor)"
 
-TITLES=$(search_titles "tuning PostgreSQL for better performance" "$VAULT_A")
+TITLES=$(search_until_hit "tuning PostgreSQL for better performance" "$VAULT_A" "PostgreSQL")
 if echo "$TITLES" | grep -q "PostgreSQL"; then
   pass "natural-language query → postgres doc"
 else
@@ -163,14 +212,14 @@ fi
 echo ""
 echo "▸ 4. BM25 recall (short keyword)"
 
-TITLES=$(search_titles "GraphQL" "$VAULT_A")
+TITLES=$(search_until_hit "GraphQL" "$VAULT_A" "GraphQL")
 if echo "$TITLES" | grep -q "GraphQL"; then
   pass "single keyword → graphql doc"
 else
   fail "bm25-en" "expected GraphQL doc, got: $TITLES"
 fi
 
-TITLES=$(search_titles "쿠버네티스" "$VAULT_A")
+TITLES=$(search_until_hit "쿠버네티스" "$VAULT_A" "Kubernetes")
 if echo "$TITLES" | grep -q "Kubernetes"; then
   pass "Korean keyword → kubernetes doc"
 else
@@ -188,7 +237,7 @@ else
   pass "vault A search does not leak vault B doc"
 fi
 
-TITLES=$(search_titles "private" "$VAULT_B")
+TITLES=$(search_until_hit "private" "$VAULT_B" "Vault B private")
 if echo "$TITLES" | grep -q "Vault B private"; then
   pass "vault B search finds its own doc"
 else
@@ -206,7 +255,7 @@ if [ -n "$GQL_DOC_URI" ]; then
   ${AKB_RECOMPUTE_CMD:-docker compose exec -T backend python -m scripts.init_bm25_vocab} \
     >/dev/null 2>&1 || true
 
-  TITLES=$(search_titles "Apollo" "$VAULT_A")
+  TITLES=$(search_until_hit "Apollo" "$VAULT_A" "GraphQL")
   if echo "$TITLES" | grep -q "GraphQL"; then
     pass "updated content is searchable"
   else
