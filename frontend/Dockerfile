@@ -4,7 +4,11 @@ RUN npm install -g pnpm@latest
 
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+# `--ignore-scripts` skips devDependency postinstall hooks (e.g. msw's
+# service-worker bundle registration). The image only runs the built
+# SPA via nginx — none of those hooks are needed at runtime, and pnpm
+# 10+ otherwise exits non-zero when it sees them.
+RUN pnpm install --frozen-lockfile --ignore-scripts
 
 COPY . .
 RUN npx vite build
