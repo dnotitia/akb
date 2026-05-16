@@ -10,10 +10,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.60.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -26,6 +28,7 @@
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
     "jsdom": "^29.0.2",
+    "msw": "^2.14.6",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.59.3",
     "vite": "^8.0.1",
