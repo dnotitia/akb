@@ -11,7 +11,6 @@ We verify:
      server chain which requires kiwipiepy / psycopg / /data/ filesystem).
 """
 import ast
-import textwrap
 from pathlib import Path
 
 from mcp_server.instructions import INSTRUCTIONS

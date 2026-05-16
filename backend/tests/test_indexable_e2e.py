@@ -27,11 +27,10 @@ import uuid
 
 sys.path.insert(0, "/app")
 
-from app.config import settings  # noqa: E402
 from app.db.postgres import get_pool, init_db, close_pool  # noqa: E402
 from app.services.index_service import (  # noqa: E402
-    build_doc_metadata_header, build_table_chunk, build_file_chunk,
-    chunk_markdown, generate_embeddings, write_source_chunks,
+    build_table_chunk, build_file_chunk,
+    generate_embeddings, write_source_chunks,
     delete_table_chunks, delete_file_chunks,
 )
 from app.services.search_service import SearchService  # noqa: E402
@@ -253,12 +252,13 @@ async def t12_delete_table_chunk():
     fake_id = uuid.uuid4()
     # Insert synthetic table chunk then delete, verify
     pool = await get_pool()
-    from app.services.index_service import build_table_chunk, write_source_chunks, delete_table_chunks
+    from app.services.index_service import write_source_chunks
     chunk = build_table_chunk(
         vault_name="_test", name="_e2e_fake_table_",
         description="e2e fake", columns=[{"name": "x", "type": "text"}],
     )
-    embs = await generate_embeddings([chunk.content])
+    # Side-effect call to verify embedding API still answers — discard.
+    await generate_embeddings([chunk.content])
     async with pool.acquire() as conn:
         vault_id = await _get_or_create_test_vault(conn)
         await write_source_chunks(
@@ -293,7 +293,8 @@ async def t13_delete_file_chunk():
         mime_type="application/pdf", size_bytes=100,
         description="e2e fake file",
     )
-    embs = await generate_embeddings([chunk.content])
+    # Side-effect call to verify embedding API still answers — discard.
+    await generate_embeddings([chunk.content])
     async with pool.acquire() as conn:
         vault_id = await _get_or_create_test_vault(conn)
         await write_source_chunks(

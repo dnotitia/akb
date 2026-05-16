@@ -1,7 +1,6 @@
 """REST API routes for auth — register, login, PAT management."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.exceptions import NotFoundError

@@ -1,8 +1,7 @@
 """Unit test: create_vault seeds overview/vault-skill.md with type=skill."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.document_service import DocumentService, VAULT_SKILL_SEED_TEMPLATE
+from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
 
 
 def test_seed_template_constant_exists():

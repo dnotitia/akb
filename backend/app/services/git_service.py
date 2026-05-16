@@ -597,7 +597,7 @@ class GitService:
             # Parse commit message for action/summary
             lines = c.message.strip().split("\n")
             subject = lines[0] if lines else ""
-            body_lines = [l.strip() for l in lines[1:] if l.strip()]
+            body_lines = [line.strip() for line in lines[1:] if line.strip()]
 
             meta = {}
             for bl in body_lines:

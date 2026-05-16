@@ -95,7 +95,7 @@ from app.services.index_service import (
 from app.services.kg_service import delete_document_relations, store_document_relations
 from app.services.uri_service import doc_uri, table_uri, file_uri
 from app.repositories import table_data_repo
-from app.utils import ensure_dict, ensure_list
+from app.utils import ensure_list
 
 logger = logging.getLogger("akb.documents")
 
@@ -960,14 +960,13 @@ class DocumentService:
             logger.warning("Template not found: %s", template)
             return
 
-        now = datetime.now(timezone.utc)
         for coll in tmpl.get("collections", []):
             path = coll["path"]
             coll_name = coll.get("name", path)
             guide = coll.get("guide", "")
 
             # Create collection
-            coll_id = await coll_repo.get_or_create(vault_id, path)
+            await coll_repo.get_or_create(vault_id, path)
 
             # Create _guide.md in collection
             if guide:

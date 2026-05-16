@@ -24,15 +24,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent
 
-from app.config import settings
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import NotFoundError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
-from app.services.uri_service import doc_uri, table_uri, file_uri, parse_uri, split_uri
+from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
     check_vault_access, grant_access, revoke_access, list_vault_members,
     list_accessible_vaults, get_vault_info, search_users, transfer_ownership,
@@ -41,12 +40,11 @@ from app.services.access_service import (
 from app.services.auth_service import resolve_token
 from app.services.memory_service import remember, recall, forget
 from app.services import publication_service, table_service
-from app.services.publication_service import parse_expires_in
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.tools import TOOLS
-from mcp_server.help import HELP, _resolve_help
+from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 
 

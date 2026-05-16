@@ -28,7 +28,6 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.config import settings

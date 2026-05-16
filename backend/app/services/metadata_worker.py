@@ -19,8 +19,8 @@ identical contract to `embed_worker`.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import uuid  # noqa: F401  — referenced in PEP 563 string annotation
 from datetime import datetime, timedelta, timezone
 
 from app.db.postgres import get_pool
