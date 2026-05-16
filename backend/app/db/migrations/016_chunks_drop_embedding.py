@@ -1,7 +1,7 @@
 """Migration 016: drop chunks.embedding + embed_* columns.
 
 Phase 4 of the vector-store driver abstraction (see
-docs/superpowers/specs/2026-05-07-vector-store-driver-abstraction.md).
+docs/design/2026-05-07-vector-store-driver-abstraction.md).
 
 Source-of-truth split flips: main PG holds chunk text + metadata only;
 the *vector store* (Qdrant or pgvector — operator's choice) owns the

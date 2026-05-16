@@ -2,8 +2,7 @@
 #
 # AKB Collection Lifecycle E2E Tests
 # Covers akb_create_collection / akb_delete_collection MCP tools and the
-# matching REST endpoints. See plan:
-#   docs/superpowers/plans/2026-05-12-collection-lifecycle-viewer-toggle.md
+# matching REST endpoints.
 #
 set -uo pipefail
 

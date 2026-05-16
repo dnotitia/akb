@@ -57,6 +57,11 @@ Desktop.ini
 # Claude Code
 .claude/
 
+# AI-assistant scratch — superpowers skill writes plans/specs here by default.
+# Keep the design assets at docs/design/ (curated) and let the working
+# directory stay local-only.
+/docs/superpowers/
+
 # Docker
 *.log
 
