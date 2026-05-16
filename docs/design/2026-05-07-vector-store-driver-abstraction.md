@@ -2,7 +2,6 @@
 
 **Status**: Approved 2026-05-07 — implementation in progress
 **Date**: 2026-05-07
-**Owner**: 한병전
 **Target**: Pre-OSS release. Replace the hard dependency on Qdrant with a
 driver-pluggable `VectorStore` interface. Ship with **pgvector** as the
 default OSS driver and **Qdrant** as an optional driver. Same codebase.
