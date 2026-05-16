@@ -20,7 +20,7 @@ VAULT_A="hybrid-a-$(date +%s)"
 VAULT_B="hybrid-b-$(date +%s)"
 # Background workers (embedding + vector indexer) are async; tune this upward
 # if the embedding API is slow.
-INDEX_WAIT="${AKB_HYBRID_INDEX_WAIT:-20}"
+INDEX_WAIT="${AKB_HYBRID_INDEX_WAIT:-40}"
 PASS=0
 FAIL=0
 ERRORS=()
@@ -118,6 +118,11 @@ pass "4 docs seeded"
 
 echo "    waiting ${INDEX_WAIT}s for async embedding + vector-store indexing…"
 sleep "$INDEX_WAIT"
+# Force BM25 stats recompute so the freshly-indexed chunks are reflected
+# in `bm25_stats` (the background refresher only fires when delta >= 50
+# chunks — small-corpus tests never clear that threshold).
+${AKB_RECOMPUTE_CMD:-docker compose exec -T backend python -m scripts.init_bm25_vocab} \
+  >/dev/null 2>&1 || true
 
 search_total() {
   local q=$1 vault=$2
@@ -193,6 +198,8 @@ if [ -n "$GQL_DOC_URI" ]; then
   mcp_call akb_update "{\"uri\":\"$GQL_DOC_URI\",\"content\":\"## Intro\\n\\nGraphQL is a query language. Updated content now mentions Apollo and Relay clients. Federation allows composing services.\",\"message\":\"test re-index\"}" >/dev/null
   echo "    waiting ${INDEX_WAIT}s for re-index…"
   sleep "$INDEX_WAIT"
+  curl -sk -X POST "$BASE_URL/api/v1/search/bm25/recompute" \
+    -H "Authorization: Bearer $JWT" >/dev/null 2>&1
 
   TITLES=$(search_titles "Apollo" "$VAULT_A")
   if echo "$TITLES" | grep -q "GraphQL"; then
@@ -219,6 +226,18 @@ if [ -n "$GQL_DOC_URI" ]; then
     pass "deleted doc is no longer returned"
   fi
 fi
+
+# ── 7b. Response shape: returned vs total_matches (#35) ──────
+# `total` alias kept for back-compat; `returned`/`total_matches` are new.
+R=$(mcp_call akb_search "{\"query\":\"PostgreSQL\",\"vault\":\"$VAULT_A\",\"limit\":2}" | mcp_result)
+RETURNED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned'))")
+TOTAL_M=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches'))")
+TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total'))")
+[ "$RETURNED" = "$TOTAL" ] && pass "returned == legacy total ($RETURNED)" || fail "returned" "returned=$RETURNED total=$TOTAL"
+# total_matches must always be ≥ returned (limit-as-count guarantee).
+[ -n "$TOTAL_M" ] && [ "$TOTAL_M" -ge "$RETURNED" ] 2>/dev/null \
+  && pass "total_matches ($TOTAL_M) >= returned ($RETURNED)" \
+  || fail "total_matches" "got total_matches=$TOTAL_M returned=$RETURNED"
 
 # ── 8. Nonsense query returns 0 ──────────────────────────────
 # Queries with no vocab overlap (random strings, fully OOV tokens) are

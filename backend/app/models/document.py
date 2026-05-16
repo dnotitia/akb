@@ -153,8 +153,21 @@ class SearchResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """Response for akb_search."""
+    """Response for akb_search.
+
+    `returned` is the number of items in `results` (post-limit / post-rerank).
+    `total_matches` is how many unique hits the prefetch window saw before
+    the limit was applied — gives callers a way to distinguish "this is
+    the full set" from "first N of more". When `total_matches > returned`
+    the agent should re-issue with a larger `limit` rather than treating
+    `returned` as the population.
+
+    `total` is kept as a deprecated alias of `returned` for backward
+    compatibility with existing UI / agent prompts.
+    """
 
     query: str
     total: int
+    returned: int = 0
+    total_matches: int = 0
     results: list[SearchResult]

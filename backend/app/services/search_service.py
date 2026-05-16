@@ -180,7 +180,7 @@ class SearchService:
                     candidate_source_ids.extend(str(r["id"]) for r in frows)
 
                 if not candidate_source_ids:
-                    return SearchResponse(query=query, total=0, results=[])
+                    return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[])
 
         target_unique = (
             max(settings.rerank_prefetch, limit) if settings.rerank_enabled else limit
@@ -212,6 +212,11 @@ class SearchService:
             if len(unique_hits) >= target_unique:
                 break
 
+        # Capture pre-limit count so callers can tell "this is the full
+        # set" from "first N of more" — the limit-as-count confusion was
+        # observed in the KISA RAG PoC (issue #35).
+        total_matches = len(unique_hits)
+
         if settings.rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
 
@@ -221,7 +226,14 @@ class SearchService:
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
         results = await self._hydrate_hits(unique_hits)
-        return SearchResponse(query=query, total=len(results), results=results)
+        returned = len(results)
+        return SearchResponse(
+            query=query,
+            total=returned,  # deprecated alias of `returned`
+            returned=returned,
+            total_matches=total_matches,
+            results=results,
+        )
 
     async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
         from app.services.index_service import SOURCE_TYPES
