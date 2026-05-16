@@ -16,16 +16,16 @@
 # Boot flow is supervisord-managed. See entrypoint.sh + supervisord.conf.
 #
 # Build:
-#   docker build -f deploy/all-in-one/Dockerfile -t dnotitia/akb .
+#   docker build -f deploy/all-in-one/Dockerfile -t dnseahorse/akb .
 # Run (MCP introspection works without any external API key):
-#   docker run --rm -p 8080:8080 dnotitia/akb
+#   docker run --rm -p 8080:8080 dnseahorse/akb
 # Run with embeddings/search enabled:
 #   docker run --rm -p 8080:8080 \
 #       -e EMBED_API_KEY=sk-... \
 #       -e EMBED_BASE_URL=https://api.openai.com/v1 \
 #       -e EMBED_MODEL=text-embedding-3-small \
 #       -e EMBED_DIMENSIONS=1536 \
-#       dnotitia/akb
+#       dnseahorse/akb
 
 # ---------- frontend build ----------
 FROM node:22-slim AS frontend-builder
