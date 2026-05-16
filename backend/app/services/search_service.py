@@ -366,6 +366,15 @@ class SearchService:
             logger.warning("sparse encode_query failed (%s); dense-only path", e)
             sparse_idx, sparse_vals = [], []
 
+        # Hybrid requires a sparse signal. If encode_query succeeded but
+        # returned no vocab terms (OOV / nonsense query) AND the embedding
+        # API succeeded (query_embedding not None), the right answer is [].
+        # Dense-only is a degraded mode for embedding-API outage, not for
+        # OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
+        # text and would return plausible-looking distractor neighbours.
+        if not sparse_idx and query_embedding is not None:
+            return []
+
         # max(limit*3, 50): same heuristic the legacy native-fusion path used.
         # Driver-agnostic now, but the value transfers cleanly — RRF
         # fusion benefits from generous prefetch in either driver.
