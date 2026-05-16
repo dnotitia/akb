@@ -1,15 +1,32 @@
 # Shared helper sourced by E2E scripts.
 #
 # wait_for_indexing — polls /health until both the embedding backfill and
-# the vector-store upsert backfill report pending=0, or until max_wait
-# seconds pass. Lets tests run on slow remote embedding endpoints
-# (OpenRouter, OpenAI) where the async embed_worker + vector_indexer
-# can take several seconds to drain after a write burst.
+# the vector-store upsert backfill report pending=0, then waits an extra
+# `AKB_VISIBILITY_BUFFER` seconds (default 60) for the upstream vector
+# store to actually surface the upserted points in search results.
 #
-# Usage: wait_for_indexing [max_wait_seconds]    (default: 90)
+# Why the buffer
+# --------------
+# Seahorse (the managed vector store the AKB validation tier runs
+# against) indexes asynchronously — `vector_indexed_at` is set the
+# moment /v2/data upsert returns 200 OK, but the new point isn't
+# visible to /v2/data/search until propagation completes. Measured on
+# the validation tier during #42 debugging:
+#   - simple PUT visible at ~5–10s
+#   - update (drop+insert) visible at ~30–55s
+# 60s is the conservative buffer that gets test_hybrid_search_e2e to
+# 21/21 stably. Drivers without this lag (pgvector for local dev) can
+# set AKB_VISIBILITY_BUFFER=0 to skip the wait entirely.
+#
+# Override with AKB_VISIBILITY_BUFFER=0 when running against a
+# zero-lag driver (e.g. local pgvector); the polling stays correct
+# either way.
+#
+# Usage: wait_for_indexing [max_wait_seconds]    (default: 180)
 
 wait_for_indexing() {
   local max_wait="${1:-180}"
+  local buffer="${AKB_VISIBILITY_BUFFER:-60}"
   local start
   start=$(date +%s)
   # Require pending=0 to hold for two consecutive polls — guards against
@@ -33,7 +50,10 @@ except Exception:
 " 2>/dev/null)
     if [ "$pending" = "0" ]; then
       stable=$((stable + 1))
-      [ "$stable" -ge 2 ] && { sleep 1; return 0; }
+      if [ "$stable" -ge 2 ]; then
+        [ "$buffer" -gt 0 ] && sleep "$buffer"
+        return 0
+      fi
     else
       stable=0
     fi
