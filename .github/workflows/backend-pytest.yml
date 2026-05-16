@@ -1,0 +1,41 @@
+name: backend-pytest
+
+# Closes the gap that `check.yml` couldn't: unit tests under
+# `backend/tests/test_*.py` import asyncpg, kiwipiepy, etc., so they
+# need backend runtime deps installed. Lives in its own workflow so
+# the heavy install doesn't slow down the lint/type/vitest gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: backend-pytest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: backend unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install backend (runtime + dev)
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Run unit tests
+        working-directory: backend
+        # `-k 'not _e2e'` excludes the two e2e files that need a live
+        # backend pod (test_indexable_e2e.py, test_rerank_e2e.py).
+        # Shell e2e suites under tests/*.sh aren't picked up by pytest.
+        run: pytest tests/ -k 'not _e2e' -v --tb=short
