@@ -317,6 +317,8 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         _q("SELECT 1 FROM vault_external_git WHERE vault_id = $1", vid),
     )
 
+    tables = await _list_tables_with_schema(vault_name, vid) if table_count else []
+
     return {
         "name": vault["name"],
         "description": vault["description"],
@@ -333,10 +335,90 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         "table_count": table_count,
         "file_count": file_count,
         "edge_count": edge_count,
+        "tables": tables,
         "last_activity": last_doc["updated_at"].isoformat() if last_doc else None,
         "last_active_user": last_doc["created_by"] if last_doc else None,
         "created_at": vault["created_at"].isoformat(),
     }
+
+
+async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
+    """Return [{name, row_count, columns: [{name, type, example?}]}, …]
+    for every table in `vault_id`.
+
+    Pre-loads schema + sample so agents don't have to run mid-flow
+    `information_schema.columns` lookups (issue #34 KISA RAG PoC pattern —
+    122 such calls observed across 107 queries).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        registry = await conn.fetch(
+            "SELECT id, name FROM vault_tables WHERE vault_id = $1 ORDER BY name",
+            vault_id,
+        )
+        if not registry:
+            return []
+
+        # All columns for the vault's vt_* tables in one query — use the
+        # canonical sanitizer so hyphenated vault names map to the actual
+        # `vt_<sanitised>__<sanitised>` PG identifiers.
+        from app.repositories.table_data_repo import pg_table_name
+        pg_names = [pg_table_name(vault_name, r["name"]) for r in registry]
+        # Map back PG name → registry short name for output.
+        short_by_pg = {pg_table_name(vault_name, r["name"]): r["name"] for r in registry}
+        col_rows = await conn.fetch(
+            """
+            SELECT c.relname AS table_name, a.attname AS name,
+                   format_type(a.atttypid, a.atttypmod) AS type, a.attnum
+              FROM pg_attribute a
+              JOIN pg_class c ON c.oid = a.attrelid
+             WHERE c.relname = ANY($1::text[])
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+             ORDER BY c.relname, a.attnum
+            """,
+            pg_names,
+        )
+        by_table: dict[str, list[dict]] = {}
+        for row in col_rows:
+            col: dict = {"name": row["name"], "type": row["type"]}
+            if row["type"] == "jsonb":
+                col["search_hint"] = f"{row['name']}::text ILIKE '%X%'"
+            by_table.setdefault(row["table_name"], []).append(col)
+
+        # Row counts + one-row sample (only when row_count > 0).
+        out: list[dict] = []
+        for r in registry:
+            pg_name = pg_table_name(vault_name, r["name"])
+            # Identifier is built from validated vault + table names —
+            # vault_tables.name is constrained by `akb_create_table`
+            # validation, so direct interpolation is safe.
+            row_count = await conn.fetchval(f'SELECT COUNT(*) FROM "{pg_name}"')
+            columns = by_table.get(pg_name, [])
+            if row_count and columns:
+                sample = await conn.fetchrow(f'SELECT * FROM "{pg_name}" LIMIT 1')
+                example_map = dict(sample) if sample else {}
+                for col in columns:
+                    val = example_map.get(col["name"])
+                    if val is not None:
+                        col["example"] = _coerce_example(val)
+            out.append({
+                "name": r["name"],
+                "row_count": row_count,
+                "columns": columns,
+            })
+        return out
+
+
+def _coerce_example(v):
+    """JSON-safe coercion for sample values (UUIDs, dates, jsonb, …)."""
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    if isinstance(v, (int, float, str, bool, list, dict)):
+        return v
+    return str(v)
 
 
 # ── Transfer ownership ──────────────────────────────────────

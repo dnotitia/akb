@@ -338,6 +338,25 @@ R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT SUM(qty) as total_q
 SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['total_qty'])" 2>/dev/null)
 [ "$SUM" = "150" ] && pass "akb_sql SUM=150" || pass "Aggregate responded ($SUM)"
 
+# vault_info now embeds table schema (#34) so agents don't run mid-flow
+# information_schema lookups. Verify columns + row_count + jsonb hint.
+R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}" | mcp_result)
+TBLS=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+tables = d.get('tables') or []
+print(len(tables))
+" 2>/dev/null)
+[ "$TBLS" -ge 1 ] 2>/dev/null && pass "vault_info has tables[] ($TBLS)" || fail "vault_info tables" "got $TBLS"
+
+HAS_COLS=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+t = next((x for x in (d.get('tables') or []) if x.get('name') == 'mcp_items'), None)
+print('yes' if t and any(c.get('name')=='product' for c in t.get('columns', [])) else 'no')
+" 2>/dev/null)
+[ "$HAS_COLS" = "yes" ] && pass "vault_info.tables.columns include 'product'" || fail "vault_info columns" "got=$HAS_COLS"
+
 # Wrong column name → fuzzy hint (issue #36)
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items WHERE producct = 'Widget'\"}" | mcp_result)
 HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
