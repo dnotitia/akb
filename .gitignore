@@ -47,6 +47,8 @@ htmlcov/
 # ClusterIssuers with real DNS-01 credentials, etc. The base manifests
 # under deploy/k8s/ stay generic; private overrides live here.
 /deploy/k8s/internal/
+/deploy/k8s/aws-internal/
+/deploy/k8s/aws-demo-internal/
 
 # OS
 .DS_Store

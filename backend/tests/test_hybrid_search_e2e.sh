@@ -18,9 +18,14 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 E2E_USER="hybrid-e2e-$(date +%s)"
 VAULT_A="hybrid-a-$(date +%s)"
 VAULT_B="hybrid-b-$(date +%s)"
-# Background workers (embedding + vector indexer) are async; tune this upward
-# if the embedding API is slow.
-INDEX_WAIT="${AKB_HYBRID_INDEX_WAIT:-40}"
+# Cap on how long we'll wait for embed_worker + vector_indexer to drain
+# (sparse + dense to the vector store) before giving up. The helper polls
+# /health, so it returns as soon as the queues are empty — INDEX_WAIT is
+# only the timeout floor for slow remote embedding endpoints (OpenRouter).
+INDEX_WAIT="${AKB_HYBRID_INDEX_WAIT:-180}"
+# Shared poll helper — replaces the previous fixed `sleep INDEX_WAIT`
+# which caused #42 (reindex-after-update flaky when sparse leg lagged).
+source "$(dirname "$0")/_wait_for_indexing.sh"
 PASS=0
 FAIL=0
 ERRORS=()
@@ -116,8 +121,8 @@ mcp_call akb_put "{\"vault\":\"$VAULT_B\",\"collection\":\"notes\",\"title\":\"V
 
 pass "4 docs seeded"
 
-echo "    waiting ${INDEX_WAIT}s for async embedding + vector-store indexing…"
-sleep "$INDEX_WAIT"
+echo "    waiting for async embedding + vector-store indexing to drain (≤${INDEX_WAIT}s)…"
+wait_for_indexing "$INDEX_WAIT" || true
 # Force BM25 stats recompute so the freshly-indexed chunks are reflected
 # in `bm25_stats` (the background refresher only fires when delta >= 50
 # chunks — small-corpus tests never clear that threshold).
@@ -196,8 +201,8 @@ echo "▸ 6. Reindex-after-update"
 
 if [ -n "$GQL_DOC_URI" ]; then
   mcp_call akb_update "{\"uri\":\"$GQL_DOC_URI\",\"content\":\"## Intro\\n\\nGraphQL is a query language. Updated content now mentions Apollo and Relay clients. Federation allows composing services.\",\"message\":\"test re-index\"}" >/dev/null
-  echo "    waiting ${INDEX_WAIT}s for re-index…"
-  sleep "$INDEX_WAIT"
+  echo "    waiting for re-index drain (≤${INDEX_WAIT}s)…"
+  wait_for_indexing "$INDEX_WAIT" || true
   ${AKB_RECOMPUTE_CMD:-docker compose exec -T backend python -m scripts.init_bm25_vocab} \
     >/dev/null 2>&1 || true
 
