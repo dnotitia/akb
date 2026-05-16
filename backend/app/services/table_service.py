@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
+from difflib import get_close_matches
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
@@ -505,4 +506,117 @@ async def execute_sql(
             msg = str(e)
             if read_only and "read-only transaction" in msg:
                 return {"error": "Write operation denied. You have read-only access to this vault."}
+            # Column/table-not-exist errors: enrich with fuzzy-match hint
+            # so agents can self-correct in a single retry instead of
+            # falling back to `information_schema` lookups or
+            # `akb_search(limit=10)` (see issues #34 / #35 / #36).
+            #
+            # Safe re-use of `conn` after the failed transaction —
+            # `async with conn.transaction()` rolls back on exception,
+            # leaving conn in healthy idle state.
+            enriched = await _enrich_undefined_error(
+                conn, msg, allowed_pg_tables=set(table_map.values())
+            )
+            if enriched:
+                return enriched
             return {"error": msg}
+
+
+# Max items listed in fallback hints (when no fuzzy suggestion strong enough).
+_HINT_LIST_LIMIT = 15
+
+_COLUMN_NOT_EXIST = _re.compile(r'column "([^"]+)" does not exist')
+_RELATION_NOT_EXIST = _re.compile(r'relation "([^"]+)" does not exist')
+
+
+async def _enrich_undefined_error(
+    conn,
+    err_msg: str,
+    *,
+    allowed_pg_tables: set[str],
+) -> dict | None:
+    """Turn a column/table-not-exist error into an actionable hint.
+
+    Backend role queries `pg_attribute` / `pg_class` directly — only the
+    user-supplied SQL is sandboxed. `allowed_pg_tables` is the caller's
+    rewritten table list (e.g. ``{"vt_sales__pipeline"}``) — we never
+    suggest names from other vaults.
+
+    Returns None when the error isn't a recoverable shape, letting the
+    caller fall through to the verbatim PG message.
+    """
+    if not allowed_pg_tables:
+        return None
+
+    # ── Column not exist ────────────────────────────────────────
+    if m := _COLUMN_NOT_EXIST.search(err_msg):
+        bad_col = m.group(1)
+        col_meta = await _fetch_column_meta(conn, allowed_pg_tables)
+        if not col_meta:
+            return None
+        hint = _fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
+        jsonb_cols = [c for c, t in col_meta.items() if t == "jsonb"]
+        if jsonb_cols:
+            hint += (
+                f"  (jsonb columns — use `<col>::text ILIKE '%X%'`: "
+                f"{', '.join(jsonb_cols)})"
+            )
+        return {
+            "error": err_msg,
+            "hint": hint,
+            "available_columns": list(col_meta.keys()),
+        }
+
+    # ── Relation/table not exist ────────────────────────────────
+    if m := _RELATION_NOT_EXIST.search(err_msg):
+        bad_rel = m.group(1)
+        # Only consult the caller's allowed tables — never leak other
+        # vaults' table names via fuzzy suggestion.
+        short_names = sorted({
+            t.split("__", 1)[1] for t in allowed_pg_tables if "__" in t
+        })
+        if not short_names:
+            return None
+        hint = _fuzzy_hint(bad_rel, short_names, label="tables")
+        hint += (
+            "  (Reference vault tables by their short name — the rewriter "
+            "prefixes them with `vt_<vault>__` automatically.)"
+        )
+        return {
+            "error": err_msg,
+            "hint": hint,
+            "available_tables": short_names,
+        }
+
+    return None
+
+
+async def _fetch_column_meta(conn, table_names: set[str]) -> dict[str, str]:
+    """{column_name: pg_type} for the union of `table_names`.
+
+    Backend pool is unsandboxed — `pg_attribute` / `pg_class` reads are
+    fine here; the protected surface is the user-supplied SQL only.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+         WHERE c.relname = ANY($1::text[])
+           AND a.attnum > 0
+           AND NOT a.attisdropped
+         ORDER BY a.attname
+        """,
+        list(table_names),
+    )
+    return {r["name"]: r["type"] for r in rows}
+
+
+def _fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
+    """Top-3 close matches → 'Did you mean…?', else first N as fallback."""
+    suggestions = get_close_matches(bad, candidates, n=3, cutoff=0.6)
+    if suggestions:
+        return f"Did you mean: {', '.join(suggestions)}?"
+    truncated = candidates[:_HINT_LIST_LIMIT]
+    suffix = " …" if len(candidates) > _HINT_LIST_LIMIT else ""
+    return f"Available {label}: {', '.join(truncated)}{suffix}"

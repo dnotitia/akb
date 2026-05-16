@@ -338,6 +338,23 @@ R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT SUM(qty) as total_q
 SUM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['total_qty'])" 2>/dev/null)
 [ "$SUM" = "150" ] && pass "akb_sql SUM=150" || pass "Aggregate responded ($SUM)"
 
+# Wrong column name → fuzzy hint (issue #36)
+R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items WHERE producct = 'Widget'\"}" | mcp_result)
+HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
+AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('available_columns',[])))" 2>/dev/null)
+case "$HINT" in
+  *"Did you mean"*"product"*) pass "akb_sql wrong column suggests 'product'" ;;
+  *) fail "akb_sql column hint" "got hint=$HINT, avail=$AVAIL" ;;
+esac
+
+# Wrong table name → fuzzy hint
+R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_itms\"}" | mcp_result)
+HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
+case "$HINT" in
+  *"Did you mean"*"mcp_items"*) pass "akb_sql wrong table suggests 'mcp_items'" ;;
+  *) fail "akb_sql table hint" "got hint=$HINT" ;;
+esac
+
 # Browse tables (unified browse replaces akb_list_tables)
 R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
 TBL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
