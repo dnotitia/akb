@@ -6,14 +6,14 @@ from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE, DocumentSer
 from app.services.auth_service import AuthenticatedUser
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
-from mcp_server.help import render_vault_skill_response, VAULT_SKILL_PATH
+from mcp_server.help import render_vault_skill_response
 
 router = APIRouter()
 doc_service = DocumentService()
 
 
-@router.get("/skill-template", response_class=PlainTextResponse, summary="Default vault-skill template body")
-async def get_skill_template() -> str:
+@router.get("/skill-template", summary="Default vault-skill template body")
+async def get_skill_template() -> PlainTextResponse:
     """Return the canonical vault-skill seed body as text/markdown.
 
     Frontend uses this to populate the 'Create from template' button so the
@@ -21,14 +21,17 @@ async def get_skill_template() -> str:
 
     The `{vault}` placeholder is left intact for the caller to substitute.
     """
-    return VAULT_SKILL_SEED_TEMPLATE
+    return PlainTextResponse(
+        content=VAULT_SKILL_SEED_TEMPLATE,
+        media_type="text/markdown",
+    )
 
 
-@router.get("/vault-skill-preview/{vault}", response_class=PlainTextResponse, summary="Agent-view preview of a vault's vault-skill")
+@router.get("/vault-skill-preview/{vault}", summary="Agent-view preview of a vault's vault-skill")
 async def get_vault_skill_preview(
     vault: str,
     user: AuthenticatedUser = Depends(get_current_user),
-) -> str:
+) -> PlainTextResponse:
     """Return the same markdown that `akb_help(topic='vault-skill', vault=X)` would emit.
 
     Used by the frontend AGENT preview segment (S6) — keeps the agent view and
@@ -49,4 +52,5 @@ async def get_vault_skill_preview(
             "updated_at": str(getattr(resp, "updated_at", "")),
         }
 
-    return await render_vault_skill_response(vault, _fetch)
+    body = await render_vault_skill_response(vault, _fetch)
+    return PlainTextResponse(content=body, media_type="text/markdown")

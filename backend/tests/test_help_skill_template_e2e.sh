@@ -15,9 +15,9 @@ echo "$RESP" | grep -q "## Purpose" && pass "Skeleton Purpose" || fail "T3" "mis
 echo "$RESP" | grep -q "{vault}" && pass "{vault} placeholder kept intact" || fail "T4" "placeholder substituted"
 echo "$RESP" | grep -q '\${{secrets.X}}' && pass "Secrets placeholder literal" || fail "T5" "secrets placeholder collapsed"
 
-echo "▸ Content-Type is text/markdown or text/plain"
+echo "▸ Content-Type is text/markdown"
 CT=$(curl -sk -I "$BASE_URL/api/v1/help/skill-template" | grep -i "^content-type:" | tr -d '\r')
-echo "$CT" | grep -qiE "text/(markdown|plain)" && pass "Content-Type ok ($CT)" || fail "T6" "wrong CT: $CT"
+echo "$CT" | grep -qi "text/markdown" && pass "Content-Type text/markdown" || fail "T6" "Content-Type should be text/markdown, got: $CT"
 
 echo ""
 echo "  Passed: $PASS  Failed: $FAIL"
