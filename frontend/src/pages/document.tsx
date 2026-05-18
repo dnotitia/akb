@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -48,10 +49,9 @@ export default function DocumentPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const view: "rendered" | "raw" =
     searchParams.get("view") === "raw" ? "raw" : "rendered";
-  const [doc, setDoc] = useState<any>(null);
   const [relations, setRelations] = useState<any[]>([]);
   const [provenance, setProvenance] = useState<any[]>([]);
-  const [error, setError] = useState("");
+  const [docOverride, setDocOverride] = useState<any>(null);
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState("");
   const [copied, setCopied] = useState(false);
@@ -76,26 +76,32 @@ export default function DocumentPage() {
       .catch(() => setVaultRole(null));
   }, [name]);
 
+  const docQuery = useQuery({
+    queryKey: ["document", name, docId],
+    queryFn: () => getDocument(name!, docId),
+    enabled: !!name && !!docId,
+    retry: false,
+  });
+
+  // Merge query data with any local overrides (publish/unpublish, frontmatter edits).
+  const doc = docOverride ?? docQuery.data ?? null;
+
   useEffect(() => {
-    if (!name || !docId) return;
-    setDoc(null);
-    setError("");
+    const d = docQuery.data;
+    if (!d) return;
+    // Reset local override when the query result changes (e.g. navigating docs).
+    setDocOverride(null);
     setProvenance([]);
-    getDocument(name, docId)
-      .then((d) => {
-        setDoc(d);
-        if (d.path && d.path !== docId) {
-          navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
-        }
-        if (d.id) {
-          getRelations(name, d.id).then((r) => setRelations(r.relations || [])).catch(() => {});
-        }
-        if (d.path) {
-          loadHistory(name, d.path);
-        }
-      })
-      .catch((e) => setError(e.message));
-  }, [name, docId]);
+    if (d.path && d.path !== docId) {
+      navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
+    }
+    if (d.id) {
+      getRelations(name!, d.id).then((r) => setRelations(r.relations || [])).catch(() => {});
+    }
+    if (d.path) {
+      loadHistory(name!, d.path);
+    }
+  }, [docQuery.data]);
 
   // History = `git log -- <doc.path>` scoped to this document.
   // The /activity endpoint's `collection` query param is plumbed to
@@ -118,11 +124,12 @@ export default function DocumentPage() {
     }
   }
 
-  if (error) {
+  if (docQuery.isError) {
+    const errorMsg = (docQuery.error as Error)?.message ?? "Unknown error";
     return (
       <div className="py-8 fade-up">
         <div className="coord-spark mb-2">⚠ ERROR</div>
-        <p className="text-destructive mb-6 max-w-xl">{error}</p>
+        <p className="text-destructive mb-6 max-w-xl">{errorMsg}</p>
         <Button asChild variant="outline">
           <Link to={`/vault/${name}`}>
             <ArrowLeft className="h-4 w-4" aria-hidden />
@@ -147,7 +154,7 @@ export default function DocumentPage() {
     setPublishError("");
     try {
       await unpublishDoc(name!, docId);
-      setDoc({ ...doc, is_public: false, public_slug: null });
+      setDocOverride({ ...doc, is_public: false, public_slug: null });
     } catch (e: any) {
       setPublishError(e?.message || "Failed to unpublish");
     }
@@ -395,7 +402,7 @@ export default function DocumentPage() {
         docId={docId}
         doc={doc}
         onSaved={(next) => {
-          setDoc({ ...doc, ...next });
+          setDocOverride({ ...doc, ...next });
           // Title/type/status changes are surfaced in the tree row
           // labels; refresh so the sidebar matches.
           refetchTree();
@@ -407,7 +414,7 @@ export default function DocumentPage() {
         onOpenChange={setPublishOpen}
         vault={name!}
         docId={docId}
-        onPublished={(slug) => setDoc({ ...doc, is_public: true, public_slug: slug })}
+        onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
       />
 
       <ConfirmDialog

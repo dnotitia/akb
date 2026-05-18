@@ -29,6 +29,16 @@ export default function VaultSkillPage() {
   }
 
   if (docQuery.isError) {
+    const errStatus = (docQuery.error as any)?.status;
+    const errMessage = String((docQuery.error as any)?.message ?? "");
+    const isNotFound = errStatus === 404 || /404/i.test(errMessage);
+    if (!isNotFound) {
+      return (
+        <div className="max-w-prose mx-auto p-12 text-sm text-foreground-muted">
+          Failed to load vault skill: {errMessage || "unknown error"}
+        </div>
+      );
+    }
     return (
       <div className="max-w-prose mx-auto p-12 flex flex-col items-start gap-4">
         <div className="flex items-center gap-2">

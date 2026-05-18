@@ -54,4 +54,15 @@ describe("VaultSkillPage", () => {
     expect(screen.getByRole("button", { name: /create from template/i })).toBeTruthy();
     spy.mockRestore();
   });
+
+  it("renders generic error (not CTA) on 403 Forbidden", async () => {
+    const err = Object.assign(new Error("403 Forbidden"), { status: 403 });
+    getDocument.mockImplementation(() => Promise.reject(err));
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(wrap("/vault/restricted-v/skill"));
+    expect(await screen.findByText(/Failed to load vault skill/i)).toBeTruthy();
+    expect(screen.queryByText(/No vault skill yet/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /create from template/i })).toBeNull();
+    spy.mockRestore();
+  });
 });
