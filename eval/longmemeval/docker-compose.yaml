@@ -1,0 +1,93 @@
+# LongMemEval benchmark stack — self-contained, isolated from local dev.
+#
+# Why a separate stack:
+#   - Pins the runtime config to the cluster's effective `akb-app-config`
+#     (bge-m3 + cohere/rerank-v3.5 + pgvector) regardless of what the
+#     dev `config/app.yaml` at repo root says.
+#   - `down -v` between full runs starts from a clean baseline without
+#     touching the main dev volumes.
+#   - Ports shifted (18000/19000/19001) so it can coexist with the main
+#     `akb` stack on `:8000`/`:9000`/`:9001`.
+#
+# Project name comes from this directory: `longmemeval`. Volumes and
+# containers are auto-prefixed (e.g. `longmemeval_postgres_data`).
+#
+# Usage:
+#   cd eval/longmemeval
+#   cp config/secret.yaml.example config/secret.yaml
+#   # edit config/secret.yaml — fill embed_api_key (OpenRouter) and
+#   # rerank_api_key (Cohere production)
+#   docker compose up -d
+#   curl http://localhost:18000/livez
+#
+# Reset for a clean run:
+#   docker compose down -v && docker compose up -d
+#
+# Frontend is intentionally omitted — benchmark runner talks REST only.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: akb
+      POSTGRES_USER: akb
+      POSTGRES_PASSWORD: akb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Install pgvector extension on first boot.  Without this, the
+      # backend's pgvector driver hits a chicken-and-egg failure
+      # (register_vector() needs the type, ensure_collection() creates
+      # it but never gets called).  See postgres-init/01-pgvector.sql.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U akb -d akb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --address :9000 --console-address :9001
+    environment:
+      MINIO_ROOT_USER: akb-local
+      MINIO_ROOT_PASSWORD: akb-local-secret
+    volumes:
+      - minio_data:/data
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-bootstrap:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 akb-local akb-local-secret &&
+      mc mb -p local/akb-files &&
+      echo 'akb-files bucket ready'
+      "
+
+  backend:
+    build: ../../backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ./config:/etc/akb:ro
+      - vault_data:/data/vaults
+    ports:
+      - "18000:8000"
+
+volumes:
+  postgres_data:
+  vault_data:
+  minio_data:

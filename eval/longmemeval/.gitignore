@@ -1,0 +1,6 @@
+# Local secrets — copy from secret.yaml.example and fill in.
+config/secret.yaml
+
+# Downloaded datasets and NDJSON outputs land elsewhere by default
+# (~/datasets, eval/reports). Add patterns here only if a local
+# convention places them inside this directory.

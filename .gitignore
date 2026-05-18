@@ -50,6 +50,11 @@ htmlcov/
 /deploy/k8s/aws-internal/
 /deploy/k8s/aws-demo-internal/
 
+# Benchmark runtime artifacts (NDJSON shards, per-worker logs, smoke
+# outputs). The runner writes here at execution time; nothing under
+# /eval/reports/ belongs in source control.
+/eval/reports/
+
 # OS
 .DS_Store
 Thumbs.db
