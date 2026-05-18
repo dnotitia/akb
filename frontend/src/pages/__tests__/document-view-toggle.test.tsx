@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 import DocumentPage from "@/pages/document";
 
@@ -50,15 +51,18 @@ function LocationProbe() {
 }
 
 function renderAt(url: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <MemoryRouter initialEntries={[url]}>
-      <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
-        <Routes>
-          <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
-        </Routes>
-      </VaultRefreshProvider>
-      <LocationProbe />
-    </MemoryRouter>,
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[url]}>
+        <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
+          <Routes>
+            <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
+          </Routes>
+        </VaultRefreshProvider>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

@@ -21,6 +21,7 @@ import PublicationPage from "@/pages/public-publication";
 import VaultMembersPage from "@/pages/vault-members";
 import VaultSettingsPage from "@/pages/vault-settings";
 import VaultActivityPage from "@/pages/vault-activity";
+import VaultSkillPage from "@/pages/vault-skill";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -52,6 +53,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/vault/:name/settings" element={<VaultSettingsPage />} />
             <Route path="/vault/:name/activity" element={<VaultActivityPage />} />
             <Route path="/vault/:name/search" element={<SearchPage />} />
+            <Route path="/vault/:name/skill" element={<VaultSkillPage />} />
           </Route>
           <Route path="/search" element={<SearchPage />} />
           <Route path="/settings" element={<SettingsPage />} />
