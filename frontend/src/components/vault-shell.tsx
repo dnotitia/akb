@@ -85,6 +85,7 @@ export function VaultShell() {
   const isGraph = location.pathname.endsWith("/graph");
   const isPublications = location.pathname.endsWith("/publications");
   const isSearch = location.pathname.endsWith("/search");
+  const isSkill = location.pathname.endsWith("/skill");
   const isMembers = location.pathname.endsWith("/members");
   const isSettings = location.pathname.endsWith("/settings");
   const isActivity = location.pathname.endsWith("/activity");
@@ -94,11 +95,13 @@ export function VaultShell() {
   const isAdminPage = isMembers || isSettings || isActivity;
   const page: VaultPageKind = isGraph
     ? "graph"
-    : isPublications
-      ? "publish"
-      : isSearch
-        ? "search"
-        : "overview";
+    : isSkill
+      ? "skill"
+      : isPublications
+        ? "publish"
+        : isSearch
+          ? "search"
+          : "overview";
 
   // /vault (no :name) — simplified shell: left nav picker + content,
   // no tree explorer, no vault actions. Keeps shell chrome consistent

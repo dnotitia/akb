@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2 } from "lucide-react";
+import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2, Sparkles } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -93,7 +93,7 @@ export function TitleBar({
   );
 }
 
-export type VaultPageKind = "overview" | "search" | "graph" | "publish";
+export type VaultPageKind = "overview" | "search" | "graph" | "skill" | "publish";
 
 interface VaultActionsProps {
   vault: string;
@@ -105,6 +105,7 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
     ["overview", "OVERVIEW", `/vault/${vault}`, Compass],
     ["search", "SEARCH", `/vault/${vault}/search`, SearchIcon],
     ["graph", "GRAPH", `/vault/${vault}/graph`, GitGraph],
+    ["skill", "SKILL", `/vault/${vault}/skill`, Sparkles],
     ["publish", "PUBLISH", `/vault/${vault}/publications`, Share2],
   ];
   return (
