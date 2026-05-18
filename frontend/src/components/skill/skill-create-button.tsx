@@ -34,8 +34,8 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
       queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
       navigate(`/vault/${vault}/skill`, { replace: true });
     } catch (e: any) {
-      const msg = e.message || "create vault skill";
-      setError(msg.toLowerCase().startsWith("failed") ? msg : `Failed: ${msg}`);
+      const raw = e?.message || "";
+      setError(raw ? `Failed to create vault skill: ${raw}` : "Failed to create vault skill");
     } finally {
       setBusy(false);
     }

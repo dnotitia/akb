@@ -60,6 +60,25 @@ async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json();
 }
 
+async function apiText(path: string, opts?: RequestInit): Promise<string> {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    ...((opts?.headers as Record<string, string>) || {}),
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  if (res.status === 401) {
+    setToken(null);
+    if (!location.pathname.startsWith("/auth")) location.href = "/auth";
+    throw new Error("Unauthorized");
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(body || `${res.status} ${res.statusText}`);
+  }
+  return res.text();
+}
+
 // ── Auth (no token) ──
 /**
  * Safely parse an auth response. If the body isn't valid JSON (empty 401,
@@ -608,19 +627,9 @@ export const getProvenance = (vault: string, docPath: string) => {
 
 // ── Help / Skill ──
 // Skill seed template (text/markdown)
-export const getSkillTemplate = async (): Promise<string> => {
-  const resp = await fetch(`${API_BASE}/help/skill-template`, {
-    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
-  });
-  if (!resp.ok) throw new Error(`getSkillTemplate failed: ${resp.status}`);
-  return resp.text();
-};
+export const getSkillTemplate = (): Promise<string> =>
+  apiText("/help/skill-template");
 
 // Agent-view preview of a vault's skill (used by S6 AGENT segment)
-export const getVaultSkillPreview = async (vault: string): Promise<string> => {
-  const resp = await fetch(`${API_BASE}/help/vault-skill-preview/${encodeURIComponent(vault)}`, {
-    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
-  });
-  if (!resp.ok) throw new Error(`getVaultSkillPreview failed: ${resp.status}`);
-  return resp.text();
-};
+export const getVaultSkillPreview = (vault: string): Promise<string> =>
+  apiText(`/help/vault-skill-preview/${encodeURIComponent(vault)}`);
