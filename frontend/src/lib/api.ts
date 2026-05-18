@@ -605,3 +605,22 @@ export const getProvenance = (vault: string, docPath: string) => {
   const p = new URLSearchParams({ uri: _docUri(vault, docPath) });
   return api<{ provenance: any }>(`/provenance?${p}`);
 };
+
+// ── Help / Skill ──
+// Skill seed template (text/markdown)
+export const getSkillTemplate = async (): Promise<string> => {
+  const resp = await fetch(`${API_BASE}/help/skill-template`, {
+    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+  });
+  if (!resp.ok) throw new Error(`getSkillTemplate failed: ${resp.status}`);
+  return resp.text();
+};
+
+// Agent-view preview of a vault's skill (used by S6 AGENT segment)
+export const getVaultSkillPreview = async (vault: string): Promise<string> => {
+  const resp = await fetch(`${API_BASE}/help/vault-skill-preview/${encodeURIComponent(vault)}`, {
+    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+  });
+  if (!resp.ok) throw new Error(`getVaultSkillPreview failed: ${resp.status}`);
+  return resp.text();
+};
