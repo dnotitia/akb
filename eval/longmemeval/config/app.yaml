@@ -1,0 +1,79 @@
+# LongMemEval benchmark runtime config — pinned to the cluster's
+# effective `akb-app-config` (bge-m3 + cohere/rerank-v3.5 + pgvector).
+#
+# Differences vs cluster yaml:
+#   - db_user: akb            (cluster: akbuser — local compose hard-codes 'akb')
+#   - s3_endpoint_url: http://minio:9000  (cluster: in-cluster IP)
+#   - s3_public_url: ""       (benchmark doesn't return presigned URLs to a browser)
+#   - public_base_url: ""     (no publication snapshots in benchmark)
+#   - llm_*: ""               (metadata_worker disabled — irrelevant to retrieval)
+#   - redis_url: ""           (no redis container in this stack — events outbox stays in PG)
+#
+# Keep this file committed: it's part of the benchmark definition.
+# Anything sensitive lives in config/secret.yaml (gitignored).
+
+# === Database ===
+db_host: postgres
+db_port: 5432
+db_name: akb
+db_user: akb
+
+# === Git storage ===
+git_storage_path: /data/vaults
+
+# === Embedding (bge-m3@1024 via OpenRouter) ===
+embed_base_url: https://openrouter.ai/api/v1
+embed_model: baai/bge-m3
+embed_dimensions: 1024
+
+# === LLM (disabled — metadata_worker unused for retrieval benchmark) ===
+# llm_base_url stays "" so metadata_worker doesn't start.  Rerank can't
+# share this fallback when it's blank, so rerank_base_url below is set
+# explicitly.
+llm_base_url: ""
+llm_model: ""
+
+# === Reranker (Cohere via OpenRouter routing) ===
+# rerank_base_url MUST be explicit here because llm_base_url is "" (the
+# default fallback path produces a bare "/rerank" without a scheme,
+# which httpx rejects).  rerank_api_key in secret.yaml is "" — service
+# falls back to llm_api_key, which holds the OpenRouter key.
+rerank_enabled: true
+rerank_provider: cohere
+rerank_model: cohere/rerank-v3.5
+rerank_base_url: https://openrouter.ai/api/v1
+rerank_prefetch: 30
+rerank_timeout_seconds: 3.0
+
+# === S3 (in-stack MinIO — required for backend to boot cleanly) ===
+s3_endpoint_url: http://minio:9000
+s3_public_url: ""
+s3_bucket: akb-files
+s3_region: ""
+
+# === Auth ===
+jwt_algorithm: HS256
+jwt_expire_hours: 24
+
+# === Server ===
+host: 0.0.0.0
+port: 8000
+public_base_url: ""
+
+# === Vector store (pgvector, same-instance same-PG, posting sparse shape) ===
+vector_store_driver: pgvector
+vector_store_dsn: ""
+vector_store_schema: vector_index
+vector_store_sparse_shape: posting
+
+# === Indexing worker tuning ===
+indexing_batch_size: 16
+
+# === BM25 ===
+bm25_k1: 1.5
+bm25_b: 0.75
+
+# === Events (no redis in this stack) ===
+redis_url: ""
+redis_event_stream: akb:events
+redis_stream_maxlen: 100000
