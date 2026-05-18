@@ -5,7 +5,7 @@ from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
 
 
 def test_seed_template_constant_exists():
-    assert "Vault Skill" in VAULT_SKILL_SEED_TEMPLATE
+    assert "Guide" in VAULT_SKILL_SEED_TEMPLATE
     assert "{vault}" in VAULT_SKILL_SEED_TEMPLATE  # substitutable
     assert "akb_put" not in VAULT_SKILL_SEED_TEMPLATE  # template is for owners to edit, not call-instructions
 

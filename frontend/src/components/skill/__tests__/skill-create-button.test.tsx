@@ -34,7 +34,7 @@ beforeEach(() => {
 
 describe("SkillCreateButton", () => {
   it("fetches template, calls putDocument, navigates on success", async () => {
-    getSkillTemplate.mockResolvedValue("# {vault} Vault Skill\n\nSeed body");
+    getSkillTemplate.mockResolvedValue("# {vault} Guide\n\nSeed body");
     putDocument.mockResolvedValue({ doc_id: "d-abc12345" });
     const u = userEvent.setup();
 
@@ -54,9 +54,9 @@ describe("SkillCreateButton", () => {
         expect.objectContaining({
           vault: "my-v",
           collection: "overview",
-          title: "Vault Skill",
+          title: "Guide",
           type: "skill",
-          content: expect.stringContaining("my-v Vault Skill"),
+          content: expect.stringContaining("my-v Guide"),
         }),
       );
     });

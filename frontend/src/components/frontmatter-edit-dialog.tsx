@@ -23,6 +23,7 @@ const DOC_TYPES = [
   "session",
   "task",
   "reference",
+  "skill",
 ] as const;
 
 const DOC_STATUSES = ["draft", "active", "archived", "superseded"] as const;

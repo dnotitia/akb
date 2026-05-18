@@ -25,7 +25,7 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
       await putDocument({
         vault,
         collection: "overview",
-        title: "Vault Skill",
+        title: "Guide",
         type: "skill",
         content,
         tags: ["akb:skill"],

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 
-VAULT_SKILL_SEED_TEMPLATE = """# {vault} Vault Skill
+VAULT_SKILL_SEED_TEMPLATE = """# {vault} Guide
 
 > Edit this document to describe how agents should write into this vault.
 > Until you do, it acts as the AKB-default template — agents fall back to
@@ -961,7 +961,7 @@ class DocumentService:
                 seed_req = DocumentPutRequest(
                     vault=name,
                     collection="overview",
-                    title="Vault Skill",
+                    title="Guide",
                     content=skill_body,
                     type="skill",
                     tags=["akb:skill"],

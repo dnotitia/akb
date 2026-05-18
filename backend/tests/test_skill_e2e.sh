@@ -85,7 +85,7 @@ echo "$GET_RESP" | grep -q '"type": *"skill"' \
   && pass "Seeded doc has type=skill" \
   || fail "T1.1" "type is not 'skill'; got: $(echo $GET_RESP | head -c 200)"
 
-echo "$GET_RESP" | grep -q "$VAULT Vault Skill" \
+echo "$GET_RESP" | grep -q "$VAULT Guide" \
   && pass "Seeded body contains vault name in title" \
   || fail "T1.2" "vault name not substituted in template title"
 

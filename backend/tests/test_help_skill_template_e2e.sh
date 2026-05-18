@@ -9,7 +9,7 @@ fail() { FAIL=$((FAIL+1)); echo "  ✗ $1 — $2"; }
 
 echo "▸ GET /api/v1/help/skill-template"
 RESP=$(curl -sk "$BASE_URL/api/v1/help/skill-template")
-echo "$RESP" | grep -q "Vault Skill" && pass "Title present" || fail "T1" "missing title"
+echo "$RESP" | grep -q "Guide" && pass "Title present" || fail "T1" "missing title"
 echo "$RESP" | grep -q "## Document Template" && pass "Document Template section present" || fail "T2" "missing section"
 echo "$RESP" | grep -q "## Purpose" && pass "Skeleton Purpose" || fail "T3" "missing Purpose"
 echo "$RESP" | grep -q "{vault}" && pass "{vault} placeholder kept intact" || fail "T4" "placeholder substituted"
