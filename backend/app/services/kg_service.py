@@ -338,10 +338,20 @@ async def get_graph(
         if resource_uri:
             await _bfs_collect(conn, vault_id, vault, resource_uri, depth, limit, nodes, edge_list)
         else:
+            # Vault-scope full graph. The cap is a visualization safety net
+            # — large graphs are unrenderable client-side — but the old code
+            # used `LIMIT (limit * 3)` *without* an ORDER BY, so PG returned
+            # an arbitrary subset and the result was non-deterministic across
+            # callers and across runs. Pin to `created_at DESC` so the cap
+            # consistently keeps the most recent edges (better UX than
+            # whatever order the heap happened to produce). The same anti-
+            # pattern that bit `grep` (count drifts with WHERE clause because
+            # the cap is tied to `limit`).
             edge_rows = await conn.fetch(
                 """
                 SELECT source_uri, target_uri, source_type, target_type, relation_type
                 FROM edges WHERE vault_id = $1
+                ORDER BY created_at DESC
                 LIMIT $2
                 """,
                 vault_id, limit * 3,

@@ -501,6 +501,23 @@ class SearchService:
                 idx += 1
 
             where_sql = " AND ".join(conditions)
+            # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited
+            # from a score-ordered hybrid search path, but `grep` matches with
+            # ILIKE — there is no score, so ORDER + LIMIT was just chopping the
+            # corpus alphabetically. Symptoms reported by users:
+            #   - vault filter gave 13 hits, no filter gave 11 (cap consumed
+            #     by vaults sorted before the real one).
+            #   - within a single vault, adding a `collection` filter raised
+            #     the count (the tighter WHERE shrank the population below
+            #     the cap, so all rows fit again).
+            # Both are the same anti-pattern: a user-facing count (total_docs /
+            # total_matches) that drifted with the WHERE clause because the
+            # cap was tied to `limit`. ILIKE is a full scan either way; the
+            # only thing the cap was buying was a memory safety net. The PG
+            # planner happily streams millions of rows back through asyncpg,
+            # and our largest vault has tens of thousands of chunks — well
+            # within budget. Drop the cap; if a pathological corpus ever
+            # becomes a real concern, gate it on `EXPLAIN` cost instead.
             rows = await conn.fetch(
                 f"""
                 SELECT d.id::text as doc_id, v.name as vault, d.path, d.title,
@@ -511,7 +528,6 @@ class SearchService:
                 JOIN vaults v ON d.vault_id = v.id
                 WHERE {where_sql}
                 ORDER BY v.name, d.path, c.chunk_index
-                LIMIT {int(limit) * 5}
                 """,
                 *params,
             )
