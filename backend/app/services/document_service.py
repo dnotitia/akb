@@ -53,6 +53,35 @@ free-form this section. Agents read it as context, not a hard schema.)
 - references — background citation
 - derived_from — generated/curated work depends on source material
 
+## Document Template
+
+When creating a new document, use this as a starting structure:
+
+```markdown
+---
+title: <Document Title>
+type: note|report|decision|spec|plan|session|reference
+tags: [topic:<slug>, source:<system>]
+---
+
+# <Document Title>
+
+## Purpose
+<Why this exists. 1-2 sentences.>
+
+## Background
+<Context, constraints.>
+
+## Decision / Result
+<Core content.>
+
+## Verification
+<How it was checked.>
+
+## Related
+<Links to other docs via akb_link or inline markdown.>
+```
+
 ## Do not
 
 - Inline secrets in bodies; use ${{secrets.X}} placeholders

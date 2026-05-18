@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
-from app.api.routes import access, auth, documents, files, memory, public, search, collections, knowledge, sessions, tables
+from app.api.routes import access, auth, documents, files, help as help_routes, memory, public, search, collections, knowledge, sessions, tables
 from app.services import embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -76,6 +76,7 @@ app.include_router(memory.router, prefix="/api/v1", tags=["memory"])
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
+app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])
 
 # Mount MCP Streamable HTTP at /mcp
 app.mount("/mcp", mcp_app)

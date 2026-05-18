@@ -35,3 +35,22 @@ def test_seed_uses_canonical_put_path():
     Skipped at unit level; the actual check is in the E2E suite.
     """
     pytest.skip("Covered by test_skill_e2e.sh — verifies frontmatter & search visibility.")
+
+
+def test_seed_template_includes_document_template_section():
+    """The Document Template section must be in the seed body between Relation rules and Do not."""
+    assert "## Document Template" in VAULT_SKILL_SEED_TEMPLATE
+    # Section ordering check
+    rel_idx = VAULT_SKILL_SEED_TEMPLATE.index("## Relation rules")
+    tmpl_idx = VAULT_SKILL_SEED_TEMPLATE.index("## Document Template")
+    do_not_idx = VAULT_SKILL_SEED_TEMPLATE.index("## Do not")
+    assert rel_idx < tmpl_idx < do_not_idx
+    # Skeleton content
+    assert "## Purpose" in VAULT_SKILL_SEED_TEMPLATE
+    assert "## Background" in VAULT_SKILL_SEED_TEMPLATE
+    assert "## Decision / Result" in VAULT_SKILL_SEED_TEMPLATE
+    assert "## Verification" in VAULT_SKILL_SEED_TEMPLATE
+    assert "## Related" in VAULT_SKILL_SEED_TEMPLATE
+    # Frontmatter example
+    assert "---\ntitle:" in VAULT_SKILL_SEED_TEMPLATE
+    assert "type: note|report|decision|spec|plan|session|reference" in VAULT_SKILL_SEED_TEMPLATE
