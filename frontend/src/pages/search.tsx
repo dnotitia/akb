@@ -1,15 +1,29 @@
 import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { ExternalLink, File, FileText, Lightbulb, Search as SearchIcon, Table } from "lucide-react";
+import { ExternalLink, File, FileText, Lightbulb, Search as SearchIcon, Sparkles, Table } from "lucide-react";
 import { searchDocs, grepDocs, listVaults, type GrepDoc } from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { parseUri } from "@/lib/uri";
+import { cn } from "@/lib/utils";
 
 type Mode = "dense" | "literal";
 type SourceType = "document" | "table" | "file";
+
+const ALL_TYPES = [
+  "skill",
+  "note",
+  "report",
+  "decision",
+  "spec",
+  "plan",
+  "session",
+  "task",
+  "reference",
+] as const;
+type DocTypeFilter = (typeof ALL_TYPES)[number];
 
 interface DenseResult {
   source_type?: SourceType;
@@ -70,6 +84,16 @@ export default function SearchPage() {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [vaults, setVaults] = useState<{ name: string }[]>([]);
+  const [activeTypes, setActiveTypes] = useState<Set<DocTypeFilter>>(new Set(ALL_TYPES));
+
+  function toggleType(t: DocTypeFilter) {
+    setActiveTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  }
 
   // Input-local query draft — separate from the committed URL `q` so
   // keystrokes don't fire a search per character. Submit (Enter / click)
@@ -138,7 +162,13 @@ export default function SearchPage() {
   const isShortQuery = q.trim().length > 0 && q.trim().length <= 6 && !/\s/.test(q.trim());
   const showLiteralHint = mode === "dense" && isShortQuery && searched && !loading;
 
-  const groupedDense = groupByType(denseResults);
+  const allTypesActive = activeTypes.size === ALL_TYPES.length;
+  const filteredDense = allTypesActive
+    ? denseResults
+    : denseResults.filter(
+        (r) => !r.doc_type || activeTypes.has(r.doc_type as DocTypeFilter),
+      );
+  const groupedDense = groupByType(filteredDense);
 
   // Commit the draft into the URL. Empty queries clear everything.
   // Keep the current mode/scope — the mode toggle handles that separately.
@@ -157,6 +187,39 @@ export default function SearchPage() {
         {scopedVault ? scopedVault : "Query the base"}
         <span className="text-foreground-muted">.</span>
       </h1>
+
+      {/* Doc-type filter chips — client-side filter on doc_type field of
+          dense results. ALL resets everything; individual chips toggle
+          inclusion. Chips are only meaningful in dense (semantic) mode
+          where doc_type is present, but we always render them so the
+          user's filter survives a mode switch. */}
+      <div className="flex flex-wrap gap-1 mb-4">
+        <button
+          type="button"
+          onClick={() => setActiveTypes(new Set(ALL_TYPES))}
+          className="px-2 h-7 border border-border font-mono text-[10px] uppercase tracking-[0.12em]"
+        >
+          ALL
+        </button>
+        {ALL_TYPES.map((t) => (
+          <button
+            key={t}
+            type="button"
+            aria-label={`Toggle ${t}`}
+            aria-pressed={activeTypes.has(t)}
+            onClick={() => toggleType(t)}
+            className={cn(
+              "inline-flex items-center gap-1 px-2 h-7 border font-mono text-[10px] uppercase tracking-[0.12em]",
+              activeTypes.has(t)
+                ? "border-foreground text-foreground"
+                : "border-border text-foreground-muted opacity-70",
+            )}
+          >
+            {t === "skill" && <Sparkles className="h-3 w-3" aria-hidden />}
+            {t}
+          </button>
+        ))}
+      </div>
 
       {/* Inline search form — mode toggle + editable input. The mode
           buttons update the URL immediately (no need to press Enter);
@@ -328,7 +391,7 @@ export default function SearchPage() {
           <TabsList>
             <TabsTrigger value="all" className="gap-1.5">
               All
-              <span className="coord tabular-nums">[{denseResults.length}]</span>
+              <span className="coord tabular-nums">[{filteredDense.length}]</span>
             </TabsTrigger>
             {(["document", "table", "file"] as const).map((type) => {
               const group = groupedDense[type] || [];
@@ -344,7 +407,7 @@ export default function SearchPage() {
 
           {/* All — every hit in score order, types interleaved. */}
           <TabsContent value="all" className="pt-4">
-            <DenseResultList items={denseResults} />
+            <DenseResultList items={filteredDense} />
           </TabsContent>
 
           {/* Per-type — same row template, filtered. */}
