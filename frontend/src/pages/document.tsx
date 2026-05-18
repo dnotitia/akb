@@ -47,7 +47,7 @@ export default function DocumentPage() {
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
   const [searchParams, setSearchParams] = useSearchParams();
-  const view: "rendered" | "raw" =
+  const view: "rendered" | "raw" | "agent" =
     searchParams.get("view") === "raw" ? "raw" : "rendered";
   const [relations, setRelations] = useState<any[]>([]);
   const [provenance, setProvenance] = useState<any[]>([]);
@@ -62,8 +62,9 @@ export default function DocumentPage() {
   const [publishOpen, setPublishOpen] = useState(false);
   const docId = id ? decodeURIComponent(id) : "";
 
-  const setView = (next: "rendered" | "raw") => {
+  const setView = (next: "rendered" | "raw" | "agent") => {
     const p = new URLSearchParams(searchParams);
+    // "agent" is an ephemeral view — not persisted to URL params
     if (next === "raw") p.set("view", "raw");
     else p.delete("view");
     setSearchParams(p, { replace: true });
