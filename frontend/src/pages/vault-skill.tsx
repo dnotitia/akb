@@ -22,7 +22,7 @@ export default function VaultSkillPage() {
 
   if (docQuery.isLoading) {
     return (
-      <div className="p-8">
+      <div className="max-w-[1020px] mx-auto w-full px-4 py-8">
         <Skeleton className="h-32 w-full" />
       </div>
     );
@@ -31,21 +31,26 @@ export default function VaultSkillPage() {
   if (docQuery.isError) {
     const errStatus = (docQuery.error as any)?.status;
     const errMessage = String((docQuery.error as any)?.message ?? "");
-    const isNotFound = errStatus === 404 || /404/i.test(errMessage);
+    // Backend NotFoundError serializes as {"error": "Document not found: ..."}
+    // without a structured detail, so api() throws a plain Error with no .status
+    // attached. Match the message instead — both "404" and "not found" cover
+    // the canonical paths.
+    const isNotFound =
+      errStatus === 404 || /404|not found/i.test(errMessage);
     if (!isNotFound) {
       return (
-        <div className="max-w-prose mx-auto p-12 text-sm text-foreground-muted">
+        <div className="max-w-[1020px] mx-auto w-full px-4 py-8 text-sm text-foreground-muted">
           Failed to load vault skill: {errMessage || "unknown error"}
         </div>
       );
     }
     return (
-      <div className="max-w-prose mx-auto p-12 flex flex-col items-start gap-4">
+      <div className="max-w-[1020px] mx-auto w-full px-4 py-12 flex flex-col items-start gap-4">
         <div className="flex items-center gap-2">
           <Sparkles className="h-5 w-5 text-foreground-muted" />
           <h2 className="font-serif text-2xl">No vault skill yet</h2>
         </div>
-        <p className="text-[14px] text-foreground-muted leading-relaxed">
+        <p className="text-[14px] text-foreground-muted leading-relaxed max-w-prose">
           Define agent conventions for this vault — what types, tags, and relations to use.
           Agents read this via{" "}
           <code className="coord">
@@ -58,5 +63,9 @@ export default function VaultSkillPage() {
     );
   }
 
-  return <DocumentView vault={vault} docId={SKILL_PATH} />;
+  return (
+    <div className="max-w-[1020px] mx-auto w-full px-4 py-8">
+      <DocumentView vault={vault} docId={SKILL_PATH} />
+    </div>
+  );
 }
