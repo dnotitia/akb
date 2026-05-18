@@ -180,14 +180,36 @@ function ensureCollection(
   return node;
 }
 
+/**
+ * Sort a flat list of items skill-first (doc_type === "skill" floats to the
+ * top), then alphabetically by name. Pure function — no side effects.
+ * Exported so tests (and future direct consumers) can exercise the logic
+ * in isolation.
+ */
+export function sortCollectionItems<T extends { name: string; raw?: any }>(items: T[]): T[] {
+  return [...items].sort((a, b) => {
+    const aSkill = (a.raw?.doc_type ?? a.raw?.type) === "skill" ? 0 : 1;
+    const bSkill = (b.raw?.doc_type ?? b.raw?.type) === "skill" ? 0 : 1;
+    if (aSkill !== bSkill) return aSkill - bSkill;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 function sortTree(nodes: TreeNode[]) {
   // Collections first, then documents, then tables, then files — each alpha.
+  // Within the document kind, skill docs are pinned to the top.
   const order: Record<NodeKind, number> = {
     collection: 0, document: 1, table: 2, file: 3,
   };
   nodes.sort((a, b) => {
     const k = order[a.kind] - order[b.kind];
     if (k !== 0) return k;
+    // Within document kind, pin skill docs to the top.
+    if (a.kind === "document" && b.kind === "document") {
+      const aSkill = (a.raw?.doc_type ?? a.raw?.type) === "skill" ? 0 : 1;
+      const bSkill = (b.raw?.doc_type ?? b.raw?.type) === "skill" ? 0 : 1;
+      if (aSkill !== bSkill) return aSkill - bSkill;
+    }
     return a.name.localeCompare(b.name);
   });
   for (const n of nodes) if (n.children) sortTree(n.children);

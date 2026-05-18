@@ -8,9 +8,11 @@ import {
   FolderPlus,
   Network,
   RefreshCw,
+  Sparkles,
   Table,
   Trash2,
 } from "lucide-react";
+import { SkillBadge } from "@/components/ui/skill-badge";
 import { useVaultTree, useExpandedPaths, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import {
@@ -468,8 +470,9 @@ const TreeRow = memo(function TreeRow({
   }
 
   const href = leafHref(vault, node);
-  const LeafIcon = node.kind === "document" ? FileText : node.kind === "table" ? Table : File;
-  const leafIconColor = node.kind === "document" ? "text-foreground-muted" : "text-accent";
+  const isSkill = node.kind === "document" && node.raw?.doc_type === "skill";
+  const LeafIcon = isSkill ? Sparkles : node.kind === "document" ? FileText : node.kind === "table" ? Table : File;
+  const leafIconColor = (node.kind === "document" && !isSkill) ? "text-foreground-muted" : "text-accent";
 
   return (
     <Link
@@ -488,6 +491,7 @@ const TreeRow = memo(function TreeRow({
         aria-hidden
       />
       <span className="truncate text-[13px] text-foreground group-hover:text-accent">{node.name}</span>
+      {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
     </Link>
   );
 });
