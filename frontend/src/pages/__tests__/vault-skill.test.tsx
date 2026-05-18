@@ -37,20 +37,20 @@ describe("VaultSkillPage", () => {
   it("renders the doc body when vault-skill exists", async () => {
     getDocument.mockResolvedValue({
       doc_id: "d-abc",
-      title: "my-v Vault Skill",
+      title: "my-v Guide",
       type: "skill",
-      content: "# my-v Vault Skill\n\nBody here",
+      content: "# my-v Guide\n\nBody here",
       tags: ["akb:skill"],
     });
     render(wrap("/vault/my-v/skill"));
-    expect(await screen.findByText(/my-v Vault Skill/)).toBeTruthy();
+    expect(await screen.findByText(/my-v Guide/)).toBeTruthy();
   });
 
   it("renders Create CTA when vault-skill is missing (404)", async () => {
     getDocument.mockImplementation(() => Promise.reject(new Error("404 Not Found")));
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     render(wrap("/vault/empty-v/skill"));
-    expect(await screen.findByText(/No vault skill yet/i)).toBeTruthy();
+    expect(await screen.findByText(/No vault guide yet/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /create from template/i })).toBeTruthy();
     spy.mockRestore();
   });
@@ -60,8 +60,8 @@ describe("VaultSkillPage", () => {
     getDocument.mockImplementation(() => Promise.reject(err));
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     render(wrap("/vault/restricted-v/skill"));
-    expect(await screen.findByText(/Failed to load vault skill/i)).toBeTruthy();
-    expect(screen.queryByText(/No vault skill yet/i)).toBeNull();
+    expect(await screen.findByText(/Failed to load vault guide/i)).toBeTruthy();
+    expect(screen.queryByText(/No vault guide yet/i)).toBeNull();
     expect(screen.queryByRole("button", { name: /create from template/i })).toBeNull();
     spy.mockRestore();
   });

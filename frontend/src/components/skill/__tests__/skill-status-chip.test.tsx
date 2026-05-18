@@ -10,7 +10,7 @@ function wrap(ui: React.ReactNode) {
 describe("SkillStatusChip", () => {
   it("renders defined variant with line count and link", () => {
     render(wrap(<SkillStatusChip vault="my-v" defined lineCount={142} />));
-    expect(screen.getByText(/SKILL/)).toBeTruthy();
+    expect(screen.getByText(/GUIDE/)).toBeTruthy();
     expect(screen.getByText(/142L/)).toBeTruthy();
     const link = screen.getByRole("link");
     expect(link.getAttribute("href")).toContain("/vault/my-v/skill");
@@ -18,7 +18,7 @@ describe("SkillStatusChip", () => {
 
   it("renders undefined variant", () => {
     render(wrap(<SkillStatusChip vault="my-v" defined={false} />));
-    const t = screen.getByText(/SKILL/);
+    const t = screen.getByText(/GUIDE/);
     expect(t.textContent).toContain("✗");
   });
 });

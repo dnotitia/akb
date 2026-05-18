@@ -24,7 +24,7 @@ beforeEach(() => {
 describe("SkillBanner", () => {
   it("renders SKILL badge + context line", () => {
     render(wrap(<SkillBanner vault="my-v" docId="overview/vault-skill.md" />));
-    expect(screen.getByText(/SKILL/)).toBeTruthy();
+    expect(screen.getByText(/GUIDE/)).toBeTruthy();
     expect(screen.getByText(/agents.*read this/i)).toBeTruthy();
   });
 

@@ -105,7 +105,7 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
     ["overview", "OVERVIEW", `/vault/${vault}`, Compass],
     ["search", "SEARCH", `/vault/${vault}/search`, SearchIcon],
     ["graph", "GRAPH", `/vault/${vault}/graph`, GitGraph],
-    ["skill", "SKILL", `/vault/${vault}/skill`, Sparkles],
+    ["skill", "GUIDE", `/vault/${vault}/skill`, Sparkles],
     ["publish", "PUBLISH", `/vault/${vault}/publications`, Share2],
   ];
   return (

@@ -15,7 +15,7 @@ export function SkillBadge({
   return (
     <Badge variant={defined ? "info" : "outline"} {...props}>
       <Sparkles className="h-3 w-3" aria-hidden />
-      SKILL
+      GUIDE
       {defined && lineCount != null && ` ✓ ${lineCount}L`}
       {!defined && " ✗"}
       {children}

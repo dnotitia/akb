@@ -16,7 +16,7 @@ export function SkillSettingsLink({ vault, defined, updatedAt }: Props) {
       <div className="flex items-center gap-3 text-[12px]">
         <SkillBadge defined={defined} />
         <span>
-          Vault skill · {defined ? "✓ defined" : "✗ undefined"}
+          Vault guide · {defined ? "✓ defined" : "✗ undefined"}
           {defined && updatedAt && ` · last updated ${timeAgo(updatedAt)}`}
         </span>
       </div>

@@ -35,7 +35,7 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
       navigate(`/vault/${vault}/skill`, { replace: true });
     } catch (e: any) {
       const raw = e?.message || "";
-      setError(raw ? `Failed to create vault skill: ${raw}` : "Failed to create vault skill");
+      setError(raw ? `Failed to create vault guide: ${raw}` : "Failed to create vault guide");
     } finally {
       setBusy(false);
     }
