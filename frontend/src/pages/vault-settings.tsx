@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Archive, ArrowLeft, Globe, Lock, RotateCcw, Save, Trash2 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import {
   archiveVault,
+  getDocument,
   getVaultInfo,
   unarchiveVault,
   updateVault,
 } from "@/lib/api";
+import { SkillSettingsLink } from "@/components/skill/skill-settings-link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -53,6 +56,15 @@ export default function VaultSettingsPage() {
   const [pendingUnarchive, setPendingUnarchive] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const vaultHealth = useVaultHealth(name);
+
+  const skillQuery = useQuery({
+    queryKey: ["document", name, "overview/vault-skill.md"],
+    queryFn: () => getDocument(name!, "overview/vault-skill.md"),
+    retry: false,
+    enabled: !!name,
+  });
+  const skillDefined = !skillQuery.isError && !!skillQuery.data;
+  const skillUpdatedAt: string | undefined = skillQuery.data?.updated_at;
 
   useEffect(() => {
     if (!name) return;
@@ -165,6 +177,10 @@ export default function VaultSettingsPage() {
               className="resize-y"
             />
           </div>
+
+          {!skillQuery.isLoading && (
+            <SkillSettingsLink vault={name!} defined={skillDefined} updatedAt={skillUpdatedAt} />
+          )}
 
           <div>
             <Label className="coord-ink mb-1.5 block">PUBLIC ACCESS</Label>
