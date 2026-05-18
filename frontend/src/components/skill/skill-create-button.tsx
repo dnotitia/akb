@@ -21,7 +21,7 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
     setError(null);
     try {
       const template = await getSkillTemplate();
-      const content = template.replace("{vault}", vault);
+      const content = template.replaceAll("{vault}", vault);
       await putDocument({
         vault,
         collection: "overview",

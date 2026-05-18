@@ -14,13 +14,20 @@ interface Props {
 export function SkillBanner({ vault, docId }: Props) {
   const queryClient = useQueryClient();
   const [resetOpen, setResetOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function handleReset() {
-    const template = await getSkillTemplate();
-    const content = template.replace("{vault}", vault);
-    await updateDocument(vault, docId, { content });
-    queryClient.invalidateQueries({ queryKey: ["document", vault, docId] });
-    queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
+    setError(null);
+    try {
+      const template = await getSkillTemplate();
+      const content = template.replaceAll("{vault}", vault);
+      await updateDocument(vault, docId, { content });
+      queryClient.invalidateQueries({ queryKey: ["document", vault, docId] });
+      queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
+    } catch (e: any) {
+      setError(e?.message || "Reset failed");
+      throw e;
+    }
   }
 
   return (
@@ -30,6 +37,9 @@ export function SkillBanner({ vault, docId }: Props) {
         <span className="font-serif italic text-[13px] text-foreground-muted">
           Agents writing into this vault read this first.
         </span>
+        {error && (
+          <p role="alert" className="coord text-destructive ml-1">{error}</p>
+        )}
       </div>
       <Button
         variant="ghost"
