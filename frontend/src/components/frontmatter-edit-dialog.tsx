@@ -40,6 +40,7 @@ interface DocLike {
   domain?: string;
   summary?: string;
   tags?: string[];
+  content?: string;
 }
 
 interface FrontmatterEditDialogProps {
@@ -50,6 +51,13 @@ interface FrontmatterEditDialogProps {
   doc: DocLike;
   /** Called with the merged doc after a successful save. */
   onSaved: (next: DocLike) => void;
+  /**
+   * Show a body editor in addition to the frontmatter fields. Used by the
+   * skill page where the doc is small and editing the body inline is the
+   * primary edit affordance. Other doc pages keep body editing out of this
+   * dialog so the description "metadata only" stays accurate there.
+   */
+  editBody?: boolean;
 }
 
 export function FrontmatterEditDialog({
@@ -59,6 +67,7 @@ export function FrontmatterEditDialog({
   docId,
   doc,
   onSaved,
+  editBody = false,
 }: FrontmatterEditDialogProps) {
   const [title, setTitle] = useState("");
   const [type, setType] = useState<DocType>("note");
@@ -67,6 +76,8 @@ export function FrontmatterEditDialog({
   const [summary, setSummary] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState<string[]>([]);
+  const [content, setContent] = useState("");
+  const [initialContent, setInitialContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -84,6 +95,8 @@ export function FrontmatterEditDialog({
     setSummary(doc.summary || "");
     setTags(doc.tags || []);
     setTagInput("");
+    setContent(doc.content || "");
+    setInitialContent(doc.content || "");
     setError("");
   }, [open, doc]);
 
@@ -106,14 +119,20 @@ export function FrontmatterEditDialog({
     setSaving(true);
     setError("");
     try {
-      const result = await updateDocument(vault, docId, {
+      // Only include `content` in the PATCH when body editing is enabled AND
+      // the body actually changed — otherwise updateDocument with content
+      // would touch git and the doc's chunks unnecessarily.
+      const contentChanged = editBody && content !== initialContent;
+      const payload: Record<string, unknown> = {
         title: title.trim(),
         type,
         status,
         domain: domain.trim() || null,
         summary: summary.trim() || null,
         tags,
-      });
+      };
+      if (contentChanged) payload.content = content;
+      const result = await updateDocument(vault, docId, payload);
       onSaved({
         ...doc,
         title: title.trim(),
@@ -122,6 +141,7 @@ export function FrontmatterEditDialog({
         domain: domain.trim() || undefined,
         summary: summary.trim() || undefined,
         tags,
+        content: contentChanged ? content : doc.content,
         path: result?.path || doc.path,
       });
       onOpenChange(false);
@@ -134,11 +154,13 @@ export function FrontmatterEditDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className={editBody ? "max-w-3xl" : "max-w-2xl"}>
         <DialogHeader>
           <DialogTitle>Edit details</DialogTitle>
           <DialogDescription>
-            Update the document's metadata. The body stays as-is.
+            {editBody
+              ? "Update the document's metadata and body."
+              : "Update the document's metadata. The body stays as-is."}
           </DialogDescription>
         </DialogHeader>
 
@@ -258,6 +280,23 @@ export function FrontmatterEditDialog({
               placeholder="Add tag and press Enter or comma"
             />
           </div>
+
+          {editBody && (
+            <div>
+              <Label htmlFor="fm-content" className="coord-ink mb-1.5 block">
+                BODY
+              </Label>
+              <Textarea
+                id="fm-content"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                rows={18}
+                placeholder="Markdown body of the document."
+                className="resize-y font-mono text-[12px] leading-relaxed"
+                spellCheck={false}
+              />
+            </div>
+          )}
 
           {error && (
             <div role="alert" className="border border-destructive p-2 text-xs text-destructive">

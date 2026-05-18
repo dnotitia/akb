@@ -91,6 +91,7 @@ export function SkillBanner({ vault, docId }: Props) {
           vault={vault}
           docId={docId}
           doc={doc}
+          editBody
           onSaved={() => {
             queryClient.invalidateQueries({ queryKey: ["document", vault, docId] });
             queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });

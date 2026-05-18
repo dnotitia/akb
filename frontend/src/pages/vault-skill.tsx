@@ -22,7 +22,7 @@ export default function VaultSkillPage() {
 
   if (docQuery.isLoading) {
     return (
-      <div className="max-w-[1020px] mx-auto w-full px-4 py-8">
+      <div className="max-w-[1280px] mx-auto w-full fade-up px-4 py-8">
         <Skeleton className="h-32 w-full" />
       </div>
     );
@@ -39,13 +39,13 @@ export default function VaultSkillPage() {
       errStatus === 404 || /404|not found/i.test(errMessage);
     if (!isNotFound) {
       return (
-        <div className="max-w-[1020px] mx-auto w-full px-4 py-8 text-sm text-foreground-muted">
+        <div className="max-w-[1280px] mx-auto w-full fade-up px-4 py-8 text-sm text-foreground-muted">
           Failed to load vault skill: {errMessage || "unknown error"}
         </div>
       );
     }
     return (
-      <div className="max-w-[1020px] mx-auto w-full px-4 py-12 flex flex-col items-start gap-4">
+      <div className="max-w-[1280px] mx-auto w-full fade-up px-4 py-12 flex flex-col items-start gap-4">
         <div className="flex items-center gap-2">
           <Sparkles className="h-5 w-5 text-foreground-muted" />
           <h2 className="font-serif text-2xl">No vault skill yet</h2>
@@ -64,7 +64,7 @@ export default function VaultSkillPage() {
   }
 
   return (
-    <div className="max-w-[1020px] mx-auto w-full px-4 py-8">
+    <div className="max-w-[1280px] mx-auto w-full fade-up px-4 py-8">
       <DocumentView vault={vault} docId={SKILL_PATH} />
     </div>
   );
