@@ -31,7 +31,7 @@ services:
     environment:
       POSTGRES_DB: akb
       POSTGRES_USER: akb
-      POSTGRES_PASSWORD: akb
+      POSTGRES_PASSWORD: akb  # pragma: allowlist secret -- local-dev hardcoded, matches secret.yaml
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Install pgvector extension on first boot.  Without this, the
@@ -50,7 +50,7 @@ services:
     command: server /data --address :9000 --console-address :9001
     environment:
       MINIO_ROOT_USER: akb-local
-      MINIO_ROOT_PASSWORD: akb-local-secret
+      MINIO_ROOT_PASSWORD: akb-local-secret  # pragma: allowlist secret -- local-dev hardcoded
     volumes:
       - minio_data:/data
     ports:
