@@ -3,15 +3,19 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Loader2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { getDocument } from "@/lib/api";
+import { getDocument, getVaultSkillPreview } from "@/lib/api";
 import { parseHeadings, slugify } from "@/lib/markdown";
+import { SkillBanner } from "@/components/skill/skill-banner";
+import { Skeleton } from "@/components/ui/skeleton";
+
+type ViewMode = "rendered" | "raw" | "agent";
 
 interface DocumentViewProps {
   vault: string;
   docId: string;
   /** Controlled view — provide this + onViewChange to sync with URL params */
-  view?: "rendered" | "raw";
-  onViewChange?: (next: "rendered" | "raw") => void;
+  view?: ViewMode;
+  onViewChange?: (next: ViewMode) => void;
 }
 
 /**
@@ -32,11 +36,11 @@ interface DocumentViewProps {
  * add a third tab here alongside the doc.type === "skill" guard.
  */
 export function DocumentView({ vault, docId, view: viewProp, onViewChange }: DocumentViewProps) {
-  const [localView, setLocalView] = useState<"rendered" | "raw">("rendered");
+  const [localView, setLocalView] = useState<ViewMode>("rendered");
 
   // Controlled vs. uncontrolled view mode
   const view = viewProp ?? localView;
-  const setView = (next: "rendered" | "raw") => {
+  const setView = (next: ViewMode) => {
     if (onViewChange) {
       onViewChange(next);
     } else {
@@ -81,10 +85,16 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange }: Doc
     return null;
   }
 
+  // If the parent passes "agent" but this isn't a skill doc, fall back to "rendered"
+  const isSkill = doc.type === "skill";
+  const effectiveView: ViewMode = view === "agent" && !isSkill ? "rendered" : view;
+
   return (
     <>
-      {/* ── Rendered/Raw segmented control ──────────────────────────
-          T6: add AGENT tab here for skill docs (doc.type === "skill") */}
+      {/* ── Skill banner (skill docs only) ──────────────────────── */}
+      {isSkill && <SkillBanner vault={vault} docId={docId} />}
+
+      {/* ── Rendered/Raw/Agent segmented control ────────────────── */}
       <div className="flex items-center justify-end mb-3">
         <div
           role="tablist"
@@ -93,10 +103,10 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange }: Doc
         >
           <button
             role="tab"
-            aria-selected={view === "rendered"}
+            aria-selected={effectiveView === "rendered"}
             onClick={() => setView("rendered")}
             className={`px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-              view === "rendered"
+              effectiveView === "rendered"
                 ? "bg-foreground text-background"
                 : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
             }`}
@@ -105,21 +115,37 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange }: Doc
           </button>
           <button
             role="tab"
-            aria-selected={view === "raw"}
+            aria-selected={effectiveView === "raw"}
             onClick={() => setView("raw")}
             className={`px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-              view === "raw"
+              effectiveView === "raw"
                 ? "bg-foreground text-background"
                 : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
             }`}
           >
             RAW
           </button>
+          {isSkill && (
+            <button
+              role="tab"
+              aria-selected={effectiveView === "agent"}
+              onClick={() => setView("agent")}
+              className={`px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                effectiveView === "agent"
+                  ? "bg-foreground text-background"
+                  : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+              }`}
+            >
+              AGENT
+            </button>
+          )}
         </div>
       </div>
 
       {/* ── Doc body ──────────────────────────────────────────────── */}
-      {view === "rendered" ? (
+      {effectiveView === "agent" ? (
+        <AgentPreview vault={vault} />
+      ) : effectiveView === "rendered" ? (
         <div
           className="prose dark:prose-invert min-w-0"
           style={{ maxWidth: "100%" }}
@@ -170,4 +196,21 @@ function flattenText(children: any): string {
   if (Array.isArray(children)) return children.map(flattenText).join("");
   if (children?.props?.children) return flattenText(children.props.children);
   return "";
+}
+
+// ── Agent preview (skill docs only) ─────────────────────────────
+
+function AgentPreview({ vault }: { vault: string }) {
+  const helpQuery = useQuery({
+    queryKey: ["vault-skill-preview", vault],
+    queryFn: () => getVaultSkillPreview(vault),
+    retry: false,
+  });
+  if (helpQuery.isLoading) return <div className="p-4"><Skeleton className="h-64 w-full" /></div>;
+  if (helpQuery.isError) return <p className="coord text-destructive p-4">Failed to load agent preview.</p>;
+  return (
+    <pre className="font-mono text-[11px] leading-snug whitespace-pre-wrap bg-background border border-border p-4">
+      {helpQuery.data}
+    </pre>
+  );
 }
