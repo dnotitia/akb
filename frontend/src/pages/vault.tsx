@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, Settings as SettingsIcon, Users } from "lucide-react";
-import { browseVault, getRecent, getVaultInfo } from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
+import { browseVault, getDocument, getRecent, getVaultInfo } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { EmptyState } from "@/components/empty-state";
 import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
+import { SkillStatusChip } from "@/components/skill/skill-status-chip";
 
 interface VaultInfo {
   name: string;
@@ -64,6 +66,17 @@ export default function VaultPage() {
         (vUpsert?.pending || 0) - vaultAbandoned,
       ) + (vaultHealth.metadata_backfill?.pending || 0)
     : null;
+
+  const skillQuery = useQuery({
+    queryKey: ["document", name, "overview/vault-skill.md"],
+    queryFn: () => getDocument(name!, "overview/vault-skill.md"),
+    retry: false,
+    enabled: !!name,
+  });
+  const skillExists = !skillQuery.isError && !!skillQuery.data;
+  const skillLineCount = skillExists
+    ? (skillQuery.data!.content || "").split("\n").length
+    : undefined;
 
   useEffect(() => {
     if (!name) return;
@@ -131,6 +144,9 @@ export default function VaultPage() {
           publicAccess={info?.public_access}
         />
         <IndexingBadge pending={vaultPending} abandoned={vaultAbandoned} />
+        {!skillQuery.isLoading && (
+          <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
+        )}
         <div className="ml-auto flex items-baseline gap-4">
           <Link
             to={`/vault/${name}/members`}
