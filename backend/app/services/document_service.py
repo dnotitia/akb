@@ -961,7 +961,7 @@ class DocumentService:
                 seed_req = DocumentPutRequest(
                     vault=name,
                     collection="overview",
-                    title="Guide",
+                    title=f"{name} Guide",
                     content=skill_body,
                     type="skill",
                     tags=["akb:skill"],
