@@ -582,13 +582,11 @@ export default function SettingsPage() {
                 <EmptyState title="No tokens yet — mint one below." />
               ) : (
                 <div className="border border-border divide-y divide-border">
-                  {pats.map((p, i) => (
-                    <div
-                      key={p.token_id}
-                      className="flex items-center justify-between gap-3 px-4 py-3"
-                    >
+                  {(pats ?? []).map((p, i) => (
+                    <div key={p.token_id} className="px-4 py-3 space-y-1.5">
+                      {/* Line 1 — identity */}
                       <div className="flex items-baseline gap-3 min-w-0">
-                        <span className="coord tabular-nums">
+                        <span className="coord tabular-nums shrink-0">
                           {String(i + 1).padStart(2, "0")}
                         </span>
                         <span className="text-sm font-medium truncate text-foreground">
@@ -598,36 +596,41 @@ export default function SettingsPage() {
                           {p.prefix}••••
                         </code>
                       </div>
-                      <div className="flex items-center gap-3 shrink-0">
-                        <span className="coord tabular-nums hidden sm:inline">
-                          CREATED {formatDate(p.created_at).toUpperCase()}
-                        </span>
-                        {p.last_used_at && (
-                          <span className="coord tabular-nums hidden md:inline">
-                            USED {formatDate(p.last_used_at).toUpperCase()}
+                      {/* Line 2 — meta + actions */}
+                      <div className="flex items-center justify-between gap-3 flex-wrap pl-7">
+                        <div className="flex items-center gap-3 text-foreground-muted">
+                          <span className="coord tabular-nums">
+                            CREATED {formatDate(p.created_at).toUpperCase()}
                           </span>
-                        )}
-                        <button
-                          onClick={async () => {
-                            await revokePAT(p.token_id);
-                            const r = await createPAT(p.name);
-                            setNewPat(r.token);
-                            loadPATs();
-                          }}
-                          aria-label={`Reissue token ${p.name}`}
-                          className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer"
-                        >
-                          <RotateCw className="h-3 w-3" aria-hidden />
-                          Reissue
-                        </button>
-                        <button
-                          onClick={() => setPendingRevokePat(p)}
-                          aria-label={`Revoke token ${p.name}`}
-                          className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive transition-colors cursor-pointer"
-                        >
-                          <Trash2 className="h-3 w-3" aria-hidden />
-                          Revoke
-                        </button>
+                          {p.last_used_at && (
+                            <span className="coord tabular-nums">
+                              USED {formatDate(p.last_used_at).toUpperCase()}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={async () => {
+                              await revokePAT(p.token_id);
+                              const r = await createPAT(p.name);
+                              setNewPat(r.token);
+                              loadPATs();
+                            }}
+                            aria-label={`Reissue token ${p.name}`}
+                            className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                          >
+                            <RotateCw className="h-3 w-3" aria-hidden />
+                            Reissue
+                          </button>
+                          <button
+                            onClick={() => setPendingRevokePat(p)}
+                            aria-label={`Revoke token ${p.name}`}
+                            className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-destructive hover:text-destructive/80 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                          >
+                            <Trash2 className="h-3 w-3" aria-hidden />
+                            Revoke
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ))}
