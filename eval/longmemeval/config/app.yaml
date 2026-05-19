@@ -21,7 +21,11 @@ db_user: akb
 # === Git storage ===
 git_storage_path: /data/vaults
 
-# === Embedding (bge-m3@1024 via OpenRouter) ===
+# === Embedding (bge-m3 @ 1024 via OpenRouter) ===
+# Ablation #4 — matches Run #1's model so the only delta vs Run #1 is
+# `rerank_enabled: false` below. Isolates rerank's contribution to R@5.
+# Backend always sends OpenAI-compatible `dimensions` (no-op for bge-m3
+# native 1024).
 embed_base_url: https://openrouter.ai/api/v1
 embed_model: baai/bge-m3
 embed_dimensions: 1024
@@ -38,7 +42,12 @@ llm_model: ""
 # default fallback path produces a bare "/rerank" without a scheme,
 # which httpx rejects).  rerank_api_key in secret.yaml is "" — service
 # falls back to llm_api_key, which holds the OpenRouter key.
-rerank_enabled: true
+# Ablation #4: rerank OFF to isolate its R@5 contribution vs Run #1.
+# Run #3 (text-embedding-3-large@1536 + rerank ON) lands at 95.80% R@5,
+# 1.8pp below gbrain's 97.60% (same model, rerank OFF) — pointing at
+# either rerank being a net negative or a pipeline gap upstream.
+# rerank_provider/model/base_url left in place for fast toggle-back.
+rerank_enabled: false
 rerank_provider: cohere
 rerank_model: cohere/rerank-v3.5
 rerank_base_url: https://openrouter.ai/api/v1
