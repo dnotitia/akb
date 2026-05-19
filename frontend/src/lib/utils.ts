@@ -24,6 +24,10 @@ export function sanitizeLinkUrl(raw: string | null | undefined): string {
   if (!raw) return "#";
   const trimmed = raw.trim();
   if (!trimmed) return "#";
+  // Protocol-relative URLs (`//evil.com/x`) inherit the current page
+  // scheme and act like a redirect to an arbitrary origin. Treat them
+  // as untrusted and refuse before the absolute-path check below.
+  if (trimmed.startsWith("//")) return "#";
   if (trimmed.startsWith("/") || trimmed.startsWith("#") || trimmed.startsWith("?")) {
     return trimmed;
   }

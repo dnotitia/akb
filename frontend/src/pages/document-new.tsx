@@ -84,7 +84,7 @@ export default function DocumentNewPage() {
     // separators, absolute paths, and trailing slashes before the backend
     // ever sees the value. The backend should still validate, but a clear
     // client-side rejection produces a much better error message.
-    if (!/^[a-z0-9_\-]+(?:\/[a-z0-9_\-]+)*$/.test(c)) {
+    if (!/^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/.test(c)) {
       setError(
         "Collection must use lowercase letters, digits, hyphens, underscores, and `/` only.",
       );
