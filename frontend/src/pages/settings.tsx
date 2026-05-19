@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
+  ArrowUpRight,
   ChevronRight,
   Copy,
   Eye,
@@ -34,7 +35,6 @@ import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { MemoryTab } from "@/components/memory-tab";
-import { ThemeToggle } from "@/components/theme-toggle";
 import { useTheme } from "@/hooks/use-theme";
 import { useFlashStatus } from "@/hooks/use-flash-status";
 import {
@@ -849,18 +849,41 @@ export default function SettingsPage() {
 
         </TabsContent>
 
-        {/* Preferences — theme only for now */}
-        <TabsContent value="preferences" className="pt-6 max-w-4xl">
+        {/* Preferences — status display only; real control lives in header UserMenu */}
+        <TabsContent value="preferences" className="pt-6 max-w-4xl space-y-6">
+          {/* Theme — status only. Real control lives in the header UserMenu. */}
           <div className="border border-border bg-surface">
-            <div className="p-6 flex items-center justify-between gap-4">
+            <header className="border-b border-border px-6 py-3">
+              <span className="coord-ink">§ THEME</span>
+            </header>
+            <div className="p-6 flex items-start justify-between gap-4">
               <div>
-                <div className="text-sm font-medium text-foreground">Theme</div>
-                <div className="text-xs text-foreground-muted mt-1">
+                <div className="text-sm font-medium text-foreground">
                   Current: <span className="font-mono uppercase">{theme}</span>
-                  {theme === "system" && " (follows OS preference)"}
+                  {theme === "system" && (
+                    <span className="text-foreground-muted"> (follows OS)</span>
+                  )}
                 </div>
+                <p className="text-xs text-foreground-muted mt-1.5 leading-relaxed">
+                  Active mode follows your selection in the header menu.
+                </p>
               </div>
-              <ThemeToggle />
+              <div className="inline-flex items-center gap-1 text-foreground-muted text-xs font-mono uppercase tracking-wider">
+                <ArrowUpRight className="h-3 w-3" aria-hidden />
+                Change in header menu
+              </div>
+            </div>
+          </div>
+
+          {/* Future placeholder card */}
+          <div className="border border-border bg-surface opacity-60">
+            <header className="border-b border-border px-6 py-3">
+              <span className="coord-ink">§ MORE PREFERENCES</span>
+            </header>
+            <div className="p-6">
+              <p className="text-sm text-foreground-muted">
+                Language, density, notifications — coming soon.
+              </p>
             </div>
           </div>
         </TabsContent>
