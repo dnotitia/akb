@@ -19,7 +19,6 @@ import {
   getDocument,
   getRelations,
   getVaultInfo,
-  publishDoc,
   unpublishDoc,
   updateDocument,
 } from "@/lib/api";
@@ -409,10 +408,32 @@ export default function DocumentPage() {
                 role="tablist"
                 aria-label="Document view"
                 className="inline-flex border border-border"
+                onKeyDown={(e) => {
+                  // Roving tabindex within the strip — Arrow keys move
+                  // focus, Enter/Space (handled by the button itself)
+                  // activates. Matches the WAI-ARIA tabs pattern used in
+                  // DocumentView's TabStrip.
+                  const buttons = Array.from(
+                    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+                  );
+                  const idx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                  if (idx < 0) return;
+                  let next: number;
+                  if (e.key === "ArrowRight") next = (idx + 1) % buttons.length;
+                  else if (e.key === "ArrowLeft") next = (idx - 1 + buttons.length) % buttons.length;
+                  else if (e.key === "Home") next = 0;
+                  else if (e.key === "End") next = buttons.length - 1;
+                  else return;
+                  e.preventDefault();
+                  buttons[next]?.focus();
+                }}
               >
                 <button
                   role="tab"
+                  id="doc-tab-rendered"
                   aria-selected={false}
+                  aria-controls="doc-panel-rendered"
+                  tabIndex={-1}
                   onClick={() => setView("rendered")}
                   className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
@@ -420,7 +441,10 @@ export default function DocumentPage() {
                 </button>
                 <button
                   role="tab"
+                  id="doc-tab-raw"
                   aria-selected={false}
+                  aria-controls="doc-panel-raw"
+                  tabIndex={-1}
                   onClick={() => setView("raw")}
                   className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
@@ -428,14 +452,22 @@ export default function DocumentPage() {
                 </button>
                 <button
                   role="tab"
+                  id="doc-tab-edit"
                   aria-selected={true}
+                  aria-controls="doc-panel-edit"
+                  tabIndex={0}
                   className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border bg-foreground text-background cursor-default"
                 >
                   EDIT{isDirty ? "*" : ""}
                 </button>
               </div>
             </div>
-            <div className="space-y-3">
+            <div
+              id="doc-panel-edit"
+              role="tabpanel"
+              aria-labelledby="doc-tab-edit"
+              className="space-y-3"
+            >
               <div className="coord flex items-center justify-between">
                 <span>EDITING BODY</span>
                 <span className="text-foreground-muted normal-case tracking-normal font-sans">
