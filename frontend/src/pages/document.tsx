@@ -245,16 +245,20 @@ export default function DocumentPage() {
          Tabs below keep the reading surface predictable: one
          secondary pane visible at a time. */}
       <aside className="xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100dvh-13rem)] flex flex-col text-sm min-h-0">
-        {/* Owner/admin/writer actions */}
+        {/* Owner/admin/writer actions. For skill docs, the SkillBanner
+            above the article owns the Edit details entry point, so hide
+            it here to avoid two identical buttons on the same screen. */}
         {(vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner") && (
           <div className="shrink-0 pb-3 mb-3 border-b border-border space-y-2">
-            <button
-              onClick={() => setEditOpen(true)}
-              className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              <Pencil className="h-3 w-3" aria-hidden />
-              Edit details
-            </button>
+            {doc.type !== "skill" && (
+              <button
+                onClick={() => setEditOpen(true)}
+                className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                <Pencil className="h-3 w-3" aria-hidden />
+                Edit details
+              </button>
+            )}
             <button
               onClick={() => setDeleteOpen(true)}
               className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border text-foreground-muted hover:border-destructive hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"

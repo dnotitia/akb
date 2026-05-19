@@ -154,7 +154,9 @@ export function FrontmatterEditDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className={editBody ? "max-w-3xl" : "max-w-2xl"}>
+      <DialogContent
+        className={`${editBody ? "max-w-3xl" : "max-w-2xl"} max-h-[90vh] flex flex-col`}
+      >
         <DialogHeader>
           <DialogTitle>Edit details</DialogTitle>
           <DialogDescription>
@@ -164,7 +166,7 @@ export function FrontmatterEditDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="space-y-4 flex-1 overflow-y-auto pr-1 -mr-1">
           <div>
             <Label htmlFor="fm-title" className="coord-ink mb-1.5 block">
               TITLE
