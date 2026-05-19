@@ -67,11 +67,10 @@ vector_store_schema: vector_index
 vector_store_sparse_shape: posting
 
 # === Indexing worker tuning ===
+# Bench-specific: concurrency activated to shorten ablation cycles. The
+# benchmark queue absorbs N workers safely via FOR UPDATE SKIP LOCKED.
 indexing_batch_size: 16
-# Set indexing_concurrency: N (4-8 typical) to enable parallel embed_worker
-# tasks for faster bench wall-clock. Default 1 keeps single-task behavior
-# for comparability with the legacy baseline. Activate in a follow-up PR.
-# indexing_concurrency: 8
+indexing_concurrency: 8
 
 # === BM25 ===
 bm25_k1: 1.5

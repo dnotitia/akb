@@ -52,6 +52,10 @@ vector_collection: chunks
 
 # === Indexing worker ===
 indexing_batch_size: 16
+# Set indexing_concurrency: N (4-8 typical) to enable parallel embed_worker
+# tasks. Default 1 stays single-task for predictable resource use; raise
+# when the embedding API can absorb concurrent requests.
+# indexing_concurrency: 8
 
 # === BM25 ===
 bm25_k1: 1.5

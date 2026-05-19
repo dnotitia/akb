@@ -127,6 +127,10 @@ seahorse_auto_create: false   # set true to provision the AKB-shaped table on fi
 # OpenAI-compatible endpoint latencies; tune up to ~64 for fast
 # self-hosted endpoints.
 indexing_batch_size: 16
+# Set indexing_concurrency: N (4-8 typical) to enable parallel embed_worker
+# tasks. Default 1 stays single-task for predictable resource use; raise
+# when the embedding API can absorb concurrent requests.
+# indexing_concurrency: 8
 
 # === BM25 sparse retrieval tuning (driver-neutral) ===
 bm25_k1: 1.5
