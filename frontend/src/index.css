@@ -36,7 +36,7 @@
   --color-accent: #ff4d12;
   --color-accent-foreground: #faf9f5;
   --color-success: #16a34a;
-  --color-success-foreground: #f8fdf6;  /* near-white text on success bg */
+  --color-success-foreground: #04200d;  /* dark green text on success bg */
   --color-warning: #ca8a04;
   --color-destructive: #c63d09;
   --color-destructive-foreground: #faf9f5;
