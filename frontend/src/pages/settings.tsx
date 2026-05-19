@@ -36,6 +36,7 @@ import { EmptyState } from "@/components/empty-state";
 import { MemoryTab } from "@/components/memory-tab";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useTheme } from "@/hooks/use-theme";
+import { useFlashStatus } from "@/hooks/use-flash-status";
 import {
   Tabs,
   TabsContent,
@@ -83,12 +84,12 @@ export default function SettingsPage() {
   const [pwConfirm, setPwConfirm] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
-  const [pwOk, setPwOk] = useState(false);
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileError, setProfileError] = useState("");
   const [profileBusy, setProfileBusy] = useState(false);
-  const [profileOk, setProfileOk] = useState(false);
+  const profileFlash = useFlashStatus(3000);
+  const passwordFlash = useFlashStatus(3000);
   const { theme } = useTheme();
 
   // Sync local edit state when user payload arrives.
@@ -103,7 +104,6 @@ export default function SettingsPage() {
     e.preventDefault();
     if (!user) return;
     setProfileError("");
-    setProfileOk(false);
     const patch: { display_name?: string; email?: string } = {};
     if ((user.display_name ?? "") !== profileDisplayName) patch.display_name = profileDisplayName;
     if (user.email !== profileEmail) patch.email = profileEmail;
@@ -115,7 +115,7 @@ export default function SettingsPage() {
     try {
       const res = await updateProfile(patch);
       setUser({ ...user, display_name: res.display_name ?? undefined, email: res.email });
-      setProfileOk(true);
+      profileFlash.setFlash("Saved");
     } catch (err) {
       setProfileError(err instanceof Error ? err.message : "Failed to save");
     } finally {
@@ -126,7 +126,6 @@ export default function SettingsPage() {
   async function handleChangePassword(e: React.FormEvent) {
     e.preventDefault();
     setPwError("");
-    setPwOk(false);
     if (pwNew !== pwConfirm) {
       setPwError("New password and confirmation do not match");
       return;
@@ -138,7 +137,7 @@ export default function SettingsPage() {
     setPwBusy(true);
     try {
       await changePassword(pwCurrent, pwNew);
-      setPwOk(true);
+      passwordFlash.setFlash("Password changed");
       setPwCurrent("");
       setPwNew("");
       setPwConfirm("");
@@ -352,7 +351,14 @@ export default function SettingsPage() {
 
         {/* Profile — read-only account info */}
         <TabsContent value="profile" className="pt-6 max-w-4xl space-y-6">
-          <form onSubmit={handleSaveProfile} className="border border-border bg-surface">
+          {/* Account card */}
+          <form
+            onSubmit={handleSaveProfile}
+            className="border border-border bg-surface"
+          >
+            <header className="border-b border-border px-6 py-3">
+              <span className="coord-ink">§ ACCOUNT</span>
+            </header>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4 p-6">
               <ReadOnlyField label="USERNAME" value={user.username} />
               <ReadOnlyField
@@ -384,30 +390,30 @@ export default function SettingsPage() {
               <Button type="submit" disabled={profileBusy}>
                 {profileBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save profile"}
               </Button>
-              {profileOk && (
+              {profileFlash.message && (
                 <span role="status" aria-live="polite" className="text-sm text-success">
-                  Saved
+                  {profileFlash.message}
                 </span>
               )}
               {profileError && (
-                <span className="text-sm text-destructive">{profileError}</span>
+                <span role="alert" className="text-sm text-destructive">
+                  {profileError}
+                </span>
               )}
             </div>
           </form>
 
+          {/* Change password card */}
           <section
-            className="space-y-3 pt-6 border-t border-border"
+            className="border border-border bg-surface"
             aria-labelledby="change-pw-heading"
           >
-            <h2 id="change-pw-heading" className="coord-ink">
-              CHANGE PASSWORD
-            </h2>
-            <form
-              onSubmit={handleChangePassword}
-              className="space-y-3 max-w-md"
-            >
+            <header className="border-b border-border px-6 py-3">
+              <span id="change-pw-heading" className="coord-ink">§ CHANGE PASSWORD</span>
+            </header>
+            <form onSubmit={handleChangePassword} className="space-y-3 p-6 max-w-md">
               <div>
-                <Label htmlFor="pw-current">Current password</Label>
+                <Label htmlFor="pw-current">CURRENT PASSWORD</Label>
                 <Input
                   id="pw-current"
                   type="password"
@@ -418,7 +424,7 @@ export default function SettingsPage() {
                 />
               </div>
               <div>
-                <Label htmlFor="pw-new">New password</Label>
+                <Label htmlFor="pw-new">NEW PASSWORD</Label>
                 <Input
                   id="pw-new"
                   type="password"
@@ -429,7 +435,7 @@ export default function SettingsPage() {
                 />
               </div>
               <div>
-                <Label htmlFor="pw-confirm">Confirm new password</Label>
+                <Label htmlFor="pw-confirm">CONFIRM NEW PASSWORD</Label>
                 <Input
                   id="pw-confirm"
                   type="password"
@@ -444,15 +450,13 @@ export default function SettingsPage() {
                   {pwError}
                 </p>
               )}
-              {pwOk && (
-                <p className="text-foreground text-xs font-mono">
-                  Password changed.
+              {passwordFlash.message && (
+                <p role="status" aria-live="polite" className="text-success text-xs font-mono">
+                  {passwordFlash.message}
                 </p>
               )}
               <Button type="submit" disabled={pwBusy}>
-                {pwBusy && (
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                )}
+                {pwBusy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
                 Change password
               </Button>
             </form>
