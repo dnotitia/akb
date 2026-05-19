@@ -26,6 +26,7 @@ import {
   updateProfile,
   type AdminUser,
 } from "@/lib/api";
+import { useDebounce } from "@/hooks/use-debounce";
 import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
 import { formatDate } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -64,6 +65,7 @@ interface PAT {
 
 type TabId = "profile" | "tokens" | "preferences" | "memory" | "admin";
 type ClientTab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
+type AdminSort = "recent" | "oldest" | "username" | "vaults";
 
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
@@ -75,6 +77,9 @@ export default function SettingsPage() {
   const [creating, setCreating] = useState(false);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [adminQuery, setAdminQuery] = useState("");
+  const [adminSort, setAdminSort] = useState<AdminSort>("recent");
+  const debouncedQuery = useDebounce(adminQuery, 200);
   const [clientTab, setClientTab] = useState<ClientTab>("claude");
   const [pendingDeleteUser, setPendingDeleteUser] = useState<AdminUser | null>(null);
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
@@ -316,6 +321,36 @@ export default function SettingsPage() {
     }),
     [snippetPat],
   );
+
+  const filteredUsers = useMemo(() => {
+    if (!users) return [];
+    const q = debouncedQuery.trim().toLowerCase();
+    let result = users;
+    if (q) {
+      result = users.filter(
+        (u) =>
+          u.username.toLowerCase().includes(q) ||
+          u.email?.toLowerCase().includes(q) ||
+          u.display_name?.toLowerCase().includes(q),
+      );
+    }
+    const sorted = [...result];
+    switch (adminSort) {
+      case "recent":
+        sorted.sort((a, b) => b.created_at.localeCompare(a.created_at));
+        break;
+      case "oldest":
+        sorted.sort((a, b) => a.created_at.localeCompare(b.created_at));
+        break;
+      case "username":
+        sorted.sort((a, b) => a.username.localeCompare(b.username));
+        break;
+      case "vaults":
+        sorted.sort((a, b) => (b.owned_vaults || 0) - (a.owned_vaults || 0));
+        break;
+    }
+    return sorted;
+  }, [users, debouncedQuery, adminSort]);
 
   if (!user) return null;
 
@@ -895,25 +930,64 @@ export default function SettingsPage() {
 
         {/* Admin — user management. Only rendered when user.is_admin. */}
         {user.is_admin && (
-          <TabsContent value="admin" className="pt-6 max-w-5xl">
+          <TabsContent value="admin" className="pt-6 max-w-5xl space-y-4">
+            {/* Search + sort bar */}
+            <div className="flex flex-wrap items-center gap-3">
+              <Input
+                placeholder="Search users by name or email…"
+                value={adminQuery}
+                onChange={(e) => setAdminQuery(e.target.value)}
+                className="flex-1 min-w-[260px]"
+                aria-label="Search users"
+              />
+              <Label htmlFor="admin-sort" className="sr-only">Sort</Label>
+              <select
+                id="admin-sort"
+                aria-label="Sort users"
+                value={adminSort}
+                onChange={(e) => setAdminSort(e.target.value as AdminSort)}
+                className="h-9 px-3 bg-surface border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+              >
+                <option value="recent">Recent first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="username">Username A-Z</option>
+                <option value="vaults">Most vaults</option>
+              </select>
+            </div>
+
+            {/* Match count */}
+            <div className="coord">
+              [{filteredUsers.length} matching of {users?.length ?? 0}]
+            </div>
+
             <div className="border border-border bg-surface">
               <div className="p-6">
                 {!users ? (
                   <div className="coord">LOADING…</div>
-                ) : users.length === 0 ? (
-                  <EmptyState title="No users" />
+                ) : filteredUsers.length === 0 ? (
+                  <EmptyState
+                    title={
+                      adminQuery
+                        ? `No users matching "${adminQuery}"`
+                        : "No users"
+                    }
+                  />
                 ) : (
                   <div className="border border-border divide-y divide-border">
-                    {users.map((u, i) => (
+                    {filteredUsers.map((u, i) => (
                       <div
                         key={u.id}
+                        data-testid="admin-user-row"
                         className="flex items-center justify-between gap-3 px-4 py-3"
                       >
                         <div className="flex items-baseline gap-3 min-w-0 flex-1">
                           <span className="coord tabular-nums shrink-0">
                             {String(i + 1).padStart(2, "0")}
                           </span>
-                          <span className="text-sm font-medium truncate text-foreground">
+                          <span
+                            data-testid="admin-user-name"
+                            className="text-sm font-medium truncate text-foreground"
+                          >
                             {u.username}
                           </span>
                           {u.display_name && u.display_name !== u.username && (
@@ -948,7 +1022,7 @@ export default function SettingsPage() {
                                 onClick={() => setResetTarget(u)}
                                 title={`Reset password for ${u.username}`}
                                 aria-label={`Reset password for ${u.username}`}
-                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer"
+                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                               >
                                 <Key className="h-3 w-3" aria-hidden />
                                 Reset
@@ -957,7 +1031,7 @@ export default function SettingsPage() {
                                 onClick={() => setPendingDeleteUser(u)}
                                 disabled={deletingId === u.id}
                                 aria-label={`Delete user ${u.username}`}
-                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive disabled:opacity-40 transition-colors cursor-pointer"
+                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-destructive hover:text-destructive/80 disabled:opacity-40 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                               >
                                 {deletingId === u.id ? (
                                   <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
