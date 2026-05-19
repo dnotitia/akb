@@ -80,8 +80,15 @@ async def put_document(req: DocumentPutRequest, user: AuthenticatedUser = Depend
 
 
 @router.get("/documents/{vault}/{doc_id:path}", response_model=DocumentResponse, summary="Get a document")
-async def get_document(vault: str, doc_id: str, user: AuthenticatedUser = Depends(get_current_user)):
+async def get_document(
+    vault: str,
+    doc_id: str,
+    version: str | None = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     await check_vault_access(user.user_id, vault, required_role="reader")
+    if version:
+        return await doc_service.get_at_commit(vault, doc_id, version)
     return await doc_service.get(vault, doc_id)
 
 

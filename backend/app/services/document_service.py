@@ -344,6 +344,63 @@ class DocumentService:
             public_slug=public_slug,
         )
 
+    async def get_at_commit(self, vault: str, doc_ref: str, version: str) -> DocumentResponse:
+        """Return a document's metadata + body as of a specific git commit.
+
+        The metadata (title, type, tags, summary, dates) is read from the
+        current PG row — historical metadata is not tracked here. The
+        content body is read from git at the requested commit. If the commit
+        doesn't have the file at this path, NotFoundError is raised.
+        """
+        vault_repo, doc_repo, _ = await self._repos()
+
+        vault_id = await vault_repo.get_id_by_name(vault)
+        if not vault_id:
+            raise NotFoundError("Vault", vault)
+
+        row = await doc_repo.find_by_ref(vault_id, doc_ref)
+        if not row:
+            raise NotFoundError("Document", doc_ref)
+
+        raw = await asyncio.to_thread(
+            self.git.read_file, vault, row["path"], commit=version,
+        )
+        if raw is None:
+            raise NotFoundError("Document version", f"{row['path']}@{version[:8]}")
+
+        # Strip frontmatter. Historical commits may carry malformed YAML
+        # or legacy id fields, so prefer the python-frontmatter parser
+        # which mirrors MCP's _handle_get behavior. Fall back to a regex
+        # strip if the parser chokes — never leak the raw frontmatter
+        # header (which can contain legacy d-prefix ids).
+        try:
+            import frontmatter as _fm
+            body = _fm.loads(raw).content
+        except Exception:
+            import re as _re
+            body = _re.sub(
+                r"\A---\r?\n.*?\r?\n---\r?\n",
+                "",
+                raw,
+                count=1,
+                flags=_re.DOTALL,
+            )
+
+        public_slug = await self._get_public_slug(row["vault_name"], row["path"])
+
+        return DocumentResponse(
+            uri=doc_uri(row["vault_name"], row["path"]),
+            vault=row["vault_name"], path=row["path"],
+            title=row["title"], type=row["doc_type"] or "note", status=row["status"],
+            summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+            current_commit=version,    # report the requested version, not HEAD
+            tags=list(row["tags"]) if row["tags"] else [],
+            content=body,
+            is_public=public_slug is not None,
+            public_slug=public_slug,
+        )
+
     async def _get_public_slug(self, vault_name: str, doc_path: str) -> str | None:
         """Return the newest publication slug for a document, or None.
         Looks up by the canonical resource_uri rather than the dropped
