@@ -21,7 +21,7 @@ export function SkillSettingsLink({ vault, defined, updatedAt }: Props) {
         </span>
       </div>
       {defined ? (
-        <Link to={`/vault/${vault}/skill`}>
+        <Link to={`/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`}>
           <Button variant="outline" size="sm">Configure →</Button>
         </Link>
       ) : (

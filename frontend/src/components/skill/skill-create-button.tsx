@@ -32,7 +32,10 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
       });
       queryClient.invalidateQueries({ queryKey: ["document", vault, "overview/vault-skill.md"] });
       queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
-      navigate(`/vault/${vault}/skill`, { replace: true });
+      navigate(
+        `/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`,
+        { replace: true },
+      );
     } catch (e: any) {
       const raw = e?.message || "";
       setError(raw ? `Failed to create vault guide: ${raw}` : "Failed to create vault guide");
