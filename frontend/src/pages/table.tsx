@@ -26,6 +26,12 @@ export default function TablePage() {
 
   useEffect(() => {
     if (!vault || !table) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setRows([]);
+    setCols([]);
+    setTotal(0);
+    setError("");
     const t = localStorage.getItem("akb_token") || "";
     fetch(`/api/v1/tables/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
       .then((r) => r.json())

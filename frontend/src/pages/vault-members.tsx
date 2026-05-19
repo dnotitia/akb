@@ -57,6 +57,10 @@ export default function VaultMembersPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setMembers(null);
+    setError("");
     refresh();
   }, [name]);
 

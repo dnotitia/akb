@@ -68,6 +68,11 @@ export default function VaultSettingsPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setDescription("");
+    setPublicAccess("none");
+    setError("");
     getVaultInfo(name)
       .then((d) => {
         setInfo(d);

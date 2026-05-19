@@ -80,6 +80,13 @@ export default function VaultPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setCounts(null);
+    setRecent([]);
+    setActivity([]);
+    setCommitsLoaded(false);
+    setCommitsOpen(false);
     getVaultInfo(name).then(setInfo).catch(() => {});
     getRecent(name, 12).then((d) => setRecent(d.changes || [])).catch(() => {});
     browseVault(name, undefined, 2)

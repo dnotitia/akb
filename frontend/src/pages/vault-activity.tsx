@@ -19,6 +19,8 @@ export default function VaultActivityPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setEntries(null);
     setLoading(true);
     setError("");
     getVaultActivity(name, { author: debounced || undefined, limit: PAGE_SIZE })

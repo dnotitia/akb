@@ -72,6 +72,8 @@ export default function DocumentPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setVaultRole(null);
     getVaultInfo(name)
       .then((d) => setVaultRole(d?.role || null))
       .catch(() => setVaultRole(null));
@@ -89,10 +91,12 @@ export default function DocumentPage() {
 
   useEffect(() => {
     const d = docQuery.data;
-    if (!d) return;
-    // Reset local override when the query result changes (e.g. navigating docs).
+    // Reset stale state from previous param before re-fetch resolves.
     setDocOverride(null);
     setProvenance([]);
+    setRelations([]);    // NEW
+    if (!d) return;
+    // Reset local override when the query result changes (e.g. navigating docs).
     if (d.path && d.path !== docId) {
       navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
     }
