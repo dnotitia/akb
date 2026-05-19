@@ -119,11 +119,15 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
     async with pool.acquire() as conn:
         # Upsert: existing rows stay untouched (including their term_id);
         # new rows get a fresh id from the sequence.
+        # ORDER BY enforces a deterministic row-lock acquisition order so
+        # concurrent encoders processing documents with overlapping vocab
+        # (English stopwords are the dominant case) don't deadlock on the
+        # ON CONFLICT row locks.
         rows = await conn.fetch(
             """
             INSERT INTO bm25_vocab (term, term_id)
             SELECT t, nextval('bm25_term_id_seq')
-              FROM unnest($1::text[]) AS t
+              FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
             ON CONFLICT (term) DO UPDATE
                 SET updated_at = bm25_vocab.updated_at   -- no-op, returns existing row
             RETURNING term, term_id
