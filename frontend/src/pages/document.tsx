@@ -47,6 +47,7 @@ export default function DocumentPage() {
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
   const [searchParams, setSearchParams] = useSearchParams();
+  const commitHash = searchParams.get("commit") || undefined;
   const view: "rendered" | "raw" | "agent" =
     searchParams.get("view") === "raw" ? "raw" : "rendered";
   const [relations, setRelations] = useState<any[]>([]);
@@ -80,8 +81,8 @@ export default function DocumentPage() {
   }, [name]);
 
   const docQuery = useQuery({
-    queryKey: ["document", name, docId],
-    queryFn: () => getDocument(name!, docId),
+    queryKey: ["document", name, docId, commitHash],
+    queryFn: () => getDocument(name!, docId, commitHash),
     enabled: !!name && !!docId,
     retry: false,
   });
@@ -188,6 +189,33 @@ export default function DocumentPage() {
           mirroring other pages' centering. Rail stays pinned to the
           outer outlet edge via the grid's second column. */}
       <article ref={setArticleEl} className="min-w-0 w-full max-w-[1020px] justify-self-center">
+        {commitHash && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap"
+          >
+            <div className="flex items-baseline gap-2 min-w-0">
+              <span className="coord-spark text-accent shrink-0">⊙ HISTORICAL VIEW</span>
+              <span className="text-sm text-foreground">
+                Viewing version{" "}
+                <code className="font-mono text-accent">{commitHash.slice(0, 7)}</code>
+                {" "}— writes are disabled until you return to the latest version.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const p = new URLSearchParams(searchParams);
+                p.delete("commit");
+                setSearchParams(p, { replace: false });
+              }}
+              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider border border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              ← Back to latest
+            </button>
+          </div>
+        )}
         {/* Mono meta line */}
         <div className="coord mb-2">
           DOC · akb://{name}/{doc.path}
@@ -252,7 +280,7 @@ export default function DocumentPage() {
         {/* Owner/admin/writer actions. For skill docs, the SkillBanner
             above the article owns the Edit details entry point, so hide
             it here to avoid two identical buttons on the same screen. */}
-        {(vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner") && (
+        {!commitHash && (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner") && (
           <div className="shrink-0 pb-3 mb-3 border-b border-border space-y-2">
             {doc.type !== "skill" && (
               <button
@@ -273,51 +301,53 @@ export default function DocumentPage() {
           </div>
         )}
 
-        {/* Publish strip — always visible */}
-        <div className="shrink-0 pb-3 mb-3 border-b border-border">
-          {doc.is_public && doc.public_slug ? (
-            <div className="flex flex-col gap-1.5 text-xs">
-              <div className="coord">§ PUBLISHED</div>
-              <div className="font-mono text-[11px] text-foreground truncate">
-                /p/{doc.public_slug}
+        {/* Publish strip — hidden in historical view */}
+        {!commitHash && (
+          <div className="shrink-0 pb-3 mb-3 border-b border-border">
+            {doc.is_public && doc.public_slug ? (
+              <div className="flex flex-col gap-1.5 text-xs">
+                <div className="coord">§ PUBLISHED</div>
+                <div className="font-mono text-[11px] text-foreground truncate">
+                  /p/{doc.public_slug}
+                </div>
+                <div className="flex items-center gap-3 text-[11px]">
+                  <button
+                    onClick={copyPublicLink}
+                    className="inline-flex items-center gap-1 text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  >
+                    {copied ? (
+                      <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden />
+                    ) : (
+                      <ExternalLink className="h-3 w-3" aria-hidden />
+                    )}
+                    {copied ? "Copied" : "Copy link"}
+                  </button>
+                  <button
+                    onClick={handleUnpublish}
+                    disabled={publishing}
+                    className="inline-flex items-center gap-1 text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50"
+                  >
+                    {publishing ? (
+                      <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                    ) : (
+                      <Lock className="h-3 w-3" aria-hidden />
+                    )}
+                    {publishing ? "Unpublishing…" : "Unpublish"}
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-3 text-[11px]">
-                <button
-                  onClick={copyPublicLink}
-                  className="inline-flex items-center gap-1 text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                >
-                  {copied ? (
-                    <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden />
-                  ) : (
-                    <ExternalLink className="h-3 w-3" aria-hidden />
-                  )}
-                  {copied ? "Copied" : "Copy link"}
-                </button>
-                <button
-                  onClick={handleUnpublish}
-                  disabled={publishing}
-                  className="inline-flex items-center gap-1 text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50"
-                >
-                  {publishing ? (
-                    <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                  ) : (
-                    <Lock className="h-3 w-3" aria-hidden />
-                  )}
-                  {publishing ? "Unpublishing…" : "Unpublish"}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={() => setPublishOpen(true)}
-              disabled={publishing}
-              className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors disabled:opacity-50 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              <Unlock className="h-3 w-3" aria-hidden />
-              Publish to /p/…
-            </button>
-          )}
-        </div>
+            ) : (
+              <button
+                onClick={() => setPublishOpen(true)}
+                disabled={publishing}
+                className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors disabled:opacity-50 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                <Unlock className="h-3 w-3" aria-hidden />
+                Publish to /p/…
+              </button>
+            )}
+          </div>
+        )}
 
         <Tabs defaultValue="outline" className="flex flex-col min-h-0 flex-1">
           <TabsList className="shrink-0">
@@ -399,7 +429,20 @@ export default function DocumentPage() {
             value="history"
             className="flex-1 min-h-0 overflow-hidden pr-1 pt-3"
           >
-            <HistoryList entries={provenance as any} />
+            <HistoryList
+              entries={provenance as any}
+              selectedHash={commitHash}
+              onSelect={(hash) => {
+                const p = new URLSearchParams(searchParams);
+                if (commitHash === hash) {
+                  // same hash clicked again → toggle back to latest
+                  p.delete("commit");
+                } else {
+                  p.set("commit", hash);
+                }
+                setSearchParams(p, { replace: false });
+              }}
+            />
           </TabsContent>
         </Tabs>
       </aside>
