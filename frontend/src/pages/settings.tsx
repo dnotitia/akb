@@ -383,9 +383,11 @@ export default function SettingsPage() {
           BACK
         </button>
         <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord">
-          <Link to="/" className="hover:text-accent">HOME</Link>
+          <Link to="/" className="hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">HOME</Link>
           <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-          <span className="text-foreground">SETTINGS</span>
+          <Link to="/settings" className="hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">SETTINGS</Link>
+          <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
+          <span className="text-foreground">{activeTab.toUpperCase()}</span>
         </nav>
       </div>
 
@@ -557,7 +559,7 @@ export default function SettingsPage() {
                 <button
                   onClick={() => setNewPat(null)}
                   aria-label="Dismiss fresh token"
-                  className="coord hover:text-destructive cursor-pointer"
+                  className="inline-flex items-center justify-center h-7 w-7 coord hover:text-destructive cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <X className="h-3 w-3" aria-hidden />
                 </button>
@@ -570,7 +572,7 @@ export default function SettingsPage() {
                   <button
                     onClick={() => setShowPat(!showPat)}
                     aria-label={showPat ? "Hide token" : "Show token"}
-                    className="coord hover:text-accent cursor-pointer"
+                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
                     {showPat ? (
                       <EyeOff className="h-3 w-3" aria-hidden />
@@ -581,7 +583,7 @@ export default function SettingsPage() {
                   <button
                     onClick={() => copy(newPat, "pat")}
                     aria-label="Copy token"
-                    className="coord hover:text-accent cursor-pointer"
+                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
                     {copied === "pat" ? "✓ COPIED" : <Copy className="h-3 w-3" aria-hidden />}
                   </button>
@@ -595,7 +597,7 @@ export default function SettingsPage() {
                     <button
                       onClick={() => copy(stdioConfig(newPat), "stdio")}
                       aria-label="Copy config"
-                      className={`font-mono text-[10px] uppercase tracking-wider cursor-pointer ${
+                      className={`inline-flex items-center justify-center h-7 px-2 font-mono text-[10px] uppercase tracking-wider cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
                         copied === "stdio" ? "text-accent" : "hover:text-accent"
                       }`}
                     >
@@ -808,7 +810,7 @@ export default function SettingsPage() {
                           type="button"
                           onClick={() => copy(snippets[clientTab], clientTab)}
                           aria-label="Copy snippet"
-                          className={`font-mono text-[10px] uppercase tracking-wider cursor-pointer shrink-0 ${
+                          className={`inline-flex items-center justify-center h-7 px-2 font-mono text-[10px] uppercase tracking-wider cursor-pointer shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
                             copied === clientTab ? "text-accent" : "hover:text-accent"
                           }`}
                         >
