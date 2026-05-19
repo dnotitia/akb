@@ -208,7 +208,9 @@ class DocumentService:
             raise NotFoundError("Vault", req.vault)
 
         now = datetime.now(timezone.utc)
-        slug = _slugify(req.title)
+        # Caller may pin an explicit slug (e.g. the vault-guide seed needs
+        # `vault-skill` so its path stays stable across title edits).
+        slug = (req.slug and _slugify(req.slug)) or _slugify(req.title)
         normalized_collection = _normalize_collection(req.collection)
         file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
 
@@ -962,6 +964,7 @@ class DocumentService:
                     vault=name,
                     collection="overview",
                     title=f"{name} Guide",
+                    slug="vault-skill",
                     content=skill_body,
                     type="skill",
                     tags=["akb:skill"],

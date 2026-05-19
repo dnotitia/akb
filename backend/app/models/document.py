@@ -41,6 +41,12 @@ class DocumentPutRequest(NFCModel):
     depends_on: list[str] = Field(default_factory=list)
     related_to: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Optional explicit slug for the file path under the collection.
+    # When omitted, the slug is derived from `title`. The seed flow and
+    # frontend "Create from template" both pass an explicit slug so the
+    # path stays stable (overview/vault-skill.md) even when the title
+    # is friendly text like "{vault} Guide".
+    slug: str | None = None
 
 
 class DocumentUpdateRequest(NFCModel):

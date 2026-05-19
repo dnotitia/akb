@@ -55,6 +55,7 @@ describe("SkillCreateButton", () => {
           vault: "my-v",
           collection: "overview",
           title: "my-v Guide",
+          slug: "vault-skill",
           type: "skill",
           content: expect.stringContaining("my-v Guide"),
         }),

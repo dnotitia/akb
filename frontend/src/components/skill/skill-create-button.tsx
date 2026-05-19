@@ -26,6 +26,9 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
         vault,
         collection: "overview",
         title: `${vault} Guide`,
+        // Pin the path to overview/vault-skill.md so it doesn't drift to
+        // overview/<vault>-guide.md when the friendly title is slugified.
+        slug: "vault-skill",
         type: "skill",
         content,
         tags: ["akb:skill"],
