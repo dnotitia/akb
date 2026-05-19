@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Settings as SettingsIcon, Users } from "lucide-react";
+import { ChevronDown, ChevronRight, FilePlus, Settings as SettingsIcon, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { browseVault, getDocument, getRecent, getVaultInfo } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -155,6 +155,17 @@ export default function VaultPage() {
           <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
         )}
         <div className="ml-auto flex items-baseline gap-4">
+          {(info?.role === "writer" ||
+            info?.role === "admin" ||
+            info?.role === "owner") && (
+            <Link
+              to={`/vault/${name}/doc/new`}
+              className="inline-flex items-baseline gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              <FilePlus className="h-3 w-3 self-center" aria-hidden />
+              NEW DOC
+            </Link>
+          )}
           <Link
             to={`/vault/${name}/members`}
             className="inline-flex items-baseline gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"

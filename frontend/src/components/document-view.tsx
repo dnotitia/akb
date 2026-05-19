@@ -16,6 +16,14 @@ interface DocumentViewProps {
   /** Controlled view — provide this + onViewChange to sync with URL params */
   view?: ViewMode;
   onViewChange?: (next: ViewMode) => void;
+  /**
+   * Optional extra segmented-control tab appended after RENDERED/RAW/AGENT.
+   * The parent owns the click handler — DocumentView does not switch
+   * its own view state when the extra tab is clicked. Used by
+   * DocumentPage to inject the body-editor entry point without
+   * folding the editor into this read-focused component.
+   */
+  extraTab?: { label: string; onClick: () => void };
 }
 
 /**
@@ -35,7 +43,7 @@ interface DocumentViewProps {
  * segment will land. When T6 adds it, extend the `ViewMode` union and
  * add a third tab here alongside the doc.type === "skill" guard.
  */
-export function DocumentView({ vault, docId, view: viewProp, onViewChange }: DocumentViewProps) {
+export function DocumentView({ vault, docId, view: viewProp, onViewChange, extraTab }: DocumentViewProps) {
   const [localView, setLocalView] = useState<ViewMode>("rendered");
 
   // Controlled vs. uncontrolled view mode
@@ -137,6 +145,16 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange }: Doc
               }`}
             >
               AGENT
+            </button>
+          )}
+          {extraTab && (
+            <button
+              role="tab"
+              aria-selected={false}
+              onClick={extraTab.onClick}
+              className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+            >
+              {extraTab.label}
             </button>
           )}
         </div>
