@@ -71,12 +71,31 @@ export default function DocumentNewPage() {
       setError("Title is required.");
       return;
     }
+    if (t.length > 256) {
+      setError("Title is too long (256 chars max).");
+      return;
+    }
     if (!c) {
       setError("Collection is required.");
       return;
     }
+    // Allowlist: lowercase letters, digits, hyphens, underscores, and `/`
+    // as a segment separator. Blocks path traversal (`..`), Windows-style
+    // separators, absolute paths, and trailing slashes before the backend
+    // ever sees the value. The backend should still validate, but a clear
+    // client-side rejection produces a much better error message.
+    if (!/^[a-z0-9_\-]+(?:\/[a-z0-9_\-]+)*$/.test(c)) {
+      setError(
+        "Collection must use lowercase letters, digits, hyphens, underscores, and `/` only.",
+      );
+      return;
+    }
     if (!body.trim()) {
       setError("Body cannot be empty.");
+      return;
+    }
+    if (body.length > 1_000_000) {
+      setError("Body is too large (1 MB max).");
       return;
     }
     setError("");
@@ -146,6 +165,7 @@ export default function DocumentNewPage() {
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="A short, descriptive title"
+            maxLength={256}
             autoFocus
           />
         </div>
@@ -161,6 +181,7 @@ export default function DocumentNewPage() {
               onChange={(e) => setCollection(e.target.value)}
               placeholder="e.g. engineering/specs"
               className="font-mono"
+              maxLength={120}
             />
             <div className="coord">CREATED AUTOMATICALLY IF NEW</div>
           </div>
@@ -221,6 +242,7 @@ export default function DocumentNewPage() {
             rows={2}
             placeholder="One-line description used in search results."
             className="resize-y"
+            maxLength={500}
           />
         </div>
 

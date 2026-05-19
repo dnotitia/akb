@@ -14,6 +14,7 @@ import {
   Unlock,
 } from "lucide-react";
 import {
+  ApiError,
   deleteDocument,
   getDocument,
   getRelations,
@@ -172,31 +173,48 @@ export default function DocumentPage() {
     setBodyError("");
     try {
       await updateDocument(name, docId, { content: editingContent });
-      const now = new Date().toISOString();
-      // Optimistically advance content + updated_at so the byline reads
-      // "last changed just now" without waiting for a refetch.
-      setDocOverride({
-        ...(doc || {}),
-        content: editingContent,
-        updated_at: now,
-      });
-      setOriginalContent(editingContent);
-      refetchTree();
-      // Commit `savedAt` before the view switch so the SAVED badge
-      // renders in its own paint; bundling it with `setSearchParams`
-      // lets React squash the indicator into the same commit as the
-      // tab-strip remount and the user never sees it.
-      flushSync(() => {
-        flashSaved();
-      });
-      const p = new URLSearchParams(searchParams);
-      p.delete("view");
-      setSearchParams(p, { replace: true });
-    } catch (e: any) {
-      setBodyError(e?.message || "Save failed");
-    } finally {
+    } catch (e: unknown) {
+      const status = e instanceof ApiError ? e.status : 0;
+      // 5xx responses can carry stack traces or SQL fragments — never
+      // surface those verbatim. 4xx are intentional API errors so the
+      // message is OK to show.
+      const safe =
+        status >= 500
+          ? "The server hit an error while saving. Please retry."
+          : e instanceof Error
+            ? e.message
+            : "Save failed.";
+      setBodyError(safe);
       setSavingBody(false);
+      return;
     }
+    const now = new Date().toISOString();
+    // Optimistically advance content + updated_at so the byline reads
+    // "last changed just now" without waiting for a refetch.
+    setDocOverride({
+      ...(doc || {}),
+      content: editingContent,
+      updated_at: now,
+    });
+    setOriginalContent(editingContent);
+    // Sidebar refresh is best-effort — its failure must not leave the
+    // user looking at a "still dirty" editor after a successful save.
+    try {
+      refetchTree();
+    } catch {
+      // intentionally swallowed
+    }
+    // Commit `savedAt` before the view switch so the SAVED badge
+    // renders in its own paint; bundling it with `setSearchParams`
+    // lets React squash the indicator into the same commit as the
+    // tab-strip remount and the user never sees it.
+    flushSync(() => {
+      flashSaved();
+    });
+    const p = new URLSearchParams(searchParams);
+    p.delete("view");
+    setSearchParams(p, { replace: true });
+    setSavingBody(false);
   }
 
   const savedTimerRef = useRef<number | null>(null);

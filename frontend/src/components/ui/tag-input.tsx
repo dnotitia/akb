@@ -7,6 +7,10 @@ export interface TagInputProps {
   onChange: (tags: string[]) => void;
   id?: string;
   placeholder?: string;
+  /** Per-tag character cap. Defaults to 50. */
+  maxTagLength?: number;
+  /** Maximum number of tags accepted. Defaults to 50. */
+  maxTags?: number;
 }
 
 export function TagInput({
@@ -14,12 +18,18 @@ export function TagInput({
   onChange,
   id,
   placeholder = "Add tag and press Enter or comma",
+  maxTagLength = 50,
+  maxTags = 50,
 }: TagInputProps) {
   const [draft, setDraft] = useState("");
 
   function commit() {
-    const v = draft.trim().replace(/^#/, "");
+    const v = draft.trim().replace(/^#/, "").slice(0, maxTagLength);
     if (!v) return;
+    if (value.length >= maxTags) {
+      setDraft("");
+      return;
+    }
     if (!value.includes(v)) onChange([...value, v]);
     setDraft("");
   }
@@ -53,7 +63,8 @@ export function TagInput({
       <Input
         id={id}
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => setDraft(e.target.value.slice(0, maxTagLength))}
+        maxLength={maxTagLength}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === ",") {
             e.preventDefault();

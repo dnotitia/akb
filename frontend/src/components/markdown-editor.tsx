@@ -38,7 +38,7 @@ import {
   TableRowPlugin,
 } from "@platejs/table/react";
 import remarkGfm from "remark-gfm";
-import { cn } from "@/lib/utils";
+import { cn, sanitizeLinkUrl } from "@/lib/utils";
 
 // ── Element & leaf components ─────────────────────────────────────────────
 // AKB tone: keep prose styling close to the read view (prose dark:prose-invert
@@ -93,14 +93,15 @@ function CodeLineElement(props: PlateElementProps) {
 }
 
 function LinkElement(props: PlateElementProps) {
-  const url = (props.element as any).url as string | undefined;
+  const url = (props.element as { url?: string }).url;
+  const safe = sanitizeLinkUrl(url);
   return (
     <PlateElement
       {...props}
       as="a"
       // href is read-only in the editor; opening links is handled outside the
       // editing surface (cmd-click). We still set href for serialization round-trip.
-      attributes={{ ...props.attributes, href: url }}
+      attributes={{ ...props.attributes, href: safe, rel: "noopener noreferrer" }}
       className="text-accent underline underline-offset-2 hover:no-underline"
     />
   );
@@ -264,7 +265,18 @@ export function MarkdownEditor({
   const editor = usePlateEditor({
     plugins,
     components,
-    value: (ed) => ed.getApi(MarkdownPlugin).markdown.deserialize(value || ""),
+    value: (ed) => {
+      try {
+        return ed.getApi(MarkdownPlugin).markdown.deserialize(value || "");
+      } catch (err) {
+        // Plate's mdast deserializer can throw on malformed input
+        // (unsupported HTML, broken tables, etc). Surface the editor with
+        // an empty body instead of letting the whole page crash — the user
+        // can still re-paste or use Raw view to recover the original.
+        console.warn("MarkdownEditor: deserialize failed, mounting empty editor", err);
+        return [{ type: ParagraphPlugin.key, children: [{ text: "" }] }];
+      }
+    },
   });
 
   return (
