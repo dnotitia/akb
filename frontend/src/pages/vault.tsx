@@ -221,7 +221,10 @@ export default function VaultPage() {
             {recent.map((c, i) => (
               <li key={c.doc_id + c.changed_at}>
                 <Link
-                  to={`/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}`}
+                  to={
+                    `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
+                    (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
+                  }
                   className="group grid grid-cols-[32px_1fr_auto] items-baseline gap-4 px-3 py-2 hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <span className="coord tabular-nums">
@@ -292,7 +295,8 @@ export default function VaultPage() {
                   const change = c.files?.[0]?.change;
                   const primaryDocPath = c.files?.[0]?.path;
                   const link = primaryDocPath
-                    ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}`
+                    ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}` +
+                      (c.hash ? `?commit=${encodeURIComponent(c.hash)}` : "")
                     : `/vault/${name}`;
                   return (
                     <li key={i}>

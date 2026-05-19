@@ -135,7 +135,8 @@ export default function VaultActivityPage() {
             const filesCount = e.files?.length || 0;
             const primary = e.files?.[0];
             const link = primary
-              ? `/vault/${name}/doc/${encodeURIComponent(primary.path)}`
+              ? `/vault/${name}/doc/${encodeURIComponent(primary.path)}` +
+                (e.hash ? `?commit=${encodeURIComponent(e.hash)}` : "")
               : `/vault/${name}`;
             return (
               <li key={(e.hash || "") + i}>
