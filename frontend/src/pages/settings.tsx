@@ -67,7 +67,7 @@ type ClientTab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
-  const [pats, setPats] = useState<PAT[]>([]);
+  const [pats, setPats] = useState<PAT[] | null>(null);
   const [newName, setNewName] = useState("");
   const [newPat, setNewPat] = useState<string | null>(null);
   const [showPat, setShowPat] = useState(false);
@@ -79,6 +79,12 @@ export default function SettingsPage() {
   const [pendingDeleteUser, setPendingDeleteUser] = useState<AdminUser | null>(null);
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
   const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
+  const [setupOpen, setSetupOpen] = useState<boolean | null>(() => {
+    const saved = localStorage.getItem("akb:tokens-setup-open");
+    if (saved === "true") return true;
+    if (saved === "false") return false;
+    return null;
+  });
   const [pwCurrent, setPwCurrent] = useState("");
   const [pwNew, setPwNew] = useState("");
   const [pwConfirm, setPwConfirm] = useState("");
@@ -108,6 +114,20 @@ export default function SettingsPage() {
       setProfileEmail(user.email ?? "");
     }
   }, [user]);
+
+  // Smart default: open setup guide when user has no PATs, closed otherwise.
+  // Only applies when localStorage has no saved preference (setupOpen === null).
+  useEffect(() => {
+    if (setupOpen !== null) return;
+    if (pats === null) return;
+    setSetupOpen(pats.length === 0);
+  }, [pats, setupOpen]);
+
+  function toggleSetup() {
+    const next = !setupOpen;
+    setSetupOpen(next);
+    localStorage.setItem("akb:tokens-setup-open", String(next));
+  }
 
   async function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -248,7 +268,7 @@ export default function SettingsPage() {
     );
 
   // Pat used in snippets: prefer fresh mint, else first active, else placeholder
-  const snippetPat = newPat || pats[0]?.prefix + "…" || "<YOUR_PAT>";
+  const snippetPat = newPat || pats?.[0]?.prefix + "…" || "<YOUR_PAT>";
   const snippets = useMemo<Record<ClientTab, string>>(
     () => ({
       claude: `claude mcp add --scope user akb -- npx akb-mcp --url ${MCP_URL} --pat ${snippetPat} --insecure`,
@@ -345,7 +365,7 @@ export default function SettingsPage() {
           <TabsTrigger value="profile">Profile</TabsTrigger>
           <TabsTrigger value="tokens" className="gap-1.5">
             Tokens
-            <span className="coord tabular-nums">[{pats.length}]</span>
+            <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
           </TabsTrigger>
           <TabsTrigger value="preferences">Preferences</TabsTrigger>
           <TabsTrigger value="memory">Memory</TabsTrigger>
@@ -555,10 +575,10 @@ export default function SettingsPage() {
           <section className="border border-border bg-surface">
             <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
               <span className="coord-ink">§ ACTIVE TOKENS</span>
-              <span className="coord tabular-nums">[{pats.length}]</span>
+              <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
             </header>
             <div className="p-6">
-              {pats.length === 0 ? (
+              {!pats || pats.length === 0 ? (
                 <EmptyState title="No tokens yet — mint one below." />
               ) : (
                 <div className="border border-border divide-y divide-border">
@@ -616,194 +636,213 @@ export default function SettingsPage() {
             </div>
           </section>
 
-          {/* ── Setup guide — onboarding reference below ──────────── */}
-          <div className="coord mt-2 pt-4 border-t border-border">
-            § Setup guide — mint a new token and wire it into a client
-          </div>
+          {/* Collapsible setup guide */}
+          <div className="border border-border bg-surface">
+            <button
+              type="button"
+              onClick={toggleSetup}
+              aria-expanded={!!setupOpen}
+              aria-controls="setup-guide-body"
+              className="w-full flex items-center justify-between px-6 py-3 border-b border-border hover:bg-surface-muted cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              <span className="coord-ink">§ SETUP GUIDE — 3 STEPS</span>
+              <ChevronRight
+                className={`h-4 w-4 transition-transform ${setupOpen ? "rotate-90" : ""}`}
+                aria-hidden
+              />
+            </button>
+            {setupOpen && (
+              <div id="setup-guide-body" className="p-6 space-y-6">
 
-          {/* STEP 01 — Mint a token */}
-          <section className="border border-border bg-surface">
-            <header className="border-b border-border px-6 py-3 flex items-baseline justify-between flex-wrap gap-2">
-              <div className="flex items-baseline gap-3">
-                <span className="coord-spark">STEP 01</span>
-                <h2 className="text-base font-semibold tracking-tight text-foreground">
-                  Mint a token
-                </h2>
-              </div>
-              <span className="coord">Personal Access Token</span>
-            </header>
-            <div className="p-6 space-y-3">
-              <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                A Personal Access Token authorizes your agent against the base.
-                You can rotate or revoke it any time.
-              </p>
-              <form onSubmit={handleCreatePAT} className="flex gap-2">
-                <Label htmlFor="new-pat-name" className="sr-only">
-                  Token name
-                </Label>
-                <Input
-                  id="new-pat-name"
-                  placeholder="Token name (e.g. claude-code-macbook)"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  className="flex-1"
-                />
-                <Button
-                  type="submit"
-                  variant="accent"
-                  disabled={creating || !newName.trim()}
-                >
-                  {creating ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                      Minting
-                    </>
-                  ) : (
-                    <>
-                      <Plus className="h-4 w-4" aria-hidden />
-                      Mint
-                    </>
-                  )}
-                </Button>
-              </form>
-            </div>
-          </section>
-
-          {/* STEP 02 — Drop the snippet */}
-          <section className="border border-border bg-surface">
-            <header className="border-b border-border px-6 py-3 flex items-baseline justify-between flex-wrap gap-2">
-              <div className="flex items-baseline gap-3">
-                <span className="coord-spark">STEP 02</span>
-                <h2 className="text-base font-semibold tracking-tight text-foreground">
-                  Drop the snippet
-                </h2>
-              </div>
-              <span className="coord">npm: akb-mcp</span>
-            </header>
-            <div className="p-6 space-y-3">
-              <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
-                Pick your client. Paste once. Your agent learns the base on the
-                next launch.
-              </p>
-
-              {/* Client tabs */}
-              <div className="flex flex-wrap border border-border">
-                {(
-                  [
-                    ["claude", "01", "Claude Code"],
-                    ["cursor", "02", "Cursor / Windsurf / Gemini / Claude Desktop"],
-                    ["codex", "03", "Codex CLI"],
-                    ["vscode", "04", "VS Code"],
-                    ["openclaw", "05", "OpenClaw"],
-                  ] as [ClientTab, string, string][]
-                ).map(([id, num, label], i) => (
-                  <button
-                    key={id}
-                    type="button"
-                    onClick={() => setClientTab(id)}
-                    className={`flex-1 min-w-[140px] text-left px-3 py-2 transition-colors ${
-                      i > 0 ? "border-l border-border" : ""
-                    } ${
-                      clientTab === id
-                        ? "bg-foreground text-background"
-                        : "hover:bg-surface-muted cursor-pointer"
-                    }`}
-                  >
-                    <div
-                      className={`coord ${clientTab === id ? "text-background" : ""}`}
-                    >
-                      {num}
+                {/* STEP 01 — Mint a token */}
+                <div>
+                  <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+                    <div className="flex items-baseline gap-3">
+                      <span className="coord-spark">STEP 01</span>
+                      <h2 className="text-base font-semibold tracking-tight text-foreground">
+                        Mint a token
+                      </h2>
                     </div>
-                    <div className="text-xs font-medium tracking-tight">
-                      {label}
-                    </div>
-                  </button>
-                ))}
-              </div>
-
-              {/* Snippet */}
-              <div className="border border-border">
-                <div className="flex items-center justify-between border-b border-border bg-foreground text-background px-3 py-1.5">
-                  <span className="font-mono text-[10px] uppercase tracking-wider truncate">
-                    {clientTab === "claude" && "TERMINAL"}
-                    {clientTab === "cursor" && "mcpServers schema — per-client path below"}
-                    {clientTab === "codex" && "TERMINAL"}
-                    {clientTab === "vscode" && ".vscode/mcp.json"}
-                    {clientTab === "openclaw" && "~/.openclaw/openclaw.json"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => copy(snippets[clientTab], clientTab)}
-                    aria-label="Copy snippet"
-                    className={`font-mono text-[10px] uppercase tracking-wider cursor-pointer shrink-0 ${
-                      copied === clientTab ? "text-accent" : "hover:text-accent"
-                    }`}
-                  >
-                    {copied === clientTab ? "✓ COPIED" : "COPY"}
-                  </button>
-                </div>
-                <pre className="font-mono text-[11px] leading-relaxed p-4 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-all">
-                  {snippets[clientTab]}
-                </pre>
-                {clientTab === "cursor" && (
-                  <div className="border-t border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
-                    <div><span className="coord mr-2">CURSOR</span>~/.cursor/mcp.json</div>
-                    <div><span className="coord mr-2">WINDSURF</span>~/.codeium/windsurf/mcp_config.json</div>
-                    <div><span className="coord mr-2">GEMINI</span>~/.gemini/settings.json</div>
-                    <div>
-                      <span className="coord mr-2">CLAUDE DESKTOP</span>
-                      ~/Library/Application Support/Claude/claude_desktop_config.json{" "}
-                      <span className="text-foreground-muted/60">(macOS)</span>
-                    </div>
+                    <span className="coord">Personal Access Token</span>
+                  </header>
+                  <div className="space-y-3">
+                    <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
+                      A Personal Access Token authorizes your agent against the base.
+                      You can rotate or revoke it any time.
+                    </p>
+                    <form onSubmit={handleCreatePAT} className="flex gap-2">
+                      <Label htmlFor="new-pat-name" className="sr-only">
+                        Token name
+                      </Label>
+                      <Input
+                        id="new-pat-name"
+                        placeholder="Token name (e.g. claude-code-macbook)"
+                        value={newName}
+                        onChange={(e) => setNewName(e.target.value)}
+                        className="flex-1"
+                      />
+                      <Button
+                        type="submit"
+                        variant="accent"
+                        disabled={creating || !newName.trim()}
+                      >
+                        {creating ? (
+                          <>
+                            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                            Minting
+                          </>
+                        ) : (
+                          <>
+                            <Plus className="h-4 w-4" aria-hidden />
+                            Mint
+                          </>
+                        )}
+                      </Button>
+                    </form>
                   </div>
-                )}
-              </div>
-              {snippetPat === "<YOUR_PAT>" && (
-                <p className="coord text-foreground-muted">
-                  ↑ Replace <span className="text-accent">&lt;YOUR_PAT&gt;</span> with the
-                  token string shown after Step 01.
-                </p>
-              )}
-            </div>
-          </section>
+                </div>
 
-          {/* STEP 03 — Talk to your agent */}
-          <section className="border border-border bg-surface">
-            <header className="border-b border-border px-6 py-3 flex items-baseline justify-between flex-wrap gap-2">
-              <div className="flex items-baseline gap-3">
-                <span className="coord-spark">STEP 03</span>
-                <h2 className="text-base font-semibold tracking-tight text-foreground">
-                  Talk to your agent
-                </h2>
+                <div className="border-t border-border" />
+
+                {/* STEP 02 — Drop the snippet */}
+                <div>
+                  <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+                    <div className="flex items-baseline gap-3">
+                      <span className="coord-spark">STEP 02</span>
+                      <h2 className="text-base font-semibold tracking-tight text-foreground">
+                        Drop the snippet
+                      </h2>
+                    </div>
+                    <span className="coord">npm: akb-mcp</span>
+                  </header>
+                  <div className="space-y-3">
+                    <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
+                      Pick your client. Paste once. Your agent learns the base on the
+                      next launch.
+                    </p>
+
+                    {/* Client tabs */}
+                    <div className="flex flex-wrap border border-border">
+                      {(
+                        [
+                          ["claude", "01", "Claude Code"],
+                          ["cursor", "02", "Cursor / Windsurf / Gemini / Claude Desktop"],
+                          ["codex", "03", "Codex CLI"],
+                          ["vscode", "04", "VS Code"],
+                          ["openclaw", "05", "OpenClaw"],
+                        ] as [ClientTab, string, string][]
+                      ).map(([id, num, label], i) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => setClientTab(id)}
+                          className={`flex-1 min-w-[140px] text-left px-3 py-2 transition-colors ${
+                            i > 0 ? "border-l border-border" : ""
+                          } ${
+                            clientTab === id
+                              ? "bg-foreground text-background"
+                              : "hover:bg-surface-muted cursor-pointer"
+                          }`}
+                        >
+                          <div
+                            className={`coord ${clientTab === id ? "text-background" : ""}`}
+                          >
+                            {num}
+                          </div>
+                          <div className="text-xs font-medium tracking-tight">
+                            {label}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Snippet */}
+                    <div className="border border-border">
+                      <div className="flex items-center justify-between border-b border-border bg-foreground text-background px-3 py-1.5">
+                        <span className="font-mono text-[10px] uppercase tracking-wider truncate">
+                          {clientTab === "claude" && "TERMINAL"}
+                          {clientTab === "cursor" && "mcpServers schema — per-client path below"}
+                          {clientTab === "codex" && "TERMINAL"}
+                          {clientTab === "vscode" && ".vscode/mcp.json"}
+                          {clientTab === "openclaw" && "~/.openclaw/openclaw.json"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => copy(snippets[clientTab], clientTab)}
+                          aria-label="Copy snippet"
+                          className={`font-mono text-[10px] uppercase tracking-wider cursor-pointer shrink-0 ${
+                            copied === clientTab ? "text-accent" : "hover:text-accent"
+                          }`}
+                        >
+                          {copied === clientTab ? "✓ COPIED" : "COPY"}
+                        </button>
+                      </div>
+                      <pre className="font-mono text-[11px] leading-relaxed p-4 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-all">
+                        {snippets[clientTab]}
+                      </pre>
+                      {clientTab === "cursor" && (
+                        <div className="border-t border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
+                          <div><span className="coord mr-2">CURSOR</span>~/.cursor/mcp.json</div>
+                          <div><span className="coord mr-2">WINDSURF</span>~/.codeium/windsurf/mcp_config.json</div>
+                          <div><span className="coord mr-2">GEMINI</span>~/.gemini/settings.json</div>
+                          <div>
+                            <span className="coord mr-2">CLAUDE DESKTOP</span>
+                            ~/Library/Application Support/Claude/claude_desktop_config.json{" "}
+                            <span className="text-foreground-muted/60">(macOS)</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {snippetPat === "<YOUR_PAT>" && (
+                      <p className="coord text-foreground-muted">
+                        ↑ Replace <span className="text-accent">&lt;YOUR_PAT&gt;</span> with the
+                        token string shown after Step 01.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="border-t border-border" />
+
+                {/* STEP 03 — Talk to your agent */}
+                <div>
+                  <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+                    <div className="flex items-baseline gap-3">
+                      <span className="coord-spark">STEP 03</span>
+                      <h2 className="text-base font-semibold tracking-tight text-foreground">
+                        Talk to your agent
+                      </h2>
+                    </div>
+                    <Link
+                      to="/search?q=AKB+usage+guide"
+                      className="coord hover:text-accent"
+                    >
+                      ↗ FULL GUIDE
+                    </Link>
+                  </header>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+                    <PromptExample
+                      text='"Show me how to use AKB with akb_help()"'
+                      label="tools + quickstart"
+                    />
+                    <PromptExample
+                      text='"Search the dnotitia vault for the remote-work policy"'
+                      label="internal knowledge"
+                    />
+                    <PromptExample
+                      text='"From the sales vault, show deals with win-rate ≥ 60%"'
+                      label="data analysis"
+                    />
+                    <PromptExample
+                      text='"Create a todo for Jinwoo: please upload materials"'
+                      label="task assignment"
+                    />
+                  </div>
+                </div>
+
               </div>
-              <Link
-                to="/search?q=AKB+usage+guide"
-                className="coord hover:text-accent"
-              >
-                ↗ FULL GUIDE
-              </Link>
-            </header>
-            <div className="p-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
-                <PromptExample
-                  text='"Show me how to use AKB with akb_help()"'
-                  label="tools + quickstart"
-                />
-                <PromptExample
-                  text='"Search the dnotitia vault for the remote-work policy"'
-                  label="internal knowledge"
-                />
-                <PromptExample
-                  text='"From the sales vault, show deals with win-rate ≥ 60%"'
-                  label="data analysis"
-                />
-                <PromptExample
-                  text='"Create a todo for Jinwoo: please upload materials"'
-                  label="task assignment"
-                />
-              </div>
-            </div>
-          </section>
+            )}
+          </div>
 
         </TabsContent>
 
