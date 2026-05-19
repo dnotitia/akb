@@ -384,7 +384,11 @@ export default function SettingsPage() {
               <Button type="submit" disabled={profileBusy}>
                 {profileBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save profile"}
               </Button>
-              {profileOk && <span className="text-sm text-green-600">Saved</span>}
+              {profileOk && (
+                <span role="status" aria-live="polite" className="text-sm text-success">
+                  Saved
+                </span>
+              )}
               {profileError && (
                 <span className="text-sm text-destructive">{profileError}</span>
               )}
