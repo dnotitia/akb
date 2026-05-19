@@ -122,6 +122,11 @@ class Settings(BaseModel):
     # transaction footprint. 16 is a safe default at OpenAI-compatible
     # endpoint latencies; tune up to ~64 for fast self-hosted endpoints.
     indexing_batch_size: int = 16
+    # Parallel embed_worker tasks draining the same chunks queue. Workers
+    # coordinate via FOR UPDATE SKIP LOCKED, so N can be raised until the
+    # embedding API's rate limit or PG pool budget caps it. 1 keeps the
+    # legacy single-task behavior; 4-8 is the typical production knob.
+    indexing_concurrency: int = 1
 
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
