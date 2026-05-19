@@ -35,6 +35,7 @@ Use these types when writing documents. Skip the rest unless the body explicitly
 - session — agent session record
 - task — assignment
 - reference — stable reference material
+- skill — vault-level conventions (owner-maintained; one per vault, this very doc)
 
 ## Tag conventions
 
@@ -50,7 +51,10 @@ free-form this section. Agents read it as context, not a hard schema.)
 ## Relation rules
 
 - depends_on — one resource cannot be understood without another
+- implements — code/spec realizes a designed behavior
 - references — background citation
+- related_to — soft association, no directional dependency
+- attached_to — file or table belongs to its document
 - derived_from — generated/curated work depends on source material
 
 ## Document Template
