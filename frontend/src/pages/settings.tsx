@@ -84,6 +84,15 @@ export default function SettingsPage() {
   const [pwConfirm, setPwConfirm] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
+  const [pwTouched, setPwTouched] = useState({ new: false, confirm: false });
+  const pwTooShort = pwTouched.new && pwNew.length > 0 && pwNew.length < 8;
+  const pwMismatch =
+    pwTouched.confirm && pwConfirm.length > 0 && pwNew !== pwConfirm;
+  const pwSubmitDisabled =
+    pwBusy ||
+    pwNew.length < 8 ||
+    pwNew !== pwConfirm ||
+    pwCurrent.length === 0;
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileError, setProfileError] = useState("");
@@ -141,6 +150,7 @@ export default function SettingsPage() {
       setPwCurrent("");
       setPwNew("");
       setPwConfirm("");
+      setPwTouched({ new: false, confirm: false });
     } catch (e: any) {
       setPwError(e?.message || "Failed to change password");
     } finally {
@@ -431,8 +441,16 @@ export default function SettingsPage() {
                   autoComplete="new-password"
                   value={pwNew}
                   onChange={(e) => setPwNew(e.target.value)}
+                  onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
+                  aria-invalid={pwTooShort || undefined}
+                  aria-describedby={pwTooShort ? "pw-new-help" : undefined}
                   required
                 />
+                {pwTooShort && (
+                  <p id="pw-new-help" className="text-destructive text-xs font-mono mt-1">
+                    Use at least 8 characters.
+                  </p>
+                )}
               </div>
               <div>
                 <Label htmlFor="pw-confirm">CONFIRM NEW PASSWORD</Label>
@@ -442,8 +460,16 @@ export default function SettingsPage() {
                   autoComplete="new-password"
                   value={pwConfirm}
                   onChange={(e) => setPwConfirm(e.target.value)}
+                  onBlur={() => setPwTouched((t) => ({ ...t, confirm: true }))}
+                  aria-invalid={pwMismatch || undefined}
+                  aria-describedby={pwMismatch ? "pw-confirm-help" : undefined}
                   required
                 />
+                {pwMismatch && (
+                  <p id="pw-confirm-help" className="text-destructive text-xs font-mono mt-1">
+                    Doesn&apos;t match new password.
+                  </p>
+                )}
               </div>
               {pwError && (
                 <p role="alert" className="text-destructive text-xs font-mono">
@@ -455,7 +481,7 @@ export default function SettingsPage() {
                   {passwordFlash.message}
                 </p>
               )}
-              <Button type="submit" disabled={pwBusy}>
+              <Button type="submit" disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
                 {pwBusy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
                 Change password
               </Button>
