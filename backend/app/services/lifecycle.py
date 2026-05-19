@@ -47,7 +47,18 @@ async def init_storage() -> None:
         logger.warning("Stale-lock self-heal failed (continuing): %s", e)
     # Force-construct so a misconfigured vector-store URL/DSN fails at startup rather
     # than silently serving empty search results later.
-    get_vector_store()
+    store = get_vector_store()
+    # Eagerly run schema setup BEFORE workers start. Otherwise N concurrent
+    # embed_workers all racing to be the first caller of ensure_collection can
+    # exhaust the main PG pool when N approaches pool.max_size — the lock holder
+    # waits for a second pooled conn while peers hold theirs waiting on the lock.
+    # Doing it once here, single-threaded, sidesteps the cold-start contention
+    # entirely; subsequent worker calls hit the _ensured_collection fast path.
+    try:
+        await store.ensure_collection()
+        logger.info("Vector store schema ensured (eager init)")
+    except Exception as e:  # noqa: BLE001 — fall through so degraded probes can surface it
+        logger.warning("Vector store eager init failed (will retry per-worker): %s", e)
 
 
 def start_workers() -> None:
