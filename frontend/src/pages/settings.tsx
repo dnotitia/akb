@@ -70,7 +70,7 @@ export default function SettingsPage() {
   const [pats, setPats] = useState<PAT[] | null>(null);
   const [newName, setNewName] = useState("");
   const [newPat, setNewPat] = useState<string | null>(null);
-  const [showPat, setShowPat] = useState(false);
+  const [showPat, setShowPat] = useState<boolean>(true);
   const [copied, setCopied] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
@@ -246,6 +246,7 @@ export default function SettingsPage() {
     try {
       const r = await createPAT(newName);
       setNewPat(r.token);
+      setShowPat(true);
       setNewName("");
       loadPATs();
     } finally {
@@ -512,9 +513,12 @@ export default function SettingsPage() {
         {/* Tokens — PATs + fresh token banner when minted */}
         <TabsContent value="tokens" className="pt-6 space-y-4 max-w-4xl">
           {newPat && (
-            <section className="border border-accent bg-accent/5">
-              <div className="border-b border-accent px-4 py-2 flex items-baseline justify-between">
-                <span className="coord-spark">⊛ FRESH TOKEN — COPY NOW</span>
+            <section className="border border-destructive bg-destructive/5">
+              <div className="border-b border-destructive px-4 py-2 flex items-baseline justify-between">
+                <div>
+                  <span className="coord-spark text-destructive">⊛ FRESH TOKEN — COPY NOW</span>
+                  <span className="coord ml-2">Shown once. If you dismiss without copying, you'll need to reissue.</span>
+                </div>
                 <button
                   onClick={() => setNewPat(null)}
                   aria-label="Dismiss fresh token"
@@ -614,6 +618,7 @@ export default function SettingsPage() {
                               await revokePAT(p.token_id);
                               const r = await createPAT(p.name);
                               setNewPat(r.token);
+                              setShowPat(true);
                               loadPATs();
                             }}
                             aria-label={`Reissue token ${p.name}`}
@@ -728,13 +733,13 @@ export default function SettingsPage() {
                     <div className="flex flex-wrap border border-border">
                       {(
                         [
-                          ["claude", "01", "Claude Code"],
-                          ["cursor", "02", "Cursor / Windsurf / Gemini / Claude Desktop"],
-                          ["codex", "03", "Codex CLI"],
-                          ["vscode", "04", "VS Code"],
-                          ["openclaw", "05", "OpenClaw"],
-                        ] as [ClientTab, string, string][]
-                      ).map(([id, num, label], i) => (
+                          ["claude", "Claude Code"],
+                          ["cursor", "Cursor / Windsurf / Gemini / Claude Desktop"],
+                          ["codex", "Codex CLI"],
+                          ["vscode", "VS Code"],
+                          ["openclaw", "OpenClaw"],
+                        ] as [ClientTab, string][]
+                      ).map(([id, label], i) => (
                         <button
                           key={id}
                           type="button"
@@ -747,11 +752,6 @@ export default function SettingsPage() {
                               : "hover:bg-surface-muted cursor-pointer"
                           }`}
                         >
-                          <div
-                            className={`coord ${clientTab === id ? "text-background" : ""}`}
-                          >
-                            {num}
-                          </div>
                           <div className="text-xs font-medium tracking-tight">
                             {label}
                           </div>
