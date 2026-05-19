@@ -122,9 +122,14 @@ export function MemoryTab() {
           {memories.map((m) => (
             <li
               key={m.memory_id}
-              className="grid grid-cols-[88px_minmax(0,1fr)_auto_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3"
+              className="grid grid-cols-[minmax(110px,auto)_minmax(0,1fr)_auto_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3"
             >
-              <span className="coord-ink truncate">{m.category.toUpperCase()}</span>
+              <span className="coord-ink whitespace-nowrap">
+                {m.category.toUpperCase()}
+                <span className="ml-1 text-foreground-muted">
+                  · {(m.source ?? "manual") === "session_auto" ? "AUTO" : "MANUAL"}
+                </span>
+              </span>
               <p className="text-sm text-foreground leading-relaxed whitespace-pre-line break-words min-w-0">
                 {m.content}
               </p>

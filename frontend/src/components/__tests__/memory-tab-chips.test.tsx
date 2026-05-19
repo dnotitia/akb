@@ -42,4 +42,18 @@ describe("MemoryTab chips", () => {
       expect(all.textContent).toMatch(/2/);
     });
   });
+
+  it("renders source badge (AUTO / MANUAL) next to category", async () => {
+    const { recallMemories } = await import("@/lib/api");
+    (recallMemories as any).mockResolvedValue({
+      memories: [
+        { memory_id: "1", category: "work", content: "auto", source: "session_auto", created_at: "2026-05-19T00:00:00Z", updated_at: "2026-05-19T00:00:00Z" },
+        { memory_id: "2", category: "learning", content: "manual", source: "manual", created_at: "2026-05-19T00:00:00Z", updated_at: "2026-05-19T00:00:00Z" },
+      ],
+    });
+    render(<MemoryTab />);
+    await waitFor(() => expect(screen.getByText("auto")).toBeTruthy());
+    expect(screen.getAllByText(/AUTO/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/MANUAL/i).length).toBeGreaterThanOrEqual(1);
+  });
 });
