@@ -147,6 +147,7 @@ export function VaultShell() {
             current={name}
             onRefetchReady={onVaultsRefetchReady}
             onCurrentVaultClick={toggleTree}
+            treeOpen={visible}
           />
           {showTree && (
             <VaultExplorer

@@ -2,6 +2,7 @@ import { Link, useLocation } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 import {
   Box,
+  ChevronRight,
   Plus,
   RefreshCw,
   Search as SearchIcon,
@@ -28,9 +29,15 @@ export interface VaultNavProps {
    * label doubles as a sidebar open/close handle.
    */
   onCurrentVaultClick?: () => void;
+  /**
+   * Whether the vault tree column is currently visible. Used to render
+   * the chevron state on the active vault row (closed=▶, open=▼) and
+   * the corresponding aria-expanded.
+   */
+  treeOpen?: boolean;
 }
 
-export function VaultNav({ current, onRefetchReady, onCurrentVaultClick }: VaultNavProps) {
+export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpen }: VaultNavProps) {
   const { vaults, loading, refetch } = useVaults();
   const [filter, setFilter] = useState("");
   const { pathname } = useLocation();
@@ -120,6 +127,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick }: Vault
                 icon={Box}
                 active={isActive}
                 onActiveClick={isActive ? onCurrentVaultClick : undefined}
+                treeOpen={treeOpen}
               />
             );
           })}
@@ -137,6 +145,7 @@ function NavItem({
   active,
   accent,
   onActiveClick,
+  treeOpen,
 }: {
   to: string;
   label: string;
@@ -144,28 +153,59 @@ function NavItem({
   active?: boolean;
   accent?: boolean;
   onActiveClick?: () => void;
+  treeOpen?: boolean;
 }) {
+  // For the inactive case keep the existing single-click behavior.
+  if (!active || !onActiveClick) {
+    return (
+      <Link
+        to={to}
+        aria-current={active ? "page" : undefined}
+        className={cn(
+          "flex items-center gap-2 px-2 h-7 text-sm transition-colors",
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+          active && accent && "bg-accent/10 text-accent",
+          active && !accent && "bg-surface-muted text-foreground border-l-2 border-accent -ml-[2px]",
+          !active && "text-foreground-muted hover:text-foreground hover:bg-surface-muted",
+        )}
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span className="truncate">{label}</span>
+      </Link>
+    );
+  }
+
+  // Active row with split behavior: left = overview Link, right = chevron toggle.
   return (
-    <Link
-      to={to}
-      aria-current={active ? "page" : undefined}
-      onClick={(e) => {
-        if (active && onActiveClick) {
-          e.preventDefault();
-          onActiveClick();
-        }
-      }}
+    <div
       className={cn(
-        "flex items-center gap-2 px-2 h-7 text-sm transition-colors",
-        "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-        active && accent && "bg-accent/10 text-accent",
-        active && !accent && "bg-surface-muted text-foreground border-l-2 border-accent -ml-[2px]",
-        !active && "text-foreground-muted hover:text-foreground hover:bg-surface-muted",
+        "flex items-center h-7 text-sm transition-colors",
+        accent ? "bg-accent/10 text-accent" : "bg-surface-muted text-foreground border-l-2 border-accent -ml-[2px]",
       )}
+      aria-current="page"
     >
-      <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-      <span className="truncate">{label}</span>
-    </Link>
+      <Link
+        to={to}
+        title="Go to vault overview"
+        className="flex items-center gap-2 px-2 flex-1 min-w-0 h-7 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+      >
+        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span className="truncate">{label}</span>
+      </Link>
+      <button
+        type="button"
+        onClick={onActiveClick}
+        aria-label={treeOpen ? "Collapse vault tree" : "Expand vault tree"}
+        aria-expanded={treeOpen}
+        title={treeOpen ? "Collapse vault tree" : "Expand vault tree"}
+        className="inline-flex items-center justify-center h-7 w-7 shrink-0 text-foreground-muted hover:text-foreground hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface cursor-pointer transition-colors"
+      >
+        <ChevronRight
+          className={cn("h-3.5 w-3.5 transition-transform", treeOpen && "rotate-90")}
+          aria-hidden
+        />
+      </button>
+    </div>
   );
 }
 
