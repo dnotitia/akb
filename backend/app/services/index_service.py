@@ -325,10 +325,19 @@ async def _embed_call(
         if settings.embed_api_key
         else {}
     )
+    # Send `dimensions` so MRL-capable models (qwen3-embedding-8b native
+    # 4096, text-embedding-3-* native 3072) truncate to the deployed
+    # vector schema dim. Native-dim models (bge-m3@1024) accept it as a
+    # no-op. Endpoints that 400 on `dimensions` are incompatible.
+    body = {
+        "model": settings.embed_model,
+        "input": batch,
+        "dimensions": settings.embed_dimensions,
+    }
     try:
         resp = await client.post(
             f"{settings.embed_base_url}/embeddings",
-            json={"model": settings.embed_model, "input": batch},
+            json=body,
             headers=headers,
             timeout=timeout,
         )
