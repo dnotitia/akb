@@ -226,8 +226,12 @@ export const deleteCollection = (vault: string, path: string, recursive: boolean
 // ── Documents ──
 export const putDocument = (data: any) =>
   api<any>("/documents", { method: "POST", body: JSON.stringify(data) });
-export const getDocument = (vault: string, id: string) =>
-  api<any>(`/documents/${vault}/${encodeURIComponent(id)}`);
+export const getDocument = (vault: string, id: string, version?: string) => {
+  const path = `/documents/${vault}/${encodeURIComponent(id)}`;
+  return api<any>(
+    version ? `${path}?version=${encodeURIComponent(version)}` : path,
+  );
+};
 export const updateDocument = (vault: string, id: string, data: any) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
 export const deleteDocument = (vault: string, id: string) =>
