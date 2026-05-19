@@ -181,7 +181,7 @@ function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
   }
 
   function onKey(e: React.KeyboardEvent<HTMLButtonElement>, idx: number) {
-    let next = idx;
+    let next: number;
     if (e.key === "ArrowRight") next = (idx + 1) % tabs.length;
     else if (e.key === "ArrowLeft") next = (idx - 1 + tabs.length) % tabs.length;
     else if (e.key === "Home") next = 0;
