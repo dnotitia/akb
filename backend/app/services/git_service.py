@@ -53,6 +53,16 @@ def _vault_lock(vault_name: str) -> threading.Lock:
         return lock
 
 
+# GitPython's IndexFile ops (`add`/`commit`/`remove`) are decorated
+# with `@git_working_dir`, which `os.chdir`s into the worktree and
+# restores cwd in a finally. `os.chdir` is process-global — concurrent
+# writes on DIFFERENT vault worktrees leak cwd across threads, and a
+# cleanup of the leaked dir makes the next `os.getcwd()` raise ENOENT
+# (request 500s). Per-vault `_vault_lock` is not enough; serialize
+# globally. Always acquired INSIDE `_vault_lock`.
+_GITPY_INDEX_LOCK = threading.Lock()
+
+
 class GitService:
     def __init__(self, storage_path: str | None = None):
         self.storage_path = Path(storage_path or settings.git_storage_path)
@@ -482,9 +492,10 @@ class GitService:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
 
-            work_repo.index.add([file_path])
             author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
+            with _GITPY_INDEX_LOCK:
+                work_repo.index.add([file_path])
+                commit = work_repo.index.commit(message, author=author, committer=author)
             return commit.hexsha
 
     def delete_file(
@@ -508,9 +519,10 @@ class GitService:
             if not full_path.exists():
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
 
-            work_repo.index.remove([file_path], working_tree=True)
             author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
+            with _GITPY_INDEX_LOCK:
+                work_repo.index.remove([file_path], working_tree=True)
+                commit = work_repo.index.commit(message, author=author, committer=author)
             return commit.hexsha
 
     def delete_paths_bulk(
@@ -555,9 +567,10 @@ class GitService:
                 )
                 return None
 
-            work_repo.index.remove(present, working_tree=True)
             author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
+            with _GITPY_INDEX_LOCK:
+                work_repo.index.remove(present, working_tree=True)
+                commit = work_repo.index.commit(message, author=author, committer=author)
             return commit.hexsha
 
     def _commit_via_clone(
@@ -611,8 +624,13 @@ class GitService:
             full_path = Path(tmp) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
-            work_repo.index.add([file_path])
-            commit = work_repo.index.commit(message, author=author, committer=author)
+            # IndexFile add/commit mutate process-global cwd via GitPython's
+            # @git_working_dir decorator — serialize them so concurrent commits
+            # to other vaults can't leak cwd. The push below uses the cwd-safe
+            # repo.git.* interface and stays outside the lock.
+            with _GITPY_INDEX_LOCK:
+                work_repo.index.add([file_path])
+                commit = work_repo.index.commit(message, author=author, committer=author)
             # Push is local-to-local (bare repo on the same disk), so
             # 60s is generous; if it hangs the timeout still releases
             # the vault lock for the next caller.

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_AKB_URL = "http://localhost:18000"
-DEFAULT_ADAPTER = "akb-hybrid+rerank"
+DEFAULT_ADAPTER = "akb-hybrid"
 DEFAULT_TOP_K = 5
 DEFAULT_MAX_INDEX_WAIT = 300
 POLL_INTERVAL_S = 1.0
@@ -345,8 +345,10 @@ def collect_run_meta(adapter: str, akb_url: str) -> dict:
 
     interesting = (
         "embed_model embed_dimensions embed_base_url rerank_enabled "
-        "rerank_model rerank_base_url rerank_prefetch vector_store_driver "
-        "vector_store_sparse_shape bm25_k1 bm25_b indexing_batch_size"
+        "rerank_model rerank_base_url rerank_prefetch rerank_fusion_k "
+        "search_prefetch "
+        "vector_store_driver vector_store_sparse_shape bm25_k1 bm25_b "
+        "indexing_batch_size indexing_concurrency"
     ).split()
     cfg = {k: snapshot.get(k) for k in interesting}
 

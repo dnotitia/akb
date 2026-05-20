@@ -18,7 +18,7 @@
 #
 # After a partial run, just re-invoke the same command -- shards resume.
 # Merge for analysis:
-#   cat reports/longmemeval-akb.shard-*.ndjson > reports/longmemeval-akb.ndjson
+#   cat reports/longmemeval-akb-hybrid.shard-*.ndjson > reports/longmemeval-akb-hybrid.ndjson
 
 set -euo pipefail
 
@@ -28,10 +28,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORKERS=${WORKERS:-3}
 WALL=${WALL:-}
 DATASET=${DATASET:-$HOME/datasets/longmemeval/longmemeval_s.json}
-ADAPTER=${ADAPTER:-akb-hybrid+rerank}
+ADAPTER=${ADAPTER:-akb-hybrid}
 TOPK=${TOPK:-5}
 REPORTS_DIR=${REPORTS_DIR:-"$REPO_ROOT/eval/reports"}
-NDJSON_PREFIX=${NDJSON_PREFIX:-longmemeval-akb}
+NDJSON_PREFIX=${NDJSON_PREFIX:-longmemeval-akb-hybrid}
 AKB_URL=${AKB_URL:-http://localhost:18000}
 LIMIT=${LIMIT:-}
 STRATIFY=${STRATIFY:-}

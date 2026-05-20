@@ -21,7 +21,7 @@ from app.exceptions import ValidationError
 from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import VectorHit, get_vector_store
 from app.services.rerank_service import RerankError, rerank
 
 logger = logging.getLogger("akb.search")
@@ -50,6 +50,57 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     if not text:
         return text
     return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def fuse_original_and_reranked_hits(
+    hits: list[VectorHit],
+    ranked: list[tuple[int, float]],
+    fusion_k: int,
+) -> list[VectorHit]:
+    """Fuse first-stage and cross-encoder ranks with RRF.
+
+    The reranker is strongest at judging close semantic matches, but on
+    noisy long-context corpora it can also overrule a high-confidence
+    lexical/vector hit. Fusing ranks keeps rerank ON while preserving a
+    vote from the first-stage retriever. Each hit's `score` is mutated
+    in-place to the fused score; hits are returned in fused order.
+    """
+    if not hits:
+        return []
+
+    fused_scores: dict[int, float] = {
+        i: 1.0 / (fusion_k + i + 1) for i in range(len(hits))
+    }
+    seen: set[int] = set()
+    for rank, (idx, _score) in enumerate(ranked, start=1):
+        if idx < 0 or idx >= len(hits) or idx in seen:
+            continue
+        seen.add(idx)
+        fused_scores[idx] += 1.0 / (fusion_k + rank)
+
+    ordered = sorted(fused_scores, key=lambda idx: (-fused_scores[idx], idx))
+    for idx in ordered:
+        hits[idx].score = fused_scores[idx]
+    return [hits[idx] for idx in ordered]
+
+
+def resolve_first_stage_unique_limit(
+    *,
+    limit: int,
+    rerank_enabled: bool,
+    rerank_prefetch: int,
+    search_prefetch: int,
+) -> int:
+    """How many deduped sources to keep before final response truncation.
+
+    Rerank already needs a larger candidate pool. Rerank-off search benefits
+    from the same headroom because chunk-level dense/BM25 hits can contain
+    multiple chunks from the same source before source-level dedup.
+    """
+    configured = max(search_prefetch, 0)
+    if rerank_enabled:
+        configured = max(configured, rerank_prefetch)
+    return max(configured, limit)
 
 
 class SearchService:
@@ -182,8 +233,11 @@ class SearchService:
                 if not candidate_source_ids:
                     return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[])
 
-        target_unique = (
-            max(settings.rerank_prefetch, limit) if settings.rerank_enabled else limit
+        target_unique = resolve_first_stage_unique_limit(
+            limit=limit,
+            rerank_enabled=settings.rerank_enabled,
+            rerank_prefetch=settings.rerank_prefetch,
+            search_prefetch=settings.search_prefetch,
         )
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
@@ -353,13 +407,11 @@ class SearchService:
             logger.warning("rerank failed (%s); keeping RRF order", e)
             return hits
 
-        reordered = []
-        for idx, score in ranked:
-            if 0 <= idx < len(hits):
-                hit = hits[idx]
-                hit.score = score
-                reordered.append(hit)
-        return reordered
+        return fuse_original_and_reranked_hits(
+            hits,
+            ranked,
+            settings.rerank_fusion_k,
+        )
 
     async def _run_vector_search(
         self,

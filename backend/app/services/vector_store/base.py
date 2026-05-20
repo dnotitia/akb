@@ -25,8 +25,8 @@ class VectorHit:
     """A single search result. `score` is driver-internal (monotonic,
     higher is better) — do not compare across drivers.
 
-    Mutable on purpose: the rerank service overwrites `score` in-place
-    after cross-encoder rescoring."""
+    Mutable on purpose: search_service may overwrite `score` in-place
+    with a post-rerank fused score."""
     chunk_id: str
     source_type: str
     source_id: str

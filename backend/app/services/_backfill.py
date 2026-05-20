@@ -35,11 +35,16 @@ def next_attempt_delay(retry_count: int) -> int:
 
 
 class BackfillRunner:
-    """Owns the asyncio task lifecycle for one backfill worker.
+    """Owns the asyncio task lifecycle for one or more backfill worker tasks.
 
     The caller supplies `process_once`, an async callable returning the
     number of items processed. We handle the idle/drain cadence and
     graceful stop.
+
+    Set `concurrency > 1` to spawn that many sibling tasks against the
+    same queue. Workers coordinate at the DB layer (FOR UPDATE SKIP
+    LOCKED), so they will not race on the same row. Task names get an
+    index suffix so per-worker activity stays distinguishable in logs.
     """
 
     def __init__(
@@ -47,45 +52,55 @@ class BackfillRunner:
         name: str,
         process_once: Callable[[], Awaitable[int]],
         idle_secs: int = IDLE_INTERVAL_SECS,
+        concurrency: int = 1,
     ):
         self._name = name
         self._process_once = process_once
         self._idle_secs = idle_secs
-        self._task: Optional[asyncio.Task] = None
+        self._concurrency = max(1, concurrency)
+        self._tasks: list[asyncio.Task] = []
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
 
     def start(self) -> None:
-        if self._task and not self._task.done():
+        if self._tasks and any(not t.done() for t in self._tasks):
             return
         self._stop_event = asyncio.Event()
-        self._task = asyncio.create_task(self._loop(), name=self._name)
+        for i in range(self._concurrency):
+            task_name = self._name if self._concurrency == 1 else f"{self._name}-{i}"
+            self._tasks.append(asyncio.create_task(self._loop(task_name), name=task_name))
 
     async def stop(self) -> None:
         if self._stop_event:
             self._stop_event.set()
-        if self._task:
+        if self._tasks:
             # Per-iteration work (embedding API call + vector-store upsert)
-            # can legitimately take up to ~60s end-to-end. A 5s stop timeout
-            # cancelled the task mid-upsert, ROLLBACK-ing the claim's
+            # can legitimately take up to ~60s end-to-end. A short stop
+            # timeout cancelled tasks mid-upsert, ROLLBACK-ing the claim's
             # vector_next_attempt_at update and leaving rows in a half-
             # claimed state. Give the current iteration time to finish
             # cleanly; the stop_event still prevents another tick after
             # this one drains.
             try:
-                await asyncio.wait_for(self._task, timeout=120.0)
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=120.0,
+                )
             except asyncio.TimeoutError:
                 self._log.warning(
                     "%s did not stop within 120s; cancelling", self._name,
                 )
-                self._task.cancel()
-        self._task = None
+                for t in self._tasks:
+                    if not t.done():
+                        t.cancel()
+        self._tasks = []
         self._stop_event = None
 
-    async def _loop(self) -> None:
+    async def _loop(self, task_name: str) -> None:
         assert self._stop_event is not None
-        self._log.info("%s loop started (idle=%ds, max_retries=%d)",
-                       self._name, self._idle_secs, MAX_RETRIES)
+        log = logging.getLogger(f"akb.{task_name}")
+        log.info("%s loop started (idle=%ds, max_retries=%d)",
+                 task_name, self._idle_secs, MAX_RETRIES)
         while not self._stop_event.is_set():
             try:
                 # Shield the iteration body so a cancellation arriving mid-
@@ -101,7 +116,7 @@ class BackfillRunner:
                 # the loop without swallowing — the runner is shutting down.
                 raise
             except Exception as e:  # noqa: BLE001 — keep loop alive on any failure
-                self._log.exception("%s iteration failed: %s", self._name, e)
+                log.exception("%s iteration failed: %s", task_name, e)
                 done = 0
 
             if done == 0:
@@ -110,7 +125,7 @@ class BackfillRunner:
                 except asyncio.TimeoutError:
                     pass
             else:
-                self._log.info("%s processed %d items", self._name, done)
+                log.info("%s processed %d items", task_name, done)
                 await asyncio.sleep(0)
 
-        self._log.info("%s loop stopped", self._name)
+        log.info("%s loop stopped", task_name)

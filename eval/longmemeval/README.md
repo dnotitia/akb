@@ -2,24 +2,57 @@
 
 Measures `akb_search` retrieval recall on the public
 [`xiaowu0162/longmemeval`](https://huggingface.co/datasets/xiaowu0162/longmemeval)
-`_s` split (500 questions). The goal is to put one honest line —
-`akb-hybrid+rerank` — next to [gbrain-evals](https://github.com/garrytan/gbrain-evals)
-and MemPalace on the same dataset.
+`_s` split (500 questions). The goal is to put one honest line for AKB next
+to [gbrain-evals](https://github.com/garrytan/gbrain-evals) and
+[MemPalace](https://github.com/mempalace/mempalace) on the same dataset.
 
-Reference lines as of 2026-05-07:
+Results (AKB measured 2026-05-20, backend `b54184a`; references as of 2026-05-07):
 
 | System                          | R@5    | k | n   | LLM in retrieval | Source |
 |---------------------------------|--------|---|-----|-------------------|--------|
+| **AKB hybrid (rerank off)**     | **98.40%** | 5 | 500 | no  | this repo |
+| MemPal hybrid+rerank (held-out) | 98.4%  | 5 | 450 | yes | [MemPalace](https://github.com/mempalace/mempalace) |
+| **AKB hybrid + rerank (RRF fusion)** | **97.80%** | 5 | 500 | no | this repo |
 | gbrain-hybrid                   | 97.60% | 5 | 500 | no  | [gbrain-evals](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md) |
 | gbrain-vector                   | 97.40% | 5 | 500 | no  | same |
-| MemPal hybrid+rerank (held-out) | 98.4%  | 5 | 450 | yes | MemPalace |
-| MemPal raw (ChromaDB)           | 96.6%  | 5 | 500 | no  | MemPalace headline |
+| MemPal raw (ChromaDB)           | 96.6%  | 5 | 500 | no  | [MemPalace](https://github.com/mempalace/mempalace) headline |
 | gbrain-keyword (BM25)           | 19.80% | 5 | 500 | no  | gbrain-evals |
 
-AKB posts its own line. The embedding model differs (see
-[Comparability notes](#comparability-notes)), so this is a **stack-level**
-comparison rather than apples-to-apples; the result still pins where AKB's
-production default lands on the same dataset.
+AKB's hybrid retrieval (dense + BM25, no reranker) lands at **R@5 = 98.40%**
+(492/500) — ahead of gbrain's published hybrid line and level with
+MemPalace's reranked number. The embedding model differs (AKB: `bge-m3@1024`;
+see [Comparability notes](#comparability-notes)), so treat this as a
+**stack-level** comparison rather than apples-to-apples.
+
+A cross-encoder reranker on top did **not** help: fusing the cross-encoder
+rank with the first-stage hybrid rank (RRF) scored **97.80%** (489/500),
+−0.6pp vs rerank-off.  With the first stage already placing the answer in
+the top 5, the reranker mostly reorders correct hits — it costs more in
+`single-session-user` (literal-match questions, −4.3pp) than it recovers in
+`single-session-preference` (+3.4pp).  See per-category detail below.
+
+### Per-category Recall@5 (500Q, backend `b54184a`)
+
+| Question type | rerank off | rerank on (fusion) | Δ (off − on) |
+|---|---:|---:|---:|
+| knowledge-update          | 100.0% | 100.0% | 0 |
+| multi-session             | 99.2%  | 98.5%  | +0.7 |
+| single-session-assistant  | 100.0% | 100.0% | 0 |
+| single-session-preference | 93.3%  | 96.7%  | −3.4 |
+| single-session-user       | 100.0% | 95.7%  | +4.3 |
+| temporal-reasoning        | 96.2%  | 96.2%  | 0 |
+| **TOTAL**                 | **98.4%** | **97.8%** | **+0.6** |
+
+Full report: [`results/2026-05-20-longmemeval-s.md`](results/2026-05-20-longmemeval-s.md)
+— headline, per-category breakdown, the reranker ablation, and a reproduce
+recipe.  Both runs use `bge-m3@1024` + pgvector, `search_prefetch: 30`; the
+rerank-on run adds `rerank_enabled: true` with `cohere/rerank-v3.5` via
+OpenRouter and `rerank_fusion_k: 60`.
+
+The raw per-question NDJSON (`eval/reports/longmemeval-akb-rerank-{off,on}-final.ndjson`,
+500 records each, `run_meta_start` header on line 1) is a reproducible local
+artifact — `eval/reports/` is gitignored, like the dataset.  Re-run the
+[runner](#runner) to regenerate it.
 
 ---
 
@@ -93,9 +126,10 @@ your main dev data is untouched.
 | `vector_store_sparse_shape` | `posting` | production-recommended |
 | `embed_model` / `embed_dimensions` | `baai/bge-m3` / `1024` | multilingual, within pgvector HNSW 2000-dim limit |
 | `embed_base_url` | `https://openrouter.ai/api/v1` | |
-| `rerank_enabled` / `rerank_model` | `true` / `cohere/rerank-v3.5` | production default ON |
+| `rerank_enabled` / `rerank_model` | `false` / `cohere/rerank-v3.5` | rerank-off ablation, model config retained for toggles |
 | `rerank_base_url` | `https://openrouter.ai/api/v1` | explicit — see [run #3](#known-issues) |
 | `rerank_prefetch` | `30` | RRF top-30 → rerank → top-K |
+| `search_prefetch` | `30` | rerank-off first-stage dedup pool, mirrors gbrain-style candidate headroom |
 | `bm25_k1` / `bm25_b` | `1.5` / `0.75` | standard Lucene values |
 
 `config/app.yaml` is committed because it's part of the benchmark
@@ -163,17 +197,15 @@ docker compose up -d
 | `importFromContent(slug, body)` | `POST /api/v1/documents` body=`{vault, collection:"chat", title:session_id, content:rendered}` |
 | Rendered session body | `[Session date: ...]\n\nUSER: ...\n\nASSISTANT: ...` (date prefix matters for `temporal-reasoning`/`knowledge-update`) |
 | `slug = "chat/{session_id}"` | `path = "chat/{slugify(session_id)}.md"` — backend `_slugify` lowercases and appends `.md` |
-| `hybridSearch(q, limit)` | `GET /api/v1/search?q=...&vault=...&limit=K` (rerank ON via config) |
+| `hybridSearch(q, limit)` | `GET /api/v1/search?q=...&vault=...&limit=K` (rerank OFF via config) |
 | `uniqSessionIds(results)` | `[r.path.removeprefix("chat/").removesuffix(".md") for r in results]` (path is stabler than title under backend normalization) |
 | Wait for indexing | `GET /health/vault/{vault}` poll until `vector_store.backfill.upsert.pending == 0` (vault-scoped, not global) |
 
 ### Adapter scope
 
-Only `akb-hybrid+rerank` (production default) is wired up.  Ablations
-(`akb-hybrid` rerank-off, `akb-keyword` BM25-only, `akb-vector`
-vector-only) are deferred — turning rerank off requires editing
-`app.yaml` and restarting the backend, which we'd only pay for once the
-first numbers say it's worth it.
+The current wired adapter is `akb-hybrid`: dense + BM25 with rerank off,
+embedding fixed, and `search_prefetch` widened so source-level dedup sees
+the same kind of candidate headroom that gbrain's no-rerank path uses.
 
 ---
 
@@ -188,7 +220,7 @@ enough.
 python3 eval/longmemeval/run.py \
   --dataset ~/datasets/longmemeval/longmemeval_s.json \
   --ndjson eval/reports/longmemeval-akb.ndjson \
-  --adapter akb-hybrid+rerank \
+  --adapter akb-hybrid \
   --top-k 5 \
   --worker-id 0 --total-workers 1 \
   [--limit N | --stratify N] [--max-wall-seconds N]
@@ -273,12 +305,6 @@ subset across reruns (resume works per-shard).  After workers finish,
 the script aggregates totals + per-type breakdown.  Any non-zero shard
 exit code propagates as `exit 1` so CI sees the failure.
 
-> **Multi-worker (WORKERS > 1) is currently blocked** by a cross-vault
-> race condition in the backend's GitService — concurrent PUTs to
-> different vaults trigger `FileNotFoundError` from a process-global
-> `os.chdir` inside GitPython.  See [Backend follow-ups](#backend-follow-ups).
-> Until that's fixed, run with `WORKERS=1`.
-
 Merge shards for analysis:
 
 ```bash
@@ -289,15 +315,19 @@ cat eval/reports/longmemeval-akb.shard-*.ndjson > eval/reports/longmemeval-akb.n
 
 ## Performance and cost
 
-Measured on a 5Q smoke (one worker, M-series Mac talking to OpenRouter):
+Measured on a 5Q smoke (one worker, M-series Mac talking to OpenRouter).
+The indexing-wait column shows two numbers: the original single-task
+`embed_worker` (`indexing_concurrency: 1`) and the bench default
+(`indexing_concurrency: 8`, parallel runners draining the queue via
+`FOR UPDATE SKIP LOCKED`).
 
 | Stage | Per question | Per 500 (1 worker) |
 |---|---|---|
 | Vault create/delete | ~50ms × 2 | ~50s |
 | Session PUTs (~50/Q) | ~600ms total (backend chunks asynchronously) | ~5 min |
-| Indexing wait | **~45s** (~486 chunks/Q ÷ ~32-batch × ~1.7s embedding + per-chunk upsert) | **~6.25 h** |
+| Indexing wait | **~45s** at concurrency 1 → **~10–14s** at concurrency 8 (~486 chunks/Q ÷ ~16-batch × ~1.7s embedding + per-chunk upsert) | **~6.25 h → ~1.7 h** |
 | Search (rerank ON) | ~1000ms | ~8 min |
-| **Total wall-clock** | **~48s** | **~6.5 h** |
+| **Total wall-clock (1 worker, concurrency 8)** | **~13s** | **~1.8 h** |
 
 **Cost estimate** (`bge-m3` + `cohere/rerank-v3.5` via OpenRouter):
 
@@ -308,8 +338,10 @@ Measured on a 5Q smoke (one worker, M-series Mac talking to OpenRouter):
 | **Total** | | **~$1.40** |
 
 OpenRouter is the rate-limit boundary (account-balance based), not
-Cohere's trial 10 req/min cap.  3-worker concurrency would cut wall
-time to ~2.5h, but requires the backend follow-ups below first.
+Cohere's trial 10 req/min cap.  The backend follow-ups that once blocked
+parallelism are fixed, so `WORKERS=3` on top of `indexing_concurrency: 8`
+is the standard full-run setup — wall time lands around **~40–50 min**
+for all 500 questions.
 
 ---
 
@@ -319,10 +351,16 @@ time to ~2.5h, but requires the backend follow-ups below first.
   `text-embedding-3-large@1536`; AKB uses `bge-m3@1024`.  Score
   differences mix model effect with system effect.  AKB posts as its
   own line, framed as stack-level comparison.
-- **Reranker default ON.** gbrain's 97.6% is hybrid-only.  AKB's
-  default has rerank on; posting them side by side isn't fair until
-  the rerank-off ablation runs.  First-round number is the production
-  default; ablation is a follow-up if the gap warrants it.
+- **Two reranker configs are evaluated.** gbrain's 97.6% is
+  hybrid-only (no reranker), so a fair head-to-head needs AKB's
+  rerank-off number.  Both have been run: a **rerank-off** line
+  (committed `config/app.yaml` default — dense + BM25 with conservative
+  English sparse-token variants and `search_prefetch` headroom) and a
+  **rerank-on** line (RRF fusion of the first-stage hybrid rank with the
+  cross-encoder rank, rather than a hard reorder — toggle
+  `rerank_enabled: true`).  Flip `rerank_enabled` and restart the
+  backend to switch; no re-index is needed since reranking is a
+  search-time stage.
 - **Abstention handling unverified across systems.** §1 includes `_abs`
   in the denominator (the only consistent choice when ground truth
   exists).  If gbrain excluded them, the comparison drifts slightly;
@@ -332,49 +370,20 @@ time to ~2.5h, but requires the backend follow-ups below first.
 
 ## Known issues
 
-1. **bge-m3 absolute performance on English-only data is uncertain.**
-   Multilingual models typically trail English-only models slightly.
-   First-run number is the answer.
-2. **Indexing worker throughput is the bottleneck** (~45s/Q for 486
-   chunks).  See [Backend follow-ups](#backend-follow-ups).
-3. **`SearchResult.path` round-trip stability.** Backend `_slugify`
+1. **`SearchResult.path` round-trip stability.** Backend `_slugify`
    currently lowercases and appends `.md`.  If that normalization
    changes, ground-truth matching breaks silently.  Worth a single
    PUT→GET sanity check before each round.
-4. **Source-aware boost may interact poorly.** Everything is in the
-   `chat/` collection, so any collection-weighting becomes noise.
-   First-run numbers will tell whether it matters.
-5. **OpenRouter → Cohere rerank latency is two hops, not one.** p99
-   query latency could exceed 500ms.  Time estimate uses ~150ms; update
-   after first measurement.
-6. **HF deprecated label on the dataset.** Raw file is still served,
+2. **HF deprecated label on the dataset.** Raw file is still served,
    but if HF removes it, the `curl` command breaks.  Save a local
    SHA256 of the downloaded JSON for reproducibility.
 
----
-
-## Backend follow-ups
-
-Four backend issues were discovered while building the runner.  None
-are fixed in this directory; they live as separate tasks because each
-needs an independent backend PR.
-
-1. **`rerank_service` fallback chain produces a cryptic httpx error**
-   when both `rerank_base_url` and `llm_base_url` are blank.  Should
-   fail fast at startup with a clear config error.
-2. **`backend/app/db/init.sql` is missing `CREATE EXTENSION IF NOT EXISTS
-   vector`.**  The cluster's `akb-init-sql` ConfigMap papers over this;
-   a fresh `docker compose up` against repo root would otherwise leave
-   every chunk in a `vector_last_error = 'unknown type: public.vector'`
-   loop.  Worked around here via `postgres-init/01-pgvector.sql`.
-3. **`embed_worker` runs as a single asyncio task.**  Per-chunk upsert
-   in a separate transaction dominates after the embed call (~50ms ×
-   N).  Adding N concurrent runners + a batched upsert would drop
-   45s/Q to <5s/Q.
-4. **`GitService` has a cross-vault `os.chdir` race condition.**
-   GitPython mutates process-global cwd inside `index.add`, so
-   concurrent PUTs to different vaults race.  Per-vault `threading.Lock`
-   doesn't help.  Blocks `WORKERS > 1` in `batch.sh`.
+Two backend gaps surfaced while building this runner are tracked outside
+this benchmark: `rerank_service` should fail fast at startup when both
+`rerank_base_url` and `llm_base_url` are blank (it currently raises a
+per-query `RerankError` instead), and `backend/app/db/init.sql` omits
+`CREATE EXTENSION IF NOT EXISTS vector` — worked around here via
+`postgres-init/01-pgvector.sql`.
 
 ---
 
@@ -382,9 +391,9 @@ needs an independent backend PR.
 
 - **Smoke (`--limit 5`)**: 5/5 OK, `hit_at_k` neither 0/5 nor 5/5 — a
   plausible non-degenerate number.  Current: 4/5 at R@5=80%.
-- **First report**: 500Q full-run R@5 + per-type table + latency
-  distribution + comparison table including gbrain/MemPal lines.  One
-  `akb-hybrid+rerank` row.
+- **Full report** (done): 500Q R@5 + per-type table + comparison table
+  including gbrain/MemPal lines, for both rerank-off and rerank-on
+  configs.  See the results tables at the top of this file.
 - **Honesty bar**: publish the number whatever it is.  Footnote the
   embedding-model and rerank-default differences explicitly so readers
   can interpret.
@@ -395,6 +404,7 @@ needs an independent backend PR.
 
 - gbrain-evals repo: https://github.com/garrytan/gbrain-evals
 - gbrain LongMemEval report: `docs/benchmarks/2026-05-07-longmemeval-s.md` in that repo
+- MemPalace repo: https://github.com/mempalace/mempalace
 - LongMemEval original (used here): https://huggingface.co/datasets/xiaowu0162/longmemeval
 - LongMemEval cleaned (v2 option): https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned
 - LongMemEval paper + eval code: https://github.com/xiaowu0162/LongMemEval

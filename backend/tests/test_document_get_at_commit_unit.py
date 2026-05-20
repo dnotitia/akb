@@ -1,6 +1,4 @@
 """Unit test: doc_service.get_at_commit reads body from a specific commit."""
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 # Test focuses on the strip-frontmatter + commit-pinning logic.
 # Full git integration is covered by e2e (test_mcp_e2e.sh's akb_get version).
