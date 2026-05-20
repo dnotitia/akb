@@ -345,8 +345,9 @@ def collect_run_meta(adapter: str, akb_url: str) -> dict:
 
     interesting = (
         "embed_model embed_dimensions embed_base_url rerank_enabled "
-        "rerank_model rerank_base_url rerank_prefetch vector_store_driver "
-        "vector_store_sparse_shape bm25_k1 bm25_b indexing_batch_size"
+        "rerank_model rerank_base_url rerank_prefetch rerank_fusion_k "
+        "vector_store_driver vector_store_sparse_shape bm25_k1 bm25_b "
+        "indexing_batch_size"
     ).split()
     cfg = {k: snapshot.get(k) for k in interesting}
 

@@ -20,7 +20,7 @@ from app.db.postgres import get_pool
 from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import VectorHit, get_vector_store
 from app.services.rerank_service import RerankError, rerank
 
 logger = logging.getLogger("akb.search")
@@ -49,6 +49,38 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     if not text:
         return text
     return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def fuse_original_and_reranked_hits(
+    hits: list[VectorHit],
+    ranked: list[tuple[int, float]],
+    fusion_k: int,
+) -> list[VectorHit]:
+    """Fuse first-stage and cross-encoder ranks with RRF.
+
+    The reranker is strongest at judging close semantic matches, but on
+    noisy long-context corpora it can also overrule a high-confidence
+    lexical/vector hit. Fusing ranks keeps rerank ON while preserving a
+    vote from the first-stage retriever. Each hit's `score` is mutated
+    in-place to the fused score; hits are returned in fused order.
+    """
+    if not hits:
+        return []
+
+    fused_scores: dict[int, float] = {
+        i: 1.0 / (fusion_k + i + 1) for i in range(len(hits))
+    }
+    seen: set[int] = set()
+    for rank, (idx, _score) in enumerate(ranked, start=1):
+        if idx < 0 or idx >= len(hits) or idx in seen:
+            continue
+        seen.add(idx)
+        fused_scores[idx] += 1.0 / (fusion_k + rank)
+
+    ordered = sorted(fused_scores, key=lambda idx: (-fused_scores[idx], idx))
+    for idx in ordered:
+        hits[idx].score = fused_scores[idx]
+    return [hits[idx] for idx in ordered]
 
 
 class SearchService:
@@ -352,13 +384,11 @@ class SearchService:
             logger.warning("rerank failed (%s); keeping RRF order", e)
             return hits
 
-        reordered = []
-        for idx, score in ranked:
-            if 0 <= idx < len(hits):
-                hit = hits[idx]
-                hit.score = score
-                reordered.append(hit)
-        return reordered
+        return fuse_original_and_reranked_hits(
+            hits,
+            ranked,
+            settings.rerank_fusion_k,
+        )
 
     async def _run_vector_search(
         self,

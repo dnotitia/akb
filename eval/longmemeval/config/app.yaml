@@ -52,6 +52,7 @@ rerank_provider: cohere
 rerank_model: cohere/rerank-v3.5
 rerank_base_url: https://openrouter.ai/api/v1
 rerank_prefetch: 30
+rerank_fusion_k: 60
 rerank_timeout_seconds: 3.0
 
 # === S3 (in-stack MinIO — required for backend to boot cleanly) ===

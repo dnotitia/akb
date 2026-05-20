@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Settings(BaseModel):
@@ -67,6 +67,10 @@ class Settings(BaseModel):
     rerank_base_url: str = ""                  # blank → falls back to llm_base_url
     rerank_api_key: str = ""                   # blank → falls back to llm_api_key
     rerank_prefetch: int = 30
+    # RRF k used when fusing the first-stage hybrid rank with cross-encoder
+    # rerank rank. 60 is the common RRF default; lower values make top ranks
+    # sharper, higher values flatten the contribution curve.
+    rerank_fusion_k: int = Field(default=60, ge=1)
     rerank_timeout_seconds: float = 3.0
 
     # S3-compatible object storage (for vault files)

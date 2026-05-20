@@ -60,6 +60,7 @@ rerank_model: cohere/rerank-v3.5
 # Blank → falls back to llm_base_url / llm_api_key.
 rerank_base_url: ""
 rerank_prefetch: 30
+rerank_fusion_k: 60
 rerank_timeout_seconds: 3.0
 
 # === S3-compatible object storage (for vault file uploads) ===
