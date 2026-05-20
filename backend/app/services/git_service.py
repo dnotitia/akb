@@ -91,7 +91,24 @@ class GitService:
         except (ValueError, TypeError, GitError):
             return None  # empty repo; caller falls back to the clone path
         wt.parent.mkdir(parents=True, exist_ok=True)
-        bare_repo.git.worktree("add", str(wt), branch_name)
+        try:
+            bare_repo.git.worktree("add", str(wt), branch_name)
+        except GitError as e:
+            # A previous `worktree add` killed mid-write (SIGKILL, OOM,
+            # container restart) can leave the bare's
+            # `.git/worktrees/<name>/` metadata half-written. The next
+            # call fails with "<name> is already registered" even though
+            # the on-disk worktree dir is gone. `git worktree prune`
+            # reaps those stale registrations; retry once after pruning.
+            msg = str(e)
+            if "already registered" not in msg:
+                raise
+            logger.warning(
+                "worktree add for vault %s tripped stale registration; pruning and retrying: %s",
+                vault_name, msg,
+            )
+            bare_repo.git.worktree("prune")
+            bare_repo.git.worktree("add", str(wt), branch_name)
         logger.info("Worktree created for vault %s at %s (branch=%s)", vault_name, wt, branch_name)
         return wt
 
@@ -265,18 +282,41 @@ class GitService:
         """Fetch the remote branch into the bare repo. Updates the local
         ref `refs/heads/<branch>` to whatever the remote currently is
         (force — mirrors track upstream literally). Returns the new SHA.
+
+        Lock discipline: the network fetch itself runs **outside** the
+        per-vault lock — it can take minutes on a slow upstream and
+        holding the worktree-write lock that long blocks every
+        concurrent commit on this vault. The fetch lands new objects in
+        the bare's shared object store (idempotent and append-only;
+        safe to race), then we briefly acquire the lock for the
+        local-ref update + rev_parse, which is the only shared-state
+        mutation that needs serialization with worktree commits.
         """
         bare_path = self._bare_path(vault_name)
         if not bare_path.exists():
             raise FileNotFoundError(f"Vault repo not found: {vault_name}")
         timeout = timeout or settings.external_git_fetch_timeout
+
+        # Network I/O outside the lock. We fetch to a temporary ref so
+        # the local branch ref is updated only inside the lock below.
+        repo = Repo(str(bare_path))
+        authed = self._with_auth(remote_url, auth_token)
+        tmp_ref = f"refs/akb/fetch-tmp/{branch}"
+        repo.git.fetch(
+            authed, f"+refs/heads/{branch}:{tmp_ref}",
+            kill_after_timeout=timeout,
+        )
+
+        # Brief critical section: move tmp ref onto the canonical
+        # branch ref and read the resulting sha. Both ops are local
+        # and millisecond-scale.
         with _vault_lock(vault_name):
-            repo = Repo(str(bare_path))
-            authed = self._with_auth(remote_url, auth_token)
-            repo.git.fetch(
-                authed, f"+refs/heads/{branch}:refs/heads/{branch}",
-                kill_after_timeout=timeout,
-            )
+            repo.git.update_ref(f"refs/heads/{branch}", tmp_ref)
+            try:
+                repo.git.update_ref("-d", tmp_ref)
+            except GitError:
+                # Best-effort cleanup; leftover tmp refs are harmless.
+                pass
             return repo.git.rev_parse(f"refs/heads/{branch}")
 
     def ls_remote_head(
@@ -342,12 +382,19 @@ class GitService:
     # ── Read operations ──────────────────────────────────────
 
     def read_file(self, vault_name: str, file_path: str, commit: str | None = None) -> str | None:
-        """Read a file's content from the repo. Returns None if not found."""
+        """Read a file's content from the repo. Returns None if not found.
+
+        Caller is expected to have validated ``commit`` against
+        :func:`is_valid_commit_hash` before reaching here; we still catch
+        BadName/BadObject defensively so an unexpected ref string surfaces
+        as 404 rather than a 500.
+        """
         repo = self._get_repo(vault_name)
+        from git.exc import BadName, BadObject
         try:
             ref = repo.commit(commit) if commit else repo.head.commit
-        except ValueError:
-            # Empty repo, no commits yet
+        except (ValueError, BadName, BadObject):
+            # Empty repo, malformed hash, or hash unknown to this repo.
             return None
         try:
             blob = ref.tree / file_path
@@ -533,6 +580,15 @@ class GitService:
         and every subsequent vault-creation request 500s. Use plain
         ``subprocess`` with an explicit ``cwd`` so the call never reads
         the process cwd.
+
+        Cancellation hazard: ``subprocess.run`` blocks the worker
+        thread until the child exits. If the surrounding asyncio task
+        is cancelled, the running ``git clone`` / ``git push`` keeps
+        going on the local filesystem until it finishes or hits the
+        timeout below. Acceptable because this path only runs on the
+        very first commit of a fresh vault — but the timeouts are
+        here as a hard upper bound so a wedged subprocess can't pin
+        the vault lock forever.
         """
         import subprocess
         import tempfile
@@ -542,28 +598,57 @@ class GitService:
         # process cwd to resolve a relative name. ``storage_path``
         # always exists on a healthy deploy.
         with tempfile.TemporaryDirectory(dir=str(self.storage_path)) as tmp:
-            subprocess.run(
-                ["git", "clone", "--quiet", str(bare_path), tmp],
-                check=True, cwd=tmp,
-            )
+            try:
+                subprocess.run(
+                    ["git", "clone", "--quiet", str(bare_path), tmp],
+                    check=True, cwd=tmp, timeout=60,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise GitError(
+                    f"git clone timed out after 60s for vault {vault_name}"
+                ) from e
             work_repo = Repo(tmp)
             full_path = Path(tmp) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
             work_repo.index.add([file_path])
             commit = work_repo.index.commit(message, author=author, committer=author)
-            work_repo.remote("origin").push()
+            # Push is local-to-local (bare repo on the same disk), so
+            # 60s is generous; if it hangs the timeout still releases
+            # the vault lock for the next caller.
+            try:
+                work_repo.git.push("origin", kill_after_timeout=60)
+            except GitError as e:
+                raise GitError(
+                    f"git push failed for vault {vault_name}: {e}"
+                ) from e
         return commit.hexsha
 
     # ── History operations ───────────────────────────────────
 
-    def file_log(self, vault_name: str, file_path: str, max_count: int = 20) -> list[dict]:
-        """Get commit log for a specific file."""
+    def file_log(
+        self,
+        vault_name: str,
+        file_path: str,
+        max_count: int = 20,
+        since_epoch: int | None = None,
+    ) -> list[dict]:
+        """Get commit log for a specific file.
+
+        ``since_epoch`` (Unix seconds) trims commits older than the boundary
+        so that history at a path which was deleted and re-created starts
+        clean from the current document's ``created_at`` — pre-fix, commits
+        from a since-deleted prior document leaked into the new doc's
+        history because git keys by path, not by document identity.
+        """
         repo = self._get_repo(vault_name)
         try:
             commits = list(repo.iter_commits(paths=file_path, max_count=max_count))
         except (ValueError, GitError):
             return []
+
+        if since_epoch is not None:
+            commits = [c for c in commits if c.committed_date >= since_epoch]
 
         return [
             {

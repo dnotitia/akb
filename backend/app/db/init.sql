@@ -19,7 +19,13 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- JWT revocation cutoff. A JWT is rejected if its `iat` claim is
+    -- earlier than this timestamp. Default epoch keeps every JWT issued
+    -- before the user explicitly revokes valid until natural expiry.
+    -- Set to NOW() via POST /auth/revoke-all-sessions, admin force-logout,
+    -- and automatically inside change_password.
+    tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT TIMESTAMPTZ '1970-01-01 00:00:00+00'
 );
 
 -- ============================================================

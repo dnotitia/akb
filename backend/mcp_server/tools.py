@@ -165,6 +165,10 @@ TOOLS = [
                     "description": "Replace all occurrences (default: false, requires old_string to be unique)",
                 },
                 "message": {"type": "string", "description": "Commit message describing the change"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after akb_get to fail-fast on concurrent writers.",
+                },
             },
             "required": ["uri", "old_string", "new_string"],
         },

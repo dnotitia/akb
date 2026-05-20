@@ -17,7 +17,11 @@ from typing import Literal
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
 from app.repositories.events_repo import emit_event
-from app.services.auth_service import hash_password
+from app.services.auth_service import (
+    REVOKE_REASON_PASSWORD_RESET,
+    _revoke_sessions_in_conn,
+    hash_password,
+)
 
 
 def generate_temp_password() -> str:
@@ -57,6 +61,14 @@ async def reset_password(
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
                 hash_password(temp),
                 row["id"],
+            )
+            # Otherwise the attacker who triggered the reset (or held
+            # the prior password) keeps any JWT they hold valid.
+            await _revoke_sessions_in_conn(
+                conn,
+                row["id"],
+                actor_id=actor_id or str(row["id"]),
+                reason=REVOKE_REASON_PASSWORD_RESET,
             )
             await emit_event(
                 conn,

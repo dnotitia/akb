@@ -34,14 +34,21 @@ from .base import VectorHit, VectorStoreUnavailable
 logger = logging.getLogger("akb.vector_store.seahorse")
 
 
-# Seahorse PK is enforced as `<prefix><RS><uint64>` — record separator
-# is ASCII 30 (\x1e). We compose it from `source_id` + `chunk_index`
-# so chunks of the same source share a prefix.
-_RS = "\x1e"
-
 # Column names this driver assumes in the table schema. ensure_collection
 # verifies them; auto_create lays them down.
-COL_ID = "id"                       # PK (Seahorse-format)
+#
+# PK note: we use the AKB chunk UUID (`chunk_id`) directly as the Seahorse
+# PK. Earlier revisions composed the PK from `source_id` + `chunk_index`
+# under the assumption that this would keep all chunks of one source
+# colocated, but it created a re-index correctness bug: when a document
+# was re-indexed with FEWER chunks than before, trailing old rows at
+# `(source_id, k)` for k >= new_count were never deleted. The outbox
+# DELETE targets `external_chunk_id` (the AKB UUID), but the new upsert
+# at the same `(source_id, chunk_index)` had already overwritten the
+# `external_chunk_id` column, so the delete filter matched zero rows.
+# Using `chunk_id` (one row per AKB chunk UUID) makes PK identity and
+# delete identity the same value, eliminating the class of bug.
+COL_ID = "id"                       # PK == AKB chunk UUID
 COL_EXTERNAL_CHUNK_ID = "external_chunk_id"
 COL_SOURCE_TYPE = "source_type"
 COL_SOURCE_ID = "source_id"
@@ -57,9 +64,14 @@ COL_SPARSE = "sparse_vector"
 RRF_K = 60
 
 
-def _seahorse_pk(source_id: str, chunk_index: int) -> str:
-    """Build the Seahorse-format PK: `<source_id><RS><chunk_index>`."""
-    return f"{source_id}{_RS}{int(chunk_index)}"
+def _seahorse_pk(chunk_id: str) -> str:
+    """Build the Seahorse PK from the AKB chunk UUID.
+
+    The PK is just the chunk UUID as a string. Keeping this as a tiny
+    helper (rather than inlining `str(chunk_id)`) preserves the seam
+    in case the PK encoding ever needs to grow a prefix again.
+    """
+    return str(chunk_id)
 
 
 def _sql_quote(value: str) -> str:
@@ -278,7 +290,7 @@ class SeahorseStore:
         del conn
         await self.ensure_collection()
         row = {
-            COL_ID: _seahorse_pk(str(source_id), int(chunk_index)),
+            COL_ID: _seahorse_pk(str(chunk_id)),
             COL_EXTERNAL_CHUNK_ID: str(chunk_id),
             COL_SOURCE_TYPE: source_type,
             COL_SOURCE_ID: str(source_id),

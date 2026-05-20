@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -114,7 +115,11 @@ from app.models.document import (
     DocumentResponse,
     DocumentUpdateRequest,
 )
-from app.repositories.document_repo import CollectionRepository, DocumentRepository
+from app.repositories.document_repo import (
+    CollectionRepository,
+    DocumentRepository,
+    acquire_path_lock,
+)
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository
@@ -202,6 +207,23 @@ class DocumentService:
         pool = await get_pool()
         return VaultRepository(pool), DocumentRepository(pool), CollectionRepository(pool)
 
+    @asynccontextmanager
+    async def _path_lock(self, vault_id: uuid.UUID, file_path: str):
+        """Hold an exclusive (vault_id, path) advisory lock for the duration
+        of the with-block. Serializes concurrent put/update/edit/delete on
+        the same logical document path so git HEAD never diverges from
+        ``documents.current_commit`` under a race.
+
+        Uses a dedicated short-lived connection / transaction so the
+        existing code paths (which acquire their own connections for
+        git + chunks + relations + events) can keep their structure.
+        """
+        pool = await get_pool()
+        async with pool.acquire() as lock_conn:
+            async with lock_conn.transaction():
+                await acquire_path_lock(lock_conn, vault_id, file_path)
+                yield
+
     # ── Put ───────────────────────────────────────────────────
 
     async def put(self, req: DocumentPutRequest, agent_id: str | None = None) -> DocumentPutResponse:
@@ -218,14 +240,23 @@ class DocumentService:
         normalized_collection = _normalize_collection(req.collection)
         file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
 
-        # Conflict pre-check — keep `git.commit_file` from overwriting an
-        # existing doc when the path would collide. Without this the git
-        # write lands first, the subsequent INSERT fails on the
-        # unique(vault_id, path) constraint, and the caller gets an
-        # error response while the on-disk body is already mutated.
-        # Concurrent puts can still race past this gate; the unique
-        # index is the final backstop and the rare partial-write that
-        # results is rolled back by a future explicit-update workflow.
+        async with self._path_lock(vault_id, file_path):
+            return await self._put_locked(
+                req=req, agent_id=agent_id, vault_id=vault_id,
+                file_path=file_path, slug=slug, now=now,
+                normalized_collection=normalized_collection,
+                doc_repo=doc_repo, coll_repo=coll_repo,
+            )
+
+    async def _put_locked(
+        self, *, req, agent_id, vault_id, file_path, slug, now,
+        normalized_collection, doc_repo, coll_repo,
+    ) -> DocumentPutResponse:
+        # Conflict pre-check — now safe under (vault_id, path) advisory lock.
+        # The earlier comment about "concurrent puts can still race past
+        # this gate" no longer applies: the lock serializes writers on
+        # this exact (vault_id, path), so a second caller observes the
+        # first caller's row here and 409s before any git mutation.
         if await doc_repo.find_by_path(vault_id, file_path):
             from app.exceptions import ConflictError
             raise ConflictError(f"Document already exists at path: {file_path}")
@@ -399,6 +430,11 @@ class DocumentService:
             content=body,
             is_public=public_slug is not None,
             public_slug=public_slug,
+            # Metadata (title/type/tags/...) is read from the live PG row,
+            # NOT from frontmatter at the requested commit. Flag this so
+            # the UI can render a "metadata may not reflect this version"
+            # banner alongside the historical body.
+            metadata_is_current=True,
         )
 
     async def _get_public_slug(self, vault_name: str, doc_path: str) -> str | None:
@@ -426,10 +462,34 @@ class DocumentService:
         if not vault_id:
             raise NotFoundError("Vault", vault)
 
+        # Resolve once to learn the path, then acquire the lock and re-read.
         row = await doc_repo.find_by_ref(vault_id, doc_ref)
         if not row:
             raise NotFoundError("Document", doc_ref)
+        file_path = row["path"]
 
+        async with self._path_lock(vault_id, file_path):
+            # Re-read under the lock so we observe any commit that landed
+            # between the initial resolution and lock acquisition.
+            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+            if not row:
+                raise NotFoundError("Document", doc_ref)
+
+            # Optimistic concurrency: if caller pinned expected_commit, refuse
+            # the write when the row has moved on. Caller should re-read and
+            # retry against the new HEAD.
+            if req.expected_commit and row["current_commit"] != req.expected_commit:
+                raise ConflictError(
+                    f"current_commit moved: expected {req.expected_commit}, "
+                    f"actual {row['current_commit']}"
+                )
+
+            return await self._update_locked(
+                req=req, agent_id=agent_id, vault=vault,
+                vault_id=vault_id, doc_repo=doc_repo, row=row,
+            )
+
+    async def _update_locked(self, *, req, agent_id, vault, vault_id, doc_repo, row) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
         pg_doc_id = row["id"]
         file_path = row["path"]
@@ -547,6 +607,7 @@ class DocumentService:
         replace_all: bool = False,
         message: str | None = None,
         agent_id: str | None = None,
+        base_commit: str | None = None,
     ) -> DocumentPutResponse:
         """Edit a document by replacing exact text in its body.
 
@@ -554,6 +615,9 @@ class DocumentService:
             old_string: Exact text to find. Must be unique unless replace_all=True.
             new_string: Replacement text. Can be empty to delete.
             replace_all: If True, replace all occurrences. If False, old_string must be unique.
+            base_commit: Optional OCC pin — reject with 409 if the doc's
+                current_commit doesn't match. Use to detect a concurrent
+                writer between the agent's read and edit submission.
 
         Raises:
             EditError: If old_string is empty, not found, or not unique (and replace_all=False).
@@ -567,7 +631,27 @@ class DocumentService:
         row = await doc_repo.find_by_ref(vault_id, doc_ref)
         if not row:
             raise NotFoundError("Document", doc_ref)
+        file_path = row["path"]
 
+        async with self._path_lock(vault_id, file_path):
+            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+            if not row:
+                raise NotFoundError("Document", doc_ref)
+            if base_commit and row["current_commit"] != base_commit:
+                raise ConflictError(
+                    f"current_commit moved: expected {base_commit}, "
+                    f"actual {row['current_commit']}"
+                )
+            return await self._edit_locked(
+                vault=vault, vault_id=vault_id, row=row, doc_repo=doc_repo,
+                old_string=old_string, new_string=new_string,
+                replace_all=replace_all, message=message, agent_id=agent_id,
+            )
+
+    async def _edit_locked(
+        self, *, vault, vault_id, row, doc_repo,
+        old_string, new_string, replace_all, message, agent_id,
+    ) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
         pg_doc_id = row["id"]
         file_path = row["path"]
@@ -634,25 +718,41 @@ class DocumentService:
             doc_type=row["doc_type"],
         )
         chunks = chunk_markdown(new_body, metadata_header=meta_header)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            chunks_indexed = await write_source_chunks(
-                conn, "document", str(pg_doc_id),
-                vault_id=vault_id,
-                chunks=chunks,
-            )
-
-        # Re-extract edges from updated content
         depends = current_fm.get("depends_on", []) or []
         related = current_fm.get("related_to", []) or []
         implements = current_fm.get("implements", []) or []
+
+        # Single TX across chunks + relations + event so a crash between
+        # them can't leave the chunk index, the edge graph, and the
+        # event stream in inconsistent states (pre-fix: three separate
+        # connections, no shared TX).
+        chunks_indexed = 0
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await store_document_relations(
-                conn, vault_id, vault, file_path,
-                depends, related, implements,
-                new_body,
-            )
+            async with conn.transaction():
+                chunks_indexed = await write_source_chunks(
+                    conn, "document", str(pg_doc_id),
+                    vault_id=vault_id,
+                    chunks=chunks,
+                )
+                await store_document_relations(
+                    conn, vault_id, vault, file_path,
+                    depends, related, implements,
+                    new_body,
+                )
+                await emit_event(
+                    conn, "document.update",
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(vault, file_path),
+                    actor_id=agent_id,
+                    payload={
+                        "vault": vault,
+                        "path": file_path,
+                        "commit_hash": commit_hash,
+                        "content_changed": True,
+                        "source": "edit",
+                    },
+                )
 
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
@@ -672,7 +772,19 @@ class DocumentService:
         row = await doc_repo.find_by_ref(vault_id, doc_ref)
         if not row:
             raise NotFoundError("Document", doc_ref)
+        file_path = row["path"]
 
+        async with self._path_lock(vault_id, file_path):
+            # Re-resolve under the lock — a concurrent delete may have run.
+            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+            if not row:
+                raise NotFoundError("Document", doc_ref)
+            return await self._delete_locked(
+                vault=vault, vault_id=vault_id, row=row, agent_id=agent_id,
+                doc_repo=doc_repo, coll_repo=coll_repo,
+            )
+
+    async def _delete_locked(self, *, vault, vault_id, row, agent_id, doc_repo, coll_repo) -> bool:
         pg_doc_id = row["id"]
         file_path = row["path"]
         collection_id = row["collection_id"]

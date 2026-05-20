@@ -27,7 +27,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent
 
 from app.db.postgres import get_pool, init_db, close_pool
-from app.exceptions import NotFoundError
+from app.exceptions import ConflictError, NotFoundError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
@@ -39,6 +39,7 @@ from app.services.access_service import (
 )
 from app.services.auth_service import resolve_token
 from app.services.memory_service import remember, recall, forget
+from app.util.text import to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
@@ -189,6 +190,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_get")
 async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
     if version:
@@ -235,6 +237,7 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_update")
 async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
     req = DocumentUpdateRequest(
         content=args.get("content"),
@@ -255,6 +258,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_edit")
 async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
     try:
         result = await doc_service.edit(
@@ -264,6 +268,7 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
             replace_all=args.get("replace_all", False),
             message=args.get("message"),
             agent_id=user.username,
+            base_commit=args.get("base_commit"),
         )
         return result.model_dump()
     except EditError as e:
@@ -272,11 +277,20 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
             "message": str(e),
             "hint": "Use akb_get to verify current content, then retry with adjusted old_string.",
         }
+    except ConflictError as e:
+        # base_commit OCC mismatch: a concurrent writer moved the doc
+        # between the agent's read and edit submission.
+        return {
+            "error": "conflict",
+            "message": str(e),
+            "hint": "Document was modified since base_commit. Re-read with akb_get and retry.",
+        }
 
 
 @_h("akb_delete")
 async def _handle_delete(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
     success = await doc_service.delete(vault, doc_path, agent_id=user.username)
     return {"deleted": success}
@@ -777,13 +791,26 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
 @_h("akb_history")
 async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:
         return {"error": f"Document not found: {args['uri']}"}
     from app.services.git_service import GitService
     git = GitService()
-    history = git.file_log(vault, doc["path"], max_count=args.get("limit", 20))
+    # Pass the doc's created_at as a lineage boundary so commits from a
+    # previous document at the same path (deleted-and-recreated) don't
+    # leak into this doc's history. created_at lives on the documents
+    # row; convert to Unix seconds for git's filter.
+    since_epoch = None
+    created_at = doc.get("created_at")
+    if created_at is not None:
+        since_epoch = int(created_at.timestamp())
+    history = git.file_log(
+        vault, doc["path"],
+        max_count=args.get("limit", 20),
+        since_epoch=since_epoch,
+    )
     return {"uri": doc_uri(vault, doc["path"]), "history": history}
 
 

@@ -19,6 +19,10 @@ git = GitService()
 
 @router.post("/sessions/start", summary="Start an agent work session")
 async def start_session(vault: str, agent_id: str, context: str | None = None, user: AuthenticatedUser = Depends(get_current_user)):
+    # Reader role is the minimum bar — a session is logically a read-and-write
+    # workspace, but pre-fix this route did NO access check and any authenticated
+    # user could open a session against any vault by name (06-F4).
+    await check_vault_access(user.user_id, vault, required_role="reader")
     return await session_service.start_session(vault, agent_id, context)
 
 
@@ -77,6 +81,10 @@ async def recent_changes(
                 vault, limit,
             )
         else:
+            # Include public-readable vaults so /recent is consistent with
+            # /search and list_accessible_vaults — pre-fix this route only
+            # surfaced owned/granted vaults, hiding docs from vaults the
+            # user could still read via public_access (06-F5).
             rows = await conn.fetch(
                 """
                 SELECT d.id, d.title, d.path, d.doc_type, d.current_commit,
@@ -85,7 +93,9 @@ async def recent_changes(
                 JOIN vaults v ON d.vault_id = v.id
                 LEFT JOIN vault_access va
                     ON va.vault_id = v.id AND va.user_id = $1
-                WHERE v.owner_id = $1 OR va.user_id = $1
+                WHERE v.owner_id = $1
+                   OR va.user_id = $1
+                   OR v.public_access IN ('reader', 'writer')
                 ORDER BY d.updated_at DESC
                 LIMIT $2
                 """,
