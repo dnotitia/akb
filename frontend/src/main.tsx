@@ -11,6 +11,7 @@ import VaultPage from "@/pages/vault";
 import VaultIndexPage from "@/pages/vault-index";
 import VaultNewPage from "@/pages/vault-new";
 import DocumentPage from "@/pages/document";
+import DocumentNewPage from "@/pages/document-new";
 import TablePage from "@/pages/table";
 import FilePage from "@/pages/file";
 import GraphPage from "@/pages/graph";
@@ -56,6 +57,7 @@ createRoot(document.getElementById("root")!).render(
           <Route element={<VaultShell />}>
             <Route path="/vault" element={<VaultIndexPage />} />
             <Route path="/vault/:name" element={<VaultPage />} />
+            <Route path="/vault/:name/doc/new" element={<DocumentNewPage />} />
             <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
             <Route path="/vault/:name/table/:table" element={<TablePage />} />
             <Route path="/vault/:name/file/:id" element={<FilePage />} />

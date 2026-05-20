@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -13,12 +14,13 @@ import {
   Unlock,
 } from "lucide-react";
 import {
+  ApiError,
   deleteDocument,
   getDocument,
   getRelations,
   getVaultInfo,
-  publishDoc,
   unpublishDoc,
+  updateDocument,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { parseHeadings } from "@/lib/markdown";
@@ -29,9 +31,14 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
+import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+
+// Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
+// (Rendered / Raw / Agent) stays cheap.
+const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 const RELATION_COLOR: Record<string, string> = {
   implements: "text-good",
@@ -42,14 +49,23 @@ const RELATION_COLOR: Record<string, string> = {
   derived_from: "text-warning",
 };
 
+type DocView = "rendered" | "raw" | "agent" | "edit";
+
 export default function DocumentPage() {
   const { name, id } = useParams<{ name: string; id: string }>();
   const navigate = useNavigate();
   const { refetchTree } = useVaultRefresh();
   const [searchParams, setSearchParams] = useSearchParams();
   const commitHash = searchParams.get("commit") || undefined;
-  const view: "rendered" | "raw" | "agent" =
-    searchParams.get("view") === "raw" ? "raw" : "rendered";
+  const rawView = searchParams.get("view");
+  const view: DocView =
+    rawView === "raw"
+      ? "raw"
+      : rawView === "edit"
+        ? "edit"
+        : rawView === "agent"
+          ? "agent"
+          : "rendered";
   const [relations, setRelations] = useState<any[]>([]);
   const [provenance, setProvenance] = useState<any[]>([]);
   const [docOverride, setDocOverride] = useState<any>(null);
@@ -61,19 +77,43 @@ export default function DocumentPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
+  // Plate manages its own state; we remount via `editorKey` when hydrating
+  // a fresh server value rather than treating `value` as controlled.
+  const [editingContent, setEditingContent] = useState("");
+  const [originalContent, setOriginalContent] = useState("");
+  const [editorKey, setEditorKey] = useState(0);
+  const [savingBody, setSavingBody] = useState(false);
+  const [bodyError, setBodyError] = useState("");
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  // Plate's markdown roundtrip is not byte-identity: adopt the first
+  // post-hydration emission as the new `originalContent` baseline so the
+  // editor doesn't flash "UNSAVED" the moment it mounts.
+  const hydratedKey = useRef<number | null>(null);
+  const isDirty = editingContent !== originalContent;
   const docId = id ? decodeURIComponent(id) : "";
+  const canEdit =
+    !commitHash &&
+    (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
 
-  const setView = (next: "rendered" | "raw" | "agent") => {
+  const setView = (next: DocView) => {
+    if (view === "edit" && next !== "edit" && isDirty) {
+      // Explicit save mirrors the frontmatter dialog UX — losing edits
+      // silently on tab switch would be the wrong default.
+      const ok = window.confirm(
+        "Discard unsaved changes? Your edits will be lost.",
+      );
+      if (!ok) return;
+      setEditingContent(originalContent);
+      setEditorKey((k) => k + 1);
+    }
     const p = new URLSearchParams(searchParams);
-    // "agent" is an ephemeral view — not persisted to URL params
-    if (next === "raw") p.set("view", "raw");
-    else p.delete("view");
+    if (next === "rendered") p.delete("view");
+    else p.set("view", next);
     setSearchParams(p, { replace: true });
   };
 
   useEffect(() => {
     if (!name) return;
-    // Reset stale state from previous param before re-fetch resolves.
     setVaultRole(null);
     getVaultInfo(name)
       .then((d) => setVaultRole(d?.role || null))
@@ -87,17 +127,22 @@ export default function DocumentPage() {
     retry: false,
   });
 
-  // Merge query data with any local overrides (publish/unpublish, frontmatter edits).
   const doc = docOverride ?? docQuery.data ?? null;
 
   useEffect(() => {
     const d = docQuery.data;
-    // Reset stale state from previous param before re-fetch resolves.
     setDocOverride(null);
     setProvenance([]);
-    setRelations([]);    // NEW
+    setRelations([]);
+    setBodyError("");
     if (!d) return;
-    // Reset local override when the query result changes (e.g. navigating docs).
+    const body = d.content || "";
+    setOriginalContent(body);
+    setEditingContent(body);
+    // Bump the key so the Plate editor remounts with the new value —
+    // it's uncontrolled internally and won't pick up `value` prop
+    // changes after mount.
+    setEditorKey((k) => k + 1);
     if (d.path && d.path !== docId) {
       navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
     }
@@ -107,11 +152,97 @@ export default function DocumentPage() {
     if (d.path) {
       loadHistory(name!, d.path);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docQuery.data]);
 
+  // Warn before page navigation (close tab, browser back) when dirty.
+  useEffect(() => {
+    if (!isDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isDirty]);
+
+  async function handleSaveBody() {
+    if (!name || !docId) return;
+    setSavingBody(true);
+    setBodyError("");
+    try {
+      await updateDocument(name, docId, { content: editingContent });
+    } catch (e: unknown) {
+      const status = e instanceof ApiError ? e.status : 0;
+      // 5xx responses can carry stack traces or SQL fragments — never
+      // surface those verbatim. 4xx are intentional API errors so the
+      // message is OK to show.
+      const safe =
+        status >= 500
+          ? "The server hit an error while saving. Please retry."
+          : e instanceof Error
+            ? e.message
+            : "Save failed.";
+      setBodyError(safe);
+      setSavingBody(false);
+      return;
+    }
+    const now = new Date().toISOString();
+    // Optimistically advance content + updated_at so the byline reads
+    // "last changed just now" without waiting for a refetch.
+    setDocOverride({
+      ...(doc || {}),
+      content: editingContent,
+      updated_at: now,
+    });
+    setOriginalContent(editingContent);
+    // Sidebar refresh is best-effort — its failure must not leave the
+    // user looking at a "still dirty" editor after a successful save.
+    try {
+      refetchTree();
+    } catch {
+      // intentionally swallowed
+    }
+    // Commit `savedAt` before the view switch so the SAVED badge
+    // renders in its own paint; bundling it with `setSearchParams`
+    // lets React squash the indicator into the same commit as the
+    // tab-strip remount and the user never sees it.
+    flushSync(() => {
+      flashSaved();
+    });
+    const p = new URLSearchParams(searchParams);
+    p.delete("view");
+    setSearchParams(p, { replace: true });
+    setSavingBody(false);
+  }
+
+  const savedTimerRef = useRef<number | null>(null);
+  function flashSaved() {
+    setSavedAt(Date.now());
+    if (savedTimerRef.current !== null) {
+      window.clearTimeout(savedTimerRef.current);
+    }
+    savedTimerRef.current = window.setTimeout(() => {
+      setSavedAt(null);
+      savedTimerRef.current = null;
+    }, 2500);
+  }
+  useEffect(
+    () => () => {
+      if (savedTimerRef.current !== null) {
+        window.clearTimeout(savedTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  function handleCancelBody() {
+    setEditingContent(originalContent);
+    setEditorKey((k) => k + 1);
+    setBodyError("");
+  }
+
   // History = `git log -- <doc.path>` scoped to this document.
-  // The /activity endpoint's `collection` query param is plumbed to
-  // git.vault_log(path=...), so this is true per-doc commit history.
   async function loadHistory(vault: string, docPath: string) {
     const t = localStorage.getItem("akb_token") || "";
     try {
@@ -175,20 +306,20 @@ export default function DocumentPage() {
   }
 
   const commitShort = doc.current_commit?.slice(0, 7);
+  const inEditMode = view === "edit";
 
-  // Grid fills the outlet so the right rail anchors to the outlet's
-  // right edge — a stable viewport position regardless of whether the
-  // vault tree is expanded or collapsed. When the tree hides, the
-  // reclaimed space flows into the article column on the left (article
-  // right edge and rail position stay put).
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_260px] gap-x-10 gap-y-6 fade-up">
-      {/* ── Main column ─────────────────────────────────────── */}
-      {/* Article is capped + centered within its grid cell so the body
-          gains margin on both sides as the outlet widens (tree hidden),
-          mirroring other pages' centering. Rail stays pinned to the
-          outer outlet edge via the grid's second column. */}
-      <article ref={setArticleEl} className="min-w-0 w-full max-w-[1020px] justify-self-center">
+    <div
+      className={`grid grid-cols-1 gap-x-10 gap-y-6 fade-up ${
+        inEditMode ? "" : "xl:grid-cols-[minmax(0,1fr)_260px]"
+      }`}
+    >
+      <article
+        ref={setArticleEl}
+        className={`min-w-0 w-full ${
+          inEditMode ? "max-w-none" : "max-w-[1020px] justify-self-center"
+        }`}
+      >
         {commitHash && (
           <div
             role="status"
@@ -260,26 +391,183 @@ export default function DocumentPage() {
           </div>
         )}
 
-        {/* Body — delegated to DocumentView which owns the segmented
-            control and markdown render. View state is driven from URL
-            params here and passed down as controlled props. */}
-        <DocumentView
-          vault={name!}
-          docId={docId}
-          view={view}
-          onViewChange={setView}
-        />
+        {inEditMode ? (
+          <>
+            <div className="flex items-center justify-end mb-3 gap-3">
+              {savedAt && (
+                <span
+                  role="status"
+                  aria-live="polite"
+                  className="coord text-good inline-flex items-baseline gap-1"
+                >
+                  <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
+                  SAVED
+                </span>
+              )}
+              <div
+                role="tablist"
+                aria-label="Document view"
+                className="inline-flex border border-border"
+                onKeyDown={(e) => {
+                  // Roving tabindex within the strip — Arrow keys move
+                  // focus, Enter/Space (handled by the button itself)
+                  // activates. Matches the WAI-ARIA tabs pattern used in
+                  // DocumentView's TabStrip.
+                  const buttons = Array.from(
+                    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+                  );
+                  const idx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                  if (idx < 0) return;
+                  let next: number;
+                  if (e.key === "ArrowRight") next = (idx + 1) % buttons.length;
+                  else if (e.key === "ArrowLeft") next = (idx - 1 + buttons.length) % buttons.length;
+                  else if (e.key === "Home") next = 0;
+                  else if (e.key === "End") next = buttons.length - 1;
+                  else return;
+                  e.preventDefault();
+                  buttons[next]?.focus();
+                }}
+              >
+                <button
+                  role="tab"
+                  id="doc-tab-rendered"
+                  aria-selected={false}
+                  aria-controls="doc-panel-rendered"
+                  tabIndex={-1}
+                  onClick={() => setView("rendered")}
+                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  RENDERED
+                </button>
+                <button
+                  role="tab"
+                  id="doc-tab-raw"
+                  aria-selected={false}
+                  aria-controls="doc-panel-raw"
+                  tabIndex={-1}
+                  onClick={() => setView("raw")}
+                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  RAW
+                </button>
+                <button
+                  role="tab"
+                  id="doc-tab-edit"
+                  aria-selected={true}
+                  aria-controls="doc-panel-edit"
+                  tabIndex={0}
+                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border bg-foreground text-background cursor-default"
+                >
+                  EDIT{isDirty ? "*" : ""}
+                </button>
+              </div>
+            </div>
+            <div
+              id="doc-panel-edit"
+              role="tabpanel"
+              aria-labelledby="doc-tab-edit"
+              className="space-y-3"
+            >
+              <div className="coord flex items-center justify-between">
+                <span>EDITING BODY</span>
+                <span className="text-foreground-muted normal-case tracking-normal font-sans">
+                  Title, type, tags and other metadata are managed separately
+                  via <span className="font-mono uppercase tracking-wider">Edit details</span> →
+                </span>
+              </div>
+              <Suspense fallback={<MarkdownEditorFallback />}>
+                <MarkdownEditor
+                  key={editorKey}
+                  value={originalContent}
+                  onChange={(md) => {
+                    if (hydratedKey.current !== editorKey) {
+                      hydratedKey.current = editorKey;
+                      setOriginalContent(md);
+                      setEditingContent(md);
+                      return;
+                    }
+                    setEditingContent(md);
+                  }}
+                  autoFocus
+                />
+              </Suspense>
+              {bodyError && (
+                <div
+                  role="alert"
+                  aria-live="polite"
+                  className="border border-destructive px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
+                >
+                  ⚠ {bodyError.toUpperCase()}
+                </div>
+              )}
+              <div className="flex items-center justify-between">
+                <div className="coord">
+                  {isDirty && <span className="text-warning">UNSAVED CHANGES</span>}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleCancelBody}
+                    disabled={savingBody || !isDirty}
+                    size="sm"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="accent"
+                    onClick={handleSaveBody}
+                    disabled={savingBody || !isDirty}
+                    size="sm"
+                  >
+                    {savingBody ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                        Saving…
+                      </>
+                    ) : (
+                      "Save"
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </>
+        ) : (
+          <>
+            {savedAt && (
+              <div className="flex items-center justify-end mb-2">
+                <span
+                  role="status"
+                  aria-live="polite"
+                  className="coord text-good inline-flex items-baseline gap-1"
+                >
+                  <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
+                  SAVED
+                </span>
+              </div>
+            )}
+            <DocumentView
+              vault={name!}
+              docId={docId}
+              view={view}
+              onViewChange={(v) => setView(v)}
+              extraTab={
+                canEdit
+                  ? {
+                      label: `EDIT${isDirty ? "*" : ""}`,
+                      onClick: () => setView("edit"),
+                    }
+                  : undefined
+              }
+            />
+          </>
+        )}
       </article>
 
-      {/* ── Right rail ──────────────────────────────────────────
-         Publish lives above the tabs as an always-visible strip —
-         it's a top-level action, not peer to Outline/Relations.
-         Tabs below keep the reading surface predictable: one
-         secondary pane visible at a time. */}
+      {!inEditMode && (
       <aside className="xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100dvh-13rem)] flex flex-col text-sm min-h-0">
-        {/* Owner/admin/writer actions. For skill docs, the SkillBanner
-            above the article owns the Edit details entry point, so hide
-            it here to avoid two identical buttons on the same screen. */}
         {!commitHash && (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner") && (
           <div className="shrink-0 pb-3 mb-3 border-b border-border space-y-2">
             {doc.type !== "skill" && (
@@ -301,7 +589,6 @@ export default function DocumentPage() {
           </div>
         )}
 
-        {/* Publish strip — hidden in historical view */}
         {!commitHash && (
           <div className="shrink-0 pb-3 mb-3 border-b border-border">
             {doc.is_public && doc.public_slug ? (
@@ -435,7 +722,6 @@ export default function DocumentPage() {
               onSelect={(hash) => {
                 const p = new URLSearchParams(searchParams);
                 if (commitHash === hash) {
-                  // same hash clicked again → toggle back to latest
                   p.delete("commit");
                 } else {
                   p.set("commit", hash);
@@ -446,6 +732,7 @@ export default function DocumentPage() {
           </TabsContent>
         </Tabs>
       </aside>
+      )}
 
       <FrontmatterEditDialog
         open={editOpen}
@@ -455,8 +742,6 @@ export default function DocumentPage() {
         doc={doc}
         onSaved={(next) => {
           setDocOverride({ ...doc, ...next });
-          // Title/type/status changes are surfaced in the tree row
-          // labels; refresh so the sidebar matches.
           refetchTree();
         }}
       />
