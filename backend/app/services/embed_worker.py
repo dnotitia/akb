@@ -170,6 +170,25 @@ async def _process_once() -> int:
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
+                    # Re-check the chunk still exists before upserting.
+                    # Between _claim_batch and here, the delete_worker may
+                    # have drained the outbox row corresponding to a
+                    # document deletion that removed this chunk from PG.
+                    # Upserting now would create an orphan in the vector
+                    # store (no PG row, no future delete-outbox entry to
+                    # clean it up). Lock the row FOR UPDATE so a concurrent
+                    # DELETE serializes behind us — if it's already gone,
+                    # skip upsert + mark.
+                    still_there = await conn.fetchval(
+                        "SELECT 1 FROM chunks WHERE id = $1 FOR UPDATE",
+                        row["id"],
+                    )
+                    if not still_there:
+                        logger.info(
+                            "chunk %s vanished before upsert; skipping",
+                            row["id"],
+                        )
+                        continue
                     await store.upsert_one(
                         conn=conn,  # pgvector joins this transaction
                         chunk_id=str(row["id"]),

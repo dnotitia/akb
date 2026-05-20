@@ -418,12 +418,16 @@ async def generate_embeddings(
 async def _drop_source_chunks_with_outbox(conn, source_type: str, source_id: str) -> None:
     """Remove chunks for any indexable source from PG; enqueue the
     per-chunk ids into the outbox so delete_worker drains them from
-    the vector store asynchronously."""
+    the vector store asynchronously.
+
+    The outbox enqueue and the PG DELETE MUST commit atomically. Pre-fix,
+    the enqueue was wrapped in a silent try/except that let the DELETE
+    run even when the outbox insert failed — producing permanently
+    orphaned vector-store rows (03-F1). Any failure in enqueue now
+    raises and rolls back the caller's transaction.
+    """
     from app.services import delete_worker
-    try:
-        await delete_worker.enqueue_source_deletes(source_type, source_id, conn=conn)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("vector-store outbox enqueue failed: %s", e)
+    await delete_worker.enqueue_source_deletes(source_type, source_id, conn=conn)
     await conn.execute(
         "DELETE FROM chunks WHERE source_type = $1 AND source_id = $2",
         source_type, uuid.UUID(source_id),
@@ -452,21 +456,20 @@ async def delete_vault_chunks(conn, vault_id) -> None:
     their own vault_tables / vault_files FKs at vault-drop time — their
     chunk cleanup is handled in the service delete hooks.
     """
-    try:
-        await conn.execute(
-            """
-            INSERT INTO vector_delete_outbox
-                (chunk_id, source_type, source_id, next_attempt_at)
-            SELECT c.id, c.source_type, c.source_id, NOW()
-              FROM chunks c
-              JOIN documents d ON d.id = c.source_id
-             WHERE c.source_type = 'document'
-               AND d.vault_id = $1
-            """,
-            vault_id,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Failed to enqueue vector-store deletes for vault %s: %s", vault_id, e)
+    # The outbox INSERT must commit atomically with the chunk DELETE
+    # below; failing the enqueue silently leaks vector-store rows.
+    await conn.execute(
+        """
+        INSERT INTO vector_delete_outbox
+            (chunk_id, source_type, source_id, next_attempt_at)
+        SELECT c.id, c.source_type, c.source_id, NOW()
+          FROM chunks c
+          JOIN documents d ON d.id = c.source_id
+         WHERE c.source_type = 'document'
+           AND d.vault_id = $1
+        """,
+        vault_id,
+    )
     await conn.execute(
         """
         DELETE FROM chunks

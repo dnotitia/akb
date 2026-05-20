@@ -65,9 +65,19 @@ class BackfillRunner:
         if self._stop_event:
             self._stop_event.set()
         if self._task:
+            # Per-iteration work (embedding API call + vector-store upsert)
+            # can legitimately take up to ~60s end-to-end. A 5s stop timeout
+            # cancelled the task mid-upsert, ROLLBACK-ing the claim's
+            # vector_next_attempt_at update and leaving rows in a half-
+            # claimed state. Give the current iteration time to finish
+            # cleanly; the stop_event still prevents another tick after
+            # this one drains.
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
+                await asyncio.wait_for(self._task, timeout=120.0)
             except asyncio.TimeoutError:
+                self._log.warning(
+                    "%s did not stop within 120s; cancelling", self._name,
+                )
                 self._task.cancel()
         self._task = None
         self._stop_event = None
@@ -78,7 +88,18 @@ class BackfillRunner:
                        self._name, self._idle_secs, MAX_RETRIES)
         while not self._stop_event.is_set():
             try:
-                done = await self._process_once()
+                # Shield the iteration body so a cancellation arriving mid-
+                # upsert (shutdown signal) doesn't interrupt the per-chunk
+                # transaction. The loop still exits at the top of the next
+                # iteration via _stop_event.is_set(); shielding only
+                # guarantees the in-flight chunk reaches COMMIT/ROLLBACK
+                # cleanly before we tear down.
+                done = await asyncio.shield(self._process_once())
+            except asyncio.CancelledError:
+                # Cancellation reached us despite the shield (e.g., the
+                # outer wait_for timed out and cancelled the task). Exit
+                # the loop without swallowing — the runner is shutting down.
+                raise
             except Exception as e:  # noqa: BLE001 — keep loop alive on any failure
                 self._log.exception("%s iteration failed: %s", self._name, e)
                 done = 0

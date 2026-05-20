@@ -588,9 +588,6 @@ async def resolve_publication(
         if row["expires_at"] is not None and row["expires_at"] <= datetime.now(timezone.utc):
             raise PublicationExpired()
 
-        if row["max_views"] is not None and row["view_count"] >= row["max_views"]:
-            raise PublicationViewLimitReached()
-
         if row["password_hash"] and not bypass_password:
             if not password:
                 raise PublicationPasswordRequired()
@@ -598,10 +595,32 @@ async def resolve_publication(
                 raise PublicationPasswordInvalid()
 
         if increment_view:
-            await conn.execute(
-                "UPDATE publications SET view_count = view_count + 1 WHERE id = $1",
+            # Atomic check + increment in one statement. Pre-fix, the
+            # row read at line 571 and the UPDATE here ran as two
+            # separate statements with no row lock, so N concurrent
+            # readers all saw view_count < max_views and all incremented,
+            # overshooting max_views by up to N-1 (06-F8 / 04-F7).
+            updated = await conn.fetchrow(
+                """
+                UPDATE publications
+                   SET view_count = view_count + 1
+                 WHERE id = $1
+                   AND (max_views IS NULL OR view_count < max_views)
+                 RETURNING view_count, max_views
+                """,
                 row["id"],
             )
+            if updated is None:
+                # The row exists but max_views was already reached at the
+                # moment the UPDATE ran — concurrent reader beat us.
+                raise PublicationViewLimitReached()
+            # Reflect the post-increment counter back so the response is
+            # consistent with the value that just landed in PG.
+            row = dict(row)
+            row["view_count"] = updated["view_count"]
+        else:
+            if row["max_views"] is not None and row["view_count"] >= row["max_views"]:
+                raise PublicationViewLimitReached()
 
     # `row` is non-None here (PublicationNotFound raised above), so both
     # helpers return non-None — assert for mypy's benefit.

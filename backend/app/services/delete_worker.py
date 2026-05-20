@@ -151,9 +151,14 @@ async def enqueue_source_deletes(source_type: str, source_id: str, conn=None) ->
 
     if conn is not None:
         return await _run(conn)
+    # Standalone callers (no caller-managed TX) still need atomicity:
+    # the SELECT + per-row INSERT must commit together so a crash
+    # between the two doesn't leave the outbox partially populated.
+    # Wrap in an explicit transaction.
     pool = await get_pool()
     async with pool.acquire() as c:
-        return await _run(c)
+        async with c.transaction():
+            return await _run(c)
 
 
 # ── Sweep ─────────────────────────────────────────────────────────
