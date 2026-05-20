@@ -32,6 +32,25 @@ explicit relations, and full version history. AKB gives agents a single set of
 tools (`akb_put`, `akb_search`, `akb_browse`, `akb_relations`, …) over a
 backing store of Git bare repos and a PostgreSQL hybrid index.
 
+## Retrieval quality
+
+Memory is only useful if the right note comes back. AKB's hybrid retrieval
+(dense + BM25, source-level dedup) was benchmarked on
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval)-S — 500 long-context
+questions, ~50 chat sessions per question. **Recall@5 = 98.4%**, with no
+reranker in the loop.
+
+| System | R@5 | n | Reranker | Source |
+|---|---:|:---:|:---:|---|
+| **AKB hybrid** | **98.4%** | 500 | no | this repo |
+| MemPalace hybrid + rerank | 98.4% | 450 | yes | [MemPalace](https://github.com/mempalace/mempalace) |
+| gbrain hybrid | 97.6% | 500 | no | [gbrain-evals](https://github.com/garrytan/gbrain-evals) |
+| gbrain vector | 97.4% | 500 | no | gbrain-evals |
+
+Methodology, per-category breakdown, and a one-command reproducible harness
+live in [`eval/longmemeval/`](eval/longmemeval/). The embedding model differs
+across systems (AKB: `bge-m3@1024`), so read this as a stack-level comparison.
+
 ## Design philosophy
 
 **Core stays small; flexibility comes from extension, not built-in
