@@ -93,9 +93,10 @@ your main dev data is untouched.
 | `vector_store_sparse_shape` | `posting` | production-recommended |
 | `embed_model` / `embed_dimensions` | `baai/bge-m3` / `1024` | multilingual, within pgvector HNSW 2000-dim limit |
 | `embed_base_url` | `https://openrouter.ai/api/v1` | |
-| `rerank_enabled` / `rerank_model` | `true` / `cohere/rerank-v3.5` | production default ON |
+| `rerank_enabled` / `rerank_model` | `false` / `cohere/rerank-v3.5` | rerank-off ablation, model config retained for toggles |
 | `rerank_base_url` | `https://openrouter.ai/api/v1` | explicit — see [run #3](#known-issues) |
 | `rerank_prefetch` | `30` | RRF top-30 → rerank → top-K |
+| `search_prefetch` | `30` | rerank-off first-stage dedup pool, mirrors gbrain-style candidate headroom |
 | `bm25_k1` / `bm25_b` | `1.5` / `0.75` | standard Lucene values |
 
 `config/app.yaml` is committed because it's part of the benchmark
@@ -163,17 +164,15 @@ docker compose up -d
 | `importFromContent(slug, body)` | `POST /api/v1/documents` body=`{vault, collection:"chat", title:session_id, content:rendered}` |
 | Rendered session body | `[Session date: ...]\n\nUSER: ...\n\nASSISTANT: ...` (date prefix matters for `temporal-reasoning`/`knowledge-update`) |
 | `slug = "chat/{session_id}"` | `path = "chat/{slugify(session_id)}.md"` — backend `_slugify` lowercases and appends `.md` |
-| `hybridSearch(q, limit)` | `GET /api/v1/search?q=...&vault=...&limit=K` (rerank ON via config) |
+| `hybridSearch(q, limit)` | `GET /api/v1/search?q=...&vault=...&limit=K` (rerank OFF via config) |
 | `uniqSessionIds(results)` | `[r.path.removeprefix("chat/").removesuffix(".md") for r in results]` (path is stabler than title under backend normalization) |
 | Wait for indexing | `GET /health/vault/{vault}` poll until `vector_store.backfill.upsert.pending == 0` (vault-scoped, not global) |
 
 ### Adapter scope
 
-Only `akb-hybrid+rerank` (production default) is wired up.  Ablations
-(`akb-hybrid` rerank-off, `akb-keyword` BM25-only, `akb-vector`
-vector-only) are deferred — turning rerank off requires editing
-`app.yaml` and restarting the backend, which we'd only pay for once the
-first numbers say it's worth it.
+The current wired adapter is `akb-hybrid`: dense + BM25 with rerank off,
+embedding fixed, and `search_prefetch` widened so source-level dedup sees
+the same kind of candidate headroom that gbrain's no-rerank path uses.
 
 ---
 
@@ -188,7 +187,7 @@ enough.
 python3 eval/longmemeval/run.py \
   --dataset ~/datasets/longmemeval/longmemeval_s.json \
   --ndjson eval/reports/longmemeval-akb.ndjson \
-  --adapter akb-hybrid+rerank \
+  --adapter akb-hybrid \
   --top-k 5 \
   --worker-id 0 --total-workers 1 \
   [--limit N | --stratify N] [--max-wall-seconds N]

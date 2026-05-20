@@ -72,6 +72,10 @@ class Settings(BaseModel):
     # sharper, higher values flatten the contribution curve.
     rerank_fusion_k: int = Field(default=60, ge=1)
     rerank_timeout_seconds: float = 3.0
+    # First-stage unique source pool before final `limit` is applied. 0 keeps
+    # the legacy behavior (prefetch only when rerank is enabled). Raising this
+    # lets rerank-off searches dedup over a wider dense+BM25 candidate set.
+    search_prefetch: int = Field(default=0, ge=0)
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""       # Internal endpoint (server → S3)

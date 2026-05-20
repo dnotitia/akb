@@ -83,6 +83,25 @@ def fuse_original_and_reranked_hits(
     return [hits[idx] for idx in ordered]
 
 
+def resolve_first_stage_unique_limit(
+    *,
+    limit: int,
+    rerank_enabled: bool,
+    rerank_prefetch: int,
+    search_prefetch: int,
+) -> int:
+    """How many deduped sources to keep before final response truncation.
+
+    Rerank already needs a larger candidate pool. Rerank-off search benefits
+    from the same headroom because chunk-level dense/BM25 hits can contain
+    multiple chunks from the same source before source-level dedup.
+    """
+    configured = max(search_prefetch, 0)
+    if rerank_enabled:
+        configured = max(configured, rerank_prefetch)
+    return max(configured, limit)
+
+
 class SearchService:
 
     async def search(
@@ -213,8 +232,11 @@ class SearchService:
                 if not candidate_source_ids:
                     return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[])
 
-        target_unique = (
-            max(settings.rerank_prefetch, limit) if settings.rerank_enabled else limit
+        target_unique = resolve_first_stage_unique_limit(
+            limit=limit,
+            rerank_enabled=settings.rerank_enabled,
+            rerank_prefetch=settings.rerank_prefetch,
+            search_prefetch=settings.search_prefetch,
         )
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store

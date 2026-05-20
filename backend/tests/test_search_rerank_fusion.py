@@ -4,6 +4,7 @@ import pytest
 
 from app.services.search_service import (
     fuse_original_and_reranked_hits,
+    resolve_first_stage_unique_limit,
 )
 
 FUSION_K = 60
@@ -38,3 +39,30 @@ def test_rerank_fusion_ignores_bad_or_duplicate_indexes():
     )
 
     assert [h.name for h in fused] == ["b", "a", "c"]
+
+
+def test_first_stage_unique_limit_uses_rerank_prefetch_when_rerank_is_on():
+    assert resolve_first_stage_unique_limit(
+        limit=5,
+        rerank_enabled=True,
+        rerank_prefetch=30,
+        search_prefetch=0,
+    ) == 30
+
+
+def test_first_stage_unique_limit_can_prefetch_without_rerank():
+    assert resolve_first_stage_unique_limit(
+        limit=5,
+        rerank_enabled=False,
+        rerank_prefetch=30,
+        search_prefetch=30,
+    ) == 30
+
+
+def test_first_stage_unique_limit_keeps_legacy_rerank_off_default():
+    assert resolve_first_stage_unique_limit(
+        limit=5,
+        rerank_enabled=False,
+        rerank_prefetch=30,
+        search_prefetch=0,
+    ) == 5

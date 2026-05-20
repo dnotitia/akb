@@ -22,10 +22,9 @@ db_user: akb
 git_storage_path: /data/vaults
 
 # === Embedding (bge-m3 @ 1024 via OpenRouter) ===
-# Pinned to the cluster's production default (bge-m3 + cohere rerank ON).
-# This is the standing baseline for future ablations: change ONE variable
-# at a time against it. Backend always sends OpenAI-compatible `dimensions`
-# (no-op for bge-m3 native 1024).
+# Pinned for the rerank-OFF ablation series so retrieval changes can be
+# compared without an embedding-model confound. Backend always sends
+# OpenAI-compatible `dimensions` (no-op for bge-m3 native 1024).
 embed_base_url: https://openrouter.ai/api/v1
 embed_model: baai/bge-m3
 embed_dimensions: 1024
@@ -42,18 +41,18 @@ llm_model: ""
 # default fallback path produces a bare "/rerank" without a scheme,
 # which httpx rejects).  rerank_api_key in secret.yaml is "" — service
 # falls back to llm_api_key, which holds the OpenRouter key.
-# Rerank ON = production-default baseline (Run #1, R@5 95.80%). The
-# rerank-OFF ablation series (Run #4-6) is complete: rerank net +0.80pp,
-# cosine re-score 0pp, recursive chunker -5.2pp — all debunked. Future
-# ablations vary one knob against this rerank-ON baseline. See
-# akb://product/doc/akb/benchmark-results/ for the full history.
-rerank_enabled: true
+# Rerank OFF for the gbrain-comparable retrieval ablation. gbrain's
+# published 97.x line uses no reranker; this run keeps bge-m3 fixed and
+# widens first-stage prefetch below so rerank-off does not also shrink
+# the dedup candidate pool.
+rerank_enabled: false
 rerank_provider: cohere
 rerank_model: cohere/rerank-v3.5
 rerank_base_url: https://openrouter.ai/api/v1
 rerank_prefetch: 30
 rerank_fusion_k: 60
 rerank_timeout_seconds: 3.0
+search_prefetch: 30
 
 # === S3 (in-stack MinIO — required for backend to boot cleanly) ===
 s3_endpoint_url: http://minio:9000

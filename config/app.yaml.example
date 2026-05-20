@@ -62,6 +62,10 @@ rerank_base_url: ""
 rerank_prefetch: 30
 rerank_fusion_k: 60
 rerank_timeout_seconds: 3.0
+# Optional first-stage unique source pool before final response truncation.
+# 0 keeps legacy behavior: only rerank-enabled searches use rerank_prefetch.
+# Set >limit to give rerank-off searches more dedup headroom.
+search_prefetch: 0
 
 # === S3-compatible object storage (for vault file uploads) ===
 # Leave endpoints blank to disable file storage features.
