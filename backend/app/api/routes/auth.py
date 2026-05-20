@@ -11,6 +11,7 @@ from app.services.auth_service import (
     create_pat,
     list_pats,
     revoke_pat,
+    revoke_all_sessions,
     update_profile,
 )
 from app.util.text import NFCModel
@@ -107,3 +108,21 @@ async def change_password_route(
     except BadPasswordChange as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     return {"ok": True}
+
+
+@router.post(
+    "/auth/revoke-all-sessions",
+    summary="Invalidate every JWT issued to me before now",
+)
+async def revoke_my_sessions(user: AuthenticatedUser = Depends(get_current_user)):
+    """End every JWT-backed session for the calling user, including this one.
+
+    The next request with the JWT used here will return 401. Other devices
+    that have the same user's JWT (mobile client, second browser, agent
+    runners) will all fail on their next call and must re-login.
+
+    Personal Access Tokens are NOT affected — manage those individually
+    via DELETE /auth/tokens/{token_id}.
+    """
+    revoked_at = await revoke_all_sessions(user.user_id)
+    return {"revoked_before": revoked_at.isoformat()}

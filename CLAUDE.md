@@ -5,7 +5,7 @@
 - **Backend**: Python 3.11, FastAPI + Uvicorn, PostgreSQL 16 + pgvector, GitPython (bare repo)
 - **MCP**: Anthropic MCP SDK (Streamable HTTP) — backend serves as HTTP MCP server
 - **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, zero dependencies, stdio ↔ HTTP bridge
-- **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4
+- **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Plate (`platejs` markdown editor; lazy-loaded in Edit / New-document flows)
 
 ## 2-Layer MCP Architecture
 

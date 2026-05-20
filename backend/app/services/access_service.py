@@ -10,7 +10,8 @@ import logging
 import uuid
 
 from app.db.postgres import get_pool
-from app.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from app.repositories.events_repo import emit_event
 
 logger = logging.getLogger("akb.access")
 
@@ -56,7 +57,11 @@ async def check_vault_access(user_id: str, vault_name: str, required_role: str =
         if not vault:
             raise NotFoundError("Vault", vault_name)
 
-        # Check archived vault FIRST — even admin/owner can't write to archived
+        # Check archived vault FIRST — even admin/owner can't write to archived.
+        # Note: admin-role mutations like grant/revoke also block on archived,
+        # but that check lives inside grant_access/revoke_access themselves so
+        # owner-level operations (delete_vault, transfer_ownership, unarchive)
+        # that route through `required_role="admin"` can still proceed.
         if vault["status"] == "archived" and required_role in ("writer",):
             raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
 
@@ -128,26 +133,59 @@ async def grant_access(
     if role not in VALID_ROLES or role == "owner":
         raise ForbiddenError(f"Invalid role: {role}. Use: reader, writer, admin")
 
-    # Verify granter has permission
+    # Verify granter has permission BEFORE the mutation transaction. The
+    # actual mutation re-acquires a FOR UPDATE row lock on the vault to
+    # close the TOCTOU window where a concurrent revoke removes the
+    # granter's admin role between this check and the INSERT (06-F2).
     await check_vault_access(granter_id, vault_name, required_role="admin")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
-        target = await conn.fetchrow("SELECT id, username FROM users WHERE username = $1", target_username)
-        if not target:
-            raise NotFoundError("User", target_username)
-
-        # Upsert access
-        await conn.execute(
-            """
-            INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (vault_id, user_id)
-            DO UPDATE SET role = $4, granted_by = $5
-            """,
-            uuid.uuid4(), vault["id"], target["id"], role, uuid.UUID(granter_id),
-        )
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+            if vault["status"] == "archived":
+                raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+            # Re-verify granter's role under the row lock (TOCTOU close).
+            granter_uid = uuid.UUID(granter_id)
+            if vault["owner_id"] != granter_uid:
+                is_admin = await conn.fetchval(
+                    "SELECT is_admin FROM users WHERE id = $1", granter_uid,
+                )
+                if not is_admin:
+                    granter_role = await conn.fetchval(
+                        "SELECT role FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+                        vault["id"], granter_uid,
+                    )
+                    if _role_level(granter_role or "") < _role_level("admin"):
+                        raise ForbiddenError(
+                            f"Requires 'admin' role on vault '{vault_name}'"
+                        )
+            target = await conn.fetchrow(
+                "SELECT id, username FROM users WHERE username = $1", target_username,
+            )
+            if not target:
+                raise NotFoundError("User", target_username)
+            await conn.execute(
+                """
+                INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (vault_id, user_id)
+                DO UPDATE SET role = $4, granted_by = $5
+                """,
+                uuid.uuid4(), vault["id"], target["id"], role, granter_uid,
+            )
+            await emit_event(
+                conn, "access.grant",
+                vault_id=vault["id"],
+                resource_uri=f"akb://{vault_name}",
+                actor_id=str(granter_uid),
+                payload={"vault": vault_name, "user": target_username, "role": role},
+            )
 
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "role": role, "granted": True}
@@ -159,19 +197,49 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id, owner_id FROM vaults WHERE name = $1", vault_name)
-        target = await conn.fetchrow("SELECT id FROM users WHERE username = $1", target_username)
-        if not target:
-            raise NotFoundError("User", target_username)
-
-        # Can't revoke owner
-        if vault["owner_id"] == target["id"]:
-            raise ForbiddenError("Cannot revoke owner's access. Use transfer_ownership instead.")
-
-        await conn.execute(
-            "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
-            vault["id"], target["id"],
-        )
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+            if vault["status"] == "archived":
+                raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+            revoker_uid = uuid.UUID(revoker_id)
+            if vault["owner_id"] != revoker_uid:
+                is_admin = await conn.fetchval(
+                    "SELECT is_admin FROM users WHERE id = $1", revoker_uid,
+                )
+                if not is_admin:
+                    revoker_role = await conn.fetchval(
+                        "SELECT role FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+                        vault["id"], revoker_uid,
+                    )
+                    if _role_level(revoker_role or "") < _role_level("admin"):
+                        raise ForbiddenError(
+                            f"Requires 'admin' role on vault '{vault_name}'"
+                        )
+            target = await conn.fetchrow(
+                "SELECT id FROM users WHERE username = $1", target_username,
+            )
+            if not target:
+                raise NotFoundError("User", target_username)
+            if vault["owner_id"] == target["id"]:
+                raise ForbiddenError(
+                    "Cannot revoke owner's access. Use transfer_ownership instead."
+                )
+            await conn.execute(
+                "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+                vault["id"], target["id"],
+            )
+            await emit_event(
+                conn, "access.revoke",
+                vault_id=vault["id"],
+                resource_uri=f"akb://{vault_name}",
+                actor_id=str(revoker_uid),
+                payload={"vault": vault_name, "user": target_username},
+            )
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "revoked": True}
@@ -422,34 +490,66 @@ def _coerce_example(v):
 # ── Transfer ownership ──────────────────────────────────────
 
 async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username: str) -> dict:
-    """Transfer vault ownership. Only current owner can do this."""
+    """Transfer vault ownership. Only current owner can do this.
+
+    All three mutations (owner update, old-owner-to-admin grant, new-owner
+    vault_access cleanup) run in ONE transaction so a crash mid-transfer
+    cannot leave the vault with no owner / two owners / an admin gap
+    (06-F1). The vault row is selected ``FOR UPDATE`` so a concurrent
+    transfer also serializes — only one of N parallel transfers wins.
+    """
     await check_vault_access(owner_id, vault_name, required_role="owner")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id, owner_id FROM vaults WHERE name = $1", vault_name)
-        new_owner = await conn.fetchrow("SELECT id, username FROM users WHERE username = $1", new_owner_username)
-        if not new_owner:
-            raise NotFoundError("User", new_owner_username)
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id, owner_id FROM vaults WHERE name = $1 FOR UPDATE",
+                vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+            current_owner_uid = uuid.UUID(owner_id)
+            # Re-verify ownership under the row lock — a concurrent
+            # transfer might have already moved owner_id away from us.
+            if vault["owner_id"] != current_owner_uid:
+                raise ConflictError(
+                    "owner_id moved during transfer (another transfer won the race)"
+                )
+            new_owner = await conn.fetchrow(
+                "SELECT id, username FROM users WHERE username = $1",
+                new_owner_username,
+            )
+            if not new_owner:
+                raise NotFoundError("User", new_owner_username)
 
-        # Update vault owner
-        await conn.execute("UPDATE vaults SET owner_id = $1 WHERE id = $2", new_owner["id"], vault["id"])
-
-        # Give old owner admin role
-        await conn.execute(
-            """
-            INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
-            VALUES ($1, $2, $3, 'admin', $4)
-            ON CONFLICT (vault_id, user_id) DO UPDATE SET role = 'admin'
-            """,
-            uuid.uuid4(), vault["id"], vault["owner_id"], new_owner["id"],
-        )
-
-        # Remove new owner from vault_access (they're now owner via vaults.owner_id)
-        await conn.execute(
-            "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
-            vault["id"], new_owner["id"],
-        )
+            await conn.execute(
+                "UPDATE vaults SET owner_id = $1 WHERE id = $2",
+                new_owner["id"], vault["id"],
+            )
+            await conn.execute(
+                """
+                INSERT INTO vault_access (id, vault_id, user_id, role, granted_by)
+                VALUES ($1, $2, $3, 'admin', $4)
+                ON CONFLICT (vault_id, user_id) DO UPDATE SET role = 'admin'
+                """,
+                uuid.uuid4(), vault["id"], vault["owner_id"], new_owner["id"],
+            )
+            await conn.execute(
+                "DELETE FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+                vault["id"], new_owner["id"],
+            )
+            await emit_event(
+                conn, "access.transfer_ownership",
+                vault_id=vault["id"],
+                resource_uri=f"akb://{vault_name}",
+                actor_id=str(current_owner_uid),
+                payload={
+                    "vault": vault_name,
+                    "from_user_id": str(vault["owner_id"]),
+                    "to_username": new_owner_username,
+                },
+            )
 
     logger.info("Transferred ownership of %s to %s", vault_name, new_owner_username)
     return {"vault": vault_name, "new_owner": new_owner_username, "transferred": True}

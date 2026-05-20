@@ -14,6 +14,35 @@ export function formatDate(iso: string | null | undefined): string {
   });
 }
 
+/**
+ * Allowlist URL schemes safe for `<a href>`. Rejects `javascript:`,
+ * `data:`, `vbscript:`, and anything else not explicitly enumerated so
+ * markdown like `[click](javascript:alert(1))` can't execute when a user
+ * activates the link in either the editor or the rendered view.
+ */
+export function sanitizeLinkUrl(raw: string | null | undefined): string {
+  if (!raw) return "#";
+  const trimmed = raw.trim();
+  if (!trimmed) return "#";
+  // Protocol-relative URLs (`//evil.com/x`) inherit the current page
+  // scheme and act like a redirect to an arbitrary origin. Treat them
+  // as untrusted and refuse before the absolute-path check below.
+  if (trimmed.startsWith("//")) return "#";
+  if (trimmed.startsWith("/") || trimmed.startsWith("#") || trimmed.startsWith("?")) {
+    return trimmed;
+  }
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.startsWith("http://") ||
+    lower.startsWith("https://") ||
+    lower.startsWith("mailto:") ||
+    lower.startsWith("tel:")
+  ) {
+    return trimmed;
+  }
+  return "#";
+}
+
 export function timeAgo(iso: string | null | undefined): string {
   if (!iso) return "-";
   const diff = Date.now() - new Date(iso).getTime();

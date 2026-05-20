@@ -481,6 +481,15 @@ async def recompute_stats(batch_size: int = 500) -> dict:
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Cross-pod serialization. Two replicas (or a manual operator
+            # invocation racing the periodic refresher) running recompute
+            # in parallel would both zero `bm25_vocab.df` and then race on
+            # the UPDATE — whichever commits last wins, but the corpus
+            # they each scanned may have drifted, so the loser overwrites
+            # newer counts with older ones. A transaction-scoped
+            # PG advisory lock serializes the rebuild; the key is an
+            # arbitrary constant unique to this routine.
+            await conn.execute("SELECT pg_advisory_xact_lock(987654321)")
             # Ensure all encountered terms have vocab ids. Assign in one batch.
             if df_counts:
                 await conn.execute(

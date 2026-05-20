@@ -11,6 +11,30 @@ from app.exceptions import ConflictError
 from app.utils import dumps_jsonb
 
 
+async def acquire_path_lock(conn, vault_id: uuid.UUID, path: str) -> None:
+    """Block until exclusive access to ``(vault_id, path)`` is granted.
+
+    Uses ``pg_advisory_xact_lock`` so the lock is released automatically
+    when the calling transaction commits or rolls back. The caller MUST
+    be inside a transaction — call it as the FIRST step after opening
+    the TX, before any git mutation or row read used to gate writes.
+
+    Lock key: two 32-bit ints derived from ``hashtext(vault_id)`` and
+    ``hashtext(path)`` so two distinct ``(vault, path)`` tuples cannot
+    collide unless ``hashtext`` itself collides (negligible).
+
+    Concurrent puts/updates/edits/deletes for the same ``(vault, path)``
+    serialize on this lock, eliminating the check-then-act race where
+    git HEAD ends up pointing at a different writer's commit than
+    ``documents.current_commit``.
+    """
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2))",
+        str(vault_id),
+        path,
+    )
+
+
 class DocumentRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -90,17 +114,18 @@ class DocumentRepository:
         )
         return dict(row) if row else None
 
-    async def find_by_path(self, vault_id: uuid.UUID, path: str) -> dict | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT d.*, v.name as vault_name
-                FROM documents d
-                JOIN vaults v ON d.vault_id = v.id
-                WHERE d.vault_id = $1 AND d.path = $2
-                """,
-                vault_id, path,
-            )
+    async def find_by_path(self, vault_id: uuid.UUID, path: str, *, conn=None) -> dict | None:
+        sql = """
+            SELECT d.*, v.name as vault_name
+            FROM documents d
+            JOIN vaults v ON d.vault_id = v.id
+            WHERE d.vault_id = $1 AND d.path = $2
+        """
+        if conn is not None:
+            row = await conn.fetchrow(sql, vault_id, path)
+            return dict(row) if row else None
+        async with self.pool.acquire() as c:
+            row = await c.fetchrow(sql, vault_id, path)
             return dict(row) if row else None
 
     async def update(
@@ -311,19 +336,27 @@ class CollectionRepository:
 
     async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
         async def _do(c):
+            # ON CONFLICT handles the SELECT-then-INSERT race where two
+            # concurrent PUTs both find no row and both INSERT. Pre-fix
+            # the loser raised UniqueViolationError → 500.
+            cid = uuid.uuid4()
+            name = path.rstrip("/").split("/")[-1]
             row = await c.fetchrow(
-                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
-                vault_id, path,
+                """
+                INSERT INTO collections (id, vault_id, path, name)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (vault_id, path) DO NOTHING
+                RETURNING id
+                """,
+                cid, vault_id, path, name,
             )
             if row:
                 return row["id"]
-            cid = uuid.uuid4()
-            name = path.rstrip("/").split("/")[-1]
-            await c.execute(
-                "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, $3, $4)",
-                cid, vault_id, path, name,
+            existing = await c.fetchrow(
+                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                vault_id, path,
             )
-            return cid
+            return existing["id"]
         if conn is not None:
             return await _do(conn)
         async with self.pool.acquire() as acq:

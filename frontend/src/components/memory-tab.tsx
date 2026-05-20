@@ -37,14 +37,17 @@ export function MemoryTab() {
     }
   }
 
-  // Per-category counts come from the unfiltered memory list, so the chip
-  // strip stays useful even after filtering. Re-fetched on active="all".
-  const allCounts = useMemo(() => {
-    if (!memories || active !== "all") return null;
-    const c: Record<string, number> = {};
+  // Per-category counts always computed; includes "all" key for total count.
+  const counts = useMemo(() => {
+    if (!memories) return null;
+    const c: Record<string, number> = { all: memories.length };
     for (const m of memories) c[m.category] = (c[m.category] || 0) + 1;
     return c;
-  }, [memories, active]);
+  }, [memories]);
+
+  // Chip counts only shown when active="all" — otherwise filtered subset
+  // would show misleading per-category sizes.
+  const chipCounts = active === "all" ? counts : null;
 
   return (
     <div className="space-y-6">
@@ -59,17 +62,22 @@ export function MemoryTab() {
         <div className="flex flex-wrap items-center gap-1.5">
           {CATEGORIES.map((c) => {
             const isActive = active === c;
-            const count = allCounts?.[c];
+            const count = chipCounts?.[c];
+            // When active="all" and counts are loaded, a missing key means 0
+            const disabled = active === "all" && chipCounts !== null && (count ?? 0) === 0 && c !== "all";
             return (
               <button
                 key={c}
                 type="button"
-                onClick={() => setActive(c)}
+                onClick={() => !disabled && setActive(c)}
                 aria-pressed={isActive}
-                className={`inline-flex items-baseline gap-1.5 px-2.5 h-9 text-xs font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-                  isActive
-                    ? "bg-foreground text-background border border-foreground"
-                    : "border border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+                aria-disabled={disabled || undefined}
+                className={`inline-flex items-baseline gap-1.5 px-2.5 h-9 text-xs font-mono uppercase tracking-wider transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                  disabled
+                    ? "border border-border text-foreground-muted opacity-50 cursor-not-allowed pointer-events-none"
+                    : isActive
+                      ? "bg-foreground text-background border border-foreground cursor-pointer"
+                      : "border border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer"
                 }`}
               >
                 {c}
@@ -114,9 +122,14 @@ export function MemoryTab() {
           {memories.map((m) => (
             <li
               key={m.memory_id}
-              className="grid grid-cols-[88px_minmax(0,1fr)_auto_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3"
+              className="grid grid-cols-[minmax(110px,auto)_minmax(0,1fr)_auto_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3"
             >
-              <span className="coord-ink truncate">{m.category.toUpperCase()}</span>
+              <span className="coord-ink whitespace-nowrap">
+                {m.category.toUpperCase()}
+                <span className="ml-1 text-foreground-muted">
+                  · {(m.source ?? "manual") === "session_auto" ? "AUTO" : "MANUAL"}
+                </span>
+              </span>
               <p className="text-sm text-foreground leading-relaxed whitespace-pre-line break-words min-w-0">
                 {m.content}
               </p>

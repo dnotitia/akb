@@ -14,10 +14,12 @@ function wrap(ui: React.ReactNode) {
 }
 
 describe("SkillSettingsLink", () => {
-  it("defined: shows Configure button linking to skill page", () => {
+  it("defined: shows Configure button linking to the guide doc", () => {
     render(wrap(<SkillSettingsLink vault="my-v" defined updatedAt="2026-05-18T10:00:00Z" />));
     expect(screen.getByText(/defined/i)).toBeTruthy();
-    expect(screen.getByRole("link", { name: /configure/i }).getAttribute("href")).toContain("/vault/my-v/skill");
+    expect(screen.getByRole("link", { name: /configure/i }).getAttribute("href")).toBe(
+      "/vault/my-v/doc/overview%2Fvault-skill.md",
+    );
   });
 
   it("undefined: shows Create from template button", () => {

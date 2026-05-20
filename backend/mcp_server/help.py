@@ -1594,7 +1594,8 @@ If a vault has no vault-skill yet, the owner can create one with:
     akb_put(
       vault="<vault>",
       collection="overview",
-      title="Vault Skill",
+      title="<vault> Guide",
+      slug="vault-skill",          # pins path to overview/vault-skill.md
       type="skill",
       content="<see template in this topic body>",
     )
@@ -1616,15 +1617,21 @@ The vault owner can create one with:
     akb_put(
       vault="{vault}",
       collection="overview",
-      title="Vault Skill",
+      title="{vault} Guide",
+      slug="vault-skill",          # pins path to overview/vault-skill.md
       type="skill",
       content="<see akb_help(topic='vault-skill') for the template>",
     )
 
-Until then, follow general AKB conventions:
-- akb_browse before writing to learn the existing collection layout
-- akb_search / akb_grep before writing to avoid duplicates
+First steps when writing into an unfamiliar vault:
+1. akb_browse(vault="{vault}") — see top-level collections, tables, files
+2. akb_browse(vault="{vault}", collection="<collection>") — look inside a target collection
+3. akb_search(query="<keyword>", vault="{vault}") — find similar prior writes
+4. Compose your doc with a title + collection + type that match the patterns above
+
+When writing:
 - Never inline secrets; use ${{secrets.X}} placeholders
+- Reference resources by the akb:// URIs returned by tool calls — do not reassemble paths yourself
 """
 
 

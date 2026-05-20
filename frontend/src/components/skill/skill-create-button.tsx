@@ -25,14 +25,20 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
       await putDocument({
         vault,
         collection: "overview",
-        title: "Guide",
+        title: `${vault} Guide`,
+        // Pin the path to overview/vault-skill.md so it doesn't drift to
+        // overview/<vault>-guide.md when the friendly title is slugified.
+        slug: "vault-skill",
         type: "skill",
         content,
         tags: ["akb:skill"],
       });
       queryClient.invalidateQueries({ queryKey: ["document", vault, "overview/vault-skill.md"] });
       queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", vault] });
-      navigate(`/vault/${vault}/skill`, { replace: true });
+      navigate(
+        `/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`,
+        { replace: true },
+      );
     } catch (e: any) {
       const raw = e?.message || "";
       setError(raw ? `Failed to create vault guide: ${raw}` : "Failed to create vault guide");

@@ -41,6 +41,12 @@ class DocumentPutRequest(NFCModel):
     depends_on: list[str] = Field(default_factory=list)
     related_to: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Optional explicit slug for the file path under the collection.
+    # When omitted, the slug is derived from `title`. The seed flow and
+    # frontend "Create from template" both pass an explicit slug so the
+    # path stays stable (overview/vault-skill.md) even when the title
+    # is friendly text like "{vault} Guide".
+    slug: str | None = None
 
 
 class DocumentUpdateRequest(NFCModel):
@@ -57,6 +63,21 @@ class DocumentUpdateRequest(NFCModel):
     related_to: list[str] | None = None
     metadata: dict[str, Any] | None = None
     message: str | None = None  # commit message
+    # Optimistic concurrency: when provided, the update is rejected with
+    # 409 unless the document's current_commit matches. Use to detect a
+    # concurrent writer between read and write.
+    expected_commit: str | None = None
+
+
+class DocumentEditRequest(NFCModel):
+    """Request body for akb_edit. Mirrors the MCP tool schema."""
+
+    old_string: str
+    new_string: str
+    replace_all: bool = False
+    message: str | None = None
+    # Optimistic concurrency — same semantics as DocumentUpdateRequest.expected_commit.
+    base_commit: str | None = None
 
 
 class DocumentResponse(BaseModel):
@@ -79,6 +100,11 @@ class DocumentResponse(BaseModel):
     content: str | None = None  # included only for akb_get, not for browse/search
     is_public: bool = False
     public_slug: str | None = None
+    # True when fields other than `content` reflect the live DB row even
+    # though `content` was read at a historical commit. Set by
+    # `get_at_commit` so the caller (UI banner, agent prompt) can warn
+    # that title/type/tags/etc. may not match the body.
+    metadata_is_current: bool = False
 
 
 class DocumentPutResponse(BaseModel):

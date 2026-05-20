@@ -24,6 +24,9 @@ export default function PublicationPage() {
 
   async function load() {
     if (!slug) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setData(null);
+    setNeedsPassword(false);
     setError(null);
     try {
       const urlParams = new URLSearchParams(window.location.search);

@@ -17,6 +17,7 @@ import uuid
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.exceptions import ValidationError
 from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
@@ -513,6 +514,12 @@ class SearchService:
                     "results": [],
                 }
 
+        # ACL guard: when no vault is given we MUST have a user_id so the
+        # SQL can scope to the vaults that user can access. A None user_id
+        # in that branch would silently produce a cross-vault scan.
+        if vault is None and user_id is None:
+            raise ValidationError("vault or user_id required")
+
         pool = await get_pool()
         async with pool.acquire() as conn:
             conditions = []
@@ -544,7 +551,9 @@ class SearchService:
                     f"OR v.owner_id = ${idx} "
                     f"OR v.public_access IN ('reader', 'writer'))"
                 )
-                params.append(user_id)
+                # Cast to UUID so asyncpg binds the parameter as uuid
+                # (vault_access.user_id / vaults.owner_id are uuid columns).
+                params.append(uuid.UUID(user_id) if isinstance(user_id, str) else user_id)
                 idx += 1
 
             if collection:

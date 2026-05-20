@@ -46,12 +46,26 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 # ── JWT ──────────────────────────────────────────────────────
 
-def create_jwt(user_id: str, username: str) -> str:
+def create_jwt(
+    user_id: str,
+    username: str,
+    *,
+    not_before: datetime | None = None,
+) -> str:
+    """Encode a JWT for ``user_id``.
+
+    ``not_before`` lets a caller pin the ``iat`` claim past a known
+    revocation cutoff so a token issued in the same second as a
+    revoke is born already valid (otherwise the iat-second comparison
+    in :func:`resolve_token` would reject it for up to 1s).
+    """
+    now = datetime.now(timezone.utc)
+    iat = now if not_before is None or not_before <= now else not_before
     payload = {
         "sub": user_id,
         "username": username,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=settings.jwt_expire_hours),
-        "iat": datetime.now(timezone.utc),
+        "exp": iat + timedelta(hours=settings.jwt_expire_hours),
+        "iat": iat,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
@@ -106,13 +120,24 @@ async def login(username: str, password: str) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, username, email, password_hash, display_name, is_admin FROM users WHERE username = $1 OR email = $1",
+            """
+            SELECT id, username, email, password_hash, display_name, is_admin,
+                   tokens_revoked_before
+              FROM users WHERE username = $1 OR email = $1
+            """,
             username,
         )
         if not row or not verify_password(password, row["password_hash"]):
             raise AuthenticationError("Invalid credentials")
 
-        token = create_jwt(str(row["id"]), row["username"])
+        # Push iat past the revocation cutoff so a login in the same
+        # whole second as a revoke (admin reset, change_password) still
+        # yields a usable token. resolve_token compares against
+        # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
+        not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+        token = create_jwt(
+            str(row["id"]), row["username"], not_before=not_before,
+        )
         return {
             "token": token,
             "user": {
@@ -158,6 +183,14 @@ async def change_password(user_id: str, current: str, new: str) -> None:
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
                 hash_password(new),
                 uuid.UUID(user_id),
+            )
+            # Otherwise a thief holding an old JWT would keep access
+            # for up to jwt_expire_hours after the password change.
+            await _revoke_sessions_in_conn(
+                conn,
+                uuid.UUID(user_id),
+                actor_id=user_id,
+                reason=REVOKE_REASON_PASSWORD_CHANGE,
             )
             # Users are not URI-addressable resources (the URI scheme
             # covers in-vault resources only). Subscribers identify the
@@ -291,6 +324,81 @@ async def revoke_pat(user_id: str, token_id: str) -> bool:
         return "DELETE 1" in result
 
 
+# ── JWT revocation ──────────────────────────────────────────
+
+# Canonical reasons recorded on the auth.sessions_revoked event. Keep
+# stable — SIEM/audit subscribers filter on these.
+REVOKE_REASON_SELF = "self"
+REVOKE_REASON_ADMIN = "admin"
+REVOKE_REASON_PASSWORD_CHANGE = "password_change"
+REVOKE_REASON_PASSWORD_RESET = "password_reset"
+
+
+async def _revoke_sessions_in_conn(
+    conn,
+    user_id: uuid.UUID,
+    *,
+    actor_id: str,
+    reason: str,
+) -> datetime:
+    """Bump tokens_revoked_before and emit auth.sessions_revoked.
+
+    Caller MUST be inside ``async with conn.transaction()`` so the cutoff
+    and the audit event commit atomically with whatever wrapping write
+    triggered the revoke (password change, reset, explicit revoke).
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE users
+           SET tokens_revoked_before = NOW(),
+               updated_at = NOW()
+         WHERE id = $1
+     RETURNING tokens_revoked_before
+        """,
+        user_id,
+    )
+    if row is None:
+        raise NotFoundError("User", str(user_id))
+    await emit_event(
+        conn,
+        "auth.sessions_revoked",
+        resource_uri=None,
+        actor_id=actor_id,
+        payload={
+            "user_id": str(user_id),
+            "reason": reason,
+        },
+    )
+    return row["tokens_revoked_before"]
+
+
+async def revoke_all_sessions(
+    user_id: str,
+    *,
+    actor_id: str | None = None,
+    reason: str = REVOKE_REASON_SELF,
+) -> datetime:
+    """Invalidate every JWT issued to ``user_id`` before the call.
+
+    Returns the cutoff timestamp. Any JWT with ``iat`` strictly less than
+    this is rejected by :func:`resolve_token`. The caller's own JWT is
+    invalidated too — the response is the last action that token can take.
+
+    PATs are intentionally NOT touched. Mixing them would surprise
+    pipelines that store a PAT and never expect "I changed my password"
+    to break the integration.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await _revoke_sessions_in_conn(
+                conn,
+                uuid.UUID(user_id),
+                actor_id=actor_id or user_id,
+                reason=reason,
+            )
+
+
 # ── Token resolution (JWT or PAT) ───────────────────────────
 
 async def resolve_token(authorization: str) -> AuthenticatedUser | None:
@@ -313,14 +421,40 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     payload = decode_jwt(token)
     if not payload:
         return None
+    iat = payload.get("iat")
+    if iat is None:
+        # Required for the revocation cutoff comparison below.
+        return None
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, username, email, display_name, is_admin FROM users WHERE id = $1",
+            """
+            SELECT id, username, email, display_name, is_admin,
+                   CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
+                       AS revoked_epoch_ceil
+              FROM users WHERE id = $1
+            """,
             uuid.UUID(payload["sub"]),
         )
         if not row:
+            return None
+
+        # Server-side JWT revocation. The user can void every token
+        # they have by setting tokens_revoked_before = NOW(); any JWT
+        # whose iat predates that cutoff fails here even though the
+        # signature is valid and exp has not passed. This is the only
+        # mechanism to invalidate a leaked or stale JWT short of
+        # rotating the global jwt_secret (which would log every user
+        # out, not just one).
+        #
+        # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
+        # sub-second TIMESTAMPTZ. To make same-second writes safe we
+        # compare against CEIL(epoch) — a revoke at 100.5s yields
+        # revoked_epoch_ceil=101, so any iat≤100 fails (rejected) and
+        # iat≥101 passes (post-sleep re-login). Without CEIL, a JWT
+        # issued in the same second as revoke would survive.
+        if int(iat) < int(row["revoked_epoch_ceil"]):
             return None
 
         return AuthenticatedUser(
@@ -338,28 +472,27 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
+        # Atomic fetch+update: a concurrent revoke (DELETE) between
+        # SELECT and UPDATE would have allowed the in-flight request
+        # to authenticate successfully against a row that no longer
+        # exists. Collapse to one UPDATE...RETURNING so the row is
+        # either still valid (RETURNING produces a row) or already
+        # gone/expired (0 rows → auth fails).
         row = await conn.fetchrow(
             """
-            SELECT t.id as token_id, t.user_id, t.scopes, t.expires_at,
-                   u.username, u.email, u.display_name, u.is_admin
-            FROM tokens t
-            JOIN users u ON t.user_id = u.id
-            WHERE t.token_hash = $1
+            UPDATE tokens t
+               SET last_used_at = NOW()
+              FROM users u
+             WHERE t.user_id = u.id
+               AND t.token_hash = $1
+               AND (t.expires_at IS NULL OR t.expires_at > NOW())
+            RETURNING t.id AS token_id, t.user_id, t.scopes, t.expires_at,
+                      u.username, u.email, u.display_name, u.is_admin
             """,
             token_hash,
         )
         if not row:
             return None
-
-        # Check expiry
-        if row["expires_at"] and row["expires_at"] < datetime.now(timezone.utc):
-            return None
-
-        # Update last_used_at
-        await conn.execute(
-            "UPDATE tokens SET last_used_at = $1 WHERE id = $2",
-            datetime.now(timezone.utc), row["token_id"],
-        )
 
         return AuthenticatedUser(
             user_id=str(row["user_id"]),

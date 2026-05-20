@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
@@ -11,6 +11,7 @@ import VaultPage from "@/pages/vault";
 import VaultIndexPage from "@/pages/vault-index";
 import VaultNewPage from "@/pages/vault-new";
 import DocumentPage from "@/pages/document";
+import DocumentNewPage from "@/pages/document-new";
 import TablePage from "@/pages/table";
 import FilePage from "@/pages/file";
 import GraphPage from "@/pages/graph";
@@ -21,8 +22,20 @@ import PublicationPage from "@/pages/public-publication";
 import VaultMembersPage from "@/pages/vault-members";
 import VaultSettingsPage from "@/pages/vault-settings";
 import VaultActivityPage from "@/pages/vault-activity";
-import VaultSkillPage from "@/pages/vault-skill";
 import "./index.css";
+
+// Old /vault/:name/skill URLs now redirect to the underlying guide doc;
+// removed the dedicated page because it duplicated DocumentPage.
+function SkillRedirect() {
+  const { name } = useParams<{ name: string }>();
+  if (!name) return <Navigate to="/" replace />;
+  return (
+    <Navigate
+      to={`/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`}
+      replace
+    />
+  );
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -44,6 +57,7 @@ createRoot(document.getElementById("root")!).render(
           <Route element={<VaultShell />}>
             <Route path="/vault" element={<VaultIndexPage />} />
             <Route path="/vault/:name" element={<VaultPage />} />
+            <Route path="/vault/:name/doc/new" element={<DocumentNewPage />} />
             <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
             <Route path="/vault/:name/table/:table" element={<TablePage />} />
             <Route path="/vault/:name/file/:id" element={<FilePage />} />
@@ -53,7 +67,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/vault/:name/settings" element={<VaultSettingsPage />} />
             <Route path="/vault/:name/activity" element={<VaultActivityPage />} />
             <Route path="/vault/:name/search" element={<SearchPage />} />
-            <Route path="/vault/:name/skill" element={<VaultSkillPage />} />
+            <Route path="/vault/:name/skill" element={<SkillRedirect />} />
           </Route>
           <Route path="/search" element={<SearchPage />} />
           <Route path="/settings" element={<SettingsPage />} />

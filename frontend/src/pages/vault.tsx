@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Settings as SettingsIcon, Users } from "lucide-react";
+import { ChevronDown, ChevronRight, FilePlus, Settings as SettingsIcon, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { browseVault, getDocument, getRecent, getVaultInfo } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -80,6 +80,13 @@ export default function VaultPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setCounts(null);
+    setRecent([]);
+    setActivity([]);
+    setCommitsLoaded(false);
+    setCommitsOpen(false);
     getVaultInfo(name).then(setInfo).catch(() => {});
     getRecent(name, 12).then((d) => setRecent(d.changes || [])).catch(() => {});
     browseVault(name, undefined, 2)
@@ -148,6 +155,17 @@ export default function VaultPage() {
           <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
         )}
         <div className="ml-auto flex items-baseline gap-4">
+          {(info?.role === "writer" ||
+            info?.role === "admin" ||
+            info?.role === "owner") && (
+            <Link
+              to={`/vault/${name}/doc/new`}
+              className="inline-flex items-baseline gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              <FilePlus className="h-3 w-3 self-center" aria-hidden />
+              NEW DOC
+            </Link>
+          )}
           <Link
             to={`/vault/${name}/members`}
             className="inline-flex items-baseline gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
@@ -214,7 +232,10 @@ export default function VaultPage() {
             {recent.map((c, i) => (
               <li key={c.doc_id + c.changed_at}>
                 <Link
-                  to={`/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}`}
+                  to={
+                    `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
+                    (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
+                  }
                   className="group grid grid-cols-[32px_1fr_auto] items-baseline gap-4 px-3 py-2 hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <span className="coord tabular-nums">
@@ -285,7 +306,8 @@ export default function VaultPage() {
                   const change = c.files?.[0]?.change;
                   const primaryDocPath = c.files?.[0]?.path;
                   const link = primaryDocPath
-                    ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}`
+                    ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}` +
+                      (c.hash ? `?commit=${encodeURIComponent(c.hash)}` : "")
                     : `/vault/${name}`;
                   return (
                     <li key={i}>

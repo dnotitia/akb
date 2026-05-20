@@ -57,6 +57,9 @@ export default function PublicationsPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setItems(null);
+    setError("");
     load(name);
   }, [name]);
 

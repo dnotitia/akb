@@ -1,5 +1,6 @@
 import { useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/utils";
 
 export interface HistoryEntry {
@@ -10,10 +11,23 @@ export interface HistoryEntry {
   timestamp?: string;
 }
 
+interface HistoryListProps {
+  entries: HistoryEntry[];
+  /**
+   * Called with the commit hash when a row is clicked. When omitted,
+   * rows stay read-only (legacy behavior).
+   */
+  onSelect?: (hash: string) => void;
+  /**
+   * Commit hash currently being viewed — that row gets the active style.
+   */
+  selectedHash?: string;
+}
+
 const ROW_HEIGHT = 22;
 const VIRTUALIZE_THRESHOLD = 60;
 
-export function HistoryList({ entries }: { entries: HistoryEntry[] }) {
+export function HistoryList({ entries, onSelect, selectedHash }: HistoryListProps) {
   if (entries.length === 0) {
     return <div className="coord">No history yet.</div>;
   }
@@ -21,15 +35,34 @@ export function HistoryList({ entries }: { entries: HistoryEntry[] }) {
     return (
       <ol className="font-mono text-[11px] leading-[1.9] space-y-0.5">
         {entries.map((p, i) => (
-          <Row key={p.hash || i} entry={p} />
+          <Row
+            key={p.hash || i}
+            entry={p}
+            onSelect={onSelect}
+            active={!!selectedHash && p.hash === selectedHash}
+          />
         ))}
       </ol>
     );
   }
-  return <VirtualHistoryList entries={entries} />;
+  return (
+    <VirtualHistoryList
+      entries={entries}
+      onSelect={onSelect}
+      selectedHash={selectedHash}
+    />
+  );
 }
 
-function VirtualHistoryList({ entries }: { entries: HistoryEntry[] }) {
+function VirtualHistoryList({
+  entries,
+  onSelect,
+  selectedHash,
+}: {
+  entries: HistoryEntry[];
+  onSelect?: (hash: string) => void;
+  selectedHash?: string;
+}) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
     count: entries.length,
@@ -53,6 +86,7 @@ function VirtualHistoryList({ entries }: { entries: HistoryEntry[] }) {
       >
         {rowVirtualizer.getVirtualItems().map((vRow) => {
           const p = entries[vRow.index];
+          const isActive = !!selectedHash && p.hash === selectedHash;
           return (
             <li
               key={p.hash || vRow.index}
@@ -65,9 +99,8 @@ function VirtualHistoryList({ entries }: { entries: HistoryEntry[] }) {
                 width: "100%",
                 transform: `translateY(${vRow.start}px)`,
               }}
-              className="grid grid-cols-[54px_1fr_auto] gap-2"
             >
-              <RowContent entry={p} />
+              <RowInner entry={p} onSelect={onSelect} active={isActive} />
             </li>
           );
         })}
@@ -76,30 +109,96 @@ function VirtualHistoryList({ entries }: { entries: HistoryEntry[] }) {
   );
 }
 
-function Row({ entry }: { entry: HistoryEntry }) {
+function Row({
+  entry,
+  onSelect,
+  active,
+}: {
+  entry: HistoryEntry;
+  onSelect?: (hash: string) => void;
+  active?: boolean;
+}) {
   return (
-    <li className="grid grid-cols-[54px_1fr_auto] gap-2">
-      <RowContent entry={entry} />
+    <li>
+      <RowInner entry={entry} onSelect={onSelect} active={active} />
     </li>
   );
 }
 
-function RowContent({ entry }: { entry: HistoryEntry }) {
+function RowInner({
+  entry,
+  onSelect,
+  active,
+}: {
+  entry: HistoryEntry;
+  onSelect?: (hash: string) => void;
+  active?: boolean;
+}) {
+  const baseLayout = "grid grid-cols-[54px_1fr_auto] gap-2 w-full px-1";
+  // No commit hash → never clickable (e.g. unparseable git log entry).
+  if (!entry.hash || !onSelect) {
+    return (
+      <div
+        className={cn(
+          baseLayout,
+          active && "bg-accent/10 text-accent",
+        )}
+      >
+        <RowContent entry={entry} active={active} />
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(entry.hash!)}
+      aria-pressed={active}
+      aria-label={`View document at commit ${entry.hash.slice(0, 7)}`}
+      title={`Open this version (${entry.hash.slice(0, 7)})`}
+      className={cn(
+        baseLayout,
+        "text-left cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+        active
+          ? "bg-accent/10 text-accent"
+          : "hover:bg-surface-muted",
+      )}
+    >
+      <RowContent entry={entry} active={active} />
+    </button>
+  );
+}
+
+function RowContent({
+  entry,
+  active,
+}: {
+  entry: HistoryEntry;
+  active?: boolean;
+}) {
   return (
     <>
-      <span className="text-accent">{(entry.hash || "").slice(0, 7)}</span>
-      <span className="truncate text-foreground-muted">
-        <span className="text-foreground-muted">
+      <span className={active ? "text-accent" : "text-accent"}>
+        {(entry.hash || "").slice(0, 7)}
+      </span>
+      <span className={cn("truncate", active ? "text-accent" : "text-foreground-muted")}>
+        <span className={active ? "text-accent" : "text-foreground-muted"}>
           {entry.agent || entry.author || "unknown"}
         </span>
         {entry.subject && (
           <>
             {" "}
-            <span className="text-foreground">· {entry.subject}</span>
+            <span className={active ? "text-accent" : "text-foreground"}>
+              · {entry.subject}
+            </span>
           </>
         )}
       </span>
-      <span className="text-foreground-muted tabular-nums text-right shrink-0">
+      <span
+        className={cn(
+          "tabular-nums text-right shrink-0",
+          active ? "text-accent" : "text-foreground-muted",
+        )}
+      >
         {timeAgo(entry.timestamp)}
       </span>
     </>

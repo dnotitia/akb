@@ -218,6 +218,16 @@ class CollectionService:
         docs_count = 0
         files_count = 0
         sub_count = 0
+        # Snapshot for the post-commit git cleanup. Captured inside
+        # the TX (so the doc paths reflect exactly the rows we
+        # deleted) and consumed after commit so the git call never
+        # runs while we hold FOR UPDATE row locks. A crash between
+        # commit and the git call leaves the worktree carrying files
+        # for already-deleted DB rows — an operator can reconcile via
+        # `git rm` and the chunks/embeddings are already gone, so
+        # search is correct either way.
+        doc_paths_for_git: list[str] = []
+        commit_msg_for_git: str = ""
 
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -265,34 +275,14 @@ class CollectionService:
                         len(docs), len(files), len(sub_rows),
                     )
 
-                # ── Git first (cascade only; empty-mode has no docs)
-                doc_paths = [d["path"] for d in docs]
-                if doc_paths:
-                    commit_msg = (
-                        f"[delete-collection] {norm}\n\n"
-                        f"{len(docs)} docs, {len(files)} files\n"
-                        f"agent: {agent_id or 'unknown'}\n"
-                        f"action: delete-collection"
-                    )
-                    try:
-                        await asyncio.to_thread(
-                            self.git.delete_paths_bulk,
-                            vault_name=vault,
-                            file_paths=doc_paths,
-                            message=commit_msg,
-                        )
-                    except FileNotFoundError:
-                        # No bare repo (test fixtures, fresh vault) —
-                        # same idempotency stance as
-                        # `document_service.delete`: fall through to
-                        # DB-only cleanup.
-                        logger.warning(
-                            "Vault %s has no git repo — proceeding with "
-                            "DB-only cleanup",
-                            vault,
-                        )
-
                 # ── PG cleanup (same TX, locks still held) ──────
+                # Git happens AFTER the TX commits — see the
+                # comment above. Doing it here would mean we hold
+                # FOR UPDATE row locks across `delete_paths_bulk`,
+                # which acquires the per-vault threading lock and
+                # blocks on multi-second worktree I/O. Under load
+                # that pins connection-pool slots and starves
+                # concurrent writers across the entire vault.
                 for d in docs:
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
@@ -351,6 +341,46 @@ class CollectionService:
                 docs_count = len(docs)
                 files_count = len(files)
                 sub_count = len(sub_rows)
+
+                # Snapshot for post-commit git work.
+                doc_paths_for_git = [d["path"] for d in docs]
+                if doc_paths_for_git:
+                    commit_msg_for_git = (
+                        f"[delete-collection] {norm}\n\n"
+                        f"{len(docs)} docs, {len(files)} files\n"
+                        f"agent: {agent_id or 'unknown'}\n"
+                        f"action: delete-collection"
+                    )
+
+        # ── Git cleanup AFTER the TX commits ────────────────────
+        # PG is the source of truth and is now consistent. Any
+        # failure here leaves orphan files in the worktree; the
+        # chunks/embeddings are already gone so search results stay
+        # correct. Logged loudly so an operator can reconcile.
+        if doc_paths_for_git:
+            try:
+                await asyncio.to_thread(
+                    self.git.delete_paths_bulk,
+                    vault_name=vault,
+                    file_paths=doc_paths_for_git,
+                    message=commit_msg_for_git,
+                )
+            except FileNotFoundError:
+                # No bare repo (test fixtures, fresh vault) — DB is
+                # already consistent, nothing to clean up.
+                logger.warning(
+                    "Vault %s has no git repo — DB-only cleanup completed",
+                    vault,
+                )
+            except Exception as e:  # noqa: BLE001
+                # PG already committed the deletes; surface the git
+                # failure for operator reconciliation but don't roll
+                # back (we can't).
+                logger.error(
+                    "post-commit git cleanup failed for vault=%s path=%s "
+                    "(%d docs orphaned in worktree, DB is consistent): %s",
+                    vault, norm, len(doc_paths_for_git), e,
+                )
 
         logger.info(
             "Collection delete: vault=%s path=%s docs=%d files=%d sub=%d",

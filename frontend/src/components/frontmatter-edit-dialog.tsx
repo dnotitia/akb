@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { Loader2, X } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { updateDocument } from "@/lib/api";
+import { DOC_STATUSES, DOC_TYPES, type DocStatus, type DocType } from "@/lib/doc-constants";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TagInput } from "@/components/ui/tag-input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -13,23 +15,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-
-const DOC_TYPES = [
-  "note",
-  "report",
-  "decision",
-  "spec",
-  "plan",
-  "session",
-  "task",
-  "reference",
-  "skill",
-] as const;
-
-const DOC_STATUSES = ["draft", "active", "archived", "superseded"] as const;
-
-type DocType = (typeof DOC_TYPES)[number];
-type DocStatus = (typeof DOC_STATUSES)[number];
 
 interface DocLike {
   id?: string;
@@ -74,7 +59,6 @@ export function FrontmatterEditDialog({
   const [status, setStatus] = useState<DocStatus>("draft");
   const [domain, setDomain] = useState("");
   const [summary, setSummary] = useState("");
-  const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [content, setContent] = useState("");
   const [initialContent, setInitialContent] = useState("");
@@ -94,22 +78,10 @@ export function FrontmatterEditDialog({
     setDomain(doc.domain || "");
     setSummary(doc.summary || "");
     setTags(doc.tags || []);
-    setTagInput("");
     setContent(doc.content || "");
     setInitialContent(doc.content || "");
     setError("");
   }, [open, doc]);
-
-  function commitTagInput() {
-    const v = tagInput.trim().replace(/^#/, "");
-    if (!v) return;
-    if (!tags.includes(v)) setTags([...tags, v]);
-    setTagInput("");
-  }
-
-  function removeTag(t: string) {
-    setTags(tags.filter((x) => x !== t));
-  }
 
   async function handleSave() {
     if (!title.trim()) {
@@ -154,7 +126,9 @@ export function FrontmatterEditDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className={editBody ? "max-w-3xl" : "max-w-2xl"}>
+      <DialogContent
+        className={`${editBody ? "max-w-3xl" : "max-w-2xl"} max-h-[90vh] flex flex-col`}
+      >
         <DialogHeader>
           <DialogTitle>Edit details</DialogTitle>
           <DialogDescription>
@@ -164,7 +138,7 @@ export function FrontmatterEditDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="space-y-4 flex-1 overflow-y-auto pr-1 -mr-1">
           <div>
             <Label htmlFor="fm-title" className="coord-ink mb-1.5 block">
               TITLE
@@ -244,41 +218,7 @@ export function FrontmatterEditDialog({
             <Label htmlFor="fm-tag-input" className="coord-ink mb-1.5 block">
               TAGS
             </Label>
-            {tags.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mb-2">
-                {tags.map((t) => (
-                  <span
-                    key={t}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 border border-border bg-surface-muted text-xs font-mono"
-                  >
-                    #{t}
-                    <button
-                      type="button"
-                      onClick={() => removeTag(t)}
-                      aria-label={`Remove tag ${t}`}
-                      className="text-foreground-muted hover:text-destructive cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    >
-                      <X className="h-3 w-3" aria-hidden />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-            <Input
-              id="fm-tag-input"
-              value={tagInput}
-              onChange={(e) => setTagInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === ",") {
-                  e.preventDefault();
-                  commitTagInput();
-                } else if (e.key === "Backspace" && !tagInput && tags.length > 0) {
-                  setTags(tags.slice(0, -1));
-                }
-              }}
-              onBlur={commitTagInput}
-              placeholder="Add tag and press Enter or comma"
-            />
+            <TagInput id="fm-tag-input" value={tags} onChange={setTags} />
           </div>
 
           {editBody && (

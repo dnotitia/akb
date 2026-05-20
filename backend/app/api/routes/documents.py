@@ -1,5 +1,7 @@
 """REST API routes for document CRUD."""
 
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
@@ -79,9 +81,27 @@ async def put_document(req: DocumentPutRequest, user: AuthenticatedUser = Depend
     return await doc_service.put(req, agent_id=user.username)
 
 
+_HEX_COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+
+
 @router.get("/documents/{vault}/{doc_id:path}", response_model=DocumentResponse, summary="Get a document")
-async def get_document(vault: str, doc_id: str, user: AuthenticatedUser = Depends(get_current_user)):
+async def get_document(
+    vault: str,
+    doc_id: str,
+    version: str | None = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     await check_vault_access(user.user_id, vault, required_role="reader")
+    if version:
+        # Reject symbolic refs (HEAD~N, refs/...), special-name commits,
+        # and any non-hex input. Without this guard, a user could read
+        # arbitrary refs (refs/stash, FETCH_HEAD, ...) via GitPython.
+        if not _HEX_COMMIT_RE.fullmatch(version):
+            raise HTTPException(
+                status_code=400,
+                detail="version must be a 7-64 char lowercase hex commit hash",
+            )
+        return await doc_service.get_at_commit(vault, doc_id, version)
     return await doc_service.get(vault, doc_id)
 
 

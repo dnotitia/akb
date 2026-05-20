@@ -44,7 +44,7 @@ def test_render_with_vault_missing():
     assert "# Vault skill for empty-vault" in out
     assert "No `overview/vault-skill.md` found" in out
     assert "akb_put(" in out
-    assert "akb_browse before writing" in out  # fallback bullet
+    assert "akb_browse" in out  # fallback onboarding steps
     assert "${{secrets.X}}" in out  # secrets fallback
 
 

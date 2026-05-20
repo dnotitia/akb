@@ -74,12 +74,22 @@ class BackfillRunner:
         if self._stop_event:
             self._stop_event.set()
         if self._tasks:
+            # Per-iteration work (embedding API call + vector-store upsert)
+            # can legitimately take up to ~60s end-to-end. A short stop
+            # timeout cancelled tasks mid-upsert, ROLLBACK-ing the claim's
+            # vector_next_attempt_at update and leaving rows in a half-
+            # claimed state. Give the current iteration time to finish
+            # cleanly; the stop_event still prevents another tick after
+            # this one drains.
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=5.0,
+                    timeout=120.0,
                 )
             except asyncio.TimeoutError:
+                self._log.warning(
+                    "%s did not stop within 120s; cancelling", self._name,
+                )
                 for t in self._tasks:
                     if not t.done():
                         t.cancel()
@@ -93,7 +103,18 @@ class BackfillRunner:
                  task_name, self._idle_secs, MAX_RETRIES)
         while not self._stop_event.is_set():
             try:
-                done = await self._process_once()
+                # Shield the iteration body so a cancellation arriving mid-
+                # upsert (shutdown signal) doesn't interrupt the per-chunk
+                # transaction. The loop still exits at the top of the next
+                # iteration via _stop_event.is_set(); shielding only
+                # guarantees the in-flight chunk reaches COMMIT/ROLLBACK
+                # cleanly before we tear down.
+                done = await asyncio.shield(self._process_once())
+            except asyncio.CancelledError:
+                # Cancellation reached us despite the shield (e.g., the
+                # outer wait_for timed out and cancelled the task). Exit
+                # the loop without swallowing — the runner is shutting down.
+                raise
             except Exception as e:  # noqa: BLE001 — keep loop alive on any failure
                 log.exception("%s iteration failed: %s", task_name, e)
                 done = 0

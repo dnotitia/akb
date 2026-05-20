@@ -1,0 +1,32 @@
+# Audit/test override — isolates ports + volumes from the main stack so a
+# local dev stack on the default ports keeps running undisturbed.
+#
+# Usage:
+#   docker compose -p akb-audit \
+#     -f docker-compose.yaml -f docker-compose.audit.yaml up -d
+
+services:
+  postgres:
+    ports:
+      - "5433:5432"
+
+  minio:
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+
+  backend:
+    ports:
+      - "8001:8000"
+
+  frontend:
+    ports:
+      - "3001:3000"
+
+volumes:
+  postgres_data:
+    name: akb-audit-postgres
+  vault_data:
+    name: akb-audit-vaults
+  minio_data:
+    name: akb-audit-minio

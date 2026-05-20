@@ -24,6 +24,9 @@ export default function FilePage() {
 
   useEffect(() => {
     if (!vault || !fileId) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setInfo(null);
+    setError("");
     const t = localStorage.getItem("akb_token") || "";
     fetch(`/api/v1/files/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
       .then((r) => r.json())

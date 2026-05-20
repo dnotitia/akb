@@ -19,6 +19,8 @@ export default function VaultActivityPage() {
 
   useEffect(() => {
     if (!name) return;
+    // Reset stale state from previous param before re-fetch resolves.
+    setEntries(null);
     setLoading(true);
     setError("");
     getVaultActivity(name, { author: debounced || undefined, limit: PAGE_SIZE })
@@ -133,7 +135,8 @@ export default function VaultActivityPage() {
             const filesCount = e.files?.length || 0;
             const primary = e.files?.[0];
             const link = primary
-              ? `/vault/${name}/doc/${encodeURIComponent(primary.path)}`
+              ? `/vault/${name}/doc/${encodeURIComponent(primary.path)}` +
+                (e.hash ? `?commit=${encodeURIComponent(e.hash)}` : "")
               : `/vault/${name}`;
             return (
               <li key={(e.hash || "") + i}>
