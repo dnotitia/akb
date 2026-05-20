@@ -108,6 +108,7 @@ async def _apply_migrations() -> None:
         "021_events_resource_uri.py",           # collapse events (ref_type, ref_id) → events.resource_uri (URI canonical)
         "022_publications_resource_uri.py",     # collapse publications (document_id, file_id) → publications.resource_uri (URI canonical)
         "023_drop_metadata_id.py",              # strip legacy d-prefix `metadata.id` from documents (cosmetic; SQL lookup arm already removed)
+        "024_tokens_revoked_before.py",         # users.tokens_revoked_before for JWT revocation (default epoch — pre-existing JWTs unaffected)
     ):
         module = _load_migration(filename)
         if module is None:

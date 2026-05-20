@@ -3,7 +3,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.deps import get_current_user
-from app.services.auth_service import AuthenticatedUser
+from app.services.auth_service import (
+    AuthenticatedUser,
+    REVOKE_REASON_ADMIN,
+    revoke_all_sessions,
+)
 from app.services.access_service import (
     archive_vault,
     delete_user_account,
@@ -150,6 +154,28 @@ async def admin_delete_user(
     if user_id == user.user_id:
         raise HTTPException(status_code=400, detail="Use DELETE /my/account to delete your own account")
     return await delete_user_account(user_id)
+
+
+@router.post(
+    "/admin/users/{user_id}/revoke-sessions",
+    summary="[admin] Force-logout all JWT sessions for a user",
+)
+async def admin_revoke_user_sessions(
+    user_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Invalidate every JWT issued to ``user_id`` before now.
+
+    Useful for incident response (account compromise, employee
+    offboarding) without needing the user's password and without
+    rotating the global ``jwt_secret`` (which would log out everyone).
+    Does not touch PATs — those have their own revoke flow.
+    """
+    _require_admin(user)
+    revoked_at = await revoke_all_sessions(
+        user_id, actor_id=user.user_id, reason=REVOKE_REASON_ADMIN,
+    )
+    return {"user_id": user_id, "revoked_before": revoked_at.isoformat()}
 
 
 @router.post(
