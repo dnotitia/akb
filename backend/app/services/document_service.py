@@ -131,6 +131,7 @@ from app.services.index_service import (
     delete_document_chunks,
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
+from app.services.role_sync import get_role_sync
 from app.services.uri_service import doc_uri, table_uri, file_uri
 from app.repositories import table_data_repo
 from app.utils import ensure_list
@@ -1088,7 +1089,6 @@ class DocumentService:
                         conn=conn,
                     )
             # PG-native RBAC: create vault group roles + grant admin to owner.
-            from app.services.role_sync import get_role_sync
             await get_role_sync().on_vault_create(vault_id, uid)
             logger.info(
                 "Vault created (external_git mirror, pending clone): %s host=%s branch=%s",
@@ -1122,7 +1122,6 @@ class DocumentService:
             # PG-native RBAC: create vault group roles + grant admin to owner.
             # Done before template application so any tables the template
             # creates (future) inherit grants from the proper group roles.
-            from app.services.role_sync import get_role_sync
             await get_role_sync().on_vault_create(vault_id, uid)
             if template:
                 await self._apply_template(name, vault_id, template, coll_repo)

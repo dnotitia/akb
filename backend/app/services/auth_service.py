@@ -22,6 +22,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AuthenticationError, ConflictError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
+from app.services.role_sync import get_role_sync
 
 
 @dataclass
@@ -115,7 +116,6 @@ async def register(username: str, email: str, password: str, display_name: str |
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.
-    from app.services.role_sync import get_role_sync
     await get_role_sync().on_user_create(user_id)
 
     return {"user_id": str(user_id), "username": username, "email": email}

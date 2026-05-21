@@ -12,6 +12,7 @@ import uuid
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
+from app.services.role_sync import get_role_sync
 
 logger = logging.getLogger("akb.access")
 
@@ -189,7 +190,6 @@ async def grant_access(
 
     # PG-native RBAC: GRANT akb_vault_<vid>_<role> TO akb_user_<uid>.
     # Best-effort — reconciler covers drift.
-    from app.services.role_sync import get_role_sync
     await get_role_sync().on_grant(vault["id"], target["id"], role)
 
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
@@ -247,7 +247,6 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
             )
 
     # PG-native RBAC: REVOKE all vault group memberships from akb_user_<uid>.
-    from app.services.role_sync import get_role_sync
     await get_role_sync().on_revoke(vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
@@ -560,14 +559,13 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 },
             )
 
-    # PG-native RBAC: mirror the three system DB writes
-    #   - vaults.owner_id moved → new owner gets admin
-    #   - INSERT vault_access(old_owner, admin) → old owner gets admin
-    #   - DELETE vault_access(new_owner) → clear new owner's pre-existing
-    #     membership (the admin grant above replaces it)
-    from app.services.role_sync import get_role_sync
+    # PG-native RBAC: mirror the two membership outcomes —
+    #   - new owner gets admin (vaults.owner_id moved)
+    #   - old owner gets admin (vault_access row added above)
+    # `on_grant("admin")` is idempotent and internally clears any
+    # weaker (reader/writer) membership the user previously had,
+    # so no explicit on_revoke step is required here.
     rs = get_role_sync()
-    await rs.on_revoke(vault["id"], new_owner["id"])  # clear prior membership
     await rs.on_grant(vault["id"], new_owner["id"], "admin")
     await rs.on_grant(vault["id"], vault["owner_id"], "admin")
 
@@ -770,7 +768,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 
     # PG-native RBAC: drop the three vault group roles. Memberships
     # auto-clean as part of DROP ROLE.
-    from app.services.role_sync import get_role_sync
     await get_role_sync().on_vault_delete(vault_id)
 
     logger.info("Deleted vault: %s", vault_name)
@@ -821,7 +818,6 @@ async def delete_user_account(user_id: str) -> dict:
 
     # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles
     # were already dropped by the per-vault delete_vault calls above.
-    from app.services.role_sync import get_role_sync
     await get_role_sync().on_user_delete(uid)
 
     logger.info("Deleted user %s (vaults=%d)", user_id, len(deleted_vaults))

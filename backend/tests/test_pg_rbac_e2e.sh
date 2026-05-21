@@ -141,9 +141,22 @@ mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"INSERT INTO secrets (item, value) VALUES ('bob_added', 'b')\"}" | mr)
 echo "$R" | grep -q '"result"' && pass "Writer Bob INSERT" || fail "Writer INSERT" "$R"
 
-# ── 2. Negative — PG-side denial ─────────────────────────────
+# ── 2. Negative — defence-in-depth ───────────────────────────
+#
+# Two enforcement layers, tested separately:
+#   2-A: SQL reaches PG. PG ACL rejects (42501, or "relation does
+#        not exist" when the role can't see the object). These are
+#        the cases that would actually exfil data if the boundary
+#        were soft. assert_pg_denied is strict.
+#   2-B: SQL never reaches PG. Application pre-flight (first-keyword
+#        DML check, multi-statement check) rejects before any
+#        connection is taken. Friendlier error than PG would give.
+#
+# Both layers must hold; this organisation makes the regression
+# surface for each obvious.
+
 echo ""
-echo "▸ 2. Negative — PG ACL enforcement (must NOT be regex)"
+echo "▸ 2-A. Negative — SQL reaches PG, PG ACL enforces"
 
 # Helper: assert response is a permission_denied envelope from PG,
 # not an app-side string. We accept either the structured {code:
@@ -212,23 +225,6 @@ assert_pg_denied "pg_authid (superuser-only)" "$R"
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM vault_access LIMIT 1\"}" | mr)
 assert_pg_denied "vault_access SELECT" "$R"
 
-# 2h: COPY ... TO PROGRAM (superuser-only).
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"COPY (SELECT 1) TO PROGRAM 'whoami'\"}" | mr)
-# The first-keyword check will catch COPY (it's not in the DML allow-list),
-# so this returns an app-level "not allowed" message — that's also fine
-# since COPY-as-DML wouldn't have made it past the role anyway.
-echo "$R" | grep -qiE 'denied|allowed|permission' && pass "COPY TO PROGRAM blocked" || fail "COPY block" "$R"
-
-# 2i: SET ROLE to another vault's admin role (smuggled in a DML position).
-#     Not first-keyword DML, so caught by the friendly check; PG would
-#     also deny since Bob isn't a member.
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SET ROLE postgres\"}" | mr)
-echo "$R" | grep -qiE 'denied|allowed|permission' && pass "SET ROLE blocked" || fail "SET ROLE" "$R"
-
-# 2j: Multi-statement smuggle.
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT 1; SELECT * FROM $PG_A_SECRETS\"}" | mr)
-echo "$R" | grep -qiE 'multi|allowed' && pass "Multi-statement blocked" || fail "Multi-statement" "$R"
-
 # 2k: Schema-qualified reference (public.<table>).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM public.$PG_A_SECRETS\"}" | mr)
 assert_pg_denied "Schema-qualified cross-vault SELECT" "$R"
@@ -263,24 +259,9 @@ assert_pg_denied "pg_read_file filesystem access" "$R"
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT pg_ls_dir('/')\"}" | mr)
 assert_pg_denied "pg_ls_dir filesystem access" "$R"
 
-# 2s: lo_import / lo_export (large object — superuser-only). Won't
-#     reach PG (DO/non-DML first keyword), but if it did, PG would
-#     deny.
+# 2s: lo_import / lo_export (large object — superuser-only).
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT lo_export(1, '/tmp/x')\"}" | mr)
 assert_pg_denied "lo_export superuser-only" "$R"
-
-# 2t: Anonymous PL/pgSQL DO block — try to escalate privileges.
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"DO \$\$ BEGIN PERFORM 1; END \$\$\"}" | mr)
-echo "$R" | grep -qiE 'allowed|denied|permission' && pass "DO block blocked (non-DML)" || fail "DO block" "$R"
-
-# 2u: CREATE FUNCTION (would allow arbitrary SQL execution via
-#     definer's-rights bypass if PG accepted it from a non-superuser).
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"CREATE FUNCTION pwn() RETURNS int AS \$\$ SELECT 1 \$\$ LANGUAGE sql\"}" | mr)
-echo "$R" | grep -qiE 'allowed|denied|permission' && pass "CREATE FUNCTION blocked" || fail "CREATE FUNCTION" "$R"
-
-# 2v: TRUNCATE on cross-vault — DDL-adjacent, ACL still applies.
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"TRUNCATE $PG_A_SECRETS\"}" | mr)
-echo "$R" | grep -qiE 'allowed|denied|permission|first-keyword' && pass "TRUNCATE blocked" || fail "TRUNCATE" "$R"
 
 # 2w: Comment-based smuggle (PG comment-strip happens during parse;
 #     ACL still applies to the resulting query).
@@ -308,9 +289,63 @@ echo "$R" | python3 -c "import sys,json; sys.exit(0 if 'items' in json.load(sys.
   && pass "pg_class metadata readable (content still blocked, see 2b)" \
   || pass "pg_class read returned non-data response (acceptable)"
 
-# ── 2.5. Reader scope enforcement ────────────────────────────
+# ── 2-B. Negative — app pre-flight rejects before reaching PG ─
 echo ""
-echo "▸ 2.5. Reader role write-attempt denials (PG ACL)"
+echo "▸ 2-B. Negative — app pre-flight (first-keyword DML / single-statement)"
+
+# Helper: assert response carries the application-side rejection
+# (an `error` key whose message references the allow-list rule or
+# multi-statement guard). These are intentionally caught BEFORE
+# reaching PG so the error is actionable; PG would also deny them
+# (non-DML keywords aren't in any GRANT) but with less helpful
+# messages like "permission denied for schema public".
+assert_app_rejected() {
+  local label=$1
+  local raw=$2
+  local matched
+  matched=$(echo "$raw" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    err = (d.get('error') or '').lower()
+    # App-side rejection strings carry one of these phrases.
+    is_app = ('only select / with / insert / update / delete' in err
+              or 'multi-statement' in err
+              or 'use akb_create_table' in err)
+    print('Y' if is_app else 'N')
+except Exception:
+    print('N')
+" 2>/dev/null)
+  [ "$matched" = "Y" ] && pass "$label" || fail "$label" "expected app-side rejection; raw=$raw"
+}
+
+# COPY ... TO PROGRAM — first keyword COPY is not DML.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"COPY (SELECT 1) TO PROGRAM 'whoami'\"}" | mr)
+assert_app_rejected "COPY TO PROGRAM rejected pre-flight" "$R"
+
+# SET ROLE — first keyword SET is not DML.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SET ROLE postgres\"}" | mr)
+assert_app_rejected "SET ROLE rejected pre-flight" "$R"
+
+# Multi-statement smuggle — semicolon in middle.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT 1; SELECT * FROM $PG_A_SECRETS\"}" | mr)
+assert_app_rejected "Multi-statement rejected pre-flight" "$R"
+
+# Anonymous PL/pgSQL DO block — first keyword DO is not DML.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"DO \$\$ BEGIN PERFORM 1; END \$\$\"}" | mr)
+assert_app_rejected "DO block rejected pre-flight" "$R"
+
+# CREATE FUNCTION — first keyword CREATE is not DML.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"CREATE FUNCTION pwn() RETURNS int AS \$\$ SELECT 1 \$\$ LANGUAGE sql\"}" | mr)
+assert_app_rejected "CREATE FUNCTION rejected pre-flight" "$R"
+
+# TRUNCATE — first keyword TRUNCATE is not DML.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"TRUNCATE $PG_A_SECRETS\"}" | mr)
+assert_app_rejected "TRUNCATE rejected pre-flight" "$R"
+
+# ── 2-C. Reader scope enforcement ────────────────────────────
+echo ""
+echo "▸ 2-C. Reader role write-attempt denials (PG ACL)"
 
 # Re-grant Bob reader on vault A.
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
@@ -327,9 +362,11 @@ assert_pg_denied "Reader cannot UPDATE" "$R"
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"DELETE FROM secrets WHERE item = 'api_key'\"}" | mr)
 assert_pg_denied "Reader cannot DELETE" "$R"
 
-# Reader cannot TRUNCATE (admin-only on vault A).
+# Reader TRUNCATE: caught by app pre-flight (TRUNCATE is not in DML
+# allow-list). PG ACL would also deny since reader has no TRUNCATE
+# grant; both layers cover this.
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"TRUNCATE secrets\"}" | mr)
-echo "$R" | grep -qiE 'allowed|denied|permission|first-keyword' && pass "Reader cannot TRUNCATE" || fail "Reader TRUNCATE" "$R"
+assert_app_rejected "Reader cannot TRUNCATE (pre-flight)" "$R"
 
 # Restore: revoke for the lifecycle phase below.
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1

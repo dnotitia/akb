@@ -13,6 +13,7 @@ from app.db.postgres import close_pool, get_pool, init_db
 from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, set_role_sync
+from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger("akb.lifecycle")
@@ -69,6 +70,7 @@ async def init_storage() -> None:
     pool = await get_pool()
     role_sync = RoleSync(pool)
     set_role_sync(role_sync)
+    set_user_sql_executor(UserSqlExecutor(pool))
     try:
         report = await role_sync.reconcile_from_catalog()
         logger.info("RoleSync reconcile at startup: %s", report)

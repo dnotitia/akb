@@ -432,14 +432,18 @@ class RoleSync:
     async def _drop_role_if_present(
         self, conn: asyncpg.Connection, role: str,
     ) -> None:
-        # `DROP OWNED BY` must run before `DROP ROLE` if the role owns any
-        # privileges/objects. Both no-op when the role is absent.
+        # `DROP OWNED BY` must run before `DROP ROLE` if the role owns
+        # any privileges/objects. UndefinedObjectError on the OWNED
+        # phase means the role doesn't exist — nothing further to do.
+        # Any other failure on OWNED is reported but doesn't block the
+        # DROP ROLE attempt; PG will still refuse if dependencies
+        # remain and surface a clearer error there.
         try:
             await conn.execute(f'DROP OWNED BY "{role}"')
         except asyncpg.exceptions.UndefinedObjectError:
             return
-        except Exception:  # noqa: BLE001 — log and continue to DROP ROLE
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DROP OWNED BY %s failed (continuing to DROP ROLE): %s", role, e)
         try:
             await conn.execute(f'DROP ROLE IF EXISTS "{role}"')
         except asyncpg.exceptions.UndefinedObjectError:

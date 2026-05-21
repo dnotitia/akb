@@ -137,10 +137,33 @@ class UserSqlExecutor:
                 "PG denied user_sql for user=%s: %s", user_id, e,
             )
             raise PermissionDeniedError(str(e), pg_sqlstate="42501") from e
-        except asyncpg.exceptions.UndefinedTableError as e:
+        except asyncpg.exceptions.UndefinedTableError:
             # 42P01 — table doesn't exist OR exists but role can't see it.
             # PG reports the same code for both ("relation X does not
             # exist"); we surface verbatim and let the caller's friendly-
             # hint logic offer fuzzy suggestions for tables in the
             # caller's allowed set.
             raise
+
+
+# ── Singleton accessor ────────────────────────────────────────
+
+
+_executor: Optional[UserSqlExecutor] = None
+
+
+def get_user_sql_executor() -> UserSqlExecutor:
+    """Return the process-global executor. Initialized once in
+    `lifecycle.init_storage` after the pool is ready, matching the
+    `RoleSync` singleton pattern."""
+    if _executor is None:
+        raise RuntimeError(
+            "UserSqlExecutor not initialized — call set_user_sql_executor() "
+            "during backend startup"
+        )
+    return _executor
+
+
+def set_user_sql_executor(executor: UserSqlExecutor) -> None:
+    global _executor
+    _executor = executor
