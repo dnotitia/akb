@@ -12,7 +12,7 @@ from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
 from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
 from app.services.git_service import GitService
-from app.services.role_sync import RoleSync, set_role_sync
+from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
 
@@ -114,10 +114,19 @@ def start_workers() -> None:
         started.append("events_publisher")
     else:
         logger.info("events_publisher disabled (redis_url not configured)")
+    # PG-RBAC periodic reconcile — converges drift caused by silent
+    # lifecycle-hook failures (counted in role_sync.metrics_snapshot).
+    # Set role_sync_reconcile_interval_secs <= 0 in config to disable.
+    if settings.role_sync_reconcile_interval_secs > 0:
+        get_role_sync().start_reconcile_timer(
+            settings.role_sync_reconcile_interval_secs,
+        )
+        started.append("role_sync_reconcile_loop")
     logger.info("Workers started: %s", ", ".join(started))
 
 
 async def stop_workers() -> None:
+    await get_role_sync().stop_reconcile_timer()
     await events_publisher.stop()
     await metadata_worker.stop()
     await external_git_poller.stop()

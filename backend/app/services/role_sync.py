@@ -69,6 +69,7 @@ defense-in-depth.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -151,6 +152,73 @@ class ReconcileReport:
         )
 
 
+# ── Drift report (read-only inspect) ──────────────────────────
+
+
+@dataclass
+class RoleStateDiff:
+    """What `reconcile_from_catalog` WOULD change. Read-only diff so
+    operators can inspect before mutating."""
+
+    missing_user_roles: list[str] = field(default_factory=list)
+    orphan_user_roles: list[str] = field(default_factory=list)
+    missing_vault_roles: list[str] = field(default_factory=list)
+    orphan_vault_roles: list[str] = field(default_factory=list)
+    missing_memberships: list[dict] = field(default_factory=list)
+    missing_public_grants: list[dict] = field(default_factory=list)
+    stale_public_grants: list[dict] = field(default_factory=list)
+    authenticated_role_missing: bool = False
+    users_not_in_authenticated: list[str] = field(default_factory=list)
+
+    def drift_count(self) -> int:
+        return (
+            len(self.missing_user_roles)
+            + len(self.orphan_user_roles)
+            + len(self.missing_vault_roles)
+            + len(self.orphan_vault_roles)
+            + len(self.missing_memberships)
+            + len(self.missing_public_grants)
+            + len(self.stale_public_grants)
+            + (1 if self.authenticated_role_missing else 0)
+            + len(self.users_not_in_authenticated)
+        )
+
+    def is_clean(self) -> bool:
+        return self.drift_count() == 0
+
+
+# ── Hook telemetry ────────────────────────────────────────────
+
+
+@dataclass
+class HookMetrics:
+    """Per-hook counters for drift surveillance.
+
+    Lifecycle hooks are best-effort by design: a failure logs and
+    moves on, the reconciler converges. But silent best-effort
+    failures are the exact scenario operators need to detect, so we
+    bump a counter on every hook failure and surface it via /health.
+    """
+
+    failures: dict[str, int] = field(default_factory=dict)
+    last_reconcile_errors: int = 0
+    last_reconcile_at: str | None = None
+
+    def record_failure(self, hook: str) -> None:
+        self.failures[hook] = self.failures.get(hook, 0) + 1
+
+    def total_failures(self) -> int:
+        return sum(self.failures.values())
+
+    def snapshot(self) -> dict:
+        return {
+            "hook_failures_total": self.total_failures(),
+            "hook_failures_by_name": dict(self.failures),
+            "last_reconcile_errors": self.last_reconcile_errors,
+            "last_reconcile_at": self.last_reconcile_at,
+        }
+
+
 # ── RoleSync ─────────────────────────────────────────────────
 
 
@@ -159,6 +227,71 @@ class RoleSync:
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
+        self.metrics = HookMetrics()
+        self._reconcile_task: Optional[asyncio.Task] = None
+
+    def metrics_snapshot(self) -> dict:
+        """Read-only snapshot of hook-failure counters + last reconcile
+        outcome. Surfaced via /health so operators see silent drift
+        without grepping logs."""
+        return self.metrics.snapshot()
+
+    # ── Periodic reconcile timer ──
+
+    def start_reconcile_timer(self, interval_secs: int) -> None:
+        """Spawn an asyncio task that re-runs `reconcile_from_catalog`
+        every `interval_secs`. No-op if `interval_secs <= 0` or the
+        timer is already running. Called from `start_workers` so it
+        joins the rest of the background loops."""
+        if interval_secs <= 0:
+            logger.info("role_sync timer disabled (interval = %s)", interval_secs)
+            return
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_loop(interval_secs),
+            name="role_sync_reconcile_loop",
+        )
+        logger.info(
+            "role_sync_reconcile_loop started (interval=%ss)", interval_secs,
+        )
+
+    async def stop_reconcile_timer(self) -> None:
+        """Cancel the timer and await its exit. Idempotent."""
+        if self._reconcile_task is None:
+            return
+        self._reconcile_task.cancel()
+        try:
+            await self._reconcile_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        self._reconcile_task = None
+
+    async def _reconcile_loop(self, interval_secs: int) -> None:
+        """Sleep → reconcile → repeat. Failures don't terminate the
+        loop — they're counted via metrics + logged so operators see
+        them, but the next interval still fires."""
+        while True:
+            try:
+                await asyncio.sleep(interval_secs)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self.reconcile_from_catalog()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("periodic reconcile failed: %s", e)
+                self.metrics.record_failure("reconcile_loop")
+
+    def _record_failure(self, hook: str, exc: BaseException, *fmt_args) -> None:
+        """Single place that combines warn-logging + metric counter for
+        every hook exception. Keeps the except blocks one line."""
+        if fmt_args:
+            logger.warning(f"{hook}({fmt_args}) failed: %s", exc)
+        else:
+            logger.warning(f"{hook} failed: %s", exc)
+        self.metrics.record_failure(hook)
 
     # ── Lifecycle hooks ──
 
@@ -173,7 +306,7 @@ class RoleSync:
                 await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
                 await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_user_create(%s) failed: %s", user_id, e)
+            self._record_failure("on_user_create", e, user_id)
 
     async def on_user_delete(self, user_id: uuid.UUID | str) -> None:
         """Drop `akb_user_<uid>`. Memberships in vault group roles are
@@ -183,7 +316,7 @@ class RoleSync:
             async with self.pool.acquire() as conn:
                 await self._drop_role_if_present(conn, role)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_user_delete(%s) failed: %s", user_id, e)
+            self._record_failure("on_user_delete", e, user_id)
 
     async def on_vault_create(
         self,
@@ -207,7 +340,7 @@ class RoleSync:
                     await self._create_role_if_missing(conn, owner_role)
                     await self._grant_membership(conn, admin, owner_role)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_vault_create(%s) failed: %s", vault_id, e)
+            self._record_failure("on_vault_create", e, vault_id)
 
     async def on_vault_delete(self, vault_id: uuid.UUID | str) -> None:
         """Drop the three group roles. Dependent GRANTs are cleared by
@@ -218,7 +351,7 @@ class RoleSync:
                     role = vault_group_role_name(vault_id, scope)
                     await self._drop_role_if_present(conn, role)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_vault_delete(%s) failed: %s", vault_id, e)
+            self._record_failure("on_vault_delete", e, vault_id)
 
     async def on_grant(
         self,
@@ -232,6 +365,7 @@ class RoleSync:
         which is unique on `(vault_id, user_id)`)."""
         if scope not in ("reader", "writer", "admin"):
             logger.warning("on_grant: invalid scope %r", scope)
+            self.metrics.record_failure("on_grant")
             return
         group = vault_group_role_name(vault_id, scope)
         user = user_role_name(user_id)
@@ -248,7 +382,7 @@ class RoleSync:
                 await self._create_role_if_missing(conn, user)
                 await self._grant_membership(conn, group, user)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_grant(%s, %s, %s) failed: %s", vault_id, user_id, scope, e)
+            self._record_failure("on_grant", e, vault_id, user_id, scope)
 
     async def on_revoke(
         self,
@@ -264,7 +398,7 @@ class RoleSync:
                     group = vault_group_role_name(vault_id, scope)
                     await self._revoke_membership_if_present(conn, group, user)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_revoke(%s, %s) failed: %s", vault_id, user_id, e)
+            self._record_failure("on_revoke", e, vault_id, user_id)
 
     async def on_ownership_transfer(
         self,
@@ -282,9 +416,8 @@ class RoleSync:
                 await self._create_role_if_missing(conn, new_role)
                 await self._grant_membership(conn, admin, new_role)
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "on_ownership_transfer(%s, %s→%s) failed: %s",
-                vault_id, old_owner_id, new_owner_id, e,
+            self._record_failure(
+                "on_ownership_transfer", e, vault_id, old_owner_id, new_owner_id,
             )
 
     async def on_public_access_change(
@@ -319,10 +452,7 @@ class RoleSync:
                     group = vault_group_role_name(vault_id, target)
                     await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "on_public_access_change(%s, %r) failed: %s",
-                vault_id, level, e,
-            )
+            self._record_failure("on_public_access_change", e, vault_id, level)
 
     async def on_table_create(
         self,
@@ -333,12 +463,13 @@ class RoleSync:
         vault's reader/writer/admin group roles, matching their scope."""
         if not _is_safe_pg_table_name(pg_table_name):
             logger.error("on_table_create: unsafe pg_table_name %r — refusing", pg_table_name)
+            self.metrics.record_failure("on_table_create")
             return
         try:
             async with self.pool.acquire() as conn:
                 await self._grant_table(conn, vault_id, pg_table_name)
         except Exception as e:  # noqa: BLE001
-            logger.warning("on_table_create(%s, %s) failed: %s", vault_id, pg_table_name, e)
+            self._record_failure("on_table_create", e, vault_id, pg_table_name)
 
     async def on_table_drop(
         self,
@@ -372,6 +503,8 @@ class RoleSync:
 
         Idempotent. Safe to run repeatedly.
         """
+        from datetime import datetime, timezone
+
         report = ReconcileReport()
         async with self.pool.acquire() as conn:
             await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
@@ -380,6 +513,9 @@ class RoleSync:
             await self._reconcile_memberships(conn, report)
             await self._reconcile_table_grants(conn, report)
             await self._reconcile_public_access(conn, report)
+
+        self.metrics.last_reconcile_errors = len(report.errors)
+        self.metrics.last_reconcile_at = datetime.now(timezone.utc).isoformat()
 
         if report.errors:
             logger.warning("Reconcile complete with errors: %s", report)
@@ -532,6 +668,156 @@ class RoleSync:
                 report.table_grants_applied += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT on {pg_name}: {e}")
+
+    # ── Drift inspection (read-only) ──
+
+    async def diff_against_catalog(self) -> RoleStateDiff:
+        """Compute what `reconcile_from_catalog` would change without
+        mutating anything. Cheap to call repeatedly. Returns a
+        structured diff that operators can inspect via
+        ``GET /admin/role-state`` before triggering a reconcile.
+
+        Table-level GRANT drift is intentionally NOT walked here: it
+        would require iterating every `vt_*` table's ACL via
+        `has_table_privilege` per (role, table, scope) triple, which
+        is O(vaults × tables × scopes) round-trips. Memberships and
+        public-access grants are the durable-drift surface; table
+        grants are emitted at table-create time and never revoked
+        outside table-drop.
+        """
+        diff = RoleStateDiff()
+        async with self.pool.acquire() as conn:
+            await self._diff_users(conn, diff)
+            await self._diff_vaults(conn, diff)
+            await self._diff_memberships(conn, diff)
+            await self._diff_public_grants(conn, diff)
+            await self._diff_authenticated(conn, diff)
+        return diff
+
+    async def _diff_users(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        rows = await conn.fetch("SELECT id FROM users")
+        wanted = {user_role_name(r["id"]) for r in rows}
+        existing = {
+            r["rolname"]
+            for r in await conn.fetch(
+                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_user\\_%' ESCAPE '\\'"
+            )
+        }
+        diff.missing_user_roles = sorted(wanted - existing)
+        diff.orphan_user_roles = sorted(existing - wanted)
+
+    async def _diff_vaults(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        rows = await conn.fetch("SELECT id FROM vaults")
+        wanted: set[str] = set()
+        for r in rows:
+            for scope in ("reader", "writer", "admin"):
+                wanted.add(vault_group_role_name(r["id"], scope))
+        existing = {
+            r["rolname"]
+            for r in await conn.fetch(
+                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_vault\\_%' ESCAPE '\\'"
+            )
+        }
+        diff.missing_vault_roles = sorted(wanted - existing)
+        diff.orphan_vault_roles = sorted(existing - wanted)
+
+    async def _diff_memberships(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        access_rows = await conn.fetch(
+            "SELECT vault_id, user_id, role FROM vault_access"
+        )
+        # Pull current PG memberships in one go for cheaper comparison.
+        pg_mems = await conn.fetch(
+            """
+            SELECT r.rolname AS group_role, m.rolname AS member_role
+              FROM pg_auth_members am
+              JOIN pg_roles r ON r.oid = am.roleid
+              JOIN pg_roles m ON m.oid = am.member
+             WHERE r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
+            """
+        )
+        actual = {(row["group_role"], row["member_role"]) for row in pg_mems}
+        for ar in access_rows:
+            group = vault_group_role_name(ar["vault_id"], ar["role"])
+            member = user_role_name(ar["user_id"])
+            if (group, member) not in actual:
+                diff.missing_memberships.append(
+                    {
+                        "vault_id": str(ar["vault_id"]),
+                        "user_id": str(ar["user_id"]),
+                        "scope": ar["role"],
+                    }
+                )
+
+    async def _diff_public_grants(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        rows = await conn.fetch(
+            "SELECT id, COALESCE(public_access, 'none') AS public_access FROM vaults"
+        )
+        # All akb_vault_* memberships that include akb_authenticated.
+        auth_mems = await conn.fetch(
+            """
+            SELECT r.rolname AS group_role
+              FROM pg_auth_members am
+              JOIN pg_roles r ON r.oid = am.roleid
+              JOIN pg_roles m ON m.oid = am.member
+             WHERE m.rolname = $1
+               AND r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
+            """,
+            AUTHENTICATED_ROLE,
+        )
+        actual_grants = {row["group_role"] for row in auth_mems}
+        wanted_grants: set[str] = set()
+        for r in rows:
+            scope = _public_access_scope(r["public_access"])
+            if scope:
+                role = vault_group_role_name(r["id"], scope)
+                wanted_grants.add(role)
+                if role not in actual_grants:
+                    diff.missing_public_grants.append(
+                        {
+                            "vault_id": str(r["id"]),
+                            "scope": scope,
+                            "role": role,
+                        }
+                    )
+        for stale in actual_grants - wanted_grants:
+            diff.stale_public_grants.append({"role": stale})
+
+    async def _diff_authenticated(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = $1", AUTHENTICATED_ROLE,
+        )
+        if not exists:
+            diff.authenticated_role_missing = True
+            return
+        # All user roles that should be members.
+        wanted_members = {
+            user_role_name(r["id"])
+            for r in await conn.fetch("SELECT id FROM users")
+        }
+        actual_members = {
+            r["member_role"]
+            for r in await conn.fetch(
+                """
+                SELECT m.rolname AS member_role
+                  FROM pg_auth_members am
+                  JOIN pg_roles r ON r.oid = am.roleid
+                  JOIN pg_roles m ON m.oid = am.member
+                 WHERE r.rolname = $1
+                """,
+                AUTHENTICATED_ROLE,
+            )
+        }
+        diff.users_not_in_authenticated = sorted(wanted_members - actual_members)
 
     # ── Low-level helpers ──
 

@@ -149,6 +149,12 @@ class Settings(BaseModel):
     # avgdl/df on a steady-state corpus.
     bm25_recompute_interval_secs: int = 21600
 
+    # Periodic PG-RBAC reconcile cadence. Lifecycle hooks emit role
+    # DDL online; this timer is the belt-and-suspenders that catches
+    # any silent hook failure (logged + counted in metrics_snapshot
+    # but otherwise not auto-recovered). Set to 0 to disable.
+    role_sync_reconcile_interval_secs: int = 3600
+
     # Event stream — optional Redis Streams fanout. PG outbox (`events`
     # table) is always the source of truth; when redis_url is set the
     # events_publisher worker drains the outbox to a Redis Stream so
