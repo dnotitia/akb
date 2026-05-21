@@ -693,9 +693,61 @@ async def update_vault_metadata(
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(sql, *args)
+        if public_access is not None:
+            # Need vault_id to update PG ACL via RoleSync.
+            vault_id = await conn.fetchval(
+                "SELECT id FROM vaults WHERE name = $1", vault_name,
+            )
+            if vault_id is not None:
+                await get_role_sync().on_public_access_change(vault_id, public_access)
 
     logger.info("Updated vault metadata: %s", vault_name)
     return {"vault": vault_name, "updated": True}
+
+
+async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
+    """Owner-only mutation of `vaults.public_access`.
+
+    Two writes happen atomically from the caller's perspective:
+      1. UPDATE vaults SET public_access = $level
+      2. RoleSync.on_public_access_change → grant/revoke
+         akb_vault_<vid>_<scope> TO akb_authenticated so any
+         authenticated user can read/write the vault via akb_sql.
+
+    Centralised here so `akb_set_public` (MCP) and any future REST
+    endpoint share the lifecycle plumbing without duplicating the SQL
+    or the RBAC hook call.
+    """
+    level = validate_public_access(level)
+    await check_vault_access(user_id, vault_name, required_role="owner")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vault = await conn.fetchrow(
+            "SELECT id, status FROM vaults WHERE name = $1", vault_name,
+        )
+        if not vault:
+            raise NotFoundError("Vault", vault_name)
+        if vault["status"] == "archived":
+            raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+        await conn.execute(
+            "UPDATE vaults SET public_access = $1, updated_at = NOW() WHERE id = $2",
+            level, vault["id"],
+        )
+        await emit_event(
+            conn, "vault.public_access",
+            vault_id=vault["id"],
+            resource_uri=f"akb://{vault_name}",
+            actor_id=user_id,
+            payload={"vault": vault_name, "level": level},
+        )
+
+    # PG-native RBAC: grant/revoke the corresponding vault group role
+    # TO akb_authenticated so public access maps to a real PG ACL.
+    await get_role_sync().on_public_access_change(vault["id"], level)
+
+    logger.info("Set public_access for %s → %s", vault_name, level)
+    return {"vault": vault_name, "public_access": level}
 
 
 # ── Destructive: vault delete ───────────────────────────────

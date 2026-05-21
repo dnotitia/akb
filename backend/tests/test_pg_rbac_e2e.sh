@@ -371,6 +371,55 @@ assert_app_rejected "Reader cannot TRUNCATE (pre-flight)" "$R"
 # Restore: revoke for the lifecycle phase below.
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
 
+# ── 2-D. Public vault access via akb_authenticated wildcard ─
+echo ""
+echo "▸ 2-D. public_access — non-members reach public vaults via wildcard"
+
+# Alice creates a fresh vault with public_access='reader' from the start.
+VAULT_PUB="rbac-pub-$(date +%s)"
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_vault" "{\"name\":\"$VAULT_PUB\",\"description\":\"public-reader test\",\"public_access\":\"reader\"}" | mr)
+echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev/null 2>&1 && pass "Public vault (reader) created" || fail "Public vault create" "$R"
+
+# Alice adds a table + a row to test reads against.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_table" "{\"vault\":\"$VAULT_PUB\",\"name\":\"items\",\"description\":\"public data\",\"columns\":[{\"name\":\"label\",\"type\":\"text\",\"required\":true}]}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"INSERT INTO items (label) VALUES ('one'), ('two')\"}" >/dev/null 2>&1
+
+# 2-D-1: Bob (no vault_access row) can SELECT — that's the bug we just fixed.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"SELECT label FROM items ORDER BY label\"}" | mr)
+N=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
+[ "$N" = "2" ] && pass "Non-member SELECTs public-reader vault" || fail "Public SELECT" "got $N; raw=$R"
+
+# 2-D-2: But Bob CANNOT INSERT — reader scope only.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"INSERT INTO items (label) VALUES ('hack')\"}" | mr)
+assert_pg_denied "Non-member INSERT on public-reader denied" "$R"
+
+# 2-D-3: Alice promotes to public_access='writer'.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"writer\"}" >/dev/null 2>&1
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"INSERT INTO items (label) VALUES ('bob_added')\"}" | mr)
+echo "$R" | grep -q '"result"' && pass "Non-member INSERTs after promote to writer" || fail "Promote→writer INSERT" "$R"
+
+# 2-D-4: Alice demotes back to public_access='none'.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"none\"}" >/dev/null 2>&1
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"SELECT label FROM items\"}" | mr)
+# App gate also enforces (check_vault_access rejects non-member on
+# private vault), so the 403 may come from the app layer. Either layer
+# is a valid denial here — the boundary holds.
+echo "$R" | grep -qiE 'denied|forbid|permission|require|access' && pass "Demote→none: non-member denied" || fail "Demote denial" "$R"
+
+# 2-D-5: A user created AFTER public_access flipped back to reader still
+#         gets access — proves on_user_create grants akb_authenticated
+#         membership at registration time (not relying on reconciler).
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"reader\"}" >/dev/null 2>&1
+CAROL="rbac-carol-$(date +%s)"
+PAT_CAROL=$(setup_user "$CAROL")
+SID_CAROL=$(setup_mcp "$PAT_CAROL")
+R=$(mcp_as "$PAT_CAROL" "$SID_CAROL" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"SELECT COUNT(*) AS n FROM items\"}" | mr)
+N=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('items',[{}])[0].get('n',-1))" 2>/dev/null)
+[ "$N" -ge 1 ] 2>/dev/null && pass "Newly-registered user reads public vault" || fail "New user public read" "$R"
+
+# Cleanup of the public-vault scratchpad.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_delete_vault" "{\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
+
 # ── 3. Lifecycle ────────────────────────────────────────────
 echo ""
 echo "▸ 3. Lifecycle — grant/revoke takes effect, drift recovery"

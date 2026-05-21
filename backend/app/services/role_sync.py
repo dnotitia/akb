@@ -17,13 +17,24 @@ For each vault (`vaults.id = <vid>`):
     akb_vault_<vid>_writer              NOLOGIN, +INSERT/UPDATE/DELETE
     akb_vault_<vid>_admin               NOLOGIN, +TRUNCATE
 
+Plus one process-wide wildcard:
+    akb_authenticated                   NOLOGIN — every akb_user_<uid> is a
+                                        member. Vaults with
+                                        `public_access != 'none'` grant
+                                        the corresponding scope to this
+                                        role, so any authenticated user
+                                        can read/write the vault via
+                                        akb_sql without an explicit
+                                        vault_access row.
+
 Hierarchy: writer inherits reader; admin inherits writer. So a
 `GRANT akb_vault_X_writer TO akb_user_Y` confers both write and
 read in one statement.
 
 Each `vault_access(user, vault, role)` row maps 1:1 to
 `GRANT akb_vault_<vid>_<role> TO akb_user_<uid>`. The vault owner
-gets `akb_vault_<vid>_admin`.
+gets `akb_vault_<vid>_admin`. The `vaults.public_access` value maps
+1:1 to a grant of `akb_vault_<vid>_<level>` to `akb_authenticated`.
 
 Each `vault_tables` row gets table-level GRANTs on
 `public.vt_<vault>__<table>` to all three group roles. Tables stay
@@ -71,6 +82,13 @@ logger = logging.getLogger("akb.role_sync")
 
 # ── Identifier helpers ────────────────────────────────────────
 
+# Wildcard role used to grant public-vault access without iterating
+# every existing user. Every `akb_user_<uid>` is a member, so granting
+# this role any vault-scope group is equivalent to granting all
+# authenticated users that scope. Public vaults attach here; private
+# vaults never do.
+AUTHENTICATED_ROLE = "akb_authenticated"
+
 
 def user_role_name(user_id: uuid.UUID | str) -> str:
     """`akb_user_<uid_with_dashes_to_underscores>`."""
@@ -84,6 +102,18 @@ def vault_group_role_name(
     if scope not in ("reader", "writer", "admin"):
         raise ValueError(f"invalid scope: {scope!r}")
     return f"akb_vault_{str(vault_id).replace('-', '_')}_{scope}"
+
+
+def _public_access_scope(level: str) -> str | None:
+    """Map `vaults.public_access` enum to the vault group scope the
+    `akb_authenticated` role should be granted, or None when no grant
+    applies. Anything not in {'reader', 'writer'} resolves to None
+    (i.e. 'none' / unknown → revoke all)."""
+    if level == "reader":
+        return "reader"
+    if level == "writer":
+        return "writer"
+    return None
 
 
 _VT_TABLE_RE = re.compile(r"^vt_[a-z0-9_]+__[a-z0-9_]+$")
@@ -107,6 +137,7 @@ class ReconcileReport:
     grants_added: int = 0
     grants_removed: int = 0
     table_grants_applied: int = 0
+    public_grants_applied: int = 0
     errors: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
@@ -115,6 +146,7 @@ class ReconcileReport:
             f"vaults(+{self.vault_roles_created}/-{self.vault_roles_dropped}) "
             f"grants(+{self.grants_added}/-{self.grants_removed}) "
             f"table_grants({self.table_grants_applied}) "
+            f"public_grants({self.public_grants_applied}) "
             f"errors({len(self.errors)})"
         )
 
@@ -131,11 +163,15 @@ class RoleSync:
     # ── Lifecycle hooks ──
 
     async def on_user_create(self, user_id: uuid.UUID | str) -> None:
-        """Create `akb_user_<uid>` (NOLOGIN). Idempotent."""
+        """Create `akb_user_<uid>` (NOLOGIN) and add it to the
+        `akb_authenticated` wildcard so public-vault access works.
+        Idempotent."""
         role = user_role_name(user_id)
         try:
             async with self.pool.acquire() as conn:
                 await self._create_role_if_missing(conn, role)
+                await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+                await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
         except Exception as e:  # noqa: BLE001
             logger.warning("on_user_create(%s) failed: %s", user_id, e)
 
@@ -251,6 +287,43 @@ class RoleSync:
                 vault_id, old_owner_id, new_owner_id, e,
             )
 
+    async def on_public_access_change(
+        self,
+        vault_id: uuid.UUID | str,
+        level: str,
+    ) -> None:
+        """Sync the vault's public-access grants to `akb_authenticated`.
+
+        `level` must be one of {'none', 'reader', 'writer'} (the
+        `validate_public_access` enum). For 'none' we revoke any
+        prior reader/writer membership; otherwise we revoke any
+        opposite-scope membership first (handles reader → writer
+        and writer → reader transitions cleanly) and grant the
+        target scope. Idempotent.
+        """
+        target = _public_access_scope(level)
+        try:
+            async with self.pool.acquire() as conn:
+                await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+                # Revoke any scope the wildcard previously held on this
+                # vault that isn't the target. Always revoke admin —
+                # public_access never grants admin.
+                for scope in ("reader", "writer", "admin"):
+                    if scope == target:
+                        continue
+                    group = vault_group_role_name(vault_id, scope)
+                    await self._revoke_membership_if_present(
+                        conn, group, AUTHENTICATED_ROLE,
+                    )
+                if target is not None:
+                    group = vault_group_role_name(vault_id, target)
+                    await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "on_public_access_change(%s, %r) failed: %s",
+                vault_id, level, e,
+            )
+
     async def on_table_create(
         self,
         vault_id: uuid.UUID | str,
@@ -285,24 +358,28 @@ class RoleSync:
         """Read the catalog from system DB and converge PG role state.
 
         Steps:
-          1. For each user → ensure `akb_user_<uid>` exists.
-             Drop any `akb_user_*` role not in the catalog.
-          2. For each vault → ensure three group roles + hierarchy.
-             Drop any `akb_vault_*_{reader,writer,admin}` not in catalog.
-          3. For each vault_access row + each owner → grant membership.
-             (Memberships not in catalog are not explicitly dropped
-             here — they're attached to roles which themselves are
-             owned by AKB. Dropping the parent role clears them.)
-          4. For each vault_tables row → grant table-level perms.
+          1. Ensure the `akb_authenticated` wildcard exists.
+          2. For each user → ensure `akb_user_<uid>` exists and is a
+             member of `akb_authenticated`. Drop orphan user roles.
+          3. For each vault → ensure three group roles + hierarchy.
+             Drop orphan vault roles.
+          4. For each vault_access row + each owner → grant membership.
+             (Membership drift isn't explicitly cleared row-by-row;
+             dropping the parent role clears its memberships.)
+          5. For each vault_tables row → grant table-level perms.
+          6. For each vault → sync `public_access` to akb_authenticated
+             memberships.
 
         Idempotent. Safe to run repeatedly.
         """
         report = ReconcileReport()
         async with self.pool.acquire() as conn:
+            await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
             await self._reconcile_user_roles(conn, report)
             await self._reconcile_vault_roles(conn, report)
             await self._reconcile_memberships(conn, report)
             await self._reconcile_table_grants(conn, report)
+            await self._reconcile_public_access(conn, report)
 
         if report.errors:
             logger.warning("Reconcile complete with errors: %s", report)
@@ -327,6 +404,13 @@ class RoleSync:
                 report.user_roles_created += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"CREATE ROLE {role}: {e}")
+        # Every user role must be a member of the authenticated wildcard.
+        # Idempotent GRANT re-applies are no-ops.
+        for role in wanted:
+            try:
+                await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"GRANT {AUTHENTICATED_ROLE}→{role}: {e}")
         for orphan in existing - wanted:
             try:
                 await self._drop_role_if_present(conn, orphan)
@@ -394,6 +478,36 @@ class RoleSync:
                 report.grants_added += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT {group}→{user}: {e}")
+
+    async def _reconcile_public_access(
+        self, conn: asyncpg.Connection, report: ReconcileReport,
+    ) -> None:
+        """Sync each vault's public_access state to memberships on
+        `akb_authenticated`. Walks every vault — for those with
+        public_access='none' the on_public_access_change logic
+        revokes any stale grant, so transitions to private also
+        self-heal here."""
+        rows = await conn.fetch(
+            "SELECT id, COALESCE(public_access, 'none') AS public_access FROM vaults"
+        )
+        for r in rows:
+            target = _public_access_scope(r["public_access"])
+            try:
+                for scope in ("reader", "writer", "admin"):
+                    if scope == target:
+                        continue
+                    group = vault_group_role_name(r["id"], scope)
+                    await self._revoke_membership_if_present(
+                        conn, group, AUTHENTICATED_ROLE,
+                    )
+                if target is not None:
+                    group = vault_group_role_name(r["id"], target)
+                    await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
+                    report.public_grants_applied += 1
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(
+                    f"public access {r['id']} ({r['public_access']}): {e}"
+                )
 
     async def _reconcile_table_grants(
         self, conn: asyncpg.Connection, report: ReconcileReport,

@@ -826,20 +826,21 @@ async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_set_public")
 async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
-    from app.services.access_service import validate_public_access
-    await check_vault_access(uid, args["vault"], required_role="owner")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", args["vault"])
-        # Support: "none", "reader", "writer"
-        level = args.get("level")
-        if level is None:
-            # Legacy boolean support
-            is_public = args.get("is_public", True)
-            level = "reader" if is_public else "none"
-        level = validate_public_access(level)
-        await conn.execute("UPDATE vaults SET public_access = $1 WHERE id = $2", level, vault["id"])
-    return {"vault": args["vault"], "public_access": level}
+    """Set `vaults.public_access`. Owner-only.
+
+    `level` is preferred ({"none","reader","writer"}); the legacy
+    `is_public` boolean is mapped to {"none","reader"} for back-compat.
+    Business logic + PG-RBAC plumbing live in
+    `access_service.set_public_access` — this handler is a thin
+    adapter."""
+    from app.services.access_service import set_public_access
+
+    level = args.get("level")
+    if level is None:
+        # Legacy boolean: True → reader, False → none.
+        level = "reader" if args.get("is_public", True) else "none"
+
+    return await set_public_access(uid, args["vault"], level)
 
 
 # ── Tool Handlers ────────────────────────────────────────────
