@@ -92,6 +92,45 @@ Two supported paths:
   - Design: `docs/designs/pg-native-rbac/00-overview.md`.
 - npm package: `akb-mcp` on npmjs.org.
 
+## Release & Versioning (monorepo)
+
+Two independently versioned components, each with its own tag
+namespace + GitHub Release stream + changelog:
+
+| Component | Source of truth | Tag prefix | Changelog |
+|---|---|---|---|
+| Backend | `backend/pyproject.toml` `version` | `backend-vX.Y.Z` | `backend/CHANGELOG.md` |
+| akb-mcp proxy | `packages/akb-mcp-client/package.json` `version` | `akb-mcp-vX.Y.Z` | `packages/akb-mcp-client/CHANGELOG.md` |
+
+Prefix is required so the two streams never collide on the same
+`vX.Y.Z` (`v2.0.0` was historically used for proxy; new convention
+disambiguates).
+
+**GitHub `--latest` flag**: the most recently published release wins
+the badge (single repo-wide badge). Dependency tools that care
+(npm, docker, etc.) don't read the badge — they read their native
+registries. So `--latest` is UI-only.
+
+**Legacy proxy tags** `v2.0.0` and `v2.0.1` stay (external links).
+Same commits also carry `akb-mcp-v2.0.0` / `akb-mcp-v2.0.1` as
+dual tags. Every release going forward uses the prefixed form
+only.
+
+### Release flow per component
+
+- **Backend**: bump `backend/pyproject.toml`, add CHANGELOG entry,
+  PR + merge → `git tag -a backend-vX.Y.Z <merge-commit> -m "..."` →
+  push → `gh release create backend-vX.Y.Z [--latest] --notes "..."`
+  → `bash deploy/k8s/internal/deploy-internal.sh` (image built from
+  the bumped pyproject version).
+- **Proxy**: bump `packages/akb-mcp-client/package.json`, add
+  CHANGELOG entry, PR + merge → user runs
+  `cd packages/akb-mcp-client && npm publish --access public`
+  manually (deliberate human gate, see workspace memory
+  [[feedback_proxy_npm_publish]]) →
+  `git tag -a akb-mcp-vX.Y.Z <bump-commit> -m "..."` → push →
+  `gh release create akb-mcp-vX.Y.Z [--latest] --notes "..."`.
+
 ## Indexing Pipeline
 
 - **PG is source of truth.** Main `chunks` holds text + metadata only —
