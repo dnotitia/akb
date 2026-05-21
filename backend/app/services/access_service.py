@@ -12,6 +12,7 @@ import uuid
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
+from app.services.role_sync import get_role_sync
 
 logger = logging.getLogger("akb.access")
 
@@ -187,6 +188,10 @@ async def grant_access(
                 payload={"vault": vault_name, "user": target_username, "role": role},
             )
 
+    # PG-native RBAC: GRANT akb_vault_<vid>_<role> TO akb_user_<uid>.
+    # Best-effort — reconciler covers drift.
+    await get_role_sync().on_grant(vault["id"], target["id"], role)
+
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "role": role, "granted": True}
 
@@ -240,6 +245,9 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
                 actor_id=str(revoker_uid),
                 payload={"vault": vault_name, "user": target_username},
             )
+
+    # PG-native RBAC: REVOKE all vault group memberships from akb_user_<uid>.
+    await get_role_sync().on_revoke(vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "revoked": True}
@@ -551,6 +559,16 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 },
             )
 
+    # PG-native RBAC: mirror the two membership outcomes —
+    #   - new owner gets admin (vaults.owner_id moved)
+    #   - old owner gets admin (vault_access row added above)
+    # `on_grant("admin")` is idempotent and internally clears any
+    # weaker (reader/writer) membership the user previously had,
+    # so no explicit on_revoke step is required here.
+    rs = get_role_sync()
+    await rs.on_grant(vault["id"], new_owner["id"], "admin")
+    await rs.on_grant(vault["id"], vault["owner_id"], "admin")
+
     logger.info("Transferred ownership of %s to %s", vault_name, new_owner_username)
     return {"vault": vault_name, "new_owner": new_owner_username, "transferred": True}
 
@@ -675,9 +693,61 @@ async def update_vault_metadata(
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(sql, *args)
+        if public_access is not None:
+            # Need vault_id to update PG ACL via RoleSync.
+            vault_id = await conn.fetchval(
+                "SELECT id FROM vaults WHERE name = $1", vault_name,
+            )
+            if vault_id is not None:
+                await get_role_sync().on_public_access_change(vault_id, public_access)
 
     logger.info("Updated vault metadata: %s", vault_name)
     return {"vault": vault_name, "updated": True}
+
+
+async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
+    """Owner-only mutation of `vaults.public_access`.
+
+    Two writes happen atomically from the caller's perspective:
+      1. UPDATE vaults SET public_access = $level
+      2. RoleSync.on_public_access_change → grant/revoke
+         akb_vault_<vid>_<scope> TO akb_authenticated so any
+         authenticated user can read/write the vault via akb_sql.
+
+    Centralised here so `akb_set_public` (MCP) and any future REST
+    endpoint share the lifecycle plumbing without duplicating the SQL
+    or the RBAC hook call.
+    """
+    level = validate_public_access(level)
+    await check_vault_access(user_id, vault_name, required_role="owner")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vault = await conn.fetchrow(
+            "SELECT id, status FROM vaults WHERE name = $1", vault_name,
+        )
+        if not vault:
+            raise NotFoundError("Vault", vault_name)
+        if vault["status"] == "archived":
+            raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+        await conn.execute(
+            "UPDATE vaults SET public_access = $1, updated_at = NOW() WHERE id = $2",
+            level, vault["id"],
+        )
+        await emit_event(
+            conn, "vault.public_access",
+            vault_id=vault["id"],
+            resource_uri=f"akb://{vault_name}",
+            actor_id=user_id,
+            payload={"vault": vault_name, "level": level},
+        )
+
+    # PG-native RBAC: grant/revoke the corresponding vault group role
+    # TO akb_authenticated so public access maps to a real PG ACL.
+    await get_role_sync().on_public_access_change(vault["id"], level)
+
+    logger.info("Set public_access for %s → %s", vault_name, level)
+    return {"vault": vault_name, "public_access": level}
 
 
 # ── Destructive: vault delete ───────────────────────────────
@@ -748,6 +818,10 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     # commit (the first that materialises the worktree).
     GitService().cleanup_vault_dirs(vault_name)
 
+    # PG-native RBAC: drop the three vault group roles. Memberships
+    # auto-clean as part of DROP ROLE.
+    await get_role_sync().on_vault_delete(vault_id)
+
     logger.info("Deleted vault: %s", vault_name)
     return {"deleted": True, "vault": vault_name}
 
@@ -793,6 +867,10 @@ async def delete_user_account(user_id: str) -> dict:
         await conn.execute("UPDATE todos SET created_by = NULL WHERE created_by = $1", uid)
         # CASCADE handles memories, tokens, vault_access.user_id
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
+
+    # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles
+    # were already dropped by the per-vault delete_vault calls above.
+    await get_role_sync().on_user_delete(uid)
 
     logger.info("Deleted user %s (vaults=%d)", user_id, len(deleted_vaults))
     return {"deleted": True, "user_id": user_id, "vaults_deleted": deleted_vaults}

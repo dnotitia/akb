@@ -55,7 +55,8 @@ Two supported paths:
 - `backend/tests/test_edit_e2e.sh` — akb_edit E2E (33 tests)
 - `backend/tests/test_stdio_files_e2e.sh` — file upload/download E2E (18 tests)
 - `backend/tests/test_put_file_param_e2e.sh` — file param E2E (15 tests)
-- `backend/tests/test_security_edge_e2e.sh` — security & edge cases (44 tests)
+- `backend/tests/test_security_edge_e2e.sh` — security & edge cases (62 tests)
+- `backend/tests/test_pg_rbac_e2e.sh` — PG-native vault isolation: cross-vault probes via SQL surface variations (44 tests, includes system-catalog access, schema-qualified, quoted, UNION/CTE/EXISTS/subquery, filesystem functions, DDL-shaped attempts, reader-scope writes)
 - `backend/tests/test_graph_replace_e2e.sh` — graph, replace, unicode, cross-vault (29 tests)
 - `backend/tests/test_defensive_e2e.sh` — defensive / lifecycle (33 tests)
 - `backend/tests/test_probes_e2e.sh` — /livez /readyz /health + concurrent-burst regression
@@ -72,6 +73,23 @@ Two supported paths:
   for auto-tagging external-git imports — leave blank to disable.
 - Git: bare repos per vault at `{git_storage_path}/{vault_name}.git`.
 - Auth: JWT + Personal Access Token (PAT).
+- Vault isolation in `akb_sql`: enforced by **PostgreSQL ACL** via
+  per-user PG roles (`akb_user_<uid>`) and per-vault group roles
+  (`akb_vault_<vid>_{reader,writer,admin}`). A user's `akb_sql`
+  query runs inside a tx with `SET LOCAL ROLE akb_user_<uid>`; PG
+  returns `42501` for any reference to a table outside their grant.
+  System tables (`users`/`vaults`/`tokens`/`chunks`/...) are
+  unreachable from `akb_user_*` roles by default.
+  - Lifecycle (signup, vault create/delete, grant/revoke) emits the
+    corresponding PG role DDL via `RoleSync`
+    (`backend/app/services/role_sync.py`). Hooks are best-effort;
+    the reconciler in `lifecycle.init_storage` rebuilds full role
+    state from the catalog at startup (and on
+    `POST /admin/reconcile-roles`).
+  - `UserSqlExecutor` (`backend/app/services/user_sql_executor.py`)
+    is the sole entry point for user SQL. System admins
+    (`users.is_admin=TRUE`) bypass the role switch.
+  - Design: `docs/designs/pg-native-rbac/00-overview.md`.
 - npm package: `akb-mcp` on npmjs.org.
 
 ## Indexing Pipeline

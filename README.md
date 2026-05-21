@@ -95,6 +95,13 @@ letting the indexing worker re-populate.
 - **Document** — Markdown + YAML frontmatter, optimised for agent read/write.
 - **Hybrid Search** — Dense (semantic) + BM25 (lexical) fused via RRF in one call.
 - **Relations** — `depends_on`, `related_to`, `implements` in frontmatter form an explicit knowledge graph.
+- **Vault isolation in `akb_sql`** — Enforced by PostgreSQL ACL. Each
+  AKB user has a corresponding PG role (`akb_user_<uid>`) and each
+  vault has three group roles (`akb_vault_<vid>_{reader,writer,admin}`).
+  `akb_sql` runs the user's SQL inside a transaction with
+  `SET LOCAL ROLE`; cross-vault references return PG `42501`
+  directly. No application-side regex inspects user SQL for forbidden
+  identifiers. See `docs/designs/pg-native-rbac/`.
 
 ## MCP Tools (selection)
 

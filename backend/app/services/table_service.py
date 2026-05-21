@@ -27,7 +27,9 @@ from app.repositories.events_repo import emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
+from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
+from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
 
 # Re-exported helpers used by publication_service for the
 # `table_query` share path. Other modules import directly from
@@ -162,6 +164,12 @@ async def create_table(
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
+    # PG-native RBAC: grant SELECT/INSERT/UPDATE/DELETE/ALL on the new
+    # vt_* table to the vault's reader/writer/admin group roles. Tables
+    # without these grants are invisible to akb_user_<uid> roles (PG
+    # returns "relation does not exist" or 42501).
+    await get_role_sync().on_table_create(vault_id, pg_name)
+
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
@@ -252,6 +260,10 @@ async def drop_table(
         await delete_table_index(str(table_id))
     except Exception as e:  # noqa: BLE001
         logger.warning("table chunk delete failed for %s: %s", table_name, e)
+
+    # PG-native RBAC: DROP TABLE has already cascaded the GRANTs;
+    # this hook exists for symmetry + audit (logs at DEBUG).
+    await get_role_sync().on_table_drop(vault_id, pg_name)
 
     logger.info("Table dropped: %s (%s)", table_name, pg_name)
     return {
@@ -353,74 +365,37 @@ async def alter_table(
 
 import re as _re
 
-# Statement keywords allowed via `akb_sql`. Everything else (DDL like
-# CREATE/DROP/ALTER, DCL like GRANT/REVOKE, TCL like BEGIN/COMMIT/
-# SAVEPOINT/RESET, plus informational SHOW/EXPLAIN) is delegated to
-# specific tools or simply has no business in this entry-point.
+# Statement keywords allowed via `akb_sql`. Kept as a friendly
+# pre-flight check: PG would also reject non-DML at the role level
+# (akb_user_* roles have no CREATE/ALTER/DROP/GRANT privilege), but
+# the PG error ("permission denied for schema public") is less
+# actionable than "akb_sql is DML-only; use akb_create_table for
+# schema changes."
 _ALLOWED_FIRST_KEYWORDS = ("SELECT", "WITH", "INSERT", "UPDATE", "DELETE")
-
-# Identifiers that MUST NOT appear in user-supplied SQL. PG accepts
-# them via `akbuser`'s broad privileges and would happily return
-# rows, but they cross trust boundaries (other vaults' vt_* tables,
-# AKB's own bookkeeping, PG system catalogs).
-_FORBIDDEN_TOKEN = _re.compile(
-    r"\b(?:"
-    # PG system catalogs / metadata
-    r"pg_catalog|information_schema|pg_authid|pg_user|pg_shadow|"
-    r"pg_proc|pg_class|pg_namespace|pg_database|pg_attribute|"
-    r"pg_roles|pg_settings|pg_stat_\w+|pg_tables|pg_views|"
-    # AKB internal bookkeeping. These are managed by the service
-    # layer; userland SQL must not read or write them directly.
-    r"users|vaults|documents|chunks|tokens|vault_access|"
-    r"bm25_vocab|bm25_stats|edges|events|publications|todos|"
-    r"vault_tables|vault_files|collections|memories|"
-    r"vault_external_git|vector_delete_outbox"
-    r")\b",
-    _re.IGNORECASE,
-)
-_VT_IDENTIFIER = _re.compile(r"\bvt_[a-z0-9_]+__[a-z0-9_]+\b", _re.IGNORECASE)
-
-
-def _validate_sql_surface(sql: str, allowed_pg_tables: set[str]) -> str | None:
-    """Return an error message if `sql` references anything outside the
-    caller's table whitelist or runs a non-DML statement type. None
-    means the surface is safe to hand to PG.
-
-    `allowed_pg_tables` is the set of fully-qualified `vt_<vault>__<t>`
-    names the caller can legitimately reach (i.e. `table_map.values()`).
-    """
-    stripped = sql.strip()
-    upper = stripped.upper()
-    # Statement-type whitelist: only DML (and SELECT/WITH).
-    if not upper.startswith(_ALLOWED_FIRST_KEYWORDS):
-        return (
-            "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
-            "akb_sql. Use akb_create_table / akb_alter_table / "
-            "akb_drop_table for schema changes."
-        )
-    # Foreign vt_* table references.
-    allowed_lower = {t.lower() for t in allowed_pg_tables}
-    for m in _VT_IDENTIFIER.finditer(sql):
-        if m.group(0).lower() not in allowed_lower:
-            return f"Reference to '{m.group(0)}' is not allowed."
-    # PG system catalogs + AKB internal tables.
-    bad = _FORBIDDEN_TOKEN.search(sql)
-    if bad:
-        return f"Reference to '{bad.group(0)}' is not allowed."
-    return None
 
 
 async def execute_sql(
+    *,
     vault_names: list[str],
+    user_id: str,
     sql: str,
-    read_only: bool = False,
+    is_admin: bool = False,
 ) -> dict:
     """Execute raw SQL scoped to vault tables.
 
-    Table references are rewritten:
+    Vault isolation is enforced by PostgreSQL ACL: the caller's
+    ``akb_user_<uid>`` role has GRANTs only on tables in vaults
+    they have access to (via ``akb_vault_<vid>_<scope>`` group role
+    membership). Cross-vault references return PG ``42501``; the
+    application no longer inspects user SQL for forbidden identifiers.
+
+    Table references are rewritten for UX before execution:
       - Single vault: 'pipeline' → 'vt_sales__pipeline'
       - Cross-vault: 'sales__pipeline' → 'vt_sales__pipeline'
-    Only tables registered in vault_tables are accessible.
+
+    System admins (``users.is_admin = TRUE``) bypass the per-user PG
+    role and run as the backend service role — matching the existing
+    system-admin trust model. For everyone else, PG is the authority.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -431,95 +406,45 @@ async def execute_sql(
         if ";" in sql_check:
             return {"error": "Multi-statement SQL is not allowed. Send one statement at a time."}
 
-        # Sandbox the SQL surface to a tight whitelist before PG ever sees
-        # it. Two classes of bypass exist without this gate:
-        #
-        # (1) Foreign-vault data exfiltration. `rewrite_table_names` only
-        #     rewrites identifiers in `table_map` (the caller's vault's
-        #     tables). User-supplied SQL can name another vault's PG
-        #     table directly (`vt_<other>__<t>`) — those identifiers
-        #     reach PG untouched and `akbuser` (the backend's
-        #     superuser-class role) returns the rows. ALSO catches
-        #     reads against AKB internal tables (`users`, `vaults`,
-        #     `tokens`, `chunks`, `bm25_*`, `edges`, ...) and PG
-        #     system catalogs (`pg_catalog.*`, `information_schema.*`,
-        #     `pg_user`, `pg_authid`, ...).
-        #
-        # (2) DDL-driven side channels. Even a writer must not be able
-        #     to `CREATE VIEW`, `CREATE FUNCTION`, etc. — those bypass
-        #     the table whitelist (a view can SELECT from anywhere)
-        #     and outlive the request. DDL is delegated to specific
-        #     tools (`akb_create_table` / `akb_alter_table` /
-        #     `akb_drop_table`). `akb_sql` is DML-only.
-        deny = _validate_sql_surface(rewritten, set(table_map.values()))
-        if deny:
-            return {"error": deny}
+        if not rewritten.strip().upper().startswith(_ALLOWED_FIRST_KEYWORDS):
+            return {
+                "error": (
+                    "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
+                    "akb_sql. Use akb_create_table / akb_alter_table / "
+                    "akb_drop_table for schema changes."
+                )
+            }
 
-        is_select = rewritten.strip().upper().startswith(("SELECT", "WITH"))
-
-        # Read-only access must reject anything that isn't a SELECT or
-        # WITH query. PG's `SET TRANSACTION READ ONLY` blocks data
-        # mutations (INSERT/UPDATE/DELETE/DDL) but transaction-control
-        # statements (SET/BEGIN/RESET/COMMIT/ROLLBACK/SAVEPOINT) and
-        # informational statements (SHOW/EXPLAIN) slip through. None of
-        # them are useful to a reader and several change session state.
-        if read_only and not is_select:
-            return {"error": "Read-only access: only SELECT / WITH queries are allowed."}
-
-        try:
-            async with conn.transaction():
-                # PostgreSQL enforces read-only: blocks INSERT/UPDATE/DELETE/
-                # TRUNCATE/DROP/ALTER/CREATE regardless of SQL tricks
-                if read_only:
-                    await conn.execute("SET TRANSACTION READ ONLY")
-
-                if is_select:
-                    rows = await conn.fetch(rewritten)
-                    result_rows = []
-                    for r in rows:
-                        row: dict = {}
-                        for k, v in dict(r).items():
-                            if isinstance(v, uuid.UUID):
-                                row[k] = str(v)
-                            elif hasattr(v, "isoformat"):
-                                row[k] = v.isoformat()
-                            elif isinstance(v, (int, float, str, bool, type(None))):
-                                row[k] = v
-                            else:
-                                row[k] = str(v)
-                        result_rows.append(row)
-                    return {
-                        "kind": "table_query",
-                        "vaults": vault_names,
-                        "columns": list(dict(rows[0]).keys()) if rows else [],
-                        "items": result_rows,
-                        "total": len(result_rows),
-                    }
-                else:
-                    result = await conn.execute(rewritten)
-                    return {
-                        "kind": "table_sql",
-                        "vaults": vault_names,
-                        "result": result,
-                    }
-        except Exception as e:
-            msg = str(e)
-            if read_only and "read-only transaction" in msg:
-                return {"error": "Write operation denied. You have read-only access to this vault."}
-            # Column/table-not-exist errors: enrich with fuzzy-match hint
-            # so agents can self-correct in a single retry instead of
-            # falling back to `information_schema` lookups or
-            # `akb_search(limit=10)` (see issues #34 / #35 / #36).
-            #
-            # Safe re-use of `conn` after the failed transaction —
-            # `async with conn.transaction()` rolls back on exception,
-            # leaving conn in healthy idle state.
+    try:
+        return await get_user_sql_executor().execute(
+            user_id=user_id,
+            sql=rewritten,
+            is_admin=is_admin,
+            vault_names=vault_names,
+        )
+    except PermissionDeniedError as e:
+        # PG ACL denied — the boundary working as designed. Surface
+        # the PG error verbatim so callers know it came from PG, not
+        # from application validation.
+        return {
+            "error": str(e),
+            "code": "permission_denied",
+            "pg_sqlstate": e.pg_sqlstate,
+        }
+    except Exception as e:  # noqa: BLE001 — fall through to enrichment
+        msg = str(e)
+        # Try to enrich column/table-not-exist errors with fuzzy-match
+        # hints (issues #34 / #35 / #36). The enrichment query needs
+        # superuser-class privileges on pg_attribute/pg_class — we
+        # acquire a fresh connection (default role) for it; the SET
+        # LOCAL ROLE from the failed user query is already reset.
+        async with pool.acquire() as conn:
             enriched = await _enrich_undefined_error(
-                conn, msg, allowed_pg_tables=set(table_map.values())
+                conn, msg, allowed_pg_tables=set(table_map.values()),
             )
-            if enriched:
-                return enriched
-            return {"error": msg}
+        if enriched:
+            return enriched
+        return {"error": msg}
 
 
 # Max items listed in fallback hints (when no fuzzy suggestion strong enough).
@@ -594,8 +519,12 @@ async def _enrich_undefined_error(
 async def _fetch_column_meta(conn, table_names: set[str]) -> dict[str, str]:
     """{column_name: pg_type} for the union of `table_names`.
 
-    Backend pool is unsandboxed — `pg_attribute` / `pg_class` reads are
-    fine here; the protected surface is the user-supplied SQL only.
+    Runs under the connection's default role (the backend service
+    role), NOT under the caller's `akb_user_<uid>` — `SET LOCAL ROLE`
+    inside `UserSqlExecutor` is reset on tx rollback, so by the time
+    we're here we have full read access to `pg_attribute` /
+    `pg_class`. The protected surface is the user-supplied SQL only;
+    this enrichment query is application-controlled.
     """
     rows = await conn.fetch(
         """

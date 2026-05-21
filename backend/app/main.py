@@ -195,6 +195,16 @@ async def health():
         except Exception as e:  # noqa: BLE001
             return {"error": str(e)}
 
+    # PG-RBAC subsystem: hook-failure counters + last reconcile
+    # outcome. Lets dashboards / oncall see silent role-sync drift
+    # without grepping logs.
+    rbac_info: dict
+    try:
+        from app.services.role_sync import get_role_sync
+        rbac_info = get_role_sync().metrics_snapshot()
+    except Exception as e:  # noqa: BLE001
+        rbac_info = {"error": str(e)}
+
     return {
         "status": "ok",
         "service": "akb",
@@ -202,6 +212,7 @@ async def health():
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
         "vector_store": vs_info,
+        "rbac": rbac_info,
     }
 
 
