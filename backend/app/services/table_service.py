@@ -162,6 +162,13 @@ async def create_table(
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
+    # PG-native RBAC: grant SELECT/INSERT/UPDATE/DELETE/ALL on the new
+    # vt_* table to the vault's reader/writer/admin group roles. Tables
+    # without these grants are invisible to akb_user_<uid> roles (PG
+    # returns "relation does not exist" or 42501).
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_table_create(vault_id, pg_name)
+
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
@@ -252,6 +259,11 @@ async def drop_table(
         await delete_table_index(str(table_id))
     except Exception as e:  # noqa: BLE001
         logger.warning("table chunk delete failed for %s: %s", table_name, e)
+
+    # PG-native RBAC: DROP TABLE has already cascaded the GRANTs;
+    # this hook exists for symmetry + audit (logs at DEBUG).
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_table_drop(vault_id, pg_name)
 
     logger.info("Table dropped: %s (%s)", table_name, pg_name)
     return {

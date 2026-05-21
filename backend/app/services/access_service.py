@@ -187,6 +187,11 @@ async def grant_access(
                 payload={"vault": vault_name, "user": target_username, "role": role},
             )
 
+    # PG-native RBAC: GRANT akb_vault_<vid>_<role> TO akb_user_<uid>.
+    # Best-effort — reconciler covers drift.
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_grant(vault["id"], target["id"], role)
+
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "role": role, "granted": True}
 
@@ -240,6 +245,10 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
                 actor_id=str(revoker_uid),
                 payload={"vault": vault_name, "user": target_username},
             )
+
+    # PG-native RBAC: REVOKE all vault group memberships from akb_user_<uid>.
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_revoke(vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
     return {"vault": vault_name, "user": target_username, "revoked": True}
@@ -551,6 +560,17 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 },
             )
 
+    # PG-native RBAC: mirror the three system DB writes
+    #   - vaults.owner_id moved → new owner gets admin
+    #   - INSERT vault_access(old_owner, admin) → old owner gets admin
+    #   - DELETE vault_access(new_owner) → clear new owner's pre-existing
+    #     membership (the admin grant above replaces it)
+    from app.services.role_sync import get_role_sync
+    rs = get_role_sync()
+    await rs.on_revoke(vault["id"], new_owner["id"])  # clear prior membership
+    await rs.on_grant(vault["id"], new_owner["id"], "admin")
+    await rs.on_grant(vault["id"], vault["owner_id"], "admin")
+
     logger.info("Transferred ownership of %s to %s", vault_name, new_owner_username)
     return {"vault": vault_name, "new_owner": new_owner_username, "transferred": True}
 
@@ -748,6 +768,11 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     # commit (the first that materialises the worktree).
     GitService().cleanup_vault_dirs(vault_name)
 
+    # PG-native RBAC: drop the three vault group roles. Memberships
+    # auto-clean as part of DROP ROLE.
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_vault_delete(vault_id)
+
     logger.info("Deleted vault: %s", vault_name)
     return {"deleted": True, "vault": vault_name}
 
@@ -793,6 +818,11 @@ async def delete_user_account(user_id: str) -> dict:
         await conn.execute("UPDATE todos SET created_by = NULL WHERE created_by = $1", uid)
         # CASCADE handles memories, tokens, vault_access.user_id
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
+
+    # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles
+    # were already dropped by the per-vault delete_vault calls above.
+    from app.services.role_sync import get_role_sync
+    await get_role_sync().on_user_delete(uid)
 
     logger.info("Deleted user %s (vaults=%d)", user_id, len(deleted_vaults))
     return {"deleted": True, "user_id": user_id, "vaults_deleted": deleted_vaults}
