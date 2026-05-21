@@ -59,6 +59,7 @@ python_version = "3.11"
 # don't ship type stubs. Treat them as Any rather than erroring out — we
 # still get value from intra-codebase type checks.
 ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
 # Gradual typing: untyped function bodies are not type-checked. Tightening
 # to `check_untyped_defs = true` is a follow-up once newer services are
 # fully annotated.

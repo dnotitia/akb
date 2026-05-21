@@ -76,7 +76,7 @@ CODE_OK=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $JWT
 # Change password using JWT3
 RESP=$(curl -sk -X POST "$BASE_URL/api/v1/auth/change-password" \
   -H "Authorization: Bearer $JWT3" -H "$H_JSON" \
-  -d '{"current_password":"test1234","new_password":"new12345"}')
+  -d '{"current_password":"test1234","new_password":"new12345"}') # pragma: allowlist secret
 echo "$RESP" | grep -q '"ok":true' && pass "T3 password changed" \
   || fail "T3 change" "$RESP"
 
