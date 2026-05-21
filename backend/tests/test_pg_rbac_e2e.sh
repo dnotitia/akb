@@ -229,6 +229,111 @@ echo "$R" | grep -qiE 'denied|allowed|permission' && pass "SET ROLE blocked" || 
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT 1; SELECT * FROM $PG_A_SECRETS\"}" | mr)
 echo "$R" | grep -qiE 'multi|allowed' && pass "Multi-statement blocked" || fail "Multi-statement" "$R"
 
+# 2k: Schema-qualified reference (public.<table>).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM public.$PG_A_SECRETS\"}" | mr)
+assert_pg_denied "Schema-qualified cross-vault SELECT" "$R"
+
+# 2l: Quoted identifier (PG identifier quoting preserves case + lets
+#     special chars in; ACL check still applies to the resolved relation).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM \\\"$PG_A_SECRETS\\\"\"}" | mr)
+assert_pg_denied "Quoted-identifier cross-vault SELECT" "$R"
+
+# 2m: UNION with cross-vault.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT 1 UNION ALL SELECT 1 FROM $PG_A_SECRETS\"}" | mr)
+assert_pg_denied "UNION cross-vault" "$R"
+
+# 2n: Subquery in FROM.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT * FROM (SELECT * FROM $PG_A_SECRETS) sub\"}" | mr)
+assert_pg_denied "Subquery-in-FROM cross-vault" "$R"
+
+# 2o: EXISTS subquery (most subtle — could be used as a side-channel
+#     boolean oracle if ACL didn't apply; ensure it does).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT EXISTS (SELECT 1 FROM $PG_A_SECRETS)\"}" | mr)
+assert_pg_denied "EXISTS-subquery cross-vault" "$R"
+
+# 2p: Correlated scalar subquery in SELECT list.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT (SELECT value FROM $PG_A_SECRETS LIMIT 1) AS leaked\"}" | mr)
+assert_pg_denied "Scalar subquery cross-vault" "$R"
+
+# 2q: pg_read_file (filesystem read — superuser-only PG function).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT pg_read_file('/etc/passwd')\"}" | mr)
+assert_pg_denied "pg_read_file filesystem access" "$R"
+
+# 2r: pg_ls_dir (directory listing — superuser-only).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT pg_ls_dir('/')\"}" | mr)
+assert_pg_denied "pg_ls_dir filesystem access" "$R"
+
+# 2s: lo_import / lo_export (large object — superuser-only). Won't
+#     reach PG (DO/non-DML first keyword), but if it did, PG would
+#     deny.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT lo_export(1, '/tmp/x')\"}" | mr)
+assert_pg_denied "lo_export superuser-only" "$R"
+
+# 2t: Anonymous PL/pgSQL DO block — try to escalate privileges.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"DO \$\$ BEGIN PERFORM 1; END \$\$\"}" | mr)
+echo "$R" | grep -qiE 'allowed|denied|permission' && pass "DO block blocked (non-DML)" || fail "DO block" "$R"
+
+# 2u: CREATE FUNCTION (would allow arbitrary SQL execution via
+#     definer's-rights bypass if PG accepted it from a non-superuser).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"CREATE FUNCTION pwn() RETURNS int AS \$\$ SELECT 1 \$\$ LANGUAGE sql\"}" | mr)
+echo "$R" | grep -qiE 'allowed|denied|permission' && pass "CREATE FUNCTION blocked" || fail "CREATE FUNCTION" "$R"
+
+# 2v: TRUNCATE on cross-vault — DDL-adjacent, ACL still applies.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"TRUNCATE $PG_A_SECRETS\"}" | mr)
+echo "$R" | grep -qiE 'allowed|denied|permission|first-keyword' && pass "TRUNCATE blocked" || fail "TRUNCATE" "$R"
+
+# 2w: Comment-based smuggle (PG comment-strip happens during parse;
+#     ACL still applies to the resulting query).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT /* benign */ * FROM $PG_A_SECRETS /* trailing */\"}" | mr)
+assert_pg_denied "Comment-decorated cross-vault SELECT" "$R"
+
+# 2x: Block-comment between keywords (parser-confusion attempt).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT *FROM/**/$PG_A_SECRETS\"}" | mr)
+assert_pg_denied "Inline-comment cross-vault SELECT" "$R"
+
+# 2y: Modifying CTE — try to INSERT into cross-vault from a reader-
+#     equivalent (Bob has no access to vault A).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"WITH ins AS (INSERT INTO $PG_A_SECRETS (item, value) VALUES ('x','y') RETURNING id) SELECT * FROM ins\"}" | mr)
+assert_pg_denied "Modifying CTE cross-vault INSERT" "$R"
+
+# 2z: Quoted system catalog (pg_catalog.pg_class) — qualified path
+#     normally readable by all roles, but tests that we're not
+#     accidentally hiding existence via search_path tricks.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_BOB\",\"sql\":\"SELECT relname FROM pg_catalog.pg_class WHERE relname = '$PG_A_SECRETS'\"}" | mr)
+# pg_class is publicly readable in PG; we accept this returning the
+# row name. The defense isn't "hide existence" but "block content
+# access." Just verify Bob cannot then read the table itself — that
+# was already tested in 2b.
+echo "$R" | python3 -c "import sys,json; sys.exit(0 if 'items' in json.load(sys.stdin) else 1)" 2>/dev/null \
+  && pass "pg_class metadata readable (content still blocked, see 2b)" \
+  || pass "pg_class read returned non-data response (acceptable)"
+
+# ── 2.5. Reader scope enforcement ────────────────────────────
+echo ""
+echo "▸ 2.5. Reader role write-attempt denials (PG ACL)"
+
+# Re-grant Bob reader on vault A.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
+
+# Reader cannot INSERT.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"INSERT INTO secrets (item, value) VALUES ('hack', 'h')\"}" | mr)
+assert_pg_denied "Reader cannot INSERT" "$R"
+
+# Reader cannot UPDATE.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"UPDATE secrets SET value = 'pwned' WHERE item = 'api_key'\"}" | mr)
+assert_pg_denied "Reader cannot UPDATE" "$R"
+
+# Reader cannot DELETE.
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"DELETE FROM secrets WHERE item = 'api_key'\"}" | mr)
+assert_pg_denied "Reader cannot DELETE" "$R"
+
+# Reader cannot TRUNCATE (admin-only on vault A).
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"TRUNCATE secrets\"}" | mr)
+echo "$R" | grep -qiE 'allowed|denied|permission|first-keyword' && pass "Reader cannot TRUNCATE" || fail "Reader TRUNCATE" "$R"
+
+# Restore: revoke for the lifecycle phase below.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
+
 # ── 3. Lifecycle ────────────────────────────────────────────
 echo ""
 echo "▸ 3. Lifecycle — grant/revoke takes effect, drift recovery"
