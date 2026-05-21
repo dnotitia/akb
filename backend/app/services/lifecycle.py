@@ -9,9 +9,10 @@ from __future__ import annotations
 import logging
 
 from app.config import settings
-from app.db.postgres import close_pool, init_db
+from app.db.postgres import close_pool, get_pool, init_db
 from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
 from app.services.git_service import GitService
+from app.services.role_sync import RoleSync, set_role_sync
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger("akb.lifecycle")
@@ -59,6 +60,20 @@ async def init_storage() -> None:
         logger.info("Vector store schema ensured (eager init)")
     except Exception as e:  # noqa: BLE001 — fall through so degraded probes can surface it
         logger.warning("Vector store eager init failed (will retry per-worker): %s", e)
+    # PG-native RBAC: reconcile role + GRANT state with the catalog
+    # (users + vaults + vault_access + vault_tables). Idempotent —
+    # creates missing roles, drops orphans, applies table-level GRANTs.
+    # akb_sql relies on this state to enforce vault isolation via PG
+    # ACL. Lifecycle hooks emit role DDL online for low-latency UX;
+    # this reconciler is the convergence + drift-recovery mechanism.
+    pool = await get_pool()
+    role_sync = RoleSync(pool)
+    set_role_sync(role_sync)
+    try:
+        report = await role_sync.reconcile_from_catalog()
+        logger.info("RoleSync reconcile at startup: %s", report)
+    except Exception as e:  # noqa: BLE001
+        logger.error("RoleSync reconcile failed at startup: %s", e)
 
 
 def start_workers() -> None:
