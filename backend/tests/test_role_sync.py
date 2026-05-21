@@ -350,3 +350,102 @@ async def test_metrics_records_failure_on_invalid_scope(pool, role_sync):
     await role_sync.on_grant(uuid.uuid4(), uuid.uuid4(), "owner")
     assert role_sync.metrics.total_failures() == starting + 1
     assert role_sync.metrics.failures.get("on_grant", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_diff_detects_missing_table_grant(pool, role_sync, cleanup_roles):
+    """Manually REVOKE SELECT from a vault reader role on a vt_* table;
+    diff_against_catalog must surface the exact (table, scope) missing
+    so an operator can act before reconcile."""
+    created, _ = cleanup_roles
+
+    # Wire up a synthetic vault + table the same way create_vault /
+    # create_table would. Raw SQL keeps the test independent of the
+    # service layer.
+    owner_id = uuid.uuid4()
+    vid = uuid.uuid4()
+    vname = f"_t_diff_tg_{vid.hex[:8]}"
+    tname = f"items_{vid.hex[:6]}"
+    pg_name = f"vt_{vname}__{tname}"
+    for scope in ("reader", "writer", "admin"):
+        created.append(vault_group_role_name(vid, scope))
+    created.append(user_role_name(owner_id))
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (id, username, email, password_hash)
+            VALUES ($1, $2, $3, 'x')
+            """,
+            owner_id, f"_t_diff_owner_{owner_id.hex[:8]}",
+            f"_t_diff_owner_{owner_id.hex[:8]}@test",
+        )
+        await conn.execute(
+            """
+            INSERT INTO vaults (id, name, description, git_path, owner_id)
+            VALUES ($1, $2, '', $3, $4)
+            """,
+            vid, vname, f"/tmp/{vname}.git", owner_id,
+        )
+        await conn.execute(
+            f"""
+            CREATE TABLE "{pg_name}" (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                label TEXT
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO vault_tables (id, vault_id, name, description, columns)
+            VALUES ($1, $2, $3, '', '[]'::jsonb)
+            """,
+            uuid.uuid4(), vid, tname,
+        )
+
+    try:
+        await role_sync.on_user_create(owner_id)
+        await role_sync.on_vault_create(vid, owner_user_id=owner_id)
+        await role_sync.on_table_create(vid, pg_name)
+
+        # Fresh state: no drift for this table.
+        diff = await role_sync.diff_against_catalog()
+        for tg in diff.missing_table_grants:
+            assert tg["table"] != pg_name, (
+                f"unexpected drift on freshly-created table: {tg}"
+            )
+
+        # Now sabotage: manually revoke SELECT from the reader role.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f'REVOKE SELECT ON "{pg_name}" FROM '
+                f'"{vault_group_role_name(vid, "reader")}"'
+            )
+
+        diff2 = await role_sync.diff_against_catalog()
+        hits = [
+            tg for tg in diff2.missing_table_grants
+            if tg["table"] == pg_name and tg["scope"] == "reader"
+        ]
+        assert hits, (
+            f"diff failed to detect missing SELECT on reader; "
+            f"missing_table_grants={diff2.missing_table_grants}"
+        )
+        assert "SELECT" in hits[0]["missing_privileges"]
+        assert not diff2.is_clean()
+
+        # Reconcile should re-apply the GRANT.
+        await role_sync.reconcile_from_catalog()
+        diff3 = await role_sync.diff_against_catalog()
+        residual = [
+            tg for tg in diff3.missing_table_grants if tg["table"] == pg_name
+        ]
+        assert not residual, (
+            f"reconcile did not heal the GRANT: residual={residual}"
+        )
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(f'DROP TABLE IF EXISTS "{pg_name}"')
+            await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vid)
+            await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+            await conn.execute("DELETE FROM users WHERE id = $1", owner_id)

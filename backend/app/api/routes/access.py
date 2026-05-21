@@ -236,6 +236,7 @@ async def admin_role_state(user: AuthenticatedUser = Depends(get_current_user)):
         "missing_memberships": diff.missing_memberships,
         "missing_public_grants": diff.missing_public_grants,
         "stale_public_grants": diff.stale_public_grants,
+        "missing_table_grants": diff.missing_table_grants,
         "authenticated_role_missing": diff.authenticated_role_missing,
         "users_not_in_authenticated": diff.users_not_in_authenticated,
     }

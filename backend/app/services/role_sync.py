@@ -167,6 +167,7 @@ class RoleStateDiff:
     missing_memberships: list[dict] = field(default_factory=list)
     missing_public_grants: list[dict] = field(default_factory=list)
     stale_public_grants: list[dict] = field(default_factory=list)
+    missing_table_grants: list[dict] = field(default_factory=list)
     authenticated_role_missing: bool = False
     users_not_in_authenticated: list[str] = field(default_factory=list)
 
@@ -179,12 +180,23 @@ class RoleStateDiff:
             + len(self.missing_memberships)
             + len(self.missing_public_grants)
             + len(self.stale_public_grants)
+            + len(self.missing_table_grants)
             + (1 if self.authenticated_role_missing else 0)
             + len(self.users_not_in_authenticated)
         )
 
     def is_clean(self) -> bool:
         return self.drift_count() == 0
+
+
+# Privileges that the reconciler grants on every vt_* table, keyed by
+# scope. Used by `_diff_table_grants` to spot drift (a hook silently
+# failed; an operator REVOKE'd manually). Matches `_grant_table`.
+_EXPECTED_TABLE_PRIVS: dict[str, frozenset[str]] = {
+    "reader": frozenset({"SELECT"}),
+    "writer": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
+    "admin": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"}),
+}
 
 
 # ── Hook telemetry ────────────────────────────────────────────
@@ -677,13 +689,11 @@ class RoleSync:
         structured diff that operators can inspect via
         ``GET /admin/role-state`` before triggering a reconcile.
 
-        Table-level GRANT drift is intentionally NOT walked here: it
-        would require iterating every `vt_*` table's ACL via
-        `has_table_privilege` per (role, table, scope) triple, which
-        is O(vaults × tables × scopes) round-trips. Memberships and
-        public-access grants are the durable-drift surface; table
-        grants are emitted at table-create time and never revoked
-        outside table-drop.
+        All passes use bulk catalog queries (one `pg_roles`, one
+        `pg_auth_members`, one `information_schema.role_table_grants`)
+        so the total cost is O(catalog rows) regardless of vault count.
+        Per-table `has_table_privilege` introspection is explicitly
+        avoided.
         """
         diff = RoleStateDiff()
         async with self.pool.acquire() as conn:
@@ -692,6 +702,7 @@ class RoleSync:
             await self._diff_memberships(conn, diff)
             await self._diff_public_grants(conn, diff)
             await self._diff_authenticated(conn, diff)
+            await self._diff_table_grants(conn, diff)
         return diff
 
     async def _diff_users(
@@ -789,6 +800,68 @@ class RoleSync:
                     )
         for stale in actual_grants - wanted_grants:
             diff.stale_public_grants.append({"role": stale})
+
+    async def _diff_table_grants(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        """Detect per-table GRANT drift on `vt_*` tables.
+
+        Sources of drift this catches:
+          - `on_table_create` hook fired but PG returned a transient
+            error → GRANTs never applied. Next user akb_sql on the
+            table returns 42501.
+          - Operator manually REVOKE'd a privilege without realising
+            the reconciler owns this state.
+          - DB restore from a snapshot taken before some tables were
+            granted.
+
+        One catalog-wide query, set difference in memory. The expected
+        privilege set per scope mirrors `_grant_table`."""
+        # Lazy import — same pattern as the table-grants reconcile pass.
+        from app.repositories import table_data_repo
+
+        # 1. All existing GRANTs of an akb_vault_* role on a vt_* table.
+        grant_rows = await conn.fetch(
+            """
+            SELECT grantee, table_name, privilege_type
+              FROM information_schema.role_table_grants
+             WHERE table_schema = 'public'
+               AND table_name LIKE 'vt\\_%' ESCAPE '\\'
+               AND grantee LIKE 'akb_vault\\_%' ESCAPE '\\'
+            """
+        )
+        actual: dict[tuple[str, str], set[str]] = {}
+        for r in grant_rows:
+            actual.setdefault((r["grantee"], r["table_name"]), set()).add(
+                r["privilege_type"],
+            )
+
+        # 2. Expected: every (vault_table, scope, expected_privs).
+        table_rows = await conn.fetch(
+            """
+            SELECT vt.vault_id, vt.name, v.name AS vault_name
+              FROM vault_tables vt
+              JOIN vaults v ON vt.vault_id = v.id
+            """
+        )
+        for tr in table_rows:
+            pg_name = table_data_repo.pg_table_name(tr["vault_name"], tr["name"])
+            if not _is_safe_pg_table_name(pg_name):
+                continue
+            for scope, expected in _EXPECTED_TABLE_PRIVS.items():
+                role = vault_group_role_name(tr["vault_id"], scope)
+                got = actual.get((role, pg_name), set())
+                missing = expected - got
+                if missing:
+                    diff.missing_table_grants.append(
+                        {
+                            "vault_id": str(tr["vault_id"]),
+                            "table": pg_name,
+                            "scope": scope,
+                            "role": role,
+                            "missing_privileges": sorted(missing),
+                        }
+                    )
 
     async def _diff_authenticated(
         self, conn: asyncpg.Connection, diff: RoleStateDiff,
