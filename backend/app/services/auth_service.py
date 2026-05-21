@@ -260,13 +260,24 @@ async def update_profile(
 
 # ── PAT operations ──────────────────────────────────────────
 
-async def create_pat(user_id: str, name: str, scopes: list[str] | None = None, expires_days: int | None = None) -> dict:
+async def create_pat(user_id: str, name: str, *, expires_days: int | None = None) -> dict:
+    """Issue a Personal Access Token.
+
+    Scopes are NOT a caller-tunable knob: the backend doesn't enforce
+    them anywhere, so accepting a `scopes` argument would falsely
+    imply that a "read-only" PAT exists. Tokens always store the full
+    `[read, write]` default; the response surfaces it so listings stay
+    consistent. When scope enforcement is wired into the request
+    handlers, re-introduce the argument with the matching check.
+    """
     pool = await get_pool()
     raw_token, token_hash, token_prefix = generate_pat()
 
     expires_at = None
     if expires_days:
         expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+
+    default_scopes = ["read", "write"]
 
     async with pool.acquire() as conn:
         token_id = uuid.uuid4()
@@ -280,7 +291,7 @@ async def create_pat(user_id: str, name: str, scopes: list[str] | None = None, e
             name,
             token_hash,
             token_prefix,
-            scopes or ["read", "write"],
+            default_scopes,
             expires_at,
         )
 
@@ -289,7 +300,7 @@ async def create_pat(user_id: str, name: str, scopes: list[str] | None = None, e
         "token_id": str(token_id),
         "name": name,
         "prefix": token_prefix,
-        "scopes": scopes or ["read", "write"],
+        "scopes": default_scopes,
         "expires_at": expires_at.isoformat() if expires_at else None,
         "note": "Save this token — it won't be shown again.",
     }
