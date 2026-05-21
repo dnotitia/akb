@@ -207,3 +207,31 @@ async def admin_reset_user_password(
         method="admin_ui",
     )
     return {"temporary_password": temp, "username": username}
+
+
+@router.post(
+    "/admin/reconcile-roles",
+    summary="[admin] Reconcile PG roles with the AKB catalog",
+)
+async def admin_reconcile_roles(user: AuthenticatedUser = Depends(get_current_user)):
+    """Reconcile PostgreSQL role + GRANT state with the AKB catalog.
+
+    The reconciler runs automatically at backend startup. This endpoint
+    is for drift recovery: an operator that suspects role state has
+    diverged (manual edits, partial lifecycle hook failure, restore
+    from snapshot, …) can force a reconciliation without restarting
+    the backend. Idempotent.
+    """
+    _require_admin(user)
+    from app.services.role_sync import get_role_sync
+    report = await get_role_sync().reconcile_from_catalog()
+    return {
+        "reconciled": True,
+        "user_roles_created": report.user_roles_created,
+        "user_roles_dropped": report.user_roles_dropped,
+        "vault_roles_created": report.vault_roles_created,
+        "vault_roles_dropped": report.vault_roles_dropped,
+        "grants_added": report.grants_added,
+        "table_grants_applied": report.table_grants_applied,
+        "errors": report.errors,
+    }
