@@ -17,9 +17,11 @@ question:
 
 Run inside the backend container so it shares the working DSN:
 
-  docker compose exec -T \\
-    -e AKB_TEST_DSN=postgresql://akb:akb@postgres:5432/akb \\
-    backend python3 scripts/bench_pg_rbac.py
+  docker compose exec -T -e AKB_TEST_DSN="$DSN" backend \\
+    python3 scripts/bench_pg_rbac.py
+
+…where ``$DSN`` is the docker-compose internal Postgres URL
+(``postgresql://<user>:<password>@postgres:5432/akb``).
 
 Pass `--users N --vaults M` to size the reconcile workload; the
 synthetic users / vaults are dropped at the end so the dev DB stays
@@ -49,7 +51,7 @@ from app.services.role_sync import (  # noqa: E402
 )
 
 
-_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@postgres:5432/akb")
+_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@postgres:5432/akb")  # pragma: allowlist secret
 
 
 def _stats(samples_us: list[float], label: str) -> dict:

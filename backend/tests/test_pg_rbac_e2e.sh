@@ -109,9 +109,11 @@ R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_table" "{\"vault\":\"$VAULT_B\"
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_B\",\"sql\":\"INSERT INTO notes (topic) VALUES ('hello')\"}" >/dev/null 2>&1
 pass "Vault B has table 'notes'"
 
-# Derive physical PG names (matches table_data_repo.pg_table_name)
+# Derive physical PG names (matches table_data_repo.pg_table_name).
+# detect-secrets flags the literal word in the variable name; it's a
+# table name, not a credential — pragma to whitelist.
 sanitize() { echo "$1" | tr '[:upper:]-' '[:lower:]_'; }
-PG_A_SECRETS="vt_$(sanitize "$VAULT_A")__secrets"
+PG_A_SECRETS="vt_$(sanitize "$VAULT_A")__secrets"  # pragma: allowlist secret
 PG_B_NOTES="vt_$(sanitize "$VAULT_B")__notes"
 
 # ── 1. Positive cases ────────────────────────────────────────

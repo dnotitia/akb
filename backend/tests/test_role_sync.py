@@ -6,7 +6,7 @@ lifecycle wiring. Each test acquires its own pool, applies init.sql
 to a throwaway DB or the dev DB, and cleans up after itself.
 
 DSN comes from ``AKB_TEST_DSN`` (default
-``postgresql://akb:akb@localhost:15432/akb`` to match the dev override).
+``postgresql://akb:akb@localhost:15432/akb`` to match the dev override).  # pragma: allowlist secret
 Skip the module if the DB isn't reachable — running ``pytest`` without
 a local Postgres is still a no-op rather than a failure.
 """
@@ -34,7 +34,7 @@ from app.services.role_sync import (
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:15432/akb",
+    "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 
 
