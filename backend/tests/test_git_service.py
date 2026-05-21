@@ -1,16 +1,13 @@
-"""Unit tests for GitService bulk-delete behaviour.
+"""Unit tests for GitService write behaviour.
 
 GitService writes to `git_storage_path` from settings. Passing a tmp
 `storage_path` to the constructor bypasses that entirely, so these
 tests never touch the real `/data/vaults` directory.
-
-The full write path requires a non-empty bare repo (otherwise
-`_ensure_worktree` returns None and writes fall back to the clone
-path). We seed each vault with one `commit_file` to get past that.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
@@ -29,7 +26,7 @@ def vault(git_service):
     """Initialise a vault with one seed commit so the worktree exists.
 
     Returns the vault name. The seed commit is on a single throwaway
-    file ('seed.md') the bulk-delete tests do not touch.
+    file ('seed.md') the write tests do not touch.
     """
     name = f"test_vault_{uuid.uuid4().hex[:8]}"
     git_service.init_vault(name)
@@ -44,6 +41,122 @@ def vault(git_service):
 
 def _vault_commit_count(git_service: GitService, vault_name: str) -> int:
     return len(git_service.vault_log(vault_name, max_count=1000))
+
+
+def _block_chdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_chdir(path: str) -> None:
+        raise AssertionError(f"os.chdir must not be used by GitService writes: {path}")
+
+    monkeypatch.setattr(os, "chdir", fail_chdir)
+
+
+def test_commit_file_creates_initial_commit(git_service: GitService) -> None:
+    name = f"test_vault_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+
+    sha = git_service.commit_file(
+        vault_name=name,
+        file_path="first.md",
+        content="first\n",
+        message="initial document",
+        author_name="Ada Lovelace",
+        author_email="ada@example.dev",
+    )
+
+    assert len(sha) == 40
+    assert git_service.read_file(name, "first.md") == "first\n"
+    assert _vault_commit_count(git_service, name) == 1
+
+
+def test_commit_file_existing_worktree_preserves_author_and_message(git_service: GitService, vault: str) -> None:
+    before = _vault_commit_count(git_service, vault)
+
+    sha = git_service.commit_file(
+        vault_name=vault,
+        file_path="authored.md",
+        content="body\n",
+        message="custom subject\n\nbody line",
+        author_name="Ada Lovelace",
+        author_email="ada@example.dev",
+    )
+
+    after = _vault_commit_count(git_service, vault)
+    latest = git_service.vault_log(vault, max_count=1)[0]
+
+    assert len(sha) == 40
+    assert after == before + 1
+    assert latest["hash"] == sha[:12]
+    assert latest["subject"] == "custom subject"
+    assert latest["author"] == "Ada Lovelace"
+    assert git_service.read_file(vault, "authored.md") == "body\n"
+
+
+def test_delete_file_removes_file_and_creates_commit(git_service: GitService, vault: str) -> None:
+    git_service.commit_file(
+        vault_name=vault,
+        file_path="delete-me.md",
+        content="delete me",
+        message="add delete-me",
+    )
+    before = _vault_commit_count(git_service, vault)
+
+    sha = git_service.delete_file(
+        vault_name=vault,
+        file_path="delete-me.md",
+        message="delete delete-me",
+    )
+
+    after = _vault_commit_count(git_service, vault)
+    latest = git_service.vault_log(vault, max_count=1)[0]
+
+    assert len(sha) == 40
+    assert after == before + 1
+    assert latest["hash"] == sha[:12]
+    assert latest["subject"] == "delete delete-me"
+    assert git_service.read_file(vault, "delete-me.md") is None
+
+
+def test_write_paths_do_not_call_os_chdir(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = f"test_vault_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+
+    _block_chdir(monkeypatch)
+
+    git_service.commit_file(
+        vault_name=name,
+        file_path="seed.md",
+        content="seed\n",
+        message="seed",
+    )
+    git_service.commit_file(
+        vault_name=name,
+        file_path="delete-me.md",
+        content="delete me",
+        message="add delete-me",
+    )
+    git_service.delete_file(
+        vault_name=name,
+        file_path="delete-me.md",
+        message="delete delete-me",
+    )
+    for path in ("bulk-a.md", "bulk-b.md"):
+        git_service.commit_file(
+            vault_name=name,
+            file_path=path,
+            content=path,
+            message=f"add {path}",
+        )
+
+    sha = git_service.delete_paths_bulk(
+        vault_name=name,
+        file_paths=["bulk-a.md", "bulk-b.md"],
+        message="bulk delete",
+    )
+
+    assert sha is not None
 
 
 def test_delete_paths_bulk_removes_files_and_creates_one_commit(git_service, vault):
