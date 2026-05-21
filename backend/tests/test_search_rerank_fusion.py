@@ -2,7 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.exceptions import ValidationError
 from app.services.search_service import (
+    SearchService,
     fuse_original_and_reranked_hits,
     resolve_first_stage_unique_limit,
 )
@@ -66,3 +68,28 @@ def test_first_stage_unique_limit_keeps_legacy_rerank_off_default():
         rerank_prefetch=30,
         search_prefetch=0,
     ) == 5
+
+
+@pytest.mark.asyncio
+async def test_search_requires_vault_or_user_id():
+    """Mirror of the same guard in `grep`: a caller that forwards
+    neither `vault` nor `user_id` would otherwise fall through to an
+    unscoped cross-vault scan. All current callers (REST /search, MCP
+    akb_search) forward `user_id`, so this is defense-in-depth for
+    any future caller that forgets."""
+    svc = SearchService()
+    with pytest.raises(ValidationError):
+        await svc.search(query="anything")
+    with pytest.raises(ValidationError):
+        await svc.search(query="anything", vault=None, user_id=None)
+    # Either argument present is enough — no raise.
+    # (Don't actually run the search; just verify the guard returns
+    # control flow back so something further can happen. Catching
+    # downstream errors keeps this a pure-guard unit test that
+    # doesn't need a DB.)
+    try:
+        await svc.search(query="x", vault="v")
+    except ValidationError:
+        pytest.fail("Should not raise ValidationError when vault is set")
+    except Exception:
+        pass  # downstream (DB / embedding) is fine to fail; we only assert the guard

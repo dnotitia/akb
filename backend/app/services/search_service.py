@@ -116,6 +116,15 @@ class SearchService:
         user_id: str | None = None,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow."""
+        # ACL guard mirroring `grep` below: when neither vault nor
+        # user_id scopes the query, the prefilter block ends up
+        # skipped (has_filters=False) and `_run_vector_search` runs
+        # unscoped — a cross-vault scan. The MCP and REST handlers
+        # both forward user_id today (see issue #66 / PR #67), but
+        # this self-defends against any future caller that forgets.
+        if vault is None and user_id is None:
+            raise ValidationError("vault or user_id required")
+
         pool = await get_pool()
 
         # Generate query embedding. When the embedding API is down we still
