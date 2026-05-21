@@ -330,8 +330,8 @@ async def revoke_pat(user_id: str, token_id: str) -> bool:
 # stable — SIEM/audit subscribers filter on these.
 REVOKE_REASON_SELF = "self"
 REVOKE_REASON_ADMIN = "admin"
-REVOKE_REASON_PASSWORD_CHANGE = "password_change"
-REVOKE_REASON_PASSWORD_RESET = "password_reset"
+REVOKE_REASON_PASSWORD_CHANGE = "password_change"  # pragma: allowlist secret
+REVOKE_REASON_PASSWORD_RESET = "password_reset"  # pragma: allowlist secret
 
 
 async def _revoke_sessions_in_conn(
