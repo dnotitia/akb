@@ -70,9 +70,15 @@ server = Server("akb", instructions=INSTRUCTIONS)
 
 class _MCPUser:
     """Resolved user from MCP request context."""
-    def __init__(self, user_id: str = "00000000-0000-0000-0000-000000000000", username: str = "system"):
+    def __init__(
+        self,
+        user_id: str = "00000000-0000-0000-0000-000000000000",
+        username: str = "system",
+        is_admin: bool = False,
+    ):
         self.user_id = user_id
         self.username = username
+        self.is_admin = is_admin
 
 _FALLBACK_USER = _MCPUser()
 
@@ -92,7 +98,7 @@ async def _get_user() -> _MCPUser:
             if auth_header:
                 user = await resolve_token(auth_header)
                 if user:
-                    return _MCPUser(user.user_id, user.username)
+                    return _MCPUser(user.user_id, user.username, is_admin=user.is_admin)
     except (LookupError, AttributeError):
         pass
     return _FALLBACK_USER
@@ -497,17 +503,21 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
     if not vaults:
         return {"error": "Must specify vault or vaults parameter"}
 
-    # Check access on all referenced vaults — minimum reader
-    # Collect the lowest role across all vaults
-    read_only = False
+    # Check access on all referenced vaults — minimum reader. This is
+    # the application's friendly 403 gate; if the caller has no
+    # membership at all on a referenced vault, fail fast here rather
+    # than letting PG return permission-denied. Per-statement read/
+    # write enforcement is handled by PG ACL via the caller's role
+    # memberships in akb_vault_<vid>_{reader,writer,admin}.
     for v in vaults:
-        access = await check_vault_access(uid, v, required_role="reader")
-        if access["role"] == "reader":
-            read_only = True
+        await check_vault_access(uid, v, required_role="reader")
 
-    # PostgreSQL SET TRANSACTION READ ONLY enforces write prevention
-    # at the DB level — no SQL parsing tricks can bypass it
-    return await table_service.execute_sql(vaults, sql, read_only=read_only)
+    return await table_service.execute_sql(
+        vault_names=vaults,
+        user_id=uid,
+        sql=sql,
+        is_admin=user.is_admin,
+    )
 
 
 @_h("akb_drop_table")
