@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.1 — keep-alive proxy connections
+
+Performance fix: the stdio ↔ HTTP proxy now reuses TCP+TLS connections to
+the AKB backend via module-level `http.Agent` / `https.Agent` with
+`keepAlive: true`. Each MCP tool call previously paid a fresh handshake
+because Node's default agent ships with keep-alive off; a typical agent
+session chains 5–15 calls, so this saves one round-trip per call
+(~40–100 ms on a nearby cloud backend, more across regions).
+
+No contract change. S3 presigned-URL methods (`_uploadToS3`,
+`_downloadFromS3`) are intentionally unaffected — they target arbitrary
+upload hosts, not the AKB backend.
+
+Thanks to @MackDing for the contribution (#65).
+
 ## 2.0.0 — URI-canonical hard cutover (BREAKING)
 
 The backend MCP contract is now URI-canonical: every resource handle
