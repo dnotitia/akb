@@ -9,12 +9,21 @@
  * - Zero dependencies (Node.js built-in only)
  */
 
-import { request as httpsRequest } from "node:https";
-import { request as httpRequest } from "node:http";
+import { request as httpsRequest, Agent as httpsAgent } from "node:https";
+import { request as httpRequest, Agent as httpAgent } from "node:http";
 import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+
+// ── Connection reuse ───────────────────────────────────────
+// Without keepAlive agents, every MCP tool call (search, browse, put,
+// update, relations, …) triggers a fresh TCP+TLS handshake to the backend.
+// A typical agent session chains 5–15 tool calls; reusing connections
+// saves one round-trip per call (40–100 ms on a nearby cloud backend,
+// more across regions or with slow TLS termination).
+const httpKeepAlive = new httpAgent({ keepAlive: true });
+const httpsKeepAlive = new httpsAgent({ keepAlive: true });
 
 // ── MIME type inference ────────────────────────────────────
 // Covers common file types. Unknown extensions fall back to octet-stream.
@@ -546,6 +555,7 @@ export class AKBProxy {
         path,
         method,
         headers,
+        agent: isHttps ? httpsKeepAlive : httpKeepAlive,
       };
       if (isHttps && this.insecure) opts.rejectUnauthorized = false;
 
