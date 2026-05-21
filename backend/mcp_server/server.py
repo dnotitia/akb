@@ -316,6 +316,8 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_search")
 async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
+    if args.get("vault"):
+        await check_vault_access(uid, args["vault"], required_role="reader")
     result = await search_service.search(
         query=args["query"],
         vault=args.get("vault"),
@@ -323,6 +325,7 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         doc_type=args.get("type"),
         tags=args.get("tags"),
         limit=args.get("limit", 10),
+        user_id=uid,
     )
     return result.model_dump()
 
