@@ -29,6 +29,7 @@ from app.services.index_service import (
 )
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
+from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
 
 # Re-exported helpers used by publication_service for the
 # `table_query` share path. Other modules import directly from
@@ -396,8 +397,6 @@ async def execute_sql(
     role and run as the backend service role — matching the existing
     system-admin trust model. For everyone else, PG is the authority.
     """
-    from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
-
     pool = await get_pool()
     async with pool.acquire() as conn:
         table_map = await table_data_repo.build_table_name_map(conn, vault_names)
