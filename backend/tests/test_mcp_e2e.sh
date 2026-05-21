@@ -471,6 +471,11 @@ R=$(mcp_call2 akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result2)
 DENIED_AGAIN=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
 [ "$DENIED_AGAIN" = "True" ] && pass "User2 denied after revoke" || fail "Post-revoke check" "still has access"
 
+# User2 cannot search again after revoke
+R=$(mcp_call2 akb_search "{\"query\":\"test\",\"vault\":\"$VAULT\"}" | mcp_result2)
+SEARCH_DENIED_AGAIN=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$SEARCH_DENIED_AGAIN" = "True" ] && pass "User2 denied search after revoke" || fail "Post-revoke search" "still returned search access"
+
 # ── 16. Public Access Levels ─────────────────────────────────
 echo ""
 echo "▸ 16. Public Access Levels"
