@@ -92,6 +92,52 @@ path on `akb_drill_down`. Earlier backends will run but the tree
 arm will look much worse than it should — the early-version
 benchmarks in our own history demonstrate exactly that failure mode.
 
+## Findings from the seed run
+
+The dataset we shipped this harness against was a 100-question
+single-vault corpus with ≈ 5 700 documents, a deep section
+hierarchy, and a long-form domain text style. Eight backend
+iterations measured against the same evalset and agent model
+(`qwen3.6-plus`), changing only the search-tool surface between
+runs:
+
+| Run | Backend change | A1 search | A2 grep | A3 tree | A4 all |
+|---|---|---|---|---|---|
+| Early | baseline | 73 % | 33 % | **4 %** | 63 % |
+| Mid | `akb_list_vaults` slim + filter | 80 % | 46 % | 76 % | 86 % |
+| Final | + `akb_browse` slim/filter, `akb_drill_down` pattern + outline | 78 % | 46 % | **81 %** | **84 %** |
+
+What pulled the tree arm from 4 % to 81 % wasn't the agent — it
+was the response shape. The early `akb_list_vaults` returned full
+metadata for every vault, so on a tenant with 70+ vaults the
+target one was silently truncated past the client's read window;
+the agent then hallucinated answers from its prior. Switching to
+slim `{name, description}` rows with an optional substring filter
+made the target vault visible again. The same shape applied to
+`akb_browse` recovered another 5pp. `akb_drill_down`'s `pattern`
+arg + `outline` fallback closed the remaining sub-section
+discovery gaps.
+
+Other observations the runs surface:
+
+- **`akb_get` is given to every arm.** The harness measures the
+  marginal value of *how the agent finds the right document*, not
+  whether the agent can read at all. With `akb_get` everywhere,
+  the grep-only arm (A2) still tops out around 46 % — finding a
+  URI doesn't help much if the agent then dumps the whole document
+  into context and gets lost. Grep without drill-down is a trap.
+- **A4 (full toolbox) wins by a small margin over A1**, and by a
+  larger margin only on section-pinpoint and weak-token queries.
+  Hybrid search alone is enough for the easy ⅔ of an evalset; the
+  extra tools earn their keep on a long-tail of brittle queries.
+- **Vault descriptions are part of retrieval.** A vault whose
+  description doesn't mention its domain is invisible to an agent
+  doing discovery — the obvious-in-hindsight rule that didn't make
+  it into anyone's onboarding docs until the bench surfaced it.
+
+The Korean-law evalset and per-run summaries that produced these
+numbers live in the private sister repo.
+
 ## What we keep private
 
 The Korean-law evalset, the per-run summaries, the per-query judge
