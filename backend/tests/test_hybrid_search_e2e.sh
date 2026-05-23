@@ -334,6 +334,55 @@ case "$ERR" in
   *) fail "grep mutual excl" "got err=$ERR" ;;
 esac
 
+# ── 10. Default-mode truncation: total_* MUST reflect full scan ──
+# Pre-patch bug: when more docs matched than `limit` allowed in the
+# default snippet response, `total_docs`/`total_matches` aggregated
+# only the post-limit slice. Agents reading those fields as "corpus
+# total" got false-low counts and made early-termination mistakes.
+# Now: `returned_*` = post-limit, `total_*` = full scan, plus a
+# `truncated` flag + hint so the agent can switch to count_only.
+echo ""
+echo "▸ 10. akb_grep default-mode truncation reports full corpus totals"
+
+TRUNC="TruncMarker${RANDOM}${RANDOM}"
+for i in 1 2 3; do
+  mcp_call akb_put \
+    "{\"vault\":\"$VAULT_A\",\"collection\":\"grep-trunc\",\"title\":\"trunc-$i\",\"content\":\"$TRUNC hit ${i}\"}" \
+    >/dev/null
+done
+wait_for_indexing "$INDEX_WAIT"
+
+# limit=1 → 1 doc returned, but full scan must surface total_docs=3.
+R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":1}" | mcp_result)
+RD=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_docs',-1))")
+RM=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_matches',-1))")
+TD=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
+TM=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches',-1))")
+TR=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('truncated',False))")
+HH=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('hint') else 'no')")
+[ "$RD" = "1" ] && [ "$RM" = "1" ] && [ "$TD" = "3" ] && [ "$TM" = "3" ] \
+  && [ "$TR" = "True" ] && [ "$HH" = "yes" ] \
+  && pass "truncated default returned=($RD,$RM) total=($TD,$TM) truncated+hint" \
+  || fail "grep truncated" "returned=($RD,$RM) total=($TD,$TM) truncated=$TR hint=$HH"
+
+# count_only on the same scope must agree with default's total_*.
+R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
+CO_TD=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
+CO_TM=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches',-1))")
+[ "$CO_TD" = "$TD" ] && [ "$CO_TM" = "$TM" ] \
+  && pass "count_only total_* parity ($CO_TD docs, $CO_TM matches)" \
+  || fail "grep count_only parity" "count_only=($CO_TD,$CO_TM) default=($TD,$TM)"
+
+# When everything fits, returned == total, truncated=false, no hint.
+R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":50}" | mcp_result)
+RD2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_docs',-1))")
+TD2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
+TR2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('truncated',True))")
+HH2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('hint') else 'no')")
+[ "$RD2" = "3" ] && [ "$TD2" = "3" ] && [ "$TR2" = "False" ] && [ "$HH2" = "no" ] \
+  && pass "no truncation when all fit (returned=$RD2 total=$TD2 truncated=$TR2 hint=$HH2)" \
+  || fail "grep untruncated" "returned=$RD2 total=$TD2 truncated=$TR2 hint=$HH2"
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"

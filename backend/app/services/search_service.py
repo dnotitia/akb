@@ -670,9 +670,18 @@ class SearchService:
                 "files": files,
             }
 
-        # Apply document limit (default response shape only)
-        result_docs = list(docs.values())[:limit]
-        total_matches = sum(len(d["matches"]) for d in result_docs)
+        # Default response shape: separate "what fit under limit"
+        # (`returned_*`) from "what the full scan actually matched"
+        # (`total_*`). Aligning with the hybrid-search response shape
+        # established by issue #35 (`total_matches` MUST always be ≥
+        # `returned`). Filter out chunk-level ILIKE hits that produced
+        # no line-level matches after `strip_chunk_metadata_header` —
+        # those are not real grep hits.
+        matched_docs = [d for d in docs.values() if d["matches"]]
+        total_docs = len(matched_docs)
+        total_matches = sum(len(d["matches"]) for d in matched_docs)
+        result_docs = matched_docs[:limit]
+        returned_matches = sum(len(d["matches"]) for d in result_docs)
 
         # Replace mode: apply find-and-replace on each matching document.
         # Service-layer `doc_service.update` still wants the doc path
@@ -730,10 +739,20 @@ class SearchService:
         resp = {
             "pattern": pattern,
             "regex": regex,
-            "total_docs": len(clean_results),
+            "returned_docs": len(clean_results),
+            "returned_matches": returned_matches,
+            "total_docs": total_docs,
             "total_matches": total_matches,
+            "truncated": total_docs > len(clean_results),
             "results": clean_results,
         }
+        if resp["truncated"]:
+            resp["hint"] = (
+                f"Showing {len(clean_results)} of {total_docs} matching docs "
+                f"(limit={limit}, {returned_matches} of {total_matches} line matches). "
+                f"For full counts use count_only=true; for the full URI list use "
+                f"files_with_matches=true."
+            )
 
         if total_matches == 0 and not regex:
             metachars = set("|.*+?()[]{}^$\\")

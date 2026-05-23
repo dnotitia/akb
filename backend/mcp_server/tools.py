@@ -275,7 +275,10 @@ TOOLS = [
             "Optionally pass `replace` to find-and-replace across all matching documents. "
             "Three response shapes (mutually exclusive): default lines, `count_only=true` "
             "(grep -c — per-doc counts + total, no snippets), `files_with_matches=true` "
-            "(grep -l — just the URIs that contain the pattern)."
+            "(grep -l — just the URIs that contain the pattern). "
+            "The default shape always reports BOTH `returned_*` (what fit under `limit`) "
+            "and `total_*` (full corpus matches) plus a `truncated` flag — if truncated, "
+            "switch to count_only/files_with_matches for the full picture instead of bumping `limit`."
         ),
         inputSchema={
             "type": "object",
