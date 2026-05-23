@@ -81,6 +81,15 @@ export default function SearchPage() {
   const [literalResults, setLiteralResults] = useState<GrepDoc[]>([]);
   const [total, setTotal] = useState(0);
   const [totalMatches, setTotalMatches] = useState(0);
+  // grep returns both doc-count and line-count; track the "what was
+  // shown" side separately so the header can honestly say "N of M
+  // docs · K of L matches" instead of pretending the response is the
+  // whole population. Defaults to total* when the backend doesn't
+  // distinguish (older grep, or pre-0.2.4 servers).
+  const [returnedDocs, setReturnedDocs] = useState(0);
+  const [returnedMatches, setReturnedMatches] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [vaults, setVaults] = useState<{ name: string }[]>([]);
@@ -122,19 +131,33 @@ export default function SearchPage() {
         setDenseResults(d.results);
         setLiteralResults([]);
         setTotal(d.total);
-        setTotalMatches(0);
+        setTotalMatches(d.total_matches);
+        setReturnedDocs(d.returned);
+        setReturnedMatches(0);
+        setTruncated(Boolean(d.truncated));
+        setHint(d.hint ?? null);
       } else {
         const d = await grepDocs(s, v || undefined);
         setLiteralResults(d.results);
         setDenseResults([]);
         setTotal(d.total_docs);
         setTotalMatches(d.total_matches);
+        // Older servers (< 0.2.4) don't ship returned_*; fall back to
+        // total_* so the header still renders a sensible single count.
+        setReturnedDocs(d.returned_docs ?? d.total_docs);
+        setReturnedMatches(d.returned_matches ?? d.total_matches);
+        setTruncated(Boolean(d.truncated));
+        setHint(d.hint ?? null);
       }
     } catch {
       setDenseResults([]);
       setLiteralResults([]);
       setTotal(0);
       setTotalMatches(0);
+      setReturnedDocs(0);
+      setReturnedMatches(0);
+      setTruncated(false);
+      setHint(null);
     }
     setLoading(false);
   }
@@ -386,6 +409,17 @@ export default function SearchPage() {
         />
       )}
 
+      {truncated && hint && total > 0 && !loading && (
+        <div
+          role="note"
+          className="mt-6 border border-warning/40 bg-warning/5 px-4 py-2.5 coord text-xs leading-relaxed"
+          aria-label="Result set may be incomplete"
+        >
+          <span className="coord-ink mr-2">▲ TRUNCATED</span>
+          {hint}
+        </div>
+      )}
+
       {total > 0 && mode === "dense" && (
         <Tabs defaultValue="all" className="mt-6">
           <TabsList>
@@ -428,7 +462,9 @@ export default function SearchPage() {
           <header className="border-b border-border px-4 py-2 flex items-baseline justify-between">
             <span className="coord-ink">§ RESULTS · LITERAL</span>
             <span className="coord tabular-nums">
-              [{total} docs · {totalMatches} matches]
+              {returnedDocs !== total || returnedMatches !== totalMatches
+                ? `[${returnedDocs} of ${total} docs · ${returnedMatches} of ${totalMatches} matches]`
+                : `[${total} docs · ${totalMatches} matches]`}
             </span>
           </header>
           <ol className="divide-y divide-border">
