@@ -573,7 +573,14 @@ export class AKBProxy {
       });
 
       req.on("error", reject);
-      req.setTimeout(30000, () => req.destroy(new Error("Request timeout (30s)")));
+      // Default 5 min — destructive ops like `akb_delete_vault` on
+      // large vaults (7K+ docs) take well over 30s for the backend
+      // cascade (chunks + vector outbox + git cleanup). Hardcoding
+      // 30s caused the client to abort while the backend continued
+      // processing, leaving the operator with a misleading timeout
+      // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`.
+      const reqTimeoutMs = Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
+      req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout (${Math.round(reqTimeoutMs / 1000)}s)`)));
       if (body) req.write(body);
       req.end();
     });

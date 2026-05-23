@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.2 — bump default request timeout (30s → 5min)
+
+Bug fix: the proxy's per-request timeout was hardcoded to 30s, which
+aborted any operation slower than that on the client side — most
+visibly `akb_delete_vault` against a large vault (7K+ docs), where the
+backend cascade (chunks delete + vector outbox + git cleanup) easily
+runs past 30s. The operator would see `Request timeout (30s)` even
+though the backend kept processing and eventually completed; this
+produced the misleading impression that the delete had failed when in
+fact it had succeeded after the client gave up.
+
+The default is now 5 minutes (300_000 ms). For very large vaults or
+slow links, set `AKB_MCP_REQUEST_TIMEOUT_MS` to override. S3
+upload/download paths remain at 10 min (unchanged).
+
+Longer-term fix (separate backend PR): make `akb_delete_vault` an
+async background job that returns immediately and exposes a status
+endpoint, so client timeout becomes irrelevant.
+
 ## 2.0.1 — keep-alive proxy connections
 
 Performance fix: the stdio ↔ HTTP proxy now reuses TCP+TLS connections to
