@@ -5,6 +5,37 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.2.4 — 2026-05-24
+
+`akb_grep` default response now reports the true corpus-wide totals
+even when the line snippets get truncated under `limit`. The old
+shape aggregated `total_docs` / `total_matches` over the post-limit
+slice — agents that read those as "how many hits exist in the corpus"
+got false-low counts and made early-termination mistakes. Symptom:
+"the pattern only appears in N docs" when the actual count was much
+higher.
+
+New default-mode fields:
+
+- `returned_docs` / `returned_matches` — what fit under `limit`
+- `total_docs` / `total_matches` — full ILIKE scan (no cap)
+- `truncated` (bool) + `hint` — set when there's more than `limit`
+  could hold, recommending `count_only=true` or
+  `files_with_matches=true` instead of bumping `limit`
+
+This aligns `akb_grep` with the `returned` vs `total_matches`
+contract that `akb_search` already follows (issue #35). The
+`count_only=true` and `files_with_matches=true` response shapes are
+unchanged — they always reported full-scan counts and are now also
+the official escape hatch when the default shape reports
+`truncated=true`.
+
+One small correctness side-effect: chunk hits that produced no
+line-level matches after `strip_chunk_metadata_header` (header /
+summary metadata artifacts riding along with every chunk) no longer
+appear as zero-match docs in the response. They were never real
+grep hits.
+
 ## 0.2.3 — 2026-05-23
 
 Agent-facing polish on the search tools introduced in 0.2.1 / 0.2.2.
