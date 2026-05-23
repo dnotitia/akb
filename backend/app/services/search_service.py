@@ -275,10 +275,14 @@ class SearchService:
             if len(unique_hits) >= target_unique:
                 break
 
-        # Capture pre-limit count so callers can tell "this is the full
-        # set" from "first N of more" — the limit-as-count confusion was
-        # observed in the KISA RAG PoC (issue #35).
+        # `total_matches` here is the size of the *prefetch pool* after
+        # source-level dedup, NOT a corpus-wide hit count — vector ANN is
+        # fundamentally top-K. When the pool fills to `target_unique` the
+        # corpus may contain many more hits than we ever fetched, and the
+        # caller deserves an explicit signal (the limit-as-count confusion
+        # this guards against was observed in the KISA RAG PoC, issue #35).
         total_matches = len(unique_hits)
+        prefetch_capped = total_matches >= target_unique
 
         if settings.rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
@@ -290,11 +294,19 @@ class SearchService:
         # backward-compatible (doc_id == source_id) while adding table/file.
         results = await self._hydrate_hits(unique_hits)
         returned = len(results)
+        hint = (
+            "Prefetch pool was capped; the corpus may contain more matches than reported. "
+            "For an exact corpus-wide count of a literal substring use akb_grep with "
+            "count_only=true. Semantic queries are inherently top-K and cannot be "
+            "exhaustively enumerated."
+        ) if prefetch_capped else None
         return SearchResponse(
             query=query,
             total=returned,  # deprecated alias of `returned`
             returned=returned,
             total_matches=total_matches,
+            truncated=prefetch_capped,
+            hint=hint,
             results=results,
         )
 

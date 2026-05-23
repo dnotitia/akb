@@ -293,6 +293,18 @@ TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d
   && pass "total_matches ($TOTAL_M) >= returned ($RETURNED)" \
   || fail "total_matches" "got total_matches=$TOTAL_M returned=$RETURNED"
 
+# ── 7c. truncated + hint signal (prefetch-pool honesty) ──────
+# A small corpus that fits entirely under the prefetch ceiling must
+# report truncated=false / hint=null. Adding the truncated field is
+# what lets agents tell "this is the whole set" from "tip of a deep
+# pool" — `total_matches` alone is a pool-depth read, not a corpus
+# count, since vector ANN is fundamentally top-K (see model docstring).
+TR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('truncated', False))")
+HH=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('hint') else 'no')")
+[ "$TR" = "False" ] && [ "$HH" = "no" ] \
+  && pass "small corpus → truncated=false, hint=null" \
+  || fail "truncated false" "truncated=$TR hint=$HH"
+
 # ── 8. Nonsense query returns 0 ──────────────────────────────
 # Queries with no vocab overlap (random strings, fully OOV tokens) are
 # treated as "no signal" — no dense-only fallback, so total must be 0.

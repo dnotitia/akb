@@ -5,6 +5,33 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.2.5 — 2026-05-24
+
+`akb_search` response now carries a `truncated` boolean and an
+optional `hint`, mirroring the contract that `akb_grep` got in 0.2.4.
+The motivation: `total_matches` in hybrid search was always the
+size of the source-deduped *prefetch pool*, not a corpus-wide hit
+count — vector ANN is fundamentally top-K. When the pool fills to
+the `rerank_prefetch` ceiling (default 30), the corpus may hold
+many more hits than ever reach the response, but the existing
+contract (`total_matches >= returned`) made it look like the
+caller had seen the truth.
+
+Now:
+
+- `truncated=true` iff `total_matches >= target_unique` (the
+  prefetch ceiling computed from `rerank_prefetch` /
+  `search_prefetch` / `limit`). Treats "pool filled" as "there may
+  be more in the corpus."
+- `hint` set when `truncated=true`, recommending `akb_grep` with
+  `count_only=true` for an exact literal-substring count and noting
+  that semantic queries can't be exhaustively enumerated.
+- Model docstring on `SearchResponse` rewritten to call out the
+  pool-depth semantics explicitly.
+
+The `total_matches` value itself is unchanged — same number,
+honest framing. `total` (deprecated alias of `returned`) stays.
+
 ## 0.2.4 — 2026-05-24
 
 `akb_grep` default response now reports the true corpus-wide totals
