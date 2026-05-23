@@ -792,3 +792,27 @@ class SearchService:
                 }
                 for r in rows
             ]
+
+    async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
+        """Return the document's section paths without their bodies.
+
+        Used by `akb_drill_down`'s empty-match fallback to surface the
+        available headings cheaply — pulling full content for a 1000-
+        section doc just to extract heading strings is wasteful.
+        """
+        from app.repositories.document_repo import DocumentRepository
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            doc_match = DocumentRepository.match_clause(2)
+            sql = f"""
+                SELECT c.section_path
+                FROM chunks c
+                JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
+                JOIN vaults v ON d.vault_id = v.id
+                WHERE v.name = $1 AND {doc_match}
+                ORDER BY c.chunk_index
+            """
+            if isinstance(limit, int) and limit > 0:
+                sql += f" LIMIT {int(limit)}"
+            rows = await conn.fetch(sql, vault, doc_id)
+            return [r["section_path"] for r in rows if r["section_path"]]

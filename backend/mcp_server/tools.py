@@ -33,10 +33,26 @@ from app.services import template_registry
 TOOLS = [
     Tool(
         name="akb_list_vaults",
-        description="List all accessible knowledge base vaults.",
+        description=(
+            "List accessible vaults as {name, description} pairs. "
+            "Response is slim — no metadata (id/role/created_at) — to "
+            "fit large tenants in agent context. Returns "
+            "{vaults, total, returned, truncated?, hint?}.\n"
+            "Optional args:\n"
+            "- filter: substring match on name+description (case-insensitive). "
+            "Use to narrow to a domain (e.g. filter='finance').\n"
+            "- limit / offset: pagination when there are many matches.\n"
+            "- include_archived: include archived vaults (default false)."
+        ),
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "filter": {"type": "string", "description": "Substring filter against name+description (case-insensitive)."},
+                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
+                "limit": {"type": "integer", "description": "Cap result count."},
+                "offset": {"type": "integer", "description": "Skip first N (default 0)."},
+                "include_archived": {"type": "boolean", "description": "Include archived vaults (default false)."},
+            },
         },
     ),
     Tool(
@@ -190,7 +206,11 @@ TOOLS = [
             "Browse ALL vault content — documents (by collection), tables, and files. "
             "Without collection: shows top-level collections, tables, and files. "
             "With collection: shows documents and files in that collection. "
-            "Each item carries its canonical `uri` — pass that URI to akb_get / akb_update / akb_delete."
+            "Response is slim by default (no `summary` field) so large vaults "
+            "(70+ collections) fit in the agent's context window. Returns "
+            "{vault, path, items, total, returned, truncated?, hint?}. "
+            "Use `filter` to narrow when you know a domain keyword. Each item "
+            "carries its canonical `uri`."
         ),
         inputSchema={
             "type": "object",
@@ -210,6 +230,11 @@ TOOLS = [
                     "default": "all",
                     "description": "Filter by content type",
                 },
+                "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
+                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
+                "limit": {"type": "integer", "description": "Cap returned item count."},
+                "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
+                "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
             },
             "required": ["vault"],
         },
@@ -271,15 +296,30 @@ TOOLS = [
     Tool(
         name="akb_drill_down",
         description=(
-            "Get section-level (L3) content of a document. "
-            "Returns all sections with their heading paths, or a specific section if filtered. "
-            "Use this to read specific parts without loading the entire document."
+            "Read section-level (L3) content of a document, or list its "
+            "section headings.\n"
+            "Two modes:\n"
+            "- `mode='sections'` (default): return body content of matched "
+            "sections. Filter with `section` (heading substring) and/or "
+            "`pattern` (substring grep on body). On empty match the response "
+            "carries an `outline` so you can retry.\n"
+            "- `mode='outline'`: return heading paths only (no bodies). "
+            "Use this to discover the document's structure cheaply before "
+            "deciding which section to read.\n"
+            "Returns {uri, sections|outline, returned, total?, truncated?, hint?}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
-                "section": {"type": "string", "description": "Section path filter (partial match, e.g. 'Background')"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["sections", "outline"],
+                    "default": "sections",
+                    "description": "'sections' for body content, 'outline' for heading paths only.",
+                },
+                "section": {"type": "string", "description": "Section heading filter (partial match). Used in `sections` mode."},
+                "pattern": {"type": "string", "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."},
             },
             "required": ["uri"],
         },
