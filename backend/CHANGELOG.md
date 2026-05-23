@@ -5,6 +5,94 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.2.3 — 2026-05-23
+
+Agent-facing polish on the search tools introduced in 0.2.1 / 0.2.2.
+Three small changes driven by the agentic-bench v7 review of the tool
+surface; all backward-compatible.
+
+`akb_drill_down` gets a `mode` argument. Previously the only way to
+get a document's outline was to trigger the empty-match fallback —
+agents that just wanted the structure had to ask for sections,
+discard the bodies, and parse heading paths out. `mode='outline'`
+makes that a first-class call (no body fetch, cheap), with the same
+`truncated` / `hint` metadata as the empty-match path. `mode='sections'`
+is the default and preserves the old behaviour.
+
+`akb_list_vaults` and `akb_browse` rename their substring-filter
+argument from `query` to `filter`. The old `query` name collided with
+`akb_search.query` (a natural-language retrieval string), and an
+agent picking between the tools shouldn't have to remember that the
+same parameter name means two different things. The old `query`
+parameter remains accepted as an alias and is marked DEPRECATED in
+the schema; it will be removed in 0.3.0.
+
+Response shape standardisation. List-style responses now share four
+common fields where applicable: `total` (matches before pagination),
+`returned` (items in this response), optional `truncated` (true when
+output was capped beyond the agent's control), optional `hint` (a
+one-line guidance string for retry / pagination). Existing fields
+remain in place for backward compatibility.
+
+## 0.2.2 — 2026-05-23
+
+Two more MCP tool overhauls along the same axis as 0.2.1's
+`akb_list_vaults` slim-down. After fixing vault discovery in v7 of
+the agentic-bench, the next failure modes the bench surfaced were
+the *next* steps in the routing chain — `akb_browse` payloads
+truncating before the agent could see the target collection, and
+`akb_drill_down` returning nothing when the heading guess was off
+by a word.
+
+`akb_browse` — slim by default. The per-item `summary` field is
+multi-paragraph English text and was 80-90 % of the response bytes
+in vaults with 70+ collections (`legalize-kr-external-ro` at the
+6 KB cap). Now dropped unless `include_summary=true`. Adds the
+same `query` / `limit` / `offset` filters as list_vaults so an
+agent searching for a specific collection (e.g. `query='민법'`)
+gets one row, not a truncated list. Response gains `total` /
+`returned`.
+
+`akb_drill_down` — substring grep inside sections + outline
+fallback. The old behaviour matched `section` against heading
+paths only, so queries like `section='부칙'` either fetched the
+entire 부칙 (often > 6 KB and truncated) or returned nothing when
+the agent guessed the wrong heading. Two additions:
+
+- `pattern` arg: case-insensitive substring filter on section
+  bodies. Lets the agent grep *inside* a large section without
+  refetching the whole document — useful for `'부칙'` + a
+  specific 호수, or for finding a cross-reference like
+  `'「개인정보 보호법」 제23조'` without scanning every section.
+- When the (section, pattern) query returns no sections, the
+  response now carries an `outline` field listing the document's
+  available headings (capped at 200) plus a `hint` to retry or
+  call `akb_get`. Replaces the silent empty-result trial-and-
+  error loop observed in agentic-bench v7.
+
+Schemas extended additively; existing callers keep working.
+
+## 0.2.1 — 2026-05-23
+
+`akb_list_vaults` MCP tool overhaul. The previous handler returned
+every accessible vault with full metadata (id, role, created_at,
+status, public_access), which inflated to ~80 bytes per vault. In
+tenants with 70+ vaults the payload hit ~6 KB — exactly the size at
+which the stdio proxy / agent client truncated. Vaults whose name
+sorted late in the alphabet were silently invisible to the agent,
+which then either hallucinated answers or claimed the data wasn't
+in AKB at all. (Observed under
+[agentic-bench v5–v6](../eval/agentic-bench/): the `A3_tree` arm
+hovered around 2-4% PASS purely because `legalize-kr-external-ro`
+was being trimmed off the end of the list.)
+
+The new handler returns `{name, description}` only by default, plus
+optional `query` / `limit` / `offset` / `include_archived` filters
+and a `total` / `returned` count. Same MCP tool name, additive
+schema, so existing callers continue to work; the new args are
+opt-in. REST callers that need the full rows still use
+`GET /api/v1/vaults`.
+
 ## 0.2.0 — 2026-05-21
 
 First public minor release. The headline is the **security model
