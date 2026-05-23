@@ -248,14 +248,17 @@ export const browseVault = (vault: string, collection?: string, depth = 1) => {
 // `total` is the legacy alias of `returned` (kept until the SPA / agent
 // prompts stop reading it). New fields per backend PR #39:
 //   - returned: items in `results` after limit + rerank
-//   - total_matches: unique hits seen in the prefetch window before limit
-// When `total_matches > returned`, surface "first N of more" rather than
-// treating `returned` as the population.
+//   - total_matches: deduped prefetch-pool size, NOT a corpus-wide count
+//     (vector ANN is top-K; see backend SearchResponse docstring)
+//   - truncated / hint: set when the prefetch pool filled, meaning the
+//     corpus may contain more hits than the response surfaces (#77 / 0.2.5).
 export interface SearchResponse {
   query: string;
   total: number;
   returned: number;
   total_matches: number;
+  truncated?: boolean;
+  hint?: string | null;
   results: any[];
 }
 export const searchDocs = (query: string, vault?: string, limit = 10) => {
@@ -275,17 +278,28 @@ export interface GrepDoc {
   title: string;
   matches: GrepMatch[];
 }
-export const grepDocs = (query: string, vault?: string, limit = 20) => {
-  const p = new URLSearchParams({ q: query, limit: String(limit) });
-  if (vault) p.set("vault", vault);
-  return api<{
-    pattern: string;
-    regex: boolean;
-    total_docs: number;
-    total_matches: number;
-    results: GrepDoc[];
-  }>(`/grep?${p}`);
-};
+// Grep response (default mode). `total_*` reflect the full ILIKE scan
+// across the corpus; `returned_*` reflect what fit under `limit` in
+// `results`. `truncated=true` + `hint` are set when the corpus has more
+// matches than the response surfaces — switch to count_only or
+// files_with_matches at the agent / caller level (backend #76 / 0.2.4).
+export interface GrepResponse {
+  pattern: string;
+  regex: boolean;
+  returned_docs?: number;
+  returned_matches?: number;
+  total_docs: number;
+  total_matches: number;
+  truncated?: boolean;
+  hint?: string | null;
+  results: GrepDoc[];
+}
+export const grepDocs = (query: string, vault?: string, limit = 20) =>
+  api<GrepResponse>(`/grep?${(() => {
+    const p = new URLSearchParams({ q: query, limit: String(limit) });
+    if (vault) p.set("vault", vault);
+    return p;
+  })()}`);
 
 // ── Graph ──
 export interface GraphApiNode {
