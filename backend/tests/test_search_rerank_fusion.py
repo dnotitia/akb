@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.exceptions import ValidationError
+from app.models.document import SearchResponse
 from app.services.search_service import (
     SearchService,
     fuse_original_and_reranked_hits,
@@ -68,6 +69,30 @@ def test_first_stage_unique_limit_keeps_legacy_rerank_off_default():
         rerank_prefetch=30,
         search_prefetch=0,
     ) == 5
+
+
+def test_search_response_defaults_truncated_false_no_hint():
+    """A response built without explicit truncated/hint must default to
+    'not truncated, no hint' — the most common case (small corpus or
+    prefetch pool not filled). Mirrors how the empty-result paths in
+    search_service.py:243 / :262 still construct SearchResponse."""
+    r = SearchResponse(query="x", total=0, returned=0, total_matches=0, results=[])
+    assert r.truncated is False
+    assert r.hint is None
+
+
+def test_search_response_carries_truncated_signal():
+    r = SearchResponse(
+        query="x",
+        total=2,
+        returned=2,
+        total_matches=30,
+        truncated=True,
+        hint="Prefetch pool was capped...",
+        results=[],
+    )
+    assert r.truncated is True
+    assert r.hint and "Prefetch pool" in r.hint
 
 
 @pytest.mark.asyncio

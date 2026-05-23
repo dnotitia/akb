@@ -246,7 +246,12 @@ TOOLS = [
             "BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language "
             "questions and short keyword queries well. For exact string / regex matches "
             "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
-            "use akb_drill_down or akb_get with that URI for full content."
+            "use akb_drill_down or akb_get with that URI for full content. "
+            "Response reports `returned` (in `results`) and `total_matches` (size of the "
+            "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
+            "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
+            "more hits than reported — switch to akb_grep with count_only=true for an exact "
+            "literal-substring count, or refine the query."
         ),
         inputSchema={
             "type": "object",
