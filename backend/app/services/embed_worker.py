@@ -209,7 +209,7 @@ async def _process_once() -> int:
             # Vector store is down — short-circuit the rest of the batch
             # so we don't hammer it. Remaining rows already have
             # next_attempt_at set by _claim_batch.
-            logger.info("vector store unavailable; backing off batch")
+            logger.info("vector store unavailable; backing off batch: %s", e)
             return succeeded
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
@@ -221,7 +221,11 @@ async def _process_once() -> int:
     return succeeded
 
 
-_runner = BackfillRunner("embed_worker", _process_once)
+_runner = BackfillRunner(
+    "embed_worker",
+    _process_once,
+    concurrency=max(1, int(getattr(settings, "indexing_concurrency", 1))),
+)
 start = _runner.start
 stop = _runner.stop
 

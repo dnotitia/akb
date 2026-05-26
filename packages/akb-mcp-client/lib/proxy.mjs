@@ -9,12 +9,21 @@
  * - Zero dependencies (Node.js built-in only)
  */
 
-import { request as httpsRequest } from "node:https";
-import { request as httpRequest } from "node:http";
+import { request as httpsRequest, Agent as httpsAgent } from "node:https";
+import { request as httpRequest, Agent as httpAgent } from "node:http";
 import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+
+// ── Connection reuse ───────────────────────────────────────
+// Without keepAlive agents, every MCP tool call (search, browse, put,
+// update, relations, …) triggers a fresh TCP+TLS handshake to the backend.
+// A typical agent session chains 5–15 tool calls; reusing connections
+// saves one round-trip per call (40–100 ms on a nearby cloud backend,
+// more across regions or with slow TLS termination).
+const httpKeepAlive = new httpAgent({ keepAlive: true });
+const httpsKeepAlive = new httpsAgent({ keepAlive: true });
 
 // ── MIME type inference ────────────────────────────────────
 // Covers common file types. Unknown extensions fall back to octet-stream.
@@ -546,6 +555,7 @@ export class AKBProxy {
         path,
         method,
         headers,
+        agent: isHttps ? httpsKeepAlive : httpKeepAlive,
       };
       if (isHttps && this.insecure) opts.rejectUnauthorized = false;
 
@@ -563,7 +573,14 @@ export class AKBProxy {
       });
 
       req.on("error", reject);
-      req.setTimeout(30000, () => req.destroy(new Error("Request timeout (30s)")));
+      // Default 5 min — destructive ops like `akb_delete_vault` on
+      // large vaults (7K+ docs) take well over 30s for the backend
+      // cascade (chunks + vector outbox + git cleanup). Hardcoding
+      // 30s caused the client to abort while the backend continued
+      // processing, leaving the operator with a misleading timeout
+      // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`.
+      const reqTimeoutMs = Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
+      req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout (${Math.round(reqTimeoutMs / 1000)}s)`)));
       if (body) req.write(body);
       req.end();
     });

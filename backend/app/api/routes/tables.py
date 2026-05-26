@@ -44,14 +44,21 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
 async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Depends(get_current_user)):
     vaults = req.vaults or [vault]
 
-    # Check access — minimum reader. Collect role to enforce read-only at DB level.
-    read_only = False
+    # Check access — minimum reader. This is the application's friendly
+    # 403 gate; if the user has no membership at all on a referenced
+    # vault, we fail fast here rather than letting PG return permission-
+    # denied later. Per-statement read/write enforcement (no INSERT for
+    # reader role, etc.) is handled by PG ACL via the user's role
+    # memberships — no explicit read-only TX needed any more.
     for v in vaults:
-        access = await check_vault_access(user.user_id, v, required_role="reader")
-        if access["role"] == "reader":
-            read_only = True
+        await check_vault_access(user.user_id, v, required_role="reader")
 
-    return await table_service.execute_sql(vaults, req.sql.strip(), read_only=read_only)
+    return await table_service.execute_sql(
+        vault_names=vaults,
+        user_id=user.user_id,
+        sql=req.sql.strip(),
+        is_admin=user.is_admin,
+    )
 
 
 @router.delete("/tables/{vault}/{table_name}", summary="Drop a table")

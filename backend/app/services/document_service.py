@@ -131,6 +131,7 @@ from app.services.index_service import (
     delete_document_chunks,
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
+from app.services.role_sync import get_role_sync
 from app.services.uri_service import doc_uri, table_uri, file_uri
 from app.repositories import table_data_repo
 from app.utils import ensure_list
@@ -1087,6 +1088,11 @@ class DocumentService:
                         poll_interval_secs=int(external_git.get("poll_interval_secs") or 300),
                         conn=conn,
                     )
+            # PG-native RBAC: create vault group roles + grant admin to owner,
+            # then mirror public_access (no-op if 'none').
+            rs = get_role_sync()
+            await rs.on_vault_create(vault_id, uid)
+            await rs.on_public_access_change(vault_id, public_access)
             logger.info(
                 "Vault created (external_git mirror, pending clone): %s host=%s branch=%s",
                 name, _safe_remote_host(external_git["url"]),
@@ -1116,6 +1122,13 @@ class DocumentService:
             vault_id = await vault_repo.create(
                 name, description, git_path, owner_id=uid, public_access=public_access,
             )
+            # PG-native RBAC: create vault group roles + grant admin to owner,
+            # then mirror public_access (no-op if 'none'). Done before template
+            # application so any tables the template creates inherit grants
+            # from the proper group roles.
+            rs = get_role_sync()
+            await rs.on_vault_create(vault_id, uid)
+            await rs.on_public_access_change(vault_id, public_access)
             if template:
                 await self._apply_template(name, vault_id, template, coll_repo)
             # Seed overview/vault-skill.md so every non-mirror vault carries a starter

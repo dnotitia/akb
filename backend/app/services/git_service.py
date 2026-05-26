@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, quote
 
-from git import Repo, Actor, cmd as git_cmd
+from git import Repo, cmd as git_cmd
 from git.exc import GitError
 
 from app.config import settings
@@ -53,6 +53,7 @@ def _vault_lock(vault_name: str) -> threading.Lock:
         return lock
 
 
+
 class GitService:
     def __init__(self, storage_path: str | None = None):
         self.storage_path = Path(storage_path or settings.git_storage_path)
@@ -71,6 +72,48 @@ class GitService:
         if not bare_path.exists():
             raise FileNotFoundError(f"Vault repo not found: {vault_name}")
         return Repo(str(bare_path))
+
+    @staticmethod
+    def _git_author_env(author_name: str, author_email: str) -> dict[str, str]:
+        return {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+
+    def _stage_and_commit(
+        self,
+        work_repo: Repo,
+        message: str,
+        author_name: str,
+        author_email: str,
+        *,
+        parent_required: bool,
+    ) -> str:
+        """Commit the already-staged index without GitPython IndexFile ops.
+
+        GitPython's IndexFile add/remove/commit path mutates process cwd.
+        The `repo.git.*` command interface launches git with an explicit
+        working directory instead, so writes remain safe across thread-pool
+        workers and vaults.
+        """
+        tree_sha = work_repo.git.write_tree()
+        parent_args: list[str] = []
+        if parent_required:
+            work_repo.git.rev_parse("--verify", "HEAD")
+            parent_args = ["-p", "HEAD"]
+
+        with work_repo.git.custom_environment(**self._git_author_env(author_name, author_email)):
+            commit_sha = work_repo.git.commit_tree(
+                "--no-gpg-sign",
+                tree_sha,
+                *parent_args,
+                "-m",
+                message,
+            ).strip()
+        work_repo.git.update_ref("HEAD", commit_sha)
+        return work_repo.git.rev_parse("HEAD").strip()
 
     def _ensure_worktree(self, vault_name: str) -> Path | None:
         """Create a persistent worktree for this vault if one doesn't exist.
@@ -482,10 +525,14 @@ class GitService:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
 
-            work_repo.index.add([file_path])
-            author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
-            return commit.hexsha
+            work_repo.git.add("--", file_path)
+            return self._stage_and_commit(
+                work_repo,
+                message,
+                author_name,
+                author_email,
+                parent_required=True,
+            )
 
     def delete_file(
         self,
@@ -508,10 +555,14 @@ class GitService:
             if not full_path.exists():
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
 
-            work_repo.index.remove([file_path], working_tree=True)
-            author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
-            return commit.hexsha
+            work_repo.git.rm("--", file_path)
+            return self._stage_and_commit(
+                work_repo,
+                message,
+                author_name,
+                author_email,
+                parent_required=True,
+            )
 
     def delete_paths_bulk(
         self,
@@ -529,7 +580,7 @@ class GitService:
         every requested path is already absent, no commit is made and
         this returns `None`. Duplicates in `file_paths` are deduplicated
         (order-preserving) before the presence check so a doubled path
-        doesn't trip `index.remove` on its second occurrence.
+        doesn't trip `git rm` on its second occurrence.
 
         Mirrors `delete_file`'s lock + worktree-prep + commit shape.
         Returns the new commit's hex SHA, or `None` when no commit was made.
@@ -544,7 +595,7 @@ class GitService:
             work_repo.git.reset("--hard", "HEAD")
 
             # Dedupe while preserving caller order so log output is stable
-            # and so a doubled path doesn't make `index.remove` fail on
+            # and so a doubled path doesn't make `git rm` fail on
             # the second occurrence.
             unique_paths = list(dict.fromkeys(file_paths))
             present = [p for p in unique_paths if (wt / p).exists()]
@@ -555,10 +606,14 @@ class GitService:
                 )
                 return None
 
-            work_repo.index.remove(present, working_tree=True)
-            author = Actor(author_name, author_email)
-            commit = work_repo.index.commit(message, author=author, committer=author)
-            return commit.hexsha
+            work_repo.git.rm("--", *present)
+            return self._stage_and_commit(
+                work_repo,
+                message,
+                author_name,
+                author_email,
+                parent_required=True,
+            )
 
     def _commit_via_clone(
         self,
@@ -593,7 +648,6 @@ class GitService:
         import subprocess
         import tempfile
         bare_path = self._bare_path(vault_name)
-        author = Actor(author_name, author_email)
         # Stable parent for the tmp dir so we don't depend on the
         # process cwd to resolve a relative name. ``storage_path``
         # always exists on a healthy deploy.
@@ -611,8 +665,14 @@ class GitService:
             full_path = Path(tmp) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
-            work_repo.index.add([file_path])
-            commit = work_repo.index.commit(message, author=author, committer=author)
+            work_repo.git.add("--", file_path)
+            commit_hash = self._stage_and_commit(
+                work_repo,
+                message,
+                author_name,
+                author_email,
+                parent_required=False,
+            )
             # Push is local-to-local (bare repo on the same disk), so
             # 60s is generous; if it hangs the timeout still releases
             # the vault lock for the next caller.
@@ -622,7 +682,7 @@ class GitService:
                 raise GitError(
                     f"git push failed for vault {vault_name}: {e}"
                 ) from e
-        return commit.hexsha
+        return commit_hash
 
     # ── History operations ───────────────────────────────────
 

@@ -113,6 +113,47 @@ R=$(mcp_as "$PAT2" "$SID2" "akb_grep" "{\"pattern\":\"XYZZY-SECRET\"}" | mr)
 LEAK_DOCS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_docs',0))" 2>/dev/null)
 [ "$LEAK_DOCS" = "0" ] && pass "Cross-vault grep leak prevented (0 docs)" || fail "Grep leak" "User2 found $LEAK_DOCS docs without vault access"
 
+# ── 1a. Search Access Control (issue #66) ────────────────────
+# Mirrors the grep cases above. The leak path closed by PR #67 was:
+# `akb_search` ran service-layer ACL prefiltering only when `user_id`
+# was supplied — the MCP handler wasn't forwarding it. Test 3 below
+# asserts on the actual `vault` field in results so a hit from a
+# legitimately-readable public vault is NOT mistaken for a leak.
+#
+# akb_search uses BM25 + vector store, both of which are populated by
+# the embed_worker after akb_put returns. Grep above hits git-stored
+# content directly so it doesn't need this wait; search does.
+echo ""
+echo "▸ 1a. Search Access Control"
+# embed_worker default idle is 10s; we need TWO loops worth in the worst
+# case (drain the chunks queue + actually index). 20s is conservative
+# for local pgvector.
+sleep 20
+
+# 1a-1: explicit vault arg → fail-closed at the handler gate.
+R=$(mcp_as "$PAT2" "$SID2" "akb_search" "{\"query\":\"XYZZY-SECRET\",\"vault\":\"$VAULT1\"}" | mr)
+HAS_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'Access denied' in str(d) or 'role' in str(d).lower())" 2>/dev/null)
+[ "$HAS_ERROR" = "True" ] && pass "User2 blocked from search on private vault (explicit arg)" || fail "Search explicit-vault" "$R"
+
+# 1a-2: owner can find their own doc.
+R=$(mcp_as "$PAT1" "$SID1" "akb_search" "{\"query\":\"XYZZY-SECRET\",\"vault\":\"$VAULT1\"}" | mr)
+RES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+[ "$RES" -ge 1 ] 2>/dev/null && pass "User1 search own vault ($RES hits)" || fail "Search own vault" "expected >=1, got $RES"
+
+# 1a-3: no vault arg → ACL prefilter must scope results to vaults
+# User2 can read. Hits from public vaults are FINE; the only thing
+# that constitutes a leak is a hit whose `vault` field is User1's
+# private vault. Naive total-count checks false-positive on prods
+# that have public vaults whose content loosely matches the query.
+R=$(mcp_as "$PAT2" "$SID2" "akb_search" "{\"query\":\"XYZZY-SECRET\"}" | mr)
+LEAK_FROM_V1=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+leaks = [r for r in d.get('results', []) if r.get('vault') == '$VAULT1']
+print(len(leaks))
+" 2>/dev/null)
+[ "$LEAK_FROM_V1" = "0" ] && pass "Cross-vault search leak prevented (0 results from $VAULT1)" || fail "Search leak" "User2 saw $LEAK_FROM_V1 result(s) from User1's private vault"
+
 # ── 1b. Knowledge graph access control (issue #3) ────────────
 echo ""
 echo "▸ 1b. Knowledge graph access control"

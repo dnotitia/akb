@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.0.2 — bump default request timeout (30s → 5min)
+
+Bug fix: the proxy's per-request timeout was hardcoded to 30s, which
+aborted any operation slower than that on the client side — most
+visibly `akb_delete_vault` against a large vault (7K+ docs), where the
+backend cascade (chunks delete + vector outbox + git cleanup) easily
+runs past 30s. The operator would see `Request timeout (30s)` even
+though the backend kept processing and eventually completed; this
+produced the misleading impression that the delete had failed when in
+fact it had succeeded after the client gave up.
+
+The default is now 5 minutes (300_000 ms). For very large vaults or
+slow links, set `AKB_MCP_REQUEST_TIMEOUT_MS` to override. S3
+upload/download paths remain at 10 min (unchanged).
+
+Longer-term fix (separate backend PR): make `akb_delete_vault` an
+async background job that returns immediately and exposes a status
+endpoint, so client timeout becomes irrelevant.
+
+## 2.0.1 — keep-alive proxy connections
+
+Performance fix: the stdio ↔ HTTP proxy now reuses TCP+TLS connections to
+the AKB backend via module-level `http.Agent` / `https.Agent` with
+`keepAlive: true`. Each MCP tool call previously paid a fresh handshake
+because Node's default agent ships with keep-alive off; a typical agent
+session chains 5–15 calls, so this saves one round-trip per call
+(~40–100 ms on a nearby cloud backend, more across regions).
+
+No contract change. S3 presigned-URL methods (`_uploadToS3`,
+`_downloadFromS3`) are intentionally unaffected — they target arbitrary
+upload hosts, not the AKB backend.
+
+Thanks to @MackDing for the contribution (#65).
+
 ## 2.0.0 — URI-canonical hard cutover (BREAKING)
 
 The backend MCP contract is now URI-canonical: every resource handle

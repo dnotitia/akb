@@ -26,6 +26,7 @@ rerank_provider: cohere
 rerank_model: cohere/rerank-v3.5
 rerank_base_url: ""
 rerank_prefetch: 30
+search_prefetch: 0
 
 # === S3 (in-container MinIO) ===
 s3_endpoint_url: http://127.0.0.1:9000
@@ -52,6 +53,10 @@ vector_collection: chunks
 
 # === Indexing worker ===
 indexing_batch_size: 16
+# Set indexing_concurrency: N (4-8 typical) to enable parallel embed_worker
+# tasks. Default 1 stays single-task for predictable resource use; raise
+# when the embedding API can absorb concurrent requests.
+# indexing_concurrency: 8
 
 # === BM25 ===
 bm25_k1: 1.5

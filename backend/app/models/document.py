@@ -181,11 +181,20 @@ class SearchResponse(BaseModel):
     """Response for akb_search.
 
     `returned` is the number of items in `results` (post-limit / post-rerank).
-    `total_matches` is how many unique hits the prefetch window saw before
-    the limit was applied — gives callers a way to distinguish "this is
-    the full set" from "first N of more". When `total_matches > returned`
-    the agent should re-issue with a larger `limit` rather than treating
-    `returned` as the population.
+
+    `total_matches` is how many unique sources the prefetch window saw
+    before the limit was applied. **It is NOT a corpus-wide hit count.**
+    Vector ANN is fundamentally top-K; the backend pulls a fixed-size
+    pool (driven by `rerank_prefetch`, default 30) and dedupes
+    source-level. When `total_matches` equals that pool ceiling the
+    corpus may contain many more hits — see `truncated` / `hint`. For
+    an exact corpus-wide count, use `akb_grep` with `count_only=true`
+    (literal substrings only — semantic queries can't be exhaustively
+    enumerated).
+
+    `truncated` is true when `total_matches` hit the prefetch ceiling
+    (i.e. the pool was filled and there might be more in the corpus).
+    `hint` carries a one-line follow-up suggestion when truncated.
 
     `total` is kept as a deprecated alias of `returned` for backward
     compatibility with existing UI / agent prompts.
@@ -195,4 +204,6 @@ class SearchResponse(BaseModel):
     total: int
     returned: int = 0
     total_matches: int = 0
+    truncated: bool = False
+    hint: str | None = None
     results: list[SearchResult]

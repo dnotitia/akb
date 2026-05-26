@@ -33,8 +33,12 @@ class LoginRequest(NFCModel):
 
 class CreatePATRequest(NFCModel):
     name: str
-    scopes: list[str] | None = None
     expires_days: int | None = None
+    # NOTE: scopes are stored on the `tokens` row but not enforced
+    # anywhere in the backend yet; accepting them as input would lie
+    # to the caller about a restriction that doesn't exist. When
+    # scope enforcement lands, re-expose this field with the matching
+    # check in the request handlers.
 
 
 class ChangePasswordRequest(NFCModel):
@@ -81,7 +85,7 @@ async def update_my_profile(
 
 @router.post("/auth/tokens", summary="Create a Personal Access Token")
 async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await create_pat(user.user_id, req.name, req.scopes, req.expires_days)
+    return await create_pat(user.user_id, req.name, expires_days=req.expires_days)
 
 
 @router.get("/auth/tokens", summary="List your PATs")

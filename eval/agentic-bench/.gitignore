@@ -1,0 +1,26 @@
+# Dataset and raw results stay out of the OSS repo — they're
+# domain-specific (Korean legal text, internal vault contents) and
+# the ground-truth answers are hand-written. Form/result tracking
+# lives in a separate private repo per project; OSS publishes only
+# the runner/judge code so other teams can fork it for their own
+# corpora.
+
+evalset/
+runs/
+runs_*/
+batches/
+verdicts/
+metrics.json
+vault_snapshot.json
+report_*.md
+runner*.log
+log_*.log
+
+# Build artefacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# One-off helpers from earlier iterations — not part of the
+# released runner. Kept out so the public surface stays tight.
+judge_local.py

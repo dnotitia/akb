@@ -104,6 +104,13 @@ class PgvectorStore:
         self._get_main_pool = get_main_pool
         self._own_pool: asyncpg.Pool | None = None
         self._ensured_collection = False
+        # Serialize ensure_collection across concurrent callers. PG's
+        # CREATE SCHEMA IF NOT EXISTS / CREATE TABLE IF NOT EXISTS are
+        # not race-safe at the catalog level — concurrent sessions can
+        # still trip "duplicate key value violates pg_namespace_nspname_index".
+        # The lock makes only the first caller hit the DB; the rest see
+        # _ensured_collection=True and short-circuit.
+        self._ensure_lock = asyncio.Lock()
 
     async def _pool(self) -> asyncpg.Pool:
         """Return the pool we read/write through."""
@@ -163,16 +170,26 @@ class PgvectorStore:
 
     async def ensure_collection(self, *, conn=None) -> None:
         """Idempotent schema creation. Only the first call hits the DB.
-        Reuses `conn` so first-write boots the schema in the caller's
-        transaction (one round-trip, atomic with the first chunk)."""
+
+        CREATE statements run on a dedicated pooled conn outside any
+        outer transaction, so the table is committed before the lock
+        releases — concurrent peers that take the fast path can rely
+        on the table being globally visible. `conn` is accepted for
+        driver-interface parity (base.py) and ignored.
+        """
         if self._ensured_collection:
             return
-        try:
-            async with self._conn(conn) as c:
-                await self._do_ensure(c)
-        except asyncpg.PostgresError as e:
-            raise VectorStoreUnavailable(f"schema setup failed: {e}") from e
-        self._ensured_collection = True
+        async with self._ensure_lock:
+            if self._ensured_collection:
+                return
+            try:
+                pool = await self._pool()
+                async with pool.acquire() as c:
+                    await self._ensure_codec(c)
+                    await self._do_ensure(c)
+            except asyncpg.PostgresError as e:
+                raise VectorStoreUnavailable(f"schema setup failed: {e}") from e
+            self._ensured_collection = True
 
     async def _do_ensure(self, conn) -> None:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -276,7 +293,7 @@ class PgvectorStore:
         source_type: str,
         source_id: str,
     ) -> None:
-        await self.ensure_collection(conn=conn)
+        await self.ensure_collection()
         cid = uuid.UUID(str(chunk_id))
         sid = uuid.UUID(str(source_id))
         # `dense` goes through pgvector's binary codec — list[float]
@@ -349,7 +366,7 @@ class PgvectorStore:
     # ── Delete ────────────────────────────────────────────────────
 
     async def delete_point(self, chunk_id: str, *, conn=None) -> None:
-        await self.ensure_collection(conn=conn)
+        await self.ensure_collection()
         cid = uuid.UUID(str(chunk_id))
         try:
             async with self._conn(conn) as c:

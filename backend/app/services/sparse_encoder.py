@@ -46,6 +46,150 @@ _kiwi: Kiwi | None = None
 _kiwi_version: str = kiwipiepy.__version__ if hasattr(kiwipiepy, "__version__") else "unknown"
 
 
+_ENGLISH_STOPWORDS: frozenset[str] = frozenset({
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "ours",
+    "she",
+    "should",
+    "so",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    "yours",
+})
+
+
+def _without_doubled_final_consonant(token: str) -> str:
+    if len(token) < 3:
+        return token
+    if token[-1] != token[-2]:
+        return token
+    if token[-1] in "aeiou" or token.endswith(("ss", "ll", "zz")):
+        return token
+    return token[:-1]
+
+
+def _english_token_variants(token: str) -> list[str]:
+    """Return the original ASCII token plus conservative stem variants.
+
+    Kiwi keeps English words as surface-form `SL` tokens, so `graduate`
+    and `graduated` do not meet in the sparse BM25 leg. Keep the exact
+    token for precision and add a small Porter-like variant set for common
+    English inflections; non-ASCII tokens are left untouched.
+    """
+    if not token or not token.isascii() or not any(c.isalpha() for c in token):
+        return [token]
+
+    base = token.lower().strip("'")
+    if not base:
+        return []
+    if base in _ENGLISH_STOPWORDS:
+        return []
+
+    variants = [base]
+
+    def add(value: str) -> None:
+        if len(value) >= 3 and value not in variants:
+            variants.append(value)
+
+    if len(base) <= 4:
+        return variants
+
+    if base.endswith("'s"):
+        add(base[:-2])
+
+    # Verb -ing / -ed inflections, independent of the plural/-s family below.
+    if base.endswith("ing") and len(base) > 6:
+        stem = base[:-3]
+        add(stem)
+        add(_without_doubled_final_consonant(stem))
+        if stem.endswith(("at", "iz", "iv")):
+            add(stem + "e")
+    if base.endswith("ed") and len(base) > 5:
+        stem = base[:-2]
+        add(stem)
+        add(_without_doubled_final_consonant(stem))
+        if stem.endswith(("at", "iz", "iv")):
+            add(stem + "e")
+
+    # Plural / 3rd-person -s family, most specific suffix first so each word is
+    # stemmed once ("churches" -> "church", never also "churche").
+    if base.endswith(("ies", "ied")) and len(base) > 5:
+        add(base[:-3] + "y")
+    elif base.endswith("es") and len(base) > 5:
+        add(base[:-2])
+    elif base.endswith("s") and not base.endswith(("ss", "us", "is")):
+        add(base[:-1])
+
+    if base.endswith("e") and len(base) > 5:
+        add(base[:-1])
+
+    return variants
+
+
 def _get_kiwi() -> Kiwi:
     global _kiwi
     if _kiwi is None:
@@ -69,7 +213,10 @@ def _tokenize_sync(text: str) -> list[str]:
         if not any(tok.tag.startswith(p) for p in _KEEP_TAG_PREFIXES):
             continue
         form = tok.form
-        tokens.append(form.lower() if form.isascii() else form)
+        if form.isascii():
+            tokens.extend(_english_token_variants(form))
+        else:
+            tokens.append(form)
     return tokens
 
 
@@ -119,11 +266,15 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
     async with pool.acquire() as conn:
         # Upsert: existing rows stay untouched (including their term_id);
         # new rows get a fresh id from the sequence.
+        # ORDER BY enforces a deterministic row-lock acquisition order so
+        # concurrent encoders processing documents with overlapping vocab
+        # (English stopwords are the dominant case) don't deadlock on the
+        # ON CONFLICT row locks.
         rows = await conn.fetch(
             """
             INSERT INTO bm25_vocab (term, term_id)
             SELECT t, nextval('bm25_term_id_seq')
-              FROM unnest($1::text[]) AS t
+              FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
             ON CONFLICT (term) DO UPDATE
                 SET updated_at = bm25_vocab.updated_at   -- no-op, returns existing row
             RETURNING term, term_id

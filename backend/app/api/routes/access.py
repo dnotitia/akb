@@ -207,3 +207,66 @@ async def admin_reset_user_password(
         method="admin_ui",
     )
     return {"temporary_password": temp, "username": username}
+
+
+@router.get(
+    "/admin/role-state",
+    summary="[admin] Diff PG role state against the AKB catalog (read-only)",
+)
+async def admin_role_state(user: AuthenticatedUser = Depends(get_current_user)):
+    """Inspect what ``reconcile_from_catalog`` WOULD change without
+    mutating anything.
+
+    Useful before deciding to call ``POST /admin/reconcile-roles`` —
+    an operator can confirm the drift is what they expect (e.g. a
+    user just registered + reconcile hasn't run yet, vs. genuine
+    state corruption) instead of running the mutating endpoint
+    blind.
+    """
+    _require_admin(user)
+    from app.services.role_sync import get_role_sync
+    diff = await get_role_sync().diff_against_catalog()
+    return {
+        "drift_count": diff.drift_count(),
+        "is_clean": diff.is_clean(),
+        "missing_user_roles": diff.missing_user_roles,
+        "orphan_user_roles": diff.orphan_user_roles,
+        "missing_vault_roles": diff.missing_vault_roles,
+        "orphan_vault_roles": diff.orphan_vault_roles,
+        "missing_memberships": diff.missing_memberships,
+        "missing_public_grants": diff.missing_public_grants,
+        "stale_public_grants": diff.stale_public_grants,
+        "missing_table_grants": diff.missing_table_grants,
+        "authenticated_role_missing": diff.authenticated_role_missing,
+        "users_not_in_authenticated": diff.users_not_in_authenticated,
+    }
+
+
+@router.post(
+    "/admin/reconcile-roles",
+    summary="[admin] Reconcile PG roles with the AKB catalog",
+)
+async def admin_reconcile_roles(user: AuthenticatedUser = Depends(get_current_user)):
+    """Reconcile PostgreSQL role + GRANT state with the AKB catalog.
+
+    The reconciler runs automatically at backend startup. This endpoint
+    is for drift recovery: an operator that suspects role state has
+    diverged (manual edits, partial lifecycle hook failure, restore
+    from snapshot, …) can force a reconciliation without restarting
+    the backend. Inspect with ``GET /admin/role-state`` first to
+    confirm the expected drift before running. Idempotent.
+    """
+    _require_admin(user)
+    from app.services.role_sync import get_role_sync
+    report = await get_role_sync().reconcile_from_catalog()
+    return {
+        "reconciled": True,
+        "user_roles_created": report.user_roles_created,
+        "user_roles_dropped": report.user_roles_dropped,
+        "vault_roles_created": report.vault_roles_created,
+        "vault_roles_dropped": report.vault_roles_dropped,
+        "grants_added": report.grants_added,
+        "table_grants_applied": report.table_grants_applied,
+        "public_grants_applied": report.public_grants_applied,
+        "errors": report.errors,
+    }

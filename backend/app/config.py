@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Settings(BaseModel):
@@ -67,7 +67,15 @@ class Settings(BaseModel):
     rerank_base_url: str = ""                  # blank → falls back to llm_base_url
     rerank_api_key: str = ""                   # blank → falls back to llm_api_key
     rerank_prefetch: int = 30
+    # RRF k used when fusing the first-stage hybrid rank with cross-encoder
+    # rerank rank. 60 is the common RRF default; lower values make top ranks
+    # sharper, higher values flatten the contribution curve.
+    rerank_fusion_k: int = Field(default=60, ge=1)
     rerank_timeout_seconds: float = 3.0
+    # First-stage unique source pool before final `limit` is applied. 0 keeps
+    # the legacy behavior (prefetch only when rerank is enabled). Raising this
+    # lets rerank-off searches dedup over a wider dense+BM25 candidate set.
+    search_prefetch: int = Field(default=0, ge=0)
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""       # Internal endpoint (server → S3)
@@ -122,6 +130,11 @@ class Settings(BaseModel):
     # transaction footprint. 16 is a safe default at OpenAI-compatible
     # endpoint latencies; tune up to ~64 for fast self-hosted endpoints.
     indexing_batch_size: int = 16
+    # Parallel embed_worker tasks draining the same chunks queue. Workers
+    # coordinate via FOR UPDATE SKIP LOCKED, so N can be raised until the
+    # embedding API's rate limit or PG pool budget caps it. 1 keeps the
+    # legacy single-task behavior; 4-8 is the typical production knob.
+    indexing_concurrency: int = 1
 
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
@@ -135,6 +148,12 @@ class Settings(BaseModel):
     # is cheap when nothing's changing. 6 h matches the slow drift of
     # avgdl/df on a steady-state corpus.
     bm25_recompute_interval_secs: int = 21600
+
+    # Periodic PG-RBAC reconcile cadence. Lifecycle hooks emit role
+    # DDL online; this timer is the belt-and-suspenders that catches
+    # any silent hook failure (logged + counted in metrics_snapshot
+    # but otherwise not auto-recovered). Set to 0 to disable.
+    role_sync_reconcile_interval_secs: int = 3600
 
     # Event stream — optional Redis Streams fanout. PG outbox (`events`
     # table) is always the source of truth; when redis_url is set the
