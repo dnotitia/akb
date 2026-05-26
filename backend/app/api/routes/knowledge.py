@@ -29,7 +29,7 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
             status_code=400,
             detail=f"Invalid AKB URI: {uri!r}. Expected akb://<vault>/<type>/<id>.",
         )
-    vault, rtype, ident = parsed
+    vault, rtype, ident = parsed.vault, parsed.kind, parsed.identifier
     if expected_type and rtype != expected_type:
         raise HTTPException(
             status_code=400,
@@ -59,7 +59,15 @@ async def resource_relations(
 async def vault_graph(
     uri: str | None = Query(None, description="Center resource URI (omit + pass vault for full vault graph)"),
     vault: str | None = Query(None, description="Vault name (only when uri is omitted)"),
-    depth: int = Query(2, ge=1, le=5),
+    hops: int = Query(
+        2,
+        ge=1,
+        le=5,
+        description=(
+            "BFS traversal radius in edge hops. Disambiguated from "
+            "`/browse/{vault}?depth=` (collection-tree depth)."
+        ),
+    ),
     limit: int = Query(50, ge=1, le=200),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
@@ -74,7 +82,7 @@ async def vault_graph(
         vault_name = vault
     access = await check_vault_access(user.user_id, vault_name, required_role="reader")
     return await get_graph(
-        vault_name, resource_uri=uri, depth=depth, limit=limit,
+        vault_name, resource_uri=uri, hops=hops, limit=limit,
         vault_id=access["vault_id"],
     )
 

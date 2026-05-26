@@ -330,9 +330,11 @@ class SearchService:
                 rows = await conn.fetch(
                     """
                     SELECT d.id, v.name AS vault_name, d.path, d.title,
+                           c.path AS collection,
                            d.doc_type, d.summary, d.tags
                       FROM documents d
                       JOIN vaults v ON d.vault_id = v.id
+                      LEFT JOIN collections c ON c.id = d.collection_id
                      WHERE d.id = ANY($1)
                     """,
                     [uuid.UUID(x) for x in by_type["document"]],
@@ -343,13 +345,16 @@ class SearchService:
                         "title": r["title"], "doc_type": r["doc_type"],
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
+                        "collection": r["collection"],
                     }
             if by_type["table"]:
                 rows = await conn.fetch(
                     """
-                    SELECT t.id, v.name AS vault_name, t.name, t.description
+                    SELECT t.id, v.name AS vault_name, c.path AS collection,
+                           t.name, t.description
                       FROM vault_tables t
                       JOIN vaults v ON t.vault_id = v.id
+                      LEFT JOIN collections c ON c.id = t.collection_id
                      WHERE t.id = ANY($1)
                     """,
                     [uuid.UUID(x) for x in by_type["table"]],
@@ -357,11 +362,17 @@ class SearchService:
                 for r in rows:
                     meta[("table", str(r["id"]))] = {
                         "vault": r["vault_name"],
-                        "path": f"_tables/{r['name']}",
+                        # `path` is the table name — pre-0.3.0 was the
+                        # synthetic `_tables/<name>` form. The URI now
+                        # encodes kind + location, so the prefix is
+                        # redundant noise. Matches the BrowseItem
+                        # emit shape.
+                        "path": r["name"],
                         "title": r["name"],
                         "doc_type": "table",
                         "summary": r["description"],
                         "tags": [],
+                        "collection": r["collection"],
                     }
             if by_type["file"]:
                 rows = await conn.fetch(
@@ -384,6 +395,7 @@ class SearchService:
                         "doc_type": "file",
                         "summary": r["description"] or r["mime_type"],
                         "tags": [],
+                        "collection": r["collection"],
                     }
 
         from app.services.uri_service import doc_uri, table_uri, file_uri
@@ -394,15 +406,15 @@ class SearchService:
             m = meta.get(key)
             if not m:
                 continue
-            # Build the canonical URI per resource type. `source_id` is
-            # the internal handle we use to fetch metadata; it never
-            # leaves this function — the client only sees `uri`.
+            # Build the canonical 0.3.0 URI per resource type. Doc URIs
+            # derive the collection from `path` automatically (path
+            # encodes it); table/file URIs need it passed in.
             if h.source_type == "document":
                 uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
-                uri = table_uri(m["vault"], m["title"])
+                uri = table_uri(m["vault"], m["title"], collection=m.get("collection"))
             elif h.source_type == "file":
-                uri = file_uri(m["vault"], h.source_id)
+                uri = file_uri(m["vault"], h.source_id, collection=m.get("collection"))
             else:
                 continue
             results.append(
@@ -410,6 +422,7 @@ class SearchService:
                     source_type=h.source_type,
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
+                    collection=m.get("collection"),
                     doc_type=m["doc_type"], summary=m["summary"],
                     tags=m["tags"], score=h.score,
                     matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,

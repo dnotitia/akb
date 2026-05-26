@@ -193,24 +193,61 @@ class DocumentRepository:
             )
             return [dict(r) for r in rows]
 
-    async def list_root_docs(self, vault_id: uuid.UUID) -> list[dict]:
-        """Documents living at the vault root (collection_id IS NULL).
+    async def list_docs_by_depth(
+        self,
+        vault_id: uuid.UUID,
+        max_depth: int,
+        prefix: str = "",
+    ) -> list[dict]:
+        """List documents under ``prefix`` (vault root if ``prefix=""``)
+        whose containing-collection depth, measured from inside the
+        prefix, is ≤ ``max_depth``. ``max_depth < 0`` disables the
+        depth filter (entire subtree).
 
-        Distinct from `list_by_vault`: this is the slice that the unified
-        browse needs at depth=1 — sibling to root-level tables/files —
-        so users who put docs without a collection can still find them
-        without paying the depth=2 cost of unspooling every sub-collection.
+        Depth = number of path separators *between* the prefix boundary
+        and the document filename:
+          - prefix="", path="doc.md"        → depth 0 (vault root)
+          - prefix="", path="X/doc.md"      → depth 1 (one collection in)
+          - prefix="", path="X/Y/doc.md"    → depth 2 (nested)
+          - prefix="X", path="X/doc.md"     → depth 0 (root of X)
+          - prefix="X", path="X/Y/doc.md"   → depth 1 (one level inside X)
+
+        Slashes are counted via ``length - length(replace(...,'/',''))``
+        because ``string_to_array`` rejects empty input — this form
+        handles vault-root docs uniformly.
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT path, title, doc_type, status, summary, tags, updated_at
-                FROM documents
-                WHERE vault_id = $1 AND collection_id IS NULL
-                ORDER BY updated_at DESC
-                """,
-                vault_id,
+        base_select = (
+            "SELECT path, title, doc_type, status, summary, tags, updated_at "
+            "FROM documents WHERE vault_id = $1"
+        )
+        params: list = [vault_id]
+
+        if prefix:
+            # Defend against LIKE metacharacters even though normalized
+            # collection paths shouldn't contain them. Goes through
+            # the shared helper so all four call sites agree on the
+            # escape semantics.
+            from app.util.text import like_escape
+            params.append(like_escape(prefix) + "/%")
+            prefix_clause = f" AND path LIKE ${len(params)} ESCAPE '\\'"
+            # Slashes the prefix itself contributes to `path`: "X" → 1,
+            # "X/Y" → 2 (the prefix separator plus its own internal slashes).
+            depth_offset = prefix.count("/") + 1
+        else:
+            prefix_clause = ""
+            depth_offset = 0
+
+        if max_depth < 0:
+            depth_clause = ""
+        else:
+            params.append(max_depth + depth_offset)
+            depth_clause = (
+                f" AND (length(path) - length(replace(path, '/', ''))) <= ${len(params)}"
             )
+
+        sql = base_select + prefix_clause + depth_clause + " ORDER BY updated_at DESC"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
             return [dict(r) for r in rows]
 
     # ── External-git mirror helpers ──────────────────────────
@@ -469,12 +506,14 @@ class CollectionRepository:
         async with self.pool.acquire() as acq:
             await acq.execute(sql, collection_id)
 
-    @staticmethod
-    def _like_escape(s: str) -> str:
-        """Escape LIKE metacharacters so user-supplied folder names with
-        `%`, `_`, or `\\` don't widen the match. Paired with
-        `ESCAPE '\\'` in the query."""
-        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    # ``_like_escape`` used to live here. The same triple-replace also
+    # got copy-pasted into the inline prefix-filter inside
+    # ``list_docs_by_depth`` (and into two other repos). Consolidated
+    # at ``app.util.text.like_escape`` — call sites now go through
+    # that, and this alias keeps the existing ``self._like_escape``
+    # call-pattern working without churn.
+    from app.util.text import like_escape as _like_escape_impl
+    _like_escape = staticmethod(_like_escape_impl)
 
     async def list_docs_under(
         self,

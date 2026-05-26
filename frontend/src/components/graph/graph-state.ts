@@ -20,7 +20,11 @@ function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
 export function viewToQuery(v: GraphView): string {
   const p = new URLSearchParams();
   if (v.entry) p.set("entry", v.entry);
-  if (v.depth !== DEFAULT_VIEW.depth) p.set("depth", String(v.depth));
+  // URL param `hops` mirrors the field name (renamed from `depth` in
+  // 0.3.0 to align with `akb_graph.hops`). `parseHops` below also
+  // accepts the legacy `depth` query param so bookmarked URLs from
+  // pre-0.3.0 keep working — there's no reason to break them.
+  if (v.hops !== DEFAULT_VIEW.hops) p.set("hops", String(v.hops));
   if (!setsEqual(v.types, ALL_KIND_SET)) {
     p.set("types", [...v.types].join(","));
   }
@@ -31,7 +35,7 @@ export function viewToQuery(v: GraphView): string {
   return p.toString();
 }
 
-function parseDepth(raw: string | null): 1 | 2 | 3 {
+function parseHops(raw: string | null): 1 | 2 | 3 {
   if (raw === "1") return 1;
   if (raw === "3") return 3;
   return 2;
@@ -42,7 +46,9 @@ export function queryToView(q: URLSearchParams): GraphView {
   const rel = q.get("rel");
   return {
     entry: q.get("entry") || undefined,
-    depth: parseDepth(q.get("depth")),
+    // Read `hops` first; fall back to legacy `depth` from pre-0.3.0
+    // bookmarked URLs.
+    hops: parseHops(q.get("hops") ?? q.get("depth")),
     types: types
       ? new Set(
           types.split(",").filter((s): s is NodeKind => (ALL_KIND_SET as Set<string>).has(s)),

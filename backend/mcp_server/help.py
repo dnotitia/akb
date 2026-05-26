@@ -142,9 +142,10 @@ akb_put(..., related_to=["akb://v/doc/path/to/related.md"], depends_on=["akb://v
 
 **Partial read (save tokens):**
 ```
-akb_browse(vault="v")           # L1: collection names
-akb_browse(vault="v", depth=2)  # L2: + document summaries
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="API")  # L3: one section
+akb_browse(vault="v")            # default depth=1 — root + first level of collection contents
+akb_browse(vault="v", depth=0)   # narrowest — root contents only, no descent
+akb_browse(vault="v", depth=-1)  # heaviest — entire subtree of the vault
+akb_drill_down(uri="akb://v/doc/path/to/file.md", section="API")  # one section
 ```
 
 **Update only what changed:**
@@ -197,9 +198,9 @@ ranked list. Filter by `type="document"|"table"|"file"` to narrow.
 When you want to **see everything** rather than search:
 
 ```
-akb_browse(vault="v")                        # What collections exist?
-akb_browse(vault="v", collection="specs")    # What docs are in specs?
-akb_browse(vault="v", depth=2)               # Everything at once
+akb_browse(vault="v")                        # Root + first collection level (default depth=1)
+akb_browse(vault="v", collection="specs")    # Drill into specs/, direct children only
+akb_browse(vault="v", depth=-1)              # Entire vault subtree in one call
 ```
 
 ## akb_drill_down — Section Reader
@@ -585,7 +586,7 @@ Templates pre-create useful collections (specs, decisions, guides, etc.)
 
 ### Step 2: Browse the template structure
 ```
-akb_browse(vault="my-project", depth=2)
+akb_browse(vault="my-project", depth=-1)  # see the entire template subtree
 ```
 
 ### Step 3: Invite team members
@@ -690,7 +691,7 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | Document AKB URI (`akb://{vault}/doc/{path}`) |
+| uri | ✓ | Document AKB URI — `akb://{vault}[/coll/{coll_path}]/doc/{filename}` |
 
 ## Returns
 Full document: title, content, metadata (type, tags, status, created_by, dates), relations.
@@ -806,10 +807,11 @@ Each item includes its `uri` for use with akb_link, akb_relations, etc.
 
 ## Examples
 ```
-akb_browse(vault="eng")                         # Everything: collections, tables, files
-akb_browse(vault="eng", content_type="tables")  # Only tables
-akb_browse(vault="eng", collection="specs")     # Documents + files in "specs"
-akb_browse(vault="eng", depth=2)                # Collections expanded + tables + files
+akb_browse(vault="eng")                         # Default: root + 1 collection level (depth=1)
+akb_browse(vault="eng", content_type="tables")  # Only tables (collections suppressed)
+akb_browse(vault="eng", collection="specs")     # Drill into specs/, direct children
+akb_browse(vault="eng", depth=-1)               # Entire vault subtree (unbounded)
+akb_browse(vault="eng", depth=0)                # Strict: vault root contents only
 ```
 
 💡 Use content_type to filter when you only need one data type.""",
@@ -1327,7 +1329,7 @@ The `confirm` parameter must match the vault name. Owner only.""",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | Table AKB URI (`akb://{vault}/table/{name}`) |
+| uri | ✓ | Table AKB URI — `akb://{vault}[/coll/{coll_path}]/table/{name}` |
 | add_columns | | Columns to add: [{"name": "col", "type": "text"}] |
 | drop_columns | | Column names to remove: ["old_col"] |
 | rename_columns | | Rename map: {"old_name": "new_name"} |

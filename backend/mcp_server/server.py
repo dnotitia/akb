@@ -236,10 +236,14 @@ async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_put")
 async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    try:
+        vault, collection = _resolve_parent(args, kind_name="document")
+    except ValueError as e:
+        return {"error": str(e)}
+    await check_vault_access(uid, vault, required_role="writer")
     req = DocumentPutRequest(
-        vault=args["vault"],
-        collection=args["collection"],
+        vault=vault,
+        collection=collection,
         title=args["title"],
         content=args["content"],
         type=args.get("type", "note"),
@@ -254,6 +258,37 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     except ValueError as e:
         return {"error": str(e)}
     return result.model_dump()
+
+
+def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
+    """Decode the `parent` URI form for write tools (akb_put,
+    akb_create_table, akb_put_file) and return ``(vault, collection)``.
+    If `parent` is absent, fall back to the legacy ``vault`` +
+    ``collection`` pair. Raises ``ValueError`` on a malformed `parent`
+    URI, a leaf-resource URI (those aren't valid parents — you don't
+    put a {kind_name} *inside* a doc/table/file), or when neither
+    `parent` nor `vault` is supplied.
+
+    Centralised so all three write tools agree on the rule. Mirrors
+    the equivalent logic in ``_handle_browse`` (which also takes a
+    URI-or-coordinate form)."""
+    from app.services.uri_service import split_browse_uri
+    parent = args.get("parent")
+    if parent:
+        try:
+            vault, coll = split_browse_uri(parent)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid `parent` URI for {kind_name}: {e}"
+            ) from e
+        return vault, coll or ""
+    vault = args.get("vault")
+    if not vault:
+        raise ValueError(
+            f"Either `parent` (akb:// URI) or `vault` is required to "
+            f"create a {kind_name}."
+        )
+    return vault, args.get("collection") or ""
 
 
 @_h("akb_get")
@@ -370,10 +405,28 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
     # `summary` is dropped from items by default — it's the largest
     # field on `BrowseItem` and dominates payload size on
     # collection-heavy vaults. Opt in with `include_summary=true`.
-    await check_vault_access(uid, args["vault"], required_role="reader")
+    #
+    # Browse target may be specified two ways: legacy (`vault` +
+    # optional `collection`) or canonical (`uri` — vault root or
+    # `akb://V/coll/X`). If `uri` is given it wins and the legacy
+    # params are ignored, so a caller can paste an item's `uri`
+    # straight back in without re-parsing.
+    from app.services.uri_service import split_browse_uri
+    uri_arg = args.get("uri")
+    if uri_arg:
+        try:
+            vault, collection = split_browse_uri(uri_arg)
+        except ValueError as exc:
+            return {"error": str(exc)}
+    else:
+        vault = args.get("vault")
+        if not vault:
+            return {"error": "Either `vault` or `uri` is required for akb_browse."}
+        collection = args.get("collection")
+    await check_vault_access(uid, vault, required_role="reader")
     result = await doc_service.browse(
-        args["vault"],
-        collection=args.get("collection"),
+        vault,
+        collection=collection,
         depth=args.get("depth", 1),
         content_type=args.get("content_type", "all"),
     )
@@ -484,7 +537,7 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
     if pattern:
         sections = [s for s in sections if pattern in (s.get("content") or "").lower()]
 
-    response = {
+    response: dict = {
         "uri": args["uri"],
         "sections": sections,
         "returned": len(sections),
@@ -503,7 +556,65 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
             "or call again with `mode='outline'` for the heading list only, "
             "or call `akb_get(uri=...)` to read the whole document."
         )
+        return response
+
+    # Successful match — surface where the agent can drill next.
+    # `sub_sections` are the immediate children of the matched heading
+    # that actually exist in this document (deduped across chunks).
+    # `siblings_hint` points at a sibling lookup pattern when there
+    # are no children — gives the LLM something useful to try without
+    # re-fetching the full outline.
+    section_paths = [s.get("section_path") or "" for s in sections]
+    sub_sections = _sub_sections_of(section_paths, section)
+    if sub_sections:
+        response["sub_sections"] = sub_sections[:OUTLINE_CAP]
+        response["hint"] = (
+            "This section has children — drill further with "
+            f"`section='{sub_sections[0]}'`. "
+            "For all headings call again with `mode='outline'`."
+        )
+    elif section:
+        response["hint"] = (
+            "No sub-sections under this heading. To pick a sibling "
+            "or another section, call again with `mode='outline'`."
+        )
+    else:
+        # `section` was not provided — caller got the whole doc back
+        # as section chunks. Quiet hint about the partial-read pattern.
+        response["hint"] = (
+            "Returned every section. Use `section='Heading'` or "
+            "`pattern='text'` to narrow next time."
+        )
     return response
+
+
+def _sub_sections_of(section_paths: list[str], parent: str | None) -> list[str]:
+    """Return the immediate children of ``parent`` that appear in
+    ``section_paths``. The ``section`` argument to ``drill_down`` is
+    an ILIKE substring (``section_path ILIKE '%' || $section || '%'``),
+    not an exact match — so the returned chunks may also include the
+    parent heading itself plus deeper grandchildren. We collapse
+    grandchildren onto their immediate-child segment so the agent sees
+    one nav level at a time.
+
+    When ``parent`` is ``None`` (no section filter) the helper returns
+    an empty list — the caller has the full outline already and a
+    "sub-section" concept isn't meaningful.
+    """
+    if not parent:
+        return []
+    prefix = parent.rstrip("/") + "/"
+    children: set[str] = set()
+    for path in section_paths:
+        if not path or not path.startswith(prefix):
+            continue
+        rest = path[len(prefix):]
+        if not rest:
+            continue
+        first = rest.split("/", 1)[0]
+        if first:
+            children.add(prefix + first)
+    return sorted(children)
 
 
 @_h("akb_activity")
@@ -511,17 +622,33 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, args["vault"], required_role="reader")
     from app.services.git_service import GitService
     git = GitService()
+    limit = args.get("limit", 20)
+    # Peek one past the limit so we can flag truncation without a
+    # separate `git rev-list --count` walk (which would re-traverse the
+    # whole vault log just to answer "is there more?"). The trade-off:
+    # `truncated` reflects what git would have produced *before* the
+    # post-fetch author filter below — i.e. when truncated=True the
+    # caller knows commits exist past the window, but cannot tell
+    # without paging whether they would survive the author filter.
     entries = git.vault_log(
         args["vault"],
-        max_count=args.get("limit", 20),
+        max_count=limit + 1,
         since=args.get("since"),
         path=args.get("collection"),  # Git-native path filter (like git log -- <path>)
     )
+    truncated = len(entries) > limit
+    if truncated:
+        entries = entries[:limit]
     # Filter by author (post-filter, Git doesn't support Korean author filter well)
     author = args.get("author")
     if author:
         entries = [e for e in entries if author.lower() in e.get("agent", "").lower() or author.lower() in e.get("author", "").lower()]
-    return {"vault": args["vault"], "total": len(entries), "activity": entries}
+    return {
+        "vault": args["vault"],
+        "activity": entries,
+        "returned": len(entries),
+        "truncated": truncated,
+    }
 
 
 @_h("akb_diff")
@@ -542,7 +669,7 @@ async def _handle_relations(args: dict, uid: str, user: _MCPUser) -> dict:
     parsed = parse_uri(uri)
     if parsed is None:
         return {"error": f"Invalid AKB URI: '{uri}'"}
-    vault = parsed[0]
+    vault = parsed.vault
     access = await check_vault_access(uid, vault, required_role="reader")
     relations = await get_resource_relations(
         vault, uri,
@@ -561,7 +688,7 @@ async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
         parsed = parse_uri(uri)
         if parsed is None:
             return {"error": f"Invalid AKB URI: '{uri}'"}
-        vault = parsed[0]
+        vault = parsed.vault
     else:
         v = args.get("vault")
         if not v:
@@ -571,7 +698,11 @@ async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
     return await get_graph(
         vault,
         resource_uri=uri,
-        depth=args.get("depth", 2),
+        # 0.3.0 renamed the param to `hops` so it doesn't collide with
+        # `akb_browse.depth` (collection-tree depth). Accept the new
+        # name only — the old `depth` is not aliased here because that
+        # would let half-migrated callers silently use the wrong word.
+        hops=args.get("hops", 2),
         limit=args.get("limit", 50),
         vault_id=access["vault_id"],
     )
@@ -585,9 +716,9 @@ async def _handle_link(args: dict, uid: str, user: _MCPUser) -> dict:
     tgt_parsed = parse_uri(args["target"])
     if src_parsed is None or tgt_parsed is None:
         return {"error": "Both source and target must be valid akb:// URIs"}
-    if src_parsed[0] != tgt_parsed[0]:
+    if src_parsed.vault != tgt_parsed.vault:
         return {"error": "source and target must belong to the same vault"}
-    vault = src_parsed[0]
+    vault = src_parsed.vault
     await check_vault_access(uid, vault, required_role="writer")
     return await link_resources(
         vault,
@@ -602,9 +733,9 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
     tgt_parsed = parse_uri(args["target"])
     if src_parsed is None or tgt_parsed is None:
         return {"error": "Both source and target must be valid akb:// URIs"}
-    if src_parsed[0] != tgt_parsed[0]:
+    if src_parsed.vault != tgt_parsed.vault:
         return {"error": "source and target must belong to the same vault"}
-    vault = src_parsed[0]
+    vault = src_parsed.vault
     await check_vault_access(uid, vault, required_role="writer")
     return await unlink_resources(
         args["source"], args["target"],
@@ -624,13 +755,17 @@ async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_create_table")
 async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
-    access = await check_vault_access(uid, args["vault"], required_role="writer")
+    try:
+        vault, collection = _resolve_parent(args, kind_name="table")
+    except ValueError as e:
+        return {"error": str(e)}
+    access = await check_vault_access(uid, vault, required_role="writer")
     try:
         return await table_service.create_table(
             access["vault_id"], args["name"], args["columns"],
             actor_id=user.username,
             description=args.get("description", ""),
-            collection=args.get("collection"),
+            collection=collection or None,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -695,8 +830,11 @@ async def _handle_remember(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_recall")
 async def _handle_recall(args: dict, uid: str, user: _MCPUser) -> dict:
-    memories = await recall(uid, args.get("category"), args.get("limit", 20))
-    return {"memories": memories, "total": len(memories)}
+    # `recall` now returns the full envelope: {memories, returned,
+    # total, truncated}. Pass it through unchanged — `total` is the
+    # corpus count (was len(returned) pre-0.3.0, which lied when the
+    # LIMIT cut things off).
+    return await recall(uid, args.get("category"), args.get("limit", 20))
 
 
 @_h("akb_forget")

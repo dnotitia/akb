@@ -6,11 +6,18 @@ Identifier policy
 -----------------
 Clients never see internal database IDs (UUIDs, prefixed `d-…` ids,
 file UUIDs, table UUIDs). The single canonical handle for every vault
-resource is the AKB URI:
+resource is the AKB URI — location-aware as of 0.3.0:
 
-  - akb://{vault}/doc/{path/to/file.md}
-  - akb://{vault}/table/{name}
-  - akb://{vault}/file/{uuid}
+  - akb://{vault}                                            vault root
+  - akb://{vault}/coll/{coll_path}                           collection
+  - akb://{vault}[/coll/{coll_path}]/doc/{filename}          document
+  - akb://{vault}[/coll/{coll_path}]/table/{name}            table
+  - akb://{vault}[/coll/{coll_path}]/file/{uuid}             file
+
+The `/coll/{coll_path}` segment is omitted for resources at the vault
+root. ``{filename}`` is the document's basename (no slashes); the
+collection lives in the `/coll/...` segment. ``{name}`` is the table
+name (unique per vault); ``{uuid}`` is the file's UUID PK.
 
 Tools that target an existing resource take `uri` and nothing else
 (vault is encoded in the URI). Tools that *create* a new resource keep
@@ -94,15 +101,28 @@ TOOLS = [
     Tool(
         name="akb_put",
         description=(
-            "Store a new document. The response carries the canonical `uri` "
-            "(akb://{vault}/doc/{path}) — use that to address the document from "
-            "every other tool. Automatically chunked and indexed for semantic search."
+            "Store a new document. The response carries the canonical `uri` — "
+            "`akb://{vault}/coll/{collection}/doc/{filename}` when stored under a "
+            "collection, or `akb://{vault}/doc/{filename}` at the vault root. Use "
+            "that URI to address the document from every other tool. Automatically "
+            "chunked and indexed for semantic search."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Target vault name"},
-                "collection": {"type": "string", "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'"},
+                "parent": {
+                    "type": "string",
+                    "description": (
+                        "Parent location as a canonical URI — `akb://{vault}` "
+                        "for the vault root, `akb://{vault}/coll/{path}` for a "
+                        "collection. When given, the doc is placed there and "
+                        "`vault`/`collection` are derived from the URI. Use "
+                        "this in drill-down chains: paste the `uri` from an "
+                        "`akb_browse` response straight back in."
+                    ),
+                },
+                "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
+                "collection": {"type": "string", "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'. Ignored when `parent` is given."},
                 "title": {"type": "string", "description": "Document title"},
                 "content": {"type": "string", "description": "Document body in Markdown"},
                 "type": {
@@ -117,7 +137,9 @@ TOOLS = [
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs this depends on"},
                 "related_to": {"type": "array", "items": {"type": "string"}, "description": "akb:// URIs of related resources"},
             },
-            "required": ["vault", "collection", "title", "content"],
+            # `vault` + `collection` are required-via-handler rather than
+            # required-in-schema — passing `parent` instead also satisfies.
+            "required": ["title", "content"],
         },
     ),
     Tool(
@@ -130,7 +152,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Document URI (akb://{vault}/doc/{path})"},
+                "uri": {"type": "string", "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"},
                 "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_history)"},
             },
             "required": ["uri"],
@@ -203,26 +225,52 @@ TOOLS = [
     Tool(
         name="akb_browse",
         description=(
-            "Browse ALL vault content — documents (by collection), tables, and files. "
-            "Without collection: shows top-level collections, tables, and files. "
-            "With collection: shows documents and files in that collection. "
+            "Browse ALL vault content — documents, tables, and files — under a browse "
+            "root. The browse root can be addressed two ways: pass a canonical `uri` "
+            "(`akb://V` for vault root or `akb://V/coll/X` for a collection), or the "
+            "legacy `vault` + optional `collection` pair. Use the URI form when "
+            "drilling down from a previous response — every item carries a `uri` "
+            "that can be pasted straight back in.\n\n"
+            "`depth` is tree-depth from the browse root, mirroring `tree -L N`: "
+            "0 = direct children only (no descent), N = descend N collection levels, "
+            "-1 = entire subtree. Collection rows are always emitted as navigation "
+            "aids regardless of depth.\n\n"
             "Response is slim by default (no `summary` field) so large vaults "
             "(70+ collections) fit in the agent's context window. Returns "
-            "{vault, path, items, total, returned, truncated?, hint?}. "
-            "Use `filter` to narrow when you know a domain keyword. Each item "
-            "carries its canonical `uri`."
+            "{vault, path, items, total, returned, truncated?, hint?}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "collection": {"type": "string", "description": "Collection path to browse into (omit for top-level)"},
+                "uri": {
+                    "type": "string",
+                    "description": (
+                        "Canonical browse target: `akb://{vault}` (vault root) or "
+                        "`akb://{vault}/coll/{path}` (collection-scoped). Takes "
+                        "precedence over `vault` + `collection` when both are given."
+                    ),
+                },
+                "vault": {
+                    "type": "string",
+                    "description": "Vault name. Required unless `uri` is given.",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": (
+                        "Collection path to use as the browse root (omit for "
+                        "vault root). Ignored when `uri` is given."
+                    ),
+                },
                 "depth": {
                     "type": "integer",
-                    "description": "1=collections only, 2=collections+documents",
+                    "description": (
+                        "Tree depth from the browse root. 0 = direct children only "
+                        "(no descent into any collection). N = descend N collection "
+                        "levels. -1 = unbounded (entire subtree). Collections "
+                        "themselves are always emitted regardless of depth."
+                    ),
                     "default": 1,
-                    "minimum": 1,
-                    "maximum": 2,
+                    "minimum": -1,
                 },
                 "content_type": {
                     "type": "string",
@@ -236,7 +284,9 @@ TOOLS = [
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
             },
-            "required": ["vault"],
+            # Either `vault` or `uri` must be present — enforced at the
+            # handler since JSON schema's anyOf-on-required is awkward
+            # to express in some MCP clients.
         },
     ),
     Tool(
@@ -395,7 +445,17 @@ TOOLS = [
             "properties": {
                 "uri": {"type": "string", "description": "Center resource URI (omit + pass vault for full vault graph)"},
                 "vault": {"type": "string", "description": "Vault name (only when uri is omitted — for full vault graph)"},
-                "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 5, "description": "BFS depth"},
+                "hops": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": (
+                        "BFS traversal radius in edge hops. Disambiguated from "
+                        "`akb_browse.depth` (which is collection-tree depth) — "
+                        "hops here counts relations followed, not folder levels."
+                    ),
+                },
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200, "description": "Max nodes"},
             },
         },
@@ -453,21 +513,31 @@ TOOLS = [
         name="akb_create_table",
         description=(
             "Create a structured data table in a vault. The response carries the "
-            "canonical `uri` (akb://{vault}/table/{name}). "
-            "Tables live alongside documents inside collections and follow the same permissions. "
-            "Define columns with name and type (text, number, boolean, date, json). "
-            "Optional `collection` (e.g. 'sessions/learnings') groups the table under that "
-            "collection so it appears beside the documents and files there in akb_browse; "
-            "omit for vault root."
+            "canonical `uri` — `akb://{vault}/coll/{collection}/table/{name}` when "
+            "stored under a collection, or `akb://{vault}/table/{name}` at the vault "
+            "root. Tables live alongside documents inside collections and follow the "
+            "same permissions. Define columns with name and type (text, number, "
+            "boolean, date, json). Optional `collection` (e.g. 'sessions/learnings') "
+            "groups the table under that collection so it appears beside the documents "
+            "and files there in akb_browse; omit for vault root."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string"},
+                "parent": {
+                    "type": "string",
+                    "description": (
+                        "Parent location as a canonical URI — `akb://{vault}` "
+                        "for the vault root, `akb://{vault}/coll/{path}` for a "
+                        "collection. When given, the table is created there "
+                        "and `vault`/`collection` are derived from the URI."
+                    ),
+                },
+                "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
                 "name": {"type": "string", "description": "Table name (unique within the vault)"},
                 "collection": {
                     "type": "string",
-                    "description": "Collection path (e.g. 'specs' or 'sessions/learnings'). Omit for vault root.",
+                    "description": "Collection path (e.g. 'specs' or 'sessions/learnings'). Omit for vault root. Ignored when `parent` is given.",
                 },
                 "description": {"type": "string"},
                 "columns": {
@@ -484,7 +554,7 @@ TOOLS = [
                     },
                 },
             },
-            "required": ["vault", "name", "columns"],
+            "required": ["name", "columns"],
         },
     ),
     Tool(
@@ -516,7 +586,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Table URI (akb://{vault}/table/{name})"},
+                "uri": {"type": "string", "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"},
             },
             "required": ["uri"],
         },
@@ -527,7 +597,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Table URI (akb://{vault}/table/{name})"},
+                "uri": {"type": "string", "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"},
                 "add_columns": {
                     "type": "array",
                     "description": "Columns to add",

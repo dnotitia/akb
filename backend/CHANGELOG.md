@@ -5,6 +5,198 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.0 — 2026-05-27
+
+**BREAKING** — a coordinated contract pass that takes the AKB API
+from "mostly consistent with quiet gaps" to "every surface tells the
+same story":
+
+1. `akb_browse.depth` redesigned as true tree-depth (from misnomer).
+2. **URI scheme made location-aware** — every URI carries an
+   optional `/coll/<path>` segment that names its containing
+   collection, so siblings/parents are discoverable by walking up
+   the URI without an extra lookup.
+3. `akb_graph.depth` renamed to `hops` so it does not collide with
+   the new browse `depth`.
+4. List-style tools (`akb_recall`, `akb_activity`) report what they
+   returned, the corpus total, and whether more exists, instead of
+   leaving callers to guess.
+5. `akb_search` / `akb_grep` hits now carry an explicit
+   `collection` field so clients group/filter without URI parsing.
+6. `akb_drill_down` surfaces sub-section hints on a successful
+   match so a drilling agent has its next step in hand.
+
+### Location-aware URI scheme — every resource self-describes its place
+
+Pre-0.3.0 the URI scheme placed the collection inside the doc path
+(`akb://V/doc/specs/api.md`) but emitted table and file URIs with
+no collection prefix at all (`akb://V/table/expenses`,
+`akb://V/file/<uuid>`). 0.3.0 unifies the scheme:
+
+    akb://{vault}                                       vault root
+    akb://{vault}/coll/{coll_path}                      collection
+    akb://{vault}/doc/{filename}                        root doc
+    akb://{vault}/coll/{coll_path}/doc/{filename}       doc in coll
+    akb://{vault}/table/{name}                          root table
+    akb://{vault}/coll/{coll_path}/table/{name}         table in coll
+    akb://{vault}/file/{uuid}                           root file
+    akb://{vault}/coll/{coll_path}/file/{uuid}          file in coll
+
+Two new helpers exist alongside the typed ones:
+
+  * `vault_uri(vault)` — addresses the vault root, useful as the
+    starting point of a drill-down chain.
+  * `coll_uri(vault, path)` — collections are first-class URI
+    citizens now (previously they were the only navigation type
+    without a canonical handle).
+
+`table_uri(vault, name, collection=None)` and
+`file_uri(vault, file_id, collection=None)` gained an optional
+`collection` parameter — pass it when building from a row that has
+the collection FK already JOINed. The `doc_uri(vault, path)`
+helper splits the doc's full path at the LAST slash and emits the
+new canonical form automatically — call sites that already pass
+`documents.path` need no change.
+
+`akb_browse` accepts a `uri` argument that takes precedence over
+the legacy `vault` + `collection` pair. Drill-down chains are now
+a paste-back loop: every browse item carries `uri`, paste it back
+into `akb_browse(uri=...)` to drill in. Doc / table / file URIs
+passed to browse are rejected with a hint pointing at the
+appropriate leaf tool.
+
+**Migration 026** rewrites every persisted URI in `edges`,
+`publications`, and `events` to the new canonical form. Doc
+rewrites run as a pure SQL `regexp_replace`; table/file rewrites
+JOIN through `vault_tables` / `vault_files` to recover the
+collection. Frontmatter URIs inside markdown bodies are **not**
+rewritten — old URIs there will not parse against the new scheme
+and edge extraction logs a warning. An optional batch-rewrite
+tool can be run later if needed.
+
+`make_uri(vault, type, identifier)` (the bottom-level builder that
+produced the legacy shape) is gone. Every emit site goes through
+the type-specific helpers so the location prefix is built the
+same way everywhere — a hand-built `f"akb://..."` string outside
+`uri_service.py` is now an audit finding, not a routine pattern.
+
+### `akb_browse` — true tree-depth
+
+### `akb_browse` — true tree-depth
+
+`depth` was historically a misnomer: `1 = collections only`,
+`2 = + documents` (always-all tables and files regardless). Issues
+#81 / #82 fixed in 0.2.5 patched the document asymmetry, but the
+underlying mental model stayed broken — depth wasn't depth, just
+an "include docs" toggle, and tables/files leaked from sub-collections
+into every top-level browse.
+
+0.3.0 redefines `depth` as **tree-depth from the browse root** —
+the `tree -L N` convention:
+
+- `depth=0` — direct children of the browse root only, no descent
+  into any collection
+- `depth=N` (N ≥ 1) — descend N collection levels
+- `depth=-1` — unbounded; the entire subtree of the browse root
+
+Collection rows are always emitted as navigation aids regardless of
+depth (the response would be useless without them). `doc` / `table` /
+`file` rows are the ones gated. When `collection` is supplied, the
+browse root is that collection, and depth is counted from inside it.
+
+Schema bounds: `minimum: -1`, no maximum. Existing default
+`depth=1` is preserved but its meaning shifts (root + 1 level
+of collection contents, rather than the old misnomer).
+
+Migration for the AKB frontend: `use-vault-tree.ts` now calls
+`browseVault(vault, undefined, -1)` (unbounded) because the
+client-side tree builder always wants the entire vault. External
+MCP clients passing `depth=2` and expecting "everything" must
+switch to `depth=-1`.
+
+No data migration is required — depth is computed at query time
+via PostgreSQL slash-counting (`length - length(replace(path, '/', ''))`),
+the existing `collection_id` FK + path conventions cover every
+case.
+
+### `akb_recall` — corpus total + truncated flag
+
+Pre-0.3.0 returned `list[dict]` straight out, with the MCP handler
+synthesising `{memories, total}` where `total = len(memories)` —
+i.e. it lied when `LIMIT` cut anything off. Callers had no way to
+know more memories existed.
+
+0.3.0 returns `{memories, returned, total, truncated}`:
+
+- `total` is the **corpus count** matching the filter (one extra
+  `COUNT(*)` query, cheap)
+- `returned` is `len(memories)`
+- `truncated` is `True` when `total > returned`
+
+Callers that previously consumed the bare list now read `.memories`.
+The REST `/api/v1/memory` mirror was updated symmetrically.
+
+### `akb_activity` — truncated flag, drop the misleading `total`
+
+Pre-0.3.0 returned `{vault, total: len(entries), activity: entries}`
+where `entries` was already capped by `git log --max-count=limit` —
+so `total` was the post-limit slice, never the corpus.
+
+0.3.0 returns `{vault, activity, returned, truncated}`:
+
+- `total` removed (it was wrong)
+- `truncated` computed via peek-ahead (`git log --max-count=limit+1`)
+- `returned` is `len(activity)` after any author post-filter
+
+The `total` removal is the visible BREAKING change. `test_mcp_e2e.sh`
+already reads the new `returned` field.
+
+### `akb_graph` — `depth` → `hops`
+
+Graph traversal radius is now spelled `hops` instead of `depth` to
+disambiguate from `akb_browse.depth` (collection-tree depth). The
+two parameters meant different things — one counts edges
+followed, the other counts folder levels — and sharing a name
+forced callers to memorize the difference. REST `?depth=` is
+renamed to `?hops=` on `/graph` as well. No alias; explicit
+rename so half-migrated callers fail loudly instead of using the
+wrong radius.
+
+### `akb_search` / `akb_grep` — `collection` field on hits
+
+Hit envelopes now include `collection` (the containing-collection
+path, null at vault root). Sourced from a `LEFT JOIN collections`
+in the hydrate query — same row already gives us the URI, so the
+cost is one extra column per type. Clients that grouped or
+filtered hits by collection used to parse the URI themselves;
+now they read the field directly.
+
+### `akb_drill_down` — sub-section navigation hints
+
+A successful match returns `sub_sections` — the immediate
+children of the matched heading that actually appear in the
+document. A `hint` field points at the next concrete drill step
+(`section='Setup/Install'` or `mode='outline'`), so an agent that
+just matched "Setup" gets one-step suggestions instead of having
+to re-fetch the outline.
+
+### Defense-in-depth — vault-template seed
+
+`document_service.create_vault` (template seed path) now skips
+`coll_repo.get_or_create` when the template's `collections[i].path`
+is empty, with a warning log. Every shipped template already has
+non-empty paths; the guard exists so a future template typo cannot
+quietly resurrect the `path=''` phantom row that issues #81/#82
+were about.
+
+### Migration notes
+
+- AKB frontend: included in this PR (`depth=-1`, memory type widened).
+- `seahorse-mcp-agent-server` and any external MCP consumer: needs a
+  coordinated update before deployment to environments where it runs
+  (e.g. KISA prod). Hold off on AWS-prod rollout until the demo-agent
+  team has aligned. On-prem rollout is safe in isolation.
+
 ## 0.2.5 — 2026-05-24
 
 `akb_search` response now carries a `truncated` boolean and an

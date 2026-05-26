@@ -162,7 +162,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
         )}
       </Section>
 
-      <Section label="DEPTH" className="px-2">
+      <Section label="HOPS" className="px-2">
         <div
           className={cn(
             "flex items-center gap-3 text-[11px]",
@@ -180,11 +180,11 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
             >
               <input
                 type="radio"
-                name="depth"
-                checked={view.depth === d}
+                name="hops"
+                checked={view.hops === d}
                 disabled={!view.entry}
-                onChange={() => onChange({ ...view, depth: d })}
-                aria-label={`Depth ${d}`}
+                onChange={() => onChange({ ...view, hops: d })}
+                aria-label={`${d} hop${d === 1 ? "" : "s"}`}
               />
               {d}
             </label>

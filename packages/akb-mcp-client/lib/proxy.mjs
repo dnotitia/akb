@@ -82,24 +82,63 @@ function nfcDeep(value) {
   return value;
 }
 
+// `parent` URI decoder for write tools. Mirrors the backend's
+// `_resolve_parent` helper (mcp_server/server.py). Accepts:
+//   akb://{vault}                    → (vault, "")
+//   akb://{vault}/coll/{path}        → (vault, path)
+// Falls back to legacy `vault` + `collection` args when `parent`
+// is absent. Throws on a leaf URI (doc/table/file) or malformed
+// input.
+const PARENT_VAULT_RE = /^akb:\/\/([^/]+)\/?$/;
+const PARENT_COLL_RE = /^akb:\/\/([^/]+)\/coll\/([^/]+(?:\/[^/]+)*)\/?$/;
+const PARENT_LEAF_RE = /^akb:\/\/[^/]+(?:\/coll\/[^/]+(?:\/[^/]+)*)?\/(doc|table|file)\//;
+
+function _resolveParent(args) {
+  const parent = args.parent;
+  if (parent) {
+    if (PARENT_LEAF_RE.test(parent)) {
+      throw new Error(
+        `Invalid \`parent\` URI: '${parent}' addresses a leaf resource. ` +
+        `Use a vault root or coll URI to place a new resource inside.`,
+      );
+    }
+    let m = parent.match(PARENT_COLL_RE);
+    if (m) return { vault: m[1], collection: m[2] };
+    m = parent.match(PARENT_VAULT_RE);
+    if (m) return { vault: m[1], collection: "" };
+    throw new Error(
+      `Invalid \`parent\` URI: '${parent}'. Expected akb://<vault> or ` +
+      `akb://<vault>/coll/<path>.`,
+    );
+  }
+  return { vault: args.vault, collection: args.collection || "" };
+}
+
 // ── File tool definitions (injected into tools/list) ────────
 
 const FILE_TOOLS = [
   {
     name: "akb_put_file",
     description:
-      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` (akb://{vault}/file/{id}) — pass that to akb_get_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
+      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
     inputSchema: {
       type: "object",
       properties: {
-        vault: { type: "string", description: "Vault name (new files are not URI-addressable yet, so the placement vault is named explicitly)" },
+        parent: {
+          type: "string",
+          description:
+            "Parent location as a canonical URI — `akb://{vault}` for the vault root, " +
+            "`akb://{vault}/coll/{path}` for a collection. When given, the file is " +
+            "uploaded there and `vault`/`collection` are derived from the URI.",
+        },
+        vault: { type: "string", description: "Vault name. Required unless `parent` is given." },
         file_path: {
           type: "string",
           description: "Absolute path to the local file to upload",
         },
         collection: {
           type: "string",
-          description: "Logical grouping (like document collections)",
+          description: "Logical grouping (like document collections). Ignored when `parent` is given.",
           default: "",
         },
         description: {
@@ -114,12 +153,12 @@ const FILE_TOOLS = [
             "Override only when the extension is missing, ambiguous, or wrong.",
         },
       },
-      required: ["vault", "file_path"],
+      required: ["file_path"],
     },
   },
   {
     name: "akb_get_file",
-    description: "Download a file from vault storage to a local path. Pass the file URI (akb://{vault}/file/{id}) from akb_browse or akb_put_file.",
+    description: "Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from akb_browse or akb_put_file.",
     inputSchema: {
       type: "object",
       properties: {
@@ -154,13 +193,21 @@ const FILE_TOOLS = [
 // Parse an akb://{vault}/file/{id} URI into (vault, id). Throws if malformed.
 function parseFileUri(uri) {
   if (typeof uri !== "string") throw new Error("uri must be a string");
-  const m = uri.match(/^akb:\/\/([^/]+)\/file\/(.+)$/);
-  if (!m) {
+  // 0.3.0 location-aware form: optional `/coll/<path>` segment
+  // between the vault and `/file/`. Both root and in-collection
+  // file URIs are accepted; the `id` (UUID) is what we use to
+  // address the file in subsequent /confirm / /download calls.
+  const collMatch = uri.match(/^akb:\/\/([^/]+)\/coll\/[^/]+(?:\/[^/]+)*\/file\/(.+)$/);
+  if (collMatch) {
+    return { vault: collMatch[1], id: collMatch[2] };
+  }
+  const rootMatch = uri.match(/^akb:\/\/([^/]+)\/file\/(.+)$/);
+  if (!rootMatch) {
     throw new Error(
-      `Invalid file URI: '${uri}'. Expected akb://<vault>/file/<id>.`,
+      `Invalid file URI: '${uri}'. Expected akb://<vault>[/coll/<path>]/file/<uuid>.`,
     );
   }
-  return { vault: m[1], id: m[2] };
+  return { vault: rootMatch[1], id: rootMatch[2] };
 }
 
 const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
@@ -353,8 +400,16 @@ export class AKBProxy {
   }
 
   async _putFile(args) {
-    const { vault, file_path, collection = "", description = "" } = args;
-    if (!vault || !file_path) throw new Error("vault and file_path required");
+    const { file_path, description = "" } = args;
+    // Resolve placement: either `parent` URI (vault root or coll URI)
+    // or legacy `vault` + `collection`. Mirrors the backend's
+    // `_resolve_parent` helper for akb_put / akb_create_table so the
+    // three write tools accept the same shape.
+    const { vault, collection } = _resolveParent(args);
+    if (!file_path) throw new Error("file_path required");
+    if (!vault) throw new Error(
+      "Either `parent` (akb:// URI) or `vault` is required to upload a file."
+    );
 
     const filename = basename(file_path);
     let fileSize;

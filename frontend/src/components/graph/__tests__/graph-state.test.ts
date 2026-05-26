@@ -8,14 +8,22 @@ describe("graph-state codec", () => {
     expect(viewToQuery(DEFAULT_VIEW)).toBe("");
   });
 
-  it("roundtrips entry + depth", () => {
-    const v: GraphView = { ...DEFAULT_VIEW, entry: "d-94d8657f", depth: 3 };
+  it("roundtrips entry + hops", () => {
+    const v: GraphView = { ...DEFAULT_VIEW, entry: "d-94d8657f", hops: 3 };
     const q = viewToQuery(v);
     expect(q).toContain("entry=d-94d8657f");
-    expect(q).toContain("depth=3");
+    expect(q).toContain("hops=3");
     const back = queryToView(new URLSearchParams(q));
     expect(back.entry).toBe("d-94d8657f");
-    expect(back.depth).toBe(3);
+    expect(back.hops).toBe(3);
+  });
+
+  // Pre-0.3.0 URLs used `depth=N` for the same field. The decoder
+  // honours the legacy name so bookmarked graph URLs keep working
+  // after the upgrade.
+  it("legacy `depth=` URL param maps to hops", () => {
+    const back = queryToView(new URLSearchParams("depth=3"));
+    expect(back.hops).toBe(3);
   });
 
   it("omits types when all are selected", () => {
@@ -47,9 +55,9 @@ describe("graph-state codec", () => {
     expect(back.selected).toBe(uri);
   });
 
-  it("ignores unknown depths and clamps to 2", () => {
-    const back = queryToView(new URLSearchParams("depth=7"));
-    expect(back.depth).toBe(2);
+  it("ignores unknown hops values and clamps to 2", () => {
+    const back = queryToView(new URLSearchParams("hops=7"));
+    expect(back.hops).toBe(2);
   });
 
   it("ignores unknown node kinds in types", () => {

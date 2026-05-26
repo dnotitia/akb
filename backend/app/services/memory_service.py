@@ -58,13 +58,24 @@ async def recall(
     user_id: str,
     category: str | None = None,
     limit: int = 20,
-) -> list[dict]:
-    """Retrieve memories for the user."""
+) -> dict:
+    """Retrieve memories for the user, with an honest truncation signal.
+
+    Returns ``{memories, returned, total, truncated}``. ``total`` is the
+    full corpus count matching the filter (cheap COUNT in a single
+    extra query); ``truncated`` is ``True`` when the LIMIT cut off
+    additional matches. Callers that previously consumed ``list[dict]``
+    now read ``.memories`` — see the 0.3.0 CHANGELOG entry.
+    """
     pool = await get_pool()
     uid = uuid.UUID(user_id)
 
     async with pool.acquire() as conn:
         if category:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND category = $2",
+                uid, category,
+            )
             rows = await conn.fetch(
                 """
                 SELECT id, category, content, source, created_at, updated_at
@@ -76,6 +87,10 @@ async def recall(
                 uid, category, limit,
             )
         else:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE user_id = $1",
+                uid,
+            )
             rows = await conn.fetch(
                 """
                 SELECT id, category, content, source, created_at, updated_at
@@ -87,7 +102,7 @@ async def recall(
                 uid, limit,
             )
 
-    return [
+    memories = [
         {
             "memory_id": str(r["id"]),
             "category": r["category"],
@@ -98,6 +113,13 @@ async def recall(
         }
         for r in rows
     ]
+    total_int = int(total or 0)
+    return {
+        "memories": memories,
+        "returned": len(memories),
+        "total": total_int,
+        "truncated": total_int > len(memories),
+    }
 
 
 async def forget(user_id: str, memory_id: str) -> bool:

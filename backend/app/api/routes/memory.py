@@ -26,8 +26,9 @@ async def recall_memories(
     limit: int = Query(20, ge=1, le=100),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    memories = await recall(user.user_id, category, limit)
-    return {"memories": memories, "total": len(memories)}
+    # `recall` returns the {memories, returned, total, truncated}
+    # envelope as of 0.3.0; pass it through verbatim on the REST wire.
+    return await recall(user.user_id, category, limit)
 
 
 @router.delete("/memory/{memory_id}", summary="Forget a specific memory")

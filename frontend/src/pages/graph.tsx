@@ -36,7 +36,7 @@ export default function GraphPage() {
 
   // Hybrid fetch
   const fullQuery = useFullGraph(vault!, !view.entry);
-  const neighborQuery = useNeighborhood(vault!, view.entry, view.depth);
+  const neighborQuery = useNeighborhood(vault!, view.entry, view.hops);
   const base = view.entry ? neighborQuery.data : fullQuery.data;
   const loading = view.entry ? neighborQuery.isLoading : fullQuery.isLoading;
   const error = view.entry ? neighborQuery.error : fullQuery.error;
@@ -51,7 +51,7 @@ export default function GraphPage() {
   // Reset overlay when the base shape (mode/entry/depth) changes:
   useEffect(() => {
     setOverlay({ nodes: [], edges: [] });
-  }, [view.entry, view.depth, vault]);
+  }, [view.entry, view.hops, vault]);
 
   const merged = useMemo(() => {
     const m = mergeGraph(base || { nodes: [], edges: [] }, overlay);

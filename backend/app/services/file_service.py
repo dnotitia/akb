@@ -187,7 +187,7 @@ class FileService:
         )
         return {
             "kind": "file",
-            "uri": file_uri(vault_name, str(file_id)),
+            "uri": file_uri(vault_name, str(file_id), collection=collection_path),
             "vault": vault_name,
             "collection": collection_path or None,
             "upload_url": presigned_url,
@@ -240,7 +240,11 @@ class FileService:
                     conn, "file.put",
                     vault_id=vault_id,
                     resource_uri=(
-                        file_uri(vault_name_for_event, file_id)
+                        file_uri(
+                            vault_name_for_event,
+                            file_id,
+                            collection=row["collection"],
+                        )
                         if vault_name_for_event else None
                     ),
                     actor_id=actor_id,
@@ -272,7 +276,10 @@ class FileService:
         vault_name = vault_row["name"] if vault_row else None
         return {
             "kind": "file",
-            "uri": file_uri(vault_name, file_id) if vault_name else None,
+            "uri": (
+                file_uri(vault_name, file_id, collection=row["collection"])
+                if vault_name else None
+            ),
             "vault": vault_name,
             "name": row["name"],
             "collection": row["collection"],
@@ -354,7 +361,7 @@ class FileService:
         return [
             {
                 "kind": "file",
-                "uri": file_uri(vault_name, str(r["id"])),
+                "uri": file_uri(vault_name, str(r["id"]), collection=r["collection"]),
                 "collection": r["collection"],
                 "name": r["name"],
                 "mime_type": r["mime_type"],
@@ -397,7 +404,7 @@ class FileService:
                 await vault_files_repo.delete(conn, fid)
 
                 if vault_name:
-                    f_uri = f"akb://{vault_name}/file/{file_id}"
+                    f_uri = file_uri(vault_name, file_id, collection=row["collection"])
                     await conn.execute(
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
@@ -421,7 +428,8 @@ class FileService:
                     conn, "file.delete",
                     vault_id=vault_id,
                     resource_uri=(
-                        file_uri(vault_name, file_id) if vault_name else None
+                        file_uri(vault_name, file_id, collection=row["collection"])
+                        if vault_name else None
                     ),
                     actor_id=actor_id,
                     payload={
@@ -436,7 +444,10 @@ class FileService:
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])
         return {
             "kind": "file",
-            "uri": file_uri(vault_name, file_id) if vault_name else None,
+            "uri": (
+                file_uri(vault_name, file_id, collection=row.get("collection"))
+                if vault_name else None
+            ),
             "vault": vault_name,
             "collection": row.get("collection"),
             "name": row["name"],

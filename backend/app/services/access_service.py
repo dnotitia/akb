@@ -13,6 +13,7 @@ from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
+from app.services.uri_service import vault_uri
 
 logger = logging.getLogger("akb.access")
 
@@ -183,7 +184,7 @@ async def grant_access(
             await emit_event(
                 conn, "access.grant",
                 vault_id=vault["id"],
-                resource_uri=f"akb://{vault_name}",
+                resource_uri=vault_uri(vault_name),
                 actor_id=str(granter_uid),
                 payload={"vault": vault_name, "user": target_username, "role": role},
             )
@@ -241,7 +242,7 @@ async def revoke_access(revoker_id: str, vault_name: str, target_username: str) 
             await emit_event(
                 conn, "access.revoke",
                 vault_id=vault["id"],
-                resource_uri=f"akb://{vault_name}",
+                resource_uri=vault_uri(vault_name),
                 actor_id=str(revoker_uid),
                 payload={"vault": vault_name, "user": target_username},
             )
@@ -550,7 +551,7 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
             await emit_event(
                 conn, "access.transfer_ownership",
                 vault_id=vault["id"],
-                resource_uri=f"akb://{vault_name}",
+                resource_uri=vault_uri(vault_name),
                 actor_id=str(current_owner_uid),
                 payload={
                     "vault": vault_name,
@@ -737,7 +738,7 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
         await emit_event(
             conn, "vault.public_access",
             vault_id=vault["id"],
-            resource_uri=f"akb://{vault_name}",
+            resource_uri=vault_uri(vault_name),
             actor_id=user_id,
             payload={"vault": vault_name, "level": level},
         )

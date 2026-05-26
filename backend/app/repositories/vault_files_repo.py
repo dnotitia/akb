@@ -82,12 +82,27 @@ async def list_for_vault(
     *,
     collection_id: uuid.UUID | None = None,
     scoped: bool = False,
+    max_depth: int | None = None,
+    prefix: str = "",
     limit: int = 50,
 ) -> list[dict]:
-    """List files in a vault. When `scoped=True`, only rows whose
-    `collection_id` matches `collection_id` (NULL == vault root) are
-    returned. Default `scoped=False` returns every file regardless
-    of collection (used by the top-level vault file list page)."""
+    """List files in a vault.
+
+    Three filtering modes — pick one:
+
+    * ``scoped=True`` — equality on ``collection_id``
+      (``None`` ⇒ ``IS NULL``). Files directly inside that collection
+      (or vault root).
+
+    * ``max_depth`` is not ``None`` — tree-depth filter from ``prefix``.
+      A file at collection ``X/Y`` has depth 2 from vault root, depth 1
+      from prefix ``X``. NULL collection ⇒ depth 0. ``max_depth < 0``
+      disables the depth filter (entire subtree). Used by the unified
+      vault browse to honor ``depth=N``.
+
+    Default (no flags) — every file regardless of collection. Preserved
+    so legacy callers see no behaviour change.
+    """
     if scoped:
         if collection_id is None:
             rows = await conn.fetch(
@@ -117,6 +132,44 @@ async def list_for_vault(
                 """,
                 vault_id, collection_id, limit,
             )
+    elif max_depth is not None:
+        params: list = [vault_id]
+        prefix_clause = ""
+        if prefix:
+            from app.util.text import like_escape
+            safe_prefix = like_escape(prefix)
+            params.append(safe_prefix)
+            params.append(safe_prefix + "/%")
+            prefix_clause = (
+                f" AND (c.path = ${len(params)-1} "
+                f"OR c.path LIKE ${len(params)} ESCAPE '\\')"
+            )
+            depth_offset = prefix.count("/") + 1
+        else:
+            depth_offset = 0
+
+        if max_depth < 0:
+            depth_clause = ""
+        else:
+            params.append(max_depth + depth_offset)
+            depth_clause = (
+                f" AND COALESCE("
+                f"length(c.path) - length(replace(c.path, '/', '')) + 1, 0"
+                f") <= ${len(params)}"
+            )
+        params.append(limit)
+        sql = (
+            "SELECT vf.id, vf.collection_id, c.path AS collection, vf.name, "
+            "       vf.mime_type, vf.size_bytes, vf.description, "
+            "       vf.created_by, vf.created_at "
+            "  FROM vault_files vf "
+            "  LEFT JOIN collections c ON c.id = vf.collection_id "
+            " WHERE vf.vault_id = $1"
+            + prefix_clause
+            + depth_clause
+            + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}"
+        )
+        rows = await conn.fetch(sql, *params)
     else:
         rows = await conn.fetch(
             """

@@ -139,7 +139,7 @@ async def create_table(
             await emit_event(
                 conn, "table.create",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], name),
+                resource_uri=table_uri(vault["name"], name, collection=collection_path),
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -173,7 +173,7 @@ async def create_table(
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], name),
+        "uri": table_uri(vault["name"], name, collection=collection_path),
         "vault": vault["name"],
         "collection": collection_path or None,
         "name": name,
@@ -199,7 +199,7 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
             count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
                 "kind": "table",
-                "uri": table_uri(vault["name"], r["name"]),
+                "uri": table_uri(vault["name"], r["name"], collection=r["collection"]),
                 "vault": vault["name"],
                 "collection": r["collection"],
                 "name": r["name"],
@@ -235,8 +235,10 @@ async def drop_table(
             await table_data_repo.drop_dynamic_table(conn, pg_name)
             await table_registry_repo.delete(conn, table_id)
 
-            # Clean up edges referencing this table.
-            t_uri = f"akb://{vault['name']}/table/{table_name}"
+            # Clean up edges referencing this table — use the canonical
+            # URI helper so the location prefix matches what every
+            # other write site produces.
+            t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
             await conn.execute(
                 "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                 t_uri,
@@ -245,7 +247,7 @@ async def drop_table(
             await emit_event(
                 conn, "table.drop",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], table_name),
+                resource_uri=t_uri,
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -268,7 +270,7 @@ async def drop_table(
     logger.info("Table dropped: %s (%s)", table_name, pg_name)
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], table_name),
+        "uri": table_uri(vault["name"], table_name, collection=table.get("collection")),
         "vault": vault["name"],
         "collection": table.get("collection"),
         "name": table_name,
@@ -340,10 +342,11 @@ async def alter_table(
 
             await table_registry_repo.update_columns(conn, table["id"], columns)
 
+            t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
             await emit_event(
                 conn, "table.alter",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], table_name),
+                resource_uri=t_uri,
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -356,7 +359,7 @@ async def alter_table(
 
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], table_name),
+        "uri": t_uri,
         "vault": vault["name"],
         "name": table_name,
         "columns": columns,

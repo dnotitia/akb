@@ -117,7 +117,7 @@ describe("bfsExpand", () => {
     const out = await bfsExpand({
       vault: "v",
       entry: "d-1",
-      depth: 1,
+      hops: 1,
       fetchRelations,
     });
     expect(fetchRelations).toHaveBeenCalledTimes(1);
@@ -167,7 +167,7 @@ describe("bfsExpand", () => {
     const out = await bfsExpand({
       vault: "v",
       entry: "d-1",
-      depth: 2,
+      hops: 2,
       fetchRelations,
     });
     expect(calls.sort()).toEqual(["d-1", "d-2"]);
@@ -192,7 +192,7 @@ describe("bfsExpand", () => {
         },
       ],
     }));
-    await bfsExpand({ vault: "v", entry: "d-1", depth: 3, fetchRelations });
+    await bfsExpand({ vault: "v", entry: "d-1", hops: 3, fetchRelations });
     // d-1 fetched once at hop 0; hop 1 returns d-1 again but it's already visited,
     // so no further fetch.
     expect(fetchRelations).toHaveBeenCalledTimes(1);
@@ -207,7 +207,7 @@ describe("bfsExpand", () => {
     const out = await bfsExpand({
       vault: "v",
       entry: "d-lonely",
-      depth: 3,
+      hops: 3,
       fetchRelations,
     });
     expect(fetchRelations).toHaveBeenCalledTimes(1);
@@ -245,7 +245,7 @@ describe("bfsExpand", () => {
     const out = await bfsExpand({
       vault: "v",
       entry: "d-1",
-      depth: 2,
+      hops: 2,
       fetchRelations,
     });
     // d-1 fetched at hop 0; hop 1 attempts d-fail (rejects) and d-ok (succeeds).
@@ -293,7 +293,7 @@ describe("bfsExpand", () => {
       }
       return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
     });
-    await bfsExpand({ vault: "v", entry: "d-1", depth: 3, fetchRelations });
+    await bfsExpand({ vault: "v", entry: "d-1", hops: 3, fetchRelations });
     // d-shared is announced by both d-a and d-b in hop 1, but the visited set
     // collapses it to a single fetch in hop 2.
     const sharedCalls = seen.filter((id) => id === "d-shared").length;
@@ -315,7 +315,7 @@ describe("bfsExpand", () => {
         ],
       };
     });
-    await bfsExpand({ vault: "v", entry: "A", depth: 3, fetchRelations });
+    await bfsExpand({ vault: "v", entry: "A", hops: 3, fetchRelations });
     // A → B → C → (A — already visited; cycle breaks here, no re-fetch)
     expect(calls.sort()).toEqual(["A", "B", "C"]);
   });

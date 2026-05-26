@@ -44,18 +44,18 @@ describe("GraphSidebar · types", () => {
   });
 });
 
-describe("GraphSidebar · depth", () => {
+describe("GraphSidebar · hops", () => {
   it("is disabled when no entry is set", () => {
     setup();
-    const radio = screen.getByRole("radio", { name: /depth 3/i });
+    const radio = screen.getByRole("radio", { name: /3 hops/i });
     expect(radio).toBeDisabled();
   });
 
-  it("emits depth change when entry is set", async () => {
+  it("emits hops change when entry is set", async () => {
     const u = userEvent.setup();
-    const { onChange } = setup({ entry: "d-1", depth: 2 });
-    await u.click(screen.getByRole("radio", { name: /depth 3/i }));
-    expect(onChange.mock.calls[0][0].depth).toBe(3);
+    const { onChange } = setup({ entry: "d-1", hops: 2 });
+    await u.click(screen.getByRole("radio", { name: /3 hops/i }));
+    expect(onChange.mock.calls[0][0].hops).toBe(3);
   });
 });
 

@@ -160,13 +160,17 @@ class BrowseResponse(BaseModel):
 class SearchResult(BaseModel):
     """Single search result. Unifies document / table / file results;
     `source_type` discriminates how the frontend renders the row.
-    `uri` is the only canonical handle — internal IDs are not exposed."""
+    `uri` is the only canonical handle — internal IDs are not exposed.
+    `collection` is the containing collection path (null at vault
+    root). Surfaced explicitly so a client can group or filter hits by
+    collection without parsing the URI."""
 
     source_type: str                                  # 'document' | 'table' | 'file'
     uri: str                                          # canonical akb:// URI
     vault: str
     path: str
     title: str
+    collection: str | None = None                     # containing collection (null at vault root)
     doc_type: str | None = None
     summary: str | None = None
     tags: list[str] = Field(default_factory=list)

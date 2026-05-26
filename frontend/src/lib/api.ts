@@ -312,16 +312,18 @@ export interface GraphApiEdge {
   target: string;
   relation?: string;
 }
-// `docPath` is the doc filesystem path (e.g. `specs/api.md`). The
-// frontend currently routes by `:doc_id` segments — the helpers here
-// build the canonical URI from (vault, path) before calling REST so
+// Build the canonical URI from (vault, path) before calling REST so
 // every call site presents the unified shape to the backend.
-function _docUri(vault: string, docPath: string): string {
-  return `akb://${vault}/doc/${docPath}`;
-}
+// `docUri` lives in `lib/uri.ts` and handles the 0.3.0
+// `/coll/<path>/doc/<basename>` form transparently.
+import { docUri as _docUri } from "@/lib/uri";
 
-export const getGraph = (vault: string, docPath?: string, depth = 2, limit = 50) => {
-  const p = new URLSearchParams({ depth: String(depth), limit: String(limit) });
+export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) => {
+  // Backend 0.3.0 renamed the graph traversal radius from `depth`
+  // to `hops` to disambiguate it from `browse?depth` (collection-tree
+  // depth). The frontend mirrors the rename so call sites stay
+  // self-documenting.
+  const p = new URLSearchParams({ hops: String(hops), limit: String(limit) });
   if (docPath) p.set("uri", _docUri(vault, docPath));
   else p.set("vault", vault);
   return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
@@ -597,7 +599,17 @@ export interface Memory {
 export const recallMemories = (category?: string, limit = 100) => {
   const p = new URLSearchParams({ limit: String(limit) });
   if (category) p.set("category", category);
-  return api<{ memories: Memory[]; total: number }>(`/memory?${p}`);
+  // Backend 0.3.0 response shape: `total` is the corpus count (was
+  // len(memories) pre-0.3.0). `returned` and `truncated` are new —
+  // kept optional in the type so an upgrade-in-flight backend still
+  // type-checks. memory-tab.tsx reads `.memories` directly, so the
+  // runtime is unaffected by the shape upgrade.
+  return api<{
+    memories: Memory[];
+    total: number;
+    returned?: number;
+    truncated?: boolean;
+  }>(`/memory?${p}`);
 };
 export const forgetMemory = (memory_id: string) =>
   api<{ forgotten: boolean }>(`/memory/${memory_id}`, { method: "DELETE" });

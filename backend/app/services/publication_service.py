@@ -272,7 +272,7 @@ async def create_publication(
             if resource_type == ResourceType.DOCUMENT and resource_uri:
                 parsed = parse_uri(resource_uri)
                 doc_path_for_check = (
-                    parsed[2] if parsed and parsed[1] == "doc" else None
+                    parsed.identifier if parsed and parsed.kind == "doc" else None
                 )
                 if doc_path_for_check is not None:
                     found = await conn.fetchval(
@@ -383,7 +383,21 @@ async def create_publication_for_vault(
             uuid.UUID(file_id)
         except ValueError:
             raise ValueError("Invalid file_id format")
-        resource_uri = file_uri(vault_name, file_id)
+        # Resolve the file's collection so the canonical URI includes
+        # its location prefix. Vault-root files come back with NULL
+        # collection_id — `file_uri` falls through to the root form.
+        async with pool.acquire() as conn:
+            file_coll_row = await conn.fetchrow(
+                """
+                SELECT c.path AS collection
+                  FROM vault_files f
+                  LEFT JOIN collections c ON c.id = f.collection_id
+                 WHERE f.id = $1 AND f.vault_id = $2
+                """,
+                uuid.UUID(file_id), vault_id,
+            )
+        file_collection = file_coll_row["collection"] if file_coll_row else None
+        resource_uri = file_uri(vault_name, file_id, collection=file_collection)
     elif resource_type == ResourceType.TABLE_QUERY:
         if not resolved_query_vaults:
             resolved_query_vaults = [vault_name]
@@ -461,11 +475,24 @@ async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
 
 
 async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str) -> int:
-    """Delete all publications for a given file (URI-based)."""
+    """Delete all publications for a given file. Looks up the file's
+    collection so the URI matches the canonical form stored in the
+    ``publications.resource_uri`` column."""
     from app.services.uri_service import file_uri
-    uri = file_uri(vault_name, str(file_id))
     pool = await get_pool()
     async with pool.acquire() as conn:
+        coll_row = await conn.fetchrow(
+            """
+            SELECT c.path AS collection
+              FROM vault_files f
+              JOIN vaults v ON v.id = f.vault_id
+              LEFT JOIN collections c ON c.id = f.collection_id
+             WHERE f.id = $1 AND v.name = $2
+            """,
+            uuid.UUID(str(file_id)), vault_name,
+        )
+        collection = coll_row["collection"] if coll_row else None
+        uri = file_uri(vault_name, str(file_id), collection=collection)
         rows = await conn.fetch(
             "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
             uri,
@@ -648,9 +675,9 @@ async def resolve_document_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "doc":
+    if parsed is None or parsed.kind != "doc":
         raise NotFoundError("Document", str(uri))
-    uri_vault, _rtype, doc_path = parsed
+    uri_vault, doc_path = parsed.vault, parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -776,9 +803,9 @@ async def resolve_file_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "file":
+    if parsed is None or parsed.kind != "file":
         raise NotFoundError("File", str(uri))
-    _uri_vault, _rtype, file_uuid_str = parsed
+    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -829,9 +856,9 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "file":
+    if parsed is None or parsed.kind != "file":
         raise NotFoundError("File", str(uri))
-    _uri_vault, _rtype, file_uuid_str = parsed
+    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
