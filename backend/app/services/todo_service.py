@@ -37,8 +37,8 @@ async def create_todo(
         if ref_uri:
             from app.services.uri_service import parse_uri
             parsed = parse_uri(ref_uri)
-            if parsed is not None and parsed[1] == "doc":
-                ref_vault, _rtype, ref_path = parsed
+            if parsed is not None and parsed.kind == "doc":
+                ref_vault, ref_path = parsed.vault, parsed.identifier
                 d = await conn.fetchrow(
                     """
                     SELECT d.id FROM documents d JOIN vaults v ON d.vault_id = v.id

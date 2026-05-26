@@ -203,26 +203,52 @@ TOOLS = [
     Tool(
         name="akb_browse",
         description=(
-            "Browse ALL vault content — documents (by collection), tables, and files. "
-            "Without collection: shows top-level collections, tables, and files. "
-            "With collection: shows documents and files in that collection. "
+            "Browse ALL vault content — documents, tables, and files — under a browse "
+            "root. The browse root can be addressed two ways: pass a canonical `uri` "
+            "(`akb://V` for vault root or `akb://V/coll/X` for a collection), or the "
+            "legacy `vault` + optional `collection` pair. Use the URI form when "
+            "drilling down from a previous response — every item carries a `uri` "
+            "that can be pasted straight back in.\n\n"
+            "`depth` is tree-depth from the browse root, mirroring `tree -L N`: "
+            "0 = direct children only (no descent), N = descend N collection levels, "
+            "-1 = entire subtree. Collection rows are always emitted as navigation "
+            "aids regardless of depth.\n\n"
             "Response is slim by default (no `summary` field) so large vaults "
             "(70+ collections) fit in the agent's context window. Returns "
-            "{vault, path, items, total, returned, truncated?, hint?}. "
-            "Use `filter` to narrow when you know a domain keyword. Each item "
-            "carries its canonical `uri`."
+            "{vault, path, items, total, returned, truncated?, hint?}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
-                "collection": {"type": "string", "description": "Collection path to browse into (omit for top-level)"},
+                "uri": {
+                    "type": "string",
+                    "description": (
+                        "Canonical browse target: `akb://{vault}` (vault root) or "
+                        "`akb://{vault}/coll/{path}` (collection-scoped). Takes "
+                        "precedence over `vault` + `collection` when both are given."
+                    ),
+                },
+                "vault": {
+                    "type": "string",
+                    "description": "Vault name. Required unless `uri` is given.",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": (
+                        "Collection path to use as the browse root (omit for "
+                        "vault root). Ignored when `uri` is given."
+                    ),
+                },
                 "depth": {
                     "type": "integer",
-                    "description": "1=collections only, 2=collections+documents",
+                    "description": (
+                        "Tree depth from the browse root. 0 = direct children only "
+                        "(no descent into any collection). N = descend N collection "
+                        "levels. -1 = unbounded (entire subtree). Collections "
+                        "themselves are always emitted regardless of depth."
+                    ),
                     "default": 1,
-                    "minimum": 1,
-                    "maximum": 2,
+                    "minimum": -1,
                 },
                 "content_type": {
                     "type": "string",
@@ -236,7 +262,9 @@ TOOLS = [
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
             },
-            "required": ["vault"],
+            # Either `vault` or `uri` must be present — enforced at the
+            # handler since JSON schema's anyOf-on-required is awkward
+            # to express in some MCP clients.
         },
     ),
     Tool(
@@ -395,7 +423,17 @@ TOOLS = [
             "properties": {
                 "uri": {"type": "string", "description": "Center resource URI (omit + pass vault for full vault graph)"},
                 "vault": {"type": "string", "description": "Vault name (only when uri is omitted — for full vault graph)"},
-                "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 5, "description": "BFS depth"},
+                "hops": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": (
+                        "BFS traversal radius in edge hops. Disambiguated from "
+                        "`akb_browse.depth` (which is collection-tree depth) — "
+                        "hops here counts relations followed, not folder levels."
+                    ),
+                },
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200, "description": "Max nodes"},
             },
         },

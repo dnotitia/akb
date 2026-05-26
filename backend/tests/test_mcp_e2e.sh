@@ -235,7 +235,10 @@ echo "▸ 7. Activity via MCP"
 
 # Activity (Git-based, replaces akb_recent)
 R=$(mcp_call akb_activity "{\"vault\":\"$VAULT\"}" | mcp_result)
-ACT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
+# 0.3.0: `total` was a misnomer (it was len(entries) = post-limit count
+# masquerading as corpus total). Response now reports `returned` and
+# `truncated`. Use `returned` for the count assertion.
+ACT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['returned'])" 2>/dev/null)
 [ "$ACT_COUNT" -ge 2 ] 2>/dev/null && pass "akb_activity: $ACT_COUNT commits" || fail "akb_activity" "expected >=2"
 
 # Verify activity has file change info

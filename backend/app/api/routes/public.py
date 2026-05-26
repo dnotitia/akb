@@ -145,7 +145,7 @@ async def create_publication_route(
         parsed = parse_uri(req.uri)
         if parsed is None:
             raise HTTPException(status_code=400, detail=f"Invalid AKB URI: {req.uri!r}")
-        uri_vault, uri_type, uri_ident = parsed
+        uri_vault, uri_type, uri_ident = parsed.vault, parsed.kind, parsed.identifier
         if uri_vault != vault:
             raise HTTPException(
                 status_code=400,
@@ -312,7 +312,7 @@ async def publication_meta(slug: str, request: Request):
         # column — there is no separate column anymore.
         from app.services.uri_service import parse_uri
         parsed = parse_uri(publication.get("resource_uri") or "")
-        file_uuid_str = parsed[2] if parsed and parsed[1] == "file" else None
+        file_uuid_str = parsed.identifier if parsed and parsed.kind == "file" else None
         if file_uuid_str:
             pool = await get_pool()
             async with pool.acquire() as conn:
@@ -369,9 +369,9 @@ async def publication_raw(slug: str, request: Request):
 
     from app.services.uri_service import parse_uri
     parsed = parse_uri(publication.get("resource_uri") or "")
-    if not parsed or parsed[1] != "file":
+    if not parsed or parsed.kind != "file":
         raise HTTPException(status_code=404, detail="File not found")
-    _v, _t, file_uuid_str = parsed
+    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -634,8 +634,8 @@ async def oembed(url: str, format: str = "json"):
     parsed = parse_uri(publication.get("resource_uri") or "")
     title = publication.get("title")
     if not title:
-        if rt == ResourceType.DOCUMENT and parsed and parsed[1] == "doc":
-            uri_vault, _t, doc_path = parsed
+        if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
+            uri_vault, doc_path = parsed.vault, parsed.identifier
             pool = await get_pool()
             async with pool.acquire() as conn:
                 doc_row = await conn.fetchrow(
@@ -647,8 +647,8 @@ async def oembed(url: str, format: str = "json"):
                 )
                 if doc_row:
                     title = doc_row["title"]
-        elif rt == ResourceType.FILE and parsed and parsed[1] == "file":
-            _v, _t, file_uuid_str = parsed
+        elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
+            file_uuid_str = parsed.identifier
             pool = await get_pool()
             async with pool.acquire() as conn:
                 f_row = await conn.fetchrow(

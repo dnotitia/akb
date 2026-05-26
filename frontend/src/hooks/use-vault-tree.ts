@@ -30,16 +30,21 @@ interface BrowseItem {
 }
 
 /**
- * Single depth=2 browse gives us every collection + doc. Tables/files live at
- * vault root from the same call. We fold everything into a nested tree on the
- * client so "overview" under many parents renders as `features/overview`,
- * `prd/overview`, etc. — not 14 lookalike cards.
+ * A single unbounded browse (`depth=-1` — entire subtree) gives us every
+ * collection + doc + table + file in one response. We fold everything into
+ * a nested tree on the client so "overview" under many parents renders as
+ * `features/overview`, `prd/overview`, etc. — not 14 lookalike cards.
  *
- * Scaling note: this assumes the vault fits in a single browse response
+ * `depth=-1` is the tree-depth contract introduced in backend 0.3.0:
+ * 0=root-only, N=N levels, -1=unbounded. Pre-0.3.0 the default was the
+ * misnomer "depth=2" (= "include documents"); this code requests the
+ * unbounded subtree explicitly so the tree builder sees every node.
+ *
+ * Scaling note: assumes the vault fits in a single browse response
  * comfortably. The largest real vault today holds ~30 items; when (if) a
- * vault grows past a few thousand, switch the initial call to depth=1 and
- * add a per-collection lazy-load on expand. Not implemented now because it
- * would be unreachable code under current sizes.
+ * vault grows past a few thousand, switch the initial call to `depth=1`
+ * and add a per-collection lazy-load on expand. Not implemented now
+ * because it would be unreachable code under current sizes.
  */
 export function useVaultTree(vault: string | undefined) {
   const [items, setItems] = useState<BrowseItem[] | null>(null);
@@ -61,7 +66,7 @@ export function useVaultTree(vault: string | undefined) {
     let alive = true;
     setItems(null);
     setError("");
-    browseVault(vault, undefined, 2)
+    browseVault(vault, undefined, -1)
       .then((d) => { if (alive) setItems(d.items as BrowseItem[]); })
       .catch((e) => { if (alive) setError(e.message || String(e)); });
     return () => { alive = false; };

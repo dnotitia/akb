@@ -29,7 +29,14 @@ class CreateCollectionRequest(BaseModel):
 async def browse_vault(
     vault: str,
     collection: str | None = Query(None),
-    depth: int = Query(1, ge=1, le=2),
+    depth: int = Query(
+        1,
+        ge=-1,
+        description=(
+            "Tree depth from browse root. 0 = root only; N = descend N levels; "
+            "-1 = unbounded entire subtree."
+        ),
+    ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")

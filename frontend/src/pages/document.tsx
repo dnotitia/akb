@@ -23,6 +23,7 @@ import {
   updateDocument,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { docUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
@@ -349,7 +350,7 @@ export default function DocumentPage() {
         )}
         {/* Mono meta line */}
         <div className="coord mb-2">
-          DOC · akb://{name}/{doc.path}
+          DOC · {docUri(name!, doc.path)}
           {commitShort && (
             <>
               {" · HEAD "}
@@ -702,7 +703,7 @@ export default function DocumentPage() {
                   })}
                 </ol>
                 <Link
-                  to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.id ? `akb://${name}/doc/${doc.path}` : "")}`}
+                  to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.id ? docUri(name!, doc.path) : "")}`}
                   className="mt-3 inline-flex items-center gap-1 text-xs text-accent hover:underline"
                 >
                   <GitGraph className="h-3 w-3" aria-hidden /> Open in graph →

@@ -49,13 +49,27 @@ async def list_for_vault(
     *,
     collection_id: uuid.UUID | None = None,
     scoped: bool = False,
+    max_depth: int | None = None,
+    prefix: str = "",
 ) -> list[dict]:
     """List tables in a vault.
 
-    Default (`scoped=False`) returns every table regardless of collection.
-    With `scoped=True`, only rows whose `collection_id` matches
-    `collection_id` (NULL = vault root) are returned — used by the
-    per-collection browse path.
+    Two filtering modes — pick one:
+
+    * ``scoped=True`` — equality on ``collection_id``
+      (``None`` ⇒ ``IS NULL``). Returns tables sitting directly in
+      that collection (or vault root). Used by ``collection=X, depth=0``
+      browse and analogous internal paths.
+
+    * ``max_depth`` is not ``None`` — tree-depth filter from ``prefix``.
+      A table at collection ``X/Y`` has depth 2 from vault root; depth 1
+      from prefix ``X``. Tables with ``collection_id IS NULL`` are at
+      depth 0. ``max_depth < 0`` disables the depth filter
+      (entire subtree). Used by the unified vault browse to honor
+      ``depth=N``.
+
+    Default (no flags) returns every table regardless of collection
+    — preserved so legacy callers see no behaviour change.
     """
     if scoped:
         if collection_id is None:
@@ -82,6 +96,51 @@ async def list_for_vault(
                 """,
                 vault_id, collection_id,
             )
+    elif max_depth is not None:
+        params: list = [vault_id]
+        prefix_clause = ""
+        if prefix:
+            safe_prefix = (
+                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            params.append(safe_prefix)
+            params.append(safe_prefix + "/%")
+            prefix_clause = (
+                f" AND (c.path = ${len(params)-1} "
+                f"OR c.path LIKE ${len(params)} ESCAPE '\\')"
+            )
+            depth_offset = prefix.count("/") + 1
+        else:
+            depth_offset = 0
+
+        if max_depth < 0:
+            depth_clause = ""
+        else:
+            params.append(max_depth + depth_offset)
+            # Depth of a table = number of segments in its collection
+            # path. NULL collection ⇒ depth 0. For non-NULL, segments
+            # = slashes + 1.
+            depth_clause = (
+                f" AND COALESCE("
+                f"length(c.path) - length(replace(c.path, '/', '')) + 1, 0"
+                f") <= ${len(params)}"
+            )
+        # Without a prefix the NULL-collection tables (vault root,
+        # depth 0) are always included if depth allows; the LEFT JOIN
+        # preserves them. With a prefix they're excluded by the
+        # prefix_clause (NULL fails both equality and LIKE), which is
+        # the desired scoping behaviour.
+        sql = (
+            "SELECT vt.id, vt.collection_id, c.path AS collection, "
+            "       vt.name, vt.description, vt.columns, vt.created_at "
+            "  FROM vault_tables vt "
+            "  LEFT JOIN collections c ON c.id = vt.collection_id "
+            " WHERE vt.vault_id = $1"
+            + prefix_clause
+            + depth_clause
+            + " ORDER BY vt.name"
+        )
+        rows = await conn.fetch(sql, *params)
     else:
         rows = await conn.fetch(
             """

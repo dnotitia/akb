@@ -146,8 +146,12 @@ async def link_resources(
     if not target_parsed:
         return {"error": f"Invalid target URI: {target_uri}"}
 
-    source_vault_name, source_type, source_id = source_parsed
-    target_vault_name, target_type, target_id = target_parsed
+    source_vault_name = source_parsed.vault
+    source_type = source_parsed.kind
+    source_id = source_parsed.identifier
+    target_vault_name = target_parsed.vault
+    target_type = target_parsed.kind
+    target_id = target_parsed.identifier
 
     if source_uri == target_uri:
         return {"error": "Cannot link a resource to itself"}
@@ -308,7 +312,7 @@ async def get_resource_relations(
 async def get_graph(
     vault: str,
     resource_uri: str | None = None,
-    depth: int = 2,
+    hops: int = 2,
     limit: int = 50,
     *,
     vault_id: uuid.UUID | None = None,
@@ -317,6 +321,11 @@ async def get_graph(
 
     Returns { nodes: [...], edges: [...] } suitable for visualization.
     Nodes include all resource types (doc, table, file).
+
+    ``hops`` is the BFS traversal radius in edge hops — distinct from
+    ``akb_browse.depth`` which counts collection-tree levels. 0.3.0
+    renamed the parameter to make the difference visible at every
+    call site.
 
     `vault_id` scopes the graph to one vault: both the BFS edge fetch
     and the name resolution refuse to look outside it. Caller must
@@ -336,7 +345,7 @@ async def get_graph(
             vault_id = vault_row["id"]
 
         if resource_uri:
-            await _bfs_collect(conn, vault_id, vault, resource_uri, depth, limit, nodes, edge_list)
+            await _bfs_collect(conn, vault_id, vault, resource_uri, hops, limit, nodes, edge_list)
         else:
             # Vault-scope full graph. The cap is a visualization safety net
             # — large graphs are unrenderable client-side — but the old code
@@ -457,7 +466,7 @@ async def _batch_resolve_names(
         parsed = parse_uri(uri)
         if not parsed:
             continue
-        _, _, identifier = parsed
+        identifier = parsed.identifier
         if rtype == "doc":
             doc_paths.append(identifier)
             doc_uris[identifier] = uri
@@ -545,7 +554,7 @@ async def _store_edge(
     # If target is already an akb:// URI, parse it directly
     parsed = parse_uri(target_ref)
     if parsed:
-        _, target_type, _ = parsed
+        target_type = parsed.kind
         target_uri = target_ref
     else:
         # Legacy: resolve as doc ref within the same vault
@@ -669,7 +678,7 @@ async def _bfs_collect(
             parsed = parse_uri(uri)
             if not parsed:
                 continue
-            _, rtype, _ = parsed
+            rtype = parsed.kind
 
             # Placeholder node (name resolved in batch later)
             nodes[uri] = {

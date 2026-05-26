@@ -23,6 +23,7 @@ from app.services.git_service import GitService
 from app.services.index_service import delete_document_chunks, delete_file_chunks
 from app.services.kg_service import delete_document_relations
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
+from app.services.uri_service import file_uri
 
 logger = logging.getLogger("akb.collections")
 
@@ -297,7 +298,13 @@ class CollectionService:
                 # in the HTTP handler).
                 for f in files:
                     file_id = str(f["id"])
-                    f_uri = f"akb://{vault}/file/{file_id}"
+                    # Canonical URI for the file, including its
+                    # collection prefix — `f["collection"]` comes from
+                    # the JOIN in `list_files_under` and is the path
+                    # this file lives under (always non-empty here:
+                    # we are iterating files at-or-under a known
+                    # collection).
+                    f_uri = file_uri(vault, file_id, collection=f.get("collection"))
                     await conn.execute(
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
