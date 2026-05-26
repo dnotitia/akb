@@ -551,6 +551,7 @@ export default function DocumentPage() {
             <DocumentView
               vault={name!}
               docId={docId}
+              version={commitHash}
               view={view}
               onViewChange={(v) => setView(v)}
               extraTab={

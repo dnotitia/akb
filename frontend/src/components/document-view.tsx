@@ -25,15 +25,25 @@ interface DocumentViewProps {
    * folding the editor into this read-focused component.
    */
   extraTab?: { label: string; onClick: () => void };
+  /**
+   * Optional git commit hash. When set, the body is fetched at that
+   * commit via getDocument(..., version) and the queryKey carries the
+   * hash so commit-log / history selections render the historical body
+   * instead of HEAD. Parent (DocumentPage) reads it from ?commit= URL
+   * state; uncontrolled callers (VaultSkillPage) omit it and get HEAD.
+   */
+  version?: string;
 }
 
 /**
  * Self-sufficient doc body: fetches the document, renders the
  * rendered/raw segmented control, and shows the markdown content.
  *
- * The query key is ["document", vault, docId] — identical to the key
- * used in DocumentPage, so TanStack Query dedupes the fetch when both
- * are mounted simultaneously.
+ * Query key is ["document", vault, docId, version] — matches DocumentPage
+ * exactly so TanStack Query dedupes when both are mounted. Without
+ * `version` in the key, historical-view URLs would render HEAD because
+ * the un-versioned key collides with DocumentPage's versioned fetch
+ * and serves whichever landed first.
  *
  * view/onViewChange are optional: when omitted, DocumentView manages
  * its own local toggle state (useful for VaultSkillPage and future
@@ -44,7 +54,7 @@ interface DocumentViewProps {
  * segment will land. When T6 adds it, extend the `ViewMode` union and
  * add a third tab here alongside the doc.type === "skill" guard.
  */
-export function DocumentView({ vault, docId, view: viewProp, onViewChange, extraTab }: DocumentViewProps) {
+export function DocumentView({ vault, docId, view: viewProp, onViewChange, extraTab, version }: DocumentViewProps) {
   const [localView, setLocalView] = useState<ViewMode>("rendered");
 
   // Controlled vs. uncontrolled view mode
@@ -58,8 +68,8 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
   };
 
   const { data: doc, isLoading, error } = useQuery({
-    queryKey: ["document", vault, docId],
-    queryFn: () => getDocument(vault, docId),
+    queryKey: ["document", vault, docId, version],
+    queryFn: () => getDocument(vault, docId, version),
     enabled: !!vault && !!docId,
     retry: false,
   });
