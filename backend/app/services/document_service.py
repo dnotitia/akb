@@ -984,8 +984,15 @@ class DocumentService:
                     row_count = 0
                 cols = ensure_list(r["columns"]) if isinstance(r["columns"], str) else r["columns"]
                 items.append(BrowseItem(
-                    name=r["name"], path=f"_tables/{r['name']}", type="table",
-                    uri=table_uri(vault, r["name"]),
+                    # `path` is the table name. Pre-0.3.0 it was a
+                    # synthetic `_tables/<name>` string, which made
+                    # sense before tables had URIs — the prefix
+                    # substituted for "what kind of resource is this".
+                    # Now `type="table"` + `uri` (which encodes both
+                    # location and kind) carry that signal, so the
+                    # synthetic prefix is pure noise.
+                    name=r["name"], path=r["name"], type="table",
+                    uri=table_uri(vault, r["name"], collection=r.get("collection")),
                     summary=r["description"], row_count=row_count,
                     columns=cols,
                     collection=r.get("collection"),

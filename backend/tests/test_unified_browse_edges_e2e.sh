@@ -835,6 +835,65 @@ mcp_call akb_delete "{\"uri\":\"$HIER_URI\"}" >/dev/null 2>&1
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"root_tbl\"}" >/dev/null 2>&1
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"q1_expenses\"}" >/dev/null 2>&1
 
+# ── 26. Write tools accept `parent` URI (drill-down chain) ─────
+#
+# Pre-0.3.0 write tools took `vault` + `collection` coordinates and
+# emitted a URI in the response. Pasting that URI back required the
+# caller to re-split it into coordinates — asymmetric with the
+# read/navigate side (`akb_browse(uri=...)`). 0.3.0 adds `parent`:
+# pass a vault root or coll URI and the tool derives vault+collection
+# from it. Legacy coordinate form still works.
+echo ""
+echo "▸ 26. Write tools accept `parent` URI"
+
+# `akb_put` with parent=coll URI — equivalent to vault=$VAULT, collection=docs.
+R=$(mcp_call akb_put "{\"parent\":\"akb://$VAULT/coll/docs\",\"title\":\"parent-uri-put\",\"content\":\"# pup\",\"type\":\"note\"}" | mcp_result)
+PUT_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ "$PUT_URI" = "akb://$VAULT/coll/docs/doc/parent-uri-put.md" ] && pass "akb_put(parent=coll URI): placed inside the coll" || fail "Put via parent" "got '$PUT_URI'"
+
+# `akb_put` with parent=vault URI — places at vault root.
+R=$(mcp_call akb_put "{\"parent\":\"akb://$VAULT\",\"title\":\"parent-vault-put\",\"content\":\"# pvp\",\"type\":\"note\"}" | mcp_result)
+PUT_VURI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ "$PUT_VURI" = "akb://$VAULT/doc/parent-vault-put.md" ] && pass "akb_put(parent=vault URI): placed at vault root" || fail "Put via vault parent" "got '$PUT_VURI'"
+
+# `akb_put` with parent=leaf URI — rejected.
+R=$(mcp_call akb_put "{\"parent\":\"akb://$VAULT/doc/parent-vault-put.md\",\"title\":\"x\",\"content\":\"y\"}" | mcp_result)
+LEAF_REJECT=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$LEAF_REJECT" = "True" ] && pass "akb_put(parent=doc URI): rejected (leaves can't be parents)" || fail "Leaf parent rejection" "$R"
+
+# `akb_put` with neither parent nor vault — rejected.
+R=$(mcp_call akb_put "{\"title\":\"x\",\"content\":\"y\",\"collection\":\"y\"}" | mcp_result)
+NO_PARENT=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$NO_PARENT" = "True" ] && pass "akb_put: requires `parent` or `vault`" || fail "Missing parent/vault" "$R"
+
+# `akb_create_table` with parent=coll URI.
+R=$(mcp_call akb_create_table "{\"parent\":\"akb://$VAULT/coll/metrics\",\"name\":\"parent_tbl\",\"description\":\"pt\",\"columns\":[{\"name\":\"k\",\"type\":\"text\"}]}" | mcp_result)
+TBL_PURI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ "$TBL_PURI" = "akb://$VAULT/coll/metrics/table/parent_tbl" ] && pass "akb_create_table(parent=coll URI): placed inside the coll" || fail "Create table via parent" "got '$TBL_PURI'"
+
+# Cleanup.
+mcp_call akb_delete "{\"uri\":\"$PUT_URI\"}" >/dev/null 2>&1
+mcp_call akb_delete "{\"uri\":\"$PUT_VURI\"}" >/dev/null 2>&1
+mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"parent_tbl\"}" >/dev/null 2>&1
+
+# ── 27. BrowseItem.path for tables — synthetic prefix dropped ───
+echo ""
+echo "▸ 27. BrowseItem.path for tables — bare name"
+
+# Create a sentinel table and verify its browse `path` is just the
+# table name (pre-0.3.0 was the synthetic `_tables/<name>`).
+mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"path_check\",\"description\":\"pc\",\"columns\":[{\"name\":\"k\",\"type\":\"text\"}]}" >/dev/null
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
+TBL_PATH=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+hit=next((i for i in d['items'] if i.get('type')=='table' and i.get('name')=='path_check'), None)
+print(hit.get('path','') if hit else '')
+" 2>/dev/null)
+[ "$TBL_PATH" = "path_check" ] && pass "BrowseItem.path for table is bare name (no synthetic prefix)" || fail "Table path" "got '$TBL_PATH'"
+
+mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"path_check\"}" >/dev/null 2>&1
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"

@@ -100,9 +100,8 @@ async def list_for_vault(
         params: list = [vault_id]
         prefix_clause = ""
         if prefix:
-            safe_prefix = (
-                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
+            from app.util.text import like_escape
+            safe_prefix = like_escape(prefix)
             params.append(safe_prefix)
             params.append(safe_prefix + "/%")
             prefix_clause = (

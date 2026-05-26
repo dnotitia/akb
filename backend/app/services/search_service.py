@@ -362,7 +362,12 @@ class SearchService:
                 for r in rows:
                     meta[("table", str(r["id"]))] = {
                         "vault": r["vault_name"],
-                        "path": f"_tables/{r['name']}",
+                        # `path` is the table name — pre-0.3.0 was the
+                        # synthetic `_tables/<name>` form. The URI now
+                        # encodes kind + location, so the prefix is
+                        # redundant noise. Matches the BrowseItem
+                        # emit shape.
+                        "path": r["name"],
                         "title": r["name"],
                         "doc_type": "table",
                         "summary": r["description"],

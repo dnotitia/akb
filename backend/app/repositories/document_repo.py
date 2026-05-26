@@ -224,11 +224,11 @@ class DocumentRepository:
 
         if prefix:
             # Defend against LIKE metacharacters even though normalized
-            # collection paths shouldn't contain them.
-            safe_prefix = (
-                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            params.append(safe_prefix + "/%")
+            # collection paths shouldn't contain them. Goes through
+            # the shared helper so all four call sites agree on the
+            # escape semantics.
+            from app.util.text import like_escape
+            params.append(like_escape(prefix) + "/%")
             prefix_clause = f" AND path LIKE ${len(params)} ESCAPE '\\'"
             # Slashes the prefix itself contributes to `path`: "X" → 1,
             # "X/Y" → 2 (the prefix separator plus its own internal slashes).
@@ -506,12 +506,14 @@ class CollectionRepository:
         async with self.pool.acquire() as acq:
             await acq.execute(sql, collection_id)
 
-    @staticmethod
-    def _like_escape(s: str) -> str:
-        """Escape LIKE metacharacters so user-supplied folder names with
-        `%`, `_`, or `\\` don't widen the match. Paired with
-        `ESCAPE '\\'` in the query."""
-        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    # ``_like_escape`` used to live here. The same triple-replace also
+    # got copy-pasted into the inline prefix-filter inside
+    # ``list_docs_by_depth`` (and into two other repos). Consolidated
+    # at ``app.util.text.like_escape`` — call sites now go through
+    # that, and this alias keeps the existing ``self._like_escape``
+    # call-pattern working without churn.
+    from app.util.text import like_escape as _like_escape_impl
+    _like_escape = staticmethod(_like_escape_impl)
 
     async def list_docs_under(
         self,

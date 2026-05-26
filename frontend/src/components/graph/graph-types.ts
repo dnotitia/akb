@@ -32,14 +32,20 @@ export interface GraphEdge {
 
 export interface GraphView {
   entry?: string;
-  depth: 1 | 2 | 3;
+  // BFS traversal radius in edge hops from the entry node. The
+  // backend's `akb_graph` uses the same word for its server-side
+  // BFS — keeping the name aligned across layers signals the
+  // single concept (graph traversal distance). Pre-0.3.0 this
+  // field was called `depth`, which collided with the also-
+  // renamed `akb_browse.depth` (collection-tree depth).
+  hops: 1 | 2 | 3;
   types: Set<NodeKind>;
   relations: Set<RelationKind>;
   selected?: string;
 }
 
 export const DEFAULT_VIEW: GraphView = {
-  depth: 2,
+  hops: 2,
   types: new Set(ALL_NODE_KINDS),
   relations: new Set(ALL_RELATIONS),
 };

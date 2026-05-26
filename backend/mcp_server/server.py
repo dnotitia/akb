@@ -236,10 +236,14 @@ async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_put")
 async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    try:
+        vault, collection = _resolve_parent(args, kind_name="document")
+    except ValueError as e:
+        return {"error": str(e)}
+    await check_vault_access(uid, vault, required_role="writer")
     req = DocumentPutRequest(
-        vault=args["vault"],
-        collection=args["collection"],
+        vault=vault,
+        collection=collection,
         title=args["title"],
         content=args["content"],
         type=args.get("type", "note"),
@@ -254,6 +258,37 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     except ValueError as e:
         return {"error": str(e)}
     return result.model_dump()
+
+
+def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
+    """Decode the `parent` URI form for write tools (akb_put,
+    akb_create_table, akb_put_file) and return ``(vault, collection)``.
+    If `parent` is absent, fall back to the legacy ``vault`` +
+    ``collection`` pair. Raises ``ValueError`` on a malformed `parent`
+    URI, a leaf-resource URI (those aren't valid parents — you don't
+    put a {kind_name} *inside* a doc/table/file), or when neither
+    `parent` nor `vault` is supplied.
+
+    Centralised so all three write tools agree on the rule. Mirrors
+    the equivalent logic in ``_handle_browse`` (which also takes a
+    URI-or-coordinate form)."""
+    from app.services.uri_service import split_browse_uri
+    parent = args.get("parent")
+    if parent:
+        try:
+            vault, coll = split_browse_uri(parent)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid `parent` URI for {kind_name}: {e}"
+            ) from e
+        return vault, coll or ""
+    vault = args.get("vault")
+    if not vault:
+        raise ValueError(
+            f"Either `parent` (akb:// URI) or `vault` is required to "
+            f"create a {kind_name}."
+        )
+    return vault, args.get("collection") or ""
 
 
 @_h("akb_get")
@@ -720,13 +755,17 @@ async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_create_table")
 async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
-    access = await check_vault_access(uid, args["vault"], required_role="writer")
+    try:
+        vault, collection = _resolve_parent(args, kind_name="table")
+    except ValueError as e:
+        return {"error": str(e)}
+    access = await check_vault_access(uid, vault, required_role="writer")
     try:
         return await table_service.create_table(
             access["vault_id"], args["name"], args["columns"],
             actor_id=user.username,
             description=args.get("description", ""),
-            collection=args.get("collection"),
+            collection=collection or None,
         )
     except ValueError as e:
         return {"error": str(e)}

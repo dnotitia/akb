@@ -691,7 +691,7 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | Document AKB URI (`akb://{vault}/doc/{path}`) |
+| uri | ✓ | Document AKB URI — `akb://{vault}[/coll/{coll_path}]/doc/{filename}` |
 
 ## Returns
 Full document: title, content, metadata (type, tags, status, created_by, dates), relations.
@@ -1329,7 +1329,7 @@ The `confirm` parameter must match the vault name. Owner only.""",
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | Table AKB URI (`akb://{vault}/table/{name}`) |
+| uri | ✓ | Table AKB URI — `akb://{vault}[/coll/{coll_path}]/table/{name}` |
 | add_columns | | Columns to add: [{"name": "col", "type": "text"}] |
 | drop_columns | | Column names to remove: ["old_col"] |
 | rename_columns | | Rename map: {"old_name": "new_name"} |

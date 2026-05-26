@@ -117,3 +117,16 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
             )
         parts.append(raw)
     return "/".join(parts)
+
+
+def like_escape(s: str) -> str:
+    """Escape ``%`` / ``_`` / ``\\`` so the result is safe to splice into
+    a SQL ``LIKE`` (or ``ILIKE``) pattern. Pair with ``ESCAPE '\\'``
+    in the query so PostgreSQL knows we wrote ``\\%`` to mean literal
+    ``%``, not "any sequence".
+
+    The four call sites we have (``document_repo._like_escape``,
+    plus inline copies in repo prefix-filters) repeated this exact
+    triple replace. Consolidate here so a new repo doesn't reinvent
+    the rule with subtly different escape semantics."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

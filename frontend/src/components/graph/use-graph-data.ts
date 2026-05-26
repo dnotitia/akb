@@ -95,7 +95,12 @@ export function isDegraded(rawNodeCount: number): boolean {
 interface BfsExpandArgs {
   vault: string;
   entry: string; // doc path within the vault
-  depth: 1 | 2 | 3;
+  // BFS traversal radius in edge hops. Named to match the backend's
+  // `akb_graph.hops` — same concept (graph traversal distance),
+  // just at different layers (this function makes `hops` round
+  // trips through `akb_relations`; the backend graph endpoint
+  // does its own BFS in a single round trip).
+  hops: 1 | 2 | 3;
   fetchRelations: (
     vault: string,
     docPath: string,
@@ -135,7 +140,7 @@ export function docIdFromUri(uri: string): string | null {
 }
 
 export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
-  const { vault, entry, depth, fetchRelations } = args;
+  const { vault, entry, hops, fetchRelations } = args;
   const visited = new Set<string>();
   visited.add(entry);
 
@@ -178,7 +183,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
   // single fetch on the next hop.
   let frontier: string[] = ingest(seedResp.relations, seedResp.uri);
 
-  for (let hop = 1; hop < depth; hop++) {
+  for (let hop = 1; hop < hops; hop++) {
     const toFetch = frontier.filter((docId) => {
       if (visited.has(docId)) return false;
       visited.add(docId);
@@ -229,17 +234,17 @@ export function useFullGraph(vault: string, enabled: boolean) {
 export function useNeighborhood(
   vault: string,
   entry: string | undefined,
-  depth: 1 | 2 | 3,
+  hops: 1 | 2 | 3,
 ) {
   return useQuery({
-    queryKey: ["graph", vault, "neighborhood", entry, depth],
+    queryKey: ["graph", vault, "neighborhood", entry, hops],
     enabled: !!entry,
     queryFn: () =>
       bfsExpand({
         vault,
         // `enabled: !!entry` above gates this query; entry is defined here.
         entry: entry!,
-        depth,
+        hops,
         fetchRelations: async (v, docPath) => {
           const r = await getRelations(v, docPath);
           return { uri: r.uri, relations: r.relations };
