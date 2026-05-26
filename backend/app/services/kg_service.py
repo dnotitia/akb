@@ -138,13 +138,31 @@ async def link_resources(
     created_by: str | None = None,
     metadata: dict | None = None,
 ) -> dict:
-    """Create an explicit edge between any two resources."""
+    """Create an explicit edge between any two resources.
+
+    Only doc / table / file are linkable. ``coll`` and vault URIs are
+    rejected — collections are navigation aids, not edge endpoints.
+    The ``edges.target_type`` CHECK constraint enforces the same
+    invariant at the DB layer; this surface-level reject gives the
+    caller a clear error instead of a Postgres failure.
+    """
     source_parsed = parse_uri(source_uri)
     target_parsed = parse_uri(target_uri)
     if not source_parsed:
         return {"error": f"Invalid source URI: {source_uri}"}
     if not target_parsed:
         return {"error": f"Invalid target URI: {target_uri}"}
+    _LINKABLE = ("doc", "table", "file")
+    if source_parsed.kind not in _LINKABLE:
+        return {"error": (
+            f"Cannot link from a {source_parsed.kind} URI ({source_uri}). "
+            f"Linkable kinds: {_LINKABLE}."
+        )}
+    if target_parsed.kind not in _LINKABLE:
+        return {"error": (
+            f"Cannot link to a {target_parsed.kind} URI ({target_uri}). "
+            f"Linkable kinds: {_LINKABLE}."
+        )}
 
     source_vault_name = source_parsed.vault
     source_type = source_parsed.kind
@@ -550,10 +568,30 @@ async def _store_edge(
     source_uri: str, source_type: str,
     target_ref: str, relation_type: str,
 ) -> bool:
-    """Resolve target reference and insert edge. Returns True if stored."""
+    """Resolve target reference and insert edge. Returns True if stored.
+
+    Only doc / table / file are linkable resources. ``coll`` and the
+    vault-only form ``akb://{vault}`` are navigation handles — semantically
+    a "link to a collection" doesn't have a clear meaning (is it a link
+    to every doc inside? to the folder concept itself?), and the
+    ``edges.target_type`` CHECK constraint enforces the same invariant
+    at the DB layer. This filter is what keeps body-text mentions of
+    coll URIs (e.g. "see ``akb://V/coll/X`` for the spec") from
+    silently failing at INSERT.
+    """
     # If target is already an akb:// URI, parse it directly
     parsed = parse_uri(target_ref)
     if parsed:
+        if parsed.kind not in ("doc", "table", "file"):
+            # `coll` / `vault` URIs are navigation aids, not link
+            # targets — skip silently. Logged at DEBUG so an
+            # operator running noisy edge-extraction can still see
+            # how many got filtered.
+            logger.debug(
+                "Skipping edge target %r: %s URIs are not linkable",
+                target_ref, parsed.kind,
+            )
+            return False
         target_type = parsed.kind
         target_uri = target_ref
     else:
