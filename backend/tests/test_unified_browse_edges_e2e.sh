@@ -894,6 +894,79 @@ print(hit.get('path','') if hit else '')
 
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"path_check\"}" >/dev/null 2>&1
 
+# ── 28. Edge-extraction safety: placeholders + coll URIs ───────
+#
+# 0.3.0 introduced `coll` as a URI kind, but the edges table's
+# `target_type` CHECK only allows doc / table / file (collections are
+# navigation aids, not link targets). Two scenarios this section
+# locks down so they don't surface as CHECK violations:
+#
+#  (a) `parse_uri` rejects URIs containing template placeholders
+#      (`{...}`) — caught at edge extraction so a markdown body
+#      describing the URI scheme as documentation doesn't trip
+#      kg_service into trying to insert an edge whose target_uri is
+#      literally `akb://{vault}/doc/{path}`.
+#  (b) `_store_edge` filters out coll / vault URIs as link targets —
+#      a doc whose `depends_on` mentions a coll URI by mistake
+#      silently skips that entry instead of throwing.
+echo ""
+echo "▸ 28. Edge-extraction safety (placeholders + coll URIs)"
+
+# (a) Doc body containing a placeholder URI — should be put cleanly,
+# no edge created from the placeholder, no CHECK constraint failure.
+PH_CONTENT='# Placeholder safety\n\nThis doc explains the URI scheme: `akb://{vault}/coll/{path}/doc/{filename}`. The bare-URI extractor must NOT treat that template string as a real edge target.'
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"safety\",\"title\":\"Placeholder safety\",\"content\":\"$PH_CONTENT\",\"type\":\"note\"}" | mcp_result)
+PH_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$PH_URI" ] && pass "akb_put with placeholder-URI body succeeded (no constraint failure)" || fail "Placeholder put" "$R"
+
+# Verify no orphan edges were inserted for the placeholder.
+R=$(mcp_call akb_relations "{\"uri\":\"$PH_URI\"}" | mcp_result)
+PLACEHOLDER_EDGE_COUNT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+# Count any edge whose URI mentions '{' — that'd be the smoking gun.
+n=sum(1 for r in d.get('relations',[]) if '{' in (r.get('uri') or ''))
+print(n)
+" 2>/dev/null)
+[ "$PLACEHOLDER_EDGE_COUNT" = "0" ] && pass "No edges emitted for placeholder URIs" || fail "Placeholder edges" "$PLACEHOLDER_EDGE_COUNT placeholder edges leaked"
+
+# (b) Doc with `depends_on` pointing at a coll URI — silent skip.
+# Without the kg_service filter this would either succeed (if the
+# constraint were relaxed) or fail with a Postgres CHECK error. The
+# right behavior is "doc put succeeds, that entry is just ignored
+# at edge extraction with a debug log".
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"safety\",\"title\":\"Coll-URI depends_on\",\"content\":\"# coll dep\",\"type\":\"note\",\"depends_on\":[\"akb://$VAULT/coll/safety\"]}" | mcp_result)
+COLL_DEP_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+[ -n "$COLL_DEP_URI" ] && pass "akb_put with coll-URI depends_on succeeded (constraint-safe)" || fail "Coll-URI dep put" "$R"
+
+R=$(mcp_call akb_relations "{\"uri\":\"$COLL_DEP_URI\"}" | mcp_result)
+COLL_EDGE_COUNT=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+# coll URI must not appear as a target of any extracted edge.
+n=sum(1 for r in d.get('relations',[]) if '/coll/' in (r.get('uri') or '') and '/doc/' not in (r.get('uri') or '') and '/table/' not in (r.get('uri') or '') and '/file/' not in (r.get('uri') or ''))
+print(n)
+" 2>/dev/null)
+[ "$COLL_EDGE_COUNT" = "0" ] && pass "Coll URIs filtered out at edge extraction" || fail "Coll URI edge leak" "$COLL_EDGE_COUNT coll edges"
+
+# (c) Explicit akb_link to a coll URI — must error out, not try the
+# DB and crash on the constraint.
+R=$(mcp_call akb_link "{\"source\":\"$PH_URI\",\"target\":\"akb://$VAULT/coll/safety\",\"relation\":\"related_to\"}" | mcp_result)
+LINK_REJECTED=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+# Either explicit error or 'not linkable' message — both are valid
+# rejections; what we don't want is a Postgres constraint violation
+# bubbling up unwrapped.
+ok = 'error' in d and 'Linkable' in d.get('error','') or 'coll' in d.get('error','')
+print(int(ok))
+" 2>/dev/null)
+[ "$LINK_REJECTED" = "1" ] && pass "akb_link rejects coll URI target with friendly error" || fail "Coll URI link rejection" "$R"
+
+# Cleanup
+mcp_call akb_delete "{\"uri\":\"$PH_URI\"}" >/dev/null 2>&1
+mcp_call akb_delete "{\"uri\":\"$COLL_DEP_URI\"}" >/dev/null 2>&1
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"

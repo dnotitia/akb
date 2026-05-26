@@ -115,12 +115,24 @@ def parse_uri(uri: str) -> ParsedUri | None:
     resolve identically (defense against hand-typed URIs in
     frontmatter `depends_on` lists).
 
+    Also rejects URIs containing ``{`` or ``}`` — those are template
+    placeholders (e.g. ``akb://{vault}/coll/{path}/doc/{filename}``
+    written into a markdown body as documentation) that the bare-URI
+    scanner in ``kg_service.extract_markdown_links`` would otherwise
+    pick up and try to insert as edges. Real AKB URIs never contain
+    braces, so this is a safe + cheap pre-flight check.
+
     Try-order matters: the typed-in-collection pattern must run before
     the typed-root pattern, otherwise something like
     ``akb://V/coll/X/doc/Y.md`` would mis-match the root form with
     ``type=coll`` and an identifier starting with ``X/doc/Y.md``.
     """
     if not isinstance(uri, str):
+        return None
+    if "{" in uri or "}" in uri:
+        # Template placeholder — not a real URI. Reject before regex
+        # so neither `parse_uri` nor `split_uri` ever produces a row
+        # the edges table won't accept.
         return None
 
     m = _URI_TYPED_IN_COLL_RE.match(uri)
