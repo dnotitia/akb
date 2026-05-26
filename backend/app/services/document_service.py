@@ -280,7 +280,14 @@ class DocumentService:
         # matches the document's stored `path`. Passing the raw
         # `req.collection` here would create rows with leading/trailing
         # slashes or whitespace, diverging from the doc path under it.
-        collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
+        # Empty (== vault root) maps to NULL FK, matching the convention
+        # used by file_service / table_service / external_git_service —
+        # never insert a `path=""` phantom collection row.
+        collection_id = (
+            await coll_repo.get_or_create(vault_id, normalized_collection)
+            if normalized_collection
+            else None
+        )
         # No `id` key — canonical handle is the akb:// URI built from
         # (vault, path), not a short hash. The `metadata` JSONB column is
         # reserved for internal writers (external-git import, LLM auto-tagging)
@@ -926,16 +933,24 @@ class DocumentService:
                 summary=r["summary"], doc_count=r["doc_count"],
                 last_updated=r["last_updated"],
             ))
+        # Documents:
+        #   depth=1 → root-level docs only (collection_id IS NULL), so users
+        #     who put a doc without a collection can find it from the default
+        #     browse — symmetric with tables/files which already surface at root.
+        #   depth=2 → every doc in the vault, root + inside collections (used
+        #     by exporters / bulk-context loaders / the AKB frontend tree).
         if depth >= 2:
             doc_rows = await doc_repo.list_by_vault(vault_id)
-            for r in doc_rows:
-                items.append(BrowseItem(
-                    name=r["title"], path=r["path"], type="document",
-                    uri=doc_uri(vault, r["path"]),
-                    summary=r["summary"], doc_type=r["doc_type"], status=r["status"],
-                    tags=list(r["tags"]) if r["tags"] else [],
-                    last_updated=r["updated_at"],
-                ))
+        else:
+            doc_rows = await doc_repo.list_root_docs(vault_id)
+        for r in doc_rows:
+            items.append(BrowseItem(
+                name=r["title"], path=r["path"], type="document",
+                uri=doc_uri(vault, r["path"]),
+                summary=r["summary"], doc_type=r["doc_type"], status=r["status"],
+                tags=list(r["tags"]) if r["tags"] else [],
+                last_updated=r["updated_at"],
+            ))
         return items
 
     async def _browse_tables(
