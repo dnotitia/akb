@@ -193,6 +193,26 @@ class DocumentRepository:
             )
             return [dict(r) for r in rows]
 
+    async def list_root_docs(self, vault_id: uuid.UUID) -> list[dict]:
+        """Documents living at the vault root (collection_id IS NULL).
+
+        Distinct from `list_by_vault`: this is the slice that the unified
+        browse needs at depth=1 — sibling to root-level tables/files —
+        so users who put docs without a collection can still find them
+        without paying the depth=2 cost of unspooling every sub-collection.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT path, title, doc_type, status, summary, tags, updated_at
+                FROM documents
+                WHERE vault_id = $1 AND collection_id IS NULL
+                ORDER BY updated_at DESC
+                """,
+                vault_id,
+            )
+            return [dict(r) for r in rows]
+
     # ── External-git mirror helpers ──────────────────────────
 
     async def list_external_blobs(self, vault_id: uuid.UUID) -> dict[str, dict]:

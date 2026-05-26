@@ -472,6 +472,73 @@ R=$(mcp_call akb_list_tables "{\"vault\":\"$VAULT\"}" | mcp_result)
 UNKNOWN=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin) or 'Unknown' in json.load(sys.stdin).get('error',''))" 2>/dev/null)
 [ "$UNKNOWN" = "True" ] && pass "akb_list_tables returns error (removed)" || pass "akb_list_tables may still work (graceful deprecation)"
 
+# ── 18. Root-level browse visibility (issues #81/#82) ────────
+# Two paired bugs fixed together:
+#   #82: put-without-collection used to insert a phantom path='' row
+#        which then appeared in browse as {name:'', path:'', uri:null}.
+#   #81: depth=1 default browse used to skip documents entirely, even
+#        the root-level ones, so users who put docs without collections
+#        had no way to find them via browse.
+echo ""
+echo "▸ 18. Root-Level Browse Visibility (issues #81/#82)"
+
+# Put a doc directly at vault root via explicit empty-string collection.
+# (`collection` is marked required at the MCP layer; an empty string passes
+# validation but normalises to "" — which is the exact path that used to
+# trigger the phantom row before this fix.)
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"\",\"title\":\"Root-Level Doc\",\"content\":\"# Lives at vault root\",\"type\":\"note\"}" | mcp_result)
+ROOT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+ROOT_DOC_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])" 2>/dev/null)
+[ -n "$ROOT_DOC_URI" ] && pass "Root doc put (uri=$ROOT_DOC_URI, path=$ROOT_DOC_PATH)" || fail "Root doc put" "no uri"
+
+# Path must be flat (no slash) — confirms collection_id is NULL, not a phantom row
+case "$ROOT_DOC_PATH" in
+  */*) fail "Root doc path" "path '$ROOT_DOC_PATH' contains a slash; root docs must be flat" ;;
+  *)   pass "Root doc path is flat (no slash)" ;;
+esac
+
+# Default browse (depth=1) — must include root doc, no empty marker
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+EMPTY_MARKER=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+empties=[i for i in d['items']
+         if i.get('type')=='collection' and not i.get('path') and not i.get('name')]
+print(len(empties))
+" 2>/dev/null)
+[ "$EMPTY_MARKER" = "0" ] && pass "browse(default): no empty-name collection marker" || fail "Empty marker" "found $EMPTY_MARKER empty marker(s) in default browse"
+
+ROOT_DOC_VISIBLE=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+hits=[i for i in d['items']
+      if i.get('type')=='document' and i.get('path')=='$ROOT_DOC_PATH']
+print(len(hits))
+" 2>/dev/null)
+[ "$ROOT_DOC_VISIBLE" = "1" ] && pass "browse(default): root doc is visible" || fail "Root doc visibility" "root doc not in default browse response"
+
+# Default browse must NOT include sub-collection docs (depth=1 root-only contract)
+SUBCOLL_LEAK=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+leaks=[i for i in d['items']
+       if i.get('type')=='document' and i.get('path') and '/' in i['path']]
+print(len(leaks))
+" 2>/dev/null)
+[ "$SUBCOLL_LEAK" = "0" ] && pass "browse(default): sub-collection docs not leaked at depth=1" || fail "Sub-collection leak" "$SUBCOLL_LEAK sub-collection doc(s) leaked into depth=1 browse"
+
+# depth=2 — must show every doc (root + sub-collection). Regression check.
+R2=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":2}" | mcp_result)
+ALL_DOCS=$(echo "$R2" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+docs=[i for i in d['items'] if i.get('type')=='document']
+print(len(docs))
+" 2>/dev/null)
+# Expect at least 3 docs: root + specs/api-spec-v2 + designs/system-design.
+# (Other earlier sections may have created more — only assert the minimum.)
+[ "$ALL_DOCS" -ge 3 ] 2>/dev/null && pass "browse(depth=2): all docs surfaced ($ALL_DOCS docs)" || fail "depth=2 regression" "only $ALL_DOCS docs (expected >=3)"
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
