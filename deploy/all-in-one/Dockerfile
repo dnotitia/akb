@@ -34,7 +34,7 @@ WORKDIR /src
 RUN npm install -g pnpm@latest
 
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --ignore-scripts
 
 COPY frontend/ ./
 RUN npx vite build
@@ -72,6 +72,11 @@ RUN pip install --no-cache-dir /tmp/akb-backend && rm -rf /tmp/akb-backend
 
 # Backend source (used at runtime — venv only carries dependencies).
 COPY backend /app/backend
+# Drop any locally-rendered backend/config/ that leaked into the build
+# context. The all-in-one image must use /etc/akb/{app,secret}.yaml,
+# rendered by entrypoint.sh — a stray ./config/app.yaml short-circuits
+# `config.py:_CONFIG_CANDIDATES` and starves backend of secret.yaml.
+RUN rm -rf /app/backend/config
 
 # Frontend static bundle.
 COPY --from=frontend-builder /src/dist /var/www/akb
