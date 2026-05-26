@@ -185,8 +185,6 @@ def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
         fm["depends_on"] = req.depends_on
     if req.related_to:
         fm["related_to"] = req.related_to
-    if req.metadata:
-        fm.update(req.metadata)
     return fm
 
 
@@ -284,13 +282,14 @@ class DocumentService:
         # slashes or whitespace, diverging from the doc path under it.
         collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
         # No `id` key — canonical handle is the akb:// URI built from
-        # (vault, path), not a short hash.
-        metadata = dict(req.metadata or {})
+        # (vault, path), not a short hash. The `metadata` JSONB column is
+        # reserved for internal writers (external-git import, LLM auto-tagging)
+        # — user document writes never populate it.
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
             title=req.title, doc_type=req.type, status="draft",
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
-            now=now, commit_hash=commit_hash, tags=req.tags, metadata=metadata,
+            now=now, commit_hash=commit_hash, tags=req.tags, metadata={},
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -518,8 +517,6 @@ class DocumentService:
             current_fm["depends_on"] = req.depends_on
         if req.related_to is not None:
             current_fm["related_to"] = req.related_to
-        if req.metadata:
-            current_fm.update(req.metadata)
         current_fm["updated_at"] = now.isoformat()
 
         new_body = req.content if req.content is not None else current_body
