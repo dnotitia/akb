@@ -2,7 +2,7 @@
   <img src="docs/assets/akb-hero.png" alt="AKB — agents reading and writing into a permissioned knowledge vault of docs, tables, and files, linked by a URI graph" width="100%">
 </p>
 
-# AKB — Agent Knowledgebase
+# AKB — Agent Knowledge Base
 
 > **Organizational memory for AI agents.** Git-backed knowledge base served
 > over the **Model Context Protocol (MCP)** — agents read and write directly
