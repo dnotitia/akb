@@ -85,8 +85,15 @@ async def store_document_relations(
     """
     source = doc_uri(vault_name, doc_path)
 
-    # Delete old edges from this source
-    await conn.execute("DELETE FROM edges WHERE source_uri = $1", source)
+    # Delete old IMPLICIT edges from this source — frontmatter+body markdown
+    # links are the source of truth for the implicit set, but explicit edges
+    # created via akb_link must survive this rewrite. Without the kind filter,
+    # every akb_update silently destroys every explicit edge from the doc
+    # (audit-v2 A-F1 — deterministic data loss, not a race).
+    await conn.execute(
+        "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
+        source,
+    )
 
     count = 0
 
@@ -176,36 +183,63 @@ async def link_resources(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # The edge is owned by the caller-specified vault (source convention),
-        # but each endpoint is validated against its own vault from the URI.
-        vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
-        if not vault:
-            return {"error": f"Vault not found: {vault_name}"}
-        vault_id = vault["id"]
+        async with conn.transaction():
+            # All reads + INSERT inside one TX so a concurrent delete on
+            # either endpoint cannot leave a dangling edge (audit-v2 A-F2).
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1", vault_name,
+            )
+            if not vault:
+                return {"error": f"Vault not found: {vault_name}"}
+            vault_id = vault["id"]
 
-        source_vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", source_vault_name)
-        if not source_vault:
-            return {"error": f"Source vault not found: {source_vault_name}"}
-        target_vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", target_vault_name)
-        if not target_vault:
-            return {"error": f"Target vault not found: {target_vault_name}"}
+            source_vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1", source_vault_name,
+            )
+            if not source_vault:
+                return {"error": f"Source vault not found: {source_vault_name}"}
+            target_vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1", target_vault_name,
+            )
+            if not target_vault:
+                return {"error": f"Target vault not found: {target_vault_name}"}
 
-        if not await _resource_exists(conn, source_vault["id"], source_type, source_id):
-            return {"error": f"Source resource not found: {source_uri}"}
-        if not await _resource_exists(conn, target_vault["id"], target_type, target_id):
-            return {"error": f"Target resource not found: {target_uri}"}
+            # Acquire the same path advisory lock the doc write paths use so
+            # akb_link serialises with akb_delete / akb_update on either
+            # endpoint. Doc endpoints only — table/file lifecycle is keyed by
+            # UUID and doesn't go through path_lock. Sort by (vault_id, id) to
+            # impose a deadlock-free lock-acquisition order.
+            from app.repositories.document_repo import acquire_path_lock
+            doc_endpoints: list[tuple[uuid.UUID, str]] = []
+            if source_type == "doc":
+                doc_endpoints.append((source_vault["id"], source_id))
+            if target_type == "doc":
+                doc_endpoints.append((target_vault["id"], target_id))
+            for vid, ident in sorted(
+                doc_endpoints, key=lambda x: (str(x[0]), x[1]),
+            ):
+                await acquire_path_lock(conn, vid, ident)
 
-        await conn.execute(
-            """
-            INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
-                               source_type, target_type, metadata, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
-            SET metadata = $8, created_by = $9
-            """,
-            uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
-            source_type, target_type, json.dumps(metadata or {}), created_by,
-        )
+            if not await _resource_exists(
+                conn, source_vault["id"], source_type, source_id,
+            ):
+                return {"error": f"Source resource not found: {source_uri}"}
+            if not await _resource_exists(
+                conn, target_vault["id"], target_type, target_id,
+            ):
+                return {"error": f"Target resource not found: {target_uri}"}
+
+            await conn.execute(
+                """
+                INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
+                                   source_type, target_type, metadata, created_by, kind)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'explicit')
+                ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
+                SET metadata = $8, created_by = $9, kind = 'explicit'
+                """,
+                uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
+                source_type, target_type, json.dumps(metadata or {}), created_by,
+            )
 
     logger.info("Linked %s → %s (%s)", source_uri, target_uri, relation_type)
     return {"linked": True, "source": source_uri, "target": target_uri, "relation": relation_type}
@@ -215,20 +249,29 @@ async def unlink_resources(
     source_uri: str,
     target_uri: str,
     relation_type: str | None = None,
+    *,
+    vault_id: uuid.UUID | None = None,
 ) -> dict:
-    """Remove an edge between two resources."""
+    """Remove an edge between two resources.
+
+    ``vault_id`` scopes the DELETE so a future caller can't accidentally
+    delete an edge from another vault by spelling its URIs (audit-v2 A-F9).
+    The MCP handler already gates by vault access, but the service-level
+    interface now enforces it too.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
+        params: list = [source_uri, target_uri]
+        where = "source_uri = $1 AND target_uri = $2"
         if relation_type:
-            result = await conn.execute(
-                "DELETE FROM edges WHERE source_uri = $1 AND target_uri = $2 AND relation_type = $3",
-                source_uri, target_uri, relation_type,
-            )
-        else:
-            result = await conn.execute(
-                "DELETE FROM edges WHERE source_uri = $1 AND target_uri = $2",
-                source_uri, target_uri,
-            )
+            where += " AND relation_type = $3"
+            params.append(relation_type)
+        if vault_id is not None:
+            where += f" AND vault_id = ${len(params) + 1}"
+            params.append(vault_id)
+        result = await conn.execute(
+            f"DELETE FROM edges WHERE {where}", *params,
+        )
 
     count = int(result.split(" ")[1]) if " " in result else 0
     logger.info("Unlinked %s → %s (%d removed)", source_uri, target_uri, count)
@@ -593,7 +636,21 @@ async def _store_edge(
             )
             return False
         target_type = parsed.kind
-        target_uri = target_ref
+        # Rebuild the URI from its parsed parts so two surface
+        # variants of the same target (extra slash, mixed-case vault,
+        # NFC vs NFD identifier) collapse to a single canonical row
+        # under the (vault_id, source_uri, target_uri, relation_type)
+        # uniqueness convention. Without this, dedup via
+        # ON CONFLICT DO NOTHING is defeated by string variance.
+        if parsed.kind == "doc":
+            target_uri = doc_uri(parsed.vault, parsed.identifier or "")
+        else:
+            # table / file URIs already round-trip; use the parsed form
+            # so coll prefix and trailing slash variations collapse.
+            from app.services.uri_service import table_uri as _table_uri
+            from app.services.uri_service import file_uri as _file_uri
+            builder = _table_uri if parsed.kind == "table" else _file_uri
+            target_uri = builder(parsed.vault, parsed.identifier or "", parsed.coll_path)
     else:
         # Legacy: resolve as doc ref within the same vault
         target_id = await _resolve_doc_ref(conn, vault_id, target_ref)
@@ -678,6 +735,9 @@ async def _bfs_collect(
     """
     queue = [start_uri]
     visited: set[str] = set()
+    # Track emitted edges so an edge A→B doesn't appear twice when both
+    # A and B are processed in the same BFS wave (audit-v2 A-F7).
+    emitted: set[tuple[str, str, str]] = set()
 
     for current_depth in range(depth + 1):
         if not queue or len(nodes) >= limit:
@@ -730,20 +790,26 @@ async def _bfs_collect(
                 continue
 
             for r in out_by_uri.get(uri, []):
-                edges.append({
-                    "source": uri,
-                    "target": r["target_uri"],
-                    "relation": r["relation_type"],
-                })
+                key = (uri, r["target_uri"], r["relation_type"])
+                if key not in emitted:
+                    emitted.add(key)
+                    edges.append({
+                        "source": uri,
+                        "target": r["target_uri"],
+                        "relation": r["relation_type"],
+                    })
                 if r["target_uri"] not in visited:
                     next_queue.append(r["target_uri"])
 
             for r in in_by_uri.get(uri, []):
-                edges.append({
-                    "source": r["source_uri"],
-                    "target": uri,
-                    "relation": r["relation_type"],
-                })
+                key = (r["source_uri"], uri, r["relation_type"])
+                if key not in emitted:
+                    emitted.add(key)
+                    edges.append({
+                        "source": r["source_uri"],
+                        "target": uri,
+                        "relation": r["relation_type"],
+                    })
                 if r["source_uri"] not in visited:
                     next_queue.append(r["source_uri"])
 

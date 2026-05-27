@@ -49,36 +49,46 @@ class SessionService:
         now = datetime.now(timezone.utc)
 
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT s.id, s.agent_id, s.started_at, s.ended_at, s.doc_ids, v.name as vault_name FROM sessions s JOIN vaults v ON s.vault_id = v.id WHERE s.id = $1",
-                sid,
-            )
-            if not row:
-                return {"error": "Session not found"}
+            # Single TX with FOR UPDATE so two concurrent end_session
+            # calls can't both see ended_at = NULL and both fire the
+            # auto-summarize side effect.
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT s.id, s.agent_id, s.started_at, s.ended_at, s.doc_ids, "
+                    "v.name as vault_name "
+                    "FROM sessions s JOIN vaults v ON s.vault_id = v.id "
+                    "WHERE s.id = $1 FOR UPDATE OF s",
+                    sid,
+                )
+                if not row:
+                    return {"error": "Session not found"}
 
-            if row["ended_at"] is not None:
-                return {
-                    "error": "Session already ended",
-                    "session_id": session_id,
-                    "ended_at": row["ended_at"].isoformat(),
-                }
+                if row["ended_at"] is not None:
+                    return {
+                        "error": "Session already ended",
+                        "session_id": session_id,
+                        "ended_at": row["ended_at"].isoformat(),
+                    }
 
-            await conn.execute(
-                "UPDATE sessions SET ended_at = $1, summary = $2 WHERE id = $3",
-                now, summary, sid,
-            )
+                await conn.execute(
+                    "UPDATE sessions SET ended_at = $1, summary = $2 WHERE id = $3",
+                    now, summary, sid,
+                )
 
-            # Auto-store work memory
-            if user_id and summary:
-                from app.services.memory_service import auto_summarize_session
-                doc_titles = []
-                if row["doc_ids"]:
+                doc_titles: list[str] = []
+                if user_id and summary and row["doc_ids"]:
                     title_rows = await conn.fetch(
                         "SELECT title FROM documents WHERE id = ANY($1)",
                         row["doc_ids"],
                     )
                     doc_titles = [r["title"] for r in title_rows]
 
+            # auto_summarize_session takes its own pool connections and
+            # writes a memory doc; keep it outside the session TX so it
+            # can't escalate into a multi-resource deadlock. The
+            # FOR UPDATE check above already prevents double-fire.
+            if user_id and summary:
+                from app.services.memory_service import auto_summarize_session
                 await auto_summarize_session(
                     user_id=user_id,
                     session_id=session_id,

@@ -127,17 +127,90 @@ async def build_table_name_map(conn, vault_names: list[str]) -> dict[str, str]:
     return table_map
 
 
+# Token kinds emitted by `_tokenize_sql`. Only ``id`` tokens are eligible
+# for rewriting; everything else (literals, comments, punctuation) is
+# emitted verbatim so the rewriter cannot corrupt string contents.
+#
+# Naive regex rewriting (`re.sub(r"\bname\b", ..., flags=IGNORECASE)`)
+# matched inside single-quoted strings, double-quoted identifiers,
+# comments, and column aliases — silently corrupting query results
+# (audit-v2 B-F9). The tokenizer makes the rewrite scope-aware:
+# strings/comments/quoted-idents pass through untouched.
+_SQL_TOKEN_RE = re.compile(
+    r"""
+      (?P<str>'(?:[^']|'')*')                # single-quoted string (PG escapes '' inside)
+    | (?P<qid>"(?:[^"]|"")+")                # double-quoted identifier
+    | (?P<line_comment>--[^\n]*)             # line comment
+    | (?P<block_comment>/\*[\s\S]*?\*/)      # block comment (non-greedy)
+    | (?P<num>[0-9]+(?:\.[0-9]+)?)           # numeric literal
+    | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)      # bare identifier or keyword
+    | (?P<ws>\s+)                            # whitespace
+    | (?P<sym>.)                             # any other single char
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _scan_dollar_quote(sql: str, start: int) -> int | None:
+    """If sql[start:] begins with a PG dollar-quote `$tag$ ... $tag$`,
+    return the index just past the closing tag. Otherwise None.
+    """
+    if sql[start] != "$":
+        return None
+    m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", sql[start:])
+    if not m:
+        return None
+    tag = m.group(0)
+    end = sql.find(tag, start + len(tag))
+    if end == -1:
+        return None
+    return end + len(tag)
+
+
 def rewrite_table_names(sql: str, table_map: dict[str, str]) -> str:
-    """Replace short table names in `sql` with their pg-qualified names.
-    Longest match first to avoid partial collisions (e.g. 'sales' vs
-    'sales_v2')."""
-    rewritten = sql
-    for short_name in sorted(table_map.keys(), key=len, reverse=True):
-        pg_name = table_map[short_name]
-        rewritten = re.sub(
-            rf"\b{re.escape(short_name)}\b",
-            pg_name,
-            rewritten,
-            flags=re.IGNORECASE,
-        )
-    return rewritten
+    """Replace short table names in ``sql`` with their pg-qualified
+    names, but ONLY for bare identifiers — never inside string literals,
+    quoted identifiers, or comments.
+
+    The map is matched case-insensitively (PG identifiers are
+    case-folded for unquoted refs), so ``SELECT * FROM PIPELINE`` and
+    ``FROM pipeline`` both rewrite. A quoted identifier ``"Pipeline"``
+    is left alone because PG treats it as case-sensitive — rewriting it
+    would change semantics.
+
+    Longest key first so ``"sales_v2"`` doesn't get partially clobbered
+    by a shorter ``"sales"`` entry.
+    """
+    if not table_map:
+        return sql
+
+    # Pre-sort once so each lookup is deterministic. Lower-case the keys
+    # for the case-insensitive match.
+    lowered = {k.lower(): v for k, v in table_map.items()}
+
+    out: list[str] = []
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        # Manual dollar-quote scan first; the regex below can't match
+        # arbitrary tags with backreferences via a single alternation.
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            out.append(sql[pos:end])
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            # Should not happen — `sym` catches any character. Safety net.
+            out.append(sql[pos])
+            pos += 1
+            continue
+        kind = m.lastgroup
+        text = m.group()
+        if kind == "ident":
+            replacement = lowered.get(text.lower())
+            out.append(replacement if replacement is not None else text)
+        else:
+            out.append(text)
+        pos = m.end()
+    return "".join(out)

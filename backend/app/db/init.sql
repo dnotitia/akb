@@ -219,6 +219,12 @@ CREATE TABLE IF NOT EXISTS edges (
     metadata JSONB DEFAULT '{}',
     created_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- 'implicit' = derived from frontmatter / body markdown links (rewritten on
+    -- every document write). 'explicit' = created via akb_link and durable
+    -- across document writes. Without this discriminator,
+    -- store_document_relations' DELETE-then-reinsert pattern silently destroys
+    -- every akb_link-created edge on the next akb_update of the source doc.
+    kind TEXT NOT NULL DEFAULT 'implicit' CHECK(kind IN ('implicit', 'explicit')),
     UNIQUE(source_uri, target_uri, relation_type)
 );
 

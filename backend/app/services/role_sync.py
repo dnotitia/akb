@@ -472,7 +472,13 @@ class RoleSync:
         pg_table_name: str,
     ) -> None:
         """Grant SELECT/INSERT/UPDATE/DELETE/ALL on the new table to the
-        vault's reader/writer/admin group roles, matching their scope."""
+        vault's reader/writer/admin group roles, matching their scope.
+
+        Reconciler path (acquires own connection). Prefer
+        :meth:`grant_table_in_conn` from inside the caller's TX so the
+        grant commits atomically with the CREATE TABLE — pre-fix, this
+        path ran post-commit and left a window where the table existed
+        but akb_sql callers got 42501 (audit-v2 B-F7)."""
         if not _is_safe_pg_table_name(pg_table_name):
             logger.error("on_table_create: unsafe pg_table_name %r — refusing", pg_table_name)
             self.metrics.record_failure("on_table_create")
@@ -482,6 +488,24 @@ class RoleSync:
                 await self._grant_table(conn, vault_id, pg_table_name)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_table_create", e, vault_id, pg_table_name)
+
+    async def grant_table_in_conn(
+        self,
+        conn,
+        vault_id: uuid.UUID | str,
+        pg_table_name: str,
+    ) -> None:
+        """In-TX variant: grant runs on the caller's connection so it
+        commits atomically with the CREATE TABLE that preceded it.
+
+        Errors propagate — the create_table TX rolls back rather than
+        leaving an ungranted table (intentional; the reconciler path
+        above swallows for self-healing, this path does not)."""
+        if not _is_safe_pg_table_name(pg_table_name):
+            raise ValueError(
+                f"unsafe pg_table_name {pg_table_name!r} — refusing grant"
+            )
+        await self._grant_table(conn, vault_id, pg_table_name)
 
     async def on_table_drop(
         self,

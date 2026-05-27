@@ -186,15 +186,25 @@ async def _process_once() -> int:
                 await _mark_failure(conn, doc_id, row["llm_retry_count"], str(e))
             continue
 
-        await doc_repo.mark_llm_metadata_filled(
+        applied = await doc_repo.mark_llm_metadata_filled(
             doc_id=doc_id,
             summary=fields["summary"],
             tags=fields["tags"],
             doc_type=fields["doc_type"],
             domain=fields["domain"],
             now=datetime.now(timezone.utc),
+            expected_blob=blob_sha,
         )
-        succeeded += 1
+        if applied:
+            succeeded += 1
+        else:
+            # external_git reconciler superseded the row while the LLM
+            # call was in flight. Drop the stale result; the next claim
+            # cycle re-fetches body for the new blob.
+            logger.info(
+                "metadata_worker: dropping stale result for doc=%s "
+                "(external_blob changed since claim)", doc_id,
+            )
 
     return succeeded
 

@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 
 from app.db.postgres import get_pool
 from app.repositories.document_repo import CollectionRepository, DocumentRepository
+from app.repositories.events_repo import emit_event
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.services.git_service import GitService
 from app.services.index_service import (
@@ -42,7 +43,8 @@ from app.services.index_service import (
     delete_document_chunks,
     write_source_chunks,
 )
-from app.util.text import to_nfc, to_nfc_any
+from app.services.uri_service import doc_uri
+from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
 
 logger = logging.getLogger("akb.external_git")
 
@@ -144,6 +146,7 @@ class ExternalGitService:
                 await self._reindex_file(
                     vault_id=vault_id, vault_name=vault_name,
                     path=path, blob_sha=blob_sha, remote_url=cfg["remote_url"],
+                    tip_sha=new_sha,
                 )
                 if existing:
                     updated += 1
@@ -158,7 +161,9 @@ class ExternalGitService:
 
         for path in local.keys() - remote_tree.keys():
             try:
-                await self._delete_external_path(vault_id=vault_id, path=path)
+                await self._delete_external_path(
+                    vault_id=vault_id, vault_name=vault_name, path=path
+                )
                 deleted += 1
             except Exception as e:  # noqa: BLE001
                 errors += 1
@@ -200,6 +205,7 @@ class ExternalGitService:
         path: str,
         blob_sha: str,
         remote_url: str,
+        tip_sha: str,
     ) -> None:
         raw = await asyncio.to_thread(self.git.cat_blob, vault_name, blob_sha)
         try:
@@ -235,13 +241,24 @@ class ExternalGitService:
         # meaningful across multiple syncs. Cheap compared to the cat-blob
         # / chunking work we're already doing for this path.
         last_commit = await asyncio.to_thread(
-            self.git.last_commit_for_path, vault_name, path
+            self.git.last_commit_for_path, vault_name, path, tip_sha
         )
         created_by = _created_by_for(remote_url)
         now = datetime.now(timezone.utc)
 
         parent = str(PurePosixPath(path).parent)
-        coll_path = "" if parent in (".", "") else parent
+        raw_coll = "" if parent in (".", "") else parent
+        try:
+            # Same validator the user-write path uses (rejects reserved
+            # segments `coll`/`doc`/`table`/`file`). External mirrors
+            # otherwise smuggle them in via upstream directory names,
+            # and the corresponding `akb://` URIs would be unparseable.
+            coll_path = normalize_collection_path(raw_coll, allow_empty=True)
+        except ValueError as e:
+            raise ValueError(
+                f"external_git path {path!r} maps to invalid collection "
+                f"{raw_coll!r}: {e}"
+            )
 
         meta_header = build_doc_metadata_header(
             vault_name=vault_name, path=path, title=title,
@@ -288,17 +305,40 @@ class ExternalGitService:
                     vault_id=vault_id,
                     chunks=chunks,
                 )
+                # Subscribers (search reindex, audit) need to see external
+                # mirror writes the same as user PUTs. Emitted inside the
+                # same TX so rollback drops the event too.
+                await emit_event(
+                    conn,
+                    "document.put" if inserted else "document.update",
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(vault_name, path),
+                    actor_id=created_by,
+                    payload={
+                        "path": path,
+                        "title": title,
+                        "doc_type": doc_type,
+                        "external_blob": blob_sha,
+                        "commit": last_commit,
+                    },
+                )
 
-    async def _delete_external_path(self, *, vault_id: uuid.UUID, path: str) -> None:
+    async def _delete_external_path(
+        self, *, vault_id: uuid.UUID, vault_name: str, path: str
+    ) -> None:
         pool = await get_pool()
         doc_repo = DocumentRepository(pool)
         coll_repo = CollectionRepository(pool)
         existing = await doc_repo.find_by_external_path(vault_id, path)
         if not existing:
             return
+        from app.services.kg_service import delete_document_relations
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await delete_document_chunks(conn, str(existing["id"]))
+                # Remove implicit edges anchored on this doc — otherwise
+                # they survive the delete and dangle on the next BFS.
+                await delete_document_relations(conn, vault_name, path)
                 await conn.execute("DELETE FROM documents WHERE id = $1", existing["id"])
                 if existing.get("collection_id"):
                     await coll_repo.decrement_count(
@@ -306,6 +346,14 @@ class ExternalGitService:
                         datetime.now(timezone.utc),
                         conn=conn,
                     )
+                await emit_event(
+                    conn,
+                    "document.delete",
+                    vault_id=vault_id,
+                    resource_uri=doc_uri(vault_name, path),
+                    actor_id=existing.get("created_by"),
+                    payload={"path": path, "source": "external_git"},
+                )
 
 
 # ── Helpers ──────────────────────────────────────────────────

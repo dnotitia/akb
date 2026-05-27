@@ -627,19 +627,35 @@ async def resolve_publication(
             # separate statements with no row lock, so N concurrent
             # readers all saw view_count < max_views and all incremented,
             # overshooting max_views by up to N-1 (06-F8 / 04-F7).
+            #
+            # Re-check expires_at inside the UPDATE too — between the
+            # SELECT above and this UPDATE another caller could
+            # post-date `expires_at` via an admin edit, and we don't
+            # want to record a view against a publication that became
+            # expired in the gap.
             updated = await conn.fetchrow(
                 """
                 UPDATE publications
                    SET view_count = view_count + 1
                  WHERE id = $1
                    AND (max_views IS NULL OR view_count < max_views)
-                 RETURNING view_count, max_views
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                 RETURNING view_count, max_views, expires_at
                 """,
                 row["id"],
             )
             if updated is None:
-                # The row exists but max_views was already reached at the
-                # moment the UPDATE ran — concurrent reader beat us.
+                # Either max_views was reached or expires_at lapsed
+                # between the SELECT and the UPDATE. Re-resolve which
+                # one to surface so the caller sees the same error class
+                # they would have seen with stale data.
+                cur = await conn.fetchrow(
+                    "SELECT expires_at, view_count, max_views FROM publications WHERE id = $1",
+                    row["id"],
+                )
+                if cur is not None and cur["expires_at"] is not None and \
+                        cur["expires_at"] <= datetime.now(timezone.utc):
+                    raise PublicationExpired()
                 raise PublicationViewLimitReached()
             # Reflect the post-increment counter back so the response is
             # consistent with the value that just landed in PG.
@@ -1027,49 +1043,59 @@ async def create_snapshot(publication_id: uuid.UUID) -> dict:
     return the cached result instead of re-running the query.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT s.id, s.slug, s.vault_id, s.resource_type, s.query_sql,
-                   s.query_vault_names, s.query_params, s.title,
-                   v.name AS vault_name
-            FROM publications s JOIN vaults v ON s.vault_id = v.id
-            WHERE s.id = $1
-            """,
-            publication_id,
-        )
-        if row is None:
-            raise PublicationNotFound(str(publication_id))
+    # Session-scoped advisory lock keyed on the publication id so two
+    # concurrent /snapshot calls on the same publication don't both run
+    # the (potentially slow) table query, upload to S3 twice, and race
+    # on the final UPDATE. Released on connection close.
+    lock_key = int.from_bytes(publication_id.bytes[:8], "big", signed=True)
+    async with pool.acquire() as lock_conn:
+        async with lock_conn.transaction():
+            await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-    publication = _publication_row_to_dict(row)
-    assert publication is not None  # row is non-None
-    if publication["resource_type"] != ResourceType.TABLE_QUERY:
-        raise PublicationError("Snapshots only supported for table_query publications", status_code=400)
+            row = await lock_conn.fetchrow(
+                """
+                SELECT s.id, s.slug, s.vault_id, s.resource_type, s.query_sql,
+                       s.query_vault_names, s.query_params, s.title,
+                       v.name AS vault_name
+                FROM publications s JOIN vaults v ON s.vault_id = v.id
+                WHERE s.id = $1
+                """,
+                publication_id,
+            )
+            if row is None:
+                raise PublicationNotFound(str(publication_id))
 
-    # Force live execution for the snapshot (regardless of current mode)
-    publication_for_exec = {**publication, "mode": Mode.LIVE}
-    result = await resolve_table_query_publication(publication_for_exec, {})
+            publication = _publication_row_to_dict(row)
+            assert publication is not None  # row is non-None
+            if publication["resource_type"] != ResourceType.TABLE_QUERY:
+                raise PublicationError(
+                    "Snapshots only supported for table_query publications",
+                    status_code=400,
+                )
 
-    s3_key = f"snapshots/{publication_id}.json"
-    try:
-        file_service.put_object_bytes(
-            s3_key,
-            json.dumps(result, ensure_ascii=False).encode("utf-8"),
-            content_type="application/json",
-        )
-    except (file_service.StorageError, IOError) as e:
-        raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
+            # Force live execution for the snapshot (regardless of current mode)
+            publication_for_exec = {**publication, "mode": Mode.LIVE}
+            result = await resolve_table_query_publication(publication_for_exec, {})
 
-    now = datetime.now(timezone.utc)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publications
-            SET snapshot_s3_key = $1, snapshot_at = $2, mode = 'snapshot', updated_at = $2
-            WHERE id = $3
-            """,
-            s3_key, now, publication_id,
-        )
+            s3_key = f"snapshots/{publication_id}.json"
+            try:
+                file_service.put_object_bytes(
+                    s3_key,
+                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json",
+                )
+            except (file_service.StorageError, IOError) as e:
+                raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
+
+            now = datetime.now(timezone.utc)
+            await lock_conn.execute(
+                """
+                UPDATE publications
+                SET snapshot_s3_key = $1, snapshot_at = $2, mode = 'snapshot', updated_at = $2
+                WHERE id = $3
+                """,
+                s3_key, now, publication_id,
+            )
 
     return {
         "snapshot_s3_key": s3_key,

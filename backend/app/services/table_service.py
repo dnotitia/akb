@@ -15,9 +15,12 @@ names.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from difflib import get_close_matches
+
+import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
@@ -98,6 +101,16 @@ async def create_table(
     `collections` row is auto-created via `CollectionRepository.get_or_create`
     if it doesn't exist yet.
     """
+    # Tables surface directly in akb_sql, so the user-visible name needs
+    # to be a clean PG identifier shape. The sanitiser in pg_table_name
+    # maps hyphens AND any other punctuation to underscores, so accepting
+    # both `mcp-items` and `mcp_items` would collide on the PG side.
+    # Allow only `[a-z0-9_]+` (underscore is the PG-native separator) to
+    # keep the sanitiser injective for valid inputs (audit-v2 B-F5).
+    if not _TABLE_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid table name {name!r}: must match {_TABLE_NAME_RE.pattern}"
+        )
     pool = await get_pool()
     tid = uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -128,14 +141,27 @@ async def create_table(
                 )
 
             pg_name = table_data_repo.pg_table_name(vault["name"], name)
-            await table_data_repo.create_dynamic_table(conn, pg_name, columns)
-            await table_registry_repo.insert(
-                conn,
-                table_id=tid, vault_id=vault_id, name=name,
-                description=description, columns=columns,
-                created_by=actor_id, now=now,
-                collection_id=collection_id,
-            )
+            try:
+                await table_data_repo.create_dynamic_table(conn, pg_name, columns)
+                await table_registry_repo.insert(
+                    conn,
+                    table_id=tid, vault_id=vault_id, name=name,
+                    description=description, columns=columns,
+                    created_by=actor_id, now=now,
+                    collection_id=collection_id,
+                )
+            except asyncpg.UniqueViolationError as e:
+                # Two concurrent create_table calls past the find_by_name
+                # check both hit the UNIQUE constraint (vault_tables) or
+                # the pg_type sysid for the dynamic table. Surface as a
+                # clean 409 rather than leaking raw PG error text to the
+                # caller (audit-v2 B-F1).
+                raise ConflictError(f"Table already exists: {name}") from e
+            # Grant PG RBAC inside the same TX so the table is callable
+            # via akb_sql the instant the create commits — pre-fix, the
+            # grant ran in a separate connection after the TX commit,
+            # leaving an "exists but 42501" window (audit-v2 B-F7).
+            await get_role_sync().grant_table_in_conn(conn, vault_id, pg_name)
             await emit_event(
                 conn, "table.create",
                 vault_id=vault_id,
@@ -164,12 +190,6 @@ async def create_table(
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
-    # PG-native RBAC: grant SELECT/INSERT/UPDATE/DELETE/ALL on the new
-    # vt_* table to the vault's reader/writer/admin group roles. Tables
-    # without these grants are invisible to akb_user_<uid> roles (PG
-    # returns "relation does not exist" or 42501).
-    await get_role_sync().on_table_create(vault_id, pg_name)
-
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
@@ -182,6 +202,11 @@ async def create_table(
 
 
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
+
+# Table name shape — PG-native identifier grammar. Underscores only
+# (no hyphens) so `pg_table_name`'s `[^a-z0-9] → _` sanitiser doesn't
+# collapse two distinct user-visible names onto the same PG identifier.
+_TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 async def list_tables(vault_id: uuid.UUID) -> list[dict]:
@@ -233,6 +258,13 @@ async def drop_table(
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
             await table_data_repo.drop_dynamic_table(conn, pg_name)
+            # Drop chunks + enqueue vector-store outbox in the SAME TX as
+            # the DDL/registry delete. Pre-fix this ran on a separate
+            # connection after the TX committed, so a crash between the
+            # two steps left orphan chunks (audit-v2 B-F2). Now it's
+            # atomic — the table either disappears completely or not at all.
+            from app.services.index_service import delete_table_chunks
+            await delete_table_chunks(conn, str(table_id))
             await table_registry_repo.delete(conn, table_id)
 
             # Clean up edges referencing this table — use the canonical
@@ -255,13 +287,6 @@ async def drop_table(
                     "table_name": table_name,
                 },
             )
-
-    # Outside the TX: drop the metadata chunk via the vector-store
-    # outbox (same pattern as file deletion).
-    try:
-        await delete_table_index(str(table_id))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("table chunk delete failed for %s: %s", table_name, e)
 
     # PG-native RBAC: DROP TABLE has already cascaded the GRANTs;
     # this hook exists for symmetry + audit (logs at DEBUG).
@@ -302,7 +327,18 @@ async def alter_table(
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
-            table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+            # FOR UPDATE on the registry row so two concurrent alter_table
+            # calls serialise their read-modify-write of vault_tables.columns
+            # (audit-v2 B-F4). Without this, concurrent alters could
+            # silently last-write-wins one of them.
+            table = await conn.fetchrow(
+                """
+                SELECT * FROM vault_tables
+                 WHERE vault_id = $1 AND name = $2
+                 FOR UPDATE
+                """,
+                vault_id, table_name,
+            )
             if not table:
                 raise NotFoundError("Table", table_name)
 
@@ -356,6 +392,21 @@ async def alter_table(
                     "renamed": renamed,
                 },
             )
+
+    # Refresh the metadata chunk so search reflects the new schema
+    # (audit-v2 B-F4: pre-fix the chunk drifted permanently from the
+    # ALTER until the table was dropped and recreated).
+    try:
+        await index_table_metadata(
+            str(table["id"]),
+            vault_id=vault_id,
+            vault_name=vault["name"],
+            name=table_name,
+            description=table["description"] or "",
+            columns=columns,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("alter_table chunk reindex failed for %s: %s", table_name, e)
 
     return {
         "kind": "table",

@@ -399,16 +399,29 @@ class GitService:
                 out[item.path] = item.hexsha
         return out
 
-    def last_commit_for_path(self, vault_name: str, path: str) -> str | None:
+    def last_commit_for_path(
+        self, vault_name: str, path: str, rev: str | None = None
+    ) -> str | None:
         """Hex sha of the most recent commit that touched `path`. Used to
         stamp `documents.current_commit` per-file so mirror docs don't
         all share the reconcile-time HEAD sha. Returns None when the
         path has no commits (should not happen for a path we just
         read from the tree).
+
+        `rev` pins the walk to a specific tip. The external_git reconciler
+        passes the tree-sha it just synced so attribution can't drift past
+        the snapshot it's writing — without it a concurrent fetch can
+        return a commit not yet reflected in `documents.current_commit`,
+        and that commit may not even contain `path` on the new tip.
         """
         repo = self._get_repo(vault_name)
         try:
-            commits = list(repo.iter_commits(paths=path, max_count=1))
+            kwargs = {"paths": path, "max_count": 1}
+            commits = (
+                list(repo.iter_commits(rev, **kwargs))
+                if rev is not None
+                else list(repo.iter_commits(**kwargs))
+            )
         except (ValueError, GitError):
             return None
         return commits[0].hexsha if commits else None
@@ -785,9 +798,24 @@ class GitService:
         """Get diff for a specific file at a specific commit.
 
         Returns the unified diff patch for the file.
+
+        Mirrors read_file's defensive `BadName/BadObject` catch so an
+        unknown / malformed commit hash surfaces as a clean
+        ``{"type":"unknown"}`` response rather than propagating as an
+        unhandled 500 (audit-v2 F-F2).
         """
+        from git.exc import BadName, BadObject
         repo = self._get_repo(vault_name)
-        commit = repo.commit(commit_hash)
+        try:
+            commit = repo.commit(commit_hash)
+        except (ValueError, BadName, BadObject):
+            return {
+                "file": file_path,
+                "commit": commit_hash,
+                "type": "unknown",
+                "diff": "",
+                "error": "commit not found",
+            }
 
         if not commit.parents:
             # Initial commit — show full content as addition

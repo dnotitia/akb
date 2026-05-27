@@ -364,13 +364,19 @@ class DocumentRepository:
         doc_type: str | None,
         domain: str | None,
         now: datetime,
-    ) -> None:
+        expected_blob: str | None = None,
+    ) -> bool:
         """Apply LLM-generated metadata, but only into NULL/empty fields
         so that frontmatter-provided values always win.
+
+        When `expected_blob` is passed, the UPDATE is gated on
+        `external_blob = expected_blob`. The external_git reconciler can
+        reindex a path between worker claim and worker write — without
+        the predicate the worker would stamp stale LLM output onto a row
+        whose body is already newer. Returns True iff the row matched.
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
+            sql = """
                 UPDATE documents SET
                     summary  = COALESCE(NULLIF(summary, ''), $2, summary),
                     tags     = CASE
@@ -382,9 +388,13 @@ class DocumentRepository:
                     llm_metadata_at = $6,
                     updated_at = $6
                 WHERE id = $1
-                """,
-                doc_id, summary, tags, doc_type, domain, now,
-            )
+            """
+            args: list = [doc_id, summary, tags, doc_type, domain, now]
+            if expected_blob is not None:
+                sql += " AND external_blob = $7"
+                args.append(expected_blob)
+            status = await conn.execute(sql, *args)
+        return status.endswith(" 1")
 
 
 class CollectionRepository:
@@ -413,6 +423,32 @@ class CollectionRepository:
                 "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
                 vault_id, path,
             )
+            if existing is None:
+                # ON CONFLICT DO NOTHING returned no row, AND the SELECT
+                # also finds nothing — the conflict winner committed and
+                # then deleted the row before our SELECT ran. Retry the
+                # full insert+select cycle once; if that also fails we
+                # surface the underlying state to the caller.
+                row = await c.fetchrow(
+                    """
+                    INSERT INTO collections (id, vault_id, path, name)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (vault_id, path) DO NOTHING
+                    RETURNING id
+                    """,
+                    uuid.uuid4(), vault_id, path, name,
+                )
+                if row:
+                    return row["id"]
+                existing = await c.fetchrow(
+                    "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+                    vault_id, path,
+                )
+                if existing is None:
+                    raise RuntimeError(
+                        f"collection {path!r} could not be created or found "
+                        "(concurrent delete race in vault {vault_id})"
+                    )
             return existing["id"]
         if conn is not None:
             return await _do(conn)
