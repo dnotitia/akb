@@ -5,6 +5,138 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.1 — 2026-05-27
+
+Second-round concurrency/atomicity audit. 54 findings across six
+domains were narrowed by a meta-review pass to a Tier 0 (HIGH,
+deterministic data loss / surface bypass) and a Tier 1 (TX + advisory
+lock + canonical URI hardening) cut, then reproduced in a Docker
+desktop isolation environment before fix. The shape of every fix is
+"narrow the surface or hold the right lock", not new feature.
+
+### Tier 0 — HIGH severity
+
+- **`edges.kind` discriminator (migration 028).** Before, every
+  `akb_update` ran `DELETE FROM edges WHERE source_uri = X` and
+  re-extracted from frontmatter + body. That wiped explicit edges
+  created via `akb_link` — deterministic, not a race. New
+  `kind ∈ {implicit, explicit}` column; rewrite DELETE is scoped to
+  `kind = 'implicit'`, `akb_link` writes `kind = 'explicit'`. Existing
+  rows default to implicit so current behaviour is preserved.
+- **Token-aware SQL rewriter for `table_query`.** Pre-fix
+  `table_data_repo.rewrite_table_names` used a regex substring
+  substitution, so a publication that mapped table name `name` would
+  silently corrupt a `WHERE label = 'foo_name_bar'` literal. New scan
+  tokenises (single/double quoted strings, line + block comments,
+  dollar-quoted strings, identifiers) and rewrites only `ident` tokens.
+- **`file_uri` collection prefix.** `document_service.delete` was
+  emitting the root-form URI for collection-resident files, so the
+  same file appeared under two URIs across event payloads / responses.
+- **MCP `version` parameter hex validation.** REST already rejected
+  non-hex refs (`HEAD~1`, `refs/...`, `@~5`) for `?version=`, but the
+  MCP `akb_get` / `akb_diff` handlers passed the string straight to
+  GitPython — letting a caller bypass the lifecycle to read historical
+  content the REST trust boundary refused. Now both handlers validate
+  with the same `^[0-9a-f]{7,64}$` regex (shared via
+  `app/util/git_refs.py`).
+
+### Tier 1 — TX / advisory-lock / canonical URI hardening
+
+- **`link_resources` runs in one TX with `acquire_path_lock`.**
+  Doc-endpoint locks are taken in `(vault_id, identifier)`-sorted
+  order so two `akb_link` calls touching overlapping endpoints never
+  deadlock. Both vault and endpoint reads are inside the snapshot.
+- **`unlink_resources(*, vault_id=...)`.** Without a vault scope the
+  delete matched purely on `(source_uri, target_uri)`, so a caller
+  could erase another vault's edge by spelling its URIs. MCP now
+  threads `access["vault_id"]` through.
+- **BFS edge dedup in `_bfs_collect`.** An `emitted: set[tuple[str,
+  str, str]]` removes duplicate edges that surfaced when both
+  endpoints sat in the same wave.
+- **`create_table` / `drop_table` / `alter_table` fully transactional.**
+  Includes new `RoleSync.grant_table_in_conn(...)` that propagates
+  errors (vs `on_table_create` which swallows) — the grant commits
+  atomically with the CREATE TABLE, eliminating the "exists but 42501"
+  window callers used to see. `alter_table` holds `FOR UPDATE` on the
+  registry row so two concurrent alters can't last-write-wins the
+  column list. Table-name validator is now `[a-z][a-z0-9_]*` —
+  rejecting hyphens because `pg_table_name`'s `[^a-z0-9] → _`
+  sanitiser is otherwise non-injective.
+- **`delete_vault` per-table chunk cleanup.** `chunks.source_id` has
+  no FK to `vault_tables` (polymorphic source), so the prior
+  vault-scoped chunk DELETE missed `source_type = 'table'` rows and
+  orphaned their vector-store entries. Now iterates `vault_tables`,
+  routes each through `_drop_source_chunks_with_outbox`, then drops
+  the dynamic PG table — all inside the outer TX.
+- **`external_git` reconciler hardening.**
+  - `last_commit_for_path` takes the synced tip sha so attribution
+    can't drift past the tree we're writing.
+  - `mark_llm_metadata_filled(..., expected_blob=...)` gates the
+    UPDATE on `external_blob = expected_blob` — a reconciler that
+    superseded the row mid-LLM-call no longer overwrites with stale
+    output. The worker clears `llm_next_attempt_at` on the dropped
+    result so the next tick reprocesses immediately.
+  - Emits `document.put` / `document.update` / `document.delete`
+    events so mirror writes have the same subscriber surface as
+    user PUTs. `_delete_external_path` also calls
+    `delete_document_relations` to drop implicit edges with the doc.
+- **Session / publication concurrency.**
+  - `SessionService.end_session` wraps the row read in a transaction
+    with `SELECT ... FOR UPDATE`; concurrent ends no longer both run
+    the `auto_summarize_session` side effect.
+  - `publication_service.create_snapshot` holds a session-scoped
+    advisory lock keyed on `publication_id` so two concurrent
+    snapshot calls don't both execute the SQL, both upload to S3,
+    and race on the final UPDATE.
+  - `resolve_publication` folds `expires_at` into the atomic view
+    UPDATE — pre-fix a publication that expired between the SELECT
+    and the UPDATE would still record a view.
+- **BM25 `recompute_stats` holds `pg_try_advisory_lock` for the full
+  scan + write.** A second replica that arrives mid-rebuild bails
+  out cheaply with a log line instead of redoing the whole tokenise
+  pass on top of the leader.
+- **Abandoned-chunk reaper outbox dedup.** Reaper INSERT into
+  `vector_delete_outbox` now guards with `NOT EXISTS (... WHERE
+  chunk_id = a.id AND processed_at IS NULL)` so concurrent
+  `_drop_source_chunks_with_outbox` calls don't enqueue the same
+  chunk twice. New `idx_vector_outbox_chunk_pending` partial index
+  (migration 029) so the guard is O(1) instead of a filtered seq scan.
+- **Edge URI canonicalisation in `_store_edge`.** Parsed URIs are
+  rebuilt through `doc_uri` / `table_uri` / `file_uri` before INSERT
+  so two surface variants (trailing slash, coll-prefix shape) of the
+  same target collapse onto one row — the `ON CONFLICT DO NOTHING`
+  dedup is no longer defeated by string variance.
+- **`external_git` paths run through `normalize_collection_path`.**
+  Mirror docs whose upstream directory contained reserved segments
+  (`coll`/`doc`/`table`/`file`) now fail at reindex time instead of
+  smuggling unparseable URIs into the edges table.
+
+### Schema
+
+- Migration **028**: `edges.kind TEXT NOT NULL DEFAULT 'implicit'
+  CHECK(kind IN ('implicit', 'explicit'))` + partial index
+  `idx_edges_source_kind ON edges(source_uri, kind)`.
+- Migration **029**: partial index
+  `idx_vector_outbox_chunk_pending ON vector_delete_outbox(chunk_id)
+  WHERE processed_at IS NULL`.
+
+Both migrations are idempotent ADD COLUMN / CREATE INDEX IF NOT
+EXISTS; PG 11+ runs the column add as a metadata-only ALTER (no
+table rewrite).
+
+### Notes for operators
+
+- Existing edges are preserved as `kind = 'implicit'`. Explicit
+  edges that were destroyed by prior `akb_update` rewrites are
+  recovered by re-running `akb_link` — the new row lands as
+  `kind = 'explicit'` and now survives.
+- MCP clients that previously passed `version="HEAD~1"` (or any
+  symbolic ref) to `akb_get` / `akb_diff` will start receiving a
+  clear error. Switch to a hex commit hash from `akb_history`.
+- `external_git` mirror vaults now emit `document.*` events on each
+  reindex pass. Existing subscribers will see throughput proportional
+  to the upstream change rate.
+
 ## 0.3.0 — 2026-05-27
 
 ### Follow-up patch: edge-extraction safety (PR #85, 2026-05-26)
