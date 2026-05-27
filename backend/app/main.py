@@ -1,4 +1,4 @@
-"""AKB — Agent Knowledgebase API Server."""
+"""AKB — Agent Knowledge Base API Server."""
 
 import asyncio
 import logging
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AKB — Agent Knowledgebase",
+    title="AKB — Agent Knowledge Base",
     description="Organizational Memory for Agents. Git-backed, MCP-native knowledge base.",
     version="0.1.0",
     lifespan=lifespan,

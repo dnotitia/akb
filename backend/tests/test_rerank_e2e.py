@@ -75,7 +75,7 @@ async def test_rerank_raw_call():
         results = await rerank(
             "AKB 검색 파이프라인 설계",
             [
-                "AKB는 agent knowledgebase 플랫폼입니다.",
+                "AKB는 agent knowledge base 플랫폼입니다.",
                 "오늘 점심은 김치찌개입니다.",
                 "AKB 검색은 하이브리드와 RRF 융합을 씁니다.",
             ],

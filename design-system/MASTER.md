@@ -136,7 +136,7 @@ Use for any page chrome bar:
 ```jsx
 <div className="border-b border-border">
   <div className="mx-auto flex max-w-[1400px] justify-between px-6 py-1">
-    <div className="coord">§ AKB · Agent Knowledgebase</div>
+    <div className="coord">§ AKB · Agent Knowledge Base</div>
     <div className="coord">v1.0</div>
   </div>
 </div>

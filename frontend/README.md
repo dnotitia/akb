@@ -1,7 +1,7 @@
 # AKB Frontend
 
 React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4. The web UI for
-[AKB](../README.md), the agent knowledgebase.
+[AKB](../README.md), the agent knowledge base.
 
 ## Scripts
 

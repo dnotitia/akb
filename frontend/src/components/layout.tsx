@@ -102,7 +102,7 @@ export function Layout() {
         {/* Coordinate strip */}
         <div className="border-b border-border">
           <div className="mx-auto flex max-w-[1400px] items-center justify-between gap-3 px-6 py-1">
-            <div className="coord">§ AKB · Agent Knowledgebase</div>
+            <div className="coord">§ AKB · Agent Knowledge Base</div>
             <div className="flex items-center gap-3">
               <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
               <div className="coord hidden md:block">
@@ -222,7 +222,7 @@ export function Layout() {
         <footer className="border-t border-border mt-16">
           <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 py-2">
             <div className="coord">© Dnotitia / Seahorse</div>
-            <div className="coord hidden md:block">AGENT KNOWLEDGEBASE</div>
+            <div className="coord hidden md:block">AGENT KNOWLEDGE BASE</div>
             <div className="coord">v1.0</div>
           </div>
         </footer>

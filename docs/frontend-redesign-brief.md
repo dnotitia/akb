@@ -28,7 +28,7 @@
 
 ## 0. 한눈에 보기
 
-**AKB (Agent Knowledgebase)** — Confluence/Notion을 대체하는 **Git 네이티브 + RAG + MCP 퍼스트** 조직 메모리.
+**AKB (Agent Knowledge Base)** — Confluence/Notion을 대체하는 **Git 네이티브 + RAG + MCP 퍼스트** 조직 메모리.
 
 - **두 종류 사용자**: (1) **사람** — 웹 UI / (2) **AI 에이전트** — MCP 스트리밍 HTTP
 - **세 종류 콘텐츠**: **Document (Markdown)**, **Table (구조화 데이터, 실제 PG 테이블)**, **File (바이너리, S3)** — 모두 하나의 검색 인덱스에 공존

@@ -123,7 +123,7 @@ export default function AuthPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const title = useTyped("Agent Knowledgebase", 60);
+  const title = useTyped("Agent Knowledge Base", 60);
   const subText =
     "A unified base for AI agents — documents, tables, and files under one structured root.";
   const sub = useTypingLoop(subText, {
@@ -250,7 +250,7 @@ export default function AuthPage() {
         <div className="tw-marquee-track py-1.5 coord">
           {Array.from({ length: 16 }).map((_, i) => (
             <span key={i} className="px-6">
-              § AKB · A knowledgebase for agents · Documents / Tables / Files · MCP · Git · Dnotitia · Seahorse ·
+              § AKB · A knowledge base for agents · Documents / Tables / Files · MCP · Git · Dnotitia · Seahorse ·
             </span>
           ))}
         </div>

@@ -93,7 +93,7 @@ export default function PublicationPage() {
             <span className="font-display text-3xl leading-none tracking-tight group-hover:text-accent transition-colors">
               AKB
             </span>
-            <span className="coord hidden sm:inline">/ knowledgebase</span>
+            <span className="coord hidden sm:inline">/ knowledge base</span>
           </a>
           <div className="flex items-center gap-3">
             <Badge variant="spark">PUBLIC</Badge>
