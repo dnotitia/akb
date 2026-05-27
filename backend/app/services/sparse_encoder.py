@@ -437,110 +437,131 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
 # ── Corpus stats recompute ────────────────────────────────────────
 
 
+_BM25_RECOMPUTE_LOCK_KEY = 987654321
+
+
 async def recompute_stats(batch_size: int = 500) -> dict:
     """Rebuild df (per term) and (total_docs, avgdl). Safe to run repeatedly.
 
     Streams chunks in keyset-paginated batches to keep memory bounded even
     on large corpora.
+
+    Held under a session-scoped PG advisory lock for the duration of the
+    scan AND write. Without this, two replicas would each spend minutes
+    tokenizing the corpus and then race on the final UPDATE — wasting
+    CPU and letting the loser overwrite newer counts with older ones.
+    `pg_try_advisory_lock` makes the loser bail out cheaply instead of
+    waiting for the leader to finish.
     """
     pool = await get_pool()
     tname, tver = tokenizer_info()
 
-    total_docs = 0
-    total_length = 0
-    df_counts: Counter[str] = Counter()
-
-    last_id = None
-    while True:
-        async with pool.acquire() as conn:
-            if last_id is None:
-                rows = await conn.fetch(
-                    "SELECT id, content FROM chunks WHERE content IS NOT NULL "
-                    "ORDER BY id LIMIT $1",
-                    batch_size,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, content FROM chunks WHERE content IS NOT NULL AND id > $1 "
-                    "ORDER BY id LIMIT $2",
-                    last_id, batch_size,
-                )
-        if not rows:
-            break
-        for r in rows:
-            last_id = r["id"]
-            toks = await tokenize(r["content"] or "")
-            if not toks:
-                continue
-            total_docs += 1
-            total_length += len(toks)
-            for term in set(toks):
-                df_counts[term] += 1
-
-    avgdl = (total_length / total_docs) if total_docs else 0.0
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            # Cross-pod serialization. Two replicas (or a manual operator
-            # invocation racing the periodic refresher) running recompute
-            # in parallel would both zero `bm25_vocab.df` and then race on
-            # the UPDATE — whichever commits last wins, but the corpus
-            # they each scanned may have drifted, so the loser overwrites
-            # newer counts with older ones. A transaction-scoped
-            # PG advisory lock serializes the rebuild; the key is an
-            # arbitrary constant unique to this routine.
-            await conn.execute("SELECT pg_advisory_xact_lock(987654321)")
-            # Ensure all encountered terms have vocab ids. Assign in one batch.
-            if df_counts:
-                await conn.execute(
-                    """
-                    INSERT INTO bm25_vocab (term, term_id)
-                    SELECT t, nextval('bm25_term_id_seq')
-                      FROM unnest($1::text[]) AS t
-                    ON CONFLICT (term) DO NOTHING
-                    """,
-                    list(df_counts.keys()),
-                )
-
-            # Two-step reset: (1) zero every row, (2) set counts for present
-            # terms from a single unnest. Replaces a full-table UPDATE + N
-            # executemany (one round-trip per term) with exactly two queries.
-            await conn.execute("UPDATE bm25_vocab SET df = 0, updated_at = NOW()")
-            if df_counts:
-                terms, counts = zip(*df_counts.items())
-                await conn.execute(
-                    """
-                    UPDATE bm25_vocab v
-                       SET df = c.cnt,
-                           updated_at = NOW()
-                      FROM unnest($1::text[], $2::bigint[]) AS c(term, cnt)
-                     WHERE v.term = c.term
-                    """,
-                    list(terms), list(counts),
-                )
-
-            await conn.execute(
-                """
-                UPDATE bm25_stats
-                   SET total_docs = $1,
-                       avgdl = $2,
-                       tokenizer_name = $3,
-                       tokenizer_version = $4,
-                       updated_at = NOW()
-                 WHERE id = 1
-                """,
-                total_docs, avgdl, tname, tver,
+    # Hold one connection for the whole call so the session-scoped
+    # advisory lock outlives every batch SELECT. Releasing on conn close.
+    async with pool.acquire() as lock_conn:
+        got = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)", _BM25_RECOMPUTE_LOCK_KEY
+        )
+        if not got:
+            logger.info(
+                "BM25 recompute skipped: another replica holds the lock"
             )
+            return {
+                "total_docs": None,
+                "avgdl": None,
+                "vocab_size": None,
+                "tokenizer": f"{tname}@{tver}",
+                "skipped": True,
+            }
+        try:
+            total_docs = 0
+            total_length = 0
+            df_counts: Counter[str] = Counter()
 
-    _invalidate_stats_cache()
-    logger.info("BM25 stats recomputed: total_docs=%d avgdl=%.2f vocab_size=%d",
-                total_docs, avgdl, len(df_counts))
-    return {
-        "total_docs": total_docs,
-        "avgdl": avgdl,
-        "vocab_size": len(df_counts),
-        "tokenizer": f"{tname}@{tver}",
-    }
+            last_id = None
+            while True:
+                if last_id is None:
+                    rows = await lock_conn.fetch(
+                        "SELECT id, content FROM chunks WHERE content IS NOT NULL "
+                        "ORDER BY id LIMIT $1",
+                        batch_size,
+                    )
+                else:
+                    rows = await lock_conn.fetch(
+                        "SELECT id, content FROM chunks WHERE content IS NOT NULL AND id > $1 "
+                        "ORDER BY id LIMIT $2",
+                        last_id, batch_size,
+                    )
+                if not rows:
+                    break
+                for r in rows:
+                    last_id = r["id"]
+                    toks = await tokenize(r["content"] or "")
+                    if not toks:
+                        continue
+                    total_docs += 1
+                    total_length += len(toks)
+                    for term in set(toks):
+                        df_counts[term] += 1
+
+            avgdl = (total_length / total_docs) if total_docs else 0.0
+
+            async with lock_conn.transaction():
+                # Ensure all encountered terms have vocab ids. Assign in one batch.
+                if df_counts:
+                    await lock_conn.execute(
+                        """
+                        INSERT INTO bm25_vocab (term, term_id)
+                        SELECT t, nextval('bm25_term_id_seq')
+                          FROM unnest($1::text[]) AS t
+                        ON CONFLICT (term) DO NOTHING
+                        """,
+                        list(df_counts.keys()),
+                    )
+
+                # Two-step reset: (1) zero every row, (2) set counts for present
+                # terms from a single unnest. Replaces a full-table UPDATE + N
+                # executemany (one round-trip per term) with exactly two queries.
+                await lock_conn.execute("UPDATE bm25_vocab SET df = 0, updated_at = NOW()")
+                if df_counts:
+                    terms, counts = zip(*df_counts.items())
+                    await lock_conn.execute(
+                        """
+                        UPDATE bm25_vocab v
+                           SET df = c.cnt,
+                               updated_at = NOW()
+                          FROM unnest($1::text[], $2::bigint[]) AS c(term, cnt)
+                         WHERE v.term = c.term
+                        """,
+                        list(terms), list(counts),
+                    )
+
+                await lock_conn.execute(
+                    """
+                    UPDATE bm25_stats
+                       SET total_docs = $1,
+                           avgdl = $2,
+                           tokenizer_name = $3,
+                           tokenizer_version = $4,
+                           updated_at = NOW()
+                     WHERE id = 1
+                    """,
+                    total_docs, avgdl, tname, tver,
+                )
+
+            _invalidate_stats_cache()
+            logger.info("BM25 stats recomputed: total_docs=%d avgdl=%.2f vocab_size=%d",
+                        total_docs, avgdl, len(df_counts))
+            return {
+                "total_docs": total_docs,
+                "avgdl": avgdl,
+                "vocab_size": len(df_counts),
+                "tokenizer": f"{tname}@{tver}",
+            }
+        finally:
+            await lock_conn.execute(
+                "SELECT pg_advisory_unlock($1)", _BM25_RECOMPUTE_LOCK_KEY
+            )
 
 
 async def vocab_size() -> int:

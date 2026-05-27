@@ -1027,7 +1027,12 @@ class DocumentService:
                 # display string and must not embed the file UUID.
                 path=(f"{r.get('collection')}/{r['name']}" if r.get("collection") else r["name"]),
                 type="file",
-                uri=file_uri(vault, str(r["id"])),
+                # Pass collection so the URI takes 0.3.0 canonical form
+                # akb://V/coll/<path>/file/<uuid> instead of root-form
+                # akb://V/file/<uuid>. Without this, browse → akb_link
+                # round-trips re-pollute the edges table with non-canonical
+                # URIs that migration 026 already cleaned up.
+                uri=file_uri(vault, str(r["id"]), collection=r.get("collection")),
                 mime_type=r["mime_type"],
                 size_bytes=r["size_bytes"], summary=r["description"],
                 collection=r.get("collection"),

@@ -19,6 +19,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.util.git_refs import HEX_COMMIT_RE
+
 # Add backend to path so we can import app modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -298,6 +300,13 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
     if version:
+        if not HEX_COMMIT_RE.fullmatch(version):
+            return {
+                "error": (
+                    "version must be a 7-64 char lowercase hex commit hash; "
+                    "symbolic refs (HEAD~N, refs/heads/main, ...) are not accepted"
+                )
+            }
         # Read specific version from Git. Strip frontmatter (yaml meta
         # block at top) before returning content — the un-versioned
         # akb_get path does the same via doc_service.get, and any
@@ -655,12 +664,20 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
 async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
+    commit = args.get("commit", "")
+    if not HEX_COMMIT_RE.fullmatch(commit):
+        return {
+            "error": (
+                "commit must be a 7-64 char lowercase hex hash; "
+                "symbolic refs are not accepted"
+            )
+        }
     doc = await _find_doc(vault, doc_path)
     if not doc:
         return {"error": f"Document not found: {args['uri']}"}
     from app.services.git_service import GitService
     git = GitService()
-    return git.file_diff(vault, doc["path"], args["commit"])
+    return git.file_diff(vault, doc["path"], commit)
 
 
 @_h("akb_relations")
@@ -736,10 +753,11 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
     if src_parsed.vault != tgt_parsed.vault:
         return {"error": "source and target must belong to the same vault"}
     vault = src_parsed.vault
-    await check_vault_access(uid, vault, required_role="writer")
+    access = await check_vault_access(uid, vault, required_role="writer")
     return await unlink_resources(
         args["source"], args["target"],
         relation_type=args.get("relation"),
+        vault_id=access["vault_id"],
     )
 
 

@@ -364,13 +364,19 @@ class DocumentRepository:
         doc_type: str | None,
         domain: str | None,
         now: datetime,
-    ) -> None:
+        expected_blob: str | None = None,
+    ) -> bool:
         """Apply LLM-generated metadata, but only into NULL/empty fields
         so that frontmatter-provided values always win.
+
+        When `expected_blob` is passed, the UPDATE is gated on
+        `external_blob = expected_blob`. The external_git reconciler can
+        reindex a path between worker claim and worker write — without
+        the predicate the worker would stamp stale LLM output onto a row
+        whose body is already newer. Returns True iff the row matched.
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
+            sql = """
                 UPDATE documents SET
                     summary  = COALESCE(NULLIF(summary, ''), $2, summary),
                     tags     = CASE
@@ -382,9 +388,13 @@ class DocumentRepository:
                     llm_metadata_at = $6,
                     updated_at = $6
                 WHERE id = $1
-                """,
-                doc_id, summary, tags, doc_type, domain, now,
-            )
+            """
+            args: list = [doc_id, summary, tags, doc_type, domain, now]
+            if expected_blob is not None:
+                sql += " AND external_blob = $7"
+                args.append(expected_blob)
+            status = await conn.execute(sql, *args)
+        return status.endswith(" 1")
 
 
 class CollectionRepository:
@@ -394,9 +404,7 @@ class CollectionRepository:
     async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
         async def _do(c):
             # ON CONFLICT handles the SELECT-then-INSERT race where two
-            # concurrent PUTs both find no row and both INSERT. Pre-fix
-            # the loser raised UniqueViolationError → 500.
-            cid = uuid.uuid4()
+            # concurrent PUTs both find no row and both INSERT.
             name = path.rstrip("/").split("/")[-1]
             row = await c.fetchrow(
                 """
@@ -405,7 +413,7 @@ class CollectionRepository:
                 ON CONFLICT (vault_id, path) DO NOTHING
                 RETURNING id
                 """,
-                cid, vault_id, path, name,
+                uuid.uuid4(), vault_id, path, name,
             )
             if row:
                 return row["id"]
@@ -413,6 +421,11 @@ class CollectionRepository:
                 "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
                 vault_id, path,
             )
+            if existing is None:
+                raise RuntimeError(
+                    f"collection {path!r} could not be created or found "
+                    f"in vault {vault_id} (concurrent delete?)"
+                )
             return existing["id"]
         if conn is not None:
             return await _do(conn)

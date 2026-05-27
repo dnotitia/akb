@@ -237,9 +237,21 @@ async def _reap_abandoned_chunks_once() -> int:
                      FOR UPDATE SKIP LOCKED
                 ),
                 enqueued AS (
+                    -- Guard against duplicate outbox rows for the same
+                    -- chunk_id. `_drop_source_chunks_with_outbox` can run
+                    -- concurrently with reap on the same chunk_id (e.g.
+                    -- an explicit doc delete arrives while we're reaping
+                    -- abandoned chunks); the FOR UPDATE serializes the
+                    -- chunks DELETE but does not serialize the outbox
+                    -- INSERT, so both would otherwise enqueue the same
+                    -- chunk_id.
                     INSERT INTO vector_delete_outbox
                         (chunk_id, source_type, source_id, next_attempt_at)
-                    SELECT id, source_type, source_id, NOW() FROM abandoned
+                    SELECT a.id, a.source_type, a.source_id, NOW() FROM abandoned a
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM vector_delete_outbox o
+                         WHERE o.chunk_id = a.id AND o.processed_at IS NULL
+                    )
                     RETURNING 1
                 ),
                 deleted AS (

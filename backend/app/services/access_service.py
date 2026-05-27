@@ -783,7 +783,12 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             return {"error": f"Vault not found: {vault_name}"}
         vault_id = vault["id"]
 
-        # Delete S3 files before DB cascade removes vault_files records.
+        # Delete S3 files BEFORE the DB cascade — this part cannot be
+        # transactional with PG (S3 is out-of-band), so we accept the
+        # narrow "S3 gone but DB rolled back" recovery window. Everything
+        # PG-side runs inside the transaction below so a mid-flight crash
+        # never leaves the vault with phantom vt_* tables or registry
+        # rows pointing at dropped physical tables.
         file_rows = await conn.fetch("SELECT s3_key FROM vault_files WHERE vault_id = $1", vault_id)
         if file_rows and settings.s3_endpoint_url:
             from app.services.adapters import s3_adapter
@@ -796,23 +801,38 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                     logger.warning("Failed to delete S3 object %s: %s", fr["s3_key"], e)
             if failed:
                 logger.error("Vault %s: %d/%d S3 files failed to delete", vault_name, len(failed), len(file_rows))
-            await conn.execute("DELETE FROM vault_files WHERE vault_id = $1", vault_id)
 
-        await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
-        await delete_vault_chunks(conn, vault_id)
+        async with conn.transaction():
+            if file_rows and settings.s3_endpoint_url:
+                await conn.execute("DELETE FROM vault_files WHERE vault_id = $1", vault_id)
 
-        vtables = await conn.fetch("SELECT name FROM vault_tables WHERE vault_id = $1", vault_id)
-        for vt in vtables:
-            pg_name = table_data_repo.pg_table_name(vault_name, vt["name"])
-            await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
-        await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
+            await delete_vault_chunks(conn, vault_id)
 
-        await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
-        await conn.execute("DELETE FROM sessions WHERE vault_id = $1", vault_id)
-        await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
-        await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
-        await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
-        await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+            # Drop table metadata chunks BEFORE the registry DELETE so the
+            # outbox is enqueued against the still-extant source_id.
+            # delete_vault_chunks only handles source_type='document';
+            # tables/files need explicit cleanup because chunks.source_id
+            # has no FK (polymorphic source) and would orphan otherwise.
+            from app.services.index_service import _drop_source_chunks_with_outbox
+            vtables = await conn.fetch(
+                "SELECT id, name FROM vault_tables WHERE vault_id = $1",
+                vault_id,
+            )
+            for vt in vtables:
+                await _drop_source_chunks_with_outbox(
+                    conn, "table", str(vt["id"]),
+                )
+                pg_name = table_data_repo.pg_table_name(vault_name, vt["name"])
+                await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
+            await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
+
+            await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM sessions WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
+            await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
 
     # On-disk cleanup: bare repo + persistent worktree. Both must go,
     # otherwise a same-named recreate hits stale state on its second
