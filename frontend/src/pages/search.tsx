@@ -27,13 +27,17 @@ type DocTypeFilter = (typeof ALL_TYPES)[number];
 
 interface DenseResult {
   source_type?: SourceType;
-  // Canonical handle — `akb://{vault}/{doc|table|file}/{identifier}`.
-  // Backend dropped the legacy `source_id`/`doc_id`/`file_id` shape;
+  // Canonical handle. As of backend 0.3.0 the form is
+  // `akb://{vault}[/coll/{coll_path}]/{doc|table|file}/{identifier}` —
   // routing decisions here parse the URI tail.
   uri: string;
   vault: string;
   path: string;
   title: string;
+  // Containing-collection path (null at vault root). Surfaced
+  // explicitly by backend 0.3.0 so clients group/filter hits
+  // without parsing the URI themselves.
+  collection?: string | null;
   doc_type?: string;
   summary?: string;
   matched_section?: string;
@@ -543,7 +547,9 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                   {r.doc_type && <Badge variant="outline">{r.doc_type}</Badge>}
                 </div>
                 <div className="coord mt-0.5">
-                  {r.vault} / {r.path}
+                  {r.vault}
+                  {r.collection && <> · <span className="text-accent/80">{r.collection}</span></>}
+                  {" / "}{r.path}
                 </div>
                 {r.summary && (
                   <p className="text-sm text-foreground-muted mt-2 line-clamp-2">

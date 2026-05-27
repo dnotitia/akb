@@ -125,8 +125,21 @@ The full tool catalogue is exposed via `akb_help()` from any MCP client.
 
 ## Document Format
 
-Documents are addressed by URI — `akb://{vault}/{path}` is the canonical
-handle used by every tool and stored in relations.
+Every vault resource has a location-aware AKB URI — the canonical handle
+used by every tool and stored in relations. As of 0.3.0:
+
+```
+akb://{vault}                                          vault root (browse target)
+akb://{vault}/coll/{coll_path}                         collection (browse target)
+akb://{vault}[/coll/{coll_path}]/doc/{filename}        document
+akb://{vault}[/coll/{coll_path}]/table/{name}          table
+akb://{vault}[/coll/{coll_path}]/file/{uuid}           file
+```
+
+The `/coll/{coll_path}` segment is omitted for resources at the vault
+root. Walking up a URI to its parent collection is a pure string
+operation — paste the parent into `akb_browse(uri=...)` to list
+siblings without an extra lookup.
 
 ```yaml
 ---
@@ -136,8 +149,8 @@ status: active          # draft | active | archived | superseded
 tags: [payments, api]
 domain: engineering
 summary: "REST → gRPC transition plan."
-depends_on: ["akb://eng/specs/payment-api-v2"]
-related_to: ["akb://eng/meetings/2026-05-01-payments"]
+depends_on: ["akb://eng/coll/specs/doc/payment-api-v2.md"]
+related_to: ["akb://eng/coll/meetings/doc/2026-05-01-payments.md"]
 ---
 
 # Payment API v2 migration plan
