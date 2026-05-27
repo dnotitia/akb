@@ -111,6 +111,7 @@ async def _apply_migrations() -> None:
         "024_tokens_revoked_before.py",         # users.tokens_revoked_before for JWT revocation (default epoch — pre-existing JWTs unaffected)
         "025_drop_phantom_root_collection.py",  # drop path='' collection rows that legacy put() created when collection was omitted (issues #81/#82)
         "026_uri_collection_prefix.py",         # rewrite edges/publications/events URIs to 0.3.0 canonical (akb://V[/coll/<path>]/<type>/<id>)
+        "027_collection_path_reserved_segments.py",  # WARN about pre-existing collection paths whose segments collide with URI structural markers (coll/doc/table/file)
     ):
         module = _load_migration(filename)
         if module is None:

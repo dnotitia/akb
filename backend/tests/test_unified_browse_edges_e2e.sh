@@ -967,6 +967,46 @@ print(int(ok))
 mcp_call akb_delete "{\"uri\":\"$PH_URI\"}" >/dev/null 2>&1
 mcp_call akb_delete "{\"uri\":\"$COLL_DEP_URI\"}" >/dev/null 2>&1
 
+# ── 29. Reserved collection segments (URI grammar safety) ──────
+#
+# The 0.3.0 URI grammar `akb://V/coll/<coll_path>/<type>/<id>` puts the
+# four type words (coll / doc / table / file) in fixed structural
+# positions. A collection whose path contains one of those words as a
+# MIDDLE segment produces a URI the parser then mis-classifies as a
+# typed-resource URI — e.g. coll path "frontend/file/X" emits
+# `akb://V/coll/frontend/file/X` which `parse_uri` reads as
+# (coll="frontend", type=file, id="X"). Round-trip broken.
+#
+# Fix: `normalize_collection_path` rejects reserved segments at the
+# input layer. These cases lock that down.
+echo ""
+echo "▸ 29. Reserved collection segments (URI grammar safety)"
+
+for seg in coll doc table file; do
+  # As the only segment
+  R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"$seg\"}" | mcp_result)
+  REJECTED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'reserved' in d.get('error','').lower() or 'Invalid' in d.get('error',''))" 2>/dev/null)
+  [ "$REJECTED" = "True" ] && pass "akb_create_collection(path='$seg'): rejected" || fail "Reserved '$seg' alone" "$R"
+
+  # As a middle segment — the case that actually breaks URI round-trip
+  R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"frontend/$seg/X\"}" | mcp_result)
+  REJECTED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'reserved' in d.get('error','').lower() or 'Invalid' in d.get('error',''))" 2>/dev/null)
+  [ "$REJECTED" = "True" ] && pass "akb_create_collection(path='frontend/$seg/X'): rejected" || fail "Reserved '$seg' middle" "$R"
+done
+
+# akb_put with a reserved segment in its collection arg also blocked
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"X/doc/y\",\"title\":\"x\",\"content\":\"y\",\"type\":\"note\"}" | mcp_result)
+PUT_REJECT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'reserved' in d.get('error','').lower() or 'Invalid' in d.get('error',''))" 2>/dev/null)
+[ "$PUT_REJECT" = "True" ] && pass "akb_put(collection='X/doc/y'): rejected (same normalizer)" || fail "Put with reserved coll" "$R"
+
+# Sanity — paths that look similar but are NOT reserved still succeed
+# ("docs" plural, etc.). Confirms exact-segment match.
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"docs/api\"}" | mcp_result)
+CREATED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d)" 2>/dev/null)
+[ "$CREATED" = "True" ] && pass "akb_create_collection(path='docs/api'): allowed (plural — not reserved)" || fail "Plural docs" "$R"
+mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs/api\"}" >/dev/null 2>&1
+mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" >/dev/null 2>&1
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
