@@ -338,6 +338,63 @@ HIST_BODY=$(curl -sk -H "$H_AUTH" "$BASE_URL/api/v1/documents/$V17/specs/e-doc.m
 [ "$HEAD_BODY" = "$HIST_BODY" ] && pass "T17 EDIT race convergent" || fail "T17 EDIT race" "diverged"
 rm -rf "$TMP"
 
+# ─────────────────────────────────────────────────────────────────
+echo ""
+echo "▸ T18: DELETE + concurrent GET returns bodyful 200 or 404"
+V18="v18-$TS"; mkvault "$V18"
+MARKER="DeleteRaceMarker-$TS"
+putdoc "$V18" "delete-race" "$MARKER" >/dev/null
+TMP=$(mktemp -d)
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  ( curl -sk -o "$TMP/body$i" -w '%{http_code}' \
+      -H "$H_AUTH" "$BASE_URL/api/v1/documents/$V18/specs/delete-race.md" \
+      > "$TMP/code$i" 2>/dev/null ) &
+done
+( curl -sk -X DELETE "$BASE_URL/api/v1/documents/$V18/specs/delete-race.md" \
+    -H "$H_AUTH" -o "$TMP/delete_body" -w '%{http_code}' \
+    > "$TMP/delete_code" 2>/dev/null ) &
+wait
+
+DEL_CODE=$(cat "$TMP/delete_code" 2>/dev/null || echo "000")
+BAD_200=0
+UNEXPECTED=0
+OK_200=0
+OK_404=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  CODE=$(cat "$TMP/code$i" 2>/dev/null || echo "000")
+  case "$CODE" in
+    200)
+      HAS_MARKER=$(python3 -c 'import json,sys
+marker=sys.argv[1]
+path=sys.argv[2]
+try:
+    with open(path) as f:
+        doc=json.load(f)
+    print(marker in str(doc.get("content", "")))
+except Exception:
+    print(False)' "$MARKER" "$TMP/body$i")
+      if [ "$HAS_MARKER" = "True" ]; then
+        OK_200=$((OK_200+1))
+      else
+        BAD_200=$((BAD_200+1))
+      fi
+      ;;
+    404)
+      OK_404=$((OK_404+1))
+      ;;
+    *)
+      UNEXPECTED=$((UNEXPECTED+1))
+      ;;
+  esac
+done
+
+if [ "$DEL_CODE" = "200" ] && [ "$BAD_200" = "0" ] && [ "$UNEXPECTED" = "0" ]; then
+  pass "T18 delete/read race: 200 responses include body or return 404 (200=$OK_200 404=$OK_404)"
+else
+  fail "T18 delete/read race" "delete=$DEL_CODE bad_200=$BAD_200 unexpected=$UNEXPECTED 200=$OK_200 404=$OK_404"
+fi
+rm -rf "$TMP"
+
 echo ""
 echo "═══════════════════════════════════════════"
 echo "Results: $PASS passed, $FAIL failed"
