@@ -7,6 +7,44 @@ specifically; the proxy has its own log in
 
 ## 0.3.0 — 2026-05-27
 
+### Follow-up patch: edge-extraction safety (PR #85, 2026-05-26)
+
+Found during the on-prem verification of 0.3.0. Two paired contract
+gaps the URI scheme refactor exposed, both surfacing as a
+`edges_target_type_check` violation when something `parse_uri`
+considers valid makes it past `kg_service` into the INSERT:
+
+- **Markdown body containing URI template placeholders** — a doc
+  whose body documents the URI scheme as
+  `akb://{vault}/coll/{coll_path}/{type}/{id}` (curly braces literal
+  in the text) tripped `extract_markdown_links` into treating the
+  template string as a real edge target. `parse_uri` happily
+  matched `{vault}` as the vault segment, `{coll_path}` as the coll
+  path, etc.
+- **Doc with `depends_on: [coll-URI]` or `akb_link(target=coll-URI)`** —
+  collections are URI-citizens as of 0.3.0, but they are *navigation
+  aids*, not link endpoints. The `edges.target_type` CHECK constraint
+  enforces this at the DB layer (`doc | table | file` only); without
+  a surface filter the constraint was reachable as a Postgres failure.
+
+Fix is three lines in three files:
+
+- `uri_service.parse_uri`: reject any URI containing `{` or `}`.
+  Real AKB URIs never carry braces; this stops the placeholder
+  hijack before regex runs.
+- `kg_service._store_edge`: explicit
+  `parsed.kind in ('doc','table','file')` gate. coll/vault URIs
+  silent-skip with a DEBUG log.
+- `kg_service.link_resources`: same gate, but with a friendly
+  user-facing error so explicit `akb_link` callers get a clear
+  4xx-style message instead of a Postgres failure.
+
+E2E `§28` of `test_unified_browse_edges_e2e.sh` locks down all
+three failure modes (placeholder body, coll-URI depends_on,
+akb_link rejection). 401/401 across the full sweep.
+
+### 0.3.0 main release
+
 **BREAKING** — a coordinated contract pass that takes the AKB API
 from "mostly consistent with quiet gaps" to "every surface tells the
 same story":

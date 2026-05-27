@@ -43,7 +43,12 @@ interface DenseResult {
 function resultHref(r: DenseResult): string {
   const type = r.source_type || "document";
   if (type === "table") {
-    const name = (r.path || "").replace(/^_tables\//, "") || r.title;
+    // 0.3.0+: backend emits `path` as the bare table name (the
+    // pre-0.3.0 synthetic `_tables/<name>` prefix was removed
+    // because the `type`+`uri` fields already disambiguate kind).
+    // Fall back to `r.title` for ancient cached responses that
+    // might still carry the legacy shape.
+    const name = r.path || r.title;
     return `/vault/${r.vault}/table/${encodeURIComponent(name)}`;
   }
   const parsed = parseUri(r.uri);
