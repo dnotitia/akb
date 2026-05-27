@@ -134,7 +134,7 @@ async def build_table_name_map(conn, vault_names: list[str]) -> dict[str, str]:
 # Naive regex rewriting (`re.sub(r"\bname\b", ..., flags=IGNORECASE)`)
 # matched inside single-quoted strings, double-quoted identifiers,
 # comments, and column aliases — silently corrupting query results
-# (audit-v2 B-F9). The tokenizer makes the rewrite scope-aware:
+#. The tokenizer makes the rewrite scope-aware:
 # strings/comments/quoted-idents pass through untouched.
 _SQL_TOKEN_RE = re.compile(
     r"""

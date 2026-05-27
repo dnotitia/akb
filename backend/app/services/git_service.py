@@ -802,7 +802,7 @@ class GitService:
         Mirrors read_file's defensive `BadName/BadObject` catch so an
         unknown / malformed commit hash surfaces as a clean
         ``{"type":"unknown"}`` response rather than propagating as an
-        unhandled 500 (audit-v2 F-F2).
+        unhandled 500.
         """
         from git.exc import BadName, BadObject
         repo = self._get_repo(vault_name)

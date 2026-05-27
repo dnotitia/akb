@@ -14,18 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
-# Git commit hashes only — same regex the REST layer (documents.py)
-# applies to ?version=. MCP must validate too: pre-fix, an MCP caller
-# could send version="HEAD~1" / "refs/heads/main" / "@~5" and have it
-# resolved by GitPython, leaking historical content the REST trust
-# boundary rejects (audit-v2 F-F2).
-_HEX_COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+from app.util.git_refs import HEX_COMMIT_RE
 
 # Add backend to path so we can import app modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -306,7 +300,7 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
     if version:
-        if not _HEX_COMMIT_RE.fullmatch(version):
+        if not HEX_COMMIT_RE.fullmatch(version):
             return {
                 "error": (
                     "version must be a 7-64 char lowercase hex commit hash; "
@@ -671,7 +665,7 @@ async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
     commit = args.get("commit", "")
-    if not _HEX_COMMIT_RE.fullmatch(commit):
+    if not HEX_COMMIT_RE.fullmatch(commit):
         return {
             "error": (
                 "commit must be a 7-64 char lowercase hex hash; "

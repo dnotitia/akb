@@ -478,7 +478,7 @@ class RoleSync:
         :meth:`grant_table_in_conn` from inside the caller's TX so the
         grant commits atomically with the CREATE TABLE — pre-fix, this
         path ran post-commit and left a window where the table existed
-        but akb_sql callers got 42501 (audit-v2 B-F7)."""
+        but akb_sql callers got 42501."""
         if not _is_safe_pg_table_name(pg_table_name):
             logger.error("on_table_create: unsafe pg_table_name %r — refusing", pg_table_name)
             self.metrics.record_failure("on_table_create")

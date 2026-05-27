@@ -788,7 +788,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
         # narrow "S3 gone but DB rolled back" recovery window. Everything
         # PG-side runs inside the transaction below so a mid-flight crash
         # never leaves the vault with phantom vt_* tables or registry
-        # rows pointing at dropped physical tables (audit-v2 B-F3).
+        # rows pointing at dropped physical tables.
         file_rows = await conn.fetch("SELECT s3_key FROM vault_files WHERE vault_id = $1", vault_id)
         if file_rows and settings.s3_endpoint_url:
             from app.services.adapters import s3_adapter
@@ -810,12 +810,10 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             await delete_vault_chunks(conn, vault_id)
 
             # Drop table metadata chunks BEFORE the registry DELETE so the
-            # chunk outbox is enqueued against the still-extant source_id.
-            # `delete_vault_chunks` only handles source_type='document';
-            # tables (and files) need explicit per-source cleanup because
-            # chunks.source_id has no PG FK (polymorphic source) — pre-fix
-            # this left orphan vector entries for every dropped table
-            # (audit-v2 B-F8).
+            # outbox is enqueued against the still-extant source_id.
+            # delete_vault_chunks only handles source_type='document';
+            # tables/files need explicit cleanup because chunks.source_id
+            # has no FK (polymorphic source) and would orphan otherwise.
             from app.services.index_service import _drop_source_chunks_with_outbox
             vtables = await conn.fetch(
                 "SELECT id, name FROM vault_tables WHERE vault_id = $1",

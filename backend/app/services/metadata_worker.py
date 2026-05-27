@@ -197,13 +197,18 @@ async def _process_once() -> int:
         )
         if applied:
             succeeded += 1
-        else:
-            # external_git reconciler superseded the row while the LLM
-            # call was in flight. Drop the stale result; the next claim
-            # cycle re-fetches body for the new blob.
-            logger.info(
-                "metadata_worker: dropping stale result for doc=%s "
-                "(external_blob changed since claim)", doc_id,
+            continue
+        # external_git superseded the blob mid-call. Drop the stale
+        # output and clear the lookahead so the next tick reprocesses
+        # immediately instead of waiting external_git_claim_lookahead_secs.
+        logger.info(
+            "metadata_worker: dropping stale result for doc=%s "
+            "(external_blob changed since claim)", doc_id,
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE documents SET llm_next_attempt_at = NULL WHERE id = $1",
+                doc_id,
             )
 
     return succeeded

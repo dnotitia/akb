@@ -404,9 +404,7 @@ class CollectionRepository:
     async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
         async def _do(c):
             # ON CONFLICT handles the SELECT-then-INSERT race where two
-            # concurrent PUTs both find no row and both INSERT. Pre-fix
-            # the loser raised UniqueViolationError → 500.
-            cid = uuid.uuid4()
+            # concurrent PUTs both find no row and both INSERT.
             name = path.rstrip("/").split("/")[-1]
             row = await c.fetchrow(
                 """
@@ -415,7 +413,7 @@ class CollectionRepository:
                 ON CONFLICT (vault_id, path) DO NOTHING
                 RETURNING id
                 """,
-                cid, vault_id, path, name,
+                uuid.uuid4(), vault_id, path, name,
             )
             if row:
                 return row["id"]
@@ -424,31 +422,10 @@ class CollectionRepository:
                 vault_id, path,
             )
             if existing is None:
-                # ON CONFLICT DO NOTHING returned no row, AND the SELECT
-                # also finds nothing — the conflict winner committed and
-                # then deleted the row before our SELECT ran. Retry the
-                # full insert+select cycle once; if that also fails we
-                # surface the underlying state to the caller.
-                row = await c.fetchrow(
-                    """
-                    INSERT INTO collections (id, vault_id, path, name)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (vault_id, path) DO NOTHING
-                    RETURNING id
-                    """,
-                    uuid.uuid4(), vault_id, path, name,
+                raise RuntimeError(
+                    f"collection {path!r} could not be created or found "
+                    f"in vault {vault_id} (concurrent delete?)"
                 )
-                if row:
-                    return row["id"]
-                existing = await c.fetchrow(
-                    "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
-                    vault_id, path,
-                )
-                if existing is None:
-                    raise RuntimeError(
-                        f"collection {path!r} could not be created or found "
-                        "(concurrent delete race in vault {vault_id})"
-                    )
             return existing["id"]
         if conn is not None:
             return await _do(conn)

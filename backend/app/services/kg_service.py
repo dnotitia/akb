@@ -19,7 +19,7 @@ import re
 import uuid
 
 from app.db.postgres import get_pool
-from app.services.uri_service import parse_uri, doc_uri
+from app.services.uri_service import parse_uri, doc_uri, table_uri, file_uri
 
 logger = logging.getLogger("akb.graph")
 
@@ -85,11 +85,9 @@ async def store_document_relations(
     """
     source = doc_uri(vault_name, doc_path)
 
-    # Delete old IMPLICIT edges from this source — frontmatter+body markdown
-    # links are the source of truth for the implicit set, but explicit edges
-    # created via akb_link must survive this rewrite. Without the kind filter,
-    # every akb_update silently destroys every explicit edge from the doc
-    # (audit-v2 A-F1 — deterministic data loss, not a race).
+    # Delete only IMPLICIT edges — frontmatter+body links are the source
+    # of truth for those, but explicit (akb_link) edges must survive a
+    # rewrite. Without the kind filter every akb_update destroys them.
     await conn.execute(
         "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
         source,
@@ -185,7 +183,7 @@ async def link_resources(
     async with pool.acquire() as conn:
         async with conn.transaction():
             # All reads + INSERT inside one TX so a concurrent delete on
-            # either endpoint cannot leave a dangling edge (audit-v2 A-F2).
+            # either endpoint cannot leave a dangling edge.
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1", vault_name,
             )
@@ -255,7 +253,7 @@ async def unlink_resources(
     """Remove an edge between two resources.
 
     ``vault_id`` scopes the DELETE so a future caller can't accidentally
-    delete an edge from another vault by spelling its URIs (audit-v2 A-F9).
+    delete an edge from another vault by spelling its URIs.
     The MCP handler already gates by vault access, but the service-level
     interface now enforces it too.
     """
@@ -636,21 +634,16 @@ async def _store_edge(
             )
             return False
         target_type = parsed.kind
-        # Rebuild the URI from its parsed parts so two surface
-        # variants of the same target (extra slash, mixed-case vault,
-        # NFC vs NFD identifier) collapse to a single canonical row
-        # under the (vault_id, source_uri, target_uri, relation_type)
-        # uniqueness convention. Without this, dedup via
-        # ON CONFLICT DO NOTHING is defeated by string variance.
+        # Rebuild from parsed parts so surface variants (extra slash,
+        # coll prefix shape) of the same target collapse under the
+        # edges uniqueness convention — otherwise ON CONFLICT can't dedupe.
+        ident = parsed.identifier or ""
         if parsed.kind == "doc":
-            target_uri = doc_uri(parsed.vault, parsed.identifier or "")
+            target_uri = doc_uri(parsed.vault, ident)
+        elif parsed.kind == "table":
+            target_uri = table_uri(parsed.vault, ident, parsed.coll_path)
         else:
-            # table / file URIs already round-trip; use the parsed form
-            # so coll prefix and trailing slash variations collapse.
-            from app.services.uri_service import table_uri as _table_uri
-            from app.services.uri_service import file_uri as _file_uri
-            builder = _table_uri if parsed.kind == "table" else _file_uri
-            target_uri = builder(parsed.vault, parsed.identifier or "", parsed.coll_path)
+            target_uri = file_uri(parsed.vault, ident, parsed.coll_path)
     else:
         # Legacy: resolve as doc ref within the same vault
         target_id = await _resolve_doc_ref(conn, vault_id, target_ref)
@@ -736,7 +729,7 @@ async def _bfs_collect(
     queue = [start_uri]
     visited: set[str] = set()
     # Track emitted edges so an edge A→B doesn't appear twice when both
-    # A and B are processed in the same BFS wave (audit-v2 A-F7).
+    # A and B are processed in the same BFS wave.
     emitted: set[tuple[str, str, str]] = set()
 
     for current_depth in range(depth + 1):

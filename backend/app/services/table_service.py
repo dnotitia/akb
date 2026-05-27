@@ -101,12 +101,8 @@ async def create_table(
     `collections` row is auto-created via `CollectionRepository.get_or_create`
     if it doesn't exist yet.
     """
-    # Tables surface directly in akb_sql, so the user-visible name needs
-    # to be a clean PG identifier shape. The sanitiser in pg_table_name
-    # maps hyphens AND any other punctuation to underscores, so accepting
-    # both `mcp-items` and `mcp_items` would collide on the PG side.
-    # Allow only `[a-z0-9_]+` (underscore is the PG-native separator) to
-    # keep the sanitiser injective for valid inputs (audit-v2 B-F5).
+    # pg_table_name maps any punctuation to underscore — allowing hyphens
+    # would let `mcp-items` and `mcp_items` collide on the PG side.
     if not _TABLE_NAME_RE.fullmatch(name):
         raise ValueError(
             f"Invalid table name {name!r}: must match {_TABLE_NAME_RE.pattern}"
@@ -151,16 +147,11 @@ async def create_table(
                     collection_id=collection_id,
                 )
             except asyncpg.UniqueViolationError as e:
-                # Two concurrent create_table calls past the find_by_name
-                # check both hit the UNIQUE constraint (vault_tables) or
-                # the pg_type sysid for the dynamic table. Surface as a
-                # clean 409 rather than leaking raw PG error text to the
-                # caller (audit-v2 B-F1).
+                # Concurrent create past the find_by_name check races on
+                # UNIQUE(vault_tables) or pg_type. Surface as 409.
                 raise ConflictError(f"Table already exists: {name}") from e
-            # Grant PG RBAC inside the same TX so the table is callable
-            # via akb_sql the instant the create commits — pre-fix, the
-            # grant ran in a separate connection after the TX commit,
-            # leaving an "exists but 42501" window (audit-v2 B-F7).
+            # Grant inside the TX so akb_sql can address the table the
+            # instant the create commits (no "exists but 42501" window).
             await get_role_sync().grant_table_in_conn(conn, vault_id, pg_name)
             await emit_event(
                 conn, "table.create",
@@ -258,18 +249,12 @@ async def drop_table(
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
             await table_data_repo.drop_dynamic_table(conn, pg_name)
-            # Drop chunks + enqueue vector-store outbox in the SAME TX as
-            # the DDL/registry delete. Pre-fix this ran on a separate
-            # connection after the TX committed, so a crash between the
-            # two steps left orphan chunks (audit-v2 B-F2). Now it's
-            # atomic — the table either disappears completely or not at all.
+            # Chunks + vector outbox enqueue must commit with the DDL/registry
+            # delete so a crash mid-drop can't leave orphan chunks.
             from app.services.index_service import delete_table_chunks
             await delete_table_chunks(conn, str(table_id))
             await table_registry_repo.delete(conn, table_id)
 
-            # Clean up edges referencing this table — use the canonical
-            # URI helper so the location prefix matches what every
-            # other write site produces.
             t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
             await conn.execute(
                 "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
@@ -327,10 +312,8 @@ async def alter_table(
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
-            # FOR UPDATE on the registry row so two concurrent alter_table
-            # calls serialise their read-modify-write of vault_tables.columns
-            # (audit-v2 B-F4). Without this, concurrent alters could
-            # silently last-write-wins one of them.
+            # FOR UPDATE serialises concurrent alters' read-modify-write
+            # of vault_tables.columns — without it they last-write-wins.
             table = await conn.fetchrow(
                 """
                 SELECT * FROM vault_tables
@@ -393,9 +376,8 @@ async def alter_table(
                 },
             )
 
-    # Refresh the metadata chunk so search reflects the new schema
-    # (audit-v2 B-F4: pre-fix the chunk drifted permanently from the
-    # ALTER until the table was dropped and recreated).
+    # Refresh the metadata chunk so search reflects the new schema —
+    # otherwise the chunk drifts from the ALTER until the table is dropped.
     try:
         await index_table_metadata(
             str(table["id"]),
