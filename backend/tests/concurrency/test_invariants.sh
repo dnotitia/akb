@@ -116,21 +116,26 @@ mcp_classify() {
 python3 -c '
 import sys, json
 raw = sys.stdin.read()
+if not raw.strip():
+    print("ERR:empty-response"); sys.exit(0)
 try:
     d = json.loads(raw)
 except Exception:
-    print("ERR:non-json"); sys.exit(0)
-if d.get("error"):
-    print(f"ERR:{d[\"error\"].get(\"message\",\"jsonrpc-error\")}"); sys.exit(0)
+    snippet = raw[:120]
+    print("ERR:non-json:" + repr(snippet)); sys.exit(0)
+err = d.get("error")
+if err:
+    msg = err.get("message", "jsonrpc-error") if isinstance(err, dict) else str(err)
+    print("ERR:" + str(msg)); sys.exit(0)
 res = d.get("result") or {}
 if res.get("isError"):
-    print(f"ERR:{res}"); sys.exit(0)
+    print("ERR:" + str(res)); sys.exit(0)
 # tools/call wraps the actual return in result.content[0].text (json string)
 try:
     txt = res["content"][0]["text"]
     obj = json.loads(txt)
     if isinstance(obj, dict) and "error" in obj:
-        print(f"ERR:{obj[\"error\"]}"); sys.exit(0)
+        print("ERR:" + str(obj["error"])); sys.exit(0)
 except Exception:
     pass
 print("OK")
