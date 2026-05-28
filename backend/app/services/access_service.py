@@ -827,6 +827,19 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
             await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
 
+            # File chunks need the same explicit outbox enqueue as table
+            # chunks — chunks.vault_id CASCADE removes the rows from PG,
+            # but vector_delete_outbox doesn't ride the cascade and the
+            # vector-store points would otherwise orphan.
+            vfiles = await conn.fetch(
+                "SELECT id FROM vault_files WHERE vault_id = $1",
+                vault_id,
+            )
+            for vf in vfiles:
+                await _drop_source_chunks_with_outbox(
+                    conn, "file", str(vf["id"]),
+                )
+
             await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM sessions WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
