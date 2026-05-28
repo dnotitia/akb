@@ -5,6 +5,44 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.3 — 2026-05-28
+
+Hotfix on top of 0.3.2. The 0.3.2 image failed to start on existing
+prod-shaped state: migration 026 (`uri_collection_prefix`, original
+0.3.0 work) re-ran on every backend boot and tripped a
+`UniqueViolationError` on the second pass.
+
+### Cause
+
+`026_uri_collection_prefix._run` rewrites legacy `akb://V/doc/{coll}/{name}`
+URIs to the canonical `akb://V/coll/{coll}/doc/{name}` shape across
+`edges`, `publications`, `events`. After the first deploy on a vault
+the rewrite is complete, but the migration is still in the registry
+that runs on every startup. New edges written between 0.3.0 and 0.3.2
+ended up with the canonical shape directly; the second pass of the
+rewrite would map those onto each other, colliding on
+`UNIQUE (source_uri, target_uri, relation_type)`.
+
+This is an idempotency bug in the original 0.3.0 migration, not in
+the 0.3.2 fix. It surfaced now because nothing had been forcing a
+backend rolling restart on these databases since 0.3.0 went out.
+
+### Fix
+
+`026._run` now starts with a cheap probe: a single SQL that checks
+whether any URI column still matches the legacy shape. If none does,
+the migration logs "no legacy URI shapes remain; skipping" and
+returns. The probe is `LIMIT 1` so it's O(1) once the indexes
+warm up.
+
+### Notes for operators
+
+- 0.3.2 was tagged + released but the image never made it past
+  startup on any cluster that had previously processed migration
+  026. Use 0.3.3.
+- No schema change. The probe is read-only.
+- 0.3.2 changelog body is preserved below for reference.
+
 ## 0.3.2 — 2026-05-28
 
 Follow-up patch to 0.3.1. One new finding surfaced while writing the

@@ -67,6 +67,33 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    # Idempotency guard. The rewrites below are not safe to re-run after
+    # the first pass: subsequent inserts that use the post-rewrite
+    # canonical URI shape can collide with the unique constraint on
+    # (source_uri, target_uri, relation_type) when we'd rewrite a
+    # legacy duplicate onto the canonical row. Skip the whole migration
+    # once there are no legacy URI shapes left to rewrite.
+    legacy_remaining = await conn.fetchval(
+        """
+        SELECT 1 FROM (
+            SELECT source_uri AS u FROM edges
+             WHERE source_uri ~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+            UNION ALL
+            SELECT target_uri FROM edges
+             WHERE target_uri ~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+            UNION ALL
+            SELECT resource_uri FROM publications
+             WHERE resource_uri ~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+            UNION ALL
+            SELECT resource_uri FROM events
+             WHERE resource_uri ~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+        ) AS legacy LIMIT 1
+        """
+    )
+    if not legacy_remaining:
+        logger.info("Migration 026: no legacy URI shapes remain; skipping")
+        return
+
     async with conn.transaction():
         doc_rewrites = 0
         table_rewrites = 0
