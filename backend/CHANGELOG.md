@@ -5,6 +5,71 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.2 — 2026-05-28
+
+Follow-up patch to 0.3.1. One new finding surfaced while writing the
+invariant test suite added in 0.3.1, plus the suite itself.
+
+### Fix: `delete_vault` enqueues file chunks for vector-store deletion
+
+`access_service.delete_vault` already iterated `vault_tables` and ran
+`_drop_source_chunks_with_outbox(conn, "table", id)` so the
+vector-store points for table-metadata chunks got enqueued into
+`vector_delete_outbox` before the cascade fired. The matching loop
+over `vault_files` was missing.
+
+Effect of the gap: `chunks.vault_id ON DELETE CASCADE` still removed
+the file chunks from PG when the vaults row went, but
+`vector_delete_outbox` doesn't ride the cascade, so the vector store
+kept the points. Production vector stores accumulated one orphan
+point per chunk per file in every deleted vault.
+
+Why the audit-v2 pass missed it: the `delete_vault_chunks` docstring
+claimed "tables/files CASCADE through their own vault_tables /
+vault_files FKs at vault-drop time — their chunk cleanup is handled
+in the service delete hooks." Half-true: vault_tables/vault_files
+rows do cascade, but `chunks.source_id` has no FK (polymorphic
+source), and the "service delete hooks" only existed for tables.
+
+Fix mirrors the table loop inside the same outer transaction so the
+outbox INSERT commits atomically with the chunks DELETE.
+
+Surfaced by a multi-assertion invariant test (`post == 0 AND outbox
+== 3`) — the single-condition "no orphan chunks" assertion would have
+passed because the cascade does its job in PG; only the second
+assertion noticed the missing outbox row.
+
+### Tests: concurrency invariant suite
+
+New `backend/tests/concurrency/` with two complementary tracks:
+
+- `test_invariants.sh` — bombardment + PG ground-truth shell suite.
+  Hits the audit Docker stack with N concurrent curl clients per
+  invariant, then asserts the post-condition by querying PG via
+  `docker exec`. Covers INV-1, INV-2, INV-4, INV-8, INV-9, INV-10
+  (cross- + same-vault), INV-11, INV-12. 9/9 pass.
+- `test_invariants_unit.py` — pytest for the four invariants that
+  don't fit a curl-bombardment shape (INV-3 `end_session` dedup,
+  INV-5 BM25 `try_advisory_lock`, INV-6 metadata stale guard, INV-7
+  `delete_vault` orphan chunks). 4/4 pass.
+
+Together the suite verifies every Tier 0 / Tier 1 fix from 0.3.1
+plus the new 0.3.2 fix above (13/13 invariants).
+
+### Notes for operators
+
+- No schema change. No migration.
+- Existing vaults with file-heavy history have already lost
+  outbox rows for any file chunks deleted before this patch — those
+  orphan vector-store points are not recoverable from PG state and
+  would need a separate sweep job to reconcile (out of scope here).
+- Running the new invariant suite locally:
+  ```
+  AKB_URL=http://localhost:8001 bash backend/tests/concurrency/test_invariants.sh
+  AKB_TEST_DSN=postgresql://akb:akb@localhost:5433/akb \
+    uv run pytest backend/tests/concurrency/test_invariants_unit.py -v
+  ```
+
 ## 0.3.1 — 2026-05-27
 
 Second-round concurrency/atomicity audit. 54 findings across six
