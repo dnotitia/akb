@@ -38,12 +38,15 @@ async def upload_file(
 async def confirm_upload(
     vault: str,
     file_id: str,
+    content_hash: str | None = Query(None, description="Optional client-computed sha256 of uploaded bytes"),
+    hash_algorithm: str = Query("sha256", description="Hash algorithm for content_hash"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Called after presigned URL upload. Updates file size from S3. Recovery use only."""
+    """Called after presigned URL upload. Updates size and byte hash from S3."""
     access = await check_vault_access(user.user_id, vault, required_role="writer")
     return await file_service.confirm_upload(
         access["vault_id"], file_id, actor_id=user.username,
+        content_hash=content_hash, hash_algorithm=hash_algorithm,
     )
 
 

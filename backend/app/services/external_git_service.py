@@ -43,6 +43,7 @@ from app.services.index_service import (
     delete_document_chunks,
     write_source_chunks,
 )
+from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.uri_service import doc_uri
 from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
 
@@ -291,6 +292,8 @@ class ExternalGitService:
                     metadata=metadata,
                     now=now,
                     commit_hash=last_commit,
+                    content_hash=compute_text_content_hash(body),
+                    hash_algorithm=HASH_ALGORITHM,
                     created_by=created_by,
                     conn=conn,
                 )
@@ -320,6 +323,8 @@ class ExternalGitService:
                         "doc_type": doc_type,
                         "external_blob": blob_sha,
                         "commit": last_commit,
+                        "content_hash": compute_text_content_hash(body),
+                        "hash_algorithm": HASH_ALGORITHM,
                     },
                 )
 

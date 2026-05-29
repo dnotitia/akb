@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     current_commit TEXT,               -- Git commit hash
+    content_hash TEXT,                 -- sha256 of canonical document body returned by AKB
+    hash_algorithm TEXT DEFAULT 'sha256',
+    content_hash_commit TEXT,          -- commit the content_hash projection was computed from
     tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}',       -- extended metadata from frontmatter
     supersedes UUID REFERENCES documents(id) ON DELETE SET NULL,
@@ -246,6 +249,11 @@ CREATE TABLE IF NOT EXISTS vault_files (
     s3_key TEXT NOT NULL,
     mime_type TEXT,
     size_bytes BIGINT,
+    content_hash TEXT,                 -- sha256 of file bytes
+    hash_algorithm TEXT DEFAULT 'sha256',
+    etag TEXT,                         -- object-store ETag/checksum hint
+    storage_version TEXT,              -- object-store version id when available
+    hash_verified_at TIMESTAMPTZ,      -- when AKB last verified content_hash from storage bytes
     description TEXT,
     created_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -361,4 +369,3 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_vault ON sessions(vault_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
-

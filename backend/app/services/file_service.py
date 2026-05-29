@@ -1,8 +1,9 @@
 """File service — S3-backed binary file storage for vaults.
 
-AKB never touches file bytes. It only:
+AKB does not store file bytes in the application database. It:
 1. Generates presigned URLs for direct client ↔ S3 transfer.
 2. Manages file metadata in PostgreSQL (`vault_files_repo`).
+3. Streams uploaded object bytes once at confirmation to certify sha256.
 
 Access control inherits from vault permissions.
 
@@ -13,6 +14,7 @@ This module is the file-domain layer over those primitives.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Iterator
@@ -27,6 +29,11 @@ from app.repositories.events_repo import emit_event
 from app.services.adapters import s3_adapter
 from app.services.index_service import (
     build_file_chunk, delete_file_chunks, write_source_chunks,
+)
+from app.services.resource_hash import (
+    HASH_ALGORITHM,
+    compute_stream_content_hash,
+    is_sha256_hex,
 )
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
@@ -201,12 +208,22 @@ class FileService:
         file_id: str,
         *,
         actor_id: str,
+        content_hash: str | None = None,
+        hash_algorithm: str = HASH_ALGORITHM,
     ) -> dict:
-        """Confirm upload completion. Updates size_bytes from S3 metadata.
+        """Confirm upload completion and persist AKB-certified byte hash.
 
         If the file doesn't exist in S3 (upload failed/abandoned),
         deletes the orphan DB record and returns an error.
         """
+        if hash_algorithm != HASH_ALGORITHM:
+            raise AKBError(
+                f"Unsupported file hash algorithm: {hash_algorithm}",
+                status_code=400,
+            )
+        if content_hash is not None and not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -229,9 +246,33 @@ class FileService:
                 status_code=404,
             )
 
+        server_content_hash = await asyncio.to_thread(
+            compute_stream_content_hash,
+            s3_adapter.iter_chunks(row["s3_key"]),
+        )
+        if content_hash and content_hash != server_content_hash:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await vault_files_repo.delete(conn, fid)
+                    await _enqueue_s3_delete(conn, row["s3_key"])
+            raise AKBError(
+                "Uploaded file hash mismatch; file record was cleaned up.",
+                status_code=409,
+            )
+
+        etag = (meta.get("ETag") or "").strip('"') or None
+        storage_version = meta.get("VersionId")
+
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await vault_files_repo.update_size(conn, fid, size_bytes)
+                await vault_files_repo.update_confirmed_metadata(
+                    conn, fid,
+                    size_bytes=size_bytes,
+                    content_hash=server_content_hash,
+                    hash_algorithm=HASH_ALGORITHM,
+                    etag=etag,
+                    storage_version=storage_version,
+                )
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )
@@ -254,6 +295,10 @@ class FileService:
                         "name": row["name"],
                         "mime_type": row["mime_type"],
                         "size_bytes": size_bytes,
+                        "content_hash": server_content_hash,
+                        "hash_algorithm": HASH_ALGORITHM,
+                        "etag": etag,
+                        "storage_version": storage_version,
                     },
                 )
 
@@ -285,6 +330,10 @@ class FileService:
             "collection": row["collection"],
             "mime_type": row["mime_type"],
             "size_bytes": size_bytes,
+            "content_hash": server_content_hash,
+            "hash_algorithm": HASH_ALGORITHM,
+            "etag": etag,
+            "storage_version": storage_version,
         }
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
@@ -318,6 +367,10 @@ class FileService:
             "download_url": presigned_url,
             "mime_type": row["mime_type"],
             "size_bytes": row["size_bytes"],
+            "content_hash": row["content_hash"],
+            "hash_algorithm": row["hash_algorithm"],
+            "etag": row["etag"],
+            "storage_version": row["storage_version"],
             "expires_in": _PRESIGN_DOWNLOAD_TTL,
         }
 
@@ -366,6 +419,10 @@ class FileService:
                 "name": r["name"],
                 "mime_type": r["mime_type"],
                 "size_bytes": r["size_bytes"],
+                "content_hash": r["content_hash"],
+                "hash_algorithm": r["hash_algorithm"],
+                "etag": r["etag"],
+                "storage_version": r["storage_version"],
                 "description": r["description"],
                 "created_by": r["created_by"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,

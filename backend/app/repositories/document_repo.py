@@ -52,6 +52,8 @@ class DocumentRepository:
         created_by: str | None,
         now: datetime,
         commit_hash: str,
+        content_hash: str,
+        hash_algorithm: str,
         tags: list[str],
         metadata: dict,
     ) -> uuid.UUID:
@@ -63,12 +65,15 @@ class DocumentRepository:
                     INSERT INTO documents
                         (id, vault_id, collection_id, path, title, doc_type, status,
                          summary, domain, created_by, created_at, updated_at,
-                         current_commit, tags, metadata)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                         current_commit, content_hash, hash_algorithm, content_hash_commit,
+                         tags, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15, $16, $17, $18)
                     """,
                     doc_id, vault_id, collection_id, path, title, doc_type, status,
                     summary, domain, created_by, now, now,
-                    commit_hash, tags, dumps_jsonb(metadata),
+                    commit_hash, content_hash, hash_algorithm, commit_hash,
+                    tags, dumps_jsonb(metadata),
                 )
             except asyncpg.UniqueViolationError as e:
                 # (vault_id, path) is the only UNIQUE constraint that callers
@@ -138,6 +143,9 @@ class DocumentRepository:
         domain: str | None = None,
         now: datetime | None = None,
         commit_hash: str | None = None,
+        content_hash: str | None = None,
+        hash_algorithm: str | None = None,
+        content_hash_commit: str | None = None,
         tags: list[str] | None = None,
     ) -> None:
         async with self.pool.acquire() as conn:
@@ -151,10 +159,34 @@ class DocumentRepository:
                     domain = COALESCE($5, domain),
                     updated_at = COALESCE($6, updated_at),
                     current_commit = COALESCE($7, current_commit),
-                    tags = COALESCE($8, tags)
-                WHERE id = $9
+                    content_hash = COALESCE($8, content_hash),
+                    hash_algorithm = COALESCE($9, hash_algorithm),
+                    content_hash_commit = COALESCE($10, content_hash_commit),
+                    tags = COALESCE($11, tags)
+                WHERE id = $12
                 """,
-                title, doc_type, status, summary, domain, now, commit_hash, tags, doc_id,
+                title, doc_type, status, summary, domain, now, commit_hash,
+                content_hash, hash_algorithm, content_hash_commit, tags, doc_id,
+            )
+
+    async def update_hash(
+        self,
+        doc_id: uuid.UUID,
+        *,
+        content_hash: str,
+        hash_algorithm: str,
+        content_hash_commit: str | None,
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE documents SET
+                    content_hash = $1,
+                    hash_algorithm = $2,
+                    content_hash_commit = $3
+                WHERE id = $4
+                """,
+                content_hash, hash_algorithm, content_hash_commit, doc_id,
             )
 
     async def delete(self, doc_id: uuid.UUID, *, conn=None) -> None:
@@ -171,7 +203,8 @@ class DocumentRepository:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT path, title, doc_type, status, summary, tags, updated_at
+                SELECT path, title, doc_type, status, summary, tags, updated_at,
+                       current_commit, content_hash, hash_algorithm, content_hash_commit
                 FROM documents
                 WHERE vault_id = $1 AND collection_id = (
                     SELECT id FROM collections WHERE vault_id = $1 AND path = $2
@@ -186,7 +219,8 @@ class DocumentRepository:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT path, title, doc_type, status, summary, tags, updated_at
+                SELECT path, title, doc_type, status, summary, tags, updated_at,
+                       current_commit, content_hash, hash_algorithm, content_hash_commit
                 FROM documents WHERE vault_id = $1 ORDER BY updated_at DESC
                 """,
                 vault_id,
@@ -217,7 +251,8 @@ class DocumentRepository:
         handles vault-root docs uniformly.
         """
         base_select = (
-            "SELECT path, title, doc_type, status, summary, tags, updated_at "
+            "SELECT id, path, title, doc_type, status, summary, tags, updated_at, "
+            "current_commit, content_hash, hash_algorithm, content_hash_commit "
             "FROM documents WHERE vault_id = $1"
         )
         params: list = [vault_id]
@@ -298,6 +333,8 @@ class DocumentRepository:
         metadata: dict,
         now: datetime,
         commit_hash: str | None,
+        content_hash: str,
+        hash_algorithm: str,
         created_by: str | None = None,
         conn=None,
     ) -> tuple[uuid.UUID, bool]:
@@ -319,11 +356,13 @@ class DocumentRepository:
             INSERT INTO documents
                 (id, vault_id, collection_id, path, title, doc_type, status,
                  summary, domain, created_by, created_at, updated_at,
-                 current_commit, tags, metadata,
+                 current_commit, content_hash, hash_algorithm, content_hash_commit,
+                 tags, metadata,
                  source, external_path, external_blob)
             VALUES ($1, $2, $3, $4, $5, $6, 'active',
-                    $7, $8, $9, $10, $10, $11, $12, $13,
-                    'external_git', $14, $15)
+                    $7, $8, $9, $10, $10, $11, $12, $13, $11,
+                    $14, $15,
+                    'external_git', $16, $17)
             ON CONFLICT (vault_id, path) DO UPDATE SET
                 collection_id  = EXCLUDED.collection_id,
                 title          = EXCLUDED.title,
@@ -332,6 +371,9 @@ class DocumentRepository:
                 domain         = EXCLUDED.domain,
                 updated_at     = EXCLUDED.updated_at,
                 current_commit = EXCLUDED.current_commit,
+                content_hash   = EXCLUDED.content_hash,
+                hash_algorithm = EXCLUDED.hash_algorithm,
+                content_hash_commit = EXCLUDED.content_hash_commit,
                 tags           = EXCLUDED.tags,
                 metadata       = EXCLUDED.metadata,
                 external_blob  = EXCLUDED.external_blob,
@@ -346,7 +388,8 @@ class DocumentRepository:
         """
         args = (
             uuid.uuid4(), vault_id, collection_id, path, title, doc_type,
-            summary, domain, created_by, now, commit_hash, tags, dumps_jsonb(metadata),
+            summary, domain, created_by, now, commit_hash, content_hash,
+            hash_algorithm, tags, dumps_jsonb(metadata),
             external_path, external_blob,
         )
         if conn is not None:

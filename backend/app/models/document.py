@@ -64,6 +64,10 @@ class DocumentUpdateRequest(NFCModel):
     # 409 unless the document's current_commit matches. Use to detect a
     # concurrent writer between read and write.
     expected_commit: str | None = None
+    # Optional body-level precondition. Unlike current_commit, this only
+    # tracks the document body returned by akb_get; frontmatter-only
+    # metadata changes do not change it.
+    expected_content_hash: str | None = None
 
 
 class DocumentEditRequest(NFCModel):
@@ -93,6 +97,8 @@ class DocumentResponse(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     current_commit: str | None = None
+    content_hash: str | None = None
+    hash_algorithm: str | None = None
     tags: list[str] = Field(default_factory=list)
     content: str | None = None  # included only for akb_get, not for browse/search
     is_public: bool = False
@@ -111,6 +117,12 @@ class DocumentPutResponse(BaseModel):
     vault: str
     path: str
     commit_hash: str
+    current_commit: str | None = None
+    previous_commit: str | None = None
+    content_hash: str | None = None
+    previous_content_hash: str | None = None
+    hash_algorithm: str | None = None
+    action: str | None = None
     chunks_indexed: int
     entities_found: int
 
@@ -140,12 +152,17 @@ class BrowseItem(BaseModel):
     status: str | None = None  # for documents
     tags: list[str] = Field(default_factory=list)
     last_updated: datetime | None = None
+    current_commit: str | None = None
+    content_hash: str | None = None
+    hash_algorithm: str | None = None
     # Table fields
     row_count: int | None = None
     columns: list[dict] | None = None
     # File fields
     mime_type: str | None = None
     size_bytes: int | None = None
+    etag: str | None = None
+    storage_version: str | None = None
 
 
 class BrowseResponse(BaseModel):

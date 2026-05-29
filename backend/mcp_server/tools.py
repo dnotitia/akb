@@ -173,6 +173,14 @@ TOOLS = [
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (akb:// URIs)"},
                 "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update related list (akb:// URIs)"},
                 "message": {"type": "string", "description": "Commit message describing the change"},
+                "expected_commit": {
+                    "type": "string",
+                    "description": "Optional OCC pin — reject if the document current_commit moved.",
+                },
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "Optional body hash pin — reject if the current document body hash moved.",
+                },
             },
             "required": ["uri"],
         },
@@ -283,6 +291,13 @@ TOOLS = [
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
+                "include_hashes": {
+                    "type": "boolean",
+                    "description": (
+                        "Include AKB-certified content_hash/hash_algorithm and "
+                        "resource version fields for documents/files."
+                    ),
+                },
             },
             # Either `vault` or `uri` must be present — enforced at the
             # handler since JSON schema's anyOf-on-required is awkward

@@ -52,7 +52,9 @@ async def find_by_id(
         """
         SELECT vf.id, vf.vault_id, vf.collection_id, c.path AS collection,
                vf.name, vf.s3_key, vf.mime_type, vf.size_bytes,
-               vf.description, vf.created_by, vf.created_at, vf.updated_at
+               vf.description, vf.created_by, vf.created_at, vf.updated_at,
+               vf.content_hash, vf.hash_algorithm, vf.etag,
+               vf.storage_version, vf.hash_verified_at
           FROM vault_files vf
           LEFT JOIN collections c ON c.id = vf.collection_id
          WHERE vf.id = $1 AND vf.vault_id = $2
@@ -66,6 +68,32 @@ async def update_size(conn, file_id: uuid.UUID, size_bytes: int) -> None:
     await conn.execute(
         "UPDATE vault_files SET size_bytes = $1, updated_at = NOW() WHERE id = $2",
         size_bytes, file_id,
+    )
+
+
+async def update_confirmed_metadata(
+    conn,
+    file_id: uuid.UUID,
+    *,
+    size_bytes: int,
+    content_hash: str,
+    hash_algorithm: str,
+    etag: str | None,
+    storage_version: str | None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE vault_files SET
+            size_bytes = $1,
+            content_hash = $2,
+            hash_algorithm = $3,
+            etag = $4,
+            storage_version = $5,
+            hash_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $6
+        """,
+        size_bytes, content_hash, hash_algorithm, etag, storage_version, file_id,
     )
 
 
@@ -109,7 +137,9 @@ async def list_for_vault(
                 """
                 SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                        vf.mime_type, vf.size_bytes, vf.description,
-                       vf.created_by, vf.created_at
+                       vf.created_by, vf.created_at, vf.content_hash,
+                       vf.hash_algorithm, vf.etag, vf.storage_version,
+                       vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
                  WHERE vf.vault_id = $1 AND vf.collection_id IS NULL
@@ -123,7 +153,9 @@ async def list_for_vault(
                 """
                 SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                        vf.mime_type, vf.size_bytes, vf.description,
-                       vf.created_by, vf.created_at
+                       vf.created_by, vf.created_at, vf.content_hash,
+                       vf.hash_algorithm, vf.etag, vf.storage_version,
+                       vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
                  WHERE vf.vault_id = $1 AND vf.collection_id = $2
@@ -161,7 +193,9 @@ async def list_for_vault(
         sql = (
             "SELECT vf.id, vf.collection_id, c.path AS collection, vf.name, "
             "       vf.mime_type, vf.size_bytes, vf.description, "
-            "       vf.created_by, vf.created_at "
+            "       vf.created_by, vf.created_at, vf.content_hash, "
+            "       vf.hash_algorithm, vf.etag, vf.storage_version, "
+            "       vf.hash_verified_at "
             "  FROM vault_files vf "
             "  LEFT JOIN collections c ON c.id = vf.collection_id "
             " WHERE vf.vault_id = $1"
@@ -175,7 +209,9 @@ async def list_for_vault(
             """
             SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                    vf.mime_type, vf.size_bytes, vf.description,
-                   vf.created_by, vf.created_at
+                   vf.created_by, vf.created_at, vf.content_hash,
+                   vf.hash_algorithm, vf.etag, vf.storage_version,
+                   vf.hash_verified_at
               FROM vault_files vf
               LEFT JOIN collections c ON c.id = vf.collection_id
              WHERE vf.vault_id = $1

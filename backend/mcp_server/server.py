@@ -335,10 +335,14 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
                 r"\A---\r?\n.*?\r?\n---\r?\n", "", raw, count=1, flags=_re.DOTALL,
             )
             body = stripped
+        from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
         return {
             "title": doc["title"],
             "uri": doc_uri(vault, doc["path"]),
             "version": version,
+            "current_commit": version,
+            "content_hash": compute_text_content_hash(body),
+            "hash_algorithm": HASH_ALGORITHM,
             "content": body,
         }
     doc = await doc_service.get(vault, doc_path)
@@ -361,6 +365,8 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         depends_on=args.get("depends_on"),
         related_to=args.get("related_to"),
         message=args.get("message"),
+        expected_commit=args.get("expected_commit"),
+        expected_content_hash=args.get("expected_content_hash"),
     )
     result = await doc_service.update(vault, doc_path, req, agent_id=user.username)
     if not result:
@@ -438,6 +444,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         collection=collection,
         depth=args.get("depth", 1),
         content_type=args.get("content_type", "all"),
+        include_hashes=args.get("include_hashes", False),
     )
     include_summary = args.get("include_summary")
     payload = result.model_dump(

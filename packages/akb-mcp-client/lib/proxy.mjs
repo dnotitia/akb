@@ -15,6 +15,7 @@ import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 
 // ── Connection reuse ───────────────────────────────────────
 // Without keepAlive agents, every MCP tool call (search, browse, put,
@@ -421,6 +422,7 @@ export class AKBProxy {
 
     // Resolve MIME type: explicit override wins, otherwise guess from extension.
     const mimeType = args.mime_type || guessMime(filename);
+    const contentHash = await this._sha256File(file_path);
 
     // 1. Get presigned upload URL from AKB. The backend returns the
     //    canonical `uri` plus a transient `s3_key` + presigned upload
@@ -449,7 +451,11 @@ export class AKBProxy {
     // 3. Confirm upload with AKB.
     const confirmResp = await this._http(
       "POST",
-      `/api/v1/files/${encodeURIComponent(vault)}/${fileId}/confirm`,
+      `/api/v1/files/${encodeURIComponent(vault)}/${fileId}/confirm?` +
+        new URLSearchParams({
+          content_hash: contentHash,
+          hash_algorithm: "sha256",
+        }),
     );
     return JSON.parse(confirmResp.text);
   }
@@ -464,7 +470,15 @@ export class AKBProxy {
       "GET",
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
     );
-    const { name: filename, download_url, size_bytes } = JSON.parse(resp.text);
+    const {
+      name: filename,
+      download_url,
+      size_bytes,
+      content_hash,
+      hash_algorithm,
+      etag,
+      storage_version,
+    } = JSON.parse(resp.text);
 
     // 2. Determine save path
     let savePath = save_to;
@@ -479,7 +493,16 @@ export class AKBProxy {
     await mkdir(dirname(savePath), { recursive: true });
     const bytesWritten = await this._downloadFromS3(download_url, savePath);
 
-    return { name: filename, save_to: savePath, size_bytes: bytesWritten, uri };
+    return {
+      name: filename,
+      save_to: savePath,
+      size_bytes: bytesWritten,
+      uri,
+      content_hash,
+      hash_algorithm,
+      etag,
+      storage_version,
+    };
   }
 
   async _deleteFile(args) {
@@ -495,6 +518,16 @@ export class AKBProxy {
   }
 
   // ── S3 direct transfer ────────────────────────────────────
+
+  _sha256File(filePath) {
+    return new Promise((resolve, reject) => {
+      const hash = createHash("sha256");
+      const stream = createReadStream(filePath);
+      stream.on("data", (chunk) => hash.update(chunk));
+      stream.on("end", () => resolve(hash.digest("hex")));
+      stream.on("error", reject);
+    });
+  }
 
   /**
    * Stream a local file directly to S3 via presigned PUT URL.

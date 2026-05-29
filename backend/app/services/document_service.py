@@ -131,6 +131,7 @@ from app.services.index_service import (
     delete_document_chunks,
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
+from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
 from app.repositories import table_data_repo
@@ -198,6 +199,10 @@ def _parse_markdown(content: str) -> tuple[dict, str]:
     return dict(post.metadata), post.content
 
 
+def _body_content_hash(body: str) -> str:
+    return compute_text_content_hash(body)
+
+
 class DocumentService:
     def __init__(self, git: GitService | None = None):
         self.git = git or GitService()
@@ -205,6 +210,32 @@ class DocumentService:
     async def _repos(self):
         pool = await get_pool()
         return VaultRepository(pool), DocumentRepository(pool), CollectionRepository(pool)
+
+    async def _ensure_document_hash(
+        self,
+        doc_repo,
+        row: dict,
+        body: str,
+        *,
+        persist: bool = True,
+    ) -> tuple[str, str]:
+        content_hash = _body_content_hash(body)
+        current_commit = row.get("current_commit")
+        if (
+            persist
+            and (
+                row.get("content_hash") != content_hash
+                or row.get("hash_algorithm") != HASH_ALGORITHM
+                or row.get("content_hash_commit") != current_commit
+            )
+        ):
+            await doc_repo.update_hash(
+                row["id"],
+                content_hash=content_hash,
+                hash_algorithm=HASH_ALGORITHM,
+                content_hash_commit=current_commit,
+            )
+        return content_hash, HASH_ALGORITHM
 
     @asynccontextmanager
     async def _path_lock(self, vault_id: uuid.UUID, file_path: str):
@@ -264,6 +295,7 @@ class DocumentService:
         if agent_id:
             fm_dict["created_by"] = agent_id
         md_content = _compose_markdown(fm_dict, req.content)
+        content_hash = _body_content_hash(req.content)
 
         # Git commit
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
@@ -296,7 +328,8 @@ class DocumentService:
             vault_id=vault_id, collection_id=collection_id, path=file_path,
             title=req.title, doc_type=req.type, status="draft",
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
-            now=now, commit_hash=commit_hash, tags=req.tags, metadata={},
+            now=now, commit_hash=commit_hash, content_hash=content_hash,
+            hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={},
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -334,6 +367,8 @@ class DocumentService:
                         "title": req.title,
                         "doc_type": req.type,
                         "commit_hash": commit_hash,
+                        "content_hash": content_hash,
+                        "hash_algorithm": HASH_ALGORITHM,
                         "collection": normalized_collection,
                     },
                 )
@@ -343,7 +378,9 @@ class DocumentService:
         return DocumentPutResponse(
             uri=doc_uri(req.vault, file_path),
             vault=req.vault, path=file_path,
-            commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
+            commit_hash=commit_hash, current_commit=commit_hash,
+            content_hash=content_hash, hash_algorithm=HASH_ALGORITHM,
+            action="created", chunks_indexed=chunks_indexed, entities_found=0,
         )
 
     # ── Get ───────────────────────────────────────────────────
@@ -363,6 +400,7 @@ class DocumentService:
         body = ""
         if content:
             _, body = _parse_markdown(content)
+        content_hash, hash_algorithm = await self._ensure_document_hash(doc_repo, row, body)
 
         # Derive published state from the publications table. We pick the
         # newest matching publication so the UI is consistent with publishDoc()
@@ -376,6 +414,7 @@ class DocumentService:
             summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
             created_at=row["created_at"], updated_at=row["updated_at"],
             current_commit=row["current_commit"],
+            content_hash=content_hash, hash_algorithm=hash_algorithm,
             tags=list(row["tags"]) if row["tags"] else [],
             content=body,
             is_public=public_slug is not None,
@@ -425,6 +464,7 @@ class DocumentService:
             )
 
         public_slug = await self._get_public_slug(row["vault_name"], row["path"])
+        content_hash = _body_content_hash(body)
 
         return DocumentResponse(
             uri=doc_uri(row["vault_name"], row["path"]),
@@ -433,6 +473,7 @@ class DocumentService:
             summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
             created_at=row["created_at"], updated_at=row["updated_at"],
             current_commit=version,    # report the requested version, not HEAD
+            content_hash=content_hash, hash_algorithm=HASH_ALGORITHM,
             tags=list(row["tags"]) if row["tags"] else [],
             content=body,
             is_public=public_slug is not None,
@@ -502,10 +543,16 @@ class DocumentService:
         file_path = row["path"]
 
         current_content = await asyncio.to_thread(self.git.read_file, vault, file_path)
-        if not current_content:
+        if current_content is None:
             raise NotFoundError("Document file", file_path)
 
         current_fm, current_body = _parse_markdown(current_content)
+        current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body)
+        if req.expected_content_hash and req.expected_content_hash != current_hash:
+            raise ConflictError(
+                f"content_hash moved: expected {req.expected_content_hash}, "
+                f"actual {current_hash}"
+            )
 
         # Merge updates
         if req.title:
@@ -528,6 +575,8 @@ class DocumentService:
 
         new_body = req.content if req.content is not None else current_body
         new_md = _compose_markdown(current_fm, new_body)
+        previous_hash = current_hash
+        content_hash = _body_content_hash(new_body)
 
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
@@ -542,7 +591,9 @@ class DocumentService:
         await doc_repo.update(
             pg_doc_id, title=req.title, doc_type=req.type, status=req.status,
             summary=req.summary, domain=req.domain, now=now,
-            commit_hash=commit_hash, tags=req.tags,
+            commit_hash=commit_hash, content_hash=content_hash,
+            hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
+            tags=req.tags,
         )
 
         chunks_indexed = 0
@@ -591,6 +642,8 @@ class DocumentService:
                         "vault": vault,
                         "path": file_path,
                         "commit_hash": commit_hash,
+                        "content_hash": content_hash,
+                        "hash_algorithm": HASH_ALGORITHM,
                         "content_changed": req.content is not None,
                     },
                 )
@@ -598,7 +651,11 @@ class DocumentService:
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
             vault=vault, path=file_path,
-            commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
+            commit_hash=commit_hash, current_commit=commit_hash,
+            previous_commit=row.get("current_commit"),
+            previous_content_hash=previous_hash,
+            content_hash=content_hash, hash_algorithm=HASH_ALGORITHM,
+            action="updated", chunks_indexed=chunks_indexed, entities_found=0,
         )
 
     # ── Edit ──────────────────────────────────────────────────
@@ -662,7 +719,7 @@ class DocumentService:
         file_path = row["path"]
 
         current_content = await asyncio.to_thread(self.git.read_file, vault, file_path)
-        if not current_content:
+        if current_content is None:
             raise NotFoundError("Document file", file_path)
 
         current_fm, current_body = _parse_markdown(current_content)
@@ -689,15 +746,22 @@ class DocumentService:
             new_body = current_body.replace(old_string, new_string, 1)
 
         if new_body == current_body:
+            content_hash, hash_algorithm = await self._ensure_document_hash(
+                doc_repo, row, current_body,
+            )
             return DocumentPutResponse(
                 uri=doc_uri(vault, file_path),
                 vault=vault, path=file_path,
                 commit_hash=row.get("current_commit") or "",
-                chunks_indexed=0, entities_found=0,
+                current_commit=row.get("current_commit"),
+                content_hash=content_hash, hash_algorithm=hash_algorithm,
+                action="unchanged", chunks_indexed=0, entities_found=0,
             )
 
         current_fm["updated_at"] = now.isoformat()
         new_md = _compose_markdown(current_fm, new_body)
+        previous_hash = row.get("content_hash") or _body_content_hash(current_body)
+        content_hash = _body_content_hash(new_body)
 
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
@@ -712,7 +776,9 @@ class DocumentService:
         await doc_repo.update(
             pg_doc_id, title=None, doc_type=None, status=None,
             summary=None, domain=None, now=now,
-            commit_hash=commit_hash, tags=None,
+            commit_hash=commit_hash, content_hash=content_hash,
+            hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
+            tags=None,
         )
 
         # Re-chunk and re-embed (full pipeline — mirrors update())
@@ -754,6 +820,8 @@ class DocumentService:
                         "vault": vault,
                         "path": file_path,
                         "commit_hash": commit_hash,
+                        "content_hash": content_hash,
+                        "hash_algorithm": HASH_ALGORITHM,
                         "content_changed": True,
                         "source": "edit",
                     },
@@ -762,7 +830,11 @@ class DocumentService:
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
             vault=vault, path=file_path,
-            commit_hash=commit_hash, chunks_indexed=chunks_indexed, entities_found=0,
+            commit_hash=commit_hash, current_commit=commit_hash,
+            previous_commit=row.get("current_commit"),
+            previous_content_hash=previous_hash,
+            content_hash=content_hash, hash_algorithm=HASH_ALGORITHM,
+            action="updated", chunks_indexed=chunks_indexed, entities_found=0,
         )
 
     # ── Delete ────────────────────────────────────────────────
@@ -846,7 +918,14 @@ class DocumentService:
 
     # ── Browse ────────────────────────────────────────────────
 
-    async def browse(self, vault: str, collection: str | None = None, depth: int = 1, content_type: str = "all") -> BrowseResponse:
+    async def browse(
+        self,
+        vault: str,
+        collection: str | None = None,
+        depth: int = 1,
+        content_type: str = "all",
+        include_hashes: bool = False,
+    ) -> BrowseResponse:
         """Unified vault browse.
 
         ``depth`` is **tree-depth from the browse root**, mirroring the
@@ -894,6 +973,7 @@ class DocumentService:
             items.extend(await self._browse_collections(coll_repo, vault, vault_id, prefix))
             items.extend(await self._browse_docs(
                 doc_repo, vault, vault_id, prefix=prefix, max_depth=depth,
+                include_hashes=include_hashes,
             ))
         if show_tables:
             items.extend(await self._browse_tables_by_depth(
@@ -902,6 +982,7 @@ class DocumentService:
         if show_files:
             items.extend(await self._browse_files_by_depth(
                 vault, vault_id, prefix=prefix, max_depth=depth,
+                include_hashes=include_hashes,
             ))
 
         hint = self._browse_hint(vault, collection, items)
@@ -941,20 +1022,39 @@ class DocumentService:
         *,
         prefix: str,
         max_depth: int,
+        include_hashes: bool = False,
     ) -> list[BrowseItem]:
         """Documents under ``prefix`` whose depth (from inside the
         prefix) is ≤ ``max_depth``. ``max_depth < 0`` is unbounded."""
         rows = await doc_repo.list_docs_by_depth(vault_id, max_depth, prefix)
-        return [
-            BrowseItem(
-                name=r["title"], path=r["path"], type="document",
-                uri=doc_uri(vault, r["path"]),
-                summary=r["summary"], doc_type=r["doc_type"], status=r["status"],
-                tags=list(r["tags"]) if r["tags"] else [],
-                last_updated=r["updated_at"],
+        items: list[BrowseItem] = []
+        for r in rows:
+            content_hash = r.get("content_hash")
+            hash_algorithm = r.get("hash_algorithm")
+            if include_hashes and (
+                not content_hash
+                or hash_algorithm != HASH_ALGORITHM
+                or r.get("content_hash_commit") != r.get("current_commit")
+            ):
+                raw = await asyncio.to_thread(self.git.read_file, vault, r["path"])
+                if raw is not None:
+                    _, body = _parse_markdown(raw)
+                    content_hash, hash_algorithm = await self._ensure_document_hash(
+                        doc_repo, r, body,
+                    )
+            items.append(
+                BrowseItem(
+                    name=r["title"], path=r["path"], type="document",
+                    uri=doc_uri(vault, r["path"]),
+                    summary=r["summary"], doc_type=r["doc_type"], status=r["status"],
+                    tags=list(r["tags"]) if r["tags"] else [],
+                    last_updated=r["updated_at"],
+                    current_commit=r.get("current_commit") if include_hashes else None,
+                    content_hash=content_hash if include_hashes else None,
+                    hash_algorithm=hash_algorithm if include_hashes else None,
+                )
             )
-            for r in rows
-        ]
+        return items
 
     async def _browse_tables_by_depth(
         self,
@@ -963,6 +1063,7 @@ class DocumentService:
         *,
         prefix: str,
         max_depth: int,
+        include_hashes: bool = False,
     ) -> list[BrowseItem]:
         """Tables under ``prefix`` whose containing-collection depth
         (relative to the prefix) is ≤ ``max_depth``. ``max_depth < 0``
@@ -1007,6 +1108,7 @@ class DocumentService:
         *,
         prefix: str,
         max_depth: int,
+        include_hashes: bool = False,
     ) -> list[BrowseItem]:
         from app.repositories import vault_files_repo
         pool = await get_pool()
@@ -1037,6 +1139,10 @@ class DocumentService:
                 size_bytes=r["size_bytes"], summary=r["description"],
                 collection=r.get("collection"),
                 last_updated=r["created_at"],
+                content_hash=r.get("content_hash") if include_hashes else None,
+                hash_algorithm=r.get("hash_algorithm") if include_hashes else None,
+                etag=r.get("etag") if include_hashes else None,
+                storage_version=r.get("storage_version") if include_hashes else None,
             )
             for r in rows
         ]

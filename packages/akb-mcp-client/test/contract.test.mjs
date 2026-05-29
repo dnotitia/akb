@@ -24,7 +24,7 @@ function it(name, fn) {
 
 const initiateUploadResp = JSON.stringify({
   kind: "file",
-  id: "11111111-2222-3333-4444-555555555555",
+  uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555",
   vault: "myvault",
   upload_url: "https://s3.example/presigned",
   s3_key: "myvault/abc123_file.bin",
@@ -33,11 +33,14 @@ const initiateUploadResp = JSON.stringify({
 
 const downloadResp = JSON.stringify({
   kind: "file",
-  id: "11111111-2222-3333-4444-555555555555",
   name: "file.bin",
   download_url: "https://s3.example/presigned-get",
   mime_type: "application/octet-stream",
   size_bytes: 4096,
+  content_hash: "a".repeat(64),
+  hash_algorithm: "sha256",
+  etag: "etag-1",
+  storage_version: "version-1",
   expires_in: 3600,
 });
 
@@ -60,18 +63,19 @@ const listResp = JSON.stringify({
 
 // ── Proxy-pattern destructure mirrors ────────────────────────────
 
-it("_putFile destructures id + upload_url", () => {
-  const { id: fileId, upload_url } = JSON.parse(initiateUploadResp);
-  assert.equal(typeof fileId, "string");
-  assert.equal(fileId.length, 36);
+it("_putFile destructures uri + upload_url", () => {
+  const { uri, upload_url } = JSON.parse(initiateUploadResp);
+  assert.match(uri, /^akb:\/\/myvault\/file\//);
   assert.match(upload_url, /^https:/);
 });
 
-it("_getFile destructures name + download_url + size_bytes", () => {
-  const { name: filename, download_url, size_bytes } = JSON.parse(downloadResp);
+it("_getFile destructures name + download_url + size_bytes + hash fields", () => {
+  const { name: filename, download_url, size_bytes, content_hash, hash_algorithm } = JSON.parse(downloadResp);
   assert.equal(filename, "file.bin");
   assert.match(download_url, /^https:/);
   assert.equal(size_bytes, 4096);
+  assert.match(content_hash, /^[0-9a-f]{64}$/);
+  assert.equal(hash_algorithm, "sha256");
 });
 
 it("_deleteFile passthrough produces a dict (not bool)", () => {
@@ -94,11 +98,11 @@ it("envelope adds kind without breaking legacy fields", () => {
   // Confirm the old keys the proxy reads are still present alongside
   // the new envelope discriminator.
   const init = JSON.parse(initiateUploadResp);
-  for (const k of ["kind", "id", "upload_url", "s3_key", "expires_in"]) {
+  for (const k of ["kind", "uri", "upload_url", "s3_key", "expires_in"]) {
     assert.ok(k in init, `initiate response missing ${k}`);
   }
   const dl = JSON.parse(downloadResp);
-  for (const k of ["kind", "id", "name", "download_url", "size_bytes"]) {
+  for (const k of ["kind", "name", "download_url", "size_bytes", "content_hash", "hash_algorithm"]) {
     assert.ok(k in dl, `download response missing ${k}`);
   }
 });
