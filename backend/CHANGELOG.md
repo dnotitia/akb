@@ -5,6 +5,78 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.4 — 2026-05-28
+
+Security + data-integrity patch. Findings came out of a full
+functional/logic review of the backend (20-subsystem multi-agent pass,
+55 confirmed findings); this release lands the highest-priority cut.
+Each fix was reproduced in the audit stack BEFORE the change and
+re-verified SAFE after. No schema change, no migration.
+
+### Security — publication public surface (unauthenticated)
+
+Publications are served at `/api/v1/public/{slug}` with no auth, so
+these were directly exploitable by anyone with the URL.
+
+- **Public `table_query` ran as the privileged pool role.**
+  `resolve_table_query_publication` executed the canned SQL on the
+  default service-role connection with only `SET TRANSACTION READ ONLY`
+  — no `SET LOCAL ROLE`, no table ACL. A publication such as
+  `SELECT password_hash FROM users` / `SELECT token_hash FROM tokens` /
+  `SELECT * FROM vt_othervault__secret` returned rows to unauthenticated
+  visitors (verified: `SELECT count(*) FROM users` → 59 rows;
+  `SELECT current_user` → `akb`). Now the query runs under the
+  publication CREATOR's PG role (`SET LOCAL ROLE akb_user_<created_by>`),
+  so PG returns 42501 for anything the creator could not read via
+  `akb_sql`. Publications without a recorded creator fail closed (403).
+  Adds `s.created_by` to the resolve SELECT.
+- **`akb_publish` / `create_publication_route` now authorize every vault
+  in `query_vault_names`,** not just the route vault — a writer on one
+  vault could otherwise publish a query reading another vault's tables.
+- **`delete_publication` IDOR fixed.** The REST delete route bound the
+  delete only to the publication id, ignoring the route vault, so a
+  writer on any vault could delete any publication by id. Now scoped to
+  `WHERE id=$1 AND vault_id=$2`; returns 404 otherwise.
+- **`create_snapshot` cross-vault fixed.** Loaded the publication by id
+  with no vault filter (REST and MCP), letting a writer on vault A
+  force-execute and snapshot vault B's publication. Now binds to the
+  authorized vault and rejects with 404 before running the query / S3
+  write.
+
+### Data integrity / correctness
+
+- **`delete_vault` orphaned file-chunk vectors when S3 is configured.**
+  The 0.3.2 file-chunk outbox enqueue ran AFTER the early
+  `DELETE FROM vault_files` (which only fires when S3 is configured), so
+  it read zero rows and every file chunk CASCADE-dropped from PG without
+  a `vector_delete_outbox` entry — permanent orphan points. The 0.3.2
+  unit test missed it because the audit stack has no S3. File ids are now
+  captured (`SELECT id, s3_key`) and enqueued BEFORE the delete.
+- **`FileService.delete` swallowed chunk-delete failures.** The
+  `delete_file_chunks` call was wrapped in a `try/except` that logged and
+  continued, defeating the 03-F1 contract (the enqueue is meant to RAISE
+  so a failure rolls back the file delete). Removed; failures now roll
+  back the whole delete like the document/table/vault paths.
+- **Collection-scoped search 500'd.** The search ACL prefilter's
+  file-candidate branch filtered on `vault_files.collection`, a column
+  dropped in migration 020 (replaced by `collection_id`). Any
+  `search?...&collection=X` with the default `doc_type` raised
+  UndefinedColumn and 500'd the whole request. Now joins `collections`
+  on `collection_id` and prefix-matches `c.path`, same as the documents
+  branch.
+
+### Tests
+
+- `backend/tests/concurrency/repro_pub_security.sh` — before/after
+  VULNERABLE↔SAFE probes for the publication authz holes + the search
+  crash.
+- `test_invariants_unit.py`: `test_inv7b` (delete_vault file outbox with
+  S3 configured) and `test_p1_2` (FileService.delete rollback).
+
+Regression: `test_mcp_e2e` 76/76, `test_invariants.sh` 9/9, unit 6/6.
+Legit flows reverified (own-table publication view, authorized
+multi-vault publish, owner delete/snapshot).
+
 ## 0.3.3 — 2026-05-28
 
 Hotfix on top of 0.3.2. The 0.3.2 image failed to start on existing

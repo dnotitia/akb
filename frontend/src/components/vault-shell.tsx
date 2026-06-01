@@ -7,9 +7,26 @@ import { TitleBar, VaultActions, type VaultPageKind } from "@/components/title-b
 import { ErrorBoundary } from "@/components/error-boundary";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 
+// Tree (collection) column is drag-resizable. Width persists across
+// sessions in localStorage and is clamped so it can never collapse the
+// content column or overrun the viewport. Double-clicking the handle
+// resets to the default.
+const TREE_MIN = 180;
+const TREE_MAX = 560;
+const TREE_DEFAULT = 260;
+const TREE_WIDTH_KEY = "akb.treeWidth";
+
+function loadTreeWidth(): number {
+  if (typeof window === "undefined") return TREE_DEFAULT;
+  const saved = Number(window.localStorage.getItem(TREE_WIDTH_KEY));
+  return Number.isFinite(saved) && saved >= TREE_MIN && saved <= TREE_MAX
+    ? saved
+    : TREE_DEFAULT;
+}
+
 /**
  * 3-column vault workspace:
- *   [ 200px vault-nav | 260px tree | 1fr content ]
+ *   [ 200px vault-nav | <resizable> tree | 1fr content ]
  * Above them a 36px TitleBar with breadcrumb + VaultActions.
  * Each page renders into the Outlet and owns its inner layout (e.g. the
  * document page still decides where its right-rail outline goes).
@@ -18,6 +35,45 @@ export function VaultShell() {
   const { name } = useParams<{ name: string }>();
   const location = useLocation();
   const [visible, setVisible] = useState(true);
+  const [treeWidth, setTreeWidth] = useState<number>(loadTreeWidth);
+
+  // Persist the chosen width so it survives reloads and vault switches.
+  useEffect(() => {
+    window.localStorage.setItem(TREE_WIDTH_KEY, String(treeWidth));
+  }, [treeWidth]);
+
+  // Pointer-drag resize of the tree column. We capture the pointer on the
+  // handle so the drag keeps tracking even when the cursor leaves the thin
+  // hit area, and lock body cursor/selection for the duration.
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
+  const onResizeStart = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      dragRef.current = { startX: e.clientX, startW: treeWidth };
+      e.currentTarget.setPointerCapture(e.pointerId);
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [treeWidth],
+  );
+  const onResizeMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const next = Math.min(
+      TREE_MAX,
+      Math.max(TREE_MIN, drag.startW + (e.clientX - drag.startX)),
+    );
+    setTreeWidth(next);
+  }, []);
+  const onResizeEnd = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }, []);
 
   // Tree defaults to open on every vault switch — clicking the active
   // vault row in the nav (or ⌘\) toggles it.
@@ -130,7 +186,7 @@ export function VaultShell() {
   // room by default. Members/settings/activity follow the same rule —
   // those are vault-level admin pages, not content browsing.
   const showTree = !isGraph && !isAdminPage && visible;
-  const gridCols = showTree ? "200px 260px 1fr" : "200px 1fr";
+  const gridCols = showTree ? `200px ${treeWidth}px 1fr` : "200px 1fr";
 
   return (
     <VaultRefreshProvider refetchTree={refetchTree} refetchVaults={refetchVaults}>
@@ -140,7 +196,7 @@ export function VaultShell() {
           right={<VaultActions vault={name} page={page} />}
         />
         <div
-          className="grid grid-cols-[var(--cols)] flex-1 min-h-0"
+          className="grid grid-cols-[var(--cols)] flex-1 min-h-0 relative"
           style={{ ["--cols" as any]: gridCols }}
         >
           <VaultNav
@@ -154,6 +210,23 @@ export function VaultShell() {
               vault={name}
               onRefetchReady={onTreeRefetchReady}
             />
+          )}
+          {showTree && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize collection tree"
+              onPointerDown={onResizeStart}
+              onPointerMove={onResizeMove}
+              onPointerUp={onResizeEnd}
+              onPointerCancel={onResizeEnd}
+              onDoubleClick={() => setTreeWidth(TREE_DEFAULT)}
+              title="Drag to resize · double-click to reset"
+              className="group absolute top-0 bottom-0 z-20 w-2 cursor-col-resize touch-none"
+              style={{ left: `calc(200px + ${treeWidth}px)`, transform: "translateX(-50%)" }}
+            >
+              <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-accent group-active:bg-accent" />
+            </div>
           )}
           {/* Content column. The tree toggle lives here so it naturally
               sits on the outlet's left edge — next to the explorer when

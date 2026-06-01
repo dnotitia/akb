@@ -474,10 +474,12 @@ class FileService:
                     )
 
                 # Drop the metadata chunk (outbox-driven vector-store delete).
-                try:
-                    await delete_file_chunks(conn, file_id)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("file chunk delete failed for %s: %s", file_id, e)
+                # delete_file_chunks → _drop_source_chunks_with_outbox is
+                # designed to RAISE so a failed outbox enqueue rolls back the
+                # whole file delete (03-F1). Do NOT swallow it: swallowing
+                # commits the vault_files delete + s3 enqueue while leaving
+                # the chunk's vector-store point orphaned.
+                await delete_file_chunks(conn, file_id)
 
                 await _enqueue_s3_delete(conn, row["s3_key"])
 

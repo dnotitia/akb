@@ -898,6 +898,14 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
         return {"error": f"Unknown resource_type: {resource_type}"}
 
     await check_vault_access(uid, vault_name, required_role="writer")
+    # A table_query publication runs against EVERY vault in
+    # query_vault_names, served to unauthenticated visitors. Authorize
+    # each one — without this a writer on one vault could publish a query
+    # that reads another vault's tables (cross-vault exfiltration).
+    if resource_type == "table_query":
+        for qv in (args.get("query_vault_names") or [vault_name]):
+            if qv != vault_name:
+                await check_vault_access(uid, qv, required_role="writer")
     created_by = uuid.UUID(uid) if uid and uid != _SYSTEM_UID else None
 
     try:
@@ -979,17 +987,22 @@ async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_publication_snapshot")
 async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> dict:
     """Create a snapshot of a table_query publication."""
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    access = await check_vault_access(uid, args["vault"], required_role="writer")
     slug = args["slug"]
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Bind to the authorized vault — without it a writer on `vault`
+        # could snapshot (force-execute) any publication by slug.
         row = await conn.fetchrow(
-            "SELECT id FROM publications WHERE slug = $1", slug,
+            "SELECT id FROM publications WHERE slug = $1 AND vault_id = $2",
+            slug, access["vault_id"],
         )
     if not row:
         return {"error": f"Publication not found: {slug}"}
     try:
-        return await publication_service.create_snapshot(row["id"])
+        return await publication_service.create_snapshot(
+            row["id"], expected_vault_id=access["vault_id"],
+        )
     except publication_service.PublicationError as e:
         return {"error": e.message}
     except Exception as e:
