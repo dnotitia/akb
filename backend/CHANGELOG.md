@@ -5,6 +5,93 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.6 — 2026-05-28
+
+The "P2" cut of the functional/logic review — four data-integrity /
+contract bugs plus one latent publication-cascade bug. Each was
+designed from a current-code blueprint (adversarially checked) and
+verified with a unit test. No schema change, no migration.
+
+### Archived vaults are now genuinely read-only (both directions fixed)
+
+The archive contract was broken in two opposing ways:
+- **Writes weren't blocked.** `check_vault_access` only enforced the
+  archived guard for `required_role == "writer"`, and the akb_sql write
+  surface gated at `reader` then relied on PG ACL — which has no archive
+  concept. A writer/admin/owner could still `INSERT/UPDATE/DELETE` (and
+  `drop_table`/`alter_table`) on an archived vault.
+- **Reads broke after reconcile.** `_reconcile_vault_roles` fetched only
+  non-archived vaults and then *dropped* every group role not in that
+  set, so on the next reconcile (startup + periodic) an archived vault's
+  reader role + table GRANTs were dropped and `akb_sql` SELECT returned
+  42501 for everyone incl. the owner. `_diff_vaults` used a different
+  vault set, so diff/reconcile never converged (`is_clean()` never True).
+
+One coherent model now: archived = READ-ONLY. The write block lives in
+the app layer — `execute_sql` rejects any non-SELECT against an archived
+referenced vault, and `check_vault_access`'s guard fires for `writer`
+AND `admin` (so create/alter/drop table are refused), positioned before
+the admin/owner short-circuits so even a system admin is blocked. PG
+write grants are intentionally preserved (so unarchive is instant), and
+the reconciler now keeps archived vaults' roles by fetching ALL vaults —
+matching `_diff_vaults`. `delete_vault` passes a new `allow_archived=True`
+so you can still delete an archived vault.
+
+### `alter_table` reserved-column guard
+
+`create_table` rejected `id`/`created_at`/`updated_at`/`created_by`, but
+`alter_table` didn't — so `drop_columns=["id"]` dropped the table's
+primary key, and `add_columns=[{name:"created_at",type:"text"}]` made
+the registry lie about a bookkeeping column's type. A shared
+`_validate_column_name` now guards add/drop/rename in both paths
+(reserved names + `^[a-z][a-z0-9_]*$` shape so the registry name can't
+diverge from its `safe_ident` PG identity), with the MCP handler
+surfacing the `ValueError` as a friendly error.
+
+### Collection delete handles tables
+
+`CollectionService.delete` enumerated only documents and files, never
+`vault_tables` — so a collection containing only a table passed the
+empty-mode check and was silently destroyed, and even recursive delete
+left the table (re-homed to vault root via `collection_id`
+ON DELETE SET NULL). It now lists tables under the prefix (`FOR UPDATE`),
+counts them in the empty-mode 409, and in recursive mode tears each one
+down (dynamic PG table + chunk outbox + registry row + edges) inside the
+same transaction, returning a `deleted_tables` count.
+
+### Embedding response paired by `index`, not array order
+
+`_embed_call` zipped the embeddings response to its inputs by position.
+The OpenAI embeddings contract pairs each output to its input via the
+item's `index` field; an OpenAI-compatible gateway that reassembles a
+batched response out of order would silently attach vectors to the wrong
+chunks. The response is now reordered by `index` with a completeness
+assertion (`{0..n-1}`); a malformed/gapped index set is treated as a
+transient error so the worker retries.
+
+### Fix: `delete_publications_for_document` UUID branch built a legacy URI
+
+When called with a doc UUID (vs a canonical URI), it materialized
+`akb://V/doc/{path}` (pre-0.3.0 legacy shape) which never matched the
+canonical `akb://V/coll/{coll}/doc/{name}` stored in
+`publications.resource_uri` — so the cascade silently left orphan
+publications. Now built via `doc_uri`. (Dormant — the only live caller
+passes a canonical URI and the real doc-delete path already uses
+`doc_uri` — but a latent landmine, now closed.)
+
+### Tests
+
+- `test_invariants_unit.py`: archived read-only (write blocked / read
+  works), alter reserved-column guard (PK survives), collection delete
+  table teardown + empty-mode reject, embed index reorder, and the
+  publication-cascade canonical match.
+- Modernized two stale `test_collection_*` cases that still inserted into
+  the `vault_files.collection` column dropped in migration 020.
+
+Regression: `test_mcp_e2e` 76/76, `test_pg_rbac_e2e` 50/50,
+`repro_pub_security` 4/4 SAFE, unit suite green. Archived-vault model
+verified end-to-end (read 200, write/DDL refused).
+
 ## 0.3.5 — 2026-05-28
 
 Permanently fixes the recurring migration-026 boot crash and stops new

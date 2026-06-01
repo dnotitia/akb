@@ -44,12 +44,18 @@ def validate_public_access(level: str) -> str:
 
 # ── Permission checks ───────────────────────────────────────
 
-async def check_vault_access(user_id: str, vault_name: str, required_role: str = "reader") -> dict:
+async def check_vault_access(
+    user_id: str, vault_name: str, required_role: str = "reader",
+    *, allow_archived: bool = False,
+) -> dict:
     """Check if user has at least the required role on a vault.
 
     Returns vault info dict if authorized.
     Raises ForbiddenError if not.
     Raises NotFoundError if vault doesn't exist.
+
+    `allow_archived` lets a destructive lifecycle op (delete_vault) run
+    on an archived vault; every normal mutating caller leaves it False.
     """
     pool = await get_pool()
     uid = uuid.UUID(user_id)
@@ -59,12 +65,21 @@ async def check_vault_access(user_id: str, vault_name: str, required_role: str =
         if not vault:
             raise NotFoundError("Vault", vault_name)
 
-        # Check archived vault FIRST — even admin/owner can't write to archived.
-        # Note: admin-role mutations like grant/revoke also block on archived,
-        # but that check lives inside grant_access/revoke_access themselves so
-        # owner-level operations (delete_vault, transfer_ownership, unarchive)
-        # that route through `required_role="admin"` can still proceed.
-        if vault["status"] == "archived" and required_role in ("writer",):
+        # Archived vault = READ-ONLY for EVERYONE incl. admin/owner. This
+        # guard sits BEFORE the is_admin / owner short-circuits below, so
+        # even a system admin or the owner is refused a mutation. It fires
+        # for any mutating-role request: 'writer' (put/update/table row
+        # writes) and 'admin' (drop_table / create_table / alter_table).
+        # PG ACL has no archive concept and we intentionally keep the
+        # write grants intact (so unarchive is instant) — the block lives
+        # here in the app layer. Owner-level lifecycle (unarchive,
+        # transfer_ownership) routes through required_role='owner', and
+        # delete_vault passes allow_archived=True (you archive then delete).
+        if (
+            not allow_archived
+            and vault["status"] == "archived"
+            and required_role in ("writer", "admin")
+        ):
             raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
 
         # External-git mirror vaults are read-only to every user (incl. owner).
@@ -775,7 +790,11 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     from app.services.git_service import GitService
     from app.services.index_service import delete_vault_chunks
 
-    await check_vault_access(user_id, vault_name, required_role="admin")
+    # Deletion is a lifecycle op that must work on archived vaults (you
+    # archive, then delete) — bypass the archived read-only guard here.
+    await check_vault_access(
+        user_id, vault_name, required_role="admin", allow_archived=True,
+    )
     pool = await get_pool()
     async with pool.acquire() as conn:
         vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)

@@ -295,6 +295,7 @@ async def test_delete_empty(service_with_fake_git, vault_name, pool, vault_id):
         "deleted_docs": 0,
         "deleted_files": 0,
         "deleted_sub_collections": 0,
+        "deleted_tables": 0,
     }
     # No docs => no git commit attempted.
     assert fake.calls == []
@@ -380,12 +381,18 @@ async def test_delete_cascade_removes_docs_files_row(
     # the vault_files / s3_delete_outbox path.
     file_id = uuid.uuid4()
     async with pool.acquire() as conn:
+        # vault_files.collection (TEXT) was dropped in migration 020 →
+        # collection_id FK. Resolve the 'drop-me' collection row.
+        coll_id = await conn.fetchval(
+            "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
+            vault_id, "drop-me",
+        )
         await conn.execute(
             """
-            INSERT INTO vault_files (id, vault_id, collection, name, s3_key)
+            INSERT INTO vault_files (id, vault_id, collection_id, name, s3_key)
             VALUES ($1, $2, $3, $4, $5)
             """,
-            file_id, vault_id, "drop-me", "logo.png", f"k/{file_id}",
+            file_id, vault_id, coll_id, "logo.png", f"k/{file_id}",
         )
 
     out = await service.delete(

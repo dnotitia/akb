@@ -186,13 +186,23 @@ async def test_list_files_under_includes_folder_and_descendants(pool, vault_id):
             ("media-extra",  "decoy.png",   "k3"),
             ("other",        "other.png",   "k4"),
         ]:
+            # vault_files.collection (TEXT) was dropped in migration 020 →
+            # collection_id FK. Materialize the collection row, then link
+            # the file via collection_id.
+            coll_id = await conn.fetchval(
+                "INSERT INTO collections (id, vault_id, path, name) "
+                "VALUES (gen_random_uuid(), $1, $2, $3) "
+                "ON CONFLICT (vault_id, path) DO UPDATE SET name = EXCLUDED.name "
+                "RETURNING id",
+                vault_id, coll, coll.rsplit("/", 1)[-1],
+            )
             await conn.execute(
                 """
                 INSERT INTO vault_files
-                    (id, vault_id, collection, name, s3_key)
+                    (id, vault_id, collection_id, name, s3_key)
                 VALUES ($1, $2, $3, $4, $5)
                 """,
-                uuid.uuid4(), vault_id, coll, name, key,
+                uuid.uuid4(), vault_id, coll_id, name, key,
             )
 
     rows = await repo.list_files_under(vault_id, "media")

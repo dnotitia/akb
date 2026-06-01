@@ -351,8 +351,27 @@ async def _embed_call(
 
     try:
         data = resp.json()
-        return "ok", [item["embedding"] for item in data["data"]], ""
-    except (KeyError, ValueError) as e:
+        items = data["data"]
+        # OpenAI /v1/embeddings pairs each output to its input via the
+        # item's `index` field, NOT array order. Some OpenAI-compatible
+        # gateways / load-balancers fan a batch out to replicas and
+        # reassemble responses out of order; zipping by position would
+        # then attach vectors to the wrong chunks (silent search
+        # corruption). Reorder by `index` and assert the index set is
+        # exactly {0..n-1} before returning a positionally-aligned list.
+        by_index: dict[int, list[float]] = {}
+        for item in items:
+            idx = item["index"]
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                raise ValueError(f"non-int index {idx!r}")
+            if idx in by_index:
+                raise ValueError(f"duplicate index {idx}")
+            by_index[idx] = item["embedding"]
+        n = len(batch)
+        if set(by_index) != set(range(n)):
+            raise ValueError(f"index set {sorted(by_index)} != 0..{n - 1}")
+        return "ok", [by_index[i] for i in range(n)], ""
+    except (KeyError, ValueError, TypeError) as e:
         return "transient", None, f"malformed response: {e}"
 
 
