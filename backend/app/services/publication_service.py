@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import asyncpg
 import bcrypt
 import frontmatter
 
@@ -424,17 +425,40 @@ async def create_publication_for_vault(
     )
 
 
-async def delete_publication(*, publication_id: uuid.UUID | None = None, slug: str | None = None) -> bool:
-    """Delete a publication by id or slug. Returns True if deleted."""
+async def delete_publication(
+    *,
+    publication_id: uuid.UUID | None = None,
+    slug: str | None = None,
+    expected_vault_id: uuid.UUID | None = None,
+) -> bool:
+    """Delete a publication by id or slug. Returns True if deleted.
+
+    `expected_vault_id` binds the delete to a vault: the row is removed
+    only if it belongs to that vault. Callers that authorized the request
+    against a specific vault MUST pass it, otherwise a writer on vault A
+    could delete any publication by id regardless of owning vault (IDOR).
+    """
     if not publication_id and not slug:
         raise ValueError("Either publication_id or slug must be provided")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         if publication_id:
-            result = await conn.execute("DELETE FROM publications WHERE id = $1", publication_id)
+            if expected_vault_id is not None:
+                result = await conn.execute(
+                    "DELETE FROM publications WHERE id = $1 AND vault_id = $2",
+                    publication_id, expected_vault_id,
+                )
+            else:
+                result = await conn.execute("DELETE FROM publications WHERE id = $1", publication_id)
         else:
-            result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
+            if expected_vault_id is not None:
+                result = await conn.execute(
+                    "DELETE FROM publications WHERE slug = $1 AND vault_id = $2",
+                    slug, expected_vault_id,
+                )
+            else:
+                result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
     deleted = result.endswith(" 1")
     if deleted:
         logger.info("Publication deleted: %s", publication_id or slug)
@@ -602,6 +626,7 @@ async def resolve_publication(
                    s.password_hash, s.max_views, s.view_count, s.expires_at,
                    s.mode, s.snapshot_s3_key, s.snapshot_at,
                    s.section_filter, s.allow_embed, s.title, s.created_at,
+                   s.created_by,
                    v.name AS vault_name
             FROM publications s
             JOIN vaults v ON s.vault_id = v.id
@@ -990,10 +1015,44 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
         if not rewritten.strip().upper().startswith(("SELECT", "WITH")):
             raise PublicationError("Only SELECT queries are allowed for publications", status_code=400)
 
+        # Execute under the publication CREATOR's PG role, never the
+        # privileged pool role. Without this, a public (unauthenticated)
+        # visitor's query runs as the service role and can read system
+        # tables (users/tokens) and any vault's vt_* tables — full
+        # cross-vault / system-table exfiltration. Running as
+        # akb_user_<created_by> makes PG return 42501 for anything the
+        # creator could not have read via akb_sql, so a publication can
+        # only ever expose what its author was authorized to see.
+        from app.services.role_sync import user_role_name
+        created_by = publication.get("created_by")
+        if not created_by:
+            # Legacy publications without a recorded creator cannot be
+            # safely scoped — fail closed rather than fall back to the
+            # privileged role.
+            raise PublicationError(
+                "This shared query can no longer be served (no owner on record).",
+                status_code=403,
+            )
+        role = user_role_name(created_by)
         try:
             async with conn.transaction():
                 await conn.execute("SET TRANSACTION READ ONLY")
+                await conn.execute(f'SET LOCAL ROLE "{role}"')
                 rows = await conn.fetch(rewritten, *values)
+        except asyncpg.exceptions.InsufficientPrivilegeError:
+            # 42501 — the creator's role lacks SELECT on a referenced
+            # table (system table or another vault). Do not echo the
+            # table name to the public visitor.
+            raise PublicationError(
+                "This shared query references data that is no longer accessible.",
+                status_code=403,
+            )
+        except asyncpg.exceptions.UndefinedObjectError:
+            # SET LOCAL ROLE to a role that no longer exists (creator deleted).
+            raise PublicationError(
+                "This shared query can no longer be served (owner removed).",
+                status_code=403,
+            )
         except Exception as e:
             msg = str(e)
             if "read-only transaction" in msg:
@@ -1036,11 +1095,20 @@ async def _read_snapshot(publication: dict) -> dict:
     return data
 
 
-async def create_snapshot(publication_id: uuid.UUID) -> dict:
+async def create_snapshot(
+    publication_id: uuid.UUID,
+    *,
+    expected_vault_id: uuid.UUID | None = None,
+) -> dict:
     """Execute a table_query publication's SQL once and store result in S3.
 
     The publication's `mode` is then flipped to 'snapshot' so subsequent visits
     return the cached result instead of re-running the query.
+
+    `expected_vault_id` binds the snapshot to a vault: callers that
+    authorized the request against a specific vault MUST pass it, else a
+    writer on vault A could force-execute and snapshot any publication by
+    id regardless of owning vault (cross-vault execution).
     """
     pool = await get_pool()
     # Session-scoped advisory lock keyed on the publication id so two
@@ -1063,6 +1131,9 @@ async def create_snapshot(publication_id: uuid.UUID) -> dict:
                 publication_id,
             )
             if row is None:
+                raise PublicationNotFound(str(publication_id))
+            # Reject cross-vault snapshots BEFORE running the query / S3 write.
+            if expected_vault_id is not None and row["vault_id"] != expected_vault_id:
                 raise PublicationNotFound(str(publication_id))
 
             publication = _publication_row_to_dict(row)

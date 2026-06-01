@@ -129,6 +129,14 @@ async def create_publication_route(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="writer")
+    # A table_query publication runs against EVERY vault in
+    # query_vault_names, served to unauthenticated visitors. Authorize
+    # each one so a writer on one vault cannot publish a query that reads
+    # another vault's tables (cross-vault exfiltration).
+    if req.resource_type == "table_query":
+        for qv in (req.query_vault_names or [vault]):
+            if qv != vault:
+                await check_vault_access(user.user_id, qv, required_role="writer")
     # Split the canonical URI into the service-layer args
     # (doc path / file uuid). Reject mismatches between resource_type
     # and URI scheme so callers can't smuggle a doc URI into a file
@@ -194,12 +202,18 @@ async def delete_publication_route(
     publication_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    await check_vault_access(user.user_id, vault, required_role="writer")
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
     try:
         sid = uuid.UUID(publication_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid publication_id")
-    deleted = await publication_service.delete_publication(publication_id=sid)
+    # Bind the delete to the authorized vault — without this a writer on
+    # `vault` could delete any publication by id regardless of owner (IDOR).
+    deleted = await publication_service.delete_publication(
+        publication_id=sid, expected_vault_id=access["vault_id"],
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Publication not found in this vault")
     return {"deleted": deleted}
 
 
@@ -220,13 +234,15 @@ async def create_snapshot_route(
     publication_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    await check_vault_access(user.user_id, vault, required_role="writer")
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
     try:
         sid = uuid.UUID(publication_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid publication_id")
     try:
-        return await publication_service.create_snapshot(sid)
+        return await publication_service.create_snapshot(
+            sid, expected_vault_id=access["vault_id"],
+        )
     except PublicationError as e:
         raise _publication_error_to_http(e)
 

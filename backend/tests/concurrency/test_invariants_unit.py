@@ -335,3 +335,119 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
         "vector_delete_outbox should carry the three chunk ids forward "
         f"for the delete worker; got {outbox}"
     )
+
+
+# ── INV-7b: delete_vault file-chunk outbox with S3 CONFIGURED (P1-1) ─
+
+
+@pytest.mark.asyncio
+async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch):
+    """When S3 is configured, delete_vault deletes vault_files early (to
+    issue S3 object deletes), so the file-chunk outbox enqueue must read
+    the file ids BEFORE that delete — otherwise file chunks CASCADE out
+    of PG with no vector_delete_outbox row and orphan in the vector store.
+
+    The default-env inv7 test does not catch this because the audit stack
+    has no S3 (the early `DELETE FROM vault_files` branch is skipped). Here
+    we force S3 on and stub the adapter so the early delete runs.
+    """
+    from app.config import settings
+    from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
+    from app.services import access_service
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    monkeypatch.setattr(settings, "s3_endpoint_url", "http://stub-s3:9000")
+    # Stub the S3 adapter so the early per-file delete loop is a no-op.
+    from app.services.adapters import s3_adapter
+    monkeypatch.setattr(s3_adapter, "delete", lambda *_a, **_k: None)
+
+    try:
+        get_role_sync()
+    except RuntimeError:
+        set_role_sync(RoleSync(pool))
+
+    async with pool.acquire() as conn:
+        admin_id = await conn.fetchval(
+            "INSERT INTO users (id, username, email, password_hash, is_admin) "
+            "VALUES (gen_random_uuid(), $1, $2, 'x', true) RETURNING id",
+            f"inv7badm-{uuid.uuid4().hex[:6]}",
+            f"inv7badm-{uuid.uuid4().hex[:6]}@test.local",
+        )
+    vault_repo = VaultRepository(pool)
+    name = f"_inv7b_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(
+        name=name, description="inv7b", git_path=f"/tmp/{name}.git", owner_id=admin_id,
+    )
+
+    file_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, name, s3_key, mime_type, size_bytes, created_at) VALUES "
+            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, NOW())",
+            file_id, vid, f"_inv7b_{file_id}",
+        )
+        await conn.execute(
+            "INSERT INTO chunks (id, source_type, source_id, vault_id, chunk_index, content) "
+            "VALUES (gen_random_uuid(), 'file', $1, $2, 0, 'f')",
+            file_id, vid,
+        )
+
+    await access_service.delete_vault(user_id=str(admin_id), vault_name=name)
+
+    async with pool.acquire() as conn:
+        post = await conn.fetchval(
+            "SELECT COUNT(*) FROM chunks WHERE source_id = $1", file_id,
+        )
+        outbox = await conn.fetchval(
+            "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = $1", file_id,
+        )
+
+    assert post == 0, f"file chunk should be gone from PG, got {post}"
+    assert outbox == 1, (
+        "file chunk must be enqueued in vector_delete_outbox even when S3 is "
+        f"configured (vault_files deleted early); got {outbox}"
+    )
+
+
+# ── P1-2: FileService.delete must roll back on chunk-delete failure ──
+
+
+@pytest.mark.asyncio
+async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
+    """FileService.delete wraps the chunk/outbox cleanup in the file-delete
+    transaction. If delete_file_chunks raises (e.g. a failed outbox
+    enqueue), the WHOLE delete must roll back — otherwise the vault_files
+    row + s3-delete enqueue commit while the chunk's vector point orphans.
+    Pre-fix the exception was swallowed and the delete committed anyway.
+    """
+    from app.services import file_service as fs_mod
+    from app.services.file_service import FileService
+
+    vault_repo = VaultRepository(pool)
+    name = f"_p12_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(
+        name=name, description="p12", git_path=f"/tmp/{name}.git", owner_id=None,
+    )
+    file_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, name, s3_key, mime_type, size_bytes, created_at) VALUES "
+            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, NOW())",
+            file_id, vid, f"_p12_{file_id}",
+        )
+
+    # Force the chunk delete to blow up the way a failed outbox enqueue would.
+    async def _boom(*_a, **_k):
+        raise RuntimeError("simulated outbox enqueue failure")
+
+    monkeypatch.setattr(fs_mod, "delete_file_chunks", _boom)
+
+    with pytest.raises(Exception):
+        await FileService().delete(vid, str(file_id), actor_id="p12")
+
+    # The file row must survive — the transaction rolled back.
+    async with pool.acquire() as conn:
+        still = await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_files WHERE id = $1", file_id,
+        )
+    assert still == 1, "file delete must roll back when chunk delete fails (was swallowed pre-fix)"

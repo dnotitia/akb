@@ -227,13 +227,21 @@ class SearchService:
                         f_conds.append("v.name = $1")
                         f_params.append(vault)
                     if collection:
-                        f_conds.append(f"f.collection = ${len(f_params) + 1}")
+                        # vault_files.collection (TEXT) was dropped in
+                        # migration 020 → collection_id FK. Filter via the
+                        # joined collections.path with a prefix match, same
+                        # semantics as the documents branch above.
+                        f_conds.append(f"c.path LIKE ${len(f_params) + 1} || '%'")
                         f_params.append(collection)
                     acl_sql, acl_params = _vault_acl(len(f_params) + 1)
                     if acl_sql:
                         f_conds.append(acl_sql)
                         f_params.extend(acl_params)
-                    q = "SELECT f.id FROM vault_files f JOIN vaults v ON f.vault_id = v.id"
+                    q = (
+                        "SELECT f.id FROM vault_files f "
+                        "JOIN vaults v ON f.vault_id = v.id "
+                        "LEFT JOIN collections c ON c.id = f.collection_id"
+                    )
                     if f_conds:
                         q += " WHERE " + " AND ".join(f_conds)
                     frows = await conn.fetch(q, *f_params)

@@ -789,7 +789,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
         # PG-side runs inside the transaction below so a mid-flight crash
         # never leaves the vault with phantom vt_* tables or registry
         # rows pointing at dropped physical tables.
-        file_rows = await conn.fetch("SELECT s3_key FROM vault_files WHERE vault_id = $1", vault_id)
+        file_rows = await conn.fetch("SELECT id, s3_key FROM vault_files WHERE vault_id = $1", vault_id)
         if file_rows and settings.s3_endpoint_url:
             from app.services.adapters import s3_adapter
             failed = []
@@ -803,6 +803,17 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 logger.error("Vault %s: %d/%d S3 files failed to delete", vault_name, len(failed), len(file_rows))
 
         async with conn.transaction():
+            from app.services.index_service import _drop_source_chunks_with_outbox
+
+            # Enqueue file-chunk vector deletes BEFORE deleting vault_files.
+            # chunks.vault_id CASCADE removes file chunks from PG when the
+            # vaults row drops, but vector_delete_outbox doesn't ride the
+            # cascade — so the file ids must be captured (from file_rows,
+            # read above) and enqueued while they still exist, regardless
+            # of whether the S3 branch already removed the vault_files rows.
+            for fr in file_rows:
+                await _drop_source_chunks_with_outbox(conn, "file", str(fr["id"]))
+
             if file_rows and settings.s3_endpoint_url:
                 await conn.execute("DELETE FROM vault_files WHERE vault_id = $1", vault_id)
 
@@ -814,7 +825,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             # delete_vault_chunks only handles source_type='document';
             # tables/files need explicit cleanup because chunks.source_id
             # has no FK (polymorphic source) and would orphan otherwise.
-            from app.services.index_service import _drop_source_chunks_with_outbox
             vtables = await conn.fetch(
                 "SELECT id, name FROM vault_tables WHERE vault_id = $1",
                 vault_id,
@@ -826,19 +836,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 pg_name = table_data_repo.pg_table_name(vault_name, vt["name"])
                 await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
             await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
-
-            # File chunks need the same explicit outbox enqueue as table
-            # chunks — chunks.vault_id CASCADE removes the rows from PG,
-            # but vector_delete_outbox doesn't ride the cascade and the
-            # vector-store points would otherwise orphan.
-            vfiles = await conn.fetch(
-                "SELECT id FROM vault_files WHERE vault_id = $1",
-                vault_id,
-            )
-            for vf in vfiles:
-                await _drop_source_chunks_with_outbox(
-                    conn, "file", str(vf["id"]),
-                )
 
             await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM sessions WHERE vault_id = $1", vault_id)
