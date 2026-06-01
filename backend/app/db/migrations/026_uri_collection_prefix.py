@@ -99,32 +99,54 @@ async def _run(conn):
         table_rewrites = 0
         file_rewrites = 0
 
+        # `edges` has UNIQUE (source_uri, target_uri, relation_type). A
+        # legacy row whose rewritten form already exists as a canonical
+        # twin (or as another legacy row that rewrites to the same key)
+        # would trip that constraint on the rewrite UPDATE. This migration
+        # re-runs on every boot (no schema_migrations table) and legacy
+        # edges can be (re)created by external tools, so the rewrite MUST
+        # be conflict-safe: drop colliding legacy edge rows BEFORE the
+        # rewrite, preferring to keep the canonical row (or the smaller id
+        # among legacy twins). publications/events have no such constraint.
+
+        DOC_WHERE = "~ '^akb://[^/]+/doc/[^/]+/[^/]+'"
+
+        def doc_canon(expr: str) -> str:
+            return (
+                f"regexp_replace({expr}, "
+                f"'^akb://([^/]+)/doc/(.+)/([^/]+)$', "
+                f"'akb://\\1/coll/\\2/doc/\\3')"
+            )
+
         # ─── DOC URIs ───────────────────────────────────────────
-        # Pure regex rewrite. Pattern: split on the LAST slash inside
-        # the path. PostgreSQL regex group references in
-        # regexp_replace use ``\N`` style.
-        #
-        #   akb://V/doc/{collection}/{basename}   →
+        #   akb://V/doc/{collection}/{basename} →
         #   akb://V/coll/{collection}/doc/{basename}
-        #
-        # If the path has no internal slash (root-level doc) the
-        # pattern doesn't match and the URI is left as-is.
-        for table_col in (
-            ("edges", "source_uri"),
-            ("edges", "target_uri"),
-            ("publications", "resource_uri"),
-            ("events", "resource_uri"),
-        ):
-            t, c = table_col
+        # Root-level docs (no internal slash) don't match and are left as-is.
+        for col in ("source_uri", "target_uri"):
+            other = "target_uri" if col == "source_uri" else "source_uri"
+            # Drop legacy rows that would collide post-rewrite.
+            await conn.execute(
+                f"""
+                DELETE FROM edges l
+                 WHERE l.{col} {DOC_WHERE}
+                   AND EXISTS (
+                     SELECT 1 FROM edges e
+                      WHERE e.id <> l.id
+                        AND e.relation_type = l.relation_type
+                        AND e.{other} = l.{other}
+                        AND {doc_canon('e.' + col)} = {doc_canon('l.' + col)}
+                        AND (
+                          e.{col} !~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+                          OR e.id < l.id
+                        )
+                   )
+                """
+            )
             result = await conn.execute(
                 f"""
-                UPDATE {t}
-                   SET {c} = regexp_replace(
-                         {c},
-                         '^akb://([^/]+)/doc/(.+)/([^/]+)$',
-                         'akb://\\1/coll/\\2/doc/\\3'
-                       )
-                 WHERE {c} ~ '^akb://[^/]+/doc/[^/]+/[^/]+'
+                UPDATE edges
+                   SET {col} = {doc_canon(col)}
+                 WHERE {col} {DOC_WHERE}
                 """
             )
             try:
@@ -132,82 +154,95 @@ async def _run(conn):
             except (ValueError, IndexError):
                 pass
 
-        # ─── TABLE URIs ─────────────────────────────────────────
-        # Build the canonical URI per (vault, table) pair, then UPDATE
-        # rows whose stored URI matches the legacy form.
-        await conn.execute(
-            """
-            CREATE TEMP TABLE _uri_table_rewrite ON COMMIT DROP AS
-            SELECT
-              'akb://' || v.name || '/table/' || t.name AS legacy_uri,
-              CASE WHEN c.path IS NOT NULL THEN
-                'akb://' || v.name || '/coll/' || c.path || '/table/' || t.name
-              ELSE
-                'akb://' || v.name || '/table/' || t.name
-              END AS new_uri
-              FROM vault_tables t
-              JOIN vaults v ON v.id = t.vault_id
-              LEFT JOIN collections c ON c.id = t.collection_id
-            """
-        )
-        # Skip no-op rewrites (root-level table — legacy already canonical)
-        await conn.execute("DELETE FROM _uri_table_rewrite WHERE legacy_uri = new_uri")
-
-        for t, c in (
-            ("edges", "source_uri"),
-            ("edges", "target_uri"),
-            ("publications", "resource_uri"),
-            ("events", "resource_uri"),
-        ):
+        for t, c in (("publications", "resource_uri"), ("events", "resource_uri")):
             result = await conn.execute(
-                f"""
-                UPDATE {t}
-                   SET {c} = r.new_uri
-                  FROM _uri_table_rewrite r
-                 WHERE {t}.{c} = r.legacy_uri
-                """
+                f"UPDATE {t} SET {c} = {doc_canon(c)} WHERE {c} {DOC_WHERE}"
             )
             try:
-                table_rewrites += int(result.split()[-1])
+                doc_rewrites += int(result.split()[-1])
             except (ValueError, IndexError):
                 pass
 
-        # ─── FILE URIs ──────────────────────────────────────────
-        await conn.execute(
-            """
-            CREATE TEMP TABLE _uri_file_rewrite ON COMMIT DROP AS
-            SELECT
-              'akb://' || v.name || '/file/' || f.id::text AS legacy_uri,
-              CASE WHEN c.path IS NOT NULL THEN
-                'akb://' || v.name || '/coll/' || c.path || '/file/' || f.id::text
-              ELSE
-                'akb://' || v.name || '/file/' || f.id::text
-              END AS new_uri
-              FROM vault_files f
-              JOIN vaults v ON v.id = f.vault_id
-              LEFT JOIN collections c ON c.id = f.collection_id
-            """
-        )
-        await conn.execute("DELETE FROM _uri_file_rewrite WHERE legacy_uri = new_uri")
-
-        for t, c in (
-            ("edges", "source_uri"),
-            ("edges", "target_uri"),
-            ("publications", "resource_uri"),
-            ("events", "resource_uri"),
-        ):
-            result = await conn.execute(
-                f"""
-                UPDATE {t}
-                   SET {c} = r.new_uri
-                  FROM _uri_file_rewrite r
-                 WHERE {t}.{c} = r.legacy_uri
+        # ─── TABLE / FILE URIs ──────────────────────────────────
+        # Build per-(vault, resource) legacy→canonical maps, then rewrite
+        # rows whose stored URI matches the legacy form. Same conflict-safe
+        # dance for edges.
+        for kind, tmp, build in (
+            (
+                "table",
+                "_uri_table_rewrite",
                 """
-            )
-            try:
-                file_rewrites += int(result.split()[-1])
-            except (ValueError, IndexError):
-                pass
+                SELECT 'akb://' || v.name || '/table/' || t.name AS legacy_uri,
+                       CASE WHEN c.path IS NOT NULL THEN
+                         'akb://' || v.name || '/coll/' || c.path || '/table/' || t.name
+                       ELSE 'akb://' || v.name || '/table/' || t.name END AS new_uri
+                  FROM vault_tables t
+                  JOIN vaults v ON v.id = t.vault_id
+                  LEFT JOIN collections c ON c.id = t.collection_id
+                """,
+            ),
+            (
+                "file",
+                "_uri_file_rewrite",
+                """
+                SELECT 'akb://' || v.name || '/file/' || f.id::text AS legacy_uri,
+                       CASE WHEN c.path IS NOT NULL THEN
+                         'akb://' || v.name || '/coll/' || c.path || '/file/' || f.id::text
+                       ELSE 'akb://' || v.name || '/file/' || f.id::text END AS new_uri
+                  FROM vault_files f
+                  JOIN vaults v ON v.id = f.vault_id
+                  LEFT JOIN collections c ON c.id = f.collection_id
+                """,
+            ),
+        ):
+            await conn.execute(f"CREATE TEMP TABLE {tmp} ON COMMIT DROP AS {build}")
+            await conn.execute(f"DELETE FROM {tmp} WHERE legacy_uri = new_uri")
+
+            n = 0
+            for col in ("source_uri", "target_uri"):
+                other = "target_uri" if col == "source_uri" else "source_uri"
+                await conn.execute(
+                    f"""
+                    DELETE FROM edges l USING {tmp} r
+                     WHERE l.{col} = r.legacy_uri
+                       AND EXISTS (
+                         SELECT 1 FROM edges e
+                          WHERE e.id <> l.id
+                            AND e.relation_type = l.relation_type
+                            AND e.{other} = l.{other}
+                            AND e.{col} = r.new_uri
+                       )
+                    """
+                )
+                result = await conn.execute(
+                    f"""
+                    UPDATE edges
+                       SET {col} = r.new_uri
+                      FROM {tmp} r
+                     WHERE edges.{col} = r.legacy_uri
+                    """
+                )
+                try:
+                    n += int(result.split()[-1])
+                except (ValueError, IndexError):
+                    pass
+
+            for t, c in (("publications", "resource_uri"), ("events", "resource_uri")):
+                result = await conn.execute(
+                    f"""
+                    UPDATE {t} SET {c} = r.new_uri
+                      FROM {tmp} r WHERE {t}.{c} = r.legacy_uri
+                    """
+                )
+                try:
+                    n += int(result.split()[-1])
+                except (ValueError, IndexError):
+                    pass
+
+            if kind == "table":
+                table_rewrites += n
+            else:
+                file_rewrites += n
 
     if doc_rewrites or table_rewrites or file_rewrites:
         logger.info(

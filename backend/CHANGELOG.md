@@ -5,6 +5,51 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.5 — 2026-05-28
+
+Permanently fixes the recurring migration-026 boot crash and stops new
+legacy-shape edges from being created. The 0.3.3 guard only skipped 026
+when no legacy doc URIs remained; it did not make the rewrite itself
+safe. Legacy edges kept being (re)created by an external caller, so
+every cold restart re-tripped the
+`edges_source_uri_target_uri_relation_type_key` UNIQUE violation and the
+backend crash-looped (twice now in production, each needing a manual DB
+cleanup).
+
+### Fix — migration 026 is now conflict-safe (F2)
+
+Before each rewrite of an `edges` URI column, 026 now DELETEs legacy
+rows whose canonical-rewritten form would collide with an existing row,
+preferring to keep the canonical row (or the smaller id among legacy
+twins). Applied to the doc-shape regex rewrite and the table/file
+temp-table rewrites, for both `source_uri` and `target_uri`. The
+migration is now idempotent AND conflict-safe regardless of the data
+state — verified by seeding a legacy↔canonical twin and running 026
+twice with no error. (This is the exact cleanup that previously had to
+be done by hand on every crash.)
+
+### Fix — `akb_link` stores canonical URIs (F1, root cause)
+
+`kg_service.link_resources` inserted the caller-supplied `source_uri` /
+`target_uri` verbatim. An external tool calling `akb_link` with a
+legacy-shaped but parseable URI (`akb://V/doc/{coll}/{name}`) therefore
+persisted a legacy edge, which 026 then collided on. Both endpoints are
+now canonicalized from their parsed parts (new
+`kg_service.canonicalize_resource_uri` helper) before insert, so the
+explicit-link path can no longer introduce legacy edges. (Edge
+extraction via `_store_edge` already canonicalized; this closes the
+remaining writer.)
+
+### Operator notes
+
+- No schema change.
+- After this release, a cold restart no longer crashes even if legacy
+  edges exist — 026 self-heals. Existing prod legacy edges are
+  rewritten/deduped on the next boot.
+- The external tool that was emitting legacy `akb://V/doc/{coll}/{name}`
+  link URIs (observed in the `pdf-parser-test` vault) should still be
+  updated to send canonical URIs; AKB now tolerates either.
+
 ## 0.3.4 — 2026-05-28
 
 Security + data-integrity patch. Findings came out of a full

@@ -135,6 +135,25 @@ async def delete_document_relations(conn, vault_name: str, doc_path: str) -> Non
 
 # ── Explicit link/unlink (agent-driven) ───────────────────────
 
+def canonicalize_resource_uri(parsed) -> str | None:
+    """Rebuild a doc/table/file URI in canonical 0.3.0 form from its parsed
+    parts. Returns None for non-linkable kinds (coll/vault).
+
+    Callers that accept a URI string from outside (akb_link, edge
+    extraction) MUST canonicalize before persisting, otherwise a
+    legacy-shaped but parseable URI (e.g. the pre-0.3.0
+    `akb://V/doc/{coll}/{name}` form) gets stored verbatim and later
+    trips migration 026's rewrite against its canonical twin."""
+    ident = parsed.identifier or ""
+    if parsed.kind == "doc":
+        return doc_uri(parsed.vault, ident)
+    if parsed.kind == "table":
+        return table_uri(parsed.vault, ident, parsed.coll_path)
+    if parsed.kind == "file":
+        return file_uri(parsed.vault, ident, parsed.coll_path)
+    return None
+
+
 async def link_resources(
     vault_name: str,
     source_uri: str,
@@ -175,6 +194,13 @@ async def link_resources(
     target_vault_name = target_parsed.vault
     target_type = target_parsed.kind
     target_id = target_parsed.identifier
+
+    # Canonicalize both endpoints from parsed parts so a legacy-shaped
+    # URI passed by an external caller is stored in 0.3.0 canonical form
+    # (akb://V/coll/<path>/<kind>/<id>) — not verbatim. Verbatim legacy
+    # edges are what migration 026 keeps colliding on at boot.
+    source_uri = canonicalize_resource_uri(source_parsed) or source_uri
+    target_uri = canonicalize_resource_uri(target_parsed) or target_uri
 
     if source_uri == target_uri:
         return {"error": "Cannot link a resource to itself"}
