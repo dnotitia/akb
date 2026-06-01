@@ -47,6 +47,33 @@ logger = logging.getLogger("akb.tables")
 # Reserved column names that conflict with auto-added bookkeeping columns.
 _RESERVED = {"id", "created_at", "updated_at", "created_by"}
 
+# Column-name shape — same grammar as table names. Enforced on
+# create AND alter so the value stored in the registry cannot diverge
+# from `safe_ident(name)` (which silently maps punctuation to `_`).
+_COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _validate_column_name(name) -> None:
+    """Reject reserved + malformed column names (raises ValueError).
+
+    Shared by create_table and alter_table so the two paths stay
+    consistent: reserved names collide with the auto-added bookkeeping
+    columns (id/created_at/updated_at/created_by), and the shape check
+    keeps the registry name identical to its `safe_ident` PG identity.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("Column name must be a non-empty string.")
+    if name.lower() in _RESERVED:
+        raise ValueError(
+            f"Column name '{name}' is reserved (auto-added by AKB). "
+            f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
+        )
+    if not _COLUMN_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid column name {name!r}: must match {_COLUMN_NAME_RE.pattern} "
+            f"(lowercase letter then letters/digits/underscores)."
+        )
+
 
 # ── Indexing helpers ─────────────────────────────────────────────
 
@@ -123,11 +150,7 @@ async def create_table(
                 raise ConflictError(f"Table already exists: {name}")
 
             for col in columns:
-                if col["name"].lower() in _RESERVED:
-                    raise ValueError(
-                        f"Column name '{col['name']}' is reserved (auto-added by AKB). "
-                        f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
-                    )
+                _validate_column_name(col["name"])
 
             collection_id = None
             if collection_path:
@@ -328,6 +351,33 @@ async def alter_table(
             columns = table_registry_repo.parse_columns(table["columns"])
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
 
+            # ── Guard rails (mirror create_table) ───────────────────
+            # Reject reserved/malformed names BEFORE any DDL so the whole
+            # alter is atomic: a bad name rolls back the TX with zero
+            # schema change. Covers dropping/renaming the implicit
+            # bookkeeping columns (id/created_at/updated_at/created_by) —
+            # those are exactly the _RESERVED set — so a client can no
+            # longer drop the PK or shadow a reserved name.
+            for col in (add_columns or []):
+                _validate_column_name(col["name"])
+            for col_name in (drop_columns or []):
+                if not isinstance(col_name, str) or not col_name:
+                    raise ValueError("Drop column name must be a non-empty string.")
+                if col_name.lower() in _RESERVED:
+                    raise ValueError(
+                        f"Column '{col_name}' is a reserved bookkeeping column "
+                        f"and cannot be dropped. Reserved: {sorted(_RESERVED)}."
+                    )
+            for old_name, new_name in (rename_columns or {}).items():
+                if not isinstance(old_name, str) or not old_name:
+                    raise ValueError("Rename source column must be a non-empty string.")
+                if old_name.lower() in _RESERVED:
+                    raise ValueError(
+                        f"Column '{old_name}' is a reserved bookkeeping column "
+                        f"and cannot be renamed. Reserved: {sorted(_RESERVED)}."
+                    )
+                _validate_column_name(new_name)
+
             added: list[str] = []
             dropped: list[str] = []
             renamed: dict[str, str] = {}
@@ -442,7 +492,8 @@ async def execute_sql(
         if ";" in sql_check:
             return {"error": "Multi-statement SQL is not allowed. Send one statement at a time."}
 
-        if not rewritten.strip().upper().startswith(_ALLOWED_FIRST_KEYWORDS):
+        upper = rewritten.strip().upper()
+        if not upper.startswith(_ALLOWED_FIRST_KEYWORDS):
             return {
                 "error": (
                     "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
@@ -450,6 +501,27 @@ async def execute_sql(
                     "akb_drop_table for schema changes."
                 )
             }
+
+        # Archived vaults are READ-ONLY. PG ACL has no archive concept
+        # (write grants are intentionally preserved so unarchive is
+        # instant), so the write block lives here: a non-read statement
+        # (anything but SELECT/WITH) against ANY archived referenced
+        # vault is refused before it touches PG.
+        if not upper.startswith(("SELECT", "WITH")):
+            archived = await conn.fetch(
+                "SELECT name FROM vaults WHERE name = ANY($1::text[]) "
+                "AND status = 'archived'",
+                vault_names,
+            )
+            if archived:
+                names = ", ".join(sorted(r["name"] for r in archived))
+                return {
+                    "error": (
+                        f"Vault '{names}' is archived (read-only); writes via "
+                        f"akb_sql are not allowed. Unarchive the vault first."
+                    ),
+                    "code": "vault_archived",
+                }
 
     try:
         return await get_user_sql_executor().execute(

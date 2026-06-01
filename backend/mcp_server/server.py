@@ -844,7 +844,7 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
             drop_columns=args.get("drop_columns"),
             rename_columns=args.get("rename_columns"),
         )
-    except NotFoundError as e:
+    except (NotFoundError, ValueError) as e:
         return {"error": str(e)}
 
 
@@ -1111,6 +1111,7 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
             "doc_count": exc.doc_count,
             "file_count": exc.file_count,
             "sub_collection_count": exc.sub_collection_count,
+            "table_count": exc.table_count,
         }
 
 

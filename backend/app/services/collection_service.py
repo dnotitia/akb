@@ -15,15 +15,17 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
-from app.repositories import vault_files_repo
+from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_repo import VaultRepository
 from app.services.git_service import GitService
-from app.services.index_service import delete_document_chunks, delete_file_chunks
+from app.services.index_service import (
+    delete_document_chunks, delete_file_chunks, delete_table_chunks,
+)
 from app.services.kg_service import delete_document_relations
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
-from app.services.uri_service import file_uri
+from app.services.uri_service import file_uri, table_uri
 
 logger = logging.getLogger("akb.collections")
 
@@ -53,6 +55,7 @@ class CollectionNotEmptyError(Exception):
         doc_count: int,
         file_count: int,
         sub_collection_count: int = 0,
+        table_count: int = 0,
     ):
         parts: list[str] = []
         if doc_count:
@@ -61,12 +64,15 @@ class CollectionNotEmptyError(Exception):
             parts.append(f"{file_count} file(s)")
         if sub_collection_count:
             parts.append(f"{sub_collection_count} sub-collection(s)")
+        if table_count:
+            parts.append(f"{table_count} table(s)")
         super().__init__(
             f"Collection has {', '.join(parts) or 'content'}"
         )
         self.doc_count = doc_count
         self.file_count = file_count
         self.sub_collection_count = sub_collection_count
+        self.table_count = table_count
 
 
 def _normalize_path(path: str) -> str:
@@ -219,6 +225,7 @@ class CollectionService:
         docs_count = 0
         files_count = 0
         sub_count = 0
+        tables_count = 0
         # Snapshot for the post-commit git cleanup. Captured inside
         # the TX (so the doc paths reflect exactly the rows we
         # deleted) and consumed after commit so the git call never
@@ -257,6 +264,11 @@ class CollectionService:
 
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
                 files = await coll_repo.list_files_under(vault_id, norm, conn=conn)
+                # Tables living in this collection (FK collection_id is
+                # ON DELETE SET NULL, so deleting the collection rows
+                # would otherwise silently re-home them to vault root and
+                # a table-only collection would pass the empty check).
+                tables = await coll_repo.list_tables_under(vault_id, norm, conn=conn)
 
                 # ── Total-empty check ───────────────────────────
                 # Nothing at or under the prefix → genuine 404.
@@ -265,15 +277,16 @@ class CollectionService:
                     and not sub_rows
                     and not docs
                     and not files
+                    and not tables
                 ):
                     raise NotFoundError("Collection", norm)
 
                 # ── Empty-mode reject ───────────────────────────
                 # `recursive=False` succeeds ONLY when the target row
                 # exists and nothing else lives under the prefix.
-                if not recursive and (sub_rows or docs or files):
+                if not recursive and (sub_rows or docs or files or tables):
                     raise CollectionNotEmptyError(
-                        len(docs), len(files), len(sub_rows),
+                        len(docs), len(files), len(sub_rows), len(tables),
                     )
 
                 # ── PG cleanup (same TX, locks still held) ──────
@@ -318,6 +331,22 @@ class CollectionService:
                     await _enqueue_s3_delete(conn, f["s3_key"])
                     await vault_files_repo.delete(conn, uuid.UUID(file_id))
 
+                # Tear down tables BEFORE the collection-row DELETE so
+                # the FK SET NULL never fires on a still-registered table.
+                # Mirror drop_table's internals (dynamic PG table + chunk
+                # outbox + registry row + edges) inside this TX so the
+                # table either disappears completely or not at all.
+                for t in tables:
+                    pg_name = table_data_repo.pg_table_name(vault, t["name"])
+                    await table_data_repo.drop_dynamic_table(conn, pg_name)
+                    await delete_table_chunks(conn, str(t["id"]))
+                    await table_registry_repo.delete(conn, t["id"])
+                    t_uri = table_uri(vault, t["name"], collection=t.get("collection"))
+                    await conn.execute(
+                        "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
+                        t_uri,
+                    )
+
                 # Delete the union of sub-collection ids and the
                 # target row (if it exists). Empty-mode success has
                 # no sub_rows and reaches here only when target_row
@@ -343,11 +372,13 @@ class CollectionService:
                         "deleted_docs": len(docs),
                         "deleted_files": len(files),
                         "deleted_sub_collections": len(sub_rows),
+                        "deleted_tables": len(tables),
                     },
                 )
                 docs_count = len(docs)
                 files_count = len(files)
                 sub_count = len(sub_rows)
+                tables_count = len(tables)
 
                 # Snapshot for post-commit git work.
                 doc_paths_for_git = [d["path"] for d in docs]
@@ -390,8 +421,8 @@ class CollectionService:
                 )
 
         logger.info(
-            "Collection delete: vault=%s path=%s docs=%d files=%d sub=%d",
-            vault, norm, docs_count, files_count, sub_count,
+            "Collection delete: vault=%s path=%s docs=%d files=%d sub=%d tables=%d",
+            vault, norm, docs_count, files_count, sub_count, tables_count,
         )
         return {
             "ok": True,
@@ -399,4 +430,5 @@ class CollectionService:
             "deleted_docs": docs_count,
             "deleted_files": files_count,
             "deleted_sub_collections": sub_count,
+            "deleted_tables": tables_count,
         }

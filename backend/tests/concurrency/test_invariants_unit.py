@@ -451,3 +451,210 @@ async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
             "SELECT COUNT(*) FROM vault_files WHERE id = $1", file_id,
         )
     assert still == 1, "file delete must roll back when chunk delete fails (was swallowed pre-fix)"
+
+
+# ── delete_publications_for_document UUID branch must match canonical URI ──
+
+
+@pytest.mark.asyncio
+async def test_delete_publications_for_document_uuid_canonical(pool):
+    """delete_publications_for_document(UUID) previously built a legacy
+    `akb://V/doc/{coll}/{name}` URI that never matched the canonical
+    `akb://V/coll/{coll}/doc/{name}` stored in publications.resource_uri,
+    so the cascade silently left orphan publications. The UUID branch now
+    builds the URI via doc_uri so the DELETE actually matches.
+    """
+    from app.services.publication_service import delete_publications_for_document
+
+    vault_repo = VaultRepository(pool)
+    name = f"_pubdel_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(
+        name=name, description="pubdel", git_path=f"/tmp/{name}.git", owner_id=None,
+    )
+    did = uuid.uuid4()
+    canonical = f"akb://{name}/coll/incidents/doc/report.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, 'incidents/report.md', 'r', 'report', 'draft', NOW(), NOW(), "
+            "'cafef00d', '{}'::text[], '{}'::jsonb)",
+            did, vid,
+        )
+        await conn.execute(
+            "INSERT INTO publications (id, slug, vault_id, resource_type, resource_uri, created_at) "
+            "VALUES (gen_random_uuid(), $1, $2, 'document', $3, NOW())",
+            f"slug{uuid.uuid4().hex[:6]}", vid, canonical,
+        )
+
+    deleted = await delete_publications_for_document(did)  # the UUID branch
+
+    async with pool.acquire() as conn:
+        remaining = await conn.fetchval(
+            "SELECT COUNT(*) FROM publications WHERE vault_id = $1", vid,
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+
+    assert deleted == 1, "UUID branch must materialize the canonical URI and match"
+    assert remaining == 0, "publication should be cascade-deleted, not orphaned"
+
+
+# ── P2: embedding response reordered by `index`, not array position ──
+
+
+@pytest.mark.asyncio
+async def test_p2_embed_index_reorder():
+    """_embed_call must pair each output to its input via the response
+    item's `index` field, not array order. A gateway that returns items
+    out of order would otherwise attach vectors to the wrong chunks.
+    """
+    from app.services import index_service
+
+    class _Resp:
+        status_code = 200
+        def __init__(self, payload):
+            self._p = payload
+        def json(self):
+            return self._p
+
+    class _Client:
+        def __init__(self, payload):
+            self._p = payload
+        async def post(self, *_a, **_k):
+            return _Resp(self._p)
+
+    # Response deliberately OUT OF ORDER (index 2, 0, 1).
+    payload = {"data": [
+        {"index": 2, "embedding": [2.0]},
+        {"index": 0, "embedding": [0.0]},
+        {"index": 1, "embedding": [1.0]},
+    ]}
+    status, embs, _ = await index_service._embed_call(_Client(payload), ["a", "b", "c"], 5.0)
+    assert status == "ok"
+    assert embs == [[0.0], [1.0], [2.0]], "vectors must be positionally aligned by index"
+
+    # A short / gapped index set is a malformed response → transient.
+    bad = {"data": [{"index": 0, "embedding": [0.0]}, {"index": 5, "embedding": [9.0]}]}
+    status2, embs2, _ = await index_service._embed_call(_Client(bad), ["a", "b"], 5.0)
+    assert status2 == "transient" and embs2 is None
+
+
+# ── P2: alter_table reserved-column guard ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_p2_alter_table_reserved_guard(pool):
+    from app.services import table_service
+    from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
+
+    set_role_sync(RoleSync(pool))
+
+    vault_repo = VaultRepository(pool)
+    name = f"_p2alter_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(name=name, description="x", git_path=f"/tmp/{name}.git", owner_id=None)
+    await get_role_sync().on_vault_create(vid, None)
+    await table_service.create_table(vid, "items", [{"name": "label", "type": "text"}], actor_id="t")
+
+    # dropping the PK must be rejected
+    with pytest.raises(ValueError):
+        await table_service.alter_table(vid, "items", actor_id="t", drop_columns=["id"])
+    # adding a reserved name must be rejected
+    with pytest.raises(ValueError):
+        await table_service.alter_table(vid, "items", actor_id="t",
+                                        add_columns=[{"name": "created_at", "type": "text"}])
+    # renaming onto a reserved name must be rejected
+    with pytest.raises(ValueError):
+        await table_service.alter_table(vid, "items", actor_id="t",
+                                        rename_columns={"label": "id"})
+    # the PK survives all rejected alters
+    async with pool.acquire() as conn:
+        has_id = await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'id'",
+            table_service.table_data_repo.pg_table_name(name, "items"),
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+    assert has_id == 1, "PK column must still exist after rejected drop"
+
+
+# ── P2: archived vault is read-only via akb_sql ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_p2_archived_vault_blocks_writes(pool):
+    from app.services import table_service
+    from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
+    from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
+
+    set_role_sync(RoleSync(pool))
+    set_user_sql_executor(UserSqlExecutor(pool))
+
+    async with pool.acquire() as conn:
+        admin = await conn.fetchval(
+            "INSERT INTO users (id, username, email, password_hash, is_admin) "
+            "VALUES (gen_random_uuid(), $1, $2, 'x', true) RETURNING id",
+            f"p2a{uuid.uuid4().hex[:6]}", f"p2a{uuid.uuid4().hex[:6]}@t.local",
+        )
+    vault_repo = VaultRepository(pool)
+    name = f"_p2arch_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(name=name, description="x", git_path=f"/tmp/{name}.git", owner_id=admin)
+    await get_role_sync().on_vault_create(vid, admin)
+    await table_service.create_table(vid, "items", [{"name": "label", "type": "text"}], actor_id="t")
+    await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+                                    sql="INSERT INTO items (label) VALUES ('a')", is_admin=True)
+
+    # archive the vault (status flip only, no role DDL — as archive_vault does)
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET status = 'archived' WHERE id = $1", vid)
+
+    # WRITE must be blocked at the app layer
+    w = await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+                                        sql="INSERT INTO items (label) VALUES ('b')", is_admin=True)
+    assert w.get("code") == "vault_archived", f"archived write should be blocked, got {w}"
+
+    # READ must still work
+    r = await table_service.execute_sql(vault_names=[name], user_id=str(admin),
+                                        sql="SELECT label FROM items", is_admin=True)
+    assert r.get("total") == 1, f"archived read should still work, got {r}"
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+
+
+# ── P2: collection delete handles tables ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_p2_collection_delete_handles_tables(pool):
+    from app.services import table_service
+    from app.services.collection_service import CollectionService, CollectionNotEmptyError
+    from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
+
+    set_role_sync(RoleSync(pool))
+
+    vault_repo = VaultRepository(pool)
+    name = f"_p2coll_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(name=name, description="x", git_path=f"/tmp/{name}.git", owner_id=None)
+    await get_role_sync().on_vault_create(vid, None)
+    # a table inside collection 'specs'
+    await table_service.create_table(vid, "items", [{"name": "label", "type": "text"}],
+                                     actor_id="t", collection="specs")
+
+    svc = CollectionService()
+    # non-recursive delete of a table-only collection must NOT silently succeed
+    with pytest.raises(CollectionNotEmptyError) as ei:
+        await svc.delete(vault=name, path="specs", recursive=False, agent_id="t")
+    assert ei.value.table_count == 1
+
+    # recursive delete actually drops the table (registry + dynamic table)
+    out = await svc.delete(vault=name, path="specs", recursive=True, agent_id="t")
+    assert out["deleted_tables"] == 1
+
+    async with pool.acquire() as conn:
+        reg = await conn.fetchval("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid)
+        pg_tbl = await conn.fetchval(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = $1",
+            table_service.table_data_repo.pg_table_name(name, "items"),
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+    assert reg == 0, "registry row must be gone"
+    assert pg_tbl == 0, "dynamic PG table must be dropped"

@@ -474,15 +474,22 @@ async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
 
     Returns the number of publications deleted.
     """
+    from app.services.uri_service import doc_uri
     pool = await get_pool()
     async with pool.acquire() as conn:
         if isinstance(document_id, str) and document_id.startswith("akb://"):
             uri = document_id
         else:
-            # Materialize the URI from the PG UUID.
+            # Materialize the CANONICAL URI from the PG UUID. The old
+            # `'akb://' || v.name || '/doc/' || d.path` produced the
+            # pre-0.3.0 legacy shape (akb://V/doc/{coll}/{name}), which
+            # never matches the canonical publications.resource_uri
+            # (akb://V/coll/{coll}/doc/{name}) — so the cascade silently
+            # deleted nothing and left orphan publications. Build it via
+            # doc_uri so the DELETE actually matches.
             row = await conn.fetchrow(
                 """
-                SELECT 'akb://' || v.name || '/doc/' || d.path AS uri
+                SELECT v.name AS vault_name, d.path AS path
                   FROM documents d JOIN vaults v ON v.id = d.vault_id
                  WHERE d.id = $1
                 """,
@@ -490,7 +497,7 @@ async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
             )
             if not row:
                 return 0
-            uri = row["uri"]
+            uri = doc_uri(row["vault_name"], row["path"])
         rows = await conn.fetch(
             "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
             uri,

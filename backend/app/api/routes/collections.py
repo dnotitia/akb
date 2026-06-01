@@ -105,5 +105,6 @@ async def delete_collection(
                 "doc_count": exc.doc_count,
                 "file_count": exc.file_count,
                 "sub_collection_count": exc.sub_collection_count,
+                "table_count": exc.table_count,
             },
         )

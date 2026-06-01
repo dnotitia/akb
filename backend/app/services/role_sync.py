@@ -593,7 +593,16 @@ class RoleSync:
     async def _reconcile_vault_roles(
         self, conn: asyncpg.Connection, report: ReconcileReport,
     ) -> None:
-        rows = await conn.fetch("SELECT id, owner_id FROM vaults WHERE status != 'archived' OR status IS NULL")
+        # Archived vaults are READ-ONLY, not deleted: their group roles +
+        # table GRANTs MUST survive reconcile so akb_sql SELECT (and the
+        # 0.3.4 publication table_query, which runs under the creator's
+        # akb_user_* role) keeps working. The write block for archived
+        # vaults lives in the app layer (execute_sql / check_vault_access),
+        # NOT by dropping PG grants — so unarchive needs no re-grant. Only
+        # a real vault DELETE removes these roles (on_vault_delete). MUST
+        # use the SAME vault set as _diff_vaults (all vaults) or is_clean()
+        # never converges.
+        rows = await conn.fetch("SELECT id, owner_id FROM vaults")
         wanted: set[str] = set()
         for r in rows:
             for scope in ("reader", "writer", "admin"):
@@ -746,6 +755,10 @@ class RoleSync:
     async def _diff_vaults(
         self, conn: asyncpg.Connection, diff: RoleStateDiff,
     ) -> None:
+        # MUST use the same vault set as _reconcile_vault_roles — ALL
+        # vaults incl. archived (archived = read-only, roles preserved).
+        # If you ever filter here, mirror it there or is_clean() never
+        # converges (perpetual reconcile/diff flip-flop).
         rows = await conn.fetch("SELECT id FROM vaults")
         wanted: set[str] = set()
         for r in rows:

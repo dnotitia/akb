@@ -627,6 +627,38 @@ class CollectionRepository:
         async with self.pool.acquire() as acq:
             return await _do(acq)
 
+    async def list_tables_under(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        conn=None,
+    ) -> list[dict]:
+        """Return vault_tables whose owning collection path equals `path`
+        exactly or starts with `{path}/`. Covers the collection itself
+        plus every descendant — used by cascade delete to tear down
+        tables that live inside a collection (FK collection_id is
+        ON DELETE SET NULL, so the collection delete would otherwise
+        silently re-home them to vault root). Locked FOR UPDATE so a
+        concurrent drop/alter on the same table serialises.
+        """
+        bare = path.rstrip("/")
+        like = self._like_escape(bare) + "/%"
+        sql = (
+            "SELECT vt.id, vt.name, vt.collection_id, c.path AS collection "
+            "  FROM vault_tables vt "
+            "  JOIN collections c ON c.id = vt.collection_id "
+            " WHERE vt.vault_id = $1 "
+            "   AND (c.path = $2 OR c.path LIKE $3 ESCAPE '\\') "
+            " FOR UPDATE OF vt"
+        )
+        async def _do(c):
+            rows = await c.fetch(sql, vault_id, bare, like)
+            return [dict(r) for r in rows]
+        if conn is not None:
+            return await _do(conn)
+        async with self.pool.acquire() as acq:
+            return await _do(acq)
+
     async def list_collections_under(
         self,
         vault_id: uuid.UUID,
