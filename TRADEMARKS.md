@@ -1,8 +1,8 @@
 # AKB Trademarks
 
 "AKB", the AKB logo, "Dnotitia", and "Seahorse" are trademarks of
-**Dnotitia, Inc.** The [PolyForm Noncommercial 1.0](./LICENSE) license
-covers the *software* — it grants **no trademark rights**.
+**Dnotitia, Inc.** The [Business Source License 1.1](./LICENSE) covers
+the *software* — it grants **no trademark rights**.
 
 The license restricts what you can DO with the software.
 The trademark restricts what you can CALL it.
@@ -16,7 +16,7 @@ These are separate legal layers — both apply.
   for storage" — when accurate.
 - Linking to the upstream project as "AKB" in documentation.
 - Distributing unmodified copies under their original name within the
-  noncommercial use grant of the license.
+  Additional Use Grant of the license.
 
 ### Not permitted (without prior written permission from Dnotitia, Inc.)
 
@@ -44,9 +44,10 @@ name creates confusion about who maintains it, who is responsible for
 security fixes, and whose roadmap it follows. The trademark policy
 keeps that signal honest.
 
-The license deliberately keeps software freedom (modify, fork, redistribute
-within the noncommercial grant) separate from name rights (these stay
-with the trademark owner). This is the same pattern used by the Linux
+The license deliberately keeps software freedom (modify, fork,
+redistribute within the BSL's Additional Use Grant, and eventually
+under the Change License) separate from name rights (these stay with
+the trademark owner). This is the same pattern used by the Linux
 Foundation for "Linux", Mozilla for "Firefox" (which is why Debian
 historically shipped "Iceweasel"), and the Apache Software Foundation
 for project names.
@@ -54,4 +55,4 @@ for project names.
 ## Questions or permission requests
 
 For trademark questions or to request written permission, contact
-**opensource@dnotitia.com**.
+**support@dnotitia.com**.

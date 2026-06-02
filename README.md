@@ -10,7 +10,7 @@
 > graph. Drop-in alternative to Confluence / Notion for Claude Code, Cursor,
 > Windsurf, and any MCP-aware agent.
 
-[![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20NC%201.0-blue.svg)](./LICENSE)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](./LICENSE)
 [![npm: akb-mcp](https://img.shields.io/npm/v/akb-mcp.svg?label=npm%3A%20akb-mcp)](https://www.npmjs.com/package/akb-mcp)
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-orange.svg)](https://modelcontextprotocol.io)
 
@@ -305,24 +305,40 @@ semver lifecycle and is **not** tied to the product version.
 
 ## License
 
-[PolyForm Noncommercial 1.0](./LICENSE) — free for noncommercial use,
-modification, and distribution within the license's noncommercial scope.
-Attribution required.
+The AKB backend, frontend, and deployment manifests are licensed under
+the [Business Source License 1.1](./LICENSE) — source-available, with
+an Additional Use Grant that permits production use (commercial or
+non-commercial) up to a seat-count threshold, automatically converting
+to **Apache License 2.0** four years after each version's first public
+release.
+
+The npm `akb-mcp` proxy (`packages/akb-mcp-client/`) is separately
+licensed under the **MIT License** so it can be freely embedded in any
+agent client without restriction.
+
+**Free production use of the backend** — you may deploy AKB in
+production, commercial or not, provided your aggregate deployment
+serves **fewer than 100 Named Seats** (distinct human user accounts in
+the `users` table, per deployment; service accounts and
+90-day-inactive accounts excluded — see [LICENSE](./LICENSE) for the
+precise definition).
+
+**Commercial license required** for any of:
+
+- Production use of the backend at or above 100 Named Seats.
+- Offering AKB (modified or not) as a hosted service, on-premises
+  product, embedded component, or rebranded distribution to third
+  parties — regardless of seat count.
 
 **Trademarks** — "AKB", "Dnotitia", and "Seahorse" are trademarks of
 Dnotitia, Inc. The software license does not grant trademark rights.
 Forks and derivative works must be distributed under a different name.
 See [TRADEMARKS.md](./TRADEMARKS.md).
 
-**Commercial use** — a commercial license is required to:
-
-- Deploy AKB in any for-profit company's internal or production systems.
-- Offer AKB (modified or not) as a hosted service, on-premises product,
-  embedded component, or rebranded distribution to third parties.
-- Bundle AKB into a commercial product or service.
-
-For commercial licensing or trademark permission requests, contact
-**opensource@dnotitia.com**.
+For commercial licensing, the rationale behind the BSL transition, or
+trademark permission requests, see
+[LICENSE-CHANGE.md](./LICENSE-CHANGE.md) or contact
+**support@dnotitia.com**.
 
 ## Security
 

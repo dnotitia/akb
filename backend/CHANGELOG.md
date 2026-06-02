@@ -5,6 +5,24 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.4.0 — 2026-06-02
+
+License change: **PolyForm Noncommercial 1.0 → Business Source License
+1.1**. No runtime contract change; this release exists to mark the
+license transition cleanly.
+
+The BSL 1.1 ships with a 100 Named Seats Additional Use Grant — small
+commercial deployments that were previously forbidden are now
+explicitly permitted, while large-scale or third-party-hosting use
+still requires a commercial license. Each release converts
+automatically to Apache License 2.0 four years after its first public
+distribution.
+
+See [LICENSE](../LICENSE) for the load-bearing text and
+[LICENSE-CHANGE.md](../LICENSE-CHANGE.md) for the rationale and FAQ.
+
+Releases ≤ 0.3.6 remain under PolyForm NC 1.0 as originally distributed.
+
 ## 0.3.6 — 2026-05-28
 
 The "P2" cut of the functional/logic review — four data-integrity /

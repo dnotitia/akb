@@ -5,7 +5,7 @@
 If you've found a security issue in AKB, please report it privately — do
 **not** open a public GitHub issue.
 
-Email **security@dnotitia.com** with:
+Email **support@dnotitia.com** with subject prefix `[SECURITY]` and the following:
 
 - A description of the issue and its impact.
 - Steps to reproduce (proof-of-concept code is welcome).
