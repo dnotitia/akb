@@ -649,59 +649,6 @@ TOOLS = [
         },
     ),
     Tool(
-        name="akb_remember",
-        description=(
-            "Store something in your persistent memory. "
-            "Memories persist across sessions — use this to remember important context, "
-            "decisions, preferences, or learnings for future sessions. "
-            "Categories: context (current work), preference (how you like to work), "
-            "learning (things you learned), work (completed work), general."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "What to remember"},
-                "category": {
-                    "type": "string",
-                    "description": "Memory category",
-                    "enum": ["context", "preference", "learning", "work", "general"],
-                    "default": "general",
-                },
-            },
-            "required": ["content"],
-        },
-    ),
-    Tool(
-        name="akb_recall",
-        description=(
-            "Retrieve your persistent memories from previous sessions. "
-            "Call this at the start of a session to recall what you were working on. "
-            "Filter by category for specific types of memory."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Filter by category (omit for all)",
-                    "enum": ["context", "preference", "learning", "work", "general"],
-                },
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50},
-            },
-        },
-    ),
-    Tool(
-        name="akb_forget",
-        description="Delete a specific memory by its ID.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "memory_id": {"type": "string", "description": "Memory ID to delete"},
-            },
-            "required": ["memory_id"],
-        },
-    ),
-    Tool(
         name="akb_publish",
         description=(
             "Create a public share URL for a document, table query, or file. "

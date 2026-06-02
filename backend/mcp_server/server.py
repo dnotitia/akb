@@ -40,7 +40,6 @@ from app.services.access_service import (
     archive_vault,
 )
 from app.services.auth_service import resolve_token
-from app.services.memory_service import remember, recall, forget
 from app.util.text import to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
@@ -848,26 +847,6 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
         )
     except (NotFoundError, ValueError) as e:
         return {"error": str(e)}
-
-
-@_h("akb_remember")
-async def _handle_remember(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await remember(uid, args["content"], args.get("category", "general"))
-
-
-@_h("akb_recall")
-async def _handle_recall(args: dict, uid: str, user: _MCPUser) -> dict:
-    # `recall` now returns the full envelope: {memories, returned,
-    # total, truncated}. Pass it through unchanged — `total` is the
-    # corpus count (was len(returned) pre-0.3.0, which lied when the
-    # LIMIT cut things off).
-    return await recall(uid, args.get("category"), args.get("limit", 20))
-
-
-@_h("akb_forget")
-async def _handle_forget(args: dict, uid: str, user: _MCPUser) -> dict:
-    success = await forget(uid, args["memory_id"])
-    return {"forgotten": success}
 
 
 _SYSTEM_UID = "00000000-0000-0000-0000-000000000000"

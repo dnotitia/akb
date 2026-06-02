@@ -5,6 +5,102 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.0 — 2026-06-02
+
+### Agent memory — vault-shaped, REST-only (breaking)
+
+The `akb_remember` / `akb_recall` / `akb_forget` MCP tools and the
+`memories` / `sessions` PG tables are **removed**. Agent dedicated
+memory is now expressed as a per-user vault (`agent-memory-{username}`)
+with per-session collections at `sessions/{date}/{agent_id}/{session_id}`
+and a `recap.md` document at end of session.
+
+The new surface lives at `/api/v1/agent-sessions` (Bearer auth, REST,
+**not MCP**) and is intended to be driven by lifecycle plugins
+(`akb-claude-code`, `akb-cursor`, `akb-codex`) hooked into agent
+SessionStart / PreCompact / SessionEnd / UserPromptSubmit events. The
+agent itself never calls these endpoints — they sit outside the
+tool-use loop, so the agent's tool list is unpolluted by lifecycle
+plumbing.
+
+#### Removed
+
+- MCP tools: `akb_remember`, `akb_recall`, `akb_forget`
+- Services: `app.services.memory_service`, `app.services.session_service`
+- REST routes: `/api/v1/memory*`, `/api/v1/sessions/start`, `/api/v1/sessions/{id}/end`
+- PG tables: `memories`, `sessions` (dropped by migration 031 —
+  unconditional, no FK references existed)
+- Concurrency test `INV-3` (covered the removed SessionService)
+- Help topic: `memory`, `sessions`
+- Activity / recent / diff endpoints relocated from
+  `app.api.routes.sessions` to `app.api.routes.activity` (the original
+  file was 60% session-management, 40% activity-history; once the
+  session bits left, the rename made the remaining contents honest)
+
+#### Added
+
+- `app.services.agent_memory_service.AgentMemoryService` — vault
+  auto-provisioning + session lifecycle + recall.
+- REST endpoints under `/api/v1/agent-sessions`:
+  - `POST /agent-sessions/{session_id}` — start (idempotent on
+    `session_id`; SessionStart with `source=resume|clear|compact`
+    returns the existing collection rather than 409).
+  - `POST /agent-sessions/{session_id}/end` — write `recap.md` with
+    `type: session` frontmatter; accepts the Cursor-style `reason`
+    enum (`completed | aborted | error | window_close | user_close |
+    stop`) and an independent `outcome` enum
+    (`success | partial | abandoned`).
+  - `POST /agent-sessions/{session_id}/snapshot` — durable partial
+    summary for PreCompact-class events. Each call writes a sequential
+    `snapshot-NNN.md` rather than mutating collection metadata, so
+    every snapshot is git-versioned.
+  - `GET /agent-sessions/{session_id}/context` — preferences /
+    learnings / parent-recap injection for UserPromptSubmit-class
+    hooks (synchronous by contract).
+  - `GET /agent-sessions/{session_id}` — status (`ended` flag,
+    `recap` pointer).
+  - `GET /agent-sessions` — list the caller's sessions, optional
+    `agent_id` filter.
+- Migration `031_drop_memories_sessions.py`.
+- E2E suite `backend/tests/test_agent_sessions_e2e.sh` (28 cases,
+  covers auto-provision, idempotency on resume/compact, snapshot
+  sequence, parent-recap injection across agents, ungraceful end with
+  `reason=window_close`, list/filter, validation rejects, auth).
+
+#### Convergent design — sourcing
+
+The REST contract was synthesised from a cross-harness audit of agent
+lifecycle hooks (run 2026-06-02 — see
+`product/akb/design-proposals/akb-agent-memory-rest-final-design-2026-06-02-v050.md`).
+Headline findings the API honours:
+
+- Claude Code (1.0.85+), Cursor (1.7), and OpenAI Codex CLI (April
+  2026) all expose a SessionStart hook that fires on
+  resume / clear / compact / startup with the source as a discriminator
+  field — the API is idempotent on `session_id`-in-path so the plugin
+  does not need to dedupe client-side.
+- All three agents pass at least `session_id`, `transcript_path`,
+  `cwd`, and `hook_event_name` on stdin; the start body accepts the
+  superset of these so a single plugin contract drives all three.
+- Cursor's `sessionEnd` carries an explicit `reason` enum — the API
+  adopts it verbatim plus `stop` to cover Claude Code's `Stop` hook.
+- Claude Code natively supports `{type: "http", url, headers:
+  {"Authorization": "Bearer $AKB_PAT"}, allowedEnvVars: ["AKB_PAT"]}`,
+  so the plugin can call AKB directly from the hook script with no
+  wrapper — Bearer auth on the REST endpoints is sufficient.
+
+#### Migration
+
+`memories` and `sessions` are dropped without backfill. The data was
+never user-visible outside of the `akb_remember` tool; operators who
+need to retain it must snapshot before upgrade. The recommended
+replacement workflow is to write any persistent agent state into the
+auto-provisioned memory vault through the lifecycle plugin (or
+directly via `akb_put` to the vault — it is an ordinary vault).
+
+The plugin (`packages/akb-claude-code/`) is a separate work-item; this
+release is the backend it will call.
+
 ## 0.4.3 — 2026-06-02
 
 `akb_put` can now set the document `status` on create.

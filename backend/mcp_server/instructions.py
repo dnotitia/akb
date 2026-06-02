@@ -5,7 +5,7 @@ unit tests and tooling can import INSTRUCTIONS without pulling in the full
 server dependency chain (kiwipiepy, psycopg, etc.).
 """
 
-INSTRUCTIONS = """AKB stores documents, tables, files, memories, todos, sessions, and publications in vaults.
+INSTRUCTIONS = """AKB stores documents, tables, files, todos, and publications in vaults.
 
 Priority of guidance (highest first):
 1. User-defined rules — CLAUDE.md / AGENTS.md / GEMINI.md / loaded skills / explicit user requests in this conversation. These ALWAYS win.
@@ -19,5 +19,7 @@ When writing into a vault:
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
 5. Destructive tools (akb_delete_vault, akb_delete_collection) require explicit user confirmation.
 6. Reference resources by the akb:// URIs returned by tool calls — do not reassemble paths yourself.
-7. For other surfaces (akb_remember / akb_recall, akb_publish, akb_todo, akb_session_*), call akb_help() for an overview.
+7. For other surfaces (akb_publish, akb_todo, akb_activity, akb_history), call akb_help() for an overview.
+
+Agent memory is handled outside the MCP tool-use loop — the AKB lifecycle plugin (akb-claude-code, akb-cursor, ...) drives /api/v1/agent-sessions REST endpoints automatically. As an agent, your own memory vault (named agent-memory-{your-username}) is accessible via the normal akb_search / akb_browse / akb_get tools just like any other vault.
 """

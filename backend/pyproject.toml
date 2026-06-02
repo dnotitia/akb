@@ -1,7 +1,7 @@
 [project]
 name = "akb"
-version = "0.4.3"
-description = "Agent Knowledgebase - Organizational Memory for Agents"
+version = "0.5.0"
+description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",

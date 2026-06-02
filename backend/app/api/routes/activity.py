@@ -1,4 +1,10 @@
-"""REST API routes for session management and activity history."""
+"""REST API routes for vault activity history (git-based).
+
+Was `sessions.py` until the memory-feature removal in v0.4.0 — what
+remained were the activity / recent-changes / diff endpoints, all of
+which are read-only views over git history rather than session
+management. The file was renamed accordingly.
+"""
 
 import json
 
@@ -8,27 +14,11 @@ from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.git_service import GitService
-from app.services.session_service import SessionService
 from app.db.postgres import get_pool
 from app.repositories.document_repo import DocumentRepository
 
 router = APIRouter()
-session_service = SessionService()
 git = GitService()
-
-
-@router.post("/sessions/start", summary="Start an agent work session")
-async def start_session(vault: str, agent_id: str, context: str | None = None, user: AuthenticatedUser = Depends(get_current_user)):
-    # Reader role is the minimum bar — a session is logically a read-and-write
-    # workspace, but pre-fix this route did NO access check and any authenticated
-    # user could open a session against any vault by name (06-F4).
-    await check_vault_access(user.user_id, vault, required_role="reader")
-    return await session_service.start_session(vault, agent_id, context)
-
-
-@router.post("/sessions/{session_id}/end", summary="End a session")
-async def end_session(session_id: str, summary: str | None = None, user: AuthenticatedUser = Depends(get_current_user)):
-    return await session_service.end_session(session_id, summary, user_id=user.user_id)
 
 
 @router.get("/activity/{vault}", summary="Get vault activity history (Git-based)")
