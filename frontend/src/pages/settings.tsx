@@ -35,7 +35,6 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { MemoryTab } from "@/components/memory-tab";
 import { useTheme } from "@/hooks/use-theme";
 import { useFlashStatus } from "@/hooks/use-flash-status";
 import {
@@ -63,7 +62,7 @@ interface PAT {
   last_used_at?: string;
 }
 
-type TabId = "profile" | "tokens" | "preferences" | "memory" | "admin";
+type TabId = "profile" | "tokens" | "preferences" | "admin";
 type ClientTab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 type AdminSort = "recent" | "oldest" | "username" | "vaults";
 
@@ -357,7 +356,7 @@ export default function SettingsPage() {
   // Active tab synced to `?tab=` so Profile/Tokens/etc. are deep-linkable.
   // `admin` is only a valid value when the viewer is an admin — otherwise
   // it falls back to the default so non-admins can't land on a blank pane.
-  const allowedTabs: TabId[] = ["profile", "tokens", "preferences", "memory"];
+  const allowedTabs: TabId[] = ["profile", "tokens", "preferences"];
   if (user.is_admin) allowedTabs.push("admin");
   const rawTab = searchParams.get("tab");
   const activeTab: TabId =
@@ -406,7 +405,6 @@ export default function SettingsPage() {
             <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
           </TabsTrigger>
           <TabsTrigger value="preferences">Preferences</TabsTrigger>
-          <TabsTrigger value="memory">Memory</TabsTrigger>
           {user.is_admin && (
             <TabsTrigger value="admin" className="gap-1.5">
               Admin
@@ -925,10 +923,9 @@ export default function SettingsPage() {
           </div>
         </TabsContent>
 
-        {/* Memory — agent-stored facts the user can audit + forget. */}
-        <TabsContent value="memory" className="pt-6 max-w-4xl">
-          <MemoryTab />
-        </TabsContent>
+        {/* The "Memory" tab was removed in v0.5.0 — agent memory now
+            lives in a per-user vault (`agent-memory-{username}`) and is
+            accessible via the standard /vault/ browse UI. */}
 
         {/* Admin — user management. Only rendered when user.is_admin. */}
         {user.is_admin && (

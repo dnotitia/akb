@@ -158,7 +158,7 @@ TITLES=$(search_v "$VAULT_A" "OstrichBeakRatio" "&limit=20" \
 echo "$TITLES" | grep -q "LinkSrc" && echo "$TITLES" | grep -q "LinkDst" \
   && pass "both linked docs appear in search results" || fail "INT5" "missing in: $TITLES"
 
-# INT6 (memory-store-vs-search isolation) was retired in v0.4.0 — the
+# INT6 (memory-store-vs-search isolation) was retired in v0.5.0 — the
 # memory store is gone. Agent memory now lives in a per-user vault and
 # is naturally subject to the same vault-isolation rules as any other
 # vault content (covered by per-vault search tests above).

@@ -1,6 +1,6 @@
 [project]
 name = "akb"
-version = "0.5.0"
+version = "0.5.1"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.11"
 dependencies = [

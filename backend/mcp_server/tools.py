@@ -28,8 +28,8 @@ The pair tools (`akb_link`, `akb_unlink`) take `source` + `target`
 URIs — they too do not need a separate `vault` arg.
 
 Opaque domain handles that are *not* vault resources keep their own
-ID parameter (`session_id`, `todo_id`, `memory_id`, publication
-`slug`); these are not URI-addressable.
+ID parameter (`todo_id`, publication `slug`); these are not
+URI-addressable.
 """
 
 from mcp.types import Tool

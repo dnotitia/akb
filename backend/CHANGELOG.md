@@ -5,6 +5,37 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.1 — 2026-06-02
+
+Cleanup of v0.5.0 leftovers. The agent-memory feature removal in 0.5.0
+landed cleanly on the backend but left a handful of stale references
+that would confuse anyone reading the code or the UI:
+
+- **Frontend Settings page**: the "Memory" tab still rendered and
+  called `/api/v1/memory` (404 after 0.5.0). The tab + its component
+  (`memory-tab.tsx`) + its test (`memory-tab-chips.test.tsx`) + the
+  `Memory` / `recallMemories` / `forgetMemory` / `forgetCategory`
+  exports in `lib/api.ts` are all removed; settings.tsx no longer
+  declares a `memory` `TabId`.
+- **README**: the MCP tool table still listed
+  `akb_remember/akb_recall/akb_forget` and `akb_session_start/end`. The
+  row is replaced with a short paragraph pointing at the
+  `/api/v1/agent-sessions` REST surface and the auto-provisioned memory
+  vault, so a reader sees the correct mental model on first scan.
+- **tools.py docstring** referenced `memory_id` as one of the
+  non-URI-addressable opaque handles; removed.
+- **Deprecation-note version labels** in the e2e shells + concurrency
+  unit test said "retired in v0.4.0" — these were actually retired in
+  v0.5.0 (the 0.4.x stream was license + concurrency fixes). Fixed
+  inline so anyone tracing the retirement back to a release lands on
+  the right one.
+- **`settings-tokens-setup.test.tsx`** still mocked `recallMemories` —
+  removed so the test stays accurate against the trimmed client API
+  surface.
+
+No backend runtime contract change. No new MCP tools, no schema
+change. Just trace cleanup.
+
 ## 0.5.0 — 2026-06-02
 
 ### Agent memory — vault-shaped, REST-only (breaking)

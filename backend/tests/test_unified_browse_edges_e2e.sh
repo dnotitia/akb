@@ -597,7 +597,7 @@ print(int({'root_metrics','specs_metrics'}.issubset(names)))
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"root_metrics\"}" >/dev/null
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"specs_metrics\"}" >/dev/null
 
-# Section 19 (akb_recall truncation honesty) was retired in v0.4.0 —
+# Section 19 (akb_recall truncation honesty) was retired in v0.5.0 —
 # akb_recall no longer exists. The {returned, total, truncated} envelope
 # pattern is exercised by akb_browse / akb_search / akb_activity tests
 # in this suite (Sections 8-12, 20) and by /api/v1/agent-sessions tests
