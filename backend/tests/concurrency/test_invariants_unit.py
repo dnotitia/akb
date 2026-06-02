@@ -2,9 +2,6 @@
 shell-bombardment shape.
 
 Covers:
-- INV-3 SessionService.end_session FOR UPDATE — N concurrent calls
-  must produce exactly one "ended" result and exactly one
-  auto_summarize_session (i.e. one row in `memories`).
 - INV-5 sparse_encoder.recompute_stats pg_try_advisory_lock — N
   concurrent recompute calls; only the lock holder writes, the rest
   return ``{"skipped": true}``.
@@ -13,6 +10,10 @@ Covers:
   the row returns False and leaves llm_metadata_at unchanged.
 - INV-7 delete_vault orphan chunks — after delete_vault, no chunks rows
   remain for any source under that vault (documents OR tables OR files).
+
+(INV-3 SessionService.end_session FOR UPDATE was retired in v0.5.0
+alongside the memory-feature removal — the underlying service no
+longer exists.)
 
 Talks to a real Postgres via `AKB_TEST_DSN`; skips when unreachable so
 the suite runs unattended on machines without a dev DB. The audit
@@ -33,7 +34,6 @@ import pytest_asyncio
 
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
-from app.services.session_service import SessionService
 
 
 _DSN = os.environ.get(
@@ -88,49 +88,6 @@ async def vault(pool):
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
-
-
-# ── INV-3: end_session FOR UPDATE dedup ────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inv3_end_session_dedup(pool, vault):
-    """Concurrent end_session() must collapse to one ended state and
-    fire auto_summarize_session exactly once.
-    """
-    svc = SessionService()
-    started = await svc.start_session(vault["name"], agent_id="inv3", context=None)
-    sid = started["session_id"]
-
-    # Spawn a user so auto_summarize_session can attribute a memory.
-    async with pool.acquire() as conn:
-        uid = await conn.fetchval(
-            "INSERT INTO users (id, username, email, password_hash, is_admin) "
-            "VALUES (gen_random_uuid(), $1, $2, 'x', false) RETURNING id",
-            f"inv3-{uuid.uuid4().hex[:6]}",
-            f"inv3-{uuid.uuid4().hex[:6]}@test.local",
-        )
-
-    N = 10
-    results = await asyncio.gather(
-        *[svc.end_session(sid, summary=f"summary v{i}", user_id=str(uid)) for i in range(N)]
-    )
-
-    ended_ok = [r for r in results if "ended_at" in r and "error" not in r]
-    already = [r for r in results if r.get("error") == "Session already ended"]
-    other_err = [r for r in results if "error" in r and r["error"] != "Session already ended"]
-
-    assert len(ended_ok) == 1, f"expected 1 successful end, got {len(ended_ok)}: {ended_ok}"
-    assert len(already) == N - 1, f"expected {N-1} 'already ended', got {len(already)}: {already}"
-    assert not other_err, f"unexpected errors: {other_err}"
-
-    # auto_summarize_session must have fired exactly once → one memory row.
-    async with pool.acquire() as conn:
-        mem_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE session_id = $1",
-            uuid.UUID(sid),
-        )
-    assert mem_count == 1, f"expected 1 auto-memory, got {mem_count}"
 
 
 # ── INV-5: BM25 recompute_stats try_advisory_lock ──────────────────

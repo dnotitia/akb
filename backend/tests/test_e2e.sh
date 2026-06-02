@@ -230,19 +230,6 @@ assert_json_count "Drill down returns sections" "$R" "['sections']" "ge" "1"
 R=$(acurl "$BASE_URL/api/v1/drill-down/$VAULT/$DOC1_UUID?section=Overview" 2>/dev/null)
 assert_json_count "Section filter returns matching" "$R" "['sections']" "ge" "1"
 
-# ── 8. Session Management ───────────────────────────────────
-echo ""
-echo "▸ 8. Session Management"
-
-R=$(acurl -X POST "$BASE_URL/api/v1/sessions/start?vault=$VAULT&agent_id=e2e-test-agent&context=E2E+testing" 2>/dev/null)
-SESSION_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])" 2>/dev/null)
-assert_json_exists "Session start returns session_id" "$R" "['session_id']"
-assert_json "Session agent_id" "$R" "['agent_id']" "e2e-test-agent"
-
-# End session
-R=$(acurl -X POST "$BASE_URL/api/v1/sessions/$SESSION_ID/end?summary=E2E+test+completed" 2>/dev/null)
-assert_json_exists "Session end returns ended_at" "$R" "['ended_at']"
-
 # ── 9. Activity (Git-based, replaces /recent) ──────────────
 echo ""
 echo "▸ 9. Activity"
@@ -456,26 +443,6 @@ assert_json "Unpublish" "$R" "['published']" "False"
 # Verify no longer accessible
 STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null)
 [ "$STATUS" = "404" ] && pass "Unpublished doc returns 404" || fail "Unpublish verify" "expected 404, got $STATUS"
-
-# ── 17. Agent Memory ───────────────────────────────────────
-echo ""
-echo "▸ 17. Agent Memory"
-
-R=$(acurl -X POST "$BASE_URL/api/v1/memory" -H 'Content-Type: application/json' \
-  -d '{"content":"Test memory content","category":"learning"}' 2>/dev/null)
-MEM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-[ -n "$MEM_ID" ] && pass "Remember stored ($MEM_ID)" || fail "Remember" "no id"
-
-R=$(acurl "$BASE_URL/api/v1/memory" 2>/dev/null)
-MEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$MEM_COUNT" -ge 1 ] 2>/dev/null && pass "Recall returns $MEM_COUNT memories" || fail "Recall" "expected >=1"
-
-R=$(acurl "$BASE_URL/api/v1/memory?category=learning" 2>/dev/null)
-LEARN_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$LEARN_COUNT" -ge 1 ] 2>/dev/null && pass "Recall by category: $LEARN_COUNT" || fail "Recall category" "expected >=1"
-
-R=$(acurl -X DELETE "$BASE_URL/api/v1/memory/$MEM_ID" 2>/dev/null)
-assert_json "Forget memory" "$R" "['forgotten']" "True"
 
 # ── 18. Vault Tables ───────────────────────────────────────
 echo ""

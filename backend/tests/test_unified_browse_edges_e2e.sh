@@ -597,64 +597,11 @@ print(int({'root_metrics','specs_metrics'}.issubset(names)))
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"root_metrics\"}" >/dev/null
 mcp_call akb_drop_table "{\"vault\":\"$VAULT\",\"name\":\"specs_metrics\"}" >/dev/null
 
-# ── 19. akb_recall truncation honesty (0.3.0) ─────────────────
-echo ""
-echo "▸ 19. akb_recall Truncation Honesty"
-
-# Seed 3 memories in one category, request limit=2 → expect
-# returned=2, total=3, truncated=true. Category must come from the
-# MCP enum {context, preference, learning, work, general}; using
-# `general` to keep these tests isolated from any operational
-# category an agent might also write under.
-for n in 1 2 3; do
-  mcp_call akb_remember "{\"category\":\"general\",\"content\":\"truncation-e2e memory $n\"}" >/dev/null
-done
-
-RR=$(mcp_call akb_recall "{\"category\":\"general\",\"limit\":2}" | mcp_result)
-RR_OK=$(echo "$RR" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-# total may include other general-category memories from earlier
-# sections; what matters is the contract holds: returned=2, total>=3,
-# truncated reflects total>returned.
-ok = (
-    d.get('returned')==2
-    and d.get('total',0) >= 3
-    and d.get('truncated') is True
-)
-print(int(ok))
-" 2>/dev/null)
-[ "$RR_OK" = "1" ] && pass "akb_recall(limit=2): returned=2 total>=3 truncated=true" || fail "akb_recall truncation" "shape=$RR"
-
-# Request limit=50 (MCP maximum for akb_recall) → enough to see all
-# the seed memories → truncated=false.
-RR2=$(mcp_call akb_recall "{\"category\":\"general\",\"limit\":50}" | mcp_result)
-RR2_OK=$(echo "$RR2" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-# At limit=100 (the MCP maximum), truncated must reflect the real
-# state. With ≥3 seed memories and total<=100, truncated should be
-# False — returned matches the corpus count.
-ok = (
-    d.get('returned')==d.get('total')
-    and d.get('total',0) >= 3
-    and d.get('truncated') is False
-)
-print(int(ok))
-" 2>/dev/null)
-[ "$RR2_OK" = "1" ] && pass "akb_recall(limit=50): returned==total truncated=false" || fail "akb_recall full" "shape=$RR2"
-
-# Cleanup only the truncation-e2e memories we added (match on the
-# distinctive content prefix) — leave any other general-category
-# memories an earlier test might have stashed.
-echo "$RR2" | python3 -c "
-import sys,json
-for m in json.load(sys.stdin)['memories']:
-    if str(m.get('content','')).startswith('truncation-e2e memory '):
-        print(m['memory_id'])
-" | while read mid; do
-  mcp_call akb_forget "{\"memory_id\":\"$mid\"}" >/dev/null
-done
+# Section 19 (akb_recall truncation honesty) was retired in v0.5.0 —
+# akb_recall no longer exists. The {returned, total, truncated} envelope
+# pattern is exercised by akb_browse / akb_search / akb_activity tests
+# in this suite (Sections 8-12, 20) and by /api/v1/agent-sessions tests
+# in test_agent_sessions_e2e.sh.
 
 # ── 20. akb_activity truncation flag (0.3.0) ─────────────────
 echo ""

@@ -31,8 +31,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
 | `todos` | todo, todos, todo_update | Personal task assignments |
-| `memory` | remember, recall, forget | Persistent memory across sessions |
-| `sessions` | session_start, session_end, activity, diff | Track agent work + activity history |
+| `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
 | `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
 
@@ -302,33 +301,7 @@ akb_create_vault(name="my-project", description="...", template="engineering")
 ```
 Templates: `engineering`, `qa`, `hr`, `finance`, `management`, `issue-tracking`, `product`""",
 
-    "memory": """# Persistent Memory
-
-Memories persist across sessions — the agent remembers things between conversations.
-
-## Tools
-```
-akb_remember(content="The deploy key is in vault 'ops'", category="context")
-akb_recall()                          # All memories
-akb_recall(category="learning")       # Only learnings
-akb_forget(memory_id="mem-xxx")       # Delete one
-```
-
-## Categories
-| Category | Use for |
-|----------|---------|
-| `context` | Current work state, what you're doing |
-| `preference` | How the user likes to work |
-| `learning` | Things you discovered or learned |
-| `work` | Summary of completed work |
-| `general` | Anything else |
-
-## Best Practices
-- Call `akb_recall()` at session start to restore context
-- `akb_remember(category="work")` at session end to log what you did
-- Store non-obvious learnings: "vault X uses Korean collection names" """,
-
-    "activity": """# Activity & Diff — Vault History
+    "history": """# Activity & Diff — Vault History
 
 Audit who changed what and when via Git history. Use `akb_diff` to
 inspect the actual content change for a specific commit.
@@ -1138,29 +1111,6 @@ Returns:
 Find commit hashes via:
 - akb_history(uri) → per-document versions
 - akb_activity(vault) → vault-wide activity""",
-
-    "akb_remember": """# akb_remember — Store Memory
-
-```
-akb_remember(content="Deploy uses vault 'ops', collection 'runbooks'", category="context")
-```
-Categories: context, preference, learning, work, general""",
-
-    "akb_recall": """# akb_recall — Retrieve Memories
-
-```
-akb_recall()                       # All memories
-akb_recall(category="learning")   # Only learnings
-akb_recall(limit=5)               # Last 5
-```""",
-
-    "akb_forget": """# akb_forget — Delete a Memory
-
-```
-akb_forget(memory_id="mem-xxx")
-```
-
-Get memory IDs from `akb_recall()` results.""",
 
     "akb_publish": """# akb_publish — Create a Public Share
 

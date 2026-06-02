@@ -5,7 +5,7 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
-## 0.4.4 — 2026-06-02
+## 0.5.3 — 2026-06-02
 
 Document `status` coherence: leaned the lifecycle to 3 states and gave
 `archived` a real effect, after an audit found status was 100%
@@ -18,7 +18,7 @@ operationalized: no code transitioned states, the `superseded` value and
 its paired `documents.supersedes` UUID FK were never read or written.
 Leaned down to **`draft` → `active` → `archived`**. `superseded` is no
 longer accepted (`akb_put`/`akb_update` return 422; both now validate the
-status enum — previously only `put` did). Migration 031 drops the unused
+status enum — previously only `put` did). Migration 032 drops the unused
 `documents.supersedes` column (idempotent `DROP COLUMN IF EXISTS`).
 
 ### `archived` is now hidden from default search + browse
@@ -36,10 +36,162 @@ threaded through `SearchService.search`, `DocumentService.browse` /
 `akb_search`/`akb_browse` tool schemas and REST routes. The `akb-mcp`
 proxy forwards the new param transparently (no proxy release).
 
-Verified: `superseded` rejected on put + update (422); migration 031
+Verified: `superseded` rejected on put + update (422); migration 032
 drops the column on boot; browse + (embedding-backed) search hide
 archived by default and include it with `include_archived=true`;
 `test_mcp_e2e` 76/76, browse/search e2e green, status unit tests.
+
+## 0.5.2 — 2026-06-02
+
+Continuation of the v0.5.0/v0.5.1 cleanup. One more leftover surfaced
+during a post-deploy MCP probe: the `akb_help` tool schema description
+still listed `memory` and `sessions` as valid categories, and named
+`link-documents` (the pre-rename workflow) instead of `link-resources`.
+
+Tool descriptions are part of the `tools/list` MCP response that every
+agent client receives at handshake — they show up verbatim in the agent's
+own prompt. Listing dead categories there was the exact "leftover trace
+that confuses people" failure mode the v0.5.1 audit set out to avoid; it
+slipped because the audit grepped for service names + endpoints, not for
+literal references inside tool schema descriptions.
+
+Fix: rewrite the `topic` description against the actual `_HELP` keys —
+`(quickstart, documents, search, tables, files, access, history,
+publishing, relations)` for categories, `(link-resources, research,
+onboarding, data-tracking, vault-skill)` for workflows. Also dropped
+the stray `todos` entry (which was never an `_HELP` key in the first
+place; the original description had it for navigation only).
+
+No behavioural change. Verified by MCP probe against the deployed
+instance after 0.5.1: `akb_help(topic="memory")` already returned
+`No help found`; only the discovery hint was misleading.
+
+## 0.5.1 — 2026-06-02
+
+Cleanup of v0.5.0 leftovers. The agent-memory feature removal in 0.5.0
+landed cleanly on the backend but left a handful of stale references
+that would confuse anyone reading the code or the UI:
+
+- **Frontend Settings page**: the "Memory" tab still rendered and
+  called `/api/v1/memory` (404 after 0.5.0). The tab + its component
+  (`memory-tab.tsx`) + its test (`memory-tab-chips.test.tsx`) + the
+  `Memory` / `recallMemories` / `forgetMemory` / `forgetCategory`
+  exports in `lib/api.ts` are all removed; settings.tsx no longer
+  declares a `memory` `TabId`.
+- **README**: the MCP tool table still listed
+  `akb_remember/akb_recall/akb_forget` and `akb_session_start/end`. The
+  row is replaced with a short paragraph pointing at the
+  `/api/v1/agent-sessions` REST surface and the auto-provisioned memory
+  vault, so a reader sees the correct mental model on first scan.
+- **tools.py docstring** referenced `memory_id` as one of the
+  non-URI-addressable opaque handles; removed.
+- **Deprecation-note version labels** in the e2e shells + concurrency
+  unit test said "retired in v0.4.0" — these were actually retired in
+  v0.5.0 (the 0.4.x stream was license + concurrency fixes). Fixed
+  inline so anyone tracing the retirement back to a release lands on
+  the right one.
+- **`settings-tokens-setup.test.tsx`** still mocked `recallMemories` —
+  removed so the test stays accurate against the trimmed client API
+  surface.
+
+No backend runtime contract change. No new MCP tools, no schema
+change. Just trace cleanup.
+
+## 0.5.0 — 2026-06-02
+
+### Agent memory — vault-shaped, REST-only (breaking)
+
+The `akb_remember` / `akb_recall` / `akb_forget` MCP tools and the
+`memories` / `sessions` PG tables are **removed**. Agent dedicated
+memory is now expressed as a per-user vault (`agent-memory-{username}`)
+with per-session collections at `sessions/{date}/{agent_id}/{session_id}`
+and a `recap.md` document at end of session.
+
+The new surface lives at `/api/v1/agent-sessions` (Bearer auth, REST,
+**not MCP**) and is intended to be driven by lifecycle plugins
+(`akb-claude-code`, `akb-cursor`, `akb-codex`) hooked into agent
+SessionStart / PreCompact / SessionEnd / UserPromptSubmit events. The
+agent itself never calls these endpoints — they sit outside the
+tool-use loop, so the agent's tool list is unpolluted by lifecycle
+plumbing.
+
+#### Removed
+
+- MCP tools: `akb_remember`, `akb_recall`, `akb_forget`
+- Services: `app.services.memory_service`, `app.services.session_service`
+- REST routes: `/api/v1/memory*`, `/api/v1/sessions/start`, `/api/v1/sessions/{id}/end`
+- PG tables: `memories`, `sessions` (dropped by migration 031 —
+  unconditional, no FK references existed)
+- Concurrency test `INV-3` (covered the removed SessionService)
+- Help topic: `memory`, `sessions`
+- Activity / recent / diff endpoints relocated from
+  `app.api.routes.sessions` to `app.api.routes.activity` (the original
+  file was 60% session-management, 40% activity-history; once the
+  session bits left, the rename made the remaining contents honest)
+
+#### Added
+
+- `app.services.agent_memory_service.AgentMemoryService` — vault
+  auto-provisioning + session lifecycle + recall.
+- REST endpoints under `/api/v1/agent-sessions`:
+  - `POST /agent-sessions/{session_id}` — start (idempotent on
+    `session_id`; SessionStart with `source=resume|clear|compact`
+    returns the existing collection rather than 409).
+  - `POST /agent-sessions/{session_id}/end` — write `recap.md` with
+    `type: session` frontmatter; accepts the Cursor-style `reason`
+    enum (`completed | aborted | error | window_close | user_close |
+    stop`) and an independent `outcome` enum
+    (`success | partial | abandoned`).
+  - `POST /agent-sessions/{session_id}/snapshot` — durable partial
+    summary for PreCompact-class events. Each call writes a sequential
+    `snapshot-NNN.md` rather than mutating collection metadata, so
+    every snapshot is git-versioned.
+  - `GET /agent-sessions/{session_id}/context` — preferences /
+    learnings / parent-recap injection for UserPromptSubmit-class
+    hooks (synchronous by contract).
+  - `GET /agent-sessions/{session_id}` — status (`ended` flag,
+    `recap` pointer).
+  - `GET /agent-sessions` — list the caller's sessions, optional
+    `agent_id` filter.
+- Migration `031_drop_memories_sessions.py`.
+- E2E suite `backend/tests/test_agent_sessions_e2e.sh` (28 cases,
+  covers auto-provision, idempotency on resume/compact, snapshot
+  sequence, parent-recap injection across agents, ungraceful end with
+  `reason=window_close`, list/filter, validation rejects, auth).
+
+#### Convergent design — sourcing
+
+The REST contract was synthesised from a cross-harness audit of agent
+lifecycle hooks (run 2026-06-02 — see
+`product/akb/design-proposals/akb-agent-memory-rest-final-design-2026-06-02-v050.md`).
+Headline findings the API honours:
+
+- Claude Code (1.0.85+), Cursor (1.7), and OpenAI Codex CLI (April
+  2026) all expose a SessionStart hook that fires on
+  resume / clear / compact / startup with the source as a discriminator
+  field — the API is idempotent on `session_id`-in-path so the plugin
+  does not need to dedupe client-side.
+- All three agents pass at least `session_id`, `transcript_path`,
+  `cwd`, and `hook_event_name` on stdin; the start body accepts the
+  superset of these so a single plugin contract drives all three.
+- Cursor's `sessionEnd` carries an explicit `reason` enum — the API
+  adopts it verbatim plus `stop` to cover Claude Code's `Stop` hook.
+- Claude Code natively supports `{type: "http", url, headers:
+  {"Authorization": "Bearer $AKB_PAT"}, allowedEnvVars: ["AKB_PAT"]}`,
+  so the plugin can call AKB directly from the hook script with no
+  wrapper — Bearer auth on the REST endpoints is sufficient.
+
+#### Migration
+
+`memories` and `sessions` are dropped without backfill. The data was
+never user-visible outside of the `akb_remember` tool; operators who
+need to retain it must snapshot before upgrade. The recommended
+replacement workflow is to write any persistent agent state into the
+auto-provisioned memory vault through the lifecycle plugin (or
+directly via `akb_put` to the vault — it is an ordinary vault).
+
+The plugin (`packages/akb-claude-code/`) is a separate work-item; this
+release is the backend it will call.
 
 ## 0.4.3 — 2026-06-02
 

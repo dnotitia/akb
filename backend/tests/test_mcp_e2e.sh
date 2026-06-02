@@ -293,22 +293,6 @@ BROWSE_KEEP=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
 HAS_KEEP=$(echo "$BROWSE_KEEP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for i in d.get('items', []) if i.get('name') == 'keepempty' and i.get('type') == 'collection'))" 2>/dev/null)
 [ "$HAS_KEEP" = "1" ] && pass "empty collection survives last-doc delete" || fail "empty-is-valid" "keepempty not found in browse"
 
-# ── 10. Memory via MCP ───────────────────────────────────────
-echo ""
-echo "▸ 10. Memory via MCP"
-
-R=$(mcp_call akb_remember '{"content":"MCP test memory","category":"learning"}' | mcp_result)
-MEM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-[ -n "$MEM_ID" ] && pass "akb_remember ($MEM_ID)" || fail "akb_remember" "no id"
-
-R=$(mcp_call akb_recall '{}' | mcp_result)
-MEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$MEM_COUNT" -ge 1 ] 2>/dev/null && pass "akb_recall: $MEM_COUNT memories" || fail "akb_recall" "expected >=1"
-
-R=$(mcp_call akb_forget "{\"memory_id\":\"$MEM_ID\"}" | mcp_result)
-FORGOT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['forgotten'])" 2>/dev/null)
-[ "$FORGOT" = "True" ] && pass "akb_forget" || fail "akb_forget" "not deleted"
-
 # ── 11. Tables via MCP ───────────────────────────────────────
 echo ""
 echo "▸ 11. Tables via MCP"
