@@ -34,6 +34,7 @@ class _FakeDocRepo:
         content_hash: str,
         hash_algorithm: str,
         content_hash_commit: str | None,
+        conn=None,
     ) -> None:
         self.hash_update = {
             "doc_id": doc_id,
@@ -204,6 +205,7 @@ async def test_document_update_rejects_stale_expected_content_hash() -> None:
             vault_id=uuid.uuid4(),
             doc_repo=doc_repo,
             row=row,
+            conn=None,
         )
 
     assert doc_repo.hash_update == {
