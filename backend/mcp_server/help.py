@@ -130,7 +130,10 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 `note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`
 
 ## Document Status
-`draft` → `active` → `archived` or `superseded`
+`draft` (default) → `active` → `archived`. Soft lifecycle signal; `archived`
+docs are excluded from default search/browse (pass `include_archived` to
+include them). Set on create with `akb_put(status=...)` or change later with
+`akb_update`.
 
 ## Key Patterns
 
@@ -686,7 +689,7 @@ Only send fields you want to change. Unspecified fields remain unchanged.
 | uri | ✓ | Document AKB URI |
 | content | | New Markdown body (replaces existing) |
 | title | | New title |
-| status | | draft, active, archived, superseded |
+| status | | draft (default), active, archived |
 | tags | | New tag list (replaces existing) |
 | summary | | New summary |
 | depends_on | | Update dependency list (akb:// URIs) |

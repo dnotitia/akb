@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS documents (
     path TEXT NOT NULL,                -- relative path within vault (e.g. "api-specs/payment-v2.md")
     title TEXT NOT NULL,
     doc_type TEXT,                     -- note, report, decision, spec, plan, session, task, reference
-    status TEXT NOT NULL DEFAULT 'draft',  -- draft, active, archived, superseded
+    status TEXT NOT NULL DEFAULT 'draft',  -- draft, active, archived
     summary TEXT,                      -- L2 summary (auto-generated or author-provided)
     domain TEXT,                       -- engineering, product, ops, legal, ...
     created_by TEXT,                   -- principal who created
@@ -113,7 +113,6 @@ CREATE TABLE IF NOT EXISTS documents (
     content_hash_commit TEXT,          -- commit the content_hash projection was computed from
     tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}',       -- extended metadata from frontmatter
-    supersedes UUID REFERENCES documents(id) ON DELETE SET NULL,
     UNIQUE(vault_id, path)
 );
 

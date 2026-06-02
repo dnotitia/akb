@@ -225,7 +225,7 @@ def test_put_request_status_defaults_to_draft_and_accepts_active() -> None:
     base = dict(vault="v", collection="c", title="t", content="# x")
     assert DocumentPutRequest(**base).status == "draft"          # backward-compatible default
     assert DocumentPutRequest(**base, status="active").status == "active"
-    assert set(DOC_STATUSES) == {"draft", "active", "archived", "superseded"}
+    assert set(DOC_STATUSES) == {"draft", "active", "archived"}
 
 
 @pytest.mark.asyncio

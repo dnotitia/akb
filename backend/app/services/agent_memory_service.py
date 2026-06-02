@@ -444,7 +444,7 @@ class AgentMemoryService:
             f"# {slug.replace('-', ' ').title()}\n\n"
             f"Captured at {now.isoformat()} (cause: {cause}).\n\n"
             f"## Partial summary\n\n{body.partial_summary.strip()}\n"
-            + (f"\n## Progress\n\n" + "\n".join(progress_lines) + "\n" if progress_lines else "")
+            + ("\n## Progress\n\n" + "\n".join(progress_lines) + "\n" if progress_lines else "")
         )
 
         req = DocumentPutRequest(
@@ -453,7 +453,7 @@ class AgentMemoryService:
             title=f"Snapshot {n + 1} — {sid_safe[:12]}",
             content=content,
             type="session",
-            tags=[f"snapshot", f"cause:{cause}"],
+            tags=["snapshot", f"cause:{cause}"],
             domain="agent-memory",
             slug=slug,
         )
@@ -481,7 +481,7 @@ class AgentMemoryService:
         context. Pagination here is a hard cap, not an offset pattern;
         plugins consume the top-N and never paginate further.
         """
-        sid_safe = sanitise_session_id(session_id)
+        sanitise_session_id(session_id)  # validate shape (raises on bad id); result unused here
         memory_vault = memory_vault_name(username)
 
         if not scopes:

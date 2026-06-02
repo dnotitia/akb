@@ -5,6 +5,42 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.3 — 2026-06-02
+
+Document `status` coherence: leaned the lifecycle to 3 states and gave
+`archived` a real effect, after an audit found status was 100%
+descriptive (it gated nothing) and the 4th state was vestigial.
+
+### `superseded` state + `supersedes` column removed (3-state lifecycle)
+
+The 4-state model (`draft`/`active`/`archived`/`superseded`) was never
+operationalized: no code transitioned states, the `superseded` value and
+its paired `documents.supersedes` UUID FK were never read or written.
+Leaned down to **`draft` → `active` → `archived`**. `superseded` is no
+longer accepted (`akb_put`/`akb_update` return 422; both now validate the
+status enum — previously only `put` did). Migration 032 drops the unused
+`documents.supersedes` column (idempotent `DROP COLUMN IF EXISTS`).
+
+### `archived` is now hidden from default search + browse
+
+Previously `status` did not affect any read path. Now `archived` means
+something: `akb_search` and `akb_browse` (REST + MCP) **exclude archived
+documents by default**, with an opt-in `include_archived: true`. The
+default `draft` on create is unchanged — the intended flow stays
+draft → promote.
+
+Concretely: a SQL `status != 'archived'` predicate on the search
+document-candidate prefilter and the browse depth query; `include_archived`
+threaded through `SearchService.search`, `DocumentService.browse` /
+`_browse_docs`, and `DocumentRepository.list_docs_by_depth`, plus the
+`akb_search`/`akb_browse` tool schemas and REST routes. The `akb-mcp`
+proxy forwards the new param transparently (no proxy release).
+
+Verified: `superseded` rejected on put + update (422); migration 032
+drops the column on boot; browse + (embedding-backed) search hide
+archived by default and include it with `include_archived=true`;
+`test_mcp_e2e` 76/76, browse/search e2e green, status unit tests.
+
 ## 0.5.2 — 2026-06-02
 
 Continuation of the v0.5.0/v0.5.1 cleanup. One more leftover surfaced

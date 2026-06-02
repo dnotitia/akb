@@ -114,6 +114,7 @@ class SearchService:
         tags: list[str] | None = None,
         limit: int = 10,
         user_id: str | None = None,
+        include_archived: bool = False,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow."""
         # ACL guard mirroring `grep` below: when neither vault nor
@@ -189,6 +190,12 @@ class SearchService:
                 if acl_sql:
                     conditions.append(acl_sql)
                     params.extend(acl_params); idx += 1
+
+                # Default-hide archived documents from discovery; opt back in
+                # with include_archived=true. (Status literal — no bind param;
+                # only the document candidate query carries doc status.)
+                if not include_archived:
+                    conditions.append("d.status != 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
                 rows = await conn.fetch(
