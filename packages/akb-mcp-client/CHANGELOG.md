@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.3 — make MIT licensing explicit
+
+No code change. The proxy has always declared `"license": "MIT"` in
+`package.json`, but the only `LICENSE` file in the repo was the root
+PolyForm NC (and now BSL 1.1) covering the AKB backend — leaving the
+proxy's actual license ambiguous to anyone reading the source.
+
+This release ships a package-local `LICENSE` file with the MIT text,
+so the npm tarball is self-contained and the proxy is unambiguously
+MIT regardless of how the repo at large is licensed.
+
+**Why the proxy stays fully open while the backend moved to BSL 1.1**:
+the proxy is a thin stdio ↔ HTTP forwarder meant to be embedded inside
+arbitrary MCP-aware agent clients (Claude Code, Cursor, Windsurf,
+custom agents, etc.). MIT removes any friction for those embedders.
+The AKB backend — the actual knowledge base — is where the BSL
+protection applies. See the root [LICENSE-CHANGE.md](../../LICENSE-CHANGE.md)
+for the rationale on the backend transition.
+
 ## 2.0.2 — bump default request timeout (30s → 5min)
 
 Bug fix: the proxy's per-request timeout was hardcoded to 30s, which
