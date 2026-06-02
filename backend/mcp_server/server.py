@@ -249,6 +249,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
         title=args["title"],
         content=args["content"],
         type=args.get("type", "note"),
+        status=args.get("status", "draft"),
         tags=args.get("tags", []),
         domain=args.get("domain"),
         summary=args.get("summary"),
