@@ -937,9 +937,9 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "What to get help on. Options: "
-                        "categories (quickstart, documents, search, tables, access, memory, sessions, publishing), "
+                        "categories (quickstart, documents, search, tables, files, access, history, publishing, relations), "
                         "tool names (akb_put, akb_search, etc.), "
-                        "or workflow names (link-documents, research, onboarding, data-tracking)"
+                        "or workflow names (link-resources, research, onboarding, data-tracking, vault-skill)"
                     ),
                 },
                 "vault": {

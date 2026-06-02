@@ -5,6 +5,31 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.2 — 2026-06-02
+
+Continuation of the v0.5.0/v0.5.1 cleanup. One more leftover surfaced
+during a post-deploy MCP probe: the `akb_help` tool schema description
+still listed `memory` and `sessions` as valid categories, and named
+`link-documents` (the pre-rename workflow) instead of `link-resources`.
+
+Tool descriptions are part of the `tools/list` MCP response that every
+agent client receives at handshake — they show up verbatim in the agent's
+own prompt. Listing dead categories there was the exact "leftover trace
+that confuses people" failure mode the v0.5.1 audit set out to avoid; it
+slipped because the audit grepped for service names + endpoints, not for
+literal references inside tool schema descriptions.
+
+Fix: rewrite the `topic` description against the actual `_HELP` keys —
+`(quickstart, documents, search, tables, files, access, history,
+publishing, relations)` for categories, `(link-resources, research,
+onboarding, data-tracking, vault-skill)` for workflows. Also dropped
+the stray `todos` entry (which was never an `_HELP` key in the first
+place; the original description had it for navigation only).
+
+No behavioural change. Verified by MCP probe against the deployed
+instance after 0.5.1: `akb_help(topic="memory")` already returned
+`No help found`; only the discovery hint was misleading.
+
 ## 0.5.1 — 2026-06-02
 
 Cleanup of v0.5.0 leftovers. The agent-memory feature removal in 0.5.0
