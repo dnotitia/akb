@@ -255,7 +255,7 @@ EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 [ "$EMPTY_ERR" = "True" ] && pass "Edit: empty old_string rejected" || fail "Empty old_string" "$R"
 
 # Section 4 (Memory Category Filtering) and 5 (memory cross-user
-# isolation) were retired in v0.4.0 alongside the akb_remember/recall/
+# isolation) were retired in v0.5.0 alongside the akb_remember/recall/
 # forget MCP tool removal. Per-user vault isolation is exercised by
 # Section 1 (documents) and Section 2 (search) above using the same
 # access_service.check_vault_access gate that the memory routes used.

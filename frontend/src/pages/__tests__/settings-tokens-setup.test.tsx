@@ -7,7 +7,6 @@ import SettingsPage from "../settings";
 vi.mock("@/lib/api", () => ({
   getMe: vi.fn().mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false }),
   listPATs: vi.fn(),
-  recallMemories: vi.fn(),
   adminListUsers: vi.fn(),
   // stubs for other api calls used by settings.tsx
   getToken: vi.fn(() => "fake-jwt"),

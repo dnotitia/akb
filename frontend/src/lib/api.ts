@@ -587,36 +587,14 @@ export const createPublicationSnapshot = (vault: string, publication_id: string)
 export const searchUsers = (query?: string) =>
   api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);
 
-// ── Memory ──
-export interface Memory {
-  memory_id: string;
-  category: string;
-  content: string;
-  source?: string;
-  created_at?: string;
-  updated_at?: string;
-}
-export const recallMemories = (category?: string, limit = 100) => {
-  const p = new URLSearchParams({ limit: String(limit) });
-  if (category) p.set("category", category);
-  // Backend 0.3.0 response shape: `total` is the corpus count (was
-  // len(memories) pre-0.3.0). `returned` and `truncated` are new —
-  // kept optional in the type so an upgrade-in-flight backend still
-  // type-checks. memory-tab.tsx reads `.memories` directly, so the
-  // runtime is unaffected by the shape upgrade.
-  return api<{
-    memories: Memory[];
-    total: number;
-    returned?: number;
-    truncated?: boolean;
-  }>(`/memory?${p}`);
-};
-export const forgetMemory = (memory_id: string) =>
-  api<{ forgotten: boolean }>(`/memory/${memory_id}`, { method: "DELETE" });
-export const forgetCategory = (category: string) =>
-  api<{ forgotten: number; category: string }>(`/memory/category/${category}`, {
-    method: "DELETE",
-  });
+// Memory client surface (recallMemories / forgetMemory / forgetCategory /
+// Memory) was removed in v0.5.0 alongside the akb_remember/recall/forget
+// MCP tools and the /api/v1/memory REST endpoints. Agent dedicated
+// memory now lives in the auto-provisioned `agent-memory-{username}`
+// vault and is read/written via the standard documents+browse client
+// API just like any other vault. The settings-page "Memory" tab was
+// dropped; a dedicated UI for browsing the memory vault is a future
+// follow-up if needed.
 
 // ── Admin ──
 export interface AdminUser {

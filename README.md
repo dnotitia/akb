@@ -117,9 +117,15 @@ letting the indexing worker re-populate.
 | `akb_relations` / `akb_link` / `akb_unlink` / `akb_graph` | Knowledge graph |
 | `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, Git history |
 | `akb_grant` / `akb_revoke` / `akb_set_public` | Permission boundaries — per-user, per-org, public |
-| `akb_remember` / `akb_recall` / `akb_forget` | Agent memory |
-| `akb_session_start` / `akb_session_end` | Session lifecycle |
 | `akb_publish` / `akb_unpublish` | Public publication |
+
+Agent memory and session lifecycle are not MCP tools — they live on
+the dedicated `/api/v1/agent-sessions` REST surface, driven by AKB
+lifecycle plugins (`akb-claude-code`, `akb-cursor`, …) that hook into
+the agent's own SessionStart / PreCompact / SessionEnd events. As an
+agent, your own memory vault (`agent-memory-{username}`) is browsable
+through the standard `akb_search` / `akb_browse` / `akb_get` tools
+exactly like any other vault.
 
 The full tool catalogue is exposed via `akb_help()` from any MCP client.
 

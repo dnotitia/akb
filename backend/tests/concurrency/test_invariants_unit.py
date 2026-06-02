@@ -11,7 +11,7 @@ Covers:
 - INV-7 delete_vault orphan chunks — after delete_vault, no chunks rows
   remain for any source under that vault (documents OR tables OR files).
 
-(INV-3 SessionService.end_session FOR UPDATE was retired in v0.4.0
+(INV-3 SessionService.end_session FOR UPDATE was retired in v0.5.0
 alongside the memory-feature removal — the underlying service no
 longer exists.)
 
