@@ -18,6 +18,7 @@ idempotent) and catches anything caller-side normalization missed.
 from __future__ import annotations
 
 import unicodedata
+from difflib import get_close_matches
 from typing import Any
 
 from pydantic import BaseModel, model_validator
@@ -141,6 +142,26 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
             )
         parts.append(raw)
     return "/".join(parts)
+
+
+_FUZZY_HINT_LIST_LIMIT = 15
+
+
+def fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
+    """Top-3 close matches → 'Did you mean…?', else first N as fallback.
+
+    Single source of truth for "tell the caller they probably typo'd X
+    and the real names are Y / Z". Used by `akb_sql` column/table
+    error enrichment AND `_dispatch` unknown-argument detection — same
+    tone for both so an agent that recovered from one will recover
+    from the other without re-learning the shape.
+    """
+    suggestions = get_close_matches(bad, candidates, n=3, cutoff=0.6)
+    if suggestions:
+        return f"Did you mean: {', '.join(suggestions)}?"
+    truncated = candidates[:_FUZZY_HINT_LIST_LIMIT]
+    suffix = " …" if len(candidates) > _FUZZY_HINT_LIST_LIMIT else ""
+    return f"Available {label}: {', '.join(truncated)}{suffix}"
 
 
 def like_escape(s: str) -> str:

@@ -40,7 +40,7 @@ from app.services.access_service import (
     archive_vault,
 )
 from app.services.auth_service import resolve_token
-from app.util.text import to_nfc
+from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
@@ -110,6 +110,15 @@ search_service = SearchService()
 # ── Handler Registry ────────────────────────────────────────────
 
 _HANDLERS: dict[str, Any] = {}
+
+# Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
+# to reject unknown arguments with a fuzzy hint. Built once at import
+# time from the same TOOLS list returned via list_tools, so the
+# "what the agent saw" and "what we accept" can't drift.
+_TOOL_ARG_NAMES: dict[str, set[str]] = {
+    t.name: set((t.inputSchema or {}).get("properties", {}).keys())
+    for t in TOOLS
+}
 
 
 def _h(name: str):
@@ -1166,6 +1175,25 @@ async def _dispatch(name: str, args: dict):
     handler = _HANDLERS.get(name)
     if not handler:
         return {"error": f"Unknown tool: {name}"}
+
+    # Reject unknown arguments before the handler sees them. Without
+    # this, a typo like `akb_activity(user=...)` (real name: `author`)
+    # would silently fall through `args.get("author")` and quietly
+    # disable the filter — agent thinks the filter applied and trusts
+    # an unfiltered result. Surface the typo with a fuzzy hint so the
+    # caller can self-correct on retry; shape matches table_service's
+    # _enrich_undefined_error so the tone is uniform across the API.
+    allowed = _TOOL_ARG_NAMES.get(name)
+    if allowed is not None:
+        unknown = [k for k in args if k not in allowed]
+        if unknown:
+            bad = unknown[0]
+            return {
+                "error": f"Unknown argument '{bad}' for {name}",
+                "hint": fuzzy_hint(bad, sorted(allowed), label="arguments"),
+                "available_arguments": sorted(allowed),
+            }
+
     return await handler(args, uid, user)
 
 
