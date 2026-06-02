@@ -658,3 +658,37 @@ async def test_p2_collection_delete_handles_tables(pool):
         await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
     assert reg == 0, "registry row must be gone"
     assert pg_tbl == 0, "dynamic PG table must be dropped"
+
+
+# ── E06: collection-retirement vs PUT FK race ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_with_deleted_collection_raises_conflict(pool, vault):
+    """A document insert whose `collection_id` references a collection that no
+    longer exists must surface as ConflictError (409), not an unhandled
+    asyncpg.ForeignKeyViolationError (500).
+
+    This is the E06 'collection retirement race': a PUT's get_or_create
+    observes a collection, a concurrent recursive DELETE removes it, then the
+    PUT's INSERT (still referencing the vanished id) trips
+    `documents_collection_id_fkey`. `collection_id` is ON DELETE SET NULL, so
+    the delete side re-homes existing docs — but a NEW insert against the gone
+    id is an FK violation that must become a clean, retryable 409.
+    """
+    from datetime import datetime, timezone
+
+    from app.exceptions import ConflictError
+
+    doc_repo = DocumentRepository(pool)
+    bogus_collection_id = uuid.uuid4()  # never inserted into `collections`
+    now = datetime.now(timezone.utc)
+
+    with pytest.raises(ConflictError):
+        await doc_repo.create(
+            vault_id=vault["id"], collection_id=bogus_collection_id,
+            path="retire/lost-race.md", title="Doc", doc_type="note",
+            status="draft", summary=None, domain=None, created_by=None, now=now,
+            commit_hash="0" * 40, content_hash="h", hash_algorithm="sha256",
+            tags=[], metadata={},
+        )
