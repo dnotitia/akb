@@ -8,6 +8,7 @@ from datetime import datetime
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.util.text import like_escape
 from app.utils import dumps_jsonb
 
 
@@ -586,11 +587,10 @@ class CollectionRepository:
     # ``_like_escape`` used to live here. The same triple-replace also
     # got copy-pasted into the inline prefix-filter inside
     # ``list_docs_by_depth`` (and into two other repos). Consolidated
-    # at ``app.util.text.like_escape`` — call sites now go through
-    # that, and this alias keeps the existing ``self._like_escape``
-    # call-pattern working without churn.
-    from app.util.text import like_escape as _like_escape_impl
-    _like_escape = staticmethod(_like_escape_impl)
+    # at ``app.util.text.like_escape`` (imported at module top) — call
+    # sites now go through that, and this alias keeps the existing
+    # ``self._like_escape`` call-pattern working without churn.
+    _like_escape = staticmethod(like_escape)
 
     async def list_docs_under(
         self,
