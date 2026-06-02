@@ -155,5 +155,6 @@ If you fork this for your own domain, you'll write your own
 
 ## License
 
-PolyForm Noncommercial 1.0.0 — same as the parent `dnotitia/akb`
-repository. See [LICENSE](../../LICENSE).
+Business Source License 1.1 — same as the parent `dnotitia/akb`
+repository. See [LICENSE](../../LICENSE) and
+[LICENSE-CHANGE.md](../../LICENSE-CHANGE.md).

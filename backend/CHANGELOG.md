@@ -5,7 +5,7 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
-## 0.3.7 — 2026-06-02
+## 0.4.1 — 2026-06-02
 
 Connection-pool deadlock on the document write paths under a concurrent
 write burst. Reproduced from an external "E01 multi-vault knowledge
@@ -47,6 +47,24 @@ Verified: a 100-PUT + 300-GET multi-vault burst that returned 0/100 PUT
 and 2/300 GET before now returns 100/100 and 300/300; `test_mcp_e2e`
 76/76, `test_edit_e2e` 37/37, `test_concurrency_repro_e2e` 22/22. Repro
 harness lives at `backend/tests/concurrency/repro_e01_multivault.py`.
+
+## 0.4.0 — 2026-06-02
+
+License change: **PolyForm Noncommercial 1.0 → Business Source License
+1.1**. No runtime contract change; this release exists to mark the
+license transition cleanly.
+
+The BSL 1.1 ships with a 100 Named Seats Additional Use Grant — small
+commercial deployments that were previously forbidden are now
+explicitly permitted, while large-scale or third-party-hosting use
+still requires a commercial license. Each release converts
+automatically to Apache License 2.0 four years after its first public
+distribution.
+
+See [LICENSE](../LICENSE) for the load-bearing text and
+[LICENSE-CHANGE.md](../LICENSE-CHANGE.md) for the rationale and FAQ.
+
+Releases ≤ 0.3.6 remain under PolyForm NC 1.0 as originally distributed.
 
 ## 0.3.6 — 2026-05-28
 

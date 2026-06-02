@@ -8,8 +8,15 @@ By submitting a contribution (pull request, patch, or any code/content
 addition) to this repository, you agree that:
 
 1. Your contribution is licensed to Dnotitia, Inc. and downstream users
-   under [PolyForm Noncommercial 1.0](./LICENSE) — the same terms as the
-   rest of the project.
+   under the license that applies to the directory you're contributing
+   to:
+   - Contributions to `packages/akb-mcp-client/` are licensed under the
+     [MIT License](./packages/akb-mcp-client/LICENSE).
+   - Contributions to every other directory (backend, frontend,
+     deployment manifests, eval, etc.) are licensed under the
+     [Business Source License 1.1](./LICENSE), including the
+     Additional Use Grant currently in effect and the automatic
+     conversion to the Change License (Apache 2.0) on the Change Date.
 2. You grant Dnotitia, Inc. and downstream users a perpetual, worldwide,
    non-exclusive, royalty-free, irrevocable patent license to make, use,
    sell, offer for sale, import, and otherwise transfer your contribution,
