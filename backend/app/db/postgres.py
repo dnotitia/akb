@@ -115,6 +115,7 @@ async def _apply_migrations() -> None:
         "028_edges_kind.py",                    # edges.kind ('implicit' rewriteable | 'explicit' akb_link-created) so akb_link edges survive akb_update rewrites
         "029_outbox_chunk_id_index.py",         # partial index on vector_delete_outbox(chunk_id) WHERE processed_at IS NULL for reaper dedup lookups
         "030_resource_content_hash.py",         # documents/vault_files content_hash projection for manifests and preconditions
+        "031_drop_memories_sessions.py",        # drop legacy memories+sessions tables; agent memory is now vault-shaped
     ):
         module = _load_migration(filename)
         if module is None:

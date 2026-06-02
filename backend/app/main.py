@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
-from app.api.routes import access, auth, documents, files, help as help_routes, memory, public, search, collections, knowledge, sessions, tables
+from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, tables
 from app.services import embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -71,8 +71,8 @@ app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
 app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
 app.include_router(knowledge.router, prefix="/api/v1", tags=["knowledge"])
-app.include_router(sessions.router, prefix="/api/v1", tags=["sessions"])
-app.include_router(memory.router, prefix="/api/v1", tags=["memory"])
+app.include_router(activity.router, prefix="/api/v1", tags=["activity"])
+app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-sessions"])
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])

@@ -178,9 +178,14 @@ SUCC=$(grep -l '"commit_hash"' "$TMP"/out* 2>/dev/null | wc -l | tr -d ' ')
 rm -rf "$TMP"
 
 # ─────────────────────────────────────────────────────────────────
-echo ""
-echo "▸ T9: sessions/start outsider on private vault → 403"
-V9="v9-$TS"; mkvault "$V9"
+# T9 (sessions/start outsider on private vault → 403) was retired in
+# v0.4.0 alongside the session_service removal. Vault ACL coverage for
+# the outsider-on-private-vault case lives in test_security_edge_e2e.sh
+# now (it exercises the same access_service path via documents/search).
+#
+# The outsider user + PAT it set up are still needed by T13 below
+# (which checks /recent visibility of a public vault), so keep the
+# bootstrap; just skip the sessions-specific assertion.
 OUTSIDER="outsider-$TS"
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H "$H_JSON" \
   -d "{\"username\":\"$OUTSIDER\",\"email\":\"$OUTSIDER@t.dev\",\"password\":\"test1234\"}" >/dev/null
@@ -188,11 +193,6 @@ OUT_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H "$H_JSON" \
   -d "{\"username\":\"$OUTSIDER\",\"password\":\"test1234\"}" | jq_field "['token']")
 OUT_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" -H "Authorization: Bearer $OUT_JWT" \
   -H "$H_JSON" -d '{"name":"out"}' | jq_field "['token']")
-# Route uses query params (vault, agent_id)
-CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
-  "$BASE_URL/api/v1/sessions/start?vault=$V9&agent_id=x" \
-  -H "Authorization: Bearer $OUT_PAT")
-[ "$CODE" = "403" ] && pass "T9 outsider → 403" || fail "T9 sessions" "expected 403, got $CODE"
 
 # ─────────────────────────────────────────────────────────────────
 echo ""

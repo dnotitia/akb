@@ -158,22 +158,10 @@ TITLES=$(search_v "$VAULT_A" "OstrichBeakRatio" "&limit=20" \
 echo "$TITLES" | grep -q "LinkSrc" && echo "$TITLES" | grep -q "LinkDst" \
   && pass "both linked docs appear in search results" || fail "INT5" "missing in: $TITLES"
 
-# ── INT6. Memory store does NOT leak into document search ────
-echo ""
-echo "▸ INT6. memory store separation from chunks"
-
-# Put a memory entry via MCP
-if [ -n "$SID" ]; then
-  rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
-    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $SID" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_remember\",\"arguments\":{\"category\":\"trivia\",\"text\":\"PinguinValkyrieMarker memory entry only.\"}}}" >/dev/null
-fi
-sleep 3
-
-# Memory shouldn't appear in search results (it's its own table)
-T=$(search_v "$VAULT_A" "PinguinValkyrieMarker" "&limit=10" | jget "d.get('total', 0)")
-[ "$T" = "0" ] && pass "memory entry not in document search" || fail "INT6" "got $T (leaked!)"
+# INT6 (memory-store-vs-search isolation) was retired in v0.4.0 — the
+# memory store is gone. Agent memory now lives in a per-user vault and
+# is naturally subject to the same vault-isolation rules as any other
+# vault content (covered by per-vault search tests above).
 
 # ── INT7. Large doc (~10KB) chunks correctly + searchable ────
 echo ""
