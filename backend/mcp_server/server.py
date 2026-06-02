@@ -284,13 +284,13 @@ def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
                 f"Invalid `parent` URI for {kind_name}: {e}"
             ) from e
         return vault, coll or ""
-    vault = args.get("vault")
-    if not vault:
+    vault_name = args.get("vault")
+    if not vault_name:
         raise ValueError(
             f"Either `parent` (akb:// URI) or `vault` is required to "
             f"create a {kind_name}."
         )
-    return vault, args.get("collection") or ""
+    return vault_name, args.get("collection") or ""
 
 
 @_h("akb_get")
@@ -434,9 +434,10 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         except ValueError as exc:
             return {"error": str(exc)}
     else:
-        vault = args.get("vault")
-        if not vault:
+        vault_arg = args.get("vault")
+        if not vault_arg:
             return {"error": "Either `vault` or `uri` is required for akb_browse."}
+        vault = vault_arg
         collection = args.get("collection")
     await check_vault_access(uid, vault, required_role="reader")
     result = await doc_service.browse(
@@ -553,7 +554,7 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
     if pattern:
         sections = [s for s in sections if pattern in (s.get("content") or "").lower()]
 
-    response: dict = {
+    response = {
         "uri": args["uri"],
         "sections": sections,
         "returned": len(sections),

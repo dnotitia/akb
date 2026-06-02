@@ -37,7 +37,7 @@ async def drill_down(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     parsed = parse_uri(uri)
-    if parsed is None or parsed.kind != "doc":
+    if parsed is None or parsed.kind != "doc" or parsed.identifier is None:
         raise HTTPException(status_code=400, detail=f"Expected a doc URI, got {uri!r}")
     vault, doc_path = parsed.vault, parsed.identifier
     # MCP `akb_drill_down` enforces vault ACL via check_vault_access; the

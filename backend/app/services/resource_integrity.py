@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+from typing import TypedDict
 
 import frontmatter
 
@@ -25,7 +25,7 @@ class ResourceHashRepairReport:
     documents_repaired: int = 0
     files_checked: int = 0
     files_repaired: int = 0
-    errors: list[str] | None = None
+    errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -44,11 +44,19 @@ def document_hash_projection(raw_markdown: str, current_commit: str | None) -> d
     }
 
 
+class FileHashProjection(TypedDict):
+    size_bytes: int
+    content_hash: str
+    hash_algorithm: str
+    etag: str | None
+    storage_version: str | None
+
+
 def file_hash_projection(
     *,
     chunks,
     head: dict,
-) -> dict[str, object]:
+) -> FileHashProjection:
     """Compute the stored byte-hash projection for one S3-backed file."""
 
     return {
@@ -117,7 +125,7 @@ async def repair_resource_hashes(
             for row in file_rows:
                 try:
                     head = await asyncio.to_thread(file_service.s3_adapter.head, row["s3_key"])
-                    projection = await asyncio.to_thread(
+                    file_projection = await asyncio.to_thread(
                         file_hash_projection,
                         chunks=file_service.s3_adapter.iter_chunks(row["s3_key"]),
                         head=head,
@@ -125,11 +133,11 @@ async def repair_resource_hashes(
                     await vault_files_repo.update_confirmed_metadata(
                         conn,
                         row["id"],
-                        size_bytes=projection["size_bytes"],
-                        content_hash=projection["content_hash"],
-                        hash_algorithm=projection["hash_algorithm"],
-                        etag=projection["etag"],
-                        storage_version=projection["storage_version"],
+                        size_bytes=file_projection["size_bytes"],
+                        content_hash=file_projection["content_hash"],
+                        hash_algorithm=file_projection["hash_algorithm"],
+                        etag=file_projection["etag"],
+                        storage_version=file_projection["storage_version"],
                     )
                     report.files_repaired += 1
                 except Exception as error:  # noqa: BLE001

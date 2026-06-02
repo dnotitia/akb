@@ -30,6 +30,11 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
             detail=f"Invalid AKB URI: {uri!r}. Expected akb://<vault>/<type>/<id>.",
         )
     vault, rtype, ident = parsed.vault, parsed.kind, parsed.identifier
+    if ident is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"AKB URI is missing an identifier: {uri!r}.",
+        )
     if expected_type and rtype != expected_type:
         raise HTTPException(
             status_code=400,

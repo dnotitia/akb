@@ -195,6 +195,12 @@ async def link_resources(
     target_type = target_parsed.kind
     target_id = target_parsed.identifier
 
+    # Linkable kinds (doc/table/file) always carry an identifier; a None
+    # here means a malformed URI slipped past parse_uri. Fail closed so the
+    # advisory-lock + existence checks below can treat both ids as str.
+    if source_id is None or target_id is None:
+        return {"error": "Source or target URI is missing an identifier."}
+
     # Canonicalize both endpoints from parsed parts so a legacy-shaped
     # URI passed by an external caller is stored in 0.3.0 canonical form
     # (akb://V/coll/<path>/<kind>/<id>) — not verbatim. Verbatim legacy
@@ -552,6 +558,8 @@ async def _batch_resolve_names(
         if not parsed:
             continue
         identifier = parsed.identifier
+        if identifier is None:
+            continue
         if rtype == "doc":
             doc_paths.append(identifier)
             doc_uris[identifier] = uri
