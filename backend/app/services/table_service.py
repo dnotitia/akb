@@ -18,7 +18,6 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from difflib import get_close_matches
 
 import asyncpg
 
@@ -33,6 +32,7 @@ from app.services.index_service import (
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
 from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
+from app.util.text import fuzzy_hint
 
 # Re-exported helpers used by publication_service for the
 # `table_query` share path. Other modules import directly from
@@ -555,9 +555,6 @@ async def execute_sql(
         return {"error": msg}
 
 
-# Max items listed in fallback hints (when no fuzzy suggestion strong enough).
-_HINT_LIST_LIMIT = 15
-
 _COLUMN_NOT_EXIST = _re.compile(r'column "([^"]+)" does not exist')
 _RELATION_NOT_EXIST = _re.compile(r'relation "([^"]+)" does not exist')
 
@@ -587,7 +584,7 @@ async def _enrich_undefined_error(
         col_meta = await _fetch_column_meta(conn, allowed_pg_tables)
         if not col_meta:
             return None
-        hint = _fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
+        hint = fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
         jsonb_cols = [c for c, t in col_meta.items() if t == "jsonb"]
         if jsonb_cols:
             hint += (
@@ -610,7 +607,7 @@ async def _enrich_undefined_error(
         })
         if not short_names:
             return None
-        hint = _fuzzy_hint(bad_rel, short_names, label="tables")
+        hint = fuzzy_hint(bad_rel, short_names, label="tables")
         hint += (
             "  (Reference vault tables by their short name — the rewriter "
             "prefixes them with `vt_<vault>__` automatically.)"
@@ -647,13 +644,3 @@ async def _fetch_column_meta(conn, table_names: set[str]) -> dict[str, str]:
         list(table_names),
     )
     return {r["name"]: r["type"] for r in rows}
-
-
-def _fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
-    """Top-3 close matches → 'Did you mean…?', else first N as fallback."""
-    suggestions = get_close_matches(bad, candidates, n=3, cutoff=0.6)
-    if suggestions:
-        return f"Did you mean: {', '.join(suggestions)}?"
-    truncated = candidates[:_HINT_LIST_LIMIT]
-    suffix = " …" if len(candidates) > _HINT_LIST_LIMIT else ""
-    return f"Available {label}: {', '.join(truncated)}{suffix}"

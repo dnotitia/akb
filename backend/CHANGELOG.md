@@ -5,6 +5,44 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.4 — 2026-06-03
+
+MCP `_dispatch` now rejects unknown tool arguments with a fuzzy hint
+instead of silently letting them through.
+
+Before: a typo like `akb_activity(user="someone")` (real arg name:
+`author`) fell through `args.get("author")` with no signal, the filter
+quietly disabled, and the unfiltered commit list came back looking
+correct. An agent that trusts its own argument spelling has no way to
+notice. This was the exact failure mode that motivated the gate — a
+session ran a vault-permission audit, two `user=...` calls returned
+identical author-unfiltered output, and the agent reported the result
+as if the filter had applied.
+
+Fix: build `_TOOL_ARG_NAMES` from the `TOOLS` schema list at import
+time, and in `_dispatch` reject any argument key that isn't in the
+allowed set. The response uses the same `{error, hint,
+available_arguments}` shape that `table_service._enrich_undefined_error`
+already returns for SQL column / table not-exist errors, so the
+fuzzy-hint tone is uniform across the API surface.
+
+The `fuzzy_hint` helper (Top-3 close matches via `difflib`, capped
+fallback list) moves from `table_service` to `app.util.text` so both
+callers share a single implementation.
+
+New tests:
+- Unit: `fuzzy_hint` shapes (close match / fallback / truncation) and
+  AST-based `TOOLS ↔ _HANDLERS` sync assertion (no heavy imports).
+- E2E: `test_security_edge_e2e.sh` §10 covers the activity
+  `user`→`author` typo path plus a regression guard that a valid call
+  still passes through the gate.
+
+Follow-up not in this release: error-response shape standardization
+across handlers (currently ~6 distinct shapes — `{error}`,
+`{error, code}`, `{error, code, hint, available_*}`, …). Tracked
+separately; this PR deliberately reuses the existing
+`_enrich_undefined_error` shape rather than introducing a seventh.
+
 ## 0.5.3 — 2026-06-02
 
 Document `status` coherence: leaned the lifecycle to 3 states and gave

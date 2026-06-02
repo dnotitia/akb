@@ -440,6 +440,24 @@ RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.g
 curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT" \
   -H "Authorization: Bearer $PAT1" >/dev/null
 
+# ── 10. Unknown-arg validation (fuzzy hint) ──────────────────
+echo ""
+echo "▸ 10. Unknown-arg validation (fuzzy hint)"
+
+# Typo `user=` instead of `author=` on akb_activity must be rejected
+# with a fuzzy hint, not silently ignored — silent ignore was the
+# regression that motivated this dispatch-level gate.
+R=$(mcp_as "$PAT1" "$SID1" "akb_activity" "{\"vault\":\"$VAULT1\",\"user\":\"nobody\"}" | mr)
+ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','MISSING'))" 2>/dev/null)
+HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
+echo "$ERR" | grep -q "Unknown argument 'user'" && pass "unknown arg surfaced" || fail "unknown arg" "got: $ERR"
+echo "$HINT" | grep -q "author" && pass "fuzzy hint suggests 'author'" || fail "fuzzy hint" "got: $HINT"
+
+# Regression guard: valid call still works through the new gate
+R=$(mcp_as "$PAT1" "$SID1" "akb_activity" "{\"vault\":\"$VAULT1\",\"author\":\"nobody\"}" | mr)
+RET=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('returned','MISSING'))" 2>/dev/null)
+[ "$RET" != "MISSING" ] && pass "valid call passes through" || fail "valid call" "got: $R"
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
