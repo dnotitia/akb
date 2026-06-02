@@ -138,7 +138,7 @@ TOOLS = [
                         "create instead of promoting later with akb_update. Descriptive "
                         "metadata only — it does not gate search, browse, or access."
                     ),
-                    "enum": ["draft", "active", "archived", "superseded"],
+                    "enum": ["draft", "active", "archived"],
                     "default": "draft",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
@@ -177,7 +177,7 @@ TOOLS = [
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": "string", "description": "New document body (replaces existing)"},
                 "title": {"type": "string", "description": "New title"},
-                "status": {"type": "string", "enum": ["draft", "active", "archived", "superseded"]},
+                "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (akb:// URIs)"},
@@ -308,6 +308,11 @@ TOOLS = [
                         "resource version fields for documents/files."
                     ),
                 },
+                "include_archived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include archived documents. Default false — `status: archived` docs are hidden from browse.",
+                },
             },
             # Either `vault` or `uri` must be present — enforced at the
             # handler since JSON schema's anyOf-on-required is awkward
@@ -341,6 +346,11 @@ TOOLS = [
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags"},
                 "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+                "include_archived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include archived documents. Default false — `status: archived` docs are hidden from search.",
+                },
             },
             "required": ["query"],
         },

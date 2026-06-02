@@ -35,7 +35,7 @@ export function RoleBadge({ role }: { role: string }) {
   );
 }
 
-type DocStatus = "draft" | "active" | "archived" | "superseded";
+type DocStatus = "draft" | "active" | "archived";
 export function DocStatusBadge({ status }: { status: DocStatus }) {
   return <Badge variant={status}>{status}</Badge>;
 }

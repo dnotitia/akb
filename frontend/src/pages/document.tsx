@@ -782,7 +782,7 @@ function FrontmatterCard({ doc }: { doc: any }) {
   if (doc.status) {
     const statusColor =
       doc.status === "active" ? "text-good" :
-      doc.status === "archived" || doc.status === "superseded" ? "text-warning" :
+      doc.status === "archived" ? "text-warning" :
       "text-foreground-muted";
     rows.push(["status", <span className={statusColor}>{doc.status}</span>]);
   }

@@ -26,7 +26,6 @@ const badgeVariants = cva(
         active: "border-success bg-transparent text-success",
         draft: "border-foreground-muted bg-transparent text-foreground-muted",
         archived: "border-warning bg-transparent text-warning",
-        superseded: "border-foreground-muted bg-transparent text-foreground-muted line-through",
 
         /* system status */
         pending: "border-warning bg-transparent text-warning",

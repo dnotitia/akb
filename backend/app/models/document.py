@@ -6,10 +6,16 @@ from pydantic import BaseModel, Field
 
 from app.util.text import NFCModel
 
-# Allowed document lifecycle statuses. Status is descriptive metadata — it
-# does not gate search / browse / access — but we constrain it to a known
-# set so a typo can't silently land in the frontmatter and DB.
-DOC_STATUSES = ("draft", "active", "archived", "superseded")
+# Allowed document lifecycle statuses. A soft signal:
+#   draft  — default on create; work-in-progress, promote when ready
+#   active — promoted / live
+#   archived — retired; excluded from default search + browse (opt back in
+#              with include_archived=true)
+# Status does not gate access (read/write permissions are independent), but
+# archived now influences default discovery, and the set is constrained so a
+# typo can't silently land in the frontmatter and DB. ("superseded" was a
+# never-operationalized 4th state and was removed in 0.4.4.)
+DOC_STATUSES = ("draft", "active", "archived")
 
 
 class DocumentFrontmatter(NFCModel):
@@ -18,11 +24,10 @@ class DocumentFrontmatter(NFCModel):
     id: str | None = None
     title: str
     type: str = "note"  # note, report, decision, spec, plan, session, task, reference, skill
-    status: str = "draft"  # draft, active, archived, superseded
+    status: str = "draft"  # draft, active, archived
     created_by: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    supersedes: str | None = None
     tags: list[str] = Field(default_factory=list)
     domain: str | None = None
     summary: str | None = None

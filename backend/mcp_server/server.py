@@ -447,6 +447,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         depth=args.get("depth", 1),
         content_type=args.get("content_type", "all"),
         include_hashes=args.get("include_hashes", False),
+        include_archived=args.get("include_archived", False),
     )
     include_summary = args.get("include_summary")
     payload = result.model_dump(
@@ -475,6 +476,7 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         tags=args.get("tags"),
         limit=args.get("limit", 10),
         user_id=uid,
+        include_archived=args.get("include_archived", False),
     )
     return result.model_dump()
 

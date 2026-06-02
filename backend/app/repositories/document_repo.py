@@ -266,6 +266,8 @@ class DocumentRepository:
         vault_id: uuid.UUID,
         max_depth: int,
         prefix: str = "",
+        *,
+        include_archived: bool = False,
     ) -> list[dict]:
         """List documents under ``prefix`` (vault root if ``prefix=""``)
         whose containing-collection depth, measured from inside the
@@ -289,6 +291,10 @@ class DocumentRepository:
             "current_commit, content_hash, hash_algorithm, content_hash_commit "
             "FROM documents WHERE vault_id = $1"
         )
+        # Default-hide archived docs from browse; opt back in with
+        # include_archived=true. Literal status — no bind param.
+        if not include_archived:
+            base_select += " AND status != 'archived'"
         params: list = [vault_id]
 
         if prefix:
