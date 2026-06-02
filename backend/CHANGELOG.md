@@ -5,6 +5,36 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.4.3 — 2026-06-02
+
+`akb_put` can now set the document `status` on create.
+
+### Optional `status` on document create
+
+`akb_put` previously hard-coded `status: draft` into both the git
+frontmatter and the `documents` row — the only way to land an `active`
+document was to follow up with `akb_update`. `DocumentPutRequest` now
+takes an optional `status` (default `"draft"`, so existing behaviour is
+unchanged) that is stamped through to the frontmatter + DB row. Pass
+`status: "active"` (or `archived`/`superseded`) to publish on create.
+
+The value is validated against the known set
+(`draft`/`active`/`archived`/`superseded`) in `DocumentService.put`
+before any git/DB work — an unknown status returns a clean 422 instead
+of silently landing a typo. Status remains **descriptive metadata** — it
+does not gate search, browse, or access; this just removes the
+put-then-update dance.
+
+The MCP `akb_put` tool schema exposes the new `status` enum; the
+`akb-mcp` proxy forwards it transparently (no proxy release needed). No
+schema change.
+
+Verified: REST + MCP round-trip (`status:"active"` → frontmatter + DB
+`active`; default → `draft`; bad value → 422); `test_mcp_e2e` 76/76,
+`test_edit_e2e` 37/37; unit tests
+`test_put_request_status_defaults_to_draft_and_accepts_active`,
+`test_put_rejects_unknown_status`.
+
 ## 0.4.2 — 2026-06-02
 
 Collection-retirement vs document-PUT race: an unhandled foreign-key

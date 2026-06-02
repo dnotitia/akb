@@ -131,6 +131,16 @@ TOOLS = [
                     "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
                     "default": "note",
                 },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "Lifecycle status. Defaults to 'draft'; pass 'active' to publish on "
+                        "create instead of promoting later with akb_update. Descriptive "
+                        "metadata only — it does not gate search, browse, or access."
+                    ),
+                    "enum": ["draft", "active", "archived", "superseded"],
+                    "default": "draft",
+                },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
                 "domain": {"type": "string", "description": "Domain: engineering, product, ops, legal, etc."},
                 "summary": {"type": "string", "description": "Brief summary (auto-generated if omitted)"},

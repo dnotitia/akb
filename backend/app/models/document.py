@@ -6,6 +6,11 @@ from pydantic import BaseModel, Field
 
 from app.util.text import NFCModel
 
+# Allowed document lifecycle statuses. Status is descriptive metadata — it
+# does not gate search / browse / access — but we constrain it to a known
+# set so a typo can't silently land in the frontmatter and DB.
+DOC_STATUSES = ("draft", "active", "archived", "superseded")
+
 
 class DocumentFrontmatter(NFCModel):
     """Canonical frontmatter schema parsed from YAML."""
@@ -34,6 +39,11 @@ class DocumentPutRequest(NFCModel):
     title: str
     content: str
     type: str = "note"
+    # Lifecycle status stamped into the frontmatter + DB row on create.
+    # Defaults to "draft" (the historical behaviour); pass e.g. "active" to
+    # publish on create instead of having to follow up with akb_update.
+    # Validated against DOC_STATUSES in DocumentService.put.
+    status: str = "draft"
     tags: list[str] = Field(default_factory=list)
     domain: str | None = None
     summary: str | None = None

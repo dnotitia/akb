@@ -214,3 +214,29 @@ async def test_document_update_rejects_stale_expected_content_hash() -> None:
         "hash_algorithm": "sha256",
         "content_hash_commit": row["current_commit"],
     }
+
+
+# ── akb_put status option ──────────────────────────────────────────
+
+
+def test_put_request_status_defaults_to_draft_and_accepts_active() -> None:
+    from app.models.document import DOC_STATUSES, DocumentPutRequest
+
+    base = dict(vault="v", collection="c", title="t", content="# x")
+    assert DocumentPutRequest(**base).status == "draft"          # backward-compatible default
+    assert DocumentPutRequest(**base, status="active").status == "active"
+    assert set(DOC_STATUSES) == {"draft", "active", "archived", "superseded"}
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_unknown_status() -> None:
+    """An out-of-set status is rejected by DocumentService.put before any
+    DB/git work (the check is the first statement in put()), so this needs
+    no database."""
+    from app.exceptions import ValidationError
+    from app.models.document import DocumentPutRequest
+
+    svc = DocumentService(git=_FakeGit("x"))
+    req = DocumentPutRequest(vault="v", collection="c", title="t", content="# x", status="actve")
+    with pytest.raises(ValidationError):
+        await svc.put(req)
