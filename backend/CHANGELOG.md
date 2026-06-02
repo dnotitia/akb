@@ -5,6 +5,39 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.4.2 — 2026-06-02
+
+Collection-retirement vs document-PUT race: an unhandled foreign-key
+violation surfaced as HTTP 500 instead of a clean conflict.
+
+### `akb_put` into a collection being deleted returned 500
+
+When a recursive collection delete commits in the exact window between a
+concurrent PUT's `get_or_create` (which observed the collection) and that
+PUT's `INSERT INTO documents` (which still references the now-gone
+`collection_id`), the insert trips `documents_collection_id_fkey`. The
+delete side is fine — `collection_id` is `ON DELETE SET NULL`, so existing
+docs are re-homed — but a *new* insert against the vanished id is an FK
+violation that `document_repo.create` did not catch, so it bubbled up as
+an unhandled `asyncpg.ForeignKeyViolationError` → HTTP 500.
+
+`create` already maps a `UniqueViolationError` (duplicate path) to a 409;
+it now maps a `ForeignKeyViolationError` the same way, with a clear
+"Target collection or vault was concurrently deleted" message. The racing
+writer gets a clean, retryable 409 instead of a 500. No schema change.
+
+Found via an external "E06 collection retirement race" report (40 PUTs
+racing a recursive collection delete). Note: the report's primary symptom
+— all 40 PUTs as transport-level "status 0" — was the 0.4.1 pool-deadlock
+(the deployment under test had regressed to 0.4.0); with the pool fix in
+place the deadlock is gone and only this residual FK 500 remained.
+
+Verified: E06 repro (40 PUTs, seeded to widen the race window) returned
+`{200, 500}` before and `{200, 409}` after (5xx → 0); `test_mcp_e2e`
+76/76, `test_collection_lifecycle_e2e` 36/36; deterministic unit test
+(`test_create_with_deleted_collection_raises_conflict`). Repro harness:
+`backend/tests/concurrency/repro_e05_e06_delete_race.py`.
+
 ## 0.4.1 — 2026-06-02
 
 Connection-pool deadlock on the document write paths under a concurrent

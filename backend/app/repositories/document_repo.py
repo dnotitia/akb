@@ -83,6 +83,18 @@ class DocumentRepository:
                 # (vault_id, path) is the only UNIQUE constraint that callers
                 # can collide on. Surface it as a 409 instead of a 500.
                 raise ConflictError(f"Document already exists at path: {path}") from e
+            except asyncpg.ForeignKeyViolationError as e:
+                # The parent collection (or vault) was deleted out from under
+                # this insert — a concurrent collection-retirement / vault-delete
+                # race: get_or_create observed the collection, then a DELETE
+                # removed it before this INSERT committed. `collection_id` is
+                # ON DELETE SET NULL, so the *delete* side re-homes existing
+                # docs, but a NEW insert that still references the vanished id
+                # trips the FK. Surface it as a 409 (retryable) instead of an
+                # unhandled 500.
+                raise ConflictError(
+                    f"Target collection or vault was concurrently deleted while creating: {path}"
+                ) from e
 
         # When `conn` is supplied, run on the caller's connection/TX so a
         # put can hold ONE pool connection for its whole critical section
