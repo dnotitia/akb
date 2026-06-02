@@ -56,11 +56,14 @@ class DocumentRepository:
         hash_algorithm: str,
         tags: list[str],
         metadata: dict,
+        *,
+        conn=None,
     ) -> uuid.UUID:
         doc_id = uuid.uuid4()
-        async with self.pool.acquire() as conn:
+
+        async def _insert(c):
             try:
-                await conn.execute(
+                await c.execute(
                     """
                     INSERT INTO documents
                         (id, vault_id, collection_id, path, title, doc_type, status,
@@ -79,6 +82,18 @@ class DocumentRepository:
                 # (vault_id, path) is the only UNIQUE constraint that callers
                 # can collide on. Surface it as a 409 instead of a 500.
                 raise ConflictError(f"Document already exists at path: {path}") from e
+
+        # When `conn` is supplied, run on the caller's connection/TX so a
+        # put can hold ONE pool connection for its whole critical section
+        # (advisory lock + create + chunks). Acquiring a *second* connection
+        # here while the caller still holds its lock connection is what
+        # deadlocked the pool under a write burst: ≥ pool_size concurrent
+        # writers each held one conn and waited for a second that never freed.
+        if conn is not None:
+            await _insert(conn)
+        else:
+            async with self.pool.acquire() as c:
+                await _insert(c)
         return doc_id
 
     # Document lookup keys: PG UUID or exact path. MCP / REST handlers
@@ -147,10 +162,9 @@ class DocumentRepository:
         hash_algorithm: str | None = None,
         content_hash_commit: str | None = None,
         tags: list[str] | None = None,
+        conn=None,
     ) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
+        sql = """
                 UPDATE documents SET
                     title = COALESCE($1, title),
                     doc_type = COALESCE($2, doc_type),
@@ -164,10 +178,14 @@ class DocumentRepository:
                     content_hash_commit = COALESCE($10, content_hash_commit),
                     tags = COALESCE($11, tags)
                 WHERE id = $12
-                """,
-                title, doc_type, status, summary, domain, now, commit_hash,
-                content_hash, hash_algorithm, content_hash_commit, tags, doc_id,
-            )
+                """
+        args = (title, doc_type, status, summary, domain, now, commit_hash,
+                content_hash, hash_algorithm, content_hash_commit, tags, doc_id)
+        if conn is not None:
+            await conn.execute(sql, *args)
+        else:
+            async with self.pool.acquire() as own_conn:
+                await own_conn.execute(sql, *args)
 
     async def update_hash(
         self,
@@ -176,18 +194,21 @@ class DocumentRepository:
         content_hash: str,
         hash_algorithm: str,
         content_hash_commit: str | None,
+        conn=None,
     ) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
+        sql = """
                 UPDATE documents SET
                     content_hash = $1,
                     hash_algorithm = $2,
                     content_hash_commit = $3
                 WHERE id = $4
-                """,
-                content_hash, hash_algorithm, content_hash_commit, doc_id,
-            )
+                """
+        args = (content_hash, hash_algorithm, content_hash_commit, doc_id)
+        if conn is not None:
+            await conn.execute(sql, *args)
+        else:
+            async with self.pool.acquire() as own_conn:
+                await own_conn.execute(sql, *args)
 
     async def delete(self, doc_id: uuid.UUID, *, conn=None) -> None:
         """Delete the documents row. When `conn` is provided the DELETE

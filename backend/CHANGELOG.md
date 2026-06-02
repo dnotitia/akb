@@ -5,6 +5,49 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.3.7 — 2026-06-02
+
+Connection-pool deadlock on the document write paths under a concurrent
+write burst. Reproduced from an external "E01 multi-vault knowledge
+burst" report (100 PUT + 300 GET returned transport-level "status 0").
+
+### Document writes deadlocked the pool at ≥ `pool_size` concurrent writers
+
+`put`/`update`/`edit`/`delete` each acquired **two** pool connections at
+once: `_path_lock()` held one connection (`lock_conn`, inside a
+transaction holding the `pg_advisory_xact_lock`) for the whole critical
+section, and the body then did a **second** `pool.acquire()` for the
+chunks/relations/events transaction. With `max_size=20`, once 20
+concurrent writers each held a lock connection and then all waited for a
+second connection, none could free one — a textbook hold-and-wait
+deadlock. It only broke when PG's `idle_in_transaction_session_timeout`
+(60s) killed the idle lock transactions, so clients saw 60s hangs →
+`ReadTimeout`. `/livez` stayed green the whole time (it touches neither
+the pool nor the event loop), which is why the failure hid from health
+checks. Reads were collateral: every DB-touching request starved while
+the 20 connections sat frozen.
+
+The trigger is just **20 simultaneous writes to one pod** — a realistic
+bar (a bulk import, or ~20 agents), not only a synthetic stress test.
+
+Fix: each writer now holds **exactly one** pool connection. `_path_lock`
+yields its connection and every DB statement of the critical section
+(conflict pre-check, `get_or_create`, `create`/`update`, chunks,
+relations, events, publication cascade, doc-row delete, collection
+count) runs on that one connection's transaction. `document_repo`'s
+`create`/`update`/`update_hash` gained a `conn=` parameter
+(backward-compatible) so they reuse the caller's connection instead of
+acquiring their own. The pool is now a clean backpressure queue: the
+21st concurrent writer waits for a free connection instead of
+deadlocking. As a bonus, each write is now fully atomic in one
+transaction (doc row + chunks + edges + events commit or roll back
+together). No schema change, no migration.
+
+Verified: a 100-PUT + 300-GET multi-vault burst that returned 0/100 PUT
+and 2/300 GET before now returns 100/100 and 300/300; `test_mcp_e2e`
+76/76, `test_edit_e2e` 37/37, `test_concurrency_repro_e2e` 22/22. Repro
+harness lives at `backend/tests/concurrency/repro_e01_multivault.py`.
+
 ## 0.3.6 — 2026-05-28
 
 The "P2" cut of the functional/logic review — four data-integrity /

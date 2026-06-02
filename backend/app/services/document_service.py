@@ -218,6 +218,7 @@ class DocumentService:
         body: str,
         *,
         persist: bool = True,
+        conn=None,
     ) -> tuple[str, str]:
         content_hash = _body_content_hash(body)
         current_commit = row.get("current_commit")
@@ -234,6 +235,7 @@ class DocumentService:
                 content_hash=content_hash,
                 hash_algorithm=HASH_ALGORITHM,
                 content_hash_commit=current_commit,
+                conn=conn,
             )
         return content_hash, HASH_ALGORITHM
 
@@ -244,15 +246,22 @@ class DocumentService:
         the same logical document path so git HEAD never diverges from
         ``documents.current_commit`` under a race.
 
-        Uses a dedicated short-lived connection / transaction so the
-        existing code paths (which acquire their own connections for
-        git + chunks + relations + events) can keep their structure.
+        Yields the locked connection (already inside a transaction). Callers
+        MUST run every DB statement of their critical section on this one
+        connection — create, chunks, relations, events, counts — instead of
+        acquiring a second pool connection. Holding this connection while
+        acquiring another is what deadlocked the pool under a write burst:
+        once ``pool_size`` writers each held a lock connection and then
+        waited for a second connection, none could free one, so every write
+        (and any read needing the pool) stalled until PG's 60s
+        ``idle_in_transaction_session_timeout`` killed the lock transactions.
+        One connection per writer makes the pool a clean backpressure queue.
         """
         pool = await get_pool()
         async with pool.acquire() as lock_conn:
             async with lock_conn.transaction():
                 await acquire_path_lock(lock_conn, vault_id, file_path)
-                yield
+                yield lock_conn
 
     # ── Put ───────────────────────────────────────────────────
 
@@ -270,24 +279,26 @@ class DocumentService:
         normalized_collection = _normalize_collection(req.collection)
         file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
 
-        async with self._path_lock(vault_id, file_path):
+        async with self._path_lock(vault_id, file_path) as conn:
             return await self._put_locked(
                 req=req, agent_id=agent_id, vault_id=vault_id,
                 file_path=file_path, slug=slug, now=now,
                 normalized_collection=normalized_collection,
-                doc_repo=doc_repo, coll_repo=coll_repo,
+                doc_repo=doc_repo, coll_repo=coll_repo, conn=conn,
             )
 
     async def _put_locked(
         self, *, req, agent_id, vault_id, file_path, slug, now,
-        normalized_collection, doc_repo, coll_repo,
+        normalized_collection, doc_repo, coll_repo, conn,
     ) -> DocumentPutResponse:
         # Conflict pre-check — now safe under (vault_id, path) advisory lock.
         # The earlier comment about "concurrent puts can still race past
         # this gate" no longer applies: the lock serializes writers on
         # this exact (vault_id, path), so a second caller observes the
         # first caller's row here and 409s before any git mutation.
-        if await doc_repo.find_by_path(vault_id, file_path):
+        # Every DB call below reuses `conn` (the lock connection, already in
+        # a transaction) so the whole put holds exactly one pool connection.
+        if await doc_repo.find_by_path(vault_id, file_path, conn=conn):
             from app.exceptions import ConflictError
             raise ConflictError(f"Document already exists at path: {file_path}")
 
@@ -316,7 +327,7 @@ class DocumentService:
         # used by file_service / table_service / external_git_service —
         # never insert a `path=""` phantom collection row.
         collection_id = (
-            await coll_repo.get_or_create(vault_id, normalized_collection)
+            await coll_repo.get_or_create(vault_id, normalized_collection, conn=conn)
             if normalized_collection
             else None
         )
@@ -329,7 +340,7 @@ class DocumentService:
             title=req.title, doc_type=req.type, status="draft",
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
             now=now, commit_hash=commit_hash, content_hash=content_hash,
-            hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={},
+            hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={}, conn=conn,
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -343,37 +354,36 @@ class DocumentService:
         )
         chunks = chunk_markdown(req.content, metadata_header=meta_header)
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                chunks_indexed = await write_source_chunks(
-                    conn, "document", str(pg_doc_id),
-                    vault_id=vault_id,
-                    chunks=chunks,
-                )
-                await store_document_relations(
-                    conn, vault_id, req.vault, file_path,
-                    req.depends_on, req.related_to, [],
-                    req.content,
-                )
-                await emit_event(
-                    conn, "document.put",
-                    vault_id=vault_id,
-                    resource_uri=doc_uri(req.vault, file_path),
-                    actor_id=agent_id,
-                    payload={
-                        "vault": req.vault,
-                        "path": file_path,
-                        "title": req.title,
-                        "doc_type": req.type,
-                        "commit_hash": commit_hash,
-                        "content_hash": content_hash,
-                        "hash_algorithm": HASH_ALGORITHM,
-                        "collection": normalized_collection,
-                    },
-                )
+        # chunks + relations + event run on the lock connection's existing
+        # transaction (opened in `_path_lock`). No second pool.acquire().
+        chunks_indexed = await write_source_chunks(
+            conn, "document", str(pg_doc_id),
+            vault_id=vault_id,
+            chunks=chunks,
+        )
+        await store_document_relations(
+            conn, vault_id, req.vault, file_path,
+            req.depends_on, req.related_to, [],
+            req.content,
+        )
+        await emit_event(
+            conn, "document.put",
+            vault_id=vault_id,
+            resource_uri=doc_uri(req.vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": req.vault,
+                "path": file_path,
+                "title": req.title,
+                "doc_type": req.type,
+                "commit_hash": commit_hash,
+                "content_hash": content_hash,
+                "hash_algorithm": HASH_ALGORITHM,
+                "collection": normalized_collection,
+            },
+        )
 
-        await coll_repo.increment_count(collection_id, now)
+        await coll_repo.increment_count(collection_id, now, conn=conn)
 
         return DocumentPutResponse(
             uri=doc_uri(req.vault, file_path),
@@ -516,10 +526,11 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path):
+        async with self._path_lock(vault_id, file_path) as conn:
             # Re-read under the lock so we observe any commit that landed
-            # between the initial resolution and lock acquisition.
-            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+            # between the initial resolution and lock acquisition. Uses the
+            # lock connection so the whole update holds one pool connection.
+            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
                 raise NotFoundError("Document", doc_ref)
 
@@ -534,10 +545,10 @@ class DocumentService:
 
             return await self._update_locked(
                 req=req, agent_id=agent_id, vault=vault,
-                vault_id=vault_id, doc_repo=doc_repo, row=row,
+                vault_id=vault_id, doc_repo=doc_repo, row=row, conn=conn,
             )
 
-    async def _update_locked(self, *, req, agent_id, vault, vault_id, doc_repo, row) -> DocumentPutResponse:
+    async def _update_locked(self, *, req, agent_id, vault, vault_id, doc_repo, row, conn) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
         pg_doc_id = row["id"]
         file_path = row["path"]
@@ -547,7 +558,7 @@ class DocumentService:
             raise NotFoundError("Document file", file_path)
 
         current_fm, current_body = _parse_markdown(current_content)
-        current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body)
+        current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body, conn=conn)
         if req.expected_content_hash and req.expected_content_hash != current_hash:
             raise ConflictError(
                 f"content_hash moved: expected {req.expected_content_hash}, "
@@ -593,60 +604,55 @@ class DocumentService:
             summary=req.summary, domain=req.domain, now=now,
             commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
-            tags=req.tags,
+            tags=req.tags, conn=conn,
         )
 
         chunks_indexed = 0
-        # One transaction across chunks + relations + event so partial
-        # failure either commits all three or none — previously each
-        # was a separate connection, leaving git ahead of indices and
-        # subscribers missing the `document.update` signal when a
-        # mid-flight failure hit.
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                if req.content is not None:
-                    # Use the values that were actually persisted to DB, not the
-                    # raw request — e.g. req.title may be None when caller kept
-                    # the title unchanged.
-                    meta_header = build_doc_metadata_header(
-                        vault_name=vault, path=file_path,
-                        title=req.title or row["title"],
-                        summary=req.summary if req.summary is not None else row["summary"],
-                        tags=req.tags if req.tags is not None else (list(row["tags"]) if row["tags"] else []),
-                        doc_type=req.type or row["doc_type"],
-                    )
-                    chunks = chunk_markdown(new_body, metadata_header=meta_header)
-                    chunks_indexed = await write_source_chunks(
-                        conn, "document", str(pg_doc_id),
-                        vault_id=vault_id,
-                        chunks=chunks,
-                    )
+        # chunks + relations + event run on the lock connection's existing
+        # transaction (opened in `_path_lock`), so partial failure rolls back
+        # all three together and the whole update holds one pool connection.
+        if req.content is not None:
+            # Use the values that were actually persisted to DB, not the
+            # raw request — e.g. req.title may be None when caller kept
+            # the title unchanged.
+            meta_header = build_doc_metadata_header(
+                vault_name=vault, path=file_path,
+                title=req.title or row["title"],
+                summary=req.summary if req.summary is not None else row["summary"],
+                tags=req.tags if req.tags is not None else (list(row["tags"]) if row["tags"] else []),
+                doc_type=req.type or row["doc_type"],
+            )
+            chunks = chunk_markdown(new_body, metadata_header=meta_header)
+            chunks_indexed = await write_source_chunks(
+                conn, "document", str(pg_doc_id),
+                vault_id=vault_id,
+                chunks=chunks,
+            )
 
-                if req.content is not None or req.depends_on is not None or req.related_to is not None:
-                    depends = current_fm.get("depends_on", []) or []
-                    related = current_fm.get("related_to", []) or []
-                    implements = current_fm.get("implements", []) or []
-                    await store_document_relations(
-                        conn, vault_id, vault, file_path,
-                        depends, related, implements,
-                        new_body,
-                    )
+        if req.content is not None or req.depends_on is not None or req.related_to is not None:
+            depends = current_fm.get("depends_on", []) or []
+            related = current_fm.get("related_to", []) or []
+            implements = current_fm.get("implements", []) or []
+            await store_document_relations(
+                conn, vault_id, vault, file_path,
+                depends, related, implements,
+                new_body,
+            )
 
-                await emit_event(
-                    conn, "document.update",
-                    vault_id=vault_id,
-                    resource_uri=doc_uri(vault, file_path),
-                    actor_id=agent_id,
-                    payload={
-                        "vault": vault,
-                        "path": file_path,
-                        "commit_hash": commit_hash,
-                        "content_hash": content_hash,
-                        "hash_algorithm": HASH_ALGORITHM,
-                        "content_changed": req.content is not None,
-                    },
-                )
+        await emit_event(
+            conn, "document.update",
+            vault_id=vault_id,
+            resource_uri=doc_uri(vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": vault,
+                "path": file_path,
+                "commit_hash": commit_hash,
+                "content_hash": content_hash,
+                "hash_algorithm": HASH_ALGORITHM,
+                "content_changed": req.content is not None,
+            },
+        )
 
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
@@ -695,8 +701,8 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path):
-            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+        async with self._path_lock(vault_id, file_path) as conn:
+            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
                 raise NotFoundError("Document", doc_ref)
             if base_commit and row["current_commit"] != base_commit:
@@ -708,11 +714,12 @@ class DocumentService:
                 vault=vault, vault_id=vault_id, row=row, doc_repo=doc_repo,
                 old_string=old_string, new_string=new_string,
                 replace_all=replace_all, message=message, agent_id=agent_id,
+                conn=conn,
             )
 
     async def _edit_locked(
         self, *, vault, vault_id, row, doc_repo,
-        old_string, new_string, replace_all, message, agent_id,
+        old_string, new_string, replace_all, message, agent_id, conn,
     ) -> DocumentPutResponse:
         now = datetime.now(timezone.utc)
         pg_doc_id = row["id"]
@@ -747,7 +754,7 @@ class DocumentService:
 
         if new_body == current_body:
             content_hash, hash_algorithm = await self._ensure_document_hash(
-                doc_repo, row, current_body,
+                doc_repo, row, current_body, conn=conn,
             )
             return DocumentPutResponse(
                 uri=doc_uri(vault, file_path),
@@ -778,7 +785,7 @@ class DocumentService:
             summary=None, domain=None, now=now,
             commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
-            tags=None,
+            tags=None, conn=conn,
         )
 
         # Re-chunk and re-embed (full pipeline — mirrors update())
@@ -793,39 +800,35 @@ class DocumentService:
         related = current_fm.get("related_to", []) or []
         implements = current_fm.get("implements", []) or []
 
-        # Single TX across chunks + relations + event so a crash between
-        # them can't leave the chunk index, the edge graph, and the
-        # event stream in inconsistent states (pre-fix: three separate
-        # connections, no shared TX).
-        chunks_indexed = 0
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                chunks_indexed = await write_source_chunks(
-                    conn, "document", str(pg_doc_id),
-                    vault_id=vault_id,
-                    chunks=chunks,
-                )
-                await store_document_relations(
-                    conn, vault_id, vault, file_path,
-                    depends, related, implements,
-                    new_body,
-                )
-                await emit_event(
-                    conn, "document.update",
-                    vault_id=vault_id,
-                    resource_uri=doc_uri(vault, file_path),
-                    actor_id=agent_id,
-                    payload={
-                        "vault": vault,
-                        "path": file_path,
-                        "commit_hash": commit_hash,
-                        "content_hash": content_hash,
-                        "hash_algorithm": HASH_ALGORITHM,
-                        "content_changed": True,
-                        "source": "edit",
-                    },
-                )
+        # chunks + relations + event run on the lock connection's existing
+        # transaction (opened in `_path_lock`) so a crash between them can't
+        # leave the chunk index, the edge graph, and the event stream in
+        # inconsistent states — and the whole edit holds one pool connection.
+        chunks_indexed = await write_source_chunks(
+            conn, "document", str(pg_doc_id),
+            vault_id=vault_id,
+            chunks=chunks,
+        )
+        await store_document_relations(
+            conn, vault_id, vault, file_path,
+            depends, related, implements,
+            new_body,
+        )
+        await emit_event(
+            conn, "document.update",
+            vault_id=vault_id,
+            resource_uri=doc_uri(vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": vault,
+                "path": file_path,
+                "commit_hash": commit_hash,
+                "content_hash": content_hash,
+                "hash_algorithm": HASH_ALGORITHM,
+                "content_changed": True,
+                "source": "edit",
+            },
+        )
 
         return DocumentPutResponse(
             uri=doc_uri(vault, file_path),
@@ -851,17 +854,17 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path):
+        async with self._path_lock(vault_id, file_path) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
-            row = await doc_repo.find_by_ref(vault_id, doc_ref)
+            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
                 raise NotFoundError("Document", doc_ref)
             return await self._delete_locked(
                 vault=vault, vault_id=vault_id, row=row, agent_id=agent_id,
-                doc_repo=doc_repo, coll_repo=coll_repo,
+                doc_repo=doc_repo, coll_repo=coll_repo, conn=conn,
             )
 
-    async def _delete_locked(self, *, vault, vault_id, row, agent_id, doc_repo, coll_repo) -> bool:
+    async def _delete_locked(self, *, vault, vault_id, row, agent_id, doc_repo, coll_repo, conn) -> bool:
         pg_doc_id = row["id"]
         file_path = row["path"]
         collection_id = row["collection_id"]
@@ -881,37 +884,36 @@ class DocumentService:
                 vault, file_path,
             )
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await delete_document_chunks(conn, str(pg_doc_id))
-                await delete_document_relations(conn, vault, file_path)
-                # App-level publication cascade. Previously this rode
-                # on `publications.document_id` ON DELETE CASCADE; that
-                # FK column is gone after migration 022, so we wipe
-                # publications by canonical URI before the doc row
-                # itself goes.
-                await conn.execute(
-                    "DELETE FROM publications WHERE resource_uri = $1",
-                    doc_uri(vault, file_path),
-                )
-                await emit_event(
-                    conn, "document.delete",
-                    vault_id=vault_id,
-                    resource_uri=doc_uri(vault, file_path),
-                    actor_id=agent_id,
-                    payload={
-                        "vault": vault,
-                        "path": file_path,
-                    },
-                )
-                # Doc row delete must share the cascade TX so a crash
-                # between cascade commit and row delete can't leave an
-                # orphan `documents` row with no chunks/edges/publications.
-                await doc_repo.delete(pg_doc_id, conn=conn)
+        # All cascade statements run on the lock connection's existing
+        # transaction (opened in `_path_lock`): a crash between any two of
+        # them can't leave an orphan `documents` row with no
+        # chunks/edges/publications, and the whole delete holds one
+        # pool connection.
+        await delete_document_chunks(conn, str(pg_doc_id))
+        await delete_document_relations(conn, vault, file_path)
+        # App-level publication cascade. Previously this rode
+        # on `publications.document_id` ON DELETE CASCADE; that
+        # FK column is gone after migration 022, so we wipe
+        # publications by canonical URI before the doc row
+        # itself goes.
+        await conn.execute(
+            "DELETE FROM publications WHERE resource_uri = $1",
+            doc_uri(vault, file_path),
+        )
+        await emit_event(
+            conn, "document.delete",
+            vault_id=vault_id,
+            resource_uri=doc_uri(vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": vault,
+                "path": file_path,
+            },
+        )
+        await doc_repo.delete(pg_doc_id, conn=conn)
 
         if collection_id:
-            await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc))
+            await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc), conn=conn)
 
         logger.info("Document deleted: %s", file_path)
         return True
