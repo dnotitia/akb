@@ -71,7 +71,10 @@ async def e05(c, A, n):
     dstat = await del_t
     print(f"  delete: status={dstat[0]}")
     codes, z, f = show("get", gets)
-    bad = [g for g in gets if g[0] == 200 and '"content"' not in g[3]]
+    # invariant: a 200 GET must carry a body (not empty). `rec()` truncates
+    # bodies, so check for emptiness rather than a specific field that may sit
+    # past the truncation point.
+    bad = [g for g in gets if g[0] == 200 and not g[3].strip()]
     ok = dstat[0] in (200, 204) and z == 0 and f == 0 and len(bad) == 0 and set(codes) <= {200, 404}
     print(f"  VERDICT E05: {'PASS' if ok else 'FAIL'} (delete 2xx; gets only 200/404; no transport/5xx)")
     try: await c.request("DELETE", f"/api/v1/vaults/{v}", headers=A)
