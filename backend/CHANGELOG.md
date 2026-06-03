@@ -5,6 +5,72 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.8 — 2026-06-04  *(minor breaking — `query` alias removed)*
+
+Whole-repo "half-done migration" sweep. The 0.5.4–0.5.7 stream
+closed several files cleanly but left a few dead seams behind. This
+release retires them.
+
+### `query` alias on `akb_list_vaults` + `akb_browse` removed
+
+The `query` arg was kept "for one minor release" when `filter` became
+the canonical name (0.3.x era — `akb_search.query` started to collide
+with `query` as filter). That release window expired five versions
+ago. Both `tools.py` inputSchemas dropped the `query` property and
+`_filter_arg` (`mcp_server/server.py`) no longer reads it.
+
+**Breaking note**: a caller still passing `query="..."` now hits the
+0.5.4 unknown-arg gate and gets a fuzzy-hint response pointing at
+`filter`. Frontend uses neither; akb-mcp proxy is pass-through. No
+known external caller needs migration, but flagged here so anyone who
+finds a 4xx in logs can self-diagnose.
+
+### `build_table_name_map` backward-compat keys deleted
+
+`table_data_repo.build_table_name_map` was carrying two extra keys per
+table — the raw display name and `replace("-", "_")` — "for pre-fix
+callers". After 0.5.5's `pg_short_name` keying landed and the prod
+legacy hyphen / non-ASCII tables were renamed (out-of-band rename in
+this session), neither key is reachable: the SQL tokenizer accepts
+only `[A-Za-z_][A-Za-z0-9_]*`, and no table with a hyphen in its
+display name exists any more. Two lines + comment removed.
+
+### Frontend delete-vault dialog text
+
+`delete-vault-dialog.tsx` still promised the dialog would wipe
+"sessions, memories" alongside other vault content. Those PG tables
+were dropped by migration 031 (0.5.0). Wording updated to match
+what's actually deleted.
+
+### Docstring drift
+
+- `ParsedUri` docstring no longer claims "3-tuple unpack backward
+  compatibility" — every call site in the codebase reads parsed
+  attributes (`parsed.vault`, `parsed.kind`, …), never unpacks.
+  Field-order rationale rewritten as plain surface description.
+- `frontend/src/lib/api.ts` 7-line "Memory client surface removed in
+  v0.5.0" tombstone compressed to a one-liner that describes the
+  current state instead of the deleted past.
+
+### Out of scope / deferred
+
+- `_TABLE_NAME_RE` continues to reject hyphen / non-ASCII at create
+  time. Existing legacy tables were renamed in this session; making
+  create permissive is a separate design (URI escaping, column rules,
+  frontend display).
+- Boot-time migration list in `db/postgres.py` — 11 entries, all
+  idempotent and cheap. Trimming them needs a "schema-state snapshot"
+  policy decision (when does an applied migration get folded into
+  `init.sql` and dropped from the runner?). Tracked separately.
+- `app/main.py:196` `/health` field still emits a raw `{"error": str(e)}`
+  — intentional exception per 0.5.7.
+
+### Verified
+
+Unit 16/16; e2e green against 0.5.8 locally on the suites this PR
+touches (mcp, security, edit, collection, pg_rbac). Frontend type
+check + lint pass.
+
 ## 0.5.7 — 2026-06-03
 
 Post-0.5.6 cleanup pass — five findings from a code-quality audit

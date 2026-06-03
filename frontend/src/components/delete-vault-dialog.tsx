@@ -68,8 +68,8 @@ export function DeleteVaultDialog({
           <DialogDescription>
             This removes <span className="font-mono font-semibold text-foreground">{vault}</span>{" "}
             and everything inside it: documents, tables, files (including S3 objects),
-            relations, embeddings, sessions, memories, the git repository, and access
-            grants. This cannot be undone.
+            relations, embeddings, the git repository, and access grants. This cannot
+            be undone.
           </DialogDescription>
         </DialogHeader>
 

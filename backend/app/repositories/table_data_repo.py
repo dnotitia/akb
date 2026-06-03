@@ -150,13 +150,6 @@ async def build_table_name_map(conn, vault_names: list[str]) -> dict[str, str]:
             table_map[f"{sanitized_vault}__{short}"] = pg_name
             if len(vault_names) == 1:
                 table_map[short] = pg_name
-                # Backward-compat keys: pre-fix callers that referenced
-                # the display name directly (ASCII tables where display
-                # == short) keep working. Harmless on non-ASCII —
-                # display-name keys are never matched anyway because
-                # the SQL tokenizer accepts only ``[A-Za-z_][A-Za-z0-9_]*``.
-                table_map[t["name"]] = pg_name
-                table_map[t["name"].replace("-", "_")] = pg_name
     return table_map
 
 

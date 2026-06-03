@@ -178,12 +178,13 @@ def _paginate(items_or_payload, args: dict, items_key: str = "vaults") -> dict:
 def _filter_arg(args: dict) -> str:
     """Return the substring filter (case-insensitive, stripped).
 
-    Accepts `filter` (canonical) or `query` (legacy alias) — list_vaults
-    and browse historically used `query`, but `query` now collides with
-    `akb_search.query` (a semantic retrieval string). New callers should
-    pass `filter`; `query` stays accepted for one minor release.
+    Only `filter` is accepted — the historical `query` alias was
+    removed in 0.5.8 once it had outlived its one-release grace
+    window (introduced for the akb_search collision in 0.3.x).
+    A caller still passing `query=` now hits the 0.5.4 unknown-arg
+    gate and gets a fuzzy "Did you mean `filter`?" response.
     """
-    raw = args.get("filter") or args.get("query") or ""
+    raw = args.get("filter") or ""
     return raw.strip().lower()
 
 
