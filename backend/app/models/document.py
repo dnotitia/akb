@@ -173,6 +173,12 @@ class BrowseItem(BaseModel):
     # Table fields
     row_count: int | None = None
     columns: list[dict] | None = None
+    # SQL identifier the caller should pass to `akb_sql` — the right
+    # half of `vt_<vault>__<table>`. The display ``name`` can contain
+    # hyphens or non-ASCII characters that the sanitiser collapses to
+    # underscores; ``sql_name`` is what survives that transform and is
+    # what the rewriter keys off. Issue #110.
+    sql_name: str | None = None
     # File fields
     mime_type: str | None = None
     size_bytes: int | None = None

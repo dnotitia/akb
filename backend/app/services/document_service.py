@@ -1111,6 +1111,7 @@ class DocumentService:
                     uri=table_uri(vault, r["name"], collection=r.get("collection")),
                     summary=r["description"], row_count=row_count,
                     columns=cols,
+                    sql_name=table_data_repo.pg_short_name(r["name"]),
                     collection=r.get("collection"),
                     last_updated=r["created_at"],
                 ))
