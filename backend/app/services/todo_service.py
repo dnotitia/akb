@@ -6,6 +6,7 @@ import uuid
 from datetime import date as _date, datetime, timezone
 
 from app.db.postgres import get_pool
+from app.util.errors import NOT_FOUND, NO_OP, err
 
 
 async def create_todo(
@@ -140,7 +141,7 @@ async def update_todo(todo_id: str, **kwargs) -> dict:
     async with pool.acquire() as conn:
         todo = await conn.fetchrow("SELECT * FROM todos WHERE id = $1", uuid.UUID(todo_id))
         if not todo:
-            return {"error": "Todo not found"}
+            return err("Todo not found", code=NOT_FOUND)
 
         sets, params, idx = [], [], 1
         if "status" in kwargs:
@@ -173,7 +174,7 @@ async def update_todo(todo_id: str, **kwargs) -> dict:
             idx += 1
 
         if not sets:
-            return {"error": "Nothing to update"}
+            return err("Nothing to update", code=NO_OP)
 
         params.append(uuid.UUID(todo_id))
         await conn.execute(f"UPDATE todos SET {', '.join(sets)} WHERE id = ${idx}", *params)

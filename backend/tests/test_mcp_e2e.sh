@@ -339,7 +339,7 @@ print('yes' if t and any(c.get('name')=='product' for c in t.get('columns', []))
 # Wrong column name → fuzzy hint (issue #36)
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items WHERE producct = 'Widget'\"}" | mcp_result)
 HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
-AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('available_columns',[])))" 2>/dev/null)
+AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('details',{}).get('available_columns',[])))" 2>/dev/null)
 case "$HINT" in
   *"Did you mean"*"product"*) pass "akb_sql wrong column suggests 'product'" ;;
   *) fail "akb_sql column hint" "got hint=$HINT, avail=$AVAIL" ;;

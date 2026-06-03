@@ -180,7 +180,7 @@ echo ""
 echo "▸ 3. Not-Found Error"
 
 R=$(mcp_call akb_edit "{\"uri\":\"$DOC_URI\",\"old_string\":\"this string definitely does not exist in document xyz\",\"new_string\":\"replacement\"}" | mcp_result)
-NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'not found' in d.get('message','').lower())" 2>/dev/null)
+NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOT_FOUND_ERR" = "True" ] && pass "Not-found old_string returns edit_failed" || fail "Not found" "$R"
 
 HAS_HINT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('hint' in d)" 2>/dev/null)
@@ -196,7 +196,7 @@ DUP_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin
 [ -n "$DUP_DOC_URI" ] && pass "Duplicate doc created" || fail "Dup doc" "$R"
 
 R=$(mcp_call akb_edit "{\"uri\":\"$DUP_DOC_URI\",\"old_string\":\"DUPLICATE LINE\",\"new_string\":\"X\"}" | mcp_result)
-NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); m=d.get('message',''); print(d.get('error','')=='edit_failed' and 'appears 3 times' in m)" 2>/dev/null)
+NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'appears 3 times' in d.get('error',''))" 2>/dev/null)
 [ "$NOT_UNIQUE_ERR" = "True" ] && pass "Non-unique old_string rejected (3 occurrences)" || fail "Not unique" "$R"
 
 # ── 5. replace_all ──────────────────────────────────────────────
@@ -216,7 +216,7 @@ echo ""
 echo "▸ 6. Empty old_string"
 
 R=$(mcp_call akb_edit "{\"uri\":\"$DOC_URI\",\"old_string\":\"\",\"new_string\":\"anything\"}" | mcp_result)
-EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'empty' in d.get('message','').lower())" 2>/dev/null)
+EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'empty' in d.get('error','').lower())" 2>/dev/null)
 [ "$EMPTY_ERR" = "True" ] && pass "Empty old_string rejected" || fail "Empty old_string" "$R"
 
 # ── 7. No-op edit (old == new) ──────────────────────────────────
@@ -288,7 +288,7 @@ echo "▸ 10. Frontmatter Safety"
 
 # Try editing something that exists only in frontmatter → should not match
 R=$(mcp_call akb_edit "{\"uri\":\"$DOC_URI\",\"old_string\":\"Edit Target\",\"new_string\":\"Hacked Title\"}" | mcp_result)
-FM_SAFE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed')" 2>/dev/null)
+FM_SAFE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed')" 2>/dev/null)
 [ "$FM_SAFE" = "True" ] && pass "Frontmatter-only text not editable (body-only scope)" || fail "Frontmatter safety" "$R"
 
 R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
@@ -301,7 +301,7 @@ echo "▸ 11. Access Control"
 
 if [ -n "$READER_SID" ]; then
   R=$(mcp_call_as_reader akb_edit "{\"uri\":\"$DOC_URI\",\"old_string\":\"Content of section B is here.\",\"new_string\":\"reader attempted edit\"}" | mcp_result)
-  DENIED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); err=str(d.get('error',''))+str(d.get('message','')); print('403' in err or 'forbidden' in err.lower() or 'permission' in err.lower() or 'writer' in err.lower() or 'role' in err.lower())" 2>/dev/null)
+  DENIED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); err=str(d.get('error',''))+str(d.get('code','')); print('403' in err or 'forbidden' in err.lower() or 'permission' in err.lower() or 'writer' in err.lower() or 'role' in err.lower())" 2>/dev/null)
   [ "$DENIED" = "True" ] && pass "Reader cannot edit (access denied)" || fail "Reader edit" "$R"
 else
   fail "Reader MCP session" "no READER_SID"

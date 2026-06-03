@@ -40,6 +40,17 @@ from app.services.access_service import (
     archive_vault,
 )
 from app.services.auth_service import resolve_token
+from app.util.errors import (
+    err,
+    CONFLICT,
+    EDIT_FAILED,
+    INVALID_ARGUMENT,
+    INVALID_PATH,
+    INVALID_URI,
+    NOT_FOUND,
+    UNKNOWN_ARGUMENT,
+    UNKNOWN_TOOL,
+)
 from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
@@ -229,7 +240,7 @@ async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
             external_git=args.get("external_git"),
         )
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
     response = {
         "vault_id": vault_id, "name": args["name"],
         "template": args.get("template"),
@@ -249,7 +260,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     try:
         vault, collection = _resolve_parent(args, kind_name="document")
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
     await check_vault_access(uid, vault, required_role="writer")
     req = DocumentPutRequest(
         vault=vault,
@@ -267,7 +278,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     try:
         result = await doc_service.put(req, agent_id=user.username)
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
     return result.model_dump()
 
 
@@ -310,12 +321,11 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
     version = args.get("version")
     if version:
         if not HEX_COMMIT_RE.fullmatch(version):
-            return {
-                "error": (
-                    "version must be a 7-64 char lowercase hex commit hash; "
-                    "symbolic refs (HEAD~N, refs/heads/main, ...) are not accepted"
-                )
-            }
+            return err(
+                "version must be a 7-64 char lowercase hex commit hash; "
+                "symbolic refs (HEAD~N, refs/heads/main, ...) are not accepted",
+                code=INVALID_ARGUMENT,
+            )
         # Read specific version from Git. Strip frontmatter (yaml meta
         # block at top) before returning content — the un-versioned
         # akb_get path does the same via doc_service.get, and any
@@ -324,12 +334,12 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
         import frontmatter as _fm
         doc = await _find_doc(vault, doc_path)
         if not doc:
-            return {"error": "Document not found"}
+            return err("Document not found", code=NOT_FOUND)
         from app.services.git_service import GitService
         git = GitService()
         raw = git.read_file(vault, doc["path"], commit=version)
         if raw is None:
-            return {"error": f"Version not found: {version}"}
+            return err(f"Version not found: {version}", code=NOT_FOUND)
         try:
             body = _fm.loads(raw).content
         except Exception:
@@ -356,7 +366,7 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
         }
     doc = await doc_service.get(vault, doc_path)
     if not doc:
-        return {"error": "Document not found"}
+        return err("Document not found", code=NOT_FOUND)
     return doc.model_dump()
 
 
@@ -379,7 +389,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     )
     result = await doc_service.update(vault, doc_path, req, agent_id=user.username)
     if not result:
-        return {"error": "Document not found"}
+        return err("Document not found", code=NOT_FOUND)
     return result.model_dump()
 
 
@@ -400,19 +410,19 @@ async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
         )
         return result.model_dump()
     except EditError as e:
-        return {
-            "error": "edit_failed",
-            "message": str(e),
-            "hint": "Use akb_get to verify current content, then retry with adjusted old_string.",
-        }
+        return err(
+            str(e),
+            code=EDIT_FAILED,
+            hint="Use akb_get to verify current content, then retry with adjusted old_string.",
+        )
     except ConflictError as e:
         # base_commit OCC mismatch: a concurrent writer moved the doc
         # between the agent's read and edit submission.
-        return {
-            "error": "conflict",
-            "message": str(e),
-            "hint": "Document was modified since base_commit. Re-read with akb_get and retry.",
-        }
+        return err(
+            str(e),
+            code=CONFLICT,
+            hint="Document was modified since base_commit. Re-read with akb_get and retry.",
+        )
 
 
 @_h("akb_delete")
@@ -441,11 +451,11 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         try:
             vault, collection = split_browse_uri(uri_arg)
         except ValueError as exc:
-            return {"error": str(exc)}
+            return err(str(exc), code=INVALID_URI)
     else:
         vault_arg = args.get("vault")
         if not vault_arg:
-            return {"error": "Either `vault` or `uri` is required for akb_browse."}
+            return err("Either `vault` or `uri` is required for akb_browse.", code=INVALID_ARGUMENT)
         vault = vault_arg
         collection = args.get("collection")
     await check_vault_access(uid, vault, required_role="reader")
@@ -500,7 +510,7 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         if args.get("vault"):
             await check_vault_access(uid, args["vault"], required_role="writer")
         else:
-            return {"error": "vault is required when using replace"}
+            return err("vault is required when using replace", code=INVALID_ARGUMENT)
     result = await search_service.grep(
         pattern=args["pattern"],
         vault=args.get("vault"),
@@ -685,15 +695,14 @@ async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     commit = args.get("commit", "")
     if not HEX_COMMIT_RE.fullmatch(commit):
-        return {
-            "error": (
-                "commit must be a 7-64 char lowercase hex hash; "
-                "symbolic refs are not accepted"
-            )
-        }
+        return err(
+            "commit must be a 7-64 char lowercase hex hash; "
+            "symbolic refs are not accepted",
+            code=INVALID_ARGUMENT,
+        )
     doc = await _find_doc(vault, doc_path)
     if not doc:
-        return {"error": f"Document not found: {args['uri']}"}
+        return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
     from app.services.git_service import GitService
     git = GitService()
     return git.file_diff(vault, doc["path"], commit)
@@ -704,7 +713,7 @@ async def _handle_relations(args: dict, uid: str, user: _MCPUser) -> dict:
     uri = args["uri"]
     parsed = parse_uri(uri)
     if parsed is None:
-        return {"error": f"Invalid AKB URI: '{uri}'"}
+        return err(f"Invalid AKB URI: '{uri}'", code=INVALID_URI)
     vault = parsed.vault
     access = await check_vault_access(uid, vault, required_role="reader")
     relations = await get_resource_relations(
@@ -723,12 +732,12 @@ async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
     if uri:
         parsed = parse_uri(uri)
         if parsed is None:
-            return {"error": f"Invalid AKB URI: '{uri}'"}
+            return err(f"Invalid AKB URI: '{uri}'", code=INVALID_URI)
         vault = parsed.vault
     else:
         v = args.get("vault")
         if not v:
-            return {"error": "Either `uri` or `vault` is required"}
+            return err("Either `uri` or `vault` is required", code=INVALID_ARGUMENT)
         vault = v
     access = await check_vault_access(uid, vault, required_role="reader")
     return await get_graph(
@@ -751,9 +760,9 @@ async def _handle_link(args: dict, uid: str, user: _MCPUser) -> dict:
     src_parsed = parse_uri(args["source"])
     tgt_parsed = parse_uri(args["target"])
     if src_parsed is None or tgt_parsed is None:
-        return {"error": "Both source and target must be valid akb:// URIs"}
+        return err("Both source and target must be valid akb:// URIs", code=INVALID_URI)
     if src_parsed.vault != tgt_parsed.vault:
-        return {"error": "source and target must belong to the same vault"}
+        return err("source and target must belong to the same vault", code=INVALID_ARGUMENT)
     vault = src_parsed.vault
     await check_vault_access(uid, vault, required_role="writer")
     return await link_resources(
@@ -768,9 +777,9 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
     src_parsed = parse_uri(args["source"])
     tgt_parsed = parse_uri(args["target"])
     if src_parsed is None or tgt_parsed is None:
-        return {"error": "Both source and target must be valid akb:// URIs"}
+        return err("Both source and target must be valid akb:// URIs", code=INVALID_URI)
     if src_parsed.vault != tgt_parsed.vault:
-        return {"error": "source and target must belong to the same vault"}
+        return err("source and target must belong to the same vault", code=INVALID_ARGUMENT)
     vault = src_parsed.vault
     access = await check_vault_access(uid, vault, required_role="writer")
     return await unlink_resources(
@@ -786,7 +795,7 @@ async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:
-        return {"error": "Document not found"}
+        return err("Document not found", code=NOT_FOUND)
     return await get_provenance(str(doc["id"]), vault_id=doc["vault_id"])
 
 
@@ -795,7 +804,7 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
     try:
         vault, collection = _resolve_parent(args, kind_name="table")
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
     access = await check_vault_access(uid, vault, required_role="writer")
     try:
         return await table_service.create_table(
@@ -805,7 +814,7 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             collection=collection or None,
         )
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
 
 
 @_h("akb_sql")
@@ -813,7 +822,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
     sql = args["sql"].strip()
     vaults = args.get("vaults") or ([args["vault"]] if args.get("vault") else [])
     if not vaults:
-        return {"error": "Must specify vault or vaults parameter"}
+        return err("Must specify vault or vaults parameter", code=INVALID_ARGUMENT)
 
     # Check access on all referenced vaults — minimum reader. This is
     # the application's friendly 403 gate; if the caller has no
@@ -841,7 +850,7 @@ async def _handle_drop_table(args: dict, uid: str, user: _MCPUser) -> dict:
             access["vault_id"], table_name, actor_id=user.username,
         )
     except NotFoundError as e:
-        return {"error": str(e)}
+        return err(str(e), code=NOT_FOUND)
 
 
 @_h("akb_alter_table")
@@ -856,8 +865,10 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
             drop_columns=args.get("drop_columns"),
             rename_columns=args.get("rename_columns"),
         )
-    except (NotFoundError, ValueError) as e:
-        return {"error": str(e)}
+    except NotFoundError as e:
+        return err(str(e), code=NOT_FOUND)
+    except ValueError as e:
+        return err(str(e), code=INVALID_ARGUMENT)
 
 
 _SYSTEM_UID = "00000000-0000-0000-0000-000000000000"
@@ -876,18 +887,18 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
     vault_name: str | None = None
     if resource_type == "document":
         if not uri:
-            return {"error": "`uri` is required for resource_type=document"}
+            return err("`uri` is required for resource_type=document", code=INVALID_ARGUMENT)
         vault_name, doc_path = split_uri(uri, expected_type="doc")
     elif resource_type == "file":
         if not uri:
-            return {"error": "`uri` is required for resource_type=file"}
+            return err("`uri` is required for resource_type=file", code=INVALID_ARGUMENT)
         vault_name, file_id = split_uri(uri, expected_type="file")
     elif resource_type == "table_query":
         vault_name = args.get("vault")
         if not vault_name:
-            return {"error": "`vault` is required for resource_type=table_query"}
+            return err("`vault` is required for resource_type=table_query", code=INVALID_ARGUMENT)
     else:
-        return {"error": f"Unknown resource_type: {resource_type}"}
+        return err(f"Unknown resource_type: {resource_type}", code=INVALID_ARGUMENT)
 
     await check_vault_access(uid, vault_name, required_role="writer")
     # A table_query publication runs against EVERY vault in
@@ -919,7 +930,7 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
             created_by=created_by,
         )
     except ValueError as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
 
     return {
         "published": True,
@@ -963,7 +974,7 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
         count = await publication_service.delete_publications_for_document(args["uri"])
         return {"published": False, "deleted_publications": count}
 
-    return {"error": "Either slug or uri is required"}
+    return err("Either slug or uri is required", code=INVALID_ARGUMENT)
 
 
 @_h("akb_publications")
@@ -990,15 +1001,15 @@ async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> 
             slug, access["vault_id"],
         )
     if not row:
-        return {"error": f"Publication not found: {slug}"}
+        return err(f"Publication not found: {slug}", code=NOT_FOUND)
     try:
         return await publication_service.create_snapshot(
             row["id"], expected_vault_id=access["vault_id"],
         )
     except publication_service.PublicationError as e:
-        return {"error": e.message}
+        return err(e.message, code=INVALID_ARGUMENT)
     except Exception as e:
-        return {"error": str(e)}
+        return err(str(e), code=INVALID_ARGUMENT)
 
 
 @_h("akb_vault_info")
@@ -1037,7 +1048,7 @@ async def _handle_whoami(args: dict, uid: str, user: _MCPUser) -> dict:
             uuid.UUID(uid),
         )
         if not row:
-            return {"error": "User not found"}
+            return err("User not found", code=NOT_FOUND)
         return {
             "user_id": str(row["id"]),
             "username": row["username"],
@@ -1078,7 +1089,7 @@ async def _handle_create_collection(args: dict, uid: str, user: _MCPUser) -> dic
             agent_id=uid,
         )
     except InvalidPathError as exc:
-        return {"error": "invalid_path", "message": str(exc)}
+        return err(str(exc), code=INVALID_PATH)
 
 
 @_h("akb_delete_collection")
@@ -1095,16 +1106,16 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
             agent_id=uid,
         )
     except InvalidPathError as exc:
-        return {"error": "invalid_path", "message": str(exc)}
+        return err(str(exc), code=INVALID_PATH)
     except CollectionNotEmptyError as exc:
-        return {
-            "error": "not_empty",
-            "message": str(exc),
-            "doc_count": exc.doc_count,
-            "file_count": exc.file_count,
-            "sub_collection_count": exc.sub_collection_count,
-            "table_count": exc.table_count,
-        }
+        return err(
+            str(exc),
+            code=CONFLICT,
+            doc_count=exc.doc_count,
+            file_count=exc.file_count,
+            sub_collection_count=exc.sub_collection_count,
+            table_count=exc.table_count,
+        )
 
 
 @_h("akb_history")
@@ -1114,7 +1125,7 @@ async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, vault, required_role="reader")
     doc = await _find_doc(vault, doc_path)
     if not doc:
-        return {"error": f"Document not found: {args['uri']}"}
+        return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
     from app.services.git_service import GitService
     git = GitService()
     # Pass the doc's created_at as a lineage boundary so commits from a
@@ -1174,25 +1185,24 @@ async def _dispatch(name: str, args: dict):
 
     handler = _HANDLERS.get(name)
     if not handler:
-        return {"error": f"Unknown tool: {name}"}
+        return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
 
     # Reject unknown arguments before the handler sees them. Without
     # this, a typo like `akb_activity(user=...)` (real name: `author`)
     # would silently fall through `args.get("author")` and quietly
     # disable the filter — agent thinks the filter applied and trusts
-    # an unfiltered result. Surface the typo with a fuzzy hint so the
-    # caller can self-correct on retry; shape matches table_service's
-    # _enrich_undefined_error so the tone is uniform across the API.
+    # an unfiltered result.
     allowed = _TOOL_ARG_NAMES.get(name)
     if allowed is not None:
         unknown = [k for k in args if k not in allowed]
         if unknown:
             bad = unknown[0]
-            return {
-                "error": f"Unknown argument '{bad}' for {name}",
-                "hint": fuzzy_hint(bad, sorted(allowed), label="arguments"),
-                "available_arguments": sorted(allowed),
-            }
+            return err(
+                f"Unknown argument '{bad}' for {name}",
+                code=UNKNOWN_ARGUMENT,
+                hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
+                available_arguments=sorted(allowed),
+            )
 
     return await handler(args, uid, user)
 
