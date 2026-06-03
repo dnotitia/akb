@@ -14,6 +14,7 @@ from app.exceptions import ConflictError, ForbiddenError, NotFoundError, Validat
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
+from app.util.errors import NOT_FOUND, err
 
 logger = logging.getLogger("akb.access")
 
@@ -799,7 +800,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     async with pool.acquire() as conn:
         vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
         if not vault:
-            return {"error": f"Vault not found: {vault_name}"}
+            return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
         vault_id = vault["id"]
 
         # Delete S3 files BEFORE the DB cascade — this part cannot be

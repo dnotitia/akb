@@ -20,6 +20,13 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.services.uri_service import parse_uri, doc_uri, table_uri, file_uri
+from app.util.errors import (
+    err,
+    INVALID_ARGUMENT,
+    INVALID_URI,
+    NOT_FOUND,
+    SELF_LINK,
+)
 
 logger = logging.getLogger("akb.graph")
 
@@ -173,20 +180,22 @@ async def link_resources(
     source_parsed = parse_uri(source_uri)
     target_parsed = parse_uri(target_uri)
     if not source_parsed:
-        return {"error": f"Invalid source URI: {source_uri}"}
+        return err(f"Invalid source URI: {source_uri}", code=INVALID_URI)
     if not target_parsed:
-        return {"error": f"Invalid target URI: {target_uri}"}
+        return err(f"Invalid target URI: {target_uri}", code=INVALID_URI)
     _LINKABLE = ("doc", "table", "file")
     if source_parsed.kind not in _LINKABLE:
-        return {"error": (
+        return err(
             f"Cannot link from a {source_parsed.kind} URI ({source_uri}). "
-            f"Linkable kinds: {_LINKABLE}."
-        )}
+            f"Linkable kinds: {_LINKABLE}.",
+            code=INVALID_ARGUMENT,
+        )
     if target_parsed.kind not in _LINKABLE:
-        return {"error": (
+        return err(
             f"Cannot link to a {target_parsed.kind} URI ({target_uri}). "
-            f"Linkable kinds: {_LINKABLE}."
-        )}
+            f"Linkable kinds: {_LINKABLE}.",
+            code=INVALID_ARGUMENT,
+        )
 
     source_vault_name = source_parsed.vault
     source_type = source_parsed.kind
@@ -199,7 +208,7 @@ async def link_resources(
     # here means a malformed URI slipped past parse_uri. Fail closed so the
     # advisory-lock + existence checks below can treat both ids as str.
     if source_id is None or target_id is None:
-        return {"error": "Source or target URI is missing an identifier."}
+        return err("Source or target URI is missing an identifier.", code=INVALID_URI)
 
     # Canonicalize both endpoints from parsed parts so a legacy-shaped
     # URI passed by an external caller is stored in 0.3.0 canonical form
@@ -209,7 +218,7 @@ async def link_resources(
     target_uri = canonicalize_resource_uri(target_parsed) or target_uri
 
     if source_uri == target_uri:
-        return {"error": "Cannot link a resource to itself"}
+        return err("Cannot link a resource to itself", code=SELF_LINK)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -220,19 +229,19 @@ async def link_resources(
                 "SELECT id FROM vaults WHERE name = $1", vault_name,
             )
             if not vault:
-                return {"error": f"Vault not found: {vault_name}"}
+                return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
             vault_id = vault["id"]
 
             source_vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1", source_vault_name,
             )
             if not source_vault:
-                return {"error": f"Source vault not found: {source_vault_name}"}
+                return err(f"Source vault not found: {source_vault_name}", code=NOT_FOUND)
             target_vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1", target_vault_name,
             )
             if not target_vault:
-                return {"error": f"Target vault not found: {target_vault_name}"}
+                return err(f"Target vault not found: {target_vault_name}", code=NOT_FOUND)
 
             # Acquire the same path advisory lock the doc write paths use so
             # akb_link serialises with akb_delete / akb_update on either
@@ -253,11 +262,11 @@ async def link_resources(
             if not await _resource_exists(
                 conn, source_vault["id"], source_type, source_id,
             ):
-                return {"error": f"Source resource not found: {source_uri}"}
+                return err(f"Source resource not found: {source_uri}", code=NOT_FOUND)
             if not await _resource_exists(
                 conn, target_vault["id"], target_type, target_id,
             ):
-                return {"error": f"Target resource not found: {target_uri}"}
+                return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
 
             await conn.execute(
                 """
@@ -507,7 +516,7 @@ async def get_provenance(doc_id: str, *, vault_id: uuid.UUID) -> dict:
             doc_id, vault_id,
         )
         if not row:
-            return {"error": "Document not found"}
+            return err("Document not found", code=NOT_FOUND)
 
         uri = doc_uri(row["vault_name"], row["path"])
         relations = await get_resource_relations(row["vault_name"], uri, vault_id=vault_id)

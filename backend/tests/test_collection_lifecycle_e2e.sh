@@ -155,9 +155,9 @@ for p in "${INVALID_PATHS[@]}"; do
   # JSON-escape the path
   esc_p=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$p")
   R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":$esc_p}" | mcp_result)
-  ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
-  [ "$ERR" = "invalid_path" ] && pass "rejected invalid path: $(printf %q "$p")" \
-    || fail "invalid path '$p'" "expected error=invalid_path, got error='$ERR'; raw=$R"
+  CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
+  [ "$CODE" = "invalid_path" ] && pass "rejected invalid path: $(printf %q "$p")" \
+    || fail "invalid path '$p'" "expected code=invalid_path, got code='$CODE'; raw=$R"
 done
 
 # ── 7. Delete empty collection ──────────────────────────────
@@ -195,11 +195,11 @@ NE_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)
 
 # Delete without recursive
 R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"docs\"}" | mcp_result)
-NE_ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
-NE_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('doc_count', -1))" 2>/dev/null)
-[ "$NE_ERR" = "not_empty" ] && [ "$NE_DC" -ge 1 ] 2>/dev/null \
-  && pass "non-empty delete rejected with error=not_empty, doc_count=$NE_DC" \
-  || fail "non-empty no-recursive" "error=$NE_ERR doc_count=$NE_DC; raw=$R"
+NE_CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
+NE_DC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('details',{}).get('doc_count', -1))" 2>/dev/null)
+[ "$NE_CODE" = "conflict" ] && [ "$NE_DC" -ge 1 ] 2>/dev/null \
+  && pass "non-empty delete rejected with code=conflict, doc_count=$NE_DC" \
+  || fail "non-empty no-recursive" "code=$NE_CODE doc_count=$NE_DC; raw=$R"
 
 # Doc must still exist
 R=$(mcp_call akb_get "{\"uri\":\"$NE_DOC_URI\"}" | mcp_result)
@@ -335,11 +335,11 @@ NP_HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
 # Bonus: same via MCP — sub_collection_count surfaces on `not_empty`
 R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2/inner\"}" | mcp_result)
 R=$(mcp_call akb_delete_collection "{\"vault\":\"$VAULT\",\"path\":\"nested2\"}" | mcp_result)
-NP_MCP_ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
-NP_MCP_SUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sub_collection_count', -1))" 2>/dev/null)
-[ "$NP_MCP_ERR" = "not_empty" ] && [ "$NP_MCP_SUB" -ge 1 ] 2>/dev/null \
-  && pass "MCP delete_collection on nested parent → not_empty sub_collection_count=$NP_MCP_SUB" \
-  || fail "MCP nested not_empty" "error=$NP_MCP_ERR sub_collection_count=$NP_MCP_SUB; raw=$R"
+NP_MCP_CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
+NP_MCP_SUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('details',{}).get('sub_collection_count', -1))" 2>/dev/null)
+[ "$NP_MCP_CODE" = "conflict" ] && [ "$NP_MCP_SUB" -ge 1 ] 2>/dev/null \
+  && pass "MCP delete_collection on nested parent → conflict sub_collection_count=$NP_MCP_SUB" \
+  || fail "MCP nested not_empty" "code=$NP_MCP_CODE sub_collection_count=$NP_MCP_SUB; raw=$R"
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""

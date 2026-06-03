@@ -231,12 +231,12 @@ EDIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 
 # 3a. Edit: old_string not found → error
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"NOTHING LIKE THIS EXISTS\",\"new_string\":\"whatever\"}" | mr)
-NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'not found' in d.get('message','').lower())" 2>/dev/null)
+NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOT_FOUND_ERR" = "True" ] && pass "Edit: old_string not found rejected" || fail "Edit not found" "$R"
 
 # 3b. Edit: old_string not unique → error
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta replaced\"}" | mr)
-NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'appears' in d.get('message',''))" 2>/dev/null)
+NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'appears' in d.get('error',''))" 2>/dev/null)
 [ "$NOT_UNIQUE_ERR" = "True" ] && pass "Edit: non-unique old_string rejected" || fail "Edit non-unique" "$R"
 
 # 3c. Edit: valid single replacement
@@ -251,7 +251,7 @@ EDIT_ALL_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.s
 
 # 3e. Edit: empty old_string rejected
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"\",\"new_string\":\"x\"}" | mr)
-EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'empty' in d.get('message','').lower())" 2>/dev/null)
+EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'empty' in d.get('error','').lower())" 2>/dev/null)
 [ "$EMPTY_ERR" = "True" ] && pass "Edit: empty old_string rejected" || fail "Empty old_string" "$R"
 
 # Section 4 (Memory Category Filtering) and 5 (memory cross-user

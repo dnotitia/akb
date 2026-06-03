@@ -32,6 +32,16 @@ from app.services.index_service import (
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
 from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
+from app.util.errors import (
+    err,
+    METHOD_NOT_ALLOWED,
+    MULTI_STATEMENT,
+    PERMISSION_DENIED,
+    SQL_ERROR,
+    UNDEFINED_COLUMN,
+    UNDEFINED_TABLE,
+    VAULT_ARCHIVED,
+)
 from app.util.text import fuzzy_hint
 
 # Re-exported helpers used by publication_service for the
@@ -490,17 +500,19 @@ async def execute_sql(
 
         sql_check = rewritten.rstrip(";").strip()
         if ";" in sql_check:
-            return {"error": "Multi-statement SQL is not allowed. Send one statement at a time."}
+            return err(
+                "Multi-statement SQL is not allowed. Send one statement at a time.",
+                code=MULTI_STATEMENT,
+            )
 
         upper = rewritten.strip().upper()
         if not upper.startswith(_ALLOWED_FIRST_KEYWORDS):
-            return {
-                "error": (
-                    "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
-                    "akb_sql. Use akb_create_table / akb_alter_table / "
-                    "akb_drop_table for schema changes."
-                )
-            }
+            return err(
+                "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
+                "akb_sql. Use akb_create_table / akb_alter_table / "
+                "akb_drop_table for schema changes.",
+                code=METHOD_NOT_ALLOWED,
+            )
 
         # Archived vaults are READ-ONLY. PG ACL has no archive concept
         # (write grants are intentionally preserved so unarchive is
@@ -515,13 +527,11 @@ async def execute_sql(
             )
             if archived:
                 names = ", ".join(sorted(r["name"] for r in archived))
-                return {
-                    "error": (
-                        f"Vault '{names}' is archived (read-only); writes via "
-                        f"akb_sql are not allowed. Unarchive the vault first."
-                    ),
-                    "code": "vault_archived",
-                }
+                return err(
+                    f"Vault '{names}' is archived (read-only); writes via "
+                    f"akb_sql are not allowed. Unarchive the vault first.",
+                    code=VAULT_ARCHIVED,
+                )
 
     try:
         return await get_user_sql_executor().execute(
@@ -533,12 +543,13 @@ async def execute_sql(
     except PermissionDeniedError as e:
         # PG ACL denied — the boundary working as designed. Surface
         # the PG error verbatim so callers know it came from PG, not
-        # from application validation.
-        return {
-            "error": str(e),
-            "code": "permission_denied",
-            "pg_sqlstate": e.pg_sqlstate,
-        }
+        # from application validation. `pg_sqlstate` lives under
+        # `details` per the canonical shape.
+        return err(
+            str(e),
+            code=PERMISSION_DENIED,
+            pg_sqlstate=e.pg_sqlstate,
+        )
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)
         # Try to enrich column/table-not-exist errors with fuzzy-match
@@ -552,7 +563,7 @@ async def execute_sql(
             )
         if enriched:
             return enriched
-        return {"error": msg}
+        return err(msg, code=SQL_ERROR)
 
 
 _COLUMN_NOT_EXIST = _re.compile(r'column "([^"]+)" does not exist')
@@ -591,11 +602,12 @@ async def _enrich_undefined_error(
                 f"  (jsonb columns — use `<col>::text ILIKE '%X%'`: "
                 f"{', '.join(jsonb_cols)})"
             )
-        return {
-            "error": err_msg,
-            "hint": hint,
-            "available_columns": list(col_meta.keys()),
-        }
+        return err(
+            err_msg,
+            code=UNDEFINED_COLUMN,
+            hint=hint,
+            available_columns=list(col_meta.keys()),
+        )
 
     # ── Relation/table not exist ────────────────────────────────
     if m := _RELATION_NOT_EXIST.search(err_msg):
@@ -612,11 +624,12 @@ async def _enrich_undefined_error(
             "  (Reference vault tables by their short name — the rewriter "
             "prefixes them with `vt_<vault>__` automatically.)"
         )
-        return {
-            "error": err_msg,
-            "hint": hint,
-            "available_tables": short_names,
-        }
+        return err(
+            err_msg,
+            code=UNDEFINED_TABLE,
+            hint=hint,
+            available_tables=short_names,
+        )
 
     return None
 

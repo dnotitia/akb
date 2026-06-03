@@ -5,6 +5,95 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.6 — 2026-06-03  *(breaking error-response shape)*
+
+Error responses across the backend now share one envelope. Until
+0.5.5 there were ~6 distinct shapes — bare `{error}`, `{error,
+code}`, `{error, code, pg_sqlstate}`, `{error, hint, available_*}`,
+`{error, message, hint}` — and every new handler that wanted to
+surface a hint or metadata reinvented a slightly different one.
+Agents that wanted to auto-recover had to learn each case's field
+names; new error paths kept proliferating new shapes.
+
+### Canonical shape
+
+Every error return from `akb_*` MCP tools and the REST surface now
+matches:
+
+```json
+{
+  "error":   "<human-readable message>",
+  "code":    "<stable enum>",
+  "hint":    "<optional self-correction guidance>",
+  "details": { "<optional case-specific metadata>": "..." }
+}
+```
+
+`error` + `code` are always present. `hint` and `details` are
+opt-in. **Top-level meta fields that used to live alongside `error`
+have moved into `details`** — `available_columns`,
+`available_tables`, `available_arguments`, `pg_sqlstate`,
+`doc_count` / `file_count` / etc. on a non-empty-collection error.
+
+### Code catalogue (initial)
+
+Stable strings, defined in `app/util/errors.py`:
+
+| code                | When                                                                     |
+|---------------------|--------------------------------------------------------------------------|
+| `not_found`         | Resource doesn't exist (vault, doc, table, version, publication, user)    |
+| `permission_denied` | PG ACL denied (cross-vault probe); `details.pg_sqlstate` carries SQLSTATE |
+| `vault_archived`    | Write attempted against an archived vault                                 |
+| `invalid_argument`  | Generic argument-shape problem (missing required, wrong format, …)        |
+| `invalid_uri`       | `akb://…` URI couldn't be parsed                                          |
+| `invalid_path`      | Collection / file path failed normalisation                               |
+| `unknown_argument`  | Tool called with an arg key not in its schema (0.5.4)                     |
+| `unknown_tool`      | `_dispatch` got a tool name not in `_HANDLERS`                            |
+| `conflict`          | OCC mismatch / non-empty collection delete without `recursive`            |
+| `no_op`             | Update request had nothing to update                                      |
+| `edit_failed`       | `akb_edit` couldn't apply (no match / non-unique / empty old_string)      |
+| `multi_statement`   | `akb_sql` got `;`-separated statements                                    |
+| `method_not_allowed`| `akb_sql` got DDL or other non-DML                                        |
+| `sql_error`         | Generic PG error after enrichment                                         |
+| `undefined_column`  | SQL column doesn't exist; `details.available_columns` + `hint`            |
+| `undefined_table`   | SQL relation doesn't exist; `details.available_tables` + `hint`           |
+| `cross_vault_link`  | (reserved for future link cross-vault rejection)                          |
+| `self_link`         | `akb_link` source == target                                               |
+| `internal_error`    | Uncategorised exception fall-through (prefer a specific code over this)   |
+
+### Breaking changes
+
+If you parse error responses programmatically:
+
+1. **`error` is now always a human message**, not sometimes a code.
+   The old `{"error": "edit_failed", "message": "..."}` shape is
+   gone — use `code == "edit_failed"` and read `error` for the
+   message.
+2. **Aux fields moved under `details`**. `response.available_columns`
+   → `response.details.available_columns`. Same for
+   `available_tables`, `available_arguments`, `pg_sqlstate`,
+   `doc_count` / `file_count` / `sub_collection_count` / `table_count`
+   on `akb_delete_collection`.
+3. **`hint` stays top-level** (it's the dominant self-correction
+   signal — burying it under `details` would hurt agent UX).
+
+The frontend uses only `error` (verified — `frontend/src/lib/api.ts`
+throws `new Error(body.error || body.detail)`) and the akb-mcp
+stdio proxy is pass-through, so neither needs changes. Direct REST
+clients and agents that inspected the aux fields by their old
+top-level names need to look one level deeper.
+
+### Tests
+
+- `test_errors_unit.py` (new, 5 cases): envelope shape — minimal,
+  with hint, with details kwargs, `code` always present.
+- E2E migrated: `test_mcp_e2e.sh` (`available_columns` →
+  `details.available_columns`), `test_edit_e2e.sh` and
+  `test_security_edge_e2e.sh` (`error == "edit_failed"` →
+  `code == "edit_failed"`, `message` → `error`).
+- Full regression: unit 30 passed; main / security / pg_rbac e2e
+  green against the 0.5.6 backend.
+
 ## 0.5.5 — 2026-06-03
 
 Vault tables with hyphenated or non-ASCII display names are now
