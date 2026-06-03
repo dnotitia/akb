@@ -252,6 +252,10 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "vault": vault["name"],
                 "collection": r["collection"],
                 "name": r["name"],
+                # SQL-side identifier the caller must pass to akb_sql —
+                # mirrors `BrowseItem.sql_name` so REST clients have the
+                # same contract MCP clients got in 0.5.5 (issue #110).
+                "sql_name": table_data_repo.pg_short_name(r["name"]),
                 "description": r["description"],
                 "columns": table_registry_repo.parse_columns(r["columns"]),
                 "row_count": count,
@@ -459,8 +463,6 @@ async def alter_table(
     }
 
 
-import re as _re
-
 # Statement keywords allowed via `akb_sql`. Kept as a friendly
 # pre-flight check: PG would also reject non-DML at the role level
 # (akb_user_* roles have no CREATE/ALTER/DROP/GRANT privilege), but
@@ -566,8 +568,8 @@ async def execute_sql(
         return err(msg, code=SQL_ERROR)
 
 
-_COLUMN_NOT_EXIST = _re.compile(r'column "([^"]+)" does not exist')
-_RELATION_NOT_EXIST = _re.compile(r'relation "([^"]+)" does not exist')
+_COLUMN_NOT_EXIST = re.compile(r'column "([^"]+)" does not exist')
+_RELATION_NOT_EXIST = re.compile(r'relation "([^"]+)" does not exist')
 
 
 async def _enrich_undefined_error(
@@ -583,8 +585,12 @@ async def _enrich_undefined_error(
     rewritten table list (e.g. ``{"vt_sales__pipeline"}``) — we never
     suggest names from other vaults.
 
-    Returns None when the error isn't a recoverable shape, letting the
-    caller fall through to the verbatim PG message.
+    Returns the canonical 0.5.6 error envelope (``err(...)`` with
+    ``code=undefined_column`` or ``undefined_table``, ``hint``, and
+    ``details.available_columns`` / ``details.available_tables``), or
+    ``None`` when the PG message isn't a recoverable shape — in which
+    case the caller falls through to the verbatim PG message wrapped
+    in ``err(msg, code=SQL_ERROR)``.
     """
     if not allowed_pg_tables:
         return None

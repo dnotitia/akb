@@ -5,6 +5,60 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.7 — 2026-06-03
+
+Post-0.5.6 cleanup pass — five findings from a code-quality audit
+of the last four releases (0.5.4–0.5.6).
+
+### REST `sql_name` symmetry (issue #110 follow-up)
+
+`GET /api/v1/tables/{vault}` now includes `sql_name` on each table
+item, matching what MCP `akb_browse` started returning in 0.5.5. REST
+clients were unintentionally excluded from the contract — they had to
+guess the sanitisation rule the same way the original seahorse-mcp
+table viewer did before #110. Additive field; no breaking change.
+
+### Catalogue-enforcement test (drift gate)
+
+`tests/test_errors_unit.py` gains two AST-level sync tests:
+
+- `test_every_err_call_uses_catalogue_constant` — every `err(code=X)`
+  call in `app/` + `mcp_server/` must use a constant from
+  `app/util/errors.py`, not an ad-hoc string. Catches the next
+  contributor who writes `code="some_new_thing"` inline.
+- `test_catalogue_has_no_orphan_constants` — every constant in the
+  catalogue must be imported somewhere. Catches forward-declared
+  codes that get carried release-to-release without ever shipping a
+  call site (`CROSS_VAULT_LINK`, `INTERNAL_ERROR` were exactly this
+  in 0.5.6 — see "Dropped" below).
+
+Together these make the 0.5.6 "one shape" promise self-enforcing
+rather than depending on review vigilance.
+
+### Dropped
+
+- `CROSS_VAULT_LINK`, `INTERNAL_ERROR` — declared in 0.5.6's
+  catalogue but never imported. YAGNI; re-add when the first call
+  site lands.
+
+### Internal cleanup (no behaviour change)
+
+- `app/services/table_service.py`: dropped the late `import re as _re`
+  alias — the file already has `import re` at the top, and `_re.compile`
+  was only used in two patterns that now just say `re.compile`.
+- `_enrich_undefined_error` docstring rewritten to spell out the
+  canonical envelope it now returns (was accurate but vague — easy to
+  mis-read by a future maintainer).
+
+### Tests
+
+Unit: 16/16 (5 envelope shape + 2 catalogue sync + 3 fuzzy_hint
++ 1 TOOLS↔_HANDLERS sync + 5 table identifier).
+
+E2E: re-ran the suites touched by 0.5.4–0.5.6 (mcp, security, edit,
+collection_lifecycle, pg_rbac, stdio_files, put_file_param) against
+0.5.7 locally — all green.
+
 ## 0.5.6 — 2026-06-03  *(breaking error-response shape)*
 
 Error responses across the backend now share one envelope. Until

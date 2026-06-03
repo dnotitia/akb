@@ -375,6 +375,13 @@ R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) as cnt FRO
 CNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('items',[{}])[0].get('cnt','MISSING'))" 2>/dev/null)
 [ -n "$CNT" ] && [ "$CNT" != "MISSING" ] && pass "akb_sql round-trip via sql_name" || fail "akb_sql round-trip" "got: $R"
 
+# 0.5.7: REST `GET /tables/{vault}` must mirror the MCP shape and
+# include `sql_name` too — issue #110 originally only fixed the MCP
+# path, leaving direct REST clients to guess the sanitisation rule.
+REST_SQL=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" -H "Authorization: Bearer $PAT" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((t.get('sql_name','MISSING') for t in d.get('items',[]) if t.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
+[ "$REST_SQL" = "mcp_items" ] && pass "REST /tables exposes sql_name" || fail "REST sql_name" "got: $REST_SQL"
+
 # ── 12. Publish via MCP ──────────────────────────────────────
 echo ""
 echo "▸ 12. Publish via MCP"
