@@ -587,14 +587,8 @@ export const createPublicationSnapshot = (vault: string, publication_id: string)
 export const searchUsers = (query?: string) =>
   api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);
 
-// Memory client surface (recallMemories / forgetMemory / forgetCategory /
-// Memory) was removed in v0.5.0 alongside the akb_remember/recall/forget
-// MCP tools and the /api/v1/memory REST endpoints. Agent dedicated
-// memory now lives in the auto-provisioned `agent-memory-{username}`
-// vault and is read/written via the standard documents+browse client
-// API just like any other vault. The settings-page "Memory" tab was
-// dropped; a dedicated UI for browsing the memory vault is a future
-// follow-up if needed.
+// Agent memory is just another vault (`agent-memory-{username}`)
+// since v0.5.0 — read/write via the standard documents+browse API.
 
 // ── Admin ──
 export interface AdminUser {

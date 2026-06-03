@@ -81,16 +81,12 @@ RESOURCE_TYPES = ("doc", "table", "file", "coll")
 class ParsedUri(NamedTuple):
     """Structured view of an AKB URI.
 
-    Field order ``(vault, kind, identifier, coll_path)`` is chosen so
-    legacy callers that unpack the result as a 3-tuple
-    ``vault, kind, identifier = parse_uri(...)`` keep working — the
-    new ``coll_path`` is appended at the end as an optional 4th
-    element. Indexing also stays compatible:
+    Fields in surface-first order:
 
-      - ``parsed[0]`` is ``vault``
-      - ``parsed[1]`` is ``kind`` (`doc` / `table` / `file` /
-        `coll` / `vault`)
-      - ``parsed[2]`` is ``identifier``
+      - ``vault``      — vault name
+      - ``kind``       — ``doc`` / ``table`` / ``file`` / ``coll`` / ``vault``
+      - ``identifier`` — kind-specific id (see below)
+      - ``coll_path``  — collection path prefix, ``""`` for vault root
 
     For docs ``identifier`` is the **full vault-relative path** (coll
     prefix + basename) so call sites that join it back to
@@ -141,9 +137,9 @@ def parse_uri(uri: str) -> ParsedUri | None:
         ident = _strip_trailing_slash(ident)
         if ident is None:
             return None
-        # Doc identifier is the full path so legacy
-        # ``vault, kind, path = parse_uri(uri)`` unpacking still
-        # produces a usable ``documents.path`` value.
+        # Doc identifier carries the full vault-relative path so call
+        # sites can splice it straight into ``documents.path`` queries
+        # without re-joining the collection prefix.
         if rtype == "doc":
             ident = f"{coll_path}/{ident}"
         return ParsedUri(vault=vault, kind=rtype, identifier=ident, coll_path=coll_path)

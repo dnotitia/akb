@@ -55,7 +55,6 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "filter": {"type": "string", "description": "Substring filter against name+description (case-insensitive)."},
-                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
                 "limit": {"type": "integer", "description": "Cap result count."},
                 "offset": {"type": "integer", "description": "Skip first N (default 0)."},
                 "include_archived": {"type": "boolean", "description": "Include archived vaults (default false)."},
@@ -297,7 +296,6 @@ TOOLS = [
                     "description": "Filter by content type",
                 },
                 "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
-                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
