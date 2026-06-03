@@ -63,12 +63,7 @@ UNDEFINED_COLUMN = "undefined_column"
 UNDEFINED_TABLE = "undefined_table"
 
 # Knowledge-graph linking
-CROSS_VAULT_LINK = "cross_vault_link"
 SELF_LINK = "self_link"
-
-# Catch-all when an exception bubbles up without a more specific
-# classification. Prefer a specific code over this.
-INTERNAL_ERROR = "internal_error"
 
 
 # ── Builder ───────────────────────────────────────────────────
