@@ -358,6 +358,23 @@ R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | m
 TBL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
 [ "$TBL_COUNT" -ge 1 ] 2>/dev/null && pass "akb_browse(tables): $TBL_COUNT" || fail "akb_browse tables" "expected >=1"
 
+# ── 11b. Browse advertises sql_name + rewriter accepts it ─────
+# Issues #110 / #111: browse must expose the SQL identifier the
+# client should pass to akb_sql, and the rewriter must accept it.
+# `_TABLE_NAME_RE` currently rejects hyphen / non-ASCII at create
+# time, so the interesting legacy cases can't be reproduced from
+# scratch via the MCP surface — those are covered by
+# test_table_identifier_unit. Here we confirm the ASCII contract:
+# `sql_name` is present, equals the queryable identifier, and
+# round-trips through the rewriter.
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
+ASCII_SQL=$(echo "$R" | python3 -c "import sys,json; print(next((i.get('sql_name') for i in json.load(sys.stdin)['items'] if i.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
+[ "$ASCII_SQL" = "mcp_items" ] && pass "browse exposes sql_name (ascii: $ASCII_SQL)" || fail "browse sql_name" "got: $ASCII_SQL"
+
+R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) as cnt FROM $ASCII_SQL\"}" | mcp_result)
+CNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('items',[{}])[0].get('cnt','MISSING'))" 2>/dev/null)
+[ -n "$CNT" ] && [ "$CNT" != "MISSING" ] && pass "akb_sql round-trip via sql_name" || fail "akb_sql round-trip" "got: $R"
+
 # ── 12. Publish via MCP ──────────────────────────────────────
 echo ""
 echo "▸ 12. Publish via MCP"

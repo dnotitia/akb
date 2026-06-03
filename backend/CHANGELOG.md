@@ -5,6 +5,59 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.5.5 — 2026-06-03
+
+Vault tables with hyphenated or non-ASCII display names are now
+reachable via `akb_sql`, and `akb_browse` advertises the SQL identifier
+each table actually responds to. Fixes paired issues #110 + #111
+surfaced by the seahorse-mcp-agent-server table-viewer modal.
+
+### What went wrong
+
+Three call sites — `pg_table_name` (DDL), `build_table_name_map`
+(rewriter map), and the browse table-item builder — each ran their
+own slightly-different sanitisation of the display name. The
+mismatches:
+
+- `pg_table_name` collapsed every non-`[a-z0-9]` character to `_`, so a
+  Korean name like `공공사업기획` became the PG table
+  `vt_<vault>__________`.
+- `build_table_name_map` only stripped hyphens, keeping the original
+  Korean characters as map keys. The rewriter's tokenizer accepts only
+  `[A-Za-z_][A-Za-z0-9_]*`, so those Korean keys never matched and the
+  table was unreachable.
+- `akb_browse` surfaced the display name as `name` with no field that
+  exposed the SQL-side identifier, leaving clients to guess
+  AKB's sanitisation rule. The seahorse-mcp PR #193 was shipping a
+  hyphen-to-underscore client-side guess as a workaround.
+
+### Fix
+
+Single sanitisation function `_sanitize_pg_part` in
+`table_data_repo`; both `pg_table_name` and the new
+`pg_short_name` (the right half of `vt_<v>__<t>`) call it. The
+rewriter map now keys off the fully-sanitised short form, and
+`akb_browse` table items expose it as `sql_name`. Backward-compat
+keys for the previous display-name lookup are preserved.
+
+After the fix:
+
+- `akb_browse(vault="demo")` returns `{name: "pipeline-snapshots",
+  sql_name: "pipeline_snapshots", ...}` and `{name: "공공사업기획",
+  sql_name: "______", ...}`.
+- Both `SELECT * FROM pipeline_snapshots` and `SELECT * FROM ______`
+  resolve through the rewriter to the real PG table.
+
+### Tests
+
+- Unit (`test_table_identifier_unit.py`, 5 cases): pg_short_name ↔
+  pg_table_name agree on every input shape; sanitiser idempotent;
+  Korean → all-underscore; rewriter resolves all-underscore; quoted
+  identifiers untouched.
+- E2E (`test_mcp_e2e.sh` §11b, 4 cases): create hyphen + Korean
+  tables, browse exposes correct `sql_name`, round-trip the value
+  through `akb_sql` and confirm both queries return rows.
+
 ## 0.5.4 — 2026-06-03
 
 MCP `_dispatch` now rejects unknown tool arguments with a fuzzy hint

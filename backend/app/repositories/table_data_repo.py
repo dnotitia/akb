@@ -32,12 +32,34 @@ TYPE_MAP = {
 # ── Identifier helpers ───────────────────────────────────────────
 
 
+def _sanitize_pg_part(s: str) -> str:
+    """Single source of truth for the vault-name / table-name → PG-part
+    transformation. Lowercase, hyphens to underscores, then any
+    remaining non-alphanumeric replaced with underscore. Idempotent.
+
+    Non-ASCII inputs (Korean / Japanese / Chinese / symbol-only names)
+    collapse to all-underscore tokens (`______`). PG accepts those, but
+    the caller still needs to know what they sanitized to — see
+    ``pg_short_name`` below.
+    """
+    return re.sub(r"[^a-z0-9]", "_", s.lower().replace("-", "_"))
+
+
 def pg_table_name(vault_name: str, table_name: str) -> str:
     """Return the PG table name for a vault-scoped table:
     `vt_{sanitised_vault}__{sanitised_table}`."""
-    v = re.sub(r"[^a-z0-9]", "_", vault_name.lower())
-    t = re.sub(r"[^a-z0-9]", "_", table_name.lower().replace("-", "_"))
-    return f"vt_{v}__{t}"
+    return f"vt_{_sanitize_pg_part(vault_name)}__{_sanitize_pg_part(table_name)}"
+
+
+def pg_short_name(table_name: str) -> str:
+    """SQL-safe bare identifier the caller should pass to ``akb_sql``.
+
+    This is the right-hand side of ``pg_table_name``'s ``vt_<v>__<t>``;
+    it is what the rewriter actually keys off. ``akb_browse`` surfaces
+    it as ``sql_name`` so clients don't have to re-derive the
+    sanitisation rule (issue #110).
+    """
+    return _sanitize_pg_part(table_name)
 
 
 def safe_ident(name: str) -> str:
@@ -116,12 +138,23 @@ async def build_table_name_map(conn, vault_names: list[str]) -> dict[str, str]:
             "SELECT name FROM vault_tables WHERE vault_id = $1",
             vault_row["id"],
         )
+        sanitized_vault = _sanitize_pg_part(vname)
         for t in tables:
             pg_name = pg_table_name(vname, t["name"])
-            sanitized_vault = re.sub(r"[^a-z0-9]", "_", vname.lower())
-            sanitized_table = t["name"].replace("-", "_")
-            table_map[f"{sanitized_vault}__{sanitized_table}"] = pg_name
+            # The fully-sanitised short form (e.g. ``______`` for a
+            # Korean-named table) is what ``akb_browse`` now advertises
+            # as ``sql_name``. Keying off it makes that contract
+            # actually queryable; without it the rewriter dropped
+            # non-ASCII tables on the floor (issue #111).
+            short = pg_short_name(t["name"])
+            table_map[f"{sanitized_vault}__{short}"] = pg_name
             if len(vault_names) == 1:
+                table_map[short] = pg_name
+                # Backward-compat keys: pre-fix callers that referenced
+                # the display name directly (ASCII tables where display
+                # == short) keep working. Harmless on non-ASCII —
+                # display-name keys are never matched anyway because
+                # the SQL tokenizer accepts only ``[A-Za-z_][A-Za-z0-9_]*``.
                 table_map[t["name"]] = pg_name
                 table_map[t["name"].replace("-", "_")] = pg_name
     return table_map
