@@ -971,7 +971,7 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
     if args.get("uri"):
         from app.services.uri_service import parse_uri
         parsed = parse_uri(args["uri"])
-        if parsed is None or parsed.kind not in ("doc", "file"):
+        if parsed is None or parsed.kind not in ("doc", "file") or not parsed.identifier:
             return err(
                 f"`uri` must be a doc or file URI (got {parsed.kind if parsed else 'invalid'}: "
                 f"{args['uri']!r}). table_query publications must be removed by slug.",

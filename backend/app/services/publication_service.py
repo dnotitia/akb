@@ -1161,7 +1161,7 @@ async def create_snapshot(
                 raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
 
             updated_row = await lock_conn.fetchrow(
-                f"""
+                """
                 WITH bumped AS (
                     UPDATE publications
                        SET snapshot_s3_key = $1, snapshot_at = NOW(),
