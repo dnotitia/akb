@@ -74,10 +74,19 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 6
       volumes:
+        # /dev/shm: 4Gi headroom for pgvector HNSW index builds (and
+        # any PG parallel-hash op). The pre-0.6.4 default 512Mi was
+        # enough for everything until a partial-HNSW rebuild on a
+        # multi-hundred-K-chunks table needed ~533Mi shared memory
+        # and aborted the CREATE INDEX, leaving the dense leg of
+        # search unindexed. Bumping the default here pre-empts that.
+        # Larger corpora (multi-M chunks) may want this raised
+        # further in lockstep with _build_partial_hnsw's
+        # maintenance_work_mem.
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 512Mi
+            sizeLimit: 4Gi
   volumeClaimTemplates:
     - metadata:
         name: pgdata

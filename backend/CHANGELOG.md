@@ -5,6 +5,108 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.4 — 2026-06-05  *(patch — `ensure_collection` race-safety, post-mortem of a real prod incident)*
+
+### What happened
+
+The 0.6.2 BM25-fallback feature changed `vector_index.chunks.dense`
+from `NOT NULL` to nullable and the HNSW index from full to partial
+(`WHERE dense IS NOT NULL`). On the prod rollout the migration step
+in `PgvectorStore.ensure_collection` ran on a 350k-chunks table and
+needed ~533 MB of shared memory for the HNSW graph build — more
+than the 512 Mi `/dev/shm` the postgres pod had been given. The
+`CREATE INDEX` aborted mid-build, leaving the schema with **no
+dense index at all**. Every search after that hit a seq scan and
+timed out (504 nginx); the timeout cancelled the in-flight
+`ensure_collection`, the next request found
+`_ensured_collection=False` and started another build, and so on
+ad infinitum.
+
+Even at a single uvicorn worker the cancel-driven retry looked
+exactly like multi-process contention: four concurrent CREATE
+INDEX statements visible in `pg_stat_activity`, none ever
+committing.
+
+Manual recovery: scale backend to 0, terminate the in-flight
+builds, build the index once from a psql session with
+`maintenance_work_mem='2GB'`, scale backend back to 1. None of
+this was the user's job.
+
+### The fixes
+
+1. **`PgvectorStore.ensure_collection` is now race-safe across
+   processes.** Three layers:
+   - instance flag (hot-path bool read, unchanged)
+   - `asyncio.Lock` (same-process callers serialize, unchanged)
+   - **new:** `pg_advisory_xact_lock(hash(schema))` (cross-process
+     callers serialize on a transaction-scoped PG lock that
+     auto-releases on commit/rollback/conn-close — a cancelled
+     CREATE INDEX cannot strand it).
+2. **Index swap is now atomic.** Pre-0.6.4 did `DROP legacy
+   idx_vi_chunks_dense` then `CREATE partial idx_vi_chunks_dense`;
+   a failure between the two left the schema dense-index-less.
+   Now: `CREATE partial idx_vi_chunks_dense_new` → `DROP legacy
+   idx_vi_chunks_dense` → `RENAME idx_vi_chunks_dense_new →
+   idx_vi_chunks_dense`, all inside the advisory-lock tx. If the
+   `CREATE` fails the legacy index stays in place and search
+   keeps working with the full-form behavior.
+3. **`maintenance_work_mem` is now set per build.** The new
+   `_build_partial_hnsw` does `SET LOCAL maintenance_work_mem =
+   '2GB'` before issuing the `CREATE INDEX`. At our scale
+   (a few hundred K rows × 1024-dim vectors) HNSW peaks well
+   above the PG default 64 MB.
+4. **`deploy/k8s/postgres.yaml` `/dev/shm` default is now 4Gi**
+   (was 512Mi). Doc-comment records the trade-off for operators
+   on much larger corpora.
+5. **`backend/tests/concurrency/test_ensure_collection_race_unit.py`**
+   — three pytest regressions against a live Postgres
+   (`AKB_TEST_DSN`): N concurrent callers serialize, legacy →
+   partial swap is atomic, idempotent on already-partial schemas.
+   Skips when no PG is reachable; docker-compose locally passes
+   3/3.
+
+### Process gaps that let this ship
+
+The 0.6.2 PR's verification was `test_publications_e2e.sh` 97/97 +
+`test_mcp_e2e.sh` 76/76. Both pass through small ephemeral vaults
+with under a hundred chunks — the HNSW rebuild was sub-second on
+that data, so neither the OOM nor the cancel race ever surfaced.
+`test_hybrid_search_e2e.sh` exists but is not part of the default
+PR gate; we didn't run it. And the prod smoke after each deploy
+exercised publications only, not search.
+
+This release's verification section explicitly lists
+`test_hybrid_search_e2e.sh` and prod search-smoke alongside the
+publications regressions; vector_store / embed_worker /
+sparse_encoder changes should run all three. The new pytest
+regressions catch the specific ensure_collection bug shape but
+they are necessarily a narrow guard — a future indexing-side
+change will only be caught by exercising search end-to-end.
+
+### Honest scope note
+
+This release does not introduce any new feature and does not
+change any external contract. It changes the schema migration
+inside `ensure_collection` to be forward-progress-safe under
+adversarial conditions (cancel storms, undersized `/dev/shm`),
+ships the corresponding `/dev/shm` deploy default, and adds a
+regression that would have caught the original failure. The
+0.6.2/0.6.3 BM25 fallback behavior is unchanged.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `pytest tests/concurrency/test_ensure_collection_race_unit.py` —
+  3/3 (AKB_TEST_DSN set to docker-compose PG).
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+- `bash backend/tests/test_hybrid_search_e2e.sh` against
+  docker-compose local — **operator should run this for any
+  pgvector / embed_worker / sparse_encoder change**; counts as
+  release gate from 0.6.4 on.
+
+---
+
 ## 0.6.3 — 2026-06-05  *(patch — 0.6.2 review findings)*
 
 Independent review of the 0.6.2 BM25 fallback surface turned up one
