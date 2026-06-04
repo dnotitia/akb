@@ -46,7 +46,6 @@ class ResourceType:
 class Mode:
     LIVE = "live"
     SNAPSHOT = "snapshot"
-    ALL = ("live", "snapshot")
 
 
 def _share_url(slug: str) -> str:
@@ -477,41 +476,28 @@ async def create_publication_for_vault(
 
 async def delete_publication(
     *,
-    publication_id: uuid.UUID | None = None,
-    slug: str | None = None,
+    slug: str,
     expected_vault_id: uuid.UUID | None = None,
 ) -> bool:
-    """Delete a publication by id or slug. Returns True if deleted.
+    """Delete a publication by slug. Returns True if a row was removed.
 
     `expected_vault_id` binds the delete to a vault: the row is removed
     only if it belongs to that vault. Callers that authorized the request
     against a specific vault MUST pass it, otherwise a writer on vault A
-    could delete any publication by id regardless of owning vault (IDOR).
+    could delete any publication by guessing its slug (IDOR).
     """
-    if not publication_id and not slug:
-        raise ValueError("Either publication_id or slug must be provided")
-
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if publication_id:
-            if expected_vault_id is not None:
-                result = await conn.execute(
-                    "DELETE FROM publications WHERE id = $1 AND vault_id = $2",
-                    publication_id, expected_vault_id,
-                )
-            else:
-                result = await conn.execute("DELETE FROM publications WHERE id = $1", publication_id)
+        if expected_vault_id is not None:
+            result = await conn.execute(
+                "DELETE FROM publications WHERE slug = $1 AND vault_id = $2",
+                slug, expected_vault_id,
+            )
         else:
-            if expected_vault_id is not None:
-                result = await conn.execute(
-                    "DELETE FROM publications WHERE slug = $1 AND vault_id = $2",
-                    slug, expected_vault_id,
-                )
-            else:
-                result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
+            result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
     deleted = result.endswith(" 1")
     if deleted:
-        logger.info("Publication deleted: %s", publication_id or slug)
+        logger.info("Publication deleted: %s", slug)
     return deleted
 
 

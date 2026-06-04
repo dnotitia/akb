@@ -952,13 +952,20 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT v.name AS vault_name FROM publications p "
+                "SELECT p.vault_id, v.name AS vault_name FROM publications p "
                 " JOIN vaults v ON v.id = p.vault_id WHERE p.slug = $1",
                 slug,
             )
-        if row:
-            await check_vault_access(uid, row["vault_name"], required_role="writer")
-        ok = await publication_service.delete_publication(slug=slug)
+        if row is None:
+            return {"deleted": 0}
+        await check_vault_access(uid, row["vault_name"], required_role="writer")
+        # Bind the delete to the publication's own vault. Belt-and-suspenders
+        # against any future code path that could move publications between
+        # vaults — the slug → vault lookup above happens outside the delete
+        # transaction.
+        ok = await publication_service.delete_publication(
+            slug=slug, expected_vault_id=row["vault_id"],
+        )
         return {"deleted": 1 if ok else 0}
 
     if args.get("uri"):
