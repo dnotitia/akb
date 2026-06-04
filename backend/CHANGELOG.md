@@ -5,6 +5,85 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.2 — 2026-06-05  *(patch — BM25 fallback when the embed API is unavailable)*
+
+### Bug fix
+
+Before 0.6.2, `embed_worker` treated dense+sparse as an atomic pair:
+if the embedding API was unreachable (or `embed_base_url` empty),
+the whole batch was `_mark_failure`'d and nothing landed in
+`vector_index`. Result: self-hosted instances that didn't configure
+an embedding endpoint, and any temporary upstream outage, dropped to
+**0 search hits across the affected vault** — not "embedding leg
+degraded, BM25 still works", which is what the search-pipeline
+docstrings and the `embed_base_url` doc-comment implied.
+
+The fix removes the all-or-nothing coupling end-to-end so dense is
+genuinely optional:
+
+- **`vector_store.upsert_one`**: signature now
+  `dense: list[float] | None` across all three drivers. `None` means
+  "store this point with sparse only". pgvector writes a NULL column;
+  qdrant omits the dense entry from its named-vectors dict; seahorse
+  omits the column from the upsert row.
+- **`vector_index.chunks.dense`** column is now nullable, and the
+  HNSW index is *partial* (`WHERE dense IS NOT NULL`) so sparse-only
+  rows don't get indexed for dense KNN and don't appear as
+  zero-vector neighbours in the dense leg. The dense leg's
+  `ORDER BY dense <=> $1` SQL gains the matching `WHERE dense IS NOT
+  NULL` filter. Existing deployments idempotently lose the `NOT NULL`
+  constraint and have the legacy full HNSW dropped+rebuilt as partial
+  at the next `ensure_collection` (startup).
+- **`embed_worker`** distinguishes three cases that used to all
+  bucket as failure:
+  1. `embed_base_url == ""` → intentional, no embed call attempted,
+     log at DEBUG, every row → sparse-only indexed, `succeeded`
+     counter increments normally.
+  2. embed configured + transient outage → log WARNING once per
+     batch, fall through to sparse-only for this batch (do not
+     retry-storm). The `_mark_failure` / `vector_retry_count` flow is
+     reserved for problems the worker can actually fix on its own
+     next pass (sparse encoder failure, vector_store unavailable).
+  3. sparse encoder or vector_store failure → real `_mark_failure`,
+     normal retry semantics unchanged.
+
+The search side already had the symmetric `query_dense=None` path
+in `search_service` and the driver `hybrid_search` implementations,
+so the sparse-only fallback became end-to-end correct as soon as
+the indexing side stopped withholding rows.
+
+### Manual verification
+
+Reproduces the embed-disabled scenario directly: set `embed_base_url:
+""` in `config/app.yaml`, rebuild + restart the backend, create a doc,
+wait for `/health` `pending=0`, then search. The doc lands in
+`vector_index.chunks` with `dense IS NULL` + posting rows populated,
+and the BM25 leg returns it. Confirmed in the docker-compose dev
+stack:
+
+```
+score=0.0164 title="Symantec DLP issue"
+total=1
+```
+
+Regression: `bash backend/tests/test_publications_e2e.sh` 97/97,
+`bash backend/tests/test_mcp_e2e.sh` 76/76.
+
+### Out of scope (follow-ups)
+
+- **Automatic dense backfill** when an embed endpoint is configured
+  *after* sparse-only rows already exist. The current worker keeps
+  picking up `vector_indexed_at IS NULL` rows; sparse-only rows have
+  it set, so they're considered done. A separate explicit reindex
+  tool (or a `dense_pending` flag column) is the cleanest next step.
+- pgvector `posting`-shape: this release only validated the `arrays`
+  shape (the dev / prod default) end-to-end. The `posting`-shape code
+  paths went through the same diff and compile, but were not
+  e2e-exercised. Operators on the posting shape should re-run the
+  regression suite before pinning `:0.6.2`.
+
+---
+
 ## 0.6.1 — 2026-06-04  *(patch — three latent bugs around the 0.6.0 surface, plus envelope close-out)*
 
 Three honest bug fixes that surfaced during the post-0.6.0 review, plus

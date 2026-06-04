@@ -128,35 +128,47 @@ async def _process_once() -> int:
 
     # Stage 2: embedding API. Outside any PG transaction — the conn
     # pool stays free during the network round-trip.
+    #
+    # Three branches the rest of the worker must distinguish:
+    #   (a) `embed_base_url` unset      — embed intentionally disabled.
+    #       Skip the call entirely; every row in the batch goes through
+    #       the sparse-only fallback path. Not an error.
+    #   (b) embed configured + reachable — normal hybrid index.
+    #   (c) embed configured + transient outage — log warning, drop to
+    #       the sparse-only fallback for this batch. NOT a per-row
+    #       failure: BM25 search still works against the indexed row,
+    #       and retry storms against a down upstream are pointless.
     texts = [r["content"] or "" for r in batch]
-    try:
-        embeddings = await generate_embeddings(texts)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Embedding call crashed: %s", e)
-        embeddings = []
-
-    if not embeddings or len(embeddings) != len(batch):
-        # Batch-wide failure (API down, malformed response).
-        for row in batch:
-            await _mark_failure(
-                pool, row["id"], row["vector_retry_count"],
-                "embedding API returned no/partial result",
+    embed_enabled = bool(settings.embed_base_url)
+    embeddings: list[list[float]] = []
+    if not embed_enabled:
+        logger.debug(
+            "embedding disabled (embed_base_url unset); "
+            "indexing batch=%d as sparse-only",
+            len(batch),
+        )
+    else:
+        try:
+            embeddings = await generate_embeddings(texts)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "embedding API call failed (sparse-only fallback for this batch): %s", e,
             )
-        return 0
+            embeddings = []
+
+    # Pad to batch length so the per-row loop can always zip. Missing
+    # entries are an empty list, which becomes None at the driver
+    # boundary and is stored as a NULL dense column.
+    embeddings_padded: list[list[float]] = (
+        embeddings + [[]] * (len(batch) - len(embeddings))
+    )
 
     # Stage 3: per-chunk transaction. Each iteration is atomic over
     # vector_store.upsert + chunks.UPDATE — outer rollback can no
     # longer leave the vector store with an unmarked row.
     store = get_vector_store()
     succeeded = 0
-    for row, dense in zip(batch, embeddings):
-        if not dense:
-            await _mark_failure(
-                pool, row["id"], row["vector_retry_count"],
-                "empty embedding vector",
-            )
-            continue
-
+    for row, dense in zip(batch, embeddings_padded):
         content = row["content"] or ""
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_document(content)
@@ -195,7 +207,11 @@ async def _process_once() -> int:
                         content=content,
                         section_path=row["section_path"],
                         chunk_index=int(row["chunk_index"] or 0),
-                        dense=dense,
+                        # Empty list → None at the driver boundary. The
+                        # driver writes NULL / omits the dense vector;
+                        # the partial dense index + sparse leg do the
+                        # right thing without further branching.
+                        dense=dense if dense else None,
                         sparse_indices=sparse_idx,
                         sparse_values=sparse_vals,
                         source_type=row["source_type"] or "document",
