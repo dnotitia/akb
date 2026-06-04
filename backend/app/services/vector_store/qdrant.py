@@ -18,7 +18,7 @@ from typing import Any
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models as qm
 
-from .base import VectorHit, VectorStoreUnavailable
+from .base import VectorHit, VectorStoreUnavailable, has_dense
 
 logger = logging.getLogger("akb.vector_store.qdrant")
 
@@ -134,7 +134,7 @@ class QdrantStore:
         # API was unavailable; the dense leg of hybrid_search will then
         # have nothing to score against for this point.
         vectors: dict[str, Any] = {}
-        if dense:
+        if has_dense(dense):
             vectors[DENSE_VECTOR_NAME] = dense
         if sparse_indices:
             vectors[SPARSE_VECTOR_NAME] = qm.SparseVector(

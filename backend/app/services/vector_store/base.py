@@ -17,7 +17,7 @@ inputs without restructuring callers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeGuard, runtime_checkable
 
 
 @dataclass
@@ -39,6 +39,23 @@ class VectorStoreUnavailable(Exception):
     """Driver-side transient failure. Worker paths catch and back off;
     read paths let it propagate so `search` returns empty instead of
     serving stale or partial results."""
+
+
+def has_dense(dense: list[float] | None) -> TypeGuard[list[float]]:
+    """Single source of truth for "this point has a dense vector".
+
+    Callers (workers, drivers) pass ``None`` for "the embed API was
+    unavailable for this row" and ``list[float]`` for "here's the
+    embedding". The TypeGuard return lets mypy narrow ``dense`` to
+    ``list[float]`` inside an ``if has_dense(dense):`` body so call
+    sites don't need a redundant ``assert``.
+
+    Drivers should branch on this helper instead of inlining
+    ``if dense and len(dense) > 0:`` or ``if dense is not None:``.
+    Three copies that disagreed about whether ``[]`` is "dense" is
+    exactly the contract drift this helper exists to prevent.
+    """
+    return dense is not None and len(dense) > 0
 
 
 @runtime_checkable
@@ -79,18 +96,24 @@ class VectorStore(Protocol):
         source_type: str,
         source_id: str,
     ) -> None:
-        """Upsert one chunk. Driver stores dense + sparse + payload
-        atomically. `dense` and `sparse_*` are pre-computed by callers.
+        """Upsert one chunk into the driver. `dense` and `sparse_*` are
+        pre-computed by the caller (`embed_worker` for indexing).
 
-        ``dense=None`` is a valid input — the embed worker uses it as the
-        BM25-only fallback path when the embedding API is unavailable.
-        Drivers must accept the point with only sparse vectors (NULL dense
-        column / sparse-only Qdrant point / seahorse sparse-only row);
-        ``hybrid_search`` already has the symmetric ``query_dense=None``
-        path so dense-less points only contribute to the sparse leg.
+        ``dense=None`` is the BM25-only fallback the worker uses when the
+        embedding API is unavailable. Drivers must store the point with
+        only sparse vectors — pgvector writes NULL into the `dense`
+        column (excluded from the partial HNSW index by its WHERE
+        clause), Qdrant omits the dense entry from its named-vectors
+        dict, Seahorse omits the dense column. `hybrid_search` has the
+        symmetric `query_dense=None` path so dense-less points only
+        contribute to the sparse leg.
 
-        Pass `conn` to share an outer PG transaction (atomic with the
-        caller's own writes)."""
+        Atomicity guarantees are driver-specific. pgvector joins the
+        caller's PG transaction when `conn` is provided (the upsert
+        commits with the caller's own writes). Qdrant and Seahorse ignore
+        `conn` — their writes are external and non-transactional from
+        PG's perspective, so recovery for half-completed batches relies
+        on `chunk_id` idempotence (the worker can safely re-upsert)."""
 
     async def delete_point(self, chunk_id: str, *, conn=None) -> None:
         """Remove a single chunk by id. Idempotent."""

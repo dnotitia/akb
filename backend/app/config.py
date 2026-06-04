@@ -45,7 +45,11 @@ class Settings(BaseModel):
     # re-claim. Has to exceed the longest realistic initial bootstrap.
     external_git_claim_lookahead_secs: int = 3600
 
-    # Embedding — required for indexing/search
+    # Embedding — optional since 0.6.2. Unset (empty string) disables the
+    # dense leg: `embed_worker` skips the upstream call, every chunk lands
+    # in vector_index with `dense IS NULL`, and `hybrid_search` serves
+    # results from the BM25 leg alone. Set to an OpenAI-compatible
+    # `/v1/embeddings` endpoint to enable hybrid retrieval.
     embed_base_url: str = "http://localhost:8080/v1"
     embed_model: str = "text-embedding-3-small"
     embed_api_key: str = ""

@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from .base import VectorHit, VectorStoreUnavailable
+from .base import VectorHit, VectorStoreUnavailable, has_dense
 
 logger = logging.getLogger("akb.vector_store.seahorse")
 
@@ -302,7 +302,7 @@ class SeahorseStore:
         # Sparse-only row when the embed API was unavailable. Seahorse
         # treats a missing vector column as NULL; the dense ANN leg
         # then has nothing to score against for this row.
-        if dense:
+        if has_dense(dense):
             row[COL_DENSE] = list(dense)
         # Insert is JSONL with text/plain — `application/json` is rejected.
         body = json.dumps(row, ensure_ascii=False)
