@@ -5,6 +5,86 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.3 — 2026-06-05  *(patch — 0.6.2 review findings)*
+
+Independent review of the 0.6.2 BM25 fallback surface turned up one
+real correctness gap and a handful of hygiene items. Two larger
+suggestions (per-row reject signalling, `CONCURRENTLY` HNSW rebuild)
+were considered but kept out as over-engineering at the current scale.
+See the *Considered and rejected* section below.
+
+### Bug fix
+
+**`embed_worker` could now create useless points** when the embed API
+was disabled / failed AND the row's sparse vector was also empty
+(whitespace-only or OOV-only content). Before this PR the per-row loop
+would call `vector_store.upsert_one(dense=None, sparse_indices=[])`,
+producing a pgvector row with `dense IS NULL AND sparse_terms = '{}'`
+(invisible to both legs) or a Qdrant `vectors={}` upsert (rejected by
+the driver with a less specific error than the actual cause). Now the
+worker fails such rows up-front with `"no indexable signal (no dense
+embedding + empty sparse)"`; they go through normal retry semantics
+and stop accumulating in the index. The pre-0.6.2 atomic-pair check
+covered this implicitly — 0.6.2's relaxation re-opened the gap.
+
+### Hygiene
+
+- **`vector_store.base.has_dense(dense)`** — single source of truth
+  TypeGuard for "this point has a usable dense vector". All three
+  drivers (`pgvector`, `qdrant`, `seahorse`) and `embed_worker` now
+  branch on this helper instead of inlining three different falsy
+  checks. mypy narrows `dense` to `list[float]` inside the guarded
+  block, so call sites no longer need redundant asserts.
+- **`embeddings_padded` is now `list[list[float] | None]`**, padded
+  with explicit `None` instead of `[]` and a falsy-game comment. The
+  three-branch comment block at the top of stage 2 was shortened — the
+  "per-row reject" sub-case the 0.6.2 PR drafted around turned out
+  not to be distinguishable from a batch outage without a richer
+  upstream contract; if that ever becomes a signal we want, surface it
+  from `generate_embeddings` directly.
+- **Mismatched batch length is now an explicit error log + outage
+  promotion** rather than a silent zip-shorter footgun
+  (`if embeddings and len(embeddings) != len(batch): logger.error(…)`).
+- **`pgvector.ensure_collection` legacy-HNSW check** now inspects
+  `pg_index.indpred IS NOT NULL` instead of `"WHERE" in indexdef`. The
+  textual probe was correct on PG 16 but brittle across PG version
+  upgrades that could re-format `indexdef`; `indpred` is the
+  catalog's stable boolean for "this index has a WHERE clause".
+- **`config.py` `embed_base_url` comment** said "required" — stale
+  since 0.6.2. Now reads "Optional; unset disables the dense leg →
+  BM25-only retrieval".
+- **`vector_store.base.upsert_one` docstring** was claiming atomicity
+  across all drivers ("stores dense + sparse + payload atomically").
+  pgvector joins the caller's PG transaction; Qdrant and Seahorse
+  ignore `conn` and rely on `chunk_id` idempotence for recovery. Now
+  spelled out explicitly.
+
+### Considered and rejected
+
+- **Per-row reject signalling.** The review flagged that a single-row
+  `[]` from the embed API would look identical to a batch outage at
+  the worker. Investigated and kept out: `generate_embeddings`
+  currently has no upstream contract for partial responses (a missing
+  row is treated as a batch-level failure inside `index_service`), so
+  distinguishing the case at the worker would just be a guard for a
+  scenario we can't actually produce. If the upstream ever surfaces
+  per-row rejects, the worker should grow a `dense=[]` branch then;
+  pre-emptive guards for impossible states age into liabilities.
+- **HNSW `CREATE CONCURRENTLY`.** At the current single-digit-K chunks
+  scale the rebuild is sub-second; CONCURRENTLY's own failure mode
+  (an `INVALID` leftover index that `IF NOT EXISTS` then refuses to
+  recreate) is genuinely worse than the brief lock. The doc-comment
+  records this trade-off so a future maintainer at a much larger
+  chunks count can re-evaluate.
+
+### Verification
+
+- `bash scripts/check.sh` — ruff + mypy + tsc + vitest + secrets pass.
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+
+---
+
 ## 0.6.2 — 2026-06-05  *(patch — BM25 fallback when the embed API is unavailable)*
 
 ### Bug fix

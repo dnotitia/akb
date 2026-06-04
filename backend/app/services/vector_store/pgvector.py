@@ -36,7 +36,7 @@ from typing import Literal
 
 import asyncpg
 
-from .base import VectorHit, VectorStoreUnavailable
+from .base import VectorHit, VectorStoreUnavailable, has_dense
 
 logger = logging.getLogger("akb.vector_store.pgvector")
 
@@ -268,17 +268,24 @@ class PgvectorStore:
             """
         )
         # Pre-0.6.2 installs have a full HNSW index over `dense` that
-        # cannot index NULL rows — drop it so the partial form below
-        # actually takes effect. `CREATE INDEX IF NOT EXISTS` would
-        # otherwise no-op when the legacy index is still present.
-        legacy_def = await conn.fetchval(
+        # cannot accept NULL rows — drop it so the partial form below
+        # actually takes effect. Inspect `pg_index.indpred` rather than
+        # the textual `pg_indexes.indexdef`: indpred is non-NULL iff
+        # the index has a WHERE clause, format-agnostic across PG
+        # versions.
+        legacy_full_idx = await conn.fetchval(
             """
-            SELECT indexdef FROM pg_indexes
-            WHERE schemaname = $1 AND indexname = 'idx_vi_chunks_dense'
+            SELECT 1
+              FROM pg_index i
+              JOIN pg_class c     ON c.oid = i.indexrelid
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1
+               AND c.relname = 'idx_vi_chunks_dense'
+               AND i.indpred IS NULL
             """,
             self._schema,
         )
-        if legacy_def and "WHERE" not in legacy_def:
+        if legacy_full_idx:
             await conn.execute(
                 f'DROP INDEX IF EXISTS "{self._schema}".idx_vi_chunks_dense'
             )
@@ -286,6 +293,10 @@ class PgvectorStore:
         # defaults and serve us well at <1M points. Partial — sparse-only
         # rows (dense IS NULL) are excluded from the index so the dense
         # leg only ever sees points that actually have an embedding.
+        # (Not CONCURRENTLY: at the current scale the rebuild is
+        # sub-second, and CONCURRENTLY's failure mode — an INVALID
+        # leftover index that `IF NOT EXISTS` then refuses to recreate —
+        # is worse than the brief lock.)
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_dense
@@ -329,7 +340,9 @@ class PgvectorStore:
         # cast needed. `None` (sparse-only fallback when the embed API
         # was unavailable) becomes a NULL row and is excluded from the
         # partial HNSW index by the WHERE clause above.
-        dense_param: list[float] | None = list(dense) if dense else None
+        # `list(dense)` is a defensive copy: the caller may reuse the
+        # list across batches and asyncpg binds by reference.
+        dense_param: list[float] | None = list(dense) if has_dense(dense) else None
         try:
             async with self._conn(conn) as c:
                 if self._sparse_shape == "arrays":
