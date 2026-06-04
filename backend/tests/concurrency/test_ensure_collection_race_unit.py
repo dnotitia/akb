@@ -41,7 +41,7 @@ import pytest_asyncio
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",
+    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
 
 
