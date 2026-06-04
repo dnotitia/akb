@@ -44,6 +44,7 @@ from app.util.errors import (
     err,
     CONFLICT,
     EDIT_FAILED,
+    INTERNAL,
     INVALID_ARGUMENT,
     INVALID_PATH,
     INVALID_URI,
@@ -982,12 +983,19 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
         # narrowed to doc/file, so this assert is purely to tell the
         # typechecker what the URI grammar already guarantees.
         assert parsed.identifier is not None
-        await check_vault_access(uid, parsed.vault, required_role="writer")
+        access = await check_vault_access(uid, parsed.vault, required_role="writer")
+        # Pass vault_id through to the service so the DELETE is explicitly
+        # vault-bound, mirroring the slug branch above. The URI already
+        # encodes the vault, but pinning the DELETE makes the cross-vault
+        # invariant local rather than depending on URI canonicalization.
         if parsed.kind == "doc":
-            count = await publication_service.delete_publications_for_document(args["uri"])
+            count = await publication_service.delete_publications_for_document(
+                args["uri"], expected_vault_id=access["vault_id"],
+            )
         else:  # file
             count = await publication_service.delete_publications_for_file(
                 parsed.identifier, parsed.vault,
+                expected_vault_id=access["vault_id"],
             )
         return {"deleted": count}
 
@@ -1032,7 +1040,15 @@ async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> 
             row["id"], expected_vault_id=row["vault_id"],
         )
     except publication_service.PublicationError as e:
-        return err(e.message, code=INVALID_ARGUMENT)
+        # Map by status_code rather than flattening everything to
+        # INVALID_ARGUMENT — `create_snapshot` raises 502 on S3 upload
+        # failure (not the caller's fault) and 404 if the row vanished
+        # between the lookup above and the locked re-read inside.
+        if e.status_code == 404:
+            return err(e.message, code=NOT_FOUND)
+        if 400 <= e.status_code < 500:
+            return err(e.message, code=INVALID_ARGUMENT)
+        return err(e.message, code=INTERNAL)
 
 
 @_h("akb_vault_info")
@@ -1199,7 +1215,16 @@ async def call_tool(name: str, arguments: dict):
         result = await _dispatch(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+        # Last-resort envelope so the canonical {error, code, ...} shape
+        # introduced in 0.5.6 holds for every response path — including
+        # unhandled exceptions that bubble up past handler-level
+        # try/except blocks. Specific handlers should still catch their
+        # known failure modes and return err(...) with a more precise
+        # code; this only catches what nothing else does.
+        return [TextContent(
+            type="text",
+            text=json.dumps(err(str(e), code=INTERNAL), ensure_ascii=False, default=str),
+        )]
 
 
 async def _dispatch(name: str, args: dict):

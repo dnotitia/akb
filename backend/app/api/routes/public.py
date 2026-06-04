@@ -356,10 +356,10 @@ async def publication_meta(slug: str, request: Request):
                     "mime_type": file_row["mime_type"],
                     "size_bytes": file_row["size_bytes"],
                 })
-    elif rt == ResourceType.DOCUMENT:
-        meta["title"] = publication.get("title")
     elif rt == ResourceType.TABLE_QUERY:
         meta["query_params"] = publication.get("query_params") or {}
+    # DOCUMENT path needs no per-type augmentation — meta["title"] was
+    # already set from the publication dict above.
 
     return meta
 
@@ -688,7 +688,7 @@ async def oembed(url: str, format: str = "json"):
                 if f_row:
                     title = f_row["name"]
         elif rt == ResourceType.TABLE_QUERY:
-            title = "Shared query"  # display title; ok to keep "shared" in user-facing copy
+            title = "Shared query"
     title = title or "AKB Publication"
 
     return {

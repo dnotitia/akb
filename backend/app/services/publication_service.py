@@ -145,7 +145,12 @@ def parse_expires_in(expires_in: str | None) -> datetime | None:
     return datetime.now(timezone.utc) + timedelta(seconds=n * _DURATION_UNITS[m.group(2)])
 
 
-_PUBLIC_FIELDS = (
+# Keys passed through from the row into the public response as-is. The
+# final public dict is this set plus the two derived keys added by
+# ``to_public_dict``: ``share_url`` (absolute URL built from the slug)
+# and ``password_protected`` (boolean derived from ``password_hash``).
+# Add new public-facing columns here, not in two places.
+_PUBLIC_PASSTHROUGH_FIELDS = (
     "slug",
     "resource_type",
     "resource_uri",
@@ -190,6 +195,9 @@ def _row_to_internal_dict(row) -> dict:
             d[k] = str(v)
         elif hasattr(v, "isoformat"):
             d[k] = v.isoformat()
+    # query_params may arrive as a JSON string (asyncpg default for jsonb)
+    # or as an already-parsed dict (some asyncpg codec configurations).
+    # Normalize both shapes plus the NULL row case to a real dict.
     qp = d.get("query_params")
     if isinstance(qp, str):
         try:
@@ -201,6 +209,11 @@ def _row_to_internal_dict(row) -> dict:
             )
     elif qp is None:
         d["query_params"] = {}
+    elif not isinstance(qp, dict):
+        raise PublicationError(
+            f"Unexpected query_params type {type(qp).__name__} for publication {d.get('slug', '?')}",
+            status_code=500,
+        )
     return d
 
 
@@ -216,7 +229,7 @@ def to_public_dict(internal: dict) -> dict:
     Callers must NEVER hand-build a publication response dict — go through
     this function so the shape stays single-source-of-truth.
     """
-    out: dict = {k: internal.get(k) for k in _PUBLIC_FIELDS}
+    out: dict = {k: internal.get(k) for k in _PUBLIC_PASSTHROUGH_FIELDS}
     out["share_url"] = _share_url(internal["slug"])
     out["password_protected"] = bool(internal.get("password_hash"))
     return out
@@ -501,12 +514,21 @@ async def delete_publication(
     return deleted
 
 
-async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
+async def delete_publications_for_document(
+    document_id: uuid.UUID | str,
+    *,
+    expected_vault_id: uuid.UUID | None = None,
+) -> int:
     """Delete all publications for a given document, identified by either
     its canonical URI (preferred — keeps the URI canonical story end-to-end)
     or, for backwards compatibility with internal callers that still hold
     the doc's UUID, the PG UUID. UUID inputs trigger a one-row join to
     materialize the URI then drive the DELETE.
+
+    ``expected_vault_id`` adds an explicit vault binding to the DELETE,
+    matching what ``delete_publication(slug=…, expected_vault_id=…)`` does.
+    The URI itself already encodes the vault, so this is belt-and-suspenders
+    against any future code path that could fan a URI out across vaults.
 
     Returns the number of publications deleted.
     """
@@ -534,17 +556,32 @@ async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
             if not row:
                 return 0
             uri = doc_uri(row["vault_name"], row["path"])
-        rows = await conn.fetch(
-            "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
-            uri,
-        )
+        if expected_vault_id is not None:
+            rows = await conn.fetch(
+                "DELETE FROM publications WHERE resource_uri = $1 AND vault_id = $2 RETURNING id",
+                uri, expected_vault_id,
+            )
+        else:
+            rows = await conn.fetch(
+                "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
+                uri,
+            )
     return len(rows)
 
 
-async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str) -> int:
+async def delete_publications_for_file(
+    file_id: uuid.UUID | str,
+    vault_name: str,
+    *,
+    expected_vault_id: uuid.UUID | None = None,
+) -> int:
     """Delete all publications for a given file. Looks up the file's
     collection so the URI matches the canonical form stored in the
-    ``publications.resource_uri`` column."""
+    ``publications.resource_uri`` column.
+
+    ``expected_vault_id`` adds an explicit vault binding to the DELETE
+    (see ``delete_publications_for_document`` for rationale).
+    """
     from app.services.uri_service import file_uri
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -560,10 +597,16 @@ async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str
         )
         collection = coll_row["collection"] if coll_row else None
         uri = file_uri(vault_name, str(file_id), collection=collection)
-        rows = await conn.fetch(
-            "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
-            uri,
-        )
+        if expected_vault_id is not None:
+            rows = await conn.fetch(
+                "DELETE FROM publications WHERE resource_uri = $1 AND vault_id = $2 RETURNING id",
+                uri, expected_vault_id,
+            )
+        else:
+            rows = await conn.fetch(
+                "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
+                uri,
+            )
     return len(rows)
 
 
@@ -1079,7 +1122,7 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
         "total": len(result_rows),
         "query_params": param_defs,
         "applied_params": {n: url_params.get(n) for n in param_defs},
-        "mode": publication.get("mode", Mode.LIVE),
+        "mode": publication["mode"],
     }
 
 
