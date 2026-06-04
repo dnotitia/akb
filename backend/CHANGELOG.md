@@ -5,6 +5,102 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.1 — 2026-06-04  *(patch — three latent bugs around the 0.6.0 surface, plus envelope close-out)*
+
+Three honest bug fixes that surfaced during the post-0.6.0 review, plus
+the leftover piece of the 0.5.6 error-envelope unification. No contract
+changes beyond a single new stable error code; no migration needed.
+
+### Bug fixes
+
+1. **`_handle_publication_snapshot` mis-classified non-input failures as
+   `INVALID_ARGUMENT`.** The handler caught every `PublicationError` and
+   flattened it to `INVALID_ARGUMENT`, even when `create_snapshot` raised
+   502 (S3 upload failure — not the caller's fault) or 404 (the row
+   vanished between the lookup and the locked re-read). Now maps by
+   `e.status_code`: 404 → `NOT_FOUND`, 4xx → `INVALID_ARGUMENT`, 5xx →
+   `INTERNAL` (new code, see below). Callers that branched on `code` to
+   decide whether to retry vs. fix their input were getting the wrong
+   answer for the storage-failure path.
+
+2. **`akb_unpublish(uri=…)` URI branch wasn't vault-bound at the SQL
+   layer.** The slug branch already passed `expected_vault_id` to the
+   service for belt-and-suspenders IDOR protection; the URI branch
+   relied solely on the URI encoding the vault. The URI grammar
+   guarantees that holds in practice, but having one model on the slug
+   branch and a different model on the URI branch was itself a smell.
+   `delete_publications_for_document` / `_for_file` now accept optional
+   `expected_vault_id`, and the URI branch threads `access["vault_id"]`
+   through. Same explicit binding on both sides.
+
+3. **MCP `call_tool` last-resort `except Exception` broke the 0.5.6
+   error envelope.** 0.5.6 (`c00791e`) collapsed every error response
+   to `{error, code, hint?, details?}`, but the dispatch-level catch
+   was missed and kept returning bare `{error: str(e)}` — no `code`.
+   Any handler that `raise`d instead of returning `err(...)` therefore
+   shipped a response that broke the canonical envelope contract.
+   Catch-all now returns `err(str(e), code=INTERNAL)`, so every
+   response path — success, expected failure, and unhandled exception —
+   carries the same shape.
+
+### New error code
+
+- `INTERNAL = "internal"` in `app/util/errors.py`. Used by the
+  dispatch's last-resort catch and by any handler that needs to surface
+  a 5xx-class failure without falsifying caller-side blame.
+
+### Hygiene (no behavior change)
+
+- `Mode.ALL` constant removed — was dead after 0.6.0 dropped the
+  publish-time `mode` option.
+- `delete_publication()` collapsed to slug-only — no caller passes
+  `publication_id` after 0.6.0 (routes use slug, MCP was always
+  slug-only); the dual-shape signature was just `# old.` framing.
+- `resolve_table_query_publication` no longer says
+  `publication.get("mode", Mode.LIVE)` — `mode` is a NOT NULL column
+  with `'live'` default, so the `.get` default was a fallback that
+  could never fire. Replaced with direct subscript so the code reads
+  honestly.
+- `publication_meta` had a `elif rt == DOCUMENT: meta["title"] = ...`
+  branch that re-assigned the same value `meta` already carried from
+  three lines above. Dead elif removed, intent commented.
+- `_PUBLIC_FIELDS` renamed to `_PUBLIC_PASSTHROUGH_FIELDS` with a
+  docstring naming the two derived keys (`share_url`,
+  `password_protected`) that `to_public_dict` adds — single place to
+  extend.
+- `_row_to_internal_dict` previously accepted an already-parsed dict
+  as a silent third branch between the JSON string and None cases.
+  Added an explicit `isinstance(qp, dict)` check + clear error for any
+  other type.
+- `_handle_unpublish` URI branch replaced a `not parsed.identifier`
+  defensive guard (unreachable after the kind narrowing above it) with
+  `assert parsed.identifier is not None`. Same mypy narrowing, honest
+  intent.
+- Stale comment on the table_query default title removed.
+
+### Tests
+
+- `backend/tests/test_publications_e2e.sh` — 97/97 (unchanged from 0.6.0;
+  the response-shape assertions added in 0.6.0 still pass).
+- `backend/tests/test_mcp_e2e.sh` — 76/76.
+
+### Verification
+
+Six agent-driven prod scenarios after each deploy step (doc publish,
+file publish, snapshot-rejection-for-doc, `unpublish(uri=<file_uri>)`,
+table_query publish→snapshot, list-item-shape-matches-publish) — all
+clean. Existing 24 active prod publications keep resolving normally;
+no schema migration, contract changes only.
+
+### Migration
+
+None. 0.6.0 callers see the same external shape; only the dispatch
+catch-all now returns `code: "internal"` in places that previously
+returned `{error: "..."}` with no `code` field. If anything, this is a
+contract *strengthening* (envelope is now total).
+
+---
+
 ## 0.6.0 — 2026-06-04  *(BREAKING — publication tool surface rewritten)*
 
 The `akb_publish` / `akb_unpublish` / `akb_publications` /
