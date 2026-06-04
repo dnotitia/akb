@@ -119,7 +119,7 @@ class QdrantStore:
         content: str,
         section_path: str | None,
         chunk_index: int,
-        dense: list[float],
+        dense: list[float] | None,
         sparse_indices: list[int],
         sparse_values: list[float],
         source_type: str,
@@ -129,7 +129,13 @@ class QdrantStore:
         await self.ensure_collection()
         client = self._get_client()
 
-        vectors: dict[str, Any] = {DENSE_VECTOR_NAME: dense}
+        # Qdrant named-vectors collections accept points that carry only a
+        # subset of the declared vectors — leave dense out when the embed
+        # API was unavailable; the dense leg of hybrid_search will then
+        # have nothing to score against for this point.
+        vectors: dict[str, Any] = {}
+        if dense:
+            vectors[DENSE_VECTOR_NAME] = dense
         if sparse_indices:
             vectors[SPARSE_VECTOR_NAME] = qm.SparseVector(
                 indices=sparse_indices, values=sparse_values,

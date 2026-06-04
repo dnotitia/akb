@@ -281,7 +281,7 @@ class SeahorseStore:
         content: str,
         section_path: str | None,
         chunk_index: int,
-        dense: list[float],
+        dense: list[float] | None,
         sparse_indices: list[int],
         sparse_values: list[float],
         source_type: str,
@@ -289,7 +289,7 @@ class SeahorseStore:
     ) -> None:
         del conn
         await self.ensure_collection()
-        row = {
+        row: dict[str, Any] = {
             COL_ID: _seahorse_pk(str(chunk_id)),
             COL_EXTERNAL_CHUNK_ID: str(chunk_id),
             COL_SOURCE_TYPE: source_type,
@@ -297,9 +297,13 @@ class SeahorseStore:
             COL_SECTION_PATH: section_path or "",
             COL_CONTENT: content,
             COL_CHUNK_INDEX: int(chunk_index),
-            COL_DENSE: list(dense),
             COL_SPARSE: _sparse_to_str(sparse_indices, sparse_values),
         }
+        # Sparse-only row when the embed API was unavailable. Seahorse
+        # treats a missing vector column as NULL; the dense ANN leg
+        # then has nothing to score against for this row.
+        if dense:
+            row[COL_DENSE] = list(dense)
         # Insert is JSONL with text/plain — `application/json` is rejected.
         body = json.dumps(row, ensure_ascii=False)
         try:

@@ -195,6 +195,9 @@ class PgvectorStore:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
 
+        # `dense` is nullable: the embed worker upserts sparse-only points
+        # when the embedding API is unavailable, and the dense leg of
+        # hybrid_search filters them out via the partial HNSW index below.
         if self._sparse_shape == "arrays":
             await conn.execute(
                 f"""
@@ -205,7 +208,7 @@ class PgvectorStore:
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
-                    dense           vector({self._dense_dim}) NOT NULL,
+                    dense           vector({self._dense_dim}),
                     sparse_terms    BIGINT[] NOT NULL DEFAULT '{{}}',
                     sparse_weights  REAL[]   NOT NULL DEFAULT '{{}}',
                     indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -222,7 +225,7 @@ class PgvectorStore:
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
-                    dense           vector({self._dense_dim}) NOT NULL,
+                    dense           vector({self._dense_dim}),
                     indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
@@ -250,6 +253,13 @@ class PgvectorStore:
                 """
             )
 
+        # Existing deployments may have `dense` from the pre-0.6.2
+        # NOT NULL era. Drop the constraint idempotently so the
+        # sparse-only fallback can actually store a NULL.
+        await conn.execute(
+            f'ALTER TABLE "{self._schema}".chunks ALTER COLUMN dense DROP NOT NULL'
+        )
+
         # Common indexes (both shapes).
         await conn.execute(
             f"""
@@ -257,14 +267,32 @@ class PgvectorStore:
                 ON "{self._schema}".chunks (source_id)
             """
         )
+        # Pre-0.6.2 installs have a full HNSW index over `dense` that
+        # cannot index NULL rows — drop it so the partial form below
+        # actually takes effect. `CREATE INDEX IF NOT EXISTS` would
+        # otherwise no-op when the legacy index is still present.
+        legacy_def = await conn.fetchval(
+            """
+            SELECT indexdef FROM pg_indexes
+            WHERE schemaname = $1 AND indexname = 'idx_vi_chunks_dense'
+            """,
+            self._schema,
+        )
+        if legacy_def and "WHERE" not in legacy_def:
+            await conn.execute(
+                f'DROP INDEX IF EXISTS "{self._schema}".idx_vi_chunks_dense'
+            )
         # HNSW for dense KNN. m=16, ef_construction=64 are pgvector's
-        # defaults and serve us well at <1M points.
+        # defaults and serve us well at <1M points. Partial — sparse-only
+        # rows (dense IS NULL) are excluded from the index so the dense
+        # leg only ever sees points that actually have an embedding.
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_dense
                 ON "{self._schema}".chunks
                 USING hnsw (dense vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
+                WHERE dense IS NOT NULL
             """
         )
 
@@ -287,7 +315,7 @@ class PgvectorStore:
         content: str,
         section_path: str | None,
         chunk_index: int,
-        dense: list[float],
+        dense: list[float] | None,
         sparse_indices: list[int],
         sparse_values: list[float],
         source_type: str,
@@ -298,7 +326,10 @@ class PgvectorStore:
         sid = uuid.UUID(str(source_id))
         # `dense` goes through pgvector's binary codec — list[float]
         # straight into asyncpg's bind. No text literal, no `::vector`
-        # cast needed.
+        # cast needed. `None` (sparse-only fallback when the embed API
+        # was unavailable) becomes a NULL row and is excluded from the
+        # partial HNSW index by the WHERE clause above.
+        dense_param: list[float] | None = list(dense) if dense else None
         try:
             async with self._conn(conn) as c:
                 if self._sparse_shape == "arrays":
@@ -321,7 +352,7 @@ class PgvectorStore:
                             indexed_at     = NOW()
                         """,
                         cid, source_type, sid, section_path or "",
-                        content, int(chunk_index), list(dense),
+                        content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
                 else:  # posting
@@ -341,7 +372,7 @@ class PgvectorStore:
                             indexed_at   = NOW()
                         """,
                         cid, source_type, sid, section_path or "",
-                        content, int(chunk_index), list(dense),
+                        content, int(chunk_index), dense_param,
                     )
                     # Replace posting rows for this chunk.
                     await c.execute(
@@ -469,12 +500,15 @@ class PgvectorStore:
         limit: int,
     ) -> list[str]:
         # Binary codec → list[float] passes through directly.
+        # `WHERE dense IS NOT NULL` mirrors the partial HNSW index above —
+        # sparse-only points (embed API was down when they were indexed)
+        # contribute only to the sparse leg, never to the dense KNN.
         if src_uuids:
             rows = await conn.fetch(
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
-                WHERE source_id = ANY($2::uuid[])
+                WHERE source_id = ANY($2::uuid[]) AND dense IS NOT NULL
                 ORDER BY dense <=> $1
                 LIMIT $3
                 """,
@@ -485,6 +519,7 @@ class PgvectorStore:
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
+                WHERE dense IS NOT NULL
                 ORDER BY dense <=> $1
                 LIMIT $2
                 """,

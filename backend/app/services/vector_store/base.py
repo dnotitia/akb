@@ -73,7 +73,7 @@ class VectorStore(Protocol):
         content: str,
         section_path: str | None,
         chunk_index: int,
-        dense: list[float],
+        dense: list[float] | None,
         sparse_indices: list[int],
         sparse_values: list[float],
         source_type: str,
@@ -81,6 +81,14 @@ class VectorStore(Protocol):
     ) -> None:
         """Upsert one chunk. Driver stores dense + sparse + payload
         atomically. `dense` and `sparse_*` are pre-computed by callers.
+
+        ``dense=None`` is a valid input — the embed worker uses it as the
+        BM25-only fallback path when the embedding API is unavailable.
+        Drivers must accept the point with only sparse vectors (NULL dense
+        column / sparse-only Qdrant point / seahorse sparse-only row);
+        ``hybrid_search`` already has the symmetric ``query_dense=None``
+        path so dense-less points only contribute to the sparse leg.
+
         Pass `conn` to share an outer PG transaction (atomic with the
         caller's own writes)."""
 
