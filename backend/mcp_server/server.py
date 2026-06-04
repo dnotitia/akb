@@ -44,6 +44,7 @@ from app.util.errors import (
     err,
     CONFLICT,
     EDIT_FAILED,
+    INTERNAL,
     INVALID_ARGUMENT,
     INVALID_PATH,
     INVALID_URI,
@@ -1047,7 +1048,7 @@ async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> 
             return err(e.message, code=NOT_FOUND)
         if 400 <= e.status_code < 500:
             return err(e.message, code=INVALID_ARGUMENT)
-        raise  # 5xx — let the dispatch catch-all surface it as a server error
+        return err(e.message, code=INTERNAL)
 
 
 @_h("akb_vault_info")
@@ -1214,7 +1215,16 @@ async def call_tool(name: str, arguments: dict):
         result = await _dispatch(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+        # Last-resort envelope so the canonical {error, code, ...} shape
+        # introduced in 0.5.6 holds for every response path — including
+        # unhandled exceptions that bubble up past handler-level
+        # try/except blocks. Specific handlers should still catch their
+        # known failure modes and return err(...) with a more precise
+        # code; this only catches what nothing else does.
+        return [TextContent(
+            type="text",
+            text=json.dumps(err(str(e), code=INTERNAL), ensure_ascii=False, default=str),
+        )]
 
 
 async def _dispatch(name: str, args: dict):

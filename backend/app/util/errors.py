@@ -65,6 +65,14 @@ UNDEFINED_TABLE = "undefined_table"
 # Knowledge-graph linking
 SELF_LINK = "self_link"
 
+# Server-side — anything the caller can't fix. Reach for this only
+# when the failure is genuinely "our problem", not a caller-side
+# argument shape or lookup issue. Backed by the MCP dispatch's
+# last-resort catch (unhandled exceptions land here) and by handlers
+# that explicitly want to surface a 5xx-class failure (e.g. upstream
+# storage write failure in akb_publication_snapshot).
+INTERNAL = "internal"
+
 
 # ── Builder ───────────────────────────────────────────────────
 
