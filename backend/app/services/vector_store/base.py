@@ -76,7 +76,46 @@ class VectorStore(Protocol):
     async def ensure_collection(self, *, conn=None) -> None:
         """Idempotent: create the underlying storage (Qdrant collection,
         PG schema/tables, etc.) if it doesn't exist. May reuse `conn`
-        on PG-backed drivers to participate in an outer transaction."""
+        on PG-backed drivers to participate in an outer transaction.
+
+        **Race-safety is the driver's responsibility.** This method is
+        called from lifespan startup *and* lazily from the first request
+        that touches the store, possibly from multiple workers, possibly
+        with the in-flight call being cancelled (e.g. nginx timeout
+        propagating asyncio.CancelledError into a long-running CREATE
+        INDEX). The driver MUST guarantee:
+
+          - Concurrent callers serialize, in-process AND cross-process
+            (multiple uvicorn workers / pods sharing the same backend).
+          - A cancelled or crashed call cannot strand whatever
+            serialization primitive was used (no orphaned advisory
+            locks / phantom collection-creation flags).
+          - Any schema migration step is atomic from the search side's
+            point of view — there must never be a window where a
+            previously-functional index/collection is absent.
+
+        The 0.6.4 prod incident (see backend/CHANGELOG.md) is the
+        canonical anti-example: pre-0.6.4 ``PgvectorStore`` had only
+        an in-process ``asyncio.Lock`` + an ``_ensured`` bool, both of
+        which a cancellation reset. The drop-then-create migration was
+        non-atomic. Cross-process serialization (PG advisory lock) +
+        atomic index swap (``CREATE _new`` → ``DROP legacy`` → ``RENAME``)
+        was the fix, and that pattern's pgvector-specific shape is fine
+        — but every other driver author has to solve the same problem
+        with whatever primitives their backend exposes.
+
+        Today's drivers (audit before swapping production):
+          - ``PgvectorStore``: ✓ pg_advisory_xact_lock + atomic swap.
+          - ``QdrantStore``: ⚠ only the ``_ensured_collection`` bool +
+            ``collection_exists()`` check. Probably fine because Qdrant
+            ``create_collection`` is idempotent server-side, but no
+            explicit cross-process guard.
+          - ``SeahorseStore``: ⚠ BFF ``_bff_get_table()`` + optional
+            auto-create; same race-window shape as Qdrant.
+        Both ⚠ drivers should be audited before they go to prod at
+        scale; the asymmetry exists because only pgvector has ever
+        actually shipped a schema migration step here.
+        """
 
     async def health(self) -> bool:
         """Light reachability check — fast, no side effects. Used by
