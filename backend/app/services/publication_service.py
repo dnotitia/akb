@@ -32,11 +32,6 @@ from app.services.uri_service import parse_uri
 logger = logging.getLogger("akb.publications")
 
 
-# Frozen at import — AKB_PUBLIC_BASE_URL is env-only, so there's no runtime
-# toggle to handle. Trailing slash normalized once here instead of per row.
-_PUBLIC_BASE: str | None = settings.public_base_url.rstrip("/") or None
-
-
 # ============================================================
 # Constants — single source of truth, no magic strings
 # ============================================================
@@ -52,6 +47,23 @@ class Mode:
     LIVE = "live"
     SNAPSHOT = "snapshot"
     ALL = ("live", "snapshot")
+
+
+def _share_url(slug: str) -> str:
+    """Absolute share URL for ``slug``.
+
+    Lifespan refuses to start the app if ``AKB_PUBLIC_BASE_URL`` is unset —
+    so by the time any request reaches this helper, ``settings.public_base_url``
+    is a non-empty origin and ``share_url`` is guaranteed absolute. No nullable
+    return type, no client-side fallback chain.
+    """
+    base = settings.public_base_url.rstrip("/")
+    if not base:
+        raise RuntimeError(
+            "AKB_PUBLIC_BASE_URL is required at startup but was empty. "
+            "Set it to the ingress origin (e.g. https://akb.example.com)."
+        )
+    return f"{base}/p/{slug}"
 
 # Singleton DocumentService — cheap to instantiate but holds a Git client
 # we don't want to recreate on every request.
@@ -134,46 +146,81 @@ def parse_expires_in(expires_in: str | None) -> datetime | None:
     return datetime.now(timezone.utc) + timedelta(seconds=n * _DURATION_UNITS[m.group(2)])
 
 
-def _publication_row_to_dict(row) -> dict | None:
-    """Serialize an asyncpg publications row to a JSON-friendly dict.
+_PUBLIC_FIELDS = (
+    "slug",
+    "resource_type",
+    "resource_uri",
+    "vault",
+    "title",
+    "mode",
+    "expires_at",
+    "max_views",
+    "view_count",
+    "allow_embed",
+    "section_filter",
+    "snapshot_at",
+    "created_at",
+    "query_sql",
+    "query_vault_names",
+    "query_params",
+)
 
-    The row's `resource_uri` column is the canonical handle — same
-    shape MCP clients and the event stream see. Internal database
-    UUID columns no longer exist on the row, so the dict surfaces
-    exactly what callers should consume.
 
-    Normalizations applied:
-    - `id` is renamed to `publication_id` so callers never confuse it
-      with the underlying resource handle.
-    - `query_params` is parsed from JSON string into a dict.
-    - UUID columns become strings.
-    - Datetime columns become ISO strings.
+def _row_to_internal_dict(row) -> dict:
+    """Normalize a ``publications`` row (joined with ``vaults v`` so the row
+    carries ``v.name AS vault``) into a JSON-friendly dict.
 
-    Returns None only if `row` is None. Otherwise the result is
-    guaranteed to contain `publication_id`, `slug`, `resource_type`,
-    and (where applicable) `resource_uri`. Raises PublicationError if
-    `query_params` JSON is corrupted (data integrity).
+    Every read query uses `SELECT p.*, v.name AS vault FROM publications p
+    JOIN vaults v ON v.id = p.vault_id` so the row always carries the
+    vault name; no separate join in this helper.
+
+    The returned dict is the *internal* shape used by routes / resolvers
+    that still need ``password_hash`` (auth check), ``snapshot_s3_key``
+    (S3 fetch), ``id`` (advisory lock, internal updates), etc. It is NOT
+    safe to return to API/MCP clients — feed it through ``to_public_dict``
+    at the response boundary.
+
+    Normalizations:
+    - UUID columns → str
+    - datetime columns → ISO string
+    - ``query_params`` parsed from JSON string into a dict
     """
-    if row is None:
-        return None
     d = dict(row)
     for k, v in list(d.items()):
         if isinstance(v, uuid.UUID):
             d[k] = str(v)
         elif hasattr(v, "isoformat"):
             d[k] = v.isoformat()
-    if "query_params" in d and isinstance(d["query_params"], str):
+    qp = d.get("query_params")
+    if isinstance(qp, str):
         try:
-            d["query_params"] = json.loads(d["query_params"])
+            d["query_params"] = json.loads(qp)
         except (json.JSONDecodeError, TypeError) as e:
-            slug_or_id = d.get("slug") or d.get("id") or "?"
             raise PublicationError(
-                f"Corrupt query_params JSON for publication {slug_or_id}: {e}",
+                f"Corrupt query_params JSON for publication {d.get('slug', '?')}: {e}",
                 status_code=500,
             )
-    if "id" in d:
-        d["publication_id"] = d.pop("id")
+    elif qp is None:
+        d["query_params"] = {}
     return d
+
+
+def to_public_dict(internal: dict) -> dict:
+    """Internal publication dict → the single canonical public response shape.
+
+    Every external surface (MCP tools, REST API responses, frontend list)
+    sees exactly this dict. Internal-only fields (``id``, ``vault_id``,
+    ``password_hash``, ``snapshot_s3_key``, ``created_by``, ``updated_at``)
+    are stripped here. ``share_url`` is always an absolute URL
+    (``AKB_PUBLIC_BASE_URL`` is startup-required).
+
+    Callers must NEVER hand-build a publication response dict — go through
+    this function so the shape stays single-source-of-truth.
+    """
+    out: dict = {k: internal.get(k) for k in _PUBLIC_FIELDS}
+    out["share_url"] = _share_url(internal["slug"])
+    out["password_protected"] = bool(internal.get("password_hash"))
+    return out
 
 
 def to_uuid(value) -> uuid.UUID:
@@ -199,15 +246,22 @@ async def create_publication(
     max_views: int | None = None,
     expires_at: datetime | None = None,
     title: str | None = None,
-    mode: str = "live",
     section_filter: str | None = None,
     allow_embed: bool = True,
     created_by: uuid.UUID | None = None,
 ) -> dict:
-    """Create a publication row. Returns the publication dict including slug + public URL.
+    """Create a publication row. Returns the canonical public dict
+    (``slug``, ``share_url``, …) — same shape ``list_publications`` and
+    ``akb_publication_snapshot`` return.
 
     All validation lives here — routes are thin adapters that pass parsed
     arguments. Raises ValueError for any invalid input.
+
+    Every publication is created with ``mode='live'``. Snapshot is a
+    table_query-only state transition reached through
+    ``create_snapshot(slug=...)`` after the fact — it is not a create-time
+    option, which keeps the create surface free of a field that means
+    nothing for document/file publications.
 
     `resource_uri` is the canonical handle for the publishable resource.
     Required for `resource_type ∈ {document, file}`. For `table_query`,
@@ -215,8 +269,6 @@ async def create_publication(
     """
     if resource_type not in ResourceType.ALL:
         raise ValueError(f"Invalid resource_type: {resource_type}")
-    if mode not in Mode.ALL:
-        raise ValueError(f"Invalid mode: {mode}")
 
     # Validate that the right resource fields are present
     if resource_type == ResourceType.DOCUMENT and not resource_uri:
@@ -302,28 +354,28 @@ async def create_publication(
 
             row = await conn.fetchrow(
                 """
-                INSERT INTO publications (
-                    slug, vault_id, resource_type, resource_uri,
-                    query_sql, query_vault_names, query_params,
-                    password_hash, max_views, expires_at,
-                    mode, section_filter, allow_embed, title, created_by
+                WITH inserted AS (
+                    INSERT INTO publications (
+                        slug, vault_id, resource_type, resource_uri,
+                        query_sql, query_vault_names, query_params,
+                        password_hash, max_views, expires_at,
+                        mode, section_filter, allow_embed, title, created_by
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            'live', $11, $12, $13, $14)
+                    RETURNING *
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                RETURNING id, slug, vault_id, resource_type, resource_uri,
-                          query_sql, query_vault_names, query_params, max_views,
-                          view_count, expires_at, mode, section_filter, allow_embed,
-                          title, created_at
+                SELECT p.*, v.name AS vault
+                  FROM inserted p JOIN vaults v ON v.id = p.vault_id
                 """,
                 slug, vault_id, resource_type, resource_uri,
                 query_sql, query_vault_names, json.dumps(query_params or {}),
                 pwd_hash, max_views, expires_at,
-                mode, section_filter, allow_embed, title, created_by,
+                section_filter, allow_embed, title, created_by,
             )
 
-    result = _enrich_publication(_publication_row_to_dict(row)) or {}
-    result["password_protected"] = pwd_hash is not None
     logger.info("Publication created: %s (type=%s)", slug, resource_type)
-    return result
+    return to_public_dict(_row_to_internal_dict(row))
 
 
 async def create_publication_for_vault(
@@ -339,7 +391,6 @@ async def create_publication_for_vault(
     max_views: int | None = None,
     expires_in: str | None = None,
     title: str | None = None,
-    mode: str = "live",
     section_filter: str | None = None,
     allow_embed: bool = True,
     created_by: uuid.UUID | None = None,
@@ -418,7 +469,6 @@ async def create_publication_for_vault(
         max_views=max_views,
         expires_at=expires_at,
         title=title,
-        mode=mode,
         section_filter=section_filter,
         allow_embed=allow_embed,
         created_by=created_by,
@@ -531,72 +581,52 @@ async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str
     return len(rows)
 
 
-# SELECT clause used by every list/inspection query. resource_uri lives
-# on the row directly — no JOIN needed to surface the canonical handle.
-_PUBLICATION_LIST_COLUMNS = """
-    p.id, p.slug, p.vault_id, p.resource_type, p.resource_uri, p.title,
-    p.query_params, p.max_views, p.view_count, p.expires_at, p.mode, p.snapshot_at,
-    p.section_filter, p.allow_embed,
-    p.password_hash IS NOT NULL AS password_protected,
-    p.created_at
-"""
-
-_PUBLICATION_FROM_CLAUSE = "publications p"
-
-
-def _enrich_publication(d: dict | None) -> dict | None:
-    """Add URL fields to a publication dict. No-op for None.
-
-    Sets `public_url` (relative) unconditionally; `public_url_full` and
-    `public_base` are populated iff `AKB_PUBLIC_BASE_URL` is set, else None.
-    """
-    if d is None:
-        return None
-    slug = d.get("slug")
-    if not slug:
-        raise PublicationError(
-            "Publication row missing 'slug' — data integrity error",
-            status_code=500,
-        )
-    d["public_url"] = f"/p/{slug}"
-    d["public_base"] = _PUBLIC_BASE
-    d["public_url_full"] = f"{_PUBLIC_BASE}/p/{slug}" if _PUBLIC_BASE else None
-    return d
+# Single FROM clause for every read query. Joining vaults inline means the
+# row always carries `vault` (the human-readable name), so the helpers
+# never need a second lookup and the public dict has the field clients
+# actually want to display.
+_PUBLICATION_SELECT = (
+    "SELECT p.*, v.name AS vault "
+    "FROM publications p JOIN vaults v ON v.id = p.vault_id"
+)
 
 
 async def list_publications(vault_id: uuid.UUID, resource_type: str | None = None) -> list[dict]:
-    """List active publications for a vault."""
+    """List active publications for a vault. Returns public dicts."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if resource_type:
             rows = await conn.fetch(
-                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
+                f"{_PUBLICATION_SELECT} "
                 "WHERE p.vault_id = $1 AND p.resource_type = $2 "
                 "ORDER BY p.created_at DESC",
                 vault_id, resource_type,
             )
         else:
             rows = await conn.fetch(
-                f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
+                f"{_PUBLICATION_SELECT} "
                 "WHERE p.vault_id = $1 "
                 "ORDER BY p.created_at DESC",
                 vault_id,
             )
-    return [p for r in rows if (p := _enrich_publication(_publication_row_to_dict(r))) is not None]
+    return [to_public_dict(_row_to_internal_dict(r)) for r in rows]
 
 
 async def get_publication_by_slug(slug: str) -> dict | None:
-    """Read publication by slug without enforcement (for inspection)."""
+    """Read publication by slug without enforcement (for inspection).
+
+    Returns the **internal** dict — callers that surface to API/MCP must
+    feed through ``to_public_dict``. Returns None if slug not found.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            f"SELECT {_PUBLICATION_LIST_COLUMNS} FROM {_PUBLICATION_FROM_CLAUSE} "
-            "WHERE p.slug = $1",
+            f"{_PUBLICATION_SELECT} WHERE p.slug = $1",
             slug,
         )
     if row is None:
         return None
-    return _enrich_publication(_publication_row_to_dict(row))
+    return _row_to_internal_dict(row)
 
 
 # ============================================================
@@ -618,8 +648,9 @@ async def resolve_publication(
         PublicationPasswordRequired — password set but not provided
         PublicationPasswordInvalid — wrong password
 
-    Returns the publication row dict (including vault_name and query_params parsed
-    as a dict). Always includes 'publication_id' (never 'id').
+    Returns the **internal** publication dict (includes ``id``,
+    ``password_hash``, ``snapshot_s3_key`` — needed by downstream
+    resolvers). Surface-facing callers convert via ``to_public_dict``.
 
     bypass_password: skip the password check (used when caller has already
     verified an HMAC session token at the route layer).
@@ -627,18 +658,7 @@ async def resolve_publication(
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT s.id, s.slug, s.vault_id, s.resource_type, s.resource_uri,
-                   s.query_sql, s.query_vault_names, s.query_params,
-                   s.password_hash, s.max_views, s.view_count, s.expires_at,
-                   s.mode, s.snapshot_s3_key, s.snapshot_at,
-                   s.section_filter, s.allow_embed, s.title, s.created_at,
-                   s.created_by,
-                   v.name AS vault_name
-            FROM publications s
-            JOIN vaults v ON s.vault_id = v.id
-            WHERE s.slug = $1
-            """,
+            f"{_PUBLICATION_SELECT} WHERE p.slug = $1",
             slug,
         )
         if row is None:
@@ -697,11 +717,7 @@ async def resolve_publication(
             if row["max_views"] is not None and row["view_count"] >= row["max_views"]:
                 raise PublicationViewLimitReached()
 
-    # `row` is non-None here (PublicationNotFound raised above), so both
-    # helpers return non-None — assert for mypy's benefit.
-    result = _enrich_publication(_publication_row_to_dict(row))
-    assert result is not None
-    return result
+    return _row_to_internal_dict(row)
 
 
 # ============================================================
@@ -1000,7 +1016,7 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
 
     sql = publication["query_sql"]
     param_defs = publication.get("query_params") or {}
-    vault_names = list(publication.get("query_vault_names") or [publication["vault_name"]])
+    vault_names = list(publication.get("query_vault_names") or [publication["vault"]])
     url_params = url_params or {}
 
     try:
@@ -1128,13 +1144,7 @@ async def create_snapshot(
             await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
             row = await lock_conn.fetchrow(
-                """
-                SELECT s.id, s.slug, s.vault_id, s.resource_type, s.query_sql,
-                       s.query_vault_names, s.query_params, s.title,
-                       v.name AS vault_name
-                FROM publications s JOIN vaults v ON s.vault_id = v.id
-                WHERE s.id = $1
-                """,
+                f"{_PUBLICATION_SELECT} WHERE p.id = $1",
                 publication_id,
             )
             if row is None:
@@ -1143,8 +1153,7 @@ async def create_snapshot(
             if expected_vault_id is not None and row["vault_id"] != expected_vault_id:
                 raise PublicationNotFound(str(publication_id))
 
-            publication = _publication_row_to_dict(row)
-            assert publication is not None  # row is non-None
+            publication = _row_to_internal_dict(row)
             if publication["resource_type"] != ResourceType.TABLE_QUERY:
                 raise PublicationError(
                     "Snapshots only supported for table_query publications",
@@ -1165,18 +1174,19 @@ async def create_snapshot(
             except (file_service.StorageError, IOError) as e:
                 raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
 
-            now = datetime.now(timezone.utc)
-            await lock_conn.execute(
-                """
-                UPDATE publications
-                SET snapshot_s3_key = $1, snapshot_at = $2, mode = 'snapshot', updated_at = $2
-                WHERE id = $3
+            updated_row = await lock_conn.fetchrow(
+                f"""
+                WITH bumped AS (
+                    UPDATE publications
+                       SET snapshot_s3_key = $1, snapshot_at = NOW(),
+                           mode = 'snapshot', updated_at = NOW()
+                     WHERE id = $2
+                    RETURNING *
+                )
+                SELECT p.*, v.name AS vault
+                  FROM bumped p JOIN vaults v ON v.id = p.vault_id
                 """,
-                s3_key, now, publication_id,
+                s3_key, publication_id,
             )
 
-    return {
-        "snapshot_s3_key": s3_key,
-        "snapshot_at": now.isoformat(),
-        "rows": result.get("total", 0),
-    }
+    return to_public_dict(_row_to_internal_dict(updated_row))

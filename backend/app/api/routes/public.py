@@ -1,10 +1,10 @@
 """Public sharing routes — unified document/table/file public access.
 
 Authenticated endpoints (writer role required):
-  POST   /publications/{vault}/create               — create a public publication
-  DELETE /publications/{vault}/{publication_id}           — delete a publication
-  GET    /publications/{vault}                      — list publications for a vault
-  POST   /publications/{vault}/{publication_id}/snapshot  — create snapshot for table_query
+  POST   /publications/{vault}/create        — create a public publication
+  DELETE /publications/{vault}/{slug}        — delete a publication
+  GET    /publications/{vault}               — list publications for a vault
+  POST   /publications/{vault}/{slug}/snapshot — create snapshot for table_query
 
 Public endpoints (no auth):
   GET  /public/{slug}                 — resolve & render publication (dispatches by type)
@@ -14,6 +14,11 @@ Public endpoints (no auth):
   GET  /public/{slug}/embed           — embed-mode (minimal chrome)
   POST /public/{slug}/auth            — submit password, returns session token
   GET  /oembed                        — oEmbed endpoint for unfurling
+
+``slug`` is the single external identifier for a publication. All write
+endpoints take it in the URL path; the response of every CRUD endpoint
+is the canonical publication dict produced by
+``publication_service.to_public_dict`` (or a list of them).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
 from app.config import settings
@@ -91,7 +97,18 @@ class CreatePublicationRequest(NFCModel):
     For table_query publications, pass `query_sql` plus optional
     `query_vault_names`; no per-resource handle is needed since the
     query is the publishable surface.
+
+    Every publication is created live. Snapshot is a table_query-only
+    state transition reached via `POST /publications/{vault}/{slug}/snapshot`,
+    not a create-time option.
+
+    ``extra='forbid'`` here is deliberate: a typo like ``mode`` or
+    ``section`` (both removed in 0.6.0) should 422 instead of being
+    silently dropped. Quiet drops are exactly the "did this option
+    apply?" ambiguity we're trying to design out of this surface.
     """
+    model_config = ConfigDict(extra="forbid")
+
     resource_type: str = "document"  # 'document','table_query','file'
     uri: str | None = None
     query_sql: str | None = None
@@ -101,8 +118,7 @@ class CreatePublicationRequest(NFCModel):
     max_views: int | None = None
     expires_in: str | None = None  # '1h','7d','never'
     title: str | None = None
-    mode: str = "live"
-    section: str | None = None  # P5 section filter
+    section_filter: str | None = None  # document-only, filters to one heading section
     allow_embed: bool = True
 
 
@@ -174,7 +190,7 @@ async def create_publication_route(
                 )
             file_id = uri_ident
     try:
-        result = await publication_service.create_publication_for_vault(
+        return await publication_service.create_publication_for_vault(
             vault_name=vault,
             resource_type=req.resource_type,
             doc_id=doc_id,
@@ -186,35 +202,29 @@ async def create_publication_route(
             max_views=req.max_views,
             expires_in=req.expires_in,
             title=req.title,
-            mode=req.mode,
-            section_filter=req.section,
+            section_filter=req.section_filter,
             allow_embed=req.allow_embed,
             created_by=uuid.UUID(user.user_id),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return result
 
 
-@router.delete("/publications/{vault}/{publication_id}", summary="Delete a public publication")
+@router.delete("/publications/{vault}/{slug}", summary="Delete a public publication")
 async def delete_publication_route(
     vault: str,
-    publication_id: str,
+    slug: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    try:
-        sid = uuid.UUID(publication_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid publication_id")
     # Bind the delete to the authorized vault — without this a writer on
-    # `vault` could delete any publication by id regardless of owner (IDOR).
-    deleted = await publication_service.delete_publication(
-        publication_id=sid, expected_vault_id=access["vault_id"],
+    # `vault` could delete any publication by slug regardless of owner (IDOR).
+    ok = await publication_service.delete_publication(
+        slug=slug, expected_vault_id=access["vault_id"],
     )
-    if not deleted:
+    if not ok:
         raise HTTPException(status_code=404, detail="Publication not found in this vault")
-    return {"deleted": deleted}
+    return {"deleted": 1}
 
 
 @router.get("/publications/{vault}", summary="List publications for a vault")
@@ -228,20 +238,24 @@ async def list_publications_route(
     return {"publications": publications}
 
 
-@router.post("/publications/{vault}/{publication_id}/snapshot", summary="Create snapshot for table_query publication")
+@router.post("/publications/{vault}/{slug}/snapshot", summary="Create snapshot for table_query publication")
 async def create_snapshot_route(
     vault: str,
-    publication_id: str,
+    slug: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    try:
-        sid = uuid.UUID(publication_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid publication_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM publications WHERE slug = $1 AND vault_id = $2",
+            slug, access["vault_id"],
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Publication not found in this vault")
     try:
         return await publication_service.create_snapshot(
-            sid, expected_vault_id=access["vault_id"],
+            row["id"], expected_vault_id=access["vault_id"],
         )
     except PublicationError as e:
         raise _publication_error_to_http(e)

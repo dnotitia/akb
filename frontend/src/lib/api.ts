@@ -382,39 +382,20 @@ export const getVaultActivity = (
 //
 // The user-facing `doc_id` in this module is the URL-shaped doc path
 // (e.g. `specs/api.md`). We resolve it via getDocument() to recover the
-// canonical `uri`, then match publications by `resource_uri` — the
-// single shape the backend now exposes for both documents and files.
+// canonical `uri`, then match publications by `resource_uri`.
 export const publishDoc = async (vault: string, doc_id: string) => {
   const doc = await getDocument(vault, doc_id);
   const { publications } = await listPublications(vault, "document");
-  const existing = publications.find((s: any) => s.resource_uri === doc.uri);
-  if (existing) {
-    return {
-      published: true,
-      public_url: `/p/${existing.slug}`,
-      slug: existing.slug,
-      publication_id: existing.publication_id,
-    };
-  }
-  const result = await createPublication(vault, { resource_type: "document", uri: doc.uri });
-  return {
-    published: true,
-    public_url: result.public_url,
-    slug: result.slug,
-    publication_id: result.publication_id,
-  };
+  const existing = publications.find((p: any) => p.resource_uri === doc.uri);
+  return existing ?? (await createPublication(vault, { resource_type: "document", uri: doc.uri }));
 };
 
 export const unpublishDoc = async (vault: string, doc_id: string) => {
   const doc = await getDocument(vault, doc_id);
   const { publications } = await listPublications(vault, "document");
-  const matches = publications.filter((s: any) => s.resource_uri === doc.uri);
-  let deleted = 0;
-  for (const s of matches) {
-    await deletePublication(vault, s.publication_id);
-    deleted++;
-  }
-  return { published: false, deleted_publications: deleted };
+  const matches = publications.filter((p: any) => p.resource_uri === doc.uri);
+  for (const p of matches) await deletePublication(vault, p.slug);
+  return { deleted: matches.length };
 };
 
 // ── Publications (unified public sharing) ──
@@ -565,24 +546,49 @@ export interface CreatePublicationRequest {
   max_views?: number;
   expires_in?: string;
   title?: string;
-  mode?: "live" | "snapshot";
-  section?: string;
+  // Document publications only — render only this heading section.
+  section_filter?: string;
   allow_embed?: boolean;
 }
 
+// Single canonical publication dict — same shape from every endpoint
+// (create, list, snapshot). `slug` is the only identifier we hand
+// around; `share_url` is always absolute.
+export interface Publication {
+  slug: string;
+  share_url: string;
+  resource_type: "document" | "table_query" | "file";
+  resource_uri: string | null;
+  vault: string;
+  title: string | null;
+  mode: "live" | "snapshot";
+  expires_at: string | null;
+  max_views: number | null;
+  view_count: number;
+  allow_embed: boolean;
+  section_filter: string | null;
+  password_protected: boolean;
+  created_at: string;
+  snapshot_at: string | null;
+  // table_query-only:
+  query_sql?: string | null;
+  query_vault_names?: string[] | null;
+  query_params?: Record<string, any> | null;
+}
+
 export const createPublication = (vault: string, req: CreatePublicationRequest) =>
-  api<any>(`/publications/${vault}/create`, { method: "POST", body: JSON.stringify(req) });
+  api<Publication>(`/publications/${vault}/create`, { method: "POST", body: JSON.stringify(req) });
 
 export const listPublications = (vault: string, resource_type?: string) => {
   const qs = resource_type ? `?resource_type=${resource_type}` : "";
-  return api<{ publications: any[] }>(`/publications/${vault}${qs}`);
+  return api<{ publications: Publication[] }>(`/publications/${vault}${qs}`);
 };
 
-export const deletePublication = (vault: string, publication_id: string) =>
-  api<any>(`/publications/${vault}/${publication_id}`, { method: "DELETE" });
+export const deletePublication = (vault: string, slug: string) =>
+  api<{ deleted: number }>(`/publications/${vault}/${slug}`, { method: "DELETE" });
 
-export const createPublicationSnapshot = (vault: string, publication_id: string) =>
-  api<any>(`/publications/${vault}/${publication_id}/snapshot`, { method: "POST" });
+export const createPublicationSnapshot = (vault: string, slug: string) =>
+  api<Publication>(`/publications/${vault}/${slug}/snapshot`, { method: "POST" });
 
 export const searchUsers = (query?: string) =>
   api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);

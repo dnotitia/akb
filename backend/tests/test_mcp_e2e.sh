@@ -399,8 +399,8 @@ PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null | python3 -
 [ "$PUB_TITLE" = "Pub Test" ] && pass "Public access works" || fail "Public access" "wrong title: $PUB_TITLE"
 
 R=$(mcp_call akb_unpublish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
-UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['published'])" 2>/dev/null)
-[ "$UNPUB" = "False" ] && pass "akb_unpublish" || fail "akb_unpublish" "expected False"
+DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
+[ "$DELETED" -ge 1 ] 2>/dev/null && pass "akb_unpublish (deleted=$DELETED)" || fail "akb_unpublish" "expected deleted≥1 got $DELETED"
 
 # ── 13. Second-user setup (for access-control + cross-user tests below) ─
 echo ""

@@ -659,60 +659,51 @@ TOOLS = [
     Tool(
         name="akb_publish",
         description=(
-            "Create a public share URL for a document, table query, or file. "
-            "For a document or file, pass the resource `uri`. For a table query, "
-            "pass the SQL plus `vault` (queries can span multiple vaults — list them "
-            "in query_vault_names). "
-            "Supports expiration, password protection, view count limits, snapshots, and section filtering. "
-            "Returns a shareable URL accessible without authentication. "
-            "Prefer `public_url_full` (absolute URL) when sharing the link with a user; "
-            "fall back to `public_url` (relative path) only if `public_url_full` is null."
+            "Create a public, no-auth share URL for a document, file, or table query. "
+            "Document/file: pass the resource `uri`. Table query: pass `query_sql` "
+            "plus `vault` (and `query_vault_names` if the query touches more than one). "
+            "Returns the canonical publication dict — `slug` is the only identifier "
+            "you need; `share_url` is always an absolute URL ready to paste."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Resource URI to publish (document or file). Omit for table_query."},
+                "uri": {"type": "string", "description": "Resource URI to publish — required when resource_type is document or file. Omit for table_query."},
                 "resource_type": {
                     "type": "string",
                     "enum": ["document", "table_query", "file"],
                     "default": "document",
-                    "description": "Type of resource to share. For document/file, also pass uri. For table_query, pass query_sql + vault.",
+                    "description": "Kind of resource. document/file → pass `uri`. table_query → pass `query_sql` + `vault`.",
                 },
-                "vault": {"type": "string", "description": "Vault name (required for resource_type=table_query)"},
+                "vault": {"type": "string", "description": "Vault name. Required only for resource_type=table_query (doc/file vault is inferred from the URI)."},
                 "query_sql": {
                     "type": "string",
-                    "description": "SELECT SQL with :param placeholders (for resource_type=table_query)",
+                    "description": "SELECT/WITH SQL with :param placeholders. resource_type=table_query only.",
                 },
                 "query_vault_names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Vaults referenced by the query (defaults to [vault])",
+                    "description": "Vaults the query reads from. Defaults to [vault]. resource_type=table_query only.",
                 },
                 "query_params": {
                     "type": "object",
-                    "description": "Parameter declarations: {name: {type, default, required}}",
+                    "description": "Parameter declarations: {name: {type, default, required}}. resource_type=table_query only.",
                 },
-                "password": {"type": "string", "description": "Password to protect the share"},
-                "max_views": {"type": "integer", "description": "Auto-expire after N views"},
+                "password": {"type": "string", "description": "Require this password to view the share."},
+                "max_views": {"type": "integer", "description": "Auto-expire after N views."},
                 "expires_in": {
                     "type": "string",
-                    "description": "Expiration: '1h', '7d', '30d', or 'never' (default)",
+                    "description": "Expiration window: '1h', '7d', '30d', or 'never' (default).",
                 },
-                "title": {"type": "string", "description": "Override display title"},
-                "mode": {
+                "title": {"type": "string", "description": "Override the display title (defaults to the resource's own title)."},
+                "section_filter": {
                     "type": "string",
-                    "enum": ["live", "snapshot"],
-                    "default": "live",
-                    "description": "live=query each request, snapshot=cache result in S3",
-                },
-                "section": {
-                    "type": "string",
-                    "description": "(document) Filter to a specific heading section",
+                    "description": "Filter to a specific heading section. resource_type=document only.",
                 },
                 "allow_embed": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Whether the share can be embedded via iframe/oEmbed",
+                    "description": "Allow the share to be embedded via iframe/oEmbed.",
                 },
             },
         },
@@ -720,20 +711,25 @@ TOOLS = [
     Tool(
         name="akb_unpublish",
         description=(
-            "Remove a public share. Pass `slug` to delete a single publication, "
-            "or `uri` to delete all publications for that resource."
+            "Remove publication(s). Pass `slug` to remove one specific publication, "
+            "OR `uri` to remove every publication of that document/file resource "
+            "(handy when re-publishing). table_query publications have no resource "
+            "URI, so remove them by slug. Returns {deleted: N}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Resource URI — deletes all publications for this resource"},
-                "slug": {"type": "string", "description": "Publication slug — deletes that specific publication"},
+                "slug": {"type": "string", "description": "Publication slug — remove exactly this publication."},
+                "uri": {"type": "string", "description": "Document or file URI — remove every publication tied to that resource."},
             },
         },
     ),
     Tool(
         name="akb_publications",
-        description="List all publications in a vault (documents, table queries, files).",
+        description=(
+            "List every publication in a vault. Each item is the canonical "
+            "publication dict (same shape as `akb_publish` returns)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -749,14 +745,18 @@ TOOLS = [
     ),
     Tool(
         name="akb_publication_snapshot",
-        description="Create a snapshot of a table_query publication. Saves the current query result to S3 and switches mode to 'snapshot'.",
+        description=(
+            "Freeze a table_query publication's current result to S3 and flip its "
+            "mode to 'snapshot' (subsequent visits return the cached result). "
+            "Identified by `slug` alone — the vault is resolved from the publication. "
+            "Returns the updated publication dict."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
                 "slug": {"type": "string", "description": "Publication slug"},
             },
-            "required": ["vault", "slug"],
+            "required": ["slug"],
         },
     ),
     Tool(

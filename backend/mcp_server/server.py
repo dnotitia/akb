@@ -877,7 +877,10 @@ _SYSTEM_UID = "00000000-0000-0000-0000-000000000000"
 
 @_h("akb_publish")
 async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
-    """Publish a document, file, or table query."""
+    """Publish a document, file, or table query. Returns the canonical
+    publication dict — same shape ``akb_publications`` / ``akb_publication_snapshot``
+    return. ``slug`` is the only external identifier; share the link via
+    ``share_url`` (always absolute)."""
     resource_type = args.get("resource_type", "document")
     uri = args.get("uri")
 
@@ -886,20 +889,23 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
     doc_path: str | None = None
     file_id: str | None = None
     vault_name: str | None = None
-    if resource_type == "document":
-        if not uri:
-            return err("`uri` is required for resource_type=document", code=INVALID_ARGUMENT)
-        vault_name, doc_path = split_uri(uri, expected_type="doc")
-    elif resource_type == "file":
-        if not uri:
-            return err("`uri` is required for resource_type=file", code=INVALID_ARGUMENT)
-        vault_name, file_id = split_uri(uri, expected_type="file")
-    elif resource_type == "table_query":
-        vault_name = args.get("vault")
-        if not vault_name:
-            return err("`vault` is required for resource_type=table_query", code=INVALID_ARGUMENT)
-    else:
-        return err(f"Unknown resource_type: {resource_type}", code=INVALID_ARGUMENT)
+    try:
+        if resource_type == "document":
+            if not uri:
+                return err("`uri` is required for resource_type=document", code=INVALID_ARGUMENT)
+            vault_name, doc_path = split_uri(uri, expected_type="doc")
+        elif resource_type == "file":
+            if not uri:
+                return err("`uri` is required for resource_type=file", code=INVALID_ARGUMENT)
+            vault_name, file_id = split_uri(uri, expected_type="file")
+        elif resource_type == "table_query":
+            vault_name = args.get("vault")
+            if not vault_name:
+                return err("`vault` is required for resource_type=table_query", code=INVALID_ARGUMENT)
+        else:
+            return err(f"Unknown resource_type: {resource_type}", code=INVALID_ARGUMENT)
+    except ValueError as e:
+        return err(str(e), code=INVALID_URI)
 
     await check_vault_access(uid, vault_name, required_role="writer")
     # A table_query publication runs against EVERY vault in
@@ -913,7 +919,7 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
     created_by = uuid.UUID(uid) if uid and uid != _SYSTEM_UID else None
 
     try:
-        result = await publication_service.create_publication_for_vault(
+        return await publication_service.create_publication_for_vault(
             vault_name=vault_name,
             resource_type=resource_type,
             doc_id=doc_path,
@@ -925,62 +931,61 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
             max_views=args.get("max_views"),
             expires_in=args.get("expires_in"),
             title=args.get("title"),
-            mode=args.get("mode", "live"),
-            section_filter=args.get("section"),
+            section_filter=args.get("section_filter"),
             allow_embed=args.get("allow_embed", True),
             created_by=created_by,
         )
     except ValueError as e:
         return err(str(e), code=INVALID_ARGUMENT)
 
-    return {
-        "published": True,
-        "public_url": result["public_url"],
-        "public_url_full": result["public_url_full"],
-        "public_base": result["public_base"],
-        "slug": result["slug"],
-        "resource_type": resource_type,
-        "expires_at": result.get("expires_at"),
-        "password_protected": result.get("password_protected", False),
-    }
-
 
 @_h("akb_unpublish")
 async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
-    """Delete a publication by slug, or all publications for a given resource URI."""
+    """Delete a publication.
+
+    Accepts EITHER ``slug`` (delete one publication) OR ``uri`` (delete
+    every publication of that doc/file resource — handy when re-publishing).
+    table_query publications have no resource URI; remove them by slug.
+    """
     if args.get("slug"):
-        # Slug-based delete: vault scoped via the publication row itself,
-        # so we resolve the owning vault from the publication.
         slug = args["slug"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT v.name AS vault_name
-                  FROM publications p JOIN vaults v ON v.id = p.vault_id
-                 WHERE p.slug = $1
-                """,
+                "SELECT v.name AS vault_name FROM publications p "
+                " JOIN vaults v ON v.id = p.vault_id WHERE p.slug = $1",
                 slug,
             )
         if row:
             await check_vault_access(uid, row["vault_name"], required_role="writer")
-        deleted = await publication_service.delete_publication(slug=slug)
-        return {"published": False, "deleted": deleted}
+        ok = await publication_service.delete_publication(slug=slug)
+        return {"deleted": 1 if ok else 0}
 
     if args.get("uri"):
-        vault, _doc_path = split_uri(args["uri"], expected_type="doc")
-        await check_vault_access(uid, vault, required_role="writer")
-        # Pass the URI directly — delete_publications_for_document
-        # accepts canonical akb:// strings.
-        count = await publication_service.delete_publications_for_document(args["uri"])
-        return {"published": False, "deleted_publications": count}
+        from app.services.uri_service import parse_uri
+        parsed = parse_uri(args["uri"])
+        if parsed is None or parsed.kind not in ("doc", "file"):
+            return err(
+                f"`uri` must be a doc or file URI (got {parsed.kind if parsed else 'invalid'}: "
+                f"{args['uri']!r}). table_query publications must be removed by slug.",
+                code=INVALID_URI,
+            )
+        await check_vault_access(uid, parsed.vault, required_role="writer")
+        if parsed.kind == "doc":
+            count = await publication_service.delete_publications_for_document(args["uri"])
+        else:  # file
+            count = await publication_service.delete_publications_for_file(
+                parsed.identifier, parsed.vault,
+            )
+        return {"deleted": count}
 
-    return err("Either slug or uri is required", code=INVALID_ARGUMENT)
+    return err("Either `slug` or `uri` is required", code=INVALID_ARGUMENT)
 
 
 @_h("akb_publications")
 async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
-    """List all publications in a vault."""
+    """List all publications in a vault. Each item has the canonical
+    publication dict shape."""
     access = await check_vault_access(uid, args["vault"], required_role="reader")
     publications = await publication_service.list_publications(
         access["vault_id"], args.get("resource_type"),
@@ -990,27 +995,32 @@ async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_publication_snapshot")
 async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> dict:
-    """Create a snapshot of a table_query publication."""
-    access = await check_vault_access(uid, args["vault"], required_role="writer")
+    """Freeze a table_query publication's current result into S3 and flip
+    its mode to ``snapshot``. Identified by ``slug`` alone — the owning
+    vault is looked up from the publication row, and writer access on
+    that vault is required.
+
+    Returns the updated publication dict (``mode='snapshot'``,
+    ``snapshot_at`` set).
+    """
     slug = args["slug"]
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Bind to the authorized vault — without it a writer on `vault`
-        # could snapshot (force-execute) any publication by slug.
         row = await conn.fetchrow(
-            "SELECT id FROM publications WHERE slug = $1 AND vault_id = $2",
-            slug, access["vault_id"],
+            "SELECT p.id, p.vault_id, v.name AS vault_name "
+            "  FROM publications p JOIN vaults v ON v.id = p.vault_id "
+            " WHERE p.slug = $1",
+            slug,
         )
     if not row:
         return err(f"Publication not found: {slug}", code=NOT_FOUND)
+    await check_vault_access(uid, row["vault_name"], required_role="writer")
     try:
         return await publication_service.create_snapshot(
-            row["id"], expected_vault_id=access["vault_id"],
+            row["id"], expected_vault_id=row["vault_id"],
         )
     except publication_service.PublicationError as e:
         return err(e.message, code=INVALID_ARGUMENT)
-    except Exception as e:
-        return err(str(e), code=INVALID_ARGUMENT)
 
 
 @_h("akb_vault_info")

@@ -12,28 +12,11 @@ import {
   Table as TableIcon,
   Trash2,
 } from "lucide-react";
-import { listPublications, deletePublication, getDocument } from "@/lib/api";
+import { listPublications, deletePublication, getDocument, type Publication } from "@/lib/api";
 import { parseDocUri, parseFileUri } from "@/lib/uri";
 import { timeAgo } from "@/lib/utils";
 import { EmptyState } from "@/components/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-
-interface Publication {
-  publication_id: string;
-  slug: string;
-  resource_type: "document" | "file" | "table_query";
-  // Canonical handle (akb://{vault}/{doc|file}/{...}). Null for
-  // table_query publications, which have no single addressable resource.
-  resource_uri?: string | null;
-  title?: string;
-  created_at?: string;
-  expires_at?: string | null;
-  max_views?: number | null;
-  view_count?: number;
-  password_protected?: boolean;
-  public_url: string;
-  public_url_full?: string | null;
-}
 
 const RESOURCE_ICON: Record<Publication["resource_type"], React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>> = {
   document: FileText,
@@ -96,9 +79,9 @@ export default function PublicationsPage() {
 
   async function confirmRevoke() {
     if (!name || !pendingRevoke) return;
-    setRevokingId(pendingRevoke.publication_id);
+    setRevokingId(pendingRevoke.slug);
     try {
-      await deletePublication(name, pendingRevoke.publication_id);
+      await deletePublication(name, pendingRevoke.slug);
       await load(name);
     } finally {
       setRevokingId(null);
@@ -106,12 +89,8 @@ export default function PublicationsPage() {
   }
 
   function copyLink(pub: Publication) {
-    // Prefer the absolute URL the server advertises so shared links work
-    // regardless of where the viewer pastes them. Fall back to the relative
-    // /p/<slug> path when AKB_PUBLIC_BASE_URL isn't configured server-side.
-    const url = pub.public_url_full || `${location.origin}${pub.public_url}`;
-    navigator.clipboard.writeText(url);
-    setCopiedId(pub.publication_id);
+    navigator.clipboard.writeText(pub.share_url);
+    setCopiedId(pub.slug);
     setTimeout(() => setCopiedId(null), 1500);
   }
 
@@ -172,7 +151,7 @@ export default function PublicationsPage() {
               const Icon = RESOURCE_ICON[p.resource_type];
               return (
                 <li
-                  key={p.publication_id}
+                  key={p.slug}
                   className="grid grid-cols-[32px_1fr_auto] items-baseline gap-4 px-3 py-3"
                 >
                   <span className="coord tabular-nums">
@@ -219,7 +198,7 @@ export default function PublicationsPage() {
                       aria-label="Copy public link"
                       className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
-                      {copiedId === p.publication_id ? (
+                      {copiedId === p.slug ? (
                         <>
                           <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden />
                           Copied
@@ -232,7 +211,7 @@ export default function PublicationsPage() {
                       )}
                     </button>
                     <a
-                      href={p.public_url}
+                      href={p.share_url}
                       target="_blank"
                       rel="noopener noreferrer"
                       aria-label="Open public page"
@@ -243,16 +222,16 @@ export default function PublicationsPage() {
                     </a>
                     <button
                       onClick={() => setPendingRevoke(p)}
-                      disabled={revokingId === p.publication_id}
+                      disabled={revokingId === p.slug}
                       aria-label="Unpublish"
                       className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive transition-colors cursor-pointer disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
-                      {revokingId === p.publication_id ? (
+                      {revokingId === p.slug ? (
                         <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
                       ) : (
                         <Trash2 className="h-3 w-3" aria-hidden />
                       )}
-                      {revokingId === p.publication_id ? "Unpub…" : "Unpub"}
+                      {revokingId === p.slug ? "Unpub…" : "Unpub"}
                     </button>
                   </div>
                 </li>

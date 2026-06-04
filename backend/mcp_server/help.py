@@ -325,20 +325,32 @@ Create shareable URLs accessible without authentication. Supports
 expiration, password protection, view limits, snapshot mode, and
 section filters.
 
+Every CRUD call returns the same canonical publication dict — `slug`
+is the only identifier you need, `share_url` is always absolute.
+
 ## Document share (default)
 ```
 akb_publish(uri="akb://eng/doc/specs/api.md")
-→ {"slug": "abc123", "public_url": "/p/abc123"}
+→ {
+    "slug": "abc123",
+    "share_url": "https://akb.example.com/p/abc123",
+    "resource_type": "document",
+    "resource_uri": "akb://eng/doc/specs/api.md",
+    "vault": "eng",
+    "mode": "live",
+    "password_protected": false,
+    ...
+  }
 ```
 
 ## Document share with options
 ```
 akb_publish(
     uri="akb://eng/doc/specs/api.md",
-    expires_in="7d",       # auto-expire
-    password="secret",     # bcrypt-hashed
-    max_views=100,         # limit
-    section="Architecture",# render only this heading section
+    expires_in="7d",          # auto-expire
+    password="secret",        # bcrypt-hashed
+    max_views=100,            # limit
+    section_filter="Architecture",  # render only this heading section
     title="Custom title"
 )
 ```
@@ -361,7 +373,7 @@ akb_publish(
 ## File share
 ```
 akb_publish(uri="akb://docs/file/<file_uuid>", resource_type="file")
-# /p/{slug} returns metadata; /p/{slug}/download → 302 to S3 presigned URL
+# /p/{slug} returns metadata; /p/{slug}/download streams the bytes
 ```
 
 ## List + manage shares
@@ -369,18 +381,19 @@ akb_publish(uri="akb://docs/file/<file_uuid>", resource_type="file")
 akb_publications(vault="eng")                            # All publications in vault
 akb_publications(vault="eng", resource_type="file")      # Filter by type
 
-akb_unpublish(slug="abc123")                       # Remove specific share
-akb_unpublish(uri="akb://eng/doc/specs/api.md")    # Remove all shares for a doc
+akb_unpublish(slug="abc123")                       # Remove one specific share
+akb_unpublish(uri="akb://eng/doc/specs/api.md")    # Remove every share for a doc
+akb_unpublish(uri="akb://docs/file/<uuid>")        # Remove every share for a file
+# → {"deleted": N}
 ```
 
 ## Snapshot mode (table_query only)
 Freeze a query result to S3 — survives backend restarts and reduces
-load. Subsequent /p/{slug} returns the cached snapshot.
+load. Subsequent /p/{slug} returns the cached snapshot. Snapshot is a
+state transition, not a publish-time option:
 ```
-akb_publish(vault="sales", resource_type="table_query",
-            query_sql="SELECT ...", mode="snapshot")
-# Or convert an existing share to snapshot:
-akb_publication_snapshot(vault="sales", slug="abc123")
+akb_publication_snapshot(slug="abc123")
+# → publication dict with mode='snapshot', snapshot_at set
 ```
 
 💡 Shares can be embedded via `<iframe src="/p/{slug}/embed">` or
@@ -1115,17 +1128,29 @@ Find commit hashes via:
     "akb_publish": """# akb_publish — Create a Public Share
 
 Create a shareable URL accessible without authentication. Supports
-documents, table queries, and files.
+documents, files, and table queries. Returns the canonical publication
+dict — `slug` is the only identifier you need, `share_url` is always
+absolute and ready to paste.
 
 ## Document
 ```
 akb_publish(uri="akb://v/doc/specs/api.md")
-→ {"slug": "abc123", "public_url": "/p/abc123", "publication_id": "..."}
+→ {
+    "slug": "abc123",
+    "share_url": "https://akb.example.com/p/abc123",
+    "resource_type": "document",
+    "resource_uri": "akb://v/doc/specs/api.md",
+    "vault": "v",
+    "mode": "live",
+    "view_count": 0,
+    "password_protected": false,
+    ...
+  }
 
 # With options
 akb_publish(uri="akb://v/doc/specs/api.md",
             expires_in="7d", password="secret",
-            max_views=100, section="Architecture")
+            max_views=100, section_filter="Architecture")
 ```
 
 ## Table query (canned SQL with URL parameters)
@@ -1139,7 +1164,7 @@ akb_publish(vault="sales", resource_type="table_query",
 ## File
 ```
 akb_publish(uri="akb://docs/file/<uuid>", resource_type="file")
-# /p/{slug} returns metadata; /p/{slug}/download → 302 to S3
+# /p/{slug} returns metadata; /p/{slug}/download streams the file bytes
 ```
 
 ## Options
@@ -1149,18 +1174,24 @@ akb_publish(uri="akb://docs/file/<uuid>", resource_type="file")
 | `password` | bcrypt-hashed; visitors must POST /p/{slug}/auth |
 | `max_views` | auto-expire after N views |
 | `title` | display title override |
-| `mode` | 'live' (default) or 'snapshot' (table_query only) |
-| `section` | (document) filter to a heading section |
-| `allow_embed` | true (default) — set false to block iframe/oEmbed |""",
+| `section_filter` | (document) filter to a heading section |
+| `allow_embed` | true (default) — set false to block iframe/oEmbed |
 
-    "akb_unpublish": """# akb_unpublish — Delete a Public Share
+Note: publications are always created in `mode='live'`. To freeze a
+table_query publication's result, call `akb_publication_snapshot` afterwards.""",
+
+    "akb_unpublish": """# akb_unpublish — Delete Publication(s)
 
 ```
-akb_unpublish(slug="abc123")                       # Remove specific share
-akb_unpublish(uri="akb://v/doc/specs/api.md")      # Remove all shares for a document
+akb_unpublish(slug="abc123")                       # Remove this one publication
+akb_unpublish(uri="akb://v/doc/specs/api.md")      # Remove every share for a doc
+akb_unpublish(uri="akb://v/file/<uuid>")           # Remove every share for a file
+→ {"deleted": N}
 ```
 
-The shareable URL stops working immediately.""",
+Removing by `uri` is handy when you re-publish a resource and want to
+clear stale shares first. table_query publications have no resource
+URI — remove them by `slug`.""",
 
     "akb_publications": """# akb_publications — List Publications
 
@@ -1171,20 +1202,20 @@ akb_publications(vault="v", resource_type="file")
 akb_publications(vault="v", resource_type="table_query")
 ```
 
-Returns each share's id, slug, resource_type, title, view_count,
-max_views, expires_at, mode, password_protected.""",
+Each item is the canonical publication dict — same shape `akb_publish`
+returns. The fields you'll typically read: `slug`, `share_url`, `title`,
+`resource_type`, `view_count`, `expires_at`, `mode`, `password_protected`.""",
 
     "akb_publication_snapshot": """# akb_publication_snapshot — Freeze a Table Query Publication
 
 Execute a table_query share's SQL once and store the result in S3.
 Subsequent /p/{slug} returns the cached snapshot — survives backend
-restarts and reduces DB load.
+restarts and reduces DB load. Identified by `slug` alone; the owning
+vault is resolved automatically and writer access is verified.
 
 ```
-akb_publication_snapshot(vault="sales", slug="abc123")
-→ {"snapshot_s3_key": "snapshots/<uuid>.json",
-   "snapshot_at": "2026-04-11T...",
-   "rows": 123}
+akb_publication_snapshot(slug="abc123")
+→ publication dict with mode='snapshot' and snapshot_at set
 ```
 
 Only applies to resource_type='table_query'.""",

@@ -45,26 +45,24 @@ curl -s --max-time 20 -X POST "$AKB_URL/tables/$VA" "${AUTH1[@]}" "${JSON[@]}" \
 echo "  user1=$U1 vaultA=$VA · user2=$U2 vaultB=$VB"
 echo ""
 
-create_pub() { # vault, body, authvar... -> prints "slug publication_id"; auth passed via global AUTHx
+create_pub() { # vault, body, authvar... -> prints the slug (unique identifier); auth passed via global AUTHx
   local vault="$1" body="$2"; shift 2
   curl -s --max-time 20 -X POST "$AKB_URL/api/v1/publications/$vault/create" "$@" "${JSON[@]}" -d "$body" \
     | python3 -c 'import sys,json
 try:
-    d=json.load(sys.stdin)
+    print(json.load(sys.stdin).get("slug","") or "")
 except Exception:
-    print("",""); raise SystemExit
-print(d.get("slug","") or "", d.get("publication_id","") or "")' 2>/dev/null
+    print("")' 2>/dev/null
 }
 
 # ── P0-1: public table_query leaks a system table ─────────────────────
 echo "▸ P0-1: public table_query runs against system tables (data exfiltration)"
-read -r SLUG1 PID1 < <(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT count(*) AS n FROM users\",\"title\":\"leak\"}" "${AUTH1[@]}")
+SLUG1=$(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT count(*) AS n FROM users\",\"title\":\"leak\"}" "${AUTH1[@]}")
 if [ -z "$SLUG1" ]; then
   verdict "P0-1" "SAFE" "publication creation rejected the system-table query (slug empty)"
 else
   BODY=$(curl -s --max-time 20 "$AKB_URL/api/v1/public/$SLUG1")
-  WHO=$(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT current_user AS who\",\"title\":\"who\"}" "${AUTH1[@]}")
-  WHOSLUG=$(echo "$WHO" | awk '{print $1}')
+  WHOSLUG=$(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT current_user AS who\",\"title\":\"who\"}" "${AUTH1[@]}")
   WHOBODY=$(curl -s --max-time 20 "$AKB_URL/api/v1/public/$WHOSLUG")
   ROLE=$(echo "$WHOBODY" | python3 -c 'import sys,json
 try:
@@ -86,17 +84,15 @@ echo ""
 
 # ── P0-3: delete_publication IDOR (writer on B deletes A's publication) ─
 echo "▸ P0-3: delete_publication ignores vault binding (IDOR)"
-read -r SLUG3 PID3 < <(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT label FROM items\",\"title\":\"idor-target\"}" "${AUTH1[@]}")
-if [ -z "$PID3" ]; then
+SLUG3=$(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT label FROM items\",\"title\":\"idor-target\"}" "${AUTH1[@]}")
+if [ -z "$SLUG3" ]; then
   echo "  (could not create target publication; skipping)"
 else
   # user2 has zero access to vault A; deletes A's pub via the vault-B route.
   DEL=$(curl -s --max-time 20 -o /dev/null -w "%{http_code}" -X DELETE \
-    "$AKB_URL/api/v1/publications/$VB/$PID3" "${AUTH2[@]}")
-  DELBODY=$(curl -s --max-time 20 "$AKB_URL/api/v1/public/$SLUG3" -o /dev/null -w "%{http_code}")
-  # If the pub is now gone (public view 404) AND the delete returned 200, it was deleted cross-vault.
+    "$AKB_URL/api/v1/publications/$VB/$SLUG3" "${AUTH2[@]}")
   STILL=$(curl -s --max-time 20 -X GET "$AKB_URL/api/v1/publications/$VA" "${AUTH1[@]}" \
-    | python3 -c "import sys,json;print(sum(1 for p in json.load(sys.stdin).get('publications',[]) if p.get('publication_id')=='$PID3'))" 2>/dev/null)
+    | python3 -c "import sys,json;print(sum(1 for p in json.load(sys.stdin).get('publications',[]) if p.get('slug')=='$SLUG3'))" 2>/dev/null)
   if [ "$STILL" = "0" ]; then
     verdict "P0-3" "VULNERABLE" "user2 (no access to A) deleted A's publication via /publications/$VB/ (http=$DEL)"
   else
@@ -107,12 +103,12 @@ echo ""
 
 # ── P0-4: create_snapshot cross-vault ─────────────────────────────────
 echo "▸ P0-4: create_snapshot ignores vault binding (cross-vault execution)"
-read -r SLUG4 PID4 < <(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT label FROM items\",\"title\":\"snap-target\"}" "${AUTH1[@]}")
-if [ -z "$PID4" ]; then
+SLUG4=$(create_pub "$VA" "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT label FROM items\",\"title\":\"snap-target\"}" "${AUTH1[@]}")
+if [ -z "$SLUG4" ]; then
   echo "  (could not create target publication; skipping)"
 else
   SNAP=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" -X POST \
-    "$AKB_URL/api/v1/publications/$VB/$PID4/snapshot" "${AUTH2[@]}")
+    "$AKB_URL/api/v1/publications/$VB/$SLUG4/snapshot" "${AUTH2[@]}")
   # A vault-bound impl rejects the cross-vault publication with 404 BEFORE
   # ever touching the query/S3. Anything else (200 success, or 400/500 from
   # reaching the S3 step) means the vault binding was not enforced. Note the

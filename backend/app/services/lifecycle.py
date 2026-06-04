@@ -27,6 +27,12 @@ def _validate_required_settings() -> None:
         missing.append("AKB_JWT_SECRET (signs auth tokens — use a strong random string)")
     if not settings.db_password:
         missing.append("AKB_DB_PASSWORD")
+    if not settings.public_base_url:
+        missing.append(
+            "AKB_PUBLIC_BASE_URL (ingress origin — required so every "
+            "publication response carries an absolute share_url; e.g. "
+            "https://akb.example.com)"
+        )
     if missing:
         raise RuntimeError(
             "Required configuration missing:\n  - " + "\n  - ".join(missing)
