@@ -5,6 +5,152 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.0 — 2026-06-04  *(BREAKING — publication tool surface rewritten)*
+
+The `akb_publish` / `akb_unpublish` / `akb_publications` /
+`akb_publication_snapshot` quartet had accumulated several
+inconsistencies that confused agent callers: response shapes differed
+between the four tools, `publication_id` and `slug` competed for the
+"identifier" role, `public_url` / `public_url_full` / `public_base`
+all came back together with a null-fallback contract, the `mode`
+option overlapped with the dedicated snapshot tool, and
+`akb_unpublish(uri=...)` silently rejected file URIs (a bug, not a
+design choice). This release replaces the whole surface with a single,
+consistent shape.
+
+### One canonical publication dict
+
+Every endpoint (`akb_publish`, `akb_publications`,
+`akb_publication_snapshot`, `POST /publications/{vault}/create`,
+`GET /publications/{vault}`) now returns the exact same dict shape:
+
+```jsonc
+{
+  "slug": "...",                  // sole external identifier
+  "share_url": "https://...",     // always absolute (see below)
+  "resource_type": "document|file|table_query",
+  "resource_uri": "akb://...|null",
+  "vault": "...",                 // human-readable vault name
+  "title": "...|null",
+  "mode": "live|snapshot",
+  "expires_at": "...|null",
+  "max_views": null|N,
+  "view_count": 0,
+  "allow_embed": true,
+  "section_filter": "...|null",
+  "password_protected": false,
+  "created_at": "...",
+  "snapshot_at": "...|null",
+  // table_query only:
+  "query_sql": "...|null",
+  "query_vault_names": [...]|null,
+  "query_params": {...}
+}
+```
+
+**Removed fields** (no longer surfaced to any client):
+`publication_id`, `public_url`, `public_url_full`, `public_base`,
+`snapshot_s3_key`.
+
+**Internal-vs-public dict boundary**: `publication_service` now has
+exactly two helpers — `_row_to_internal_dict(row)` for code that needs
+`id` / `password_hash` / `snapshot_s3_key` (route password check,
+S3 fetch), and `to_public_dict(internal)` for every response. There
+is no `_enrich_publication` post-processing step anymore.
+
+### `AKB_PUBLIC_BASE_URL` is now startup-required
+
+`share_url` is always an absolute URL. The lifespan refuses to start
+if `AKB_PUBLIC_BASE_URL` is unset (alongside `AKB_JWT_SECRET` and
+`AKB_DB_PASSWORD`). No nullable URL field, no fallback chain, no
+client-side string concatenation.
+
+### `akb_unpublish(uri=...)` now accepts file URIs
+
+The old code path called `split_uri(uri, expected_type="doc")`,
+silently rejecting file URIs even though `akb_publish(uri=file_uri)`
+worked. Now the URI's `kind` drives the cascade:
+`doc` → `delete_publications_for_document`,
+`file` → `delete_publications_for_file` (previously defined but never
+called). table_query publications have no resource URI, so they
+remain slug-only.
+
+Response is now `{"deleted": N}` (was a mix of
+`{"published": false, "deleted": bool}` and `{"published": false,
+"deleted_publications": N}`).
+
+### `mode` is no longer a publish-time option
+
+`akb_publish` and `POST /publications/{vault}/create` no longer accept
+a `mode` parameter. Every publication is created with `mode='live'`.
+Snapshot is a state transition reached through
+`akb_publication_snapshot(slug=...)` — the only path that ever made
+sense, since `mode='snapshot'` at create time meant nothing for
+document/file publications.
+
+### REST `publication_id` URL params replaced with `slug`
+
+`DELETE /publications/{vault}/{publication_id}` →
+`DELETE /publications/{vault}/{slug}`.
+`POST /publications/{vault}/{publication_id}/snapshot` →
+`POST /publications/{vault}/{slug}/snapshot`.
+
+The internal-only `publication_id` UUID is no longer accepted as a URL
+path identifier, no longer returned in responses, and no longer
+expected as an unpublish input — `slug` is the single external handle.
+
+### `akb_publication_snapshot` input simplified
+
+Accepts only `{slug}`. The owning vault is resolved from the
+publication row and writer access is verified against it (no need
+for the caller to pass `vault` — and the prior surface let a writer
+on vault A trigger a snapshot of vault B's publication when they
+guessed the slug, which is now structurally impossible).
+
+### `section` → `section_filter`
+
+The `akb_publish` / REST publish input now uses `section_filter`,
+matching the response field name and the DB column. Document-only.
+
+### Frontend response keys migrated
+
+`frontend/src/lib/api.ts` exports a typed `Publication` interface
+matching the new dict. `frontend/src/pages/publications.tsx` uses
+`p.slug` for all keying and `p.share_url` for the "Copy link"
+button. `frontend/src/components/publish-options-dialog.tsx` already
+read `result.slug`, so it was unchanged.
+
+### Migration
+
+Callers using the MCP tools:
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `akb_publish(..., mode="snapshot")` | `akb_publish(...)` then `akb_publication_snapshot(slug=...)` |
+| `akb_publish(..., section="...")` | `akb_publish(..., section_filter="...")` |
+| `akb_publication_snapshot(vault=..., slug=...)` | `akb_publication_snapshot(slug=...)` |
+| reading `result.public_url_full` | `result.share_url` |
+| reading `result.publication_id` | `result.slug` (it was always the right identifier) |
+
+REST callers:
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `DELETE /publications/{vault}/{publication_id}` | `DELETE /publications/{vault}/{slug}` |
+| `POST /publications/{vault}/{publication_id}/snapshot` | `POST /publications/{vault}/{slug}/snapshot` |
+| `POST /publications/{vault}/create` body `{section: ...}` | `{section_filter: ...}` |
+| `POST /publications/{vault}/create` body `{mode: ...}` | (removed — call snapshot endpoint) |
+
+### Tests
+
+`backend/tests/test_publications_e2e.sh` reshaped end-to-end (slug-only
+routes, response-shape assertions for the removed fields, new
+`akb_unpublish(uri=file_uri)` regression test that exercises the bug
+the prior surface couldn't fix). `backend/tests/concurrency/repro_pub_security.sh`
+moved off `publication_id` onto `slug`.
+
+---
+
 ## 0.5.8 — 2026-06-04  *(minor breaking — `query` alias removed)*
 
 Whole-repo "half-done migration" sweep. The 0.5.4–0.5.7 stream

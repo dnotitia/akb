@@ -89,14 +89,28 @@ echo "▸ 1. Document Publication"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\"}")
-DOC_PID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("publication_id",""))' 2>/dev/null)
 DOC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-[ -n "$DOC_PID" ] && pass "Create document publication" || fail "Create doc pub" "$R"
-[ -n "$DOC_SLUG" ] && pass "Slug returned" || fail "Slug" "missing"
+[ -n "$DOC_SLUG" ] && pass "Create document publication" || fail "Create doc pub" "$R"
 
-# Response shape: must have publication_id NOT id
-HAS_ID=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if "id" in d else "no")' 2>/dev/null)
-[ "$HAS_ID" = "no" ] && pass "Response excludes deprecated 'id' field" || fail "Response shape" "leaks 'id'"
+# Response shape: canonical public dict only — no internal/legacy fields.
+LEAKS=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+forbidden = ["id", "publication_id", "public_url", "public_url_full",
+             "public_base", "snapshot_s3_key", "password_hash", "vault_id"]
+print(",".join(k for k in forbidden if k in d))' 2>/dev/null)
+[ -z "$LEAKS" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "leaks $LEAKS"
+
+# share_url is always absolute (AKB_PUBLIC_BASE_URL is startup-required).
+SU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("share_url",""))' 2>/dev/null)
+case "$SU" in
+  http://*|https://*) pass "share_url is absolute ($SU)" ;;
+  *) fail "share_url" "not absolute: $SU" ;;
+esac
+
+# vault name is on the publication
+PV=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("vault",""))' 2>/dev/null)
+[ "$PV" = "$VAULT" ] && pass "vault name surfaced on response" || fail "vault field" "$PV"
 
 # Resolve via /public/{slug} (no auth)
 R=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG")
@@ -117,7 +131,7 @@ echo ""
 echo "▸ 2. Section filter"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"Alpha\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"Alpha\"}")
 SEC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 
 R=$(curl -sk "$BASE_URL/api/v1/public/$SEC_SLUG")
@@ -131,7 +145,7 @@ SF=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("se
 
 # Non-existent section → fallback to full content
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"Nonexistent\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"Nonexistent\"}")
 FAKE_SEC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 R=$(curl -sk "$BASE_URL/api/v1/public/$FAKE_SEC_SLUG")
 CONTENT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' 2>/dev/null)
@@ -240,14 +254,14 @@ R=$(acurl "$BASE_URL/api/v1/publications/$VAULT?resource_type=document")
 DOC_COUNT=$(echo "$R" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["publications"]))' 2>/dev/null)
 [ "$DOC_COUNT" -gt 0 ] && pass "Filter by resource_type=document ($DOC_COUNT)" || fail "Filter doc" "$DOC_COUNT"
 
-# Delete one
-acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/$DOC_PID" >/dev/null
+# Delete by slug (the only external identifier)
+acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/$DOC_SLUG" >/dev/null
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_SLUG")
 [ "$CODE" = "404" ] && pass "Deleted publication → 404" || fail "Delete" "HTTP $CODE"
 
-# Invalid publication_id format
-CODE=$(acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/not-a-uuid" -o /dev/null -w "%{http_code}")
-[ "$CODE" = "400" ] && pass "Invalid publication_id → 400" || fail "Invalid ID" "HTTP $CODE"
+# Unknown slug → 404
+CODE=$(acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/totally-bogus-slug" -o /dev/null -w "%{http_code}")
+[ "$CODE" = "404" ] && pass "Unknown slug delete → 404" || fail "Unknown slug delete" "HTTP $CODE"
 
 echo ""
 
@@ -256,7 +270,6 @@ echo "▸ 7. Table query publication"
 
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d '{"resource_type":"table_query","query_sql":"SELECT name, category, price FROM products WHERE category = :cat AND price >= :min ORDER BY price DESC","query_params":{"cat":{"type":"text","default":"food"},"min":{"type":"number","default":0}},"title":"Products"}')
-TQ_PID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publication_id"])' 2>/dev/null)
 TQ_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 [ -n "$TQ_SLUG" ] && pass "Create table_query publication" || fail "TQ create" "$R"
 
@@ -302,10 +315,16 @@ echo ""
 # ── 8. Snapshot Mode ──────────────────────────────────────
 echo "▸ 8. Snapshot mode"
 
-# Create snapshot from existing publication
-R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$TQ_PID/snapshot")
-SS_KEY=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("snapshot_s3_key",""))' 2>/dev/null)
-[ -n "$SS_KEY" ] && pass "Snapshot created ($SS_KEY)" || fail "Snapshot create" "$R"
+# Create snapshot from existing publication (slug-based, no UUID)
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$TQ_SLUG/snapshot")
+SS_MODE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode",""))' 2>/dev/null)
+SS_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("snapshot_at",""))' 2>/dev/null)
+[ "$SS_MODE" = "snapshot" ] && pass "Snapshot response mode=snapshot" || fail "Snapshot mode" "$SS_MODE"
+[ -n "$SS_AT" ] && pass "Snapshot response carries snapshot_at" || fail "Snapshot at" "$SS_AT"
+
+# Snapshot response must not leak the internal s3 key
+HAS_S3=$(echo "$R" | python3 -c 'import json,sys; print("yes" if "snapshot_s3_key" in json.load(sys.stdin) else "no")' 2>/dev/null)
+[ "$HAS_S3" = "no" ] && pass "Snapshot response hides snapshot_s3_key" || fail "Snapshot leak" "exposes s3 key"
 
 # After snapshot, /public returns mode=snapshot
 R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
@@ -322,8 +341,8 @@ echo "$ROWS" | grep -q "SnapTest" && fail "Snapshot freeze" "leaked new data" ||
 # snapshot only supported for table_query
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\"}")
-DOCPID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publication_id"])' 2>/dev/null)
-CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$DOCPID/snapshot" -o /dev/null -w "%{http_code}")
+DOC_SLUG_FOR_SNAP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$DOC_SLUG_FOR_SNAP/snapshot" -o /dev/null -w "%{http_code}")
 [ "$CODE" = "400" ] && pass "Snapshot rejected for document publication" || fail "Snapshot doc" "HTTP $CODE"
 
 echo ""
@@ -350,9 +369,10 @@ DLURL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(
 RAW=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
 echo "$RAW" | grep -q '"hello":"world"' && pass "/raw streams JSON content" || fail "/raw" "$RAW"
 
-# /download → 302 to S3
+# /download streams the bytes through the backend (mixed-content safe);
+# 0.5.x flipped from "302 to S3 presigned" to a same-origin stream.
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SLUG/download")
-[ "$CODE" = "302" ] && pass "/download → 302 redirect" || fail "/download" "HTTP $CODE"
+[ "$CODE" = "200" ] && pass "/download streams (200)" || fail "/download" "HTTP $CODE"
 
 # Invalid file_id format
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -365,7 +385,7 @@ echo ""
 # ── 10. Embed + oEmbed ────────────────────────────────────
 echo "▸ 10. Embed + oEmbed"
 
-R=$(curl -sk "$BASE_URL/api/v1/public/$DOCPID/embed" 2>&1 || true)
+R=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed" 2>&1 || true)
 # embed returns the same shape with embed: true
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG/embed")
 [ "$CODE" = "200" ] && pass "/embed returns 200 for allowed publication" || fail "/embed" "HTTP $CODE"
@@ -416,7 +436,7 @@ CODE=$?
 echo "$R" | grep -qi "not found\|404" && pass "Non-existent doc_id rejected" || fail "Bad doc_id" "$R"
 
 # Snapshot of non-existent publication
-CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/00000000-0000-0000-0000-000000000000/snapshot" \
+CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/totally-bogus-slug/snapshot" \
   -o /dev/null -w "%{http_code}")
 [ "$CODE" = "404" ] && pass "Snapshot non-existent → 404" || fail "Snapshot 404" "HTTP $CODE"
 
@@ -480,29 +500,59 @@ R=$(mcp 11 akb_publications "{\"vault\":\"$VAULT\"}" | mcp_text)
 PUB_TOTAL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("total",0))' 2>/dev/null)
 [ "$PUB_TOTAL" -gt 0 ] && pass "MCP akb_publications list ($PUB_TOTAL)" || fail "MCP list" "$R"
 
-# akb_publication_snapshot — takes vault + slug
+# akb_publication_snapshot — slug alone (vault inferred from row)
 TQ_SLUG_MCP=$(mcp 12 akb_publish "{\"vault\":\"$VAULT\",\"resource_type\":\"table_query\",\"query_sql\":\"SELECT name FROM products\"}" | mcp_text | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-R=$(mcp 13 akb_publication_snapshot "{\"vault\":\"$VAULT\",\"slug\":\"$TQ_SLUG_MCP\"}" | mcp_text)
-SS_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("snapshot_at",""))' 2>/dev/null)
-[ -n "$SS_AT" ] && pass "MCP akb_publication_snapshot" || fail "MCP snapshot" "$R"
+R=$(mcp 13 akb_publication_snapshot "{\"slug\":\"$TQ_SLUG_MCP\"}" | mcp_text)
+SS_MODE_MCP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode"))' 2>/dev/null)
+[ "$SS_MODE_MCP" = "snapshot" ] && pass "MCP akb_publication_snapshot returns publication dict" || fail "MCP snapshot" "$R"
 
-# akb_unpublish by slug
+# akb_unpublish by slug — returns {deleted: N}
 R=$(mcp 14 akb_publications "{\"vault\":\"$VAULT\",\"resource_type\":\"document\"}" | mcp_text)
 ANY_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publications"][0]["slug"])' 2>/dev/null)
 R=$(mcp 15 akb_unpublish "{\"slug\":\"$ANY_SLUG\"}" | mcp_text)
 DEL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
-[ "$DEL" = "True" ] && pass "MCP akb_unpublish by slug" || fail "MCP unpublish" "$R"
+[ "$DEL" = "1" ] && pass "MCP akb_unpublish by slug → deleted=1" || fail "MCP unpublish" "$R"
+
+# akb_unpublish rejects unknown args (e.g. legacy `mode`)
+R=$(mcp 16 akb_publish "{\"uri\":\"$DOC_URI\",\"mode\":\"snapshot\"}" | mcp_text)
+echo "$R" | grep -qi "unknown argument" && pass "MCP akb_publish: legacy 'mode' rejected" || fail "MCP legacy mode" "$R"
+
+# akb_publish response has share_url (absolute), no public_url/publication_id
+R=$(mcp 17 akb_publish "{\"uri\":\"$DOC_URI\"}" | mcp_text)
+MCP_SHARE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("share_url",""))' 2>/dev/null)
+case "$MCP_SHARE" in
+  http://*|https://*) pass "MCP akb_publish: share_url absolute" ;;
+  *) fail "MCP share_url" "$MCP_SHARE" ;;
+esac
+LEAKS=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+forbidden = ["publication_id","public_url","public_url_full","public_base"]
+print(",".join(k for k in forbidden if k in d))' 2>/dev/null)
+[ -z "$LEAKS" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "$LEAKS"
+
+# akb_unpublish by FILE uri — the bug case that 0.5.x silently rejected.
+FU_RES=$(mcp 18 akb_publish "{\"uri\":\"$FILE_URI\",\"resource_type\":\"file\"}" | mcp_text)
+FU_SLUG=$(echo "$FU_RES" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+[ -n "$FU_SLUG" ] && pass "MCP akb_publish(file uri) creates slug" || fail "File pub via MCP" "$FU_RES"
+R=$(mcp 19 akb_unpublish "{\"uri\":\"$FILE_URI\"}" | mcp_text)
+DEL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
+[ "$DEL" -ge 1 ] 2>/dev/null && pass "MCP akb_unpublish(file uri) deletes ≥1" || fail "MCP file uri unpublish" "$R"
+# And the share now 404s
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FU_SLUG")
+[ "$CODE" = "404" ] && pass "Unpublished file share → 404" || fail "File unpub 404" "HTTP $CODE"
 
 echo ""
 
 # ── 13. Additional edge cases ─────────────────────────────
 echo "▸ 13. Additional edge cases"
 
-# Invalid mode value
-R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"mode\":\"banana\"}")
-ERR=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("detail") or d.get("error",""))' 2>/dev/null)
-echo "$ERR" | grep -qi "invalid mode" && pass "Invalid mode rejected" || fail "Invalid mode" "$R"
+# `mode` is no longer a publish-time option (snapshot is reached via the
+# separate snapshot endpoint). FastAPI rejects extra fields with 422.
+CODE=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"mode\":\"snapshot\"}" \
+  -o /dev/null -w "%{http_code}")
+[ "$CODE" = "422" ] && pass "publish-time mode option removed (422)" || fail "publish mode" "HTTP $CODE"
 
 # Empty query_sql (whitespace only)
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -574,20 +624,19 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PNG_PUB
 # Re-snapshot (should overwrite, not error)
 RS_TQ=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d '{"resource_type":"table_query","query_sql":"SELECT name FROM products LIMIT 1"}')
-RS_PID=$(echo "$RS_TQ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publication_id"])' 2>/dev/null)
-acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$RS_PID/snapshot" > /dev/null
-R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$RS_PID/snapshot")
+RS_SLUG=$(echo "$RS_TQ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$RS_SLUG/snapshot" > /dev/null
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$RS_SLUG/snapshot")
 SS2=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("snapshot_at",""))' 2>/dev/null)
 [ -n "$SS2" ] && pass "Re-snapshot is idempotent" || fail "Re-snapshot" "$R"
 
-# Snapshot with 0 rows
+# Snapshot with 0 rows still flips mode and reports snapshot_at
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"table_query\",\"query_sql\":\"SELECT name FROM products WHERE name = 'NeverExists'\"}")
-EMP_PID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publication_id"])' 2>/dev/null)
 EMP_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
-R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$EMP_PID/snapshot")
-ROWS=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("rows"))' 2>/dev/null)
-[ "$ROWS" = "0" ] && pass "Snapshot 0 rows handled" || fail "Empty snapshot" "$R"
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/$EMP_SLUG/snapshot")
+EMP_MODE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode"))' 2>/dev/null)
+[ "$EMP_MODE" = "snapshot" ] && pass "Snapshot 0 rows flips mode" || fail "Empty snapshot" "$R"
 # Access the empty snapshot
 R=$(curl -sk "$BASE_URL/api/v1/public/$EMP_SLUG")
 TOTAL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("total"))' 2>/dev/null)
@@ -633,7 +682,7 @@ pass "Empty vault deleted (cleanup)"
 
 # section_not_found field is True when filter missing
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section\":\"NoSuchHeading\"}")
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"NoSuchHeading\"}")
 SNF_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 SNF=$(curl -sk "$BASE_URL/api/v1/public/$SNF_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_not_found"))' 2>/dev/null)
 [ "$SNF" = "True" ] && pass "section_not_found=true when filter missing" || fail "section_not_found" "$SNF"

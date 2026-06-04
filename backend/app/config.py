@@ -94,8 +94,11 @@ class Settings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Unset disables absolute URLs in publication responses (MCP clients only
-    # get the relative /p/{slug} path). Set to the Ingress domain in prod.
+    # Ingress origin (e.g. https://akb.example.com). REQUIRED at startup —
+    # publication responses always carry an absolute ``share_url`` built
+    # from this, so MCP clients and agents never have to guess the host.
+    # ``lifecycle._validate_required_settings`` fails the app launch if
+    # this is empty.
     public_base_url: str = ""
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.

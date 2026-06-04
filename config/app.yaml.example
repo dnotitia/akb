@@ -82,9 +82,11 @@ jwt_expire_hours: 24
 host: 0.0.0.0
 port: 8000
 
-# Set to the public ingress URL in production so MCP publication
-# responses include absolute /p/{slug} URLs. Leave blank for local dev.
-public_base_url: ""
+# REQUIRED. Ingress origin used to build absolute share_url values in
+# publication responses (e.g. "https://akb.example.com" in prod,
+# "http://localhost:8000" for docker-compose dev). Backend fails to
+# start if this is empty.
+public_base_url: "http://localhost:8000"
 
 # === Vector store (driver-pluggable) ===
 # Drivers:

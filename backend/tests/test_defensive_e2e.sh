@@ -165,10 +165,10 @@ PUB_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$S
 PUB_CONTENT=$(curl -sk "$BASE_URL/api/v1/public/$SLUG" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Public Content' in d.get('content',''))" 2>/dev/null)
 [ "$PUB_CONTENT" = "True" ] && pass "Public content correct" || fail "Public content" "missing"
 
-# Unpublish
+# Unpublish — 0.6.0 returns {"deleted": N}
 R=$(m "akb_unpublish" "{\"uri\":\"$PUB_DOC_URI\"}")
-UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('published') == False)" 2>/dev/null)
-[ "$UNPUB" = "True" ] && pass "Unpublished" || fail "Unpublish" "$R"
+DEL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
+[ "$DEL" -ge 1 ] 2>/dev/null && pass "Unpublished (deleted=$DEL)" || fail "Unpublish" "$R"
 
 # Public URL should now fail
 UNPUB_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$SLUG")
@@ -256,10 +256,12 @@ DUP_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print
 # Publish already published doc (should be idempotent)
 R=$(m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"idem\",\"title\":\"Idem Doc\",\"content\":\"# Idem\"}")
 IDEM_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
-m "akb_publish" "{\"uri\":\"$IDEM_DOC_URI\"}" >/dev/null
+# 0.6.0: the response is the canonical publication dict; idempotent means
+# both calls succeed and return the same slug.
+FIRST_SLUG=$(m "akb_publish" "{\"uri\":\"$IDEM_DOC_URI\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('slug',''))" 2>/dev/null)
 R=$(m "akb_publish" "{\"uri\":\"$IDEM_DOC_URI\"}")
-IDEM_PUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('published',False))" 2>/dev/null)
-[ "$IDEM_PUB" = "True" ] && pass "Re-publish is idempotent" || fail "Re-publish" "$R"
+SECOND_SLUG=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('slug',''))" 2>/dev/null)
+[ -n "$SECOND_SLUG" ] && pass "Re-publish returns publication dict (slug=$SECOND_SLUG)" || fail "Re-publish" "$R"
 
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
