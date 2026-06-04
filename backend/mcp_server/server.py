@@ -971,12 +971,17 @@ async def _handle_unpublish(args: dict, uid: str, user: _MCPUser) -> dict:
     if args.get("uri"):
         from app.services.uri_service import parse_uri
         parsed = parse_uri(args["uri"])
-        if parsed is None or parsed.kind not in ("doc", "file") or not parsed.identifier:
+        if parsed is None or parsed.kind not in ("doc", "file"):
             return err(
                 f"`uri` must be a doc or file URI (got {parsed.kind if parsed else 'invalid'}: "
                 f"{args['uri']!r}). table_query publications must be removed by slug.",
                 code=INVALID_URI,
             )
+        # Typed URIs (doc/file/table) always carry an identifier — parse_uri
+        # returns None for shapes that don't. The kind check above already
+        # narrowed to doc/file, so this assert is purely to tell the
+        # typechecker what the URI grammar already guarantees.
+        assert parsed.identifier is not None
         await check_vault_access(uid, parsed.vault, required_role="writer")
         if parsed.kind == "doc":
             count = await publication_service.delete_publications_for_document(args["uri"])
