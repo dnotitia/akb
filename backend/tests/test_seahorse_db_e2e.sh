@@ -2,6 +2,24 @@
 #
 # SeahorseDB native driver — smoke E2E against a live Coral coordinator.
 #
+# ⚠ 0.7.1 SHIPPED THIS SCRIPT WITH WRONG WIRE FORMATS.
+# Every request used `/catalog/tables/...` paths (no `/v2`, with
+# `catalog/`) — unmatched in Coral, so axum fell through to the same-
+# port tonic gRPC fallback which returns `HTTP/1.1 200 OK` +
+# `content-type: application/grpc` + `grpc-status: 12`. The status-only
+# checks below counted every call as PASS.
+#
+# 0.7.2 fixed the driver's wire formats (see CHANGELOG) and confirmed
+# them end-to-end via the AKB REST API → embed_worker → Coral. The
+# next PR rewrites this script to:
+#   - assert `content-type: application/json` on every response
+#     (gRPC fallback is the canonical hidden failure on this port)
+#   - use the 0.7.2 corrected schemas (segmentation, JSONL insert,
+#     SQL delete_condition, dense+sparse hybrid configs)
+# Until that ships, this script is INTENTIONALLY a no-op skip even
+# when SEAHORSEDB_CORAL_URL is set, so we don't ship another round
+# of false positives.
+#
 # This test is **opt-in by environment variable**:
 #
 #   SEAHORSEDB_CORAL_URL=http://localhost:46834 bash backend/tests/test_seahorse_db_e2e.sh
@@ -33,6 +51,15 @@ set -uo pipefail
 CORAL_URL="${SEAHORSEDB_CORAL_URL:-}"
 BASE_URL="${AKB_URL:-http://localhost:8000}"
 TABLE="${SEAHORSEDB_TABLE_NAME:-akb_e2e_$(date +%s)}"
+
+echo "==> 0.7.2: this script is intentionally a skip until the wire-format-corrected rewrite ships."
+echo "    See backend/CHANGELOG.md (0.7.2) for the retraction of 0.7.1's false-positive 6/6 PASS."
+echo "    Driver itself was verified end-to-end via the AKB REST API → embed_worker → Coral in 0.7.2."
+exit 0
+
+# Past this line is the old 0.7.1 body — kept for reference only,
+# unreachable. The next PR rewrites it with content-type asserts +
+# the 0.7.2 corrected schemas.
 
 if [ -z "$CORAL_URL" ]; then
     echo "==> SEAHORSEDB_CORAL_URL not set; skipping (this is OK in CI)."
