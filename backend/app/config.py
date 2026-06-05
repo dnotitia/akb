@@ -126,7 +126,7 @@ class Settings(BaseModel):
     # outage stalls the indexing queue. Pick a driver that matches
     # your embedding-availability assumptions.
     vector_store_driver: Literal[
-        "qdrant", "pgvector", "seahorse-cloud", "seahorse-db"
+        "qdrant", "pgvector", "seahorse-cloud", "seahorse-db", "seahorse-db-grpc"
     ] = "qdrant"
 
     # Pgvector driver settings.

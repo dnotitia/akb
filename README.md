@@ -76,10 +76,11 @@ outside.
 │                  Storage Layer                           │
 │   Git bare repos       │  PostgreSQL 16 (text + meta SoT)│
 │                        │  Vector store (driver):         │
-│                        │    pgvector       (default, PG) │
-│                        │    qdrant         (optional)    │
-│                        │    seahorse-cloud (managed)     │
-│                        │    seahorse-db    (self-hosted) │
+│                        │    pgvector        (default, PG)│
+│                        │    qdrant          (optional)   │
+│                        │    seahorse-cloud  (managed)    │
+│                        │    seahorse-db     (self-hosted)│
+│                        │    seahorse-db-grpc(experimental)│
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -196,7 +197,7 @@ configuration** — no environment variables are read by the backend. Mount the
 ### Vector store (driver-pluggable)
 
 Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
-interface. Four drivers ship; pick at config time:
+interface. Five drivers ship; pick at config time:
 
 - **`pgvector`** (default) — uses the same Postgres container that holds
   application data. The pgvector/pgvector image pre-installs the
@@ -222,6 +223,17 @@ interface. Four drivers ship; pick at config time:
   **not** support BM25-only fallback when the embed API is down (its
   sparse path is server-side and structurally coupled to a live embed
   step) — keep an embedding endpoint reachable for this driver.
+- **`seahorse-db-grpc`** *(experimental)* — same Coral coordinator as
+  `seahorse-db`, same `seahorsedb_*` settings, but talks gRPC instead
+  of REST/JSONL. Coral merges axum + tonic onto a single listener so
+  the port doesn't change; only the wire format does. Trades the JSON
+  parsing path (and a class of foot-guns like INT64 sign mismatch and
+  Arrow JSON decoder edge cases) for typed protobuf messages and an
+  Arrow IPC streaming result. Prefer the REST driver for production
+  until the gRPC variant clears its own QPS / recall benchmark. Same
+  CRUD parity with REST (passes the same 25-scenario hybrid e2e), but
+  it has not yet had the production-scale exposure the REST driver
+  has.
 
 [shc]: https://console.seahorse.dnotitia.ai
 

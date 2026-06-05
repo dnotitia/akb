@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package coral.node.v1;
+
+import "coral/catalog/v1/catalog.proto";
+import "coral/common/v1/common.proto";
+
+service NodeService {
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc PingNode(PingNodeRequest) returns (PingNodeResponse);
+  rpc GetVdbResourceUsage(GetVdbResourceUsageRequest) returns (GetVdbResourceUsageResponse);
+  rpc GetNodeSyncErrors(GetNodeSyncErrorsRequest) returns (GetNodeSyncErrorsResponse);
+  rpc GetAllSyncErrors(coral.common.v1.Empty) returns (GetAllSyncErrorsResponse);
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated coral.catalog.v1.NodeRecord nodes = 1;
+}
+
+message GetNodeRequest {
+  string node_name = 1;
+}
+
+message GetNodeResponse {
+  coral.catalog.v1.NodeInfo node = 1;
+}
+
+message PingNodeRequest {
+  string node_name = 1;
+}
+
+message PingNodeResponse {
+  string node_name = 1;
+  string result = 2;
+}
+
+message GetVdbResourceUsageRequest {}
+
+message SegmentResourceUsage {
+  string segment_id = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message TableResourceUsage {
+  string table_name = 1;
+  repeated SegmentResourceUsage segments = 2;
+  uint64 total_memory_bytes = 3;
+  uint64 total_disk_bytes = 4;
+}
+
+message NodeResourceUsage {
+  repeated TableResourceUsage tables = 1;
+  uint64 total_memory_bytes = 2;
+  uint64 total_disk_bytes = 3;
+}
+
+message NodeResourceUsageResult {
+  string node_name = 1;
+  string node_type = 2;
+  optional NodeResourceUsage resource_usage = 3;
+  optional string error = 4;
+}
+
+message GetVdbResourceUsageResponse {
+  repeated NodeResourceUsageResult nodes = 1;
+  uint64 total_memory_bytes = 2;
+  uint64 total_disk_bytes = 3;
+}
+
+message SyncErrorInfo {
+  map<string, coral.common.v1.Int64Values> sync_errors = 1;
+}
+
+message GetNodeSyncErrorsRequest {
+  string node_id = 1;
+}
+
+message GetNodeSyncErrorsResponse {
+  string node_id = 1;
+  SyncErrorInfo sync_error_info = 2;
+}
+
+message GetAllSyncErrorsResponse {
+  repeated GetNodeSyncErrorsResponse nodes = 1;
+}

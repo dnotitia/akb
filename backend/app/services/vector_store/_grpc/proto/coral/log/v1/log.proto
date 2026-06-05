@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package coral.log.v1;
+
+import "coral/common/v1/common.proto";
+
+service LogService {
+  rpc GetLogLevel(coral.common.v1.Empty) returns (LogLevel);
+  rpc SetLogLevel(LogLevel) returns (LogLevel);
+  rpc GetLogConfig(coral.common.v1.Empty) returns (LogConfig);
+  rpc UpdateLogConfig(LogConfigUpdate) returns (LogConfig);
+  rpc RotateLogs(coral.common.v1.Empty) returns (coral.common.v1.Empty);
+}
+
+message LogLevel {
+  string level = 1;
+}
+
+message LogConfig {
+  string output_mode = 1;
+  string stdio_target = 2;
+  string file_path = 3;
+  string file_instance_id = 4;
+  uint64 max_size_mb = 5;
+  uint64 max_files = 6;
+  string suffix_mode = 7;
+  string timestamp_tz = 8;
+  string timestamp_format = 9;
+}
+
+message LogConfigUpdate {
+  optional string output_mode = 1;
+  optional string stdio_target = 2;
+  optional string file_path = 3;
+  optional string file_instance_id = 4;
+  optional uint64 max_size_mb = 5;
+  optional uint64 max_files = 6;
+  optional string suffix_mode = 7;
+  optional string timestamp_tz = 8;
+  optional string timestamp_format = 9;
+}

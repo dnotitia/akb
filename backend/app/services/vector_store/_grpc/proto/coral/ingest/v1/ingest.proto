@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package coral.ingest.v1;
+
+import "coral/common/v1/common.proto";
+import "coral/storage/v1/storage.proto";
+
+service IngestService {
+  rpc InsertJsonl(InsertJsonlRequest) returns (InsertResponse);
+  rpc InsertArrowIpc(stream InsertArrowIpcStreamEvent) returns (InsertResponse);
+  rpc BatchInsertFiles(BatchInsertFilesRequest) returns (BatchInsertFilesResponse);
+  rpc UpdateTableData(UpdateTableDataRequest) returns (coral.common.v1.Empty);
+  rpc DeleteTableData(DeleteTableDataRequest) returns (coral.common.v1.Empty);
+}
+
+message InsertOptions {
+  optional bool use_async_read = 1;
+  optional uint32 reader_batch_size = 2;
+}
+
+message InsertJsonlRequest {
+  string table_name = 1;
+  InsertOptions options = 2;
+  bytes jsonl = 3;
+}
+
+message InsertArrowIpcStreamHeader {
+  string table_name = 1;
+  InsertOptions options = 2;
+}
+
+message InsertArrowIpcStreamChunk {
+  bytes chunk = 1;
+}
+
+message InsertArrowIpcStreamEvent {
+  oneof event {
+    InsertArrowIpcStreamHeader header = 1;
+    InsertArrowIpcStreamChunk chunk = 2;
+  }
+}
+
+message InsertResponse {
+  uint64 inserted_record_batches = 1;
+  uint64 inserted_row_count = 2;
+  optional float elapsed_time = 3;
+}
+
+message BatchInsertOptions {
+  coral.storage.v1.FileFormat format = 1;
+  optional uint32 reader_batch_size = 2;
+  optional uint32 max_concurrent_files = 3;
+  optional bool include_metrics = 4;
+}
+
+message BatchInsertFilesRequest {
+  string table_name = 1;
+  coral.storage.v1.Paths paths = 2;
+  BatchInsertOptions options = 3;
+}
+
+message FileInsertResult {
+  string path = 1;
+  bool success = 2;
+  optional InsertResponse result = 3;
+  optional string error = 4;
+}
+
+message BatchInsertFilesResponse {
+  repeated FileInsertResult results = 1;
+  coral.common.v1.RequestMetrics metrics = 2;
+  uint64 total_inserted_row_count = 3;
+  uint64 total_inserted_record_batches = 4;
+}
+
+message UpdateTableDataRequest {
+  string table_name = 1;
+  optional string update_condition = 2;
+  string update_values = 3;
+}
+
+message DeleteTableDataRequest {
+  string table_name = 1;
+  optional string delete_condition = 2;
+}

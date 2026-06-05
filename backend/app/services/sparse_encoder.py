@@ -375,11 +375,25 @@ def _idf(df: int, total_docs: int) -> float:
     return math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
 
 
+# Drivers whose backing store computes BM25 internally and expects
+# raw TF on the doc side + weight=1.0 on the query side. Every gRPC
+# / REST transport that points at the same Coral catalog belongs in
+# this set — the BM25 implementation is server-side and the same
+# regardless of how the bytes got there. Forgetting to add a new
+# Coral transport here resurrects the 0.7.7 double-IDF /
+# double-saturation bug; the parametrised regression test in
+# ``backend/tests/test_sparse_weight_convention.py`` is the gate.
+_RAW_WEIGHT_DRIVERS: frozenset[str] = frozenset({
+    "seahorse-db",       # REST/JSONL transport (0.7.x)
+    "seahorse-db-grpc",  # gRPC transport, same Coral (0.8.0)
+})
+
+
 def _use_raw_weights() -> bool:
     """True when the active vector_store_driver computes BM25 internally
     and expects raw TF on the doc side + weight=1.0 on the query side.
     See module docstring for the convention table."""
-    return settings.vector_store_driver == "seahorse-db"
+    return settings.vector_store_driver in _RAW_WEIGHT_DRIVERS
 
 
 async def encode_document(text: str) -> tuple[list[int], list[float]]:

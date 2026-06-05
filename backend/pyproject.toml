@@ -1,6 +1,6 @@
 [project]
 name = "akb"
-version = "0.7.9"
+version = "0.8.0"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.14"
 # Runtime deps are exact-pinned for the same reproducibility reason
@@ -28,6 +28,9 @@ dependencies = [
     "qdrant-client==1.18.0",
     "kiwipiepy==0.23.1",
     "redis==8.0.0",
+    "grpcio==1.81.0",
+    "protobuf==6.33.6",
+    "pyarrow==22.0.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +58,12 @@ build-backend = "hatchling.build"
 [tool.ruff]
 target-version = "py314"
 line-length = 120
+# Generated protobuf stubs are vendored under the gRPC driver — they
+# carry their own (unused) import discipline that ruff would flag,
+# and we don't hand-edit them.
+extend-exclude = [
+    "app/services/vector_store/_grpc/proto/**",
+]
 
 [tool.ruff.lint]
 # Default ruleset is `[E, F]`. The three style rules below are routinely

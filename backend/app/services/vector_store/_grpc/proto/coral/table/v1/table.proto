@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package coral.table.v1;
+
+import "coral/catalog/v1/catalog.proto";
+import "coral/segment/v1/segment.proto";
+
+service TableService {
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  rpc GetTable(GetTableRequest) returns (GetTableResponse);
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
+  rpc DeleteTable(DeleteTableRequest) returns (DeleteTableResponse);
+  rpc GetCreateStatus(GetCreateStatusRequest) returns (GetCreateStatusResponse);
+  rpc ActiveSetFlush(ActiveSetFlushRequest) returns (ActiveSetFlushResponse);
+  rpc GetIndexedRowCount(GetIndexedRowCountRequest) returns (GetIndexedRowCountResponse);
+}
+
+enum TableView {
+  TABLE_VIEW_UNSPECIFIED = 0;
+  TABLE_VIEW_EXTERNAL = 1;
+  TABLE_VIEW_INTERNAL = 2;
+  TABLE_VIEW_NAME_ONLY = 3;
+}
+
+message TableQueryOptions {
+  TableView view = 1;
+  optional bool include_internal_columns = 2;
+}
+
+message ListTablesRequest {
+  optional TableQueryOptions options = 1;
+}
+
+message ListTablesResponse {
+  repeated coral.catalog.v1.Table tables = 1;
+}
+
+message GetTableRequest {
+  string table_name = 1;
+  optional TableQueryOptions options = 2;
+}
+
+message GetTableResponse {
+  coral.catalog.v1.Table table = 1;
+}
+
+message CreateTableRequest {
+  coral.catalog.v1.CreateTableSpec table = 1;
+}
+
+message CreateTableResponse {
+  coral.catalog.v1.TableIdentity table = 1;
+}
+
+message DeleteTableRequest {
+  string table_name = 1;
+}
+
+message DeleteTableResponse {
+  coral.catalog.v1.TableIdentity table = 1;
+}
+
+message GetCreateStatusRequest {
+  string table_name = 1;
+}
+
+message GetCreateStatusResponse {
+  string table_name = 1;
+  string status = 2;
+  optional string started_at = 3;
+  optional coral.segment.v1.TableOperationFailure failure = 4;
+  optional coral.segment.v1.TableOperationPollingInfo polling = 5;
+}
+
+enum SyncMode {
+  SYNC_MODE_UNSPECIFIED = 0;
+  SYNC_MODE_ASYNC = 1;
+  SYNC_MODE_WRITER_SYNC = 2;
+  SYNC_MODE_READER_SYNC = 3;
+}
+
+message ActiveSetFlushRequest {
+  string table_name = 1;
+  repeated string segment_ids = 2;
+  SyncMode sync_mode = 3;
+}
+
+message ActiveSetFlushResponse {
+  repeated string flushed = 1;
+  repeated string failed = 2;
+  repeated string skipped = 3;
+}
+
+message GetIndexedRowCountRequest {
+  string table_name = 1;
+  // When omitted, the server defaults this to true and includes readable
+  // (reader-based) counts in addition to primary writer-based counts.
+  optional bool readable = 2;
+}
+
+message IndexedCount {
+  string index_name = 1;
+  string index_type = 2;
+  int32 indexed_row_count = 3;
+}
+
+message TableIndexedCount {
+  int32 total_row_count = 1;
+  repeated IndexedCount indexed_counts = 2;
+}
+
+message GetIndexedRowCountResponse {
+  TableIndexedCount primary = 1;
+  optional TableIndexedCount readable = 2;
+}
