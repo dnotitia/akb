@@ -26,6 +26,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import redis.asyncio as redis_async
 
@@ -138,9 +139,15 @@ async def _mark_failure(conn, event_id: int, attempts: int, error: str) -> None:
     )
 
 
-def _xadd_fields(row: dict) -> dict[bytes, bytes]:
+def _xadd_fields(row: dict) -> dict[bytes | str, bytes | str]:
     """Pack a row into Redis stream fields. All values are encoded as
-    bytes — subscribers parse `payload` as JSON, the rest as UTF-8."""
+    bytes — subscribers parse `payload` as JSON, the rest as UTF-8.
+
+    The return type widens to the union redis-py's `xadd` stub
+    declares (`bytes | bytearray | memoryview | str | int | float`);
+    we only ever fill it with bytes, but dict invariance means
+    `dict[bytes, bytes]` is not a subtype of the wider union the
+    stub expects."""
     # asyncpg returns JSONB as either a dict/list or a str depending on
     # codec registration; normalise to a JSON string for the stream.
     payload = row["payload"]
@@ -149,7 +156,7 @@ def _xadd_fields(row: dict) -> dict[bytes, bytes]:
     else:
         payload_str = payload or "{}"
 
-    fields: dict[bytes, bytes] = {
+    fields: dict[bytes | str, bytes | str] = {
         b"id": str(row["id"]).encode(),
         b"occurred_at": row["occurred_at"].isoformat().encode(),
         b"kind": row["kind"].encode(),
@@ -191,9 +198,15 @@ async def _process_once() -> int:
         for row in batch:
             fields = _xadd_fields(row)
             try:
+                # redis-py's xadd stub takes the wider
+                # `dict[bytes|bytearray|memoryview|str|int|float, ...]`
+                # union; dict invariance means our narrower
+                # `dict[bytes|str, bytes|str]` is rejected even though
+                # every value we put is one of the accepted types.
+                # Runtime conversion is unchanged.
                 await client.xadd(
                     settings.redis_event_stream,
-                    fields,
+                    cast(dict, fields),
                     maxlen=settings.redis_stream_maxlen,
                     approximate=True,
                 )

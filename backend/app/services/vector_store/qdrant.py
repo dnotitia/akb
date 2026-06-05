@@ -60,7 +60,10 @@ class QdrantStore:
         # especially right after bulk re-index when undeleted-segment
         # overhead lingers until the optimizer's vacuum sweep catches up.
         self._client = AsyncQdrantClient(
-            url=self._url, api_key=self._api_key, timeout=30.0
+            # qdrant-client 1.13+ stubs narrowed `timeout` to int|None
+            # even though the runtime still accepts float. Integer
+            # seconds is what we want anyway at this scale.
+            url=self._url, api_key=self._api_key, timeout=30,
         )
         return self._client
 

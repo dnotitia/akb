@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, quote
 
-from git import Repo, cmd as git_cmd
+from git import Blob, Repo, cmd as git_cmd
 from git.exc import GitError
 
 from app.config import settings
@@ -394,9 +394,14 @@ class GitService:
         repo = self._get_repo(vault_name)
         commit = repo.commit(sha)
         out: dict[str, str] = {}
+        # tree.traverse() yields Tree | Blob | Submodule | tuple; we only
+        # want blobs. `isinstance(item, Blob)` narrows the union for the
+        # type checker AND skips submodule pointers / nested trees at
+        # runtime (the `item.type == "blob"` check left both to mypy's
+        # imagination).
         for item in commit.tree.traverse():
-            if item.type == "blob":
-                out[item.path] = item.hexsha
+            if isinstance(item, Blob):
+                out[str(item.path)] = item.hexsha
         return out
 
     def last_commit_for_path(
@@ -416,12 +421,14 @@ class GitService:
         """
         repo = self._get_repo(vault_name)
         try:
-            kwargs = {"paths": path, "max_count": 1}
-            commits = (
-                list(repo.iter_commits(rev, **kwargs))
-                if rev is not None
-                else list(repo.iter_commits(**kwargs))
-            )
+            # Branched calls — gitpython's iter_commits stub forbids
+            # **kwargs splatting (each named param is typed
+            # individually). Spell out the two argument shapes
+            # explicitly.
+            if rev is not None:
+                commits = list(repo.iter_commits(rev, paths=path, max_count=1))
+            else:
+                commits = list(repo.iter_commits(paths=path, max_count=1))
         except (ValueError, GitError):
             return None
         return commits[0].hexsha if commits else None
@@ -741,19 +748,28 @@ class GitService:
         """
         repo = self._get_repo(vault_name)
         try:
-            kwargs: dict = {"max_count": max_count}
-            if since:
-                kwargs["since"] = since
-            if path:
-                kwargs["paths"] = path
-            commits = list(repo.iter_commits(**kwargs))
+            # gitpython's iter_commits stub forbids **kwargs splatting
+            # (each named param is typed individually). Two branches by
+            # which optional flags are present — explicit, mypy-clean.
+            if since and path:
+                commits = list(repo.iter_commits(max_count=max_count, since=since, paths=path))
+            elif since:
+                commits = list(repo.iter_commits(max_count=max_count, since=since))
+            elif path:
+                commits = list(repo.iter_commits(max_count=max_count, paths=path))
+            else:
+                commits = list(repo.iter_commits(max_count=max_count))
         except (ValueError, GitError):
             return []
 
         results = []
         for c in commits:
-            # Parse commit message for action/summary
-            lines = c.message.strip().split("\n")
+            # Parse commit message for action/summary. `c.message` is
+            # `str | bytes` per the stub; in practice gitpython always
+            # decodes to str via its `default_encoding`. `str(...)` is
+            # a cheap normalisation that also satisfies mypy.
+            message = str(c.message)
+            lines = message.strip().split("\n")
             subject = lines[0] if lines else ""
             body_lines = [line.strip() for line in lines[1:] if line.strip()]
 
@@ -764,20 +780,32 @@ class GitService:
                     meta[k.strip().lower()] = v.strip()
 
             # Get changed files
-            changed_files = []
+            changed_files: list[dict] = []
             try:
                 if c.parents:
                     diffs = c.parents[0].diff(c)
                     for d in diffs:
-                        path = d.b_path or d.a_path
-                        if path and not path.startswith("."):
-                            change_type = "added" if d.new_file else ("deleted" if d.deleted_file else "modified")
-                            changed_files.append({"path": path, "change": change_type})
+                        # `b_path`/`a_path` are typed as
+                        # `str | PathLike[str] | None`; we want a plain
+                        # str for the response payload either way.
+                        diff_path_raw = d.b_path or d.a_path
+                        if diff_path_raw is None:
+                            continue
+                        diff_path = str(diff_path_raw)
+                        if diff_path.startswith("."):
+                            continue
+                        change_type = "added" if d.new_file else ("deleted" if d.deleted_file else "modified")
+                        changed_files.append({"path": diff_path, "change": change_type})
                 else:
-                    # Initial commit
+                    # Initial commit — every blob in the tree counts as
+                    # "added". `isinstance(item, Blob)` narrows the
+                    # traverse() union AND skips submodules cleanly.
                     for item in c.tree.traverse():
-                        if item.type == "blob" and not item.path.startswith("."):
-                            changed_files.append({"path": item.path, "change": "added"})
+                        if not isinstance(item, Blob):
+                            continue
+                        blob_path = str(item.path)
+                        if not blob_path.startswith("."):
+                            changed_files.append({"path": blob_path, "change": "added"})
             except (GitError, TypeError):
                 pass
 
