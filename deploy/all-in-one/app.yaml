@@ -41,7 +41,12 @@ jwt_expire_hours: 24
 # === Server ===
 host: 0.0.0.0
 port: 8000
-public_base_url: ""
+# Ingress origin for absolute publication share URLs. Required at
+# startup (lifecycle._validate_required_settings). Defaults to the
+# in-container nginx port; override at `docker run` with
+# `-e PUBLIC_BASE_URL=https://akb.example.com` when exposed behind a
+# real host (entrypoint.sh applies it).
+public_base_url: http://localhost:8080
 
 # === Vector store — pgvector reusing the in-container PG ===
 vector_store_driver: pgvector

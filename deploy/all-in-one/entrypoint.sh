@@ -86,6 +86,10 @@ overrides = {
     "embed_dimensions": os.environ.get("EMBED_DIMENSIONS", ""),
     "llm_base_url":   os.environ.get("LLM_BASE_URL", ""),
     "llm_model":      os.environ.get("LLM_MODEL", ""),
+    # Origin for absolute publication share URLs. Defaults in app.yaml to
+    # http://localhost:8080; override when the container is exposed behind
+    # a real host so share_url links resolve.
+    "public_base_url": os.environ.get("PUBLIC_BASE_URL", ""),
 }
 for key, val in overrides.items():
     if not val:
