@@ -99,14 +99,26 @@ def _encode_sparse_string(
 
 
 def _chunk_id_to_label(chunk_id: str) -> int:
-    """UUID -> SeahorseDB u64 label.
+    """UUID -> SeahorseDB i64 label.
 
-    First 8 bytes of the UUID's binary form, interpreted big-endian.
-    Stable, dependency-free, no DB round-trip. Collisions are
-    birthday-paradox bounded — ~2^32 chunks per table before a 50%
-    chance of any pair colliding, far beyond any realistic vault."""
+    First 8 bytes of the UUID's binary form, interpreted big-endian as
+    **signed** i64. The signedness matters: Coral's JSONL ingest
+    parses INT64 columns through Arrow, which rejects unsigned values
+    > 2^63 - 1 with ``ComponentError::Arrow`` and surfaces as HTTP 500
+    ``error_code 500233 "Internal error"`` with no row context. About
+    half of all random UUIDs have a high bit set in their first 8
+    bytes, so an unsigned variant of this function reliably 500s on
+    roughly that fraction of inserts under sustained load — exactly the
+    pattern we filed as SeahorseDB#433. ``signed=True`` keeps the full
+    64-bit space addressable on the i64 side and removes that failure
+    mode.
+
+    Collisions are birthday-paradox bounded — ~2^32 chunks per table
+    before a 50% chance of any pair colliding, far beyond any realistic
+    vault. Signedness has no effect on collision probability.
+    """
     raw = uuid.UUID(chunk_id).bytes
-    return int.from_bytes(raw[:8], "big", signed=False)
+    return int.from_bytes(raw[:8], "big", signed=True)
 
 
 class SeahorseDbStore:
