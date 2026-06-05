@@ -76,9 +76,10 @@ outside.
 │                  Storage Layer                           │
 │   Git bare repos       │  PostgreSQL 16 (text + meta SoT)│
 │                        │  Vector store (driver):         │
-│                        │    pgvector  (default, same PG) │
-│                        │    qdrant    (optional)         │
-│                        │    seahorse  (managed, optional)│
+│                        │    pgvector       (default, PG) │
+│                        │    qdrant         (optional)    │
+│                        │    seahorse-cloud (managed)     │
+│                        │    seahorse-db    (self-hosted) │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -166,11 +167,14 @@ related_to: ["akb://eng/coll/meetings/doc/2026-05-01-payments.md"]
 ## Quick Start
 
 AKB ships as a **3-container stack** (PostgreSQL with pgvector + backend +
-frontend). You bring an OpenAI-compatible embedding endpoint (OpenAI,
-OpenRouter, self-hosted vLLM/TEI, etc.) — that's the only required external
-dependency for core CRUD and search. Prefer running a separate Qdrant
-cluster, or pointing at a managed Seahorse Cloud table? See *Vector store*
-below.
+frontend). For semantic (dense) search you bring an OpenAI-compatible
+embedding endpoint (OpenAI, OpenRouter, self-hosted vLLM/TEI, etc.). It is
+not strictly required: with no embed endpoint (or during an outage) the
+pgvector and Qdrant drivers **degrade to BM25-only** lexical search rather
+than returning nothing — dense is genuinely optional end-to-end (the
+`seahorse-db` driver is the exception; see *Vector store* below). Prefer
+running a separate Qdrant cluster, or pointing at Seahorse? See *Vector
+store* below.
 
 ```bash
 # 1. Configure
@@ -192,7 +196,7 @@ configuration** — no environment variables are read by the backend. Mount the
 ### Vector store (driver-pluggable)
 
 Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
-interface. Three drivers ship; pick at config time:
+interface. Four drivers ship; pick at config time:
 
 - **`pgvector`** (default) — uses the same Postgres container that holds
   application data. The pgvector/pgvector image pre-installs the
@@ -202,14 +206,22 @@ interface. Three drivers ship; pick at config time:
 - **`qdrant`** — runs a separate Qdrant container; native RRF via the
   Query API. Useful when you already operate Qdrant or want to scale
   the vector store independently of Postgres.
-- **`seahorse`** — points at a managed [Seahorse Cloud][shc] table over
-  its TABLE_V2 + BFF API (Bearer auth, per-table host). No
-  infrastructure to run on your side; you provision a table in the
+- **`seahorse-cloud`** — points at a managed [Seahorse Cloud][shc] table
+  over its BFF management API + per-table data-plane host (Bearer auth).
+  No infrastructure to run on your side; you provision a table in the
   Seahorse console (or let the driver auto-create one) and AKB stores
   its chunks there. Native RRF, server-side BM25. See
   [`docs/vector-store-seahorse.md`](./docs/vector-store-seahorse.md)
   for the end-to-end setup walkthrough (sign-up → token → schema →
   config).
+- **`seahorse-db`** — points at a **self-hosted SeahorseDB** cluster via
+  its Coral coordinator HTTP API. You run Coral + Writer + Reader(s) +
+  Redis + Kafka + a sparse-embedding server yourself (the SeahorseDB
+  monorepo's `deploy/docker-compose.yml` brings up a minimal single-box
+  stack). Native dense+sparse hybrid. Unlike the other drivers it does
+  **not** support BM25-only fallback when the embed API is down (its
+  sparse path is server-side and structurally coupled to a live embed
+  step) — keep an embedding endpoint reachable for this driver.
 
 [shc]: https://console.seahorse.dnotitia.ai
 
@@ -226,18 +238,24 @@ $EDITOR config/app.yaml     # vector_store_driver: qdrant
 
 # Seahorse Cloud (managed; full guide in docs/vector-store-seahorse.md):
 docker compose up           # no extra container needed
-$EDITOR config/app.yaml     # vector_store_driver: seahorse
-                            # seahorse_tenant_uuid: <your tenant>
-                            # seahorse_table_name: <your table>
-$EDITOR config/secret.yaml  # seahorse_token: shsk_<...>
+$EDITOR config/app.yaml     # vector_store_driver: seahorse-cloud
+                            # seahorse_cloud_tenant_uuid: <your tenant>
+                            # seahorse_cloud_table_name: <your table>
+$EDITOR config/secret.yaml  # seahorse_cloud_token: shsk_<...>
+
+# SeahorseDB (self-hosted cluster reached via the Coral coordinator):
+docker compose up           # run the SeahorseDB stack separately
+$EDITOR config/app.yaml     # vector_store_driver: seahorse-db
+                            # seahorsedb_coordinator_url: http://localhost:3003
+                            # seahorsedb_table_name: akb_chunks
 ```
 
 Embedding model + dimensions are also fully pluggable via
 `embed_base_url` / `embed_model` / `embed_dimensions` — the codebase has
 no hard-coded model. For pgvector with HNSW, keep `embed_dimensions ≤ 2000`
 (or 4000 with `halfvec`); larger models fall back to exact scan.
-Qdrant/Seahorse have no such limit (Qdrant up to 65536, Seahorse up to
-its table-defined dim).
+Qdrant / Seahorse (cloud or db) have no such limit (Qdrant up to 65536,
+Seahorse up to its table-defined dim).
 
 ### LLM features (optional)
 
@@ -264,7 +282,7 @@ operator-private overlay under `deploy/k8s/internal/`.
 
 ```
 akb/
-├── backend/                  # Python 3.11 / FastAPI / asyncpg / GitPython
+├── backend/                  # Python 3.14 / FastAPI / asyncpg / GitPython
 │   ├── app/
 │   │   ├── api/routes/       # REST endpoints
 │   │   ├── services/         # Business logic + workers
@@ -287,11 +305,12 @@ akb/
 
 ## Tech Stack
 
-- **Backend**: Python 3.11, FastAPI, Uvicorn, asyncpg, GitPython, MCP SDK
+- **Backend**: Python 3.14, FastAPI, Uvicorn, asyncpg, GitPython, MCP SDK
 - **Database**: PostgreSQL 16 (main DB needs no extension; the same
   pgvector/pgvector image hosts the optional vector_index schema)
-- **Vector store**: driver-pluggable (pgvector default; Qdrant or
-  Seahorse Cloud optional — hybrid dense + BM25 sparse, RRF fusion)
+- **Vector store**: driver-pluggable (pgvector default; Qdrant,
+  Seahorse Cloud, or self-hosted SeahorseDB optional — hybrid dense +
+  BM25 sparse, RRF fusion; BM25-only fallback when embed is down)
 - **Event stream** (optional): PG `events` outbox + Redis Streams fanout
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
 - **Auth**: JWT + Personal Access Tokens (PATs)
