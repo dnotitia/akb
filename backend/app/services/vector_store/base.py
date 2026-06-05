@@ -110,9 +110,13 @@ class VectorStore(Protocol):
             ``collection_exists()`` check. Probably fine because Qdrant
             ``create_collection`` is idempotent server-side, but no
             explicit cross-process guard.
-          - ``SeahorseStore``: ⚠ BFF ``_bff_get_table()`` + optional
+          - ``SeahorseCloudStore``: ⚠ BFF ``_bff_get_table()`` + optional
             auto-create; same race-window shape as Qdrant.
-        Both ⚠ drivers should be audited before they go to prod at
+          - ``SeahorseDbStore``: ⚠ Coral ``GET /catalog/tables`` + optional
+            auto-create on Coral; same race-window shape as the two ⚠
+            above. Coral does serialize concurrent ``POST /catalog/tables``
+            server-side, so racing peers mostly converge.
+        All ⚠ drivers should be audited before they go to prod at
         scale; the asymmetry exists because only pgvector has ever
         actually shipped a schema migration step here.
         """

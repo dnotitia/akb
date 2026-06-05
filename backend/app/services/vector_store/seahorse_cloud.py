@@ -2,13 +2,13 @@
 
 Talks to Seahorse Cloud's two-plane API:
 
-- **Management (BFF)** at `seahorse_management_url` for table
+- **Management (BFF)** at `seahorse_cloud_management_url` for table
   lifecycle (list / get / create / delete).
 - **Per-table data plane host** for upsert / search / delete-row /
   schema. The host is discovered from the management response (each
   table gets its own subdomain) and cached on `ensure_collection`.
 
-A single `SeahorseStore` instance maps to a single Seahorse table.
+A single `SeahorseCloudStore` instance maps to a single Seahorse table.
 Multiple AKB sources (different `source_id`) live in the same table
 and are separated by SQL `WHERE` filters at search time.
 
@@ -84,7 +84,7 @@ def _sparse_to_str(indices: list[int], values: list[float]) -> str:
     return " ".join(f"{int(i)}:{float(v)}" for i, v in zip(indices, values))
 
 
-class SeahorseStore:
+class SeahorseCloudStore:
     """VectorStore impl over Seahorse Cloud's TABLE_V2 + BFF API."""
 
     def __init__(
@@ -101,13 +101,13 @@ class SeahorseStore:
     ):
         if not (table_name or table_uuid):
             raise ValueError(
-                "SeahorseStore requires either table_name or table_uuid "
+                "SeahorseCloudStore requires either table_name or table_uuid "
                 "(blank both)."
             )
         if not token:
-            raise ValueError("SeahorseStore requires a bearer token.")
+            raise ValueError("SeahorseCloudStore requires a bearer token.")
         if not tenant_uuid:
-            raise ValueError("SeahorseStore requires tenant_uuid.")
+            raise ValueError("SeahorseCloudStore requires tenant_uuid.")
         self._mgmt_url = management_url.rstrip("/")
         self._token = token
         self._tenant_uuid = tenant_uuid
@@ -172,7 +172,7 @@ class SeahorseStore:
                         f"name={self._table_name!r}, "
                         f"uuid={self._table_uuid!r}). "
                         "Create it in the console first or set "
-                        "seahorse_auto_create: true in app.yaml."
+                        "seahorse_cloud_auto_create: true in app.yaml."
                     )
                 tbl = await self._create_table()
             self._validate_schema(tbl)
@@ -196,7 +196,7 @@ class SeahorseStore:
         if not self._table_name:
             raise VectorStoreUnavailable(
                 "Cannot auto-create Seahorse table without "
-                "seahorse_table_name (uuid alone won't do "
+                "seahorse_cloud_table_name (uuid alone won't do "
                 "— it doesn't exist yet)."
             )
         body = {

@@ -119,14 +119,25 @@ vector_store_sparse_shape: posting
 vector_url: ""
 vector_collection: chunks
 
-# Seahorse Cloud driver settings (ignored unless driver is seahorse).
+# Seahorse Cloud driver settings (ignored unless driver is "seahorse-cloud").
 # Two-plane API: management (BFF) for table lifecycle + per-table
 # data-plane host (auto-discovered from BFF response).
-seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
-seahorse_tenant_uuid: ""
-seahorse_table_name: ""    # one of (table_name, table_uuid) required
-seahorse_table_uuid: ""
-seahorse_auto_create: false   # set true to provision the AKB-shaped table on first boot
+seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/bff"
+seahorse_cloud_tenant_uuid: ""
+seahorse_cloud_table_name: ""    # one of (table_name, table_uuid) required
+seahorse_cloud_table_uuid: ""
+seahorse_cloud_auto_create: false   # set true to provision the AKB-shaped table on first boot
+
+# SeahorseDB self-hosted driver settings (ignored unless driver is "seahorse-db").
+# Single-URL entry: the Coral coordinator. Coral routes to the
+# Writer/Reader cluster + Redis + Kafka behind it — bring those up
+# via SeahorseDB's deploy/docker-compose.yml (see the SeahorseDB
+# monorepo's docs/integration-test for a minimal local stack).
+seahorsedb_coordinator_url: "http://localhost:3003"
+seahorsedb_table_name: "akb_chunks"
+seahorsedb_distance: "cosine"        # cosine | l2 | ip
+seahorsedb_auto_create: true         # let AKB provision the table shape on first boot
+seahorsedb_request_timeout_secs: 30.0
 
 # === Indexing worker tuning ===
 # Chunks claimed per worker tick. Larger = fewer round-trips to the
