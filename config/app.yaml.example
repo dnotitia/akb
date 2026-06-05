@@ -135,7 +135,7 @@ seahorse_cloud_auto_create: false   # set true to provision the AKB-shaped table
 # monorepo's docs/integration-test for a minimal local stack).
 seahorsedb_coordinator_url: "http://localhost:3003"
 seahorsedb_table_name: "akb_chunks"
-seahorsedb_distance: "cosine"        # cosine | l2 | ip
+seahorsedb_distance: "ip"        # cosine | l2 | ip
 seahorsedb_auto_create: true         # let AKB provision the table shape on first boot
 seahorsedb_request_timeout_secs: 30.0
 
