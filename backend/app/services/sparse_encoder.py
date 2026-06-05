@@ -11,6 +11,25 @@
 - Query encoding goes through the same tokenizer + vocab; OOV terms are
   dropped silently.
 
+Two doc/query weight conventions live behind the same public API,
+selected by ``settings.vector_store_driver``:
+
+  - **pre-baked** (pgvector, qdrant, seahorse-cloud): doc weight =
+    saturated TF, query weight = IDF. The dot product yields BM25
+    directly — the vector store doesn't need to know about BM25 at
+    all, and pgvector's posting table just sums products.
+  - **raw** (seahorse-db): doc weight = raw TF (token count), query
+    weight = 1.0. The vector store applies the BM25 formula itself
+    from (N, avgdl, df-per-query-term) metadata passed at search time.
+    Sending pre-baked weights here causes double-saturation on the
+    doc side AND double-IDF on the query side; the BM25 ranking
+    becomes proportional to IDF² × saturated_TF instead of
+    IDF × saturated_TF.
+
+Both encodings tokenize and look up term ids identically — only the
+weight definition differs. Adding a new driver means picking which of
+the two it is in ``_use_raw_weights()``.
+
 Kiwi is a hard dependency: if import or initialization fails the module
 raises on first use. Falling back to a different tokenizer would produce
 terms that don't match the vocab (indexed with Kiwi) and silently tank
@@ -356,10 +375,18 @@ def _idf(df: int, total_docs: int) -> float:
     return math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
 
 
+def _use_raw_weights() -> bool:
+    """True when the active vector_store_driver computes BM25 internally
+    and expects raw TF on the doc side + weight=1.0 on the query side.
+    See module docstring for the convention table."""
+    return settings.vector_store_driver == "seahorse-db"
+
+
 async def encode_document(text: str) -> tuple[list[int], list[float]]:
-    """Encode a document chunk to a BM25 sparse vector (indices, values).
-    Appends new terms to the vocab as a side effect. For query-time use
-    `encode_query` which never touches the vocab.
+    """Encode a document chunk to a sparse (indices, values) tuple.
+
+    Weight convention depends on the active driver (see module
+    docstring). Both branches share tokenization + vocab insertion.
     """
     tokens = await tokenize(text)
     if not tokens:
@@ -367,6 +394,21 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
 
     term_counts = Counter(tokens)
     vocab = await get_or_create_term_ids(term_counts.keys())
+
+    if _use_raw_weights():
+        # Raw TF. The downstream driver (seahorse-db) feeds these
+        # into Coral's inverted index as raw term frequencies; the
+        # BM25 saturation/normalization is applied by the index at
+        # search time using the (k, b, avgdl) parameters the driver
+        # passes in `hybrid_search`.
+        raw_indices: list[int] = []
+        raw_values: list[float] = []
+        for term, tf in term_counts.items():
+            tid = vocab.get(term)
+            if tid is not None:
+                raw_indices.append(tid)
+                raw_values.append(float(tf))
+        return raw_indices, raw_values
 
     stats = await load_stats()
     # total_docs is only needed for query-side IDF (see encode_query); doc
@@ -400,13 +442,11 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
 
 
 async def encode_query(text: str) -> tuple[list[int], list[float]]:
-    """Encode a query to BM25 sparse vector. Uses IDF as term weight; OOV
-    terms are dropped. No new terms are registered.
+    """Encode a query to a sparse (indices, values) tuple. OOV terms
+    are dropped; no new terms are registered.
 
-    Common terms are kept — BM25 IDF already down-weights them. Over-
-    aggressive filtering caused false negatives on legitimate informative
-    words. The sparse-prefetch gate in VectorStore.hybrid_search handles
-    nonsense queries without hurting recall here.
+    Weight convention depends on the active driver (see module
+    docstring).
     """
     tokens = await tokenize(text)
     if not tokens:
@@ -416,22 +456,32 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
     if not vocab:
         return [], []
 
+    if _use_raw_weights():
+        # Driver-side BM25: query weight = 1.0; the inverted index
+        # multiplies by IDF derived from the per-term-df metadata
+        # `hybrid_search` ships. OOV-but-in-vocab terms still pass
+        # through with weight 1.0 — the index will compute their IDF
+        # from the df we send.
+        indices = list(vocab.values())
+        values = [1.0] * len(indices)
+        return indices, values
+
     df_map = await load_df_for_terms(vocab.values())
     stats = await load_stats()
     total_docs = int(stats.get("total_docs") or 0)
     if total_docs <= 0:
         return list(vocab.values()), [1.0] * len(vocab)
 
-    indices: list[int] = []
-    values: list[float] = []
+    indices_idf: list[int] = []
+    values_idf: list[float] = []
     for term, tid in vocab.items():
         df = df_map.get(tid, 0)
         w = _idf(df, total_docs)
         if w <= 0:
             continue
-        indices.append(tid)
-        values.append(float(w))
-    return indices, values
+        indices_idf.append(tid)
+        values_idf.append(float(w))
+    return indices_idf, values_idf
 
 
 # ── Corpus stats recompute ────────────────────────────────────────

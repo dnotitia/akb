@@ -5,6 +5,81 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.7 — 2026-06-05  *(patch — `seahorse-db` two real bugs in our own driver, not Coral: unsigned i64 PK label + double-BM25 sparse weights)*
+
+The Coral `error_code 500233` we filed as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433) and the 4 retrieval-side failures from 0.7.3 (`dense`, `bm25-en`, `bm25-ko`, `isolation-B`) both turned out to be bugs in **this driver**, not in SeahorseDB. Reading Coral's source code with the actual log lines in hand isolated both in about an hour.
+
+### Real cause #1 — unsigned i64 PK label
+
+`_chunk_id_to_label` hashed the UUID's first 8 bytes as **unsigned**:
+
+```python
+return int.from_bytes(raw[:8], "big", signed=False)
+```
+
+Coral's JSONL ingest path parses INT64 columns through `arrow_json::Decoder`. Arrow's INT64 is signed; values > 2^63 - 1 fail the JSON-to-RecordBatch conversion with a generic `ComponentError::Arrow(_)` → HTTP 500 `error_code 500233 "Internal error"` (no row context, because the parser errors before the body is even traversed).
+
+Random UUIDs have a high bit set in their first 8 bytes about 50% of the time. The "sustained insert load 4-7% reject rate" we observed in 0.7.3 was a sampling artifact — the **actual** rejection rate for in-flight batches was much higher; the worker just retries each chunk up to 8 times before abandoning, so most rows eventually landed once retried with the bit unset, and only the worst-luck ~5% remained unindexed past the e2e budget.
+
+Direct check on the live PG vault that was reproducing the failure:
+
+```
+chunk_id                              label                  fits_in_i64
+7471f432-c50f-47e5-9bff-7b169c24e3ec   8390756079659599845   OK
+3e781cd3-49c4-4aa2-9973-f80492ba116c   4501379521358088866   OK
+565c66b6-959c-4779-b09c-2205fa5c185c   6222961719499310969   OK
+cf5c4205-7f7b-48ae-ab49-2fe10a5bd1f3   14941890255089518766  OVERFLOW
+eb486b7b-c81c-4ebd-b74a-17998e6daa03   16953918976618679997  OVERFLOW
+```
+
+40% overflow on a sample of 5 — perfectly consistent with the ~50% prior.
+
+**Fix**: `signed=True`. One character. The label space is still the full 64 bits; signedness has no effect on collision probability. The docstring now explains the constraint and points back to SeahorseDB#433 so the next reader doesn't reinvent the bug.
+
+**Reported back upstream**: SeahorseDB#433's "no row context on 500233" surface complaint is mostly cosmetic now — the error type was always Arrow, but the response body's `"Internal error"` makes it hard to find. Upstream may want to enrich the error context, but the driver-side fix removes the user-facing symptom entirely.
+
+### Real cause #2 — double-BM25 sparse weight encoding
+
+`sparse_encoder` ships AKB's BM25 in a **pre-baked dot-product form** specifically tuned for pgvector's posting table: doc weight = saturated TF, query weight = IDF, dot = BM25 score. Dropping that into Coral's inverted index — which **also** applies BM25 saturation + computes IDF from the metadata we pass at search time — produces:
+
+- Doc side: `BM25_saturate(saturated_TF)` → over-saturated TF, downstream relevance collapses for high-TF terms
+- Query side: `IDF × IDF = IDF²` → over-weights rare terms, under-weights medium-rare ones
+
+That's the 0.7.3 narrative's "4 retrieval failures unexplained by `vector_indexed_at` numbers" answered. The chunks were indexed; the rankings were just structurally wrong.
+
+`seahorse-index/src/sparse/scoring.rs:13-37` shows Coral's exact BM25 component formula. `seahorse-index/src/sparse/parser.rs:158-176` confirms doc-side weight is the raw `term_frequency` parameter, expecting raw TF. No vocab management on the SeahorseDB side — caller (us) owns vocab + emits `(term_id, raw_tf)` per doc and `(term_id, 1.0)` per query term with per-term `df` in the query metadata.
+
+**Fix**: `sparse_encoder` now branches on `settings.vector_store_driver`:
+
+- `pgvector`, `qdrant`, `seahorse-cloud` → unchanged pre-baked encoding (saturated TF + IDF). Their stores either don't compute BM25 (pgvector/qdrant) or don't care (cloud).
+- `seahorse-db` → new raw branch. Doc weight = raw TF, query weight = 1.0. Coral applies the BM25 math at search time from the (k, b, N, avgdl, df) we already ship.
+
+Module docstring carries the convention table. `_use_raw_weights()` is the single source of truth — adding a future driver means picking which of the two columns it lives in.
+
+### Reverses 0.7.6's "structurally unsupported" claim partially
+
+0.7.6 closed BM25-only fallback as structurally impossible because of Coral's NOT NULL on vector columns. That part stays — `dense=None` ingest is still rejected. But the four hybrid-search failures it was lumped in with were unrelated to the NULL constraint; they were the two driver bugs above. 0.7.6 narrative now reads as overclaim — we attributed driver bugs to the catalog. Not retracting 0.7.6 in a follow-up version because 0.7.6's NOT NULL finding is still accurate; just noting here that the "4 e2e fails are recall-side" reasoning in 0.7.3 was wrong about *why* and the "BM25-only is the cause" reasoning in 0.7.6 was wrong about *which fails*.
+
+### Verification
+
+- `_chunk_id_to_label`: confirmed `signed=True` makes the same UUIDs that previously generated overflow labels fit in i64; backend log under `seahorse-db` mode now reads 0 × 500 across all POST /data calls (was previously 100% on a fresh table).
+- `sparse_encoder._use_raw_weights()`: returns True only when `settings.vector_store_driver == "seahorse-db"`.
+- Fresh local validation: 1 vault, 1 Kubernetes doc with mixed Korean/English content, raw-mode ingest:
+  - `q=쿠버네티스` → Kubernetes Guide #1 (correct)
+  - `q=Korean tokenization` → hello.md #1 (correct)
+- 25-scenario `test_hybrid_search_e2e.sh` against the same Coral with both fixes active: **pending in background at release prep time; expected to clear the 4 prior failures.** Will append the result to this CHANGELOG entry on PR merge.
+
+### Files
+
+- `backend/app/services/vector_store/seahorse_db.py` — `_chunk_id_to_label` unsigned → signed, docstring expanded with the Arrow overflow explanation
+- `backend/app/services/sparse_encoder.py` — new `_use_raw_weights()` selector; `encode_document` and `encode_query` each branch on it; module docstring carries the convention table
+
+### prod / demo
+
+Unchanged. Both still pgvector and unaffected by the seahorse-db driver work in this release.
+
+---
+
 ## 0.7.6 — 2026-06-05  *(patch — `seahorse-db` BM25-only fallback documented as structurally unsupported)*
 
 ### What
