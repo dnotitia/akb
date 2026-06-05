@@ -5,6 +5,40 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.9 — 2026-06-05  *(patch — `scripts/migrate_pgvector_to_seahorsedb.py`: bulk migrate without re-embedding)*
+
+The default driver-switch path (flip `vector_store_driver`, restart, let `embed_worker` rebuild) re-calls the embedding API for every chunk. On a production-sized vault that's real OpenRouter cost and real wall-clock time. The dense vectors are already sitting in pgvector's `vector_index.chunks` table, so we don't have to.
+
+`backend/scripts/migrate_pgvector_to_seahorsedb.py` reads the existing dense vectors directly out of pgvector and ships them to a fresh seahorse-db table over the driver's normal `upsert_one` path:
+
+- **Embedding API calls: 0.** Dense vectors are deterministic in `(content, model)` per `init.sql:135-138`; bulk-copy doesn't change them.
+- **Sparse is re-encoded from `chunks.content`.** The pgvector path stores pre-saturated TF weights for its posting table; the seahorse-db path needs raw TF + query weight 1.0 (see 0.7.7 CHANGELOG and `sparse_encoder` module docstring). Re-running `encode_document` with `settings.vector_store_driver = "seahorse-db"` produces the correct convention.
+- **Idempotent.** Re-running against a partially-migrated table is safe; `upsert_one` is idempotent on `(table_name, id)`.
+
+### Local verification
+
+65-chunk vault: 65/65 succeeded, 0 failed, 2.7s wall clock (~24 chunks/sec), **0 embed API calls**. Coral's `/indexes/indexed-row-count` reports 65 dense and 65 sparse after Kafka catches up (~10s). Default reindex on the same chunks would take ~30-60s of wall clock + the OpenRouter charge.
+
+### Caveats documented inline
+
+- Operator must flip `vector_store_driver` in `app.yaml` to `seahorse-db` BEFORE running the script — otherwise `sparse_encoder` emits pgvector-shape weights and the migration ships incorrect sparse data. The script refuses to run with a mismatched driver setting.
+- Embedding-disabled rows (`dense IS NULL` in pgvector) are skipped with a warning — seahorse-db's schema rejects nullable vector columns (0.7.6 CHANGELOG).
+- The script does NOT delete from pgvector. After a clean migration the operator can drop the `vector_index` schema manually; source rows are left untouched for rollback.
+
+### Driver-side fix while we were here
+
+`SeahorseDbStore.upsert_one` received a `numpy.float32`-typed dense array on the migration path (asyncpg's pgvector codec yields numpy arrays). `json.dumps` doesn't know how to serialise those. The migration script casts to Python `float` at the boundary; cleaner there than plumbing numpy awareness into the driver.
+
+### Files
+
+- `backend/scripts/migrate_pgvector_to_seahorsedb.py` — new
+
+### Not deployed
+
+prod + demo unchanged (pgvector). Running this script against production is now an option an operator can reach for during a future seahorse-db evaluation — it is not yet a recommended operation.
+
+---
+
 ## 0.7.7 — 2026-06-05  *(patch — `seahorse-db` two real bugs in our own driver, not Coral: unsigned i64 PK label + double-BM25 sparse weights)*
 
 The Coral `error_code 500233` we filed as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433) and the 4 retrieval-side failures from 0.7.3 (`dense`, `bm25-en`, `bm25-ko`, `isolation-B`) both turned out to be bugs in **this driver**, not in SeahorseDB. Reading Coral's source code with the actual log lines in hand isolated both in about an hour.
