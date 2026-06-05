@@ -5,7 +5,123 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.2 — 2026-06-05  *(patch — `seahorse-db` driver wire format actually verified end-to-end; retracts 0.7.0/0.7.1 false-positive claims)*
+
+### Retraction of 0.7.0 + 0.7.1 status claims
+
+0.7.0 shipped the `seahorse-db` driver with wire formats reverse-
+engineered from `routes.rs` path strings alone. 0.7.1 added an opt-in
+smoke E2E that claimed 6/6 PASS. Both releases overstated what was
+verified. Running the driver against a live Coral coordinator in
+this release uncovered that:
+
+- The route prefix is `/v2/tables/...`, NOT `/v2/catalog/tables/...`
+  (we had `catalog/` in there) and NOT `/catalog/tables/...` (0.7.0
+  shape). Wrong prefixes fell through to the same-port gRPC
+  fallback and returned `HTTP/1.1 200 OK` + `content-type:
+  application/grpc` + `grpc-status: 12`. The 0.7.1 smoke checked
+  status code only and counted every call as a pass.
+- `POST /v2/tables` expects flat `table_name` + top-level `columns`
+  (SCREAMING_SNAKE types: `INT64`, `STRING`, `{name: DENSE_VECTOR,
+  element: FLOAT32, dim}`, `{name: SPARSE_VECTOR}`) + `segmentation`
+  (`{strategy: hash, columns: [id], buckets: 1, composition:
+  single}`) + `indexes` (lowercase `hnsw` / `inverted`). 0.7.0
+  emitted nested `schema.columns` with `column_type` keys, no
+  segmentation, PascalCase index types, and `distance_space: Cosine`
+  — every field name and shape was off.
+- HNSW only accepts `space: "ip" | "l2"`. `cosine` is rejected at
+  segment build time (`Hnsw index does not support cosinespace`).
+  AKB callers using cosine-equivalent retrieval must normalise to
+  unit norm and use `ip`. The `seahorsedb_distance` Literal is now
+  `"l2" | "ip"`.
+- `POST /v2/tables/{name}/data` requires
+  `Content-Type: application/x-ndjson` (JSONL). `application/json`
+  fails with HTTP 400 `400102 Unsupported Content-Type for /data
+  insert`. 0.7.0 sent `application/json` + a `{"records": [...]}`
+  wrapper, both wrong.
+- Sparse vectors are a **single string** per row
+  (`"term_id:weight term_id:weight"`, space-separated), not a list
+  of pairs.
+- `POST /v2/tables/{name}/data/delete` payload is
+  `{"delete_condition": "<SQL WHERE clause>"}`, not
+  `{"labels": [u64, ...]}`.
+- `POST /v2/tables/{name}/data/hybrid-search` payload uses separate
+  `dense` and `sparse` config objects (each with `column`,
+  `vectors`, optional `parameters`), a `fusion` block, an SQL
+  `projection` string, and an SQL `filter` string. Response is
+  enveloped: `body["data"]["data"][0]` is the hit list (one
+  resultset per query vector).
+
+### End-to-end verification in this release
+
+- Backend started with `vector_store_driver: seahorse-db` pointed
+  at a live Coral. Lifespan `ensure_collection` made the table:
+  `GET /v2/tables/akb_validation → 404` then
+  `POST /v2/tables → 200 application/json`.
+- Document put via AKB REST API → `embed_worker` claimed the
+  chunks → driver POSTed each row as JSONL to
+  `/v2/tables/akb_validation/data` → Coral returned `200 OK` with
+  `inserted_row_count: 1` per chunk.
+- AKB search REST endpoint with `vault=sdb-test&q=Korean tokenization`
+  → driver POSTed hybrid-search → Coral returned 2 hits with the
+  expected `content`/`source_id`/`chunk_id`/`score` fields →
+  AKB rendered the hits at `/api/v1/search`. **Every response
+  checked for `content-type: application/json` to rule out gRPC
+  fallback.**
+
+### Driver gaps still present (honestly)
+
+- **Dense-less (BM25-only) upsert + search not supported.** The
+  embedding column is currently `nullable: false`; ingest raises
+  `VectorStoreUnavailable` when `dense=None`. To match pgvector's
+  BM25 fallback we'd need a NULL embedding column AND a
+  sparse-only search path on Coral (single-leg vector search
+  endpoint exists; not wired through this driver yet).
+- **BM25 per-query metadata not sent.** Hybrid search omits
+  `parameters` and `metadata` on the sparse leg; Coral falls back
+  to defaults. AKB has `bm25_stats` (N, avgdl, df), so the
+  retrieval quality could improve by shipping them per query.
+- **Race-safety still ⚠.** No PG-advisory-lock-grade primitive
+  on Coral; concurrent `ensure_collection` peers rely on Coral's
+  server-side serialisation.
+- **No `test_hybrid_search_e2e.sh` against seahorse-db yet.** AKB's
+  25-scenario hybrid suite still runs only against pgvector. The
+  driver-level smoke (`test_seahorse_db_e2e.sh`) needs its own
+  rewrite to match the corrected wire formats — that's the next
+  PR. Until then, "driver works on a single happy-path doc" is
+  what we claim, not "production ready".
+- **Kafka eventual consistency UX.** Coral's `POST /data` returns
+  on Kafka-accept, not on visibility (~10-30s lag). `embed_worker`
+  marks `vector_indexed_at` on insert-accept, so a doc you just
+  put may not appear in search for that window. Same shape any
+  async-indexing driver has, but worth knowing.
+
+### Files changed
+
+- `backend/app/services/vector_store/seahorse_db.py` — every wire
+  format and the helpers (`_encode_sparse_string`,
+  `_validate_uuid_for_sql`, `_is_grpc_fallback`). The
+  `_is_grpc_fallback` content-type check is the safety net that
+  prevented this miss from happening again.
+- `backend/app/config.py` — `seahorsedb_distance` Literal
+  `"cosine" | "l2" | "ip"` → `"l2" | "ip"` (cosine was never
+  valid).
+
+### What this PR does NOT do
+
+- Does NOT publish a corrected `test_seahorse_db_e2e.sh` (that
+  ships in the next PR with content-type assertions baked in).
+- Does NOT change prod / demo — both still pgvector.
+- Does NOT cover the BM25-only / sparse-only path.
+
+---
+
 ## 0.7.1 — 2026-06-05  *(patch — `seahorse-db` driver wire-shape smoke E2E + `.gitignore` overlay slot)*
+
+⚠ **RETRACTED by 0.7.2**: the "6/6 PASS" claim in this release is
+a false positive. Every request fell through Coral's gRPC fallback
+on the unmatched HTTP REST path, so the smoke validated nothing.
+See 0.7.2's retraction section.
 
 ### `backend/tests/test_seahorse_db_e2e.sh`
 

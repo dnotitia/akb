@@ -152,7 +152,12 @@ class Settings(BaseModel):
     # is true and the table is absent on startup.
     seahorsedb_coordinator_url: str = "http://localhost:3003"
     seahorsedb_table_name: str = "akb_chunks"
-    seahorsedb_distance: Literal["cosine", "l2", "ip"] = "cosine"
+    # SeahorseDB's HNSW supports `l2` and `ip` only (cosine produces
+    # "cosinespace" which the HNSW backend rejects at segment build
+    # time with `Hnsw index does not support cosinespace`). For
+    # cosine-equivalent retrieval, normalize embeddings to unit norm
+    # at the caller and use `ip`.
+    seahorsedb_distance: Literal["l2", "ip"] = "ip"
     seahorsedb_auto_create: bool = True
     # HTTP timeout for Coral calls. Inserts go through Kafka (async)
     # so the request itself is fast; raise this if upstream Kafka
