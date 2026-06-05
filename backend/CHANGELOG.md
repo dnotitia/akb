@@ -5,6 +5,54 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.1 — 2026-06-05  *(patch — `seahorse-db` driver wire-shape smoke E2E + `.gitignore` overlay slot)*
+
+### `backend/tests/test_seahorse_db_e2e.sh`
+
+Opt-in smoke E2E that confirms the `seahorse-db` driver's emitted wire
+shapes (table create schema, dense+sparse insert payload, delete by
+label) are accepted by a live Coral coordinator. Skips cleanly when
+`SEAHORSEDB_CORAL_URL` is unset — CI passes without a Coral available;
+developers with a local SeahorseDB stack pass the URL.
+
+Covers:
+- Coral `/health` reachability
+- `POST /catalog/tables` with the exact schema `SeahorseDbStore._build_create_table_payload()` emits
+- `GET /catalog/tables/{name}` (mirrors `ensure_collection`'s existence check)
+- `POST /data` with one record carrying both `embedding` (dense) and `sparse` ([[term_id, weight], ...])
+- `POST /data/delete` by `u64` label (matches `_chunk_id_to_label` output)
+- Cleanup
+
+Does NOT cover (intentionally):
+- Hybrid-search retrieval. SeahorseDB ingest goes through Kafka before
+  the row is searchable; wait windows are ~10-30s and harder to budget
+  for a smoke. Retrieval flow lives in `test_hybrid_search_e2e.sh`
+  against pgvector; this script asserts only "the bytes reach Coral
+  in the shape the driver promised".
+- Cross-process race-safety (no Coral primitive equivalent to PG
+  advisory lock; ⚠ in `base.py` audit table).
+
+Verified locally against a Coral built from the SeahorseDB monorepo's
+`cloud-functional-test` scenario: **6/6 PASS**.
+
+### `.gitignore` — `docker-compose.override.yml` slot
+
+Added `docker-compose.override.yml` + `docker-compose.*.override.yml`
+to `.gitignore`. `docker compose` auto-merges any `*.override.yml` in
+CWD on top of the base — this lets developers wire AKB backend to a
+local SeahorseDB stack (or any other private-image stack) without that
+overlay leaking into the tracked compose, which has to stay OSS-friendly.
+SeahorseDB images are dn-inc commercial and aren't pullable by external
+users, so the overlay path is local-only by design.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `SEAHORSEDB_CORAL_URL=http://localhost:NNNN bash backend/tests/test_seahorse_db_e2e.sh` — 6/6 against live Coral.
+- Without env var — skips cleanly (exit 0).
+
+---
+
 ## 0.7.0 — 2026-06-05  *(minor — split `seahorse` driver into `seahorse-cloud` + new self-hosted `seahorse-db`)*
 
 ### What
