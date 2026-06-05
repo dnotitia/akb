@@ -1,82 +1,70 @@
 #!/bin/bash
 #
-# SeahorseDB native driver — smoke E2E against a live Coral coordinator.
+# SeahorseDB native driver — wire-shape smoke E2E against a live Coral.
 #
-# ⚠ 0.7.1 SHIPPED THIS SCRIPT WITH WRONG WIRE FORMATS.
-# Every request used `/catalog/tables/...` paths (no `/v2`, with
-# `catalog/`) — unmatched in Coral, so axum fell through to the same-
-# port tonic gRPC fallback which returns `HTTP/1.1 200 OK` +
-# `content-type: application/grpc` + `grpc-status: 12`. The status-only
-# checks below counted every call as PASS.
+# Confirms the wire formats `seahorse_db.py` emits are accepted (and
+# meaningfully understood) by a live Coral coordinator. Every assertion
+# checks BOTH the HTTP status code AND `content-type: application/json`
+# — Coral's same-port tonic gRPC fallback returns 200 OK +
+# `content-type: application/grpc` + `grpc-status: 12` on unmatched
+# REST paths, which is how 0.7.1 shipped a "6/6 PASS" smoke that was
+# actually all gRPC fallbacks. Don't repeat that.
 #
-# 0.7.2 fixed the driver's wire formats (see CHANGELOG) and confirmed
-# them end-to-end via the AKB REST API → embed_worker → Coral. The
-# next PR rewrites this script to:
-#   - assert `content-type: application/json` on every response
-#     (gRPC fallback is the canonical hidden failure on this port)
-#   - use the 0.7.2 corrected schemas (segmentation, JSONL insert,
-#     SQL delete_condition, dense+sparse hybrid configs)
-# Until that ships, this script is INTENTIONALLY a no-op skip even
-# when SEAHORSEDB_CORAL_URL is set, so we don't ship another round
-# of false positives.
+# Opt-in via env var. CI skips cleanly (SeahorseDB is dn-inc commercial
+# and most environments don't have a Coral reachable):
 #
-# This test is **opt-in by environment variable**:
+#   SEAHORSEDB_CORAL_URL=http://localhost:NNNN \
+#     bash backend/tests/test_seahorse_db_e2e.sh
 #
-#   SEAHORSEDB_CORAL_URL=http://localhost:46834 bash backend/tests/test_seahorse_db_e2e.sh
+# Scope (everything pinned to the 0.7.3 wire formats):
+#   1. /health is reachable AND content-type json AND no gRPC fallback
+#   2. POST /v2/tables with the exact CreateTableRequest shape the
+#      driver builds (flat table_name + columns SCREAMING_SNAKE +
+#      segmentation hash/single + indexes hnsw+inverted with
+#      sparse_model=bm25). Verifies create succeeds + status 200 +
+#      json.
+#   3. GET /v2/tables/{name} (mirrors ensure_collection's existence
+#      probe) returns the same schema we sent.
+#   4. POST /v2/tables/{name}/data with Content-Type
+#      application/x-ndjson (JSONL); rejects application/json with
+#      400 (we assert the rejection so a future Coral that starts
+#      accepting JSON doesn't silently break the driver's chosen
+#      content-type).
+#   5. POST /v2/tables/{name}/data/delete with delete_condition
+#      SQL WHERE clause.
+#   6. POST /v2/tables/{name}/data/hybrid-search with the dense+sparse
+#      config objects, BM25 parameters + metadata, fusion block;
+#      verifies the response envelope shape body.data.data is a
+#      list-of-resultsets.
+#   7. DELETE /v2/tables/{name} cleanup.
 #
-# Without `SEAHORSEDB_CORAL_URL`, the script skips cleanly (exit 0).
-# That's intentional: SeahorseDB is dn-inc's commercial DB and most
-# OSS environments don't have a Coral coordinator reachable. CI skips;
-# developers with a local SeahorseDB stack pass the URL.
-#
-# Scope — confirm the driver's contract end-to-end:
-#   1. /health surfaces vector_store reachable
-#   2. ensure_collection idempotent against a live Coral
-#   3. upsert + scan round-trip (dense + sparse fields land on Coral
-#      in the AKB-shaped table)
-#   4. delete by chunk_id propagates
-#
-# What this test does NOT cover (and why):
-# - End-to-end hybrid_search with retrieval. SeahorseDB ingest goes
-#   through Kafka before the row is searchable — wait windows are
-#   ~10-30s on first batches and harder to budget for a smoke. The
-#   broader retrieval flow lives in test_hybrid_search_e2e.sh against
-#   pgvector; the driver-level guarantee here is "the bytes reach
-#   Coral in the right shape".
-# - Cross-process race-safety (covered by base.py docstring audit;
-#   no Coral primitive equivalent to PG advisory lock).
+# Does NOT cover (intentionally):
+# - End-to-end search relevance against a real corpus — that's
+#   covered by AKB's test_hybrid_search_e2e.sh pointed at a backend
+#   running vector_store_driver: seahorse-db. Tracked separately.
+# - Eventual-consistency lag between POST /data and visibility in
+#   hybrid-search. Driver shape correctness is what this smoke
+#   guarantees; relevance + visibility lives upstream.
 #
 set -uo pipefail
 
 CORAL_URL="${SEAHORSEDB_CORAL_URL:-}"
-BASE_URL="${AKB_URL:-http://localhost:8000}"
-TABLE="${SEAHORSEDB_TABLE_NAME:-akb_e2e_$(date +%s)}"
-
-echo "==> 0.7.2: this script is intentionally a skip until the wire-format-corrected rewrite ships."
-echo "    See backend/CHANGELOG.md (0.7.2) for the retraction of 0.7.1's false-positive 6/6 PASS."
-echo "    Driver itself was verified end-to-end via the AKB REST API → embed_worker → Coral in 0.7.2."
-exit 0
-
-# Past this line is the old 0.7.1 body — kept for reference only,
-# unreachable. The next PR rewrites it with content-type asserts +
-# the 0.7.2 corrected schemas.
+TABLE="${SEAHORSEDB_TABLE_NAME:-akb_smoke_$(date +%s)}"
 
 if [ -z "$CORAL_URL" ]; then
     echo "==> SEAHORSEDB_CORAL_URL not set; skipping (this is OK in CI)."
     echo "    To run: SEAHORSEDB_CORAL_URL=http://localhost:NNNN \\"
-    echo "            SEAHORSEDB_TABLE_NAME=akb_chunks \\"
-    echo "            AKB_URL=http://localhost:8000 \\"
     echo "            bash backend/tests/test_seahorse_db_e2e.sh"
     exit 0
 fi
 
-# Reachability gate: the URL must answer /health before we move on,
-# otherwise a wrong port or stopped stack manifests as a noisy curl
-# error halfway through and the failure mode is harder to diagnose.
+CORAL_URL="${CORAL_URL%/}"
+
+# Reachability gate.
 if ! curl -fsS "$CORAL_URL/health" >/dev/null 2>&1; then
     echo "ERROR: SEAHORSEDB_CORAL_URL=$CORAL_URL is not reachable." >&2
-    echo "       (start the SeahorseDB stack first, then re-export the" >&2
-    echo "        Coral host port from \`docker compose ps\`.)" >&2
+    echo "       (Bring the SeahorseDB stack up first; the host port" >&2
+    echo "        is the one mapped to Coral's container :3003.)"   >&2
     exit 1
 fi
 
@@ -88,112 +76,202 @@ step() { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; PASSED=$((PASSED + 1)); }
 bad()  { printf '  \033[1;31m✗\033[0m %s\n' "$*"; FAILED=$((FAILED + 1)); ERRORS+=("$*"); }
 
-# ── 1. Coral health ────────────────────────────────────────────────
-step "1. Coral /health"
-if curl -fsS "$CORAL_URL/health" >/dev/null; then
-    ok "Coral reachable at $CORAL_URL"
-else
-    bad "Coral /health failed"
-    exit 1
-fi
+# ── helpers ─────────────────────────────────────────────────────────
 
-# ── 2. AKB driver round-trip via direct REST ───────────────────────
-# The driver creates a table on first use (auto_create=true default).
-# We exercise it by hitting Coral directly with the same shape the
-# driver writes — that confirms the schema + sparse + dense columns
-# accepted by this Coral build match what `seahorse_db.py` emits.
-step "2. table create (mirrors SeahorseDbStore.ensure_collection schema)"
-CREATE_PAYLOAD=$(cat <<EOF
-{
-    "name": "$TABLE",
-    "dimension": 8,
-    "distance_space": "Cosine",
-    "schema": {
-        "columns": [
-            {"name": "id", "column_type": "Int64", "primary_key": true},
-            {"name": "chunk_id", "column_type": "String"},
-            {"name": "embedding", "column_type": {"Vector": 8}},
-            {"name": "sparse", "column_type": "SparseVector"},
-            {"name": "content", "column_type": "String"},
-            {"name": "section_path", "column_type": "String"},
-            {"name": "chunk_index", "column_type": "Int32"},
-            {"name": "source_type", "column_type": "String"},
-            {"name": "source_id", "column_type": "String"}
-        ]
-    }
+# coral_call <method> <path> <expected_status> <label> [body_file]
+# Asserts: HTTP status matches AND content-type starts with application/json.
+# The application/json check is the defence against the gRPC fallback
+# that silently returned HTTP 200 for unmatched REST routes in 0.7.1.
+coral_call() {
+    local method="$1" path="$2" expected="$3" label="$4" body="${5:-}"
+    local args=(-sS -X "$method" -o /tmp/sdb_e2e_body
+                -w "%{http_code}|%{content_type}"
+                "$CORAL_URL$path")
+    if [ -n "$body" ]; then
+        args+=(-H "Content-Type: application/json"
+               --data-binary "@$body")
+    fi
+    local out
+    out=$(curl "${args[@]}")
+    local status="${out%%|*}"
+    local ct="${out#*|}"
+
+    if [[ "$ct" != application/json* ]]; then
+        bad "$label: content-type=$ct (expected application/json) — gRPC fallback?"
+        return 1
+    fi
+    if [ "$status" != "$expected" ]; then
+        bad "$label: HTTP $status (expected $expected) — body: $(head -c 200 /tmp/sdb_e2e_body)"
+        return 1
+    fi
+    ok "$label: HTTP $status, content-type application/json"
+    return 0
 }
-EOF
-)
-CREATE_STATUS=$(curl -s -o /tmp/seahorsedb_create.out -w "%{http_code}" \
-    -X POST "$CORAL_URL/catalog/tables" \
-    -H "Content-Type: application/json" \
-    -d "$CREATE_PAYLOAD")
-case "$CREATE_STATUS" in
-    200|201|409) ok "create table $TABLE → HTTP $CREATE_STATUS" ;;
-    *)           bad "create table $TABLE → HTTP $CREATE_STATUS (body: $(cat /tmp/seahorsedb_create.out | head -c 200))" ;;
-esac
 
-# ── 3. GET table reflects what ensure_collection sees ──────────────
-step "3. GET /catalog/tables/{name} (ensure_collection 분기 검증)"
-GET_STATUS=$(curl -s -o /tmp/seahorsedb_get.out -w "%{http_code}" \
-    "$CORAL_URL/catalog/tables/$TABLE")
-if [ "$GET_STATUS" = "200" ]; then
-    ok "table visible (GET → 200)"
-else
-    bad "GET /catalog/tables/$TABLE → HTTP $GET_STATUS"
-fi
+# ndjson_post <path> <expected_status> <label> <body_file>
+# Same as coral_call but with application/x-ndjson — the only content
+# type Coral's /data insert handler accepts.
+ndjson_post() {
+    local path="$1" expected="$2" label="$3" body="$4"
+    local out status ct
+    out=$(curl -sS -X POST -o /tmp/sdb_e2e_body \
+            -w "%{http_code}|%{content_type}" \
+            -H "Content-Type: application/x-ndjson" \
+            --data-binary "@$body" \
+            "$CORAL_URL$path")
+    status="${out%%|*}"
+    ct="${out#*|}"
 
-# ── 4. Insert one record (driver upsert_one shape) ─────────────────
-step "4. POST /data with dense + sparse (driver upsert_one shape)"
-LABEL=42
-INSERT_PAYLOAD=$(cat <<EOF
+    if [[ "$ct" != application/json* ]]; then
+        bad "$label: content-type=$ct (gRPC fallback?)"
+        return 1
+    fi
+    if [ "$status" != "$expected" ]; then
+        bad "$label: HTTP $status (body: $(head -c 200 /tmp/sdb_e2e_body))"
+        return 1
+    fi
+    ok "$label: HTTP $status, content-type application/json"
+    return 0
+}
+
+# Trap to make sure we don't leave the smoke's ephemeral table behind
+# even if assertions abort mid-script.
+cleanup_table() {
+    curl -sS -X DELETE "$CORAL_URL/v2/tables/$TABLE" -o /dev/null
+}
+trap cleanup_table EXIT
+
+# ── 1. /health ──────────────────────────────────────────────────────
+step "1. /health"
+coral_call GET /health 200 "Coral health"
+
+# ── 2. POST /v2/tables (CreateTableRequest) ─────────────────────────
+step "2. POST /v2/tables (create_table shape that SeahorseDbStore emits)"
+cat > /tmp/sdb_e2e_create.json <<EOF
 {
-    "records": [
-        {
-            "id": $LABEL,
-            "chunk_id": "00000000-0000-0000-0000-00000000002a",
-            "embedding": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-            "sparse": [[1, 0.5], [3, 0.7]],
-            "content": "hello world from akb e2e",
-            "section_path": "",
-            "chunk_index": 0,
-            "source_type": "document",
-            "source_id": "doc-1"
-        }
+    "table_name": "$TABLE",
+    "columns": [
+        {"name": "id", "type": "INT64", "nullable": false},
+        {"name": "chunk_id", "type": "STRING", "nullable": false},
+        {"name": "embedding", "type": {"name": "DENSE_VECTOR", "element": "FLOAT32", "dim": 8}, "nullable": false},
+        {"name": "sparse", "type": {"name": "SPARSE_VECTOR"}, "nullable": false},
+        {"name": "content", "type": "STRING", "nullable": true},
+        {"name": "section_path", "type": "STRING", "nullable": true},
+        {"name": "chunk_index", "type": "INT64", "nullable": true},
+        {"name": "source_type", "type": "STRING", "nullable": false},
+        {"name": "source_id", "type": "STRING", "nullable": false}
+    ],
+    "segmentation": {"strategy": "hash", "columns": ["id"], "buckets": 1, "composition": "single"},
+    "indexes": [
+        {"type": "hnsw", "column": "embedding", "params": {"space": "ip", "ef_construction": 64, "M": 16}},
+        {"type": "inverted", "column": "sparse", "params": {"sparse_model": "bm25"}}
     ]
 }
 EOF
-)
-INSERT_STATUS=$(curl -s -o /tmp/seahorsedb_insert.out -w "%{http_code}" \
-    -X POST "$CORAL_URL/catalog/tables/$TABLE/data" \
-    -H "Content-Type: application/json" \
-    -d "$INSERT_PAYLOAD")
-case "$INSERT_STATUS" in
-    200|202) ok "insert → HTTP $INSERT_STATUS (Kafka-accept)" ;;
-    *)       bad "insert → HTTP $INSERT_STATUS (body: $(cat /tmp/seahorsedb_insert.out | head -c 200))" ;;
-esac
+coral_call POST /v2/tables 200 "create table $TABLE" /tmp/sdb_e2e_create.json
 
-# ── 5. Delete by label (driver delete_point shape) ─────────────────
-step "5. POST /data/delete with the label we just inserted"
-DELETE_STATUS=$(curl -s -o /tmp/seahorsedb_delete.out -w "%{http_code}" \
-    -X POST "$CORAL_URL/catalog/tables/$TABLE/data/delete" \
-    -H "Content-Type: application/json" \
-    -d "{\"labels\": [$LABEL]}")
-case "$DELETE_STATUS" in
-    200|202|404) ok "delete → HTTP $DELETE_STATUS (idempotent)" ;;
-    *)           bad "delete → HTTP $DELETE_STATUS (body: $(cat /tmp/seahorsedb_delete.out | head -c 200))" ;;
-esac
+# ── 3. GET /v2/tables/{name} (ensure_collection probe) ──────────────
+step "3. GET /v2/tables/{name} (round-trip + ensure_collection probe)"
+if coral_call GET "/v2/tables/$TABLE" 200 "get table"; then
+    # Verify a few fields actually round-tripped.
+    if grep -q "\"sparse_model\":\"bm25\"" /tmp/sdb_e2e_body; then
+        ok "sparse INVERTED index carries sparse_model=bm25"
+    else
+        bad "sparse INVERTED index missing sparse_model=bm25 in GET response"
+    fi
+    if grep -q "\"primary_key\":\\[\"id\"\\]" /tmp/sdb_e2e_body 2>/dev/null \
+       || grep -q "\"strategy\":\"hash\"" /tmp/sdb_e2e_body; then
+        ok "segmentation/PK shape round-trips"
+    else
+        bad "segmentation shape did NOT round-trip"
+    fi
+fi
 
-# ── Cleanup: drop the ephemeral table ──────────────────────────────
-step "Cleanup"
-DROP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X DELETE "$CORAL_URL/catalog/tables/$TABLE")
-case "$DROP_STATUS" in
-    200|202|404) ok "drop table → HTTP $DROP_STATUS" ;;
-    *)           bad "drop table → HTTP $DROP_STATUS" ;;
-esac
+# Negative: a name that doesn't exist must return 404 (not 200 with
+# empty body, which is the gRPC-fallback failure mode).
+coral_call GET "/v2/tables/${TABLE}_nope" 404 "missing table is real 404"
 
-# ── Results ────────────────────────────────────────────────────────
+# ── 4. POST /v2/tables/{name}/data — JSONL ──────────────────────────
+step "4. POST /data — JSONL (application/x-ndjson)"
+cat > /tmp/sdb_e2e_rec.jsonl <<EOF
+{"id": 42, "chunk_id": "00000000-0000-0000-0000-00000000002a", "embedding": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], "sparse": "1:0.5 3:0.7", "content": "hello", "section_path": "", "chunk_index": 0, "source_type": "document", "source_id": "00000000-0000-0000-0000-000000000001"}
+EOF
+ndjson_post "/v2/tables/$TABLE/data" 200 "insert one record JSONL" /tmp/sdb_e2e_rec.jsonl
+
+# Negative: application/json must be rejected. If a future Coral
+# starts accepting it, the driver's content-type choice silently
+# becomes underspecified — better to know loudly.
+step "4b. POST /data with application/json must be rejected"
+out=$(curl -sS -X POST -o /tmp/sdb_e2e_body \
+      -w "%{http_code}|%{content_type}" \
+      -H "Content-Type: application/json" \
+      --data-binary @/tmp/sdb_e2e_rec.jsonl \
+      "$CORAL_URL/v2/tables/$TABLE/data")
+status="${out%%|*}"
+ct="${out#*|}"
+if [[ "$ct" != application/json* ]]; then
+    bad "wrong content-type rejection: returned ct=$ct"
+elif [ "$status" = "400" ] && grep -q "Unsupported Content-Type" /tmp/sdb_e2e_body; then
+    ok "rejected with HTTP 400 + 'Unsupported Content-Type' (expected)"
+else
+    bad "expected HTTP 400 + 'Unsupported Content-Type', got HTTP $status — Coral changed insert content-type policy?"
+fi
+
+# ── 5. POST /data/delete — SQL WHERE ────────────────────────────────
+step "5. POST /data/delete — SQL WHERE clause"
+cat > /tmp/sdb_e2e_del.json <<EOF
+{"delete_condition": "chunk_id = '00000000-0000-0000-0000-00000000002a'"}
+EOF
+coral_call POST "/v2/tables/$TABLE/data/delete" 200 "delete by chunk_id SQL clause" /tmp/sdb_e2e_del.json
+
+# Idempotency: deleting again must still return 200 (no row matches).
+coral_call POST "/v2/tables/$TABLE/data/delete" 200 "delete idempotent re-fire" /tmp/sdb_e2e_del.json
+
+# ── 6. POST /data/hybrid-search ─────────────────────────────────────
+step "6. POST /data/hybrid-search — dense+sparse+BM25 metadata+fusion"
+cat > /tmp/sdb_e2e_hs.json <<EOF
+{
+    "top_k": 5,
+    "dense": {
+        "column": "embedding",
+        "vectors": [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]],
+        "parameters": {"ef_search": 64}
+    },
+    "sparse": {
+        "column": "sparse",
+        "vectors": ["1:0.5 3:0.7"],
+        "parameters": {"k": 1.2, "b": 0.75},
+        "metadata": {"N": 1, "avgdl": 1.0, "df": ["1:1 3:1"]}
+    },
+    "fusion": {"type": "rrf", "parameters": {"k": 60}},
+    "projection": "chunk_id, source_type, source_id, section_path, content"
+}
+EOF
+if coral_call POST "/v2/tables/$TABLE/data/hybrid-search" 200 "hybrid-search with BM25 metadata" /tmp/sdb_e2e_hs.json; then
+    # Verify the response envelope shape the driver parses.
+    if python3 -c "
+import json, sys
+body = json.load(open('/tmp/sdb_e2e_body'))
+data = body.get('data') or {}
+results = data.get('data') or []
+# The driver reads body['data']['data'][0] as the hit list; either
+# the resultset is empty (0 hits, fine — Kafka lag) or it's a list.
+if not isinstance(results, list):
+    sys.exit('outer data.data is not a list: type=' + type(results).__name__)
+if results and not isinstance(results[0], list):
+    sys.exit('inner data.data[0] is not a list: type=' + type(results[0]).__name__)
+" 2>/tmp/sdb_e2e_shapeerr; then
+        ok "response envelope body.data.data is list-of-resultsets (driver parses this)"
+    else
+        bad "envelope shape unexpected: $(cat /tmp/sdb_e2e_shapeerr)"
+    fi
+fi
+
+# ── 7. DELETE /v2/tables/{name} ─────────────────────────────────────
+step "7. DELETE /v2/tables/{name} (cleanup)"
+coral_call DELETE "/v2/tables/$TABLE" 200 "drop table"
+
+# ── Results ─────────────────────────────────────────────────────────
 echo
 echo "═══════════════════════════════════════════"
 echo "  Passed: $PASSED"
