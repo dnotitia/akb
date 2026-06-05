@@ -5,6 +5,65 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.5 — 2026-06-05  *(patch — `test_seahorse_db_e2e.sh` rewritten with content-type asserts + 0.7.3 wire formats; 13/13 against live Coral)*
+
+### What
+
+The 0.7.1-shipped smoke had been an early-exit skip since 0.7.2's
+retraction (it had reported 6/6 PASS that were all Coral gRPC
+fallbacks). 0.7.4 ships an actual smoke that exercises the wire
+formats `seahorse_db.py` emits.
+
+Every assertion now checks **HTTP status AND
+`content-type: application/json`**. The same-port tonic gRPC
+fallback that fooled 0.7.1 returns `HTTP 200 OK` +
+`content-type: application/grpc` + `grpc-status: 12` on unmatched
+REST paths; the content-type check makes that impossible to confuse
+with a real PASS again.
+
+### Scope
+
+7 stages, 13 assertions, against the 0.7.3 corrected wire formats:
+
+| # | Assertion | Why |
+|---|---|---|
+| 1 | `GET /health` 200 + json | reachability + no gRPC fallback |
+| 2 | `POST /v2/tables` 200 + json | the exact `CreateTableRequest` shape `SeahorseDbStore._build_create_table_payload()` emits (flat `table_name`, SCREAMING_SNAKE column types, `segmentation` hash/single, `indexes` hnsw + inverted with `sparse_model=bm25`) |
+| 3 | `GET /v2/tables/{name}` 200 + json, plus `sparse_model=bm25` and `segmentation`/`primary_key` round-trip in body | mirrors `ensure_collection`'s probe + verifies the create stuck |
+| 3b | `GET /v2/tables/{missing}` 404 + json | negative — 0.7.1's bug was treating 200 + grpc-status as existence |
+| 4 | `POST /v2/tables/{name}/data` with `application/x-ndjson` 200 + json | JSONL is the only accepted content-type |
+| 4b | same `POST` with `application/json` 400 + `Unsupported Content-Type` | if a future Coral starts accepting JSON the driver's pinned content-type silently underspecifies — this assertion catches that |
+| 5 | `POST /data/delete` with `{"delete_condition": "chunk_id = '...'"}` 200 + json, twice | SQL WHERE clause + idempotency |
+| 6 | `POST /data/hybrid-search` with dense+sparse configs + BM25 `parameters`+`metadata` + `fusion` 200 + json; `body.data.data` parses as `list[list[hit]]` | the response envelope shape the driver actually reads |
+| 7 | `DELETE /v2/tables/{name}` 200 + json | cleanup; `trap EXIT` guard against test aborts |
+
+`SEAHORSEDB_CORAL_URL` unset → script exits 0 with a help blurb. CI
+still skips cleanly; developers with a local Coral run it.
+
+### Verified locally against a Coral built from `SDDEV-244/monorepo-coral-sparse`
+
+**13/13 PASS.** Every response checked for `application/json`;
+zero gRPC fallbacks observed.
+
+### Not covered (by design)
+
+- AKB-side end-to-end search relevance — that's `test_hybrid_search_e2e.sh`
+  pointed at a backend running `vector_store_driver: seahorse-db`,
+  which 0.7.3 reports as 21/25 against the same Coral. Driver wire
+  correctness vs retrieval recall are different gates.
+- POST → search visibility lag — Kafka eventual consistency is upstream
+  of this driver; AKB's own e2e budget owns the wait window.
+
+### Files
+
+- `backend/tests/test_seahorse_db_e2e.sh` — rewritten from scratch
+  with two reusable helpers (`coral_call`, `ndjson_post`) that bake
+  the content-type assertion into every call. `trap EXIT cleanup_table`
+  guards against mid-script aborts leaving the smoke's ephemeral
+  table behind.
+
+---
+
 ## 0.7.4 — 2026-06-05  *(patch — pgvector driver creates the `vector` extension before registering the asyncpg codec; fixes "unknown type: public.vector" on fresh self-hosted DBs, #117)*
 
 ### Semantic search silently returned empty on a fresh self-hosted install
