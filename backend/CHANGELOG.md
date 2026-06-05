@@ -5,6 +5,124 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.3 — 2026-06-05  *(patch — `seahorse-db` BM25 metadata + `sparse_model=bm25` index param; AKB hybrid_search e2e 21/25 against live SeahorseDB)*
+
+### `sparse_model: "bm25"` is required on the INVERTED index
+
+0.7.2 emitted `{"type": "inverted", "column": "sparse"}` with no
+`params` on the sparse index. Coral accepts the table without
+complaint at create time, but `POST /v2/tables/{name}/data/hybrid-search`
+later fails with:
+
+```
+HTTP 503
+error_code 503101
+message: "BM25 sparse scoring requires sparse_model=bm25 index"
+```
+
+0.7.3 pins the param explicitly:
+
+```python
+{
+    "type": "inverted",
+    "column": "sparse",
+    "params": {"sparse_model": "bm25"},
+}
+```
+
+This means **every `seahorse-db` table created by 0.7.0/0.7.1/0.7.2 is
+unusable for hybrid_search** — there is no online migration; the
+table has to be dropped and recreated by the driver on next startup.
+At time of writing, no production or demo cluster runs this driver,
+so the practical blast radius is zero. (If you've been experimenting
+locally: drop the table on Coral and `UPDATE chunks SET
+vector_indexed_at = NULL` to re-emit.)
+
+### BM25 metadata is now sent per query
+
+0.7.2 omitted `parameters` and `metadata` on the sparse leg of
+`hybrid-search`, expecting Coral to fall back to reasonable defaults.
+That worked for the basic-shape e2e but produced empty or
+wrong-doc results on the AKB hybrid-search e2e's English-keyword and
+Korean-keyword scenarios. 0.7.3 ships our corpus stats every query:
+
+- `parameters: {k, b}` — pulled from `bm25_stats` (the values AKB
+  uses for ingest-side encoding, kept consistent with retrieval).
+- `metadata.N` and `metadata.avgdl` — same source.
+- `metadata.df` — per-term document frequencies from `bm25_vocab`,
+  one PG batch fetch per search (~ms even at our scale). Coral
+  takes them as a `Vec<String>` of `"term_id:df term_id:df ..."`,
+  one entry per query vector.
+
+One extra `await sparse_encoder.load_df_for_terms(...)` per search
+call. Cheap; the alternative is shipping the full df table to Coral
+once and hoping it doesn't drift.
+
+### AKB `test_hybrid_search_e2e.sh` against live `seahorse-db`
+
+First real run of AKB's 25-scenario hybrid retrieval e2e with the
+driver pointed at a live Coral (built from SeahorseDB monorepo's
+`SDDEV-244/monorepo-coral-sparse` branch, infra-only scenario kept
+up via `--no-cleanup`). **21/25 PASS** vs **25/25 PASS** for the
+same backend running pgvector against the same chunks.
+
+Failures (all four are recall-side, not driver-side):
+
+- `dense: expected PostgreSQL doc, got: <empty>`
+- `bm25-en: expected GraphQL doc, got: <empty>`
+- `bm25-ko: expected Kubernetes doc, got: hybrid-a-… Guide`
+- `isolation-B: expected vault B doc, got: <empty>`
+
+Two interacting causes:
+
+1. **Coral 500 `error_code 500233` under sustained single-row
+   JSONL load** — ~4–7% of `POST /v2/tables/{name}/data` requests
+   come back 500 with no row-level reason, only `tower_http`
+   "response failed" in Coral's log. Reproduces from AKB's
+   `embed_worker` pacing (~10/sec, serial-per-process); does NOT
+   reproduce from direct curl loops (single, dup PK, 30-concurrent
+   all 100% OK). The chunks that hit retry_count >= 8 stay
+   `vector_indexed_at IS NULL` past the e2e's 180s
+   `wait_for_indexing` budget, so the docs they belong to never
+   become searchable.
+   Filed upstream as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433)
+   with a standalone Python repro.
+
+2. **Kafka eventual consistency** — `POST /data` returns on
+   Kafka-accept, not on segment-visible. Even chunks that DO get
+   through can be invisible to search for ~10-30s. AKB's
+   `embed_worker` marks `vector_indexed_at` at the same point, so a
+   doc you just put may not show up immediately. Same shape any
+   async-indexing driver has, and not strictly a regression — but
+   the 180s e2e budget assumed pgvector's "indexed = visible"
+   semantics.
+
+### Where this leaves the driver
+
+`seahorse-db` driver now passes the bulk of AKB's retrieval workload
+end-to-end, but is **not** at pgvector-parity yet. Honest gaps still
+in:
+
+- The four e2e scenarios above
+- BM25-only / dense-less path raises `VectorStoreUnavailable`
+- Cross-process race-safety on `ensure_collection` ⚠
+- `test_seahorse_db_e2e.sh` is still an early-exit skip (will be
+  rewritten with content-type asserts + 0.7.3 wire formats next)
+- `embed_worker` retry semantics need a Coral 500 backoff /
+  abandon policy distinct from "vector store unavailable"
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `vector_store_driver: seahorse-db` startup, `ensure_collection`
+  with new sparse_model:bm25 schema.
+- One doc put → embed_worker → Coral; one search → driver
+  hybrid-search → 2 real hits with BM25 metadata in the payload.
+- `bash backend/tests/test_hybrid_search_e2e.sh` — 21/25 (vs
+  pgvector 25/25).
+
+---
+
 ## 0.7.2 — 2026-06-05  *(patch — `seahorse-db` driver wire format actually verified end-to-end; retracts 0.7.0/0.7.1 false-positive claims)*
 
 ### Retraction of 0.7.0 + 0.7.1 status claims
