@@ -62,13 +62,23 @@ RUN curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
     curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
         -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
 
-# Backend deps in an isolated venv so PEP 668 doesn't bite us.
-RUN python3 -m venv /opt/venv && pip install --no-cache-dir --upgrade pip
+# Backend requires Python >=3.14 (backend/pyproject.toml). The pgvector
+# base image (debian bookworm) only ships system python 3.11 — kept
+# above for entrypoint.sh's stdlib scripting (token gen + config
+# rendering). uv provisions a standalone CPython 3.14 for the backend's
+# /opt/venv so `pip install akb` actually resolves; building against the
+# bookworm 3.11 fails with "requires a different Python: 3.11 not in
+# '>=3.14'" — the all-in-one was unbuildable from 0.6.5's 3.14 bump
+# until this.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:$PATH
+RUN uv venv --python 3.14 /opt/venv
 
 COPY backend/pyproject.toml /tmp/akb-backend/pyproject.toml
 COPY backend/app /tmp/akb-backend/app
 COPY backend/mcp_server /tmp/akb-backend/mcp_server
-RUN pip install --no-cache-dir /tmp/akb-backend && rm -rf /tmp/akb-backend
+RUN uv pip install --python /opt/venv/bin/python --no-cache /tmp/akb-backend \
+    && rm -rf /tmp/akb-backend
 
 # Backend source (used at runtime — venv only carries dependencies).
 COPY backend /app/backend
