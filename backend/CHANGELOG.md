@@ -5,6 +5,65 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.6 — 2026-06-05  *(patch — clear the 18 mypy errors 0.6.5 exposed + exact-pin runtime deps)*
+
+The 0.6.5 Python 3.11 → 3.14 bump closed the "CI runs a different
+analyzer than dev" gap but left 18 mypy errors actually surfaced —
+the older runtime had been hiding them via wider stub inference.
+This release works through every one of them and pins runtime deps
+so the image's behavior is also reproducible.
+
+### Cleared 18 mypy errors (no behavior change)
+
+- `app/services/git_service.py` (14): `commit.tree.traverse()` yields
+  `Tree | Blob | Submodule | tuple` and we were narrowing with
+  `item.type == "blob"`. Replaced with `isinstance(item, Blob)`, which
+  both narrows for the type checker AND skips submodule pointers /
+  nested trees explicitly. `repo.iter_commits(**kwargs)` — gitpython's
+  stub forbids `**kwargs` splatting (each named param is individually
+  typed); spelled out the argument shapes. `c.message` is typed as
+  `str | bytes`; normalised via `str(...)`. `d.b_path`/`d.a_path` and
+  `item.path` come back as `str | PathLike[str] | None`; made the str
+  narrowing explicit with `str(...)` + None-skip.
+- `app/services/events_publisher.py` (1): `redis-py`'s `xadd` stub
+  takes the wider `dict[bytes|bytearray|memoryview|str|int|float, …]`;
+  dict invariance means our narrower `dict[bytes, bytes]` was
+  rejected. Widened the helper's return type and added a
+  `cast(dict, fields)` at the call site.
+- `app/services/vector_store/qdrant.py` (1): qdrant-client 1.13+
+  narrowed `timeout` to `int | None` even though the runtime still
+  accepts floats. Changed `30.0` → `30`.
+- `mcp_server/server.py` (2): `_handle_get` reused the identifier
+  `doc` for two different shapes — a `dict` in the version branch, a
+  `DocumentResponse` on the un-versioned path. Renamed the latter to
+  `response`.
+
+`mypy --python-version 3.14` now reports `Success: no issues found
+in 119 source files`.
+
+### Runtime deps exact-pinned
+
+The main `dependencies` block in `backend/pyproject.toml` was
+floor-only (`>=`); a silent resolver upgrade could swap backend image
+behavior on a re-deploy. Bumps are now an explicit code change. Pins
+captured from the resolved set in the 0.6.5 image (post Python 3.14
+base rebuild) and verified end-to-end:
+- `fastapi==0.136.3`, `uvicorn[standard]==0.49.0`, `pydantic==2.13.4`
+- `asyncpg==0.31.0`, `pgvector==0.4.2`, `gitpython==3.1.50`
+- `python-frontmatter==1.3.0`, `httpx==0.28.1`, `mcp[cli]==1.27.2`
+- `pyyaml==6.0.3`, `python-multipart==0.0.32`, `pyjwt==2.13.0`
+- `bcrypt==5.0.0`, `boto3==1.43.23`, `qdrant-client==1.18.0`
+- `kiwipiepy==0.23.1`, `redis==8.0.0`
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+- `bash backend/tests/test_hybrid_search_e2e.sh` — 25/25.
+
+---
+
 ## 0.6.5 — 2026-06-05  *(patch — pin static-analysis tooling + Python 3.11 → 3.14)*
 
 ### Python 3.11 → 3.14

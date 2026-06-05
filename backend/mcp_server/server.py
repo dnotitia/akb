@@ -366,10 +366,14 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
             "hash_algorithm": HASH_ALGORITHM,
             "content": body,
         }
-    doc = await doc_service.get(vault, doc_path)
-    if not doc:
+    # Different name from the `doc: dict` used in the version branch
+    # above — same identifier reused for a different shape (pydantic
+    # model here, dict there) was confusing mypy and is now actually
+    # clearer for readers too.
+    response = await doc_service.get(vault, doc_path)
+    if not response:
         return err("Document not found", code=NOT_FOUND)
-    return doc.model_dump()
+    return response.model_dump()
 
 
 @_h("akb_update")
