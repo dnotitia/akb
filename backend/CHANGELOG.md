@@ -5,6 +5,57 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.4 — 2026-06-05  *(patch — pgvector driver creates the `vector` extension before registering the asyncpg codec; fixes "unknown type: public.vector" on fresh self-hosted DBs, #117)*
+
+### Semantic search silently returned empty on a fresh self-hosted install
+
+A self-hosted reporter (#117) got zero semantic-search hits on a
+freshly stood-up stack. The backend log showed the embedding endpoint
+answering `200 OK` but every search degrading to empty:
+
+```
+WARNING akb.search: vector hybrid_search failed (unknown type: public.vector); returning empty
+```
+
+**Root cause — codec registered before the extension exists.** The
+`pgvector` driver registers pgvector's asyncpg binary codec
+(`register_vector` → `set_type_codec('vector', schema='public', …)`)
+*before* it runs `CREATE EXTENSION IF NOT EXISTS vector`. asyncpg can't
+build a codec for a type that isn't in the catalog yet, so it raises
+`ValueError: unknown type: public.vector`. That's a `ValueError`, not an
+`asyncpg.PostgresError`, so it slipped past `ensure_collection`'s except
+clause and resurfaced at every `hybrid_search`, where `search_service`
+catches it and returns empty.
+
+The trap is sharpest on the default `pgvector/pgvector` image: the
+extension is *available* but not *created* in a fresh app DB, and the
+one place that would create it (`_do_ensure`) ran *after* the codec
+registration that needed it — a chicken-and-egg that made the first
+`ensure_collection` fail on itself.
+
+Both codec-registration sites are now ordered after extension creation:
+
+- **Own pool** (separate `vector_store_dsn`): a new
+  `_bootstrap_extension()` runs `CREATE EXTENSION IF NOT EXISTS vector`
+  over a one-off connection *before* the pool — whose `init` callback
+  registers the codec — is built.
+- **Shared main pool** (blank DSN): inside `ensure_collection`, the
+  codec is registered *after* `_do_ensure` (whose first statement is
+  the `CREATE EXTENSION`), within the same transaction/connection that
+  already sees its own uncommitted DDL.
+
+Regression test `tests/test_pgvector_ext_bootstrap_e2e.py` exercises the
+real `PgvectorStore` against a throwaway DB with no `vector` extension
+in both pool modes: it failed with the exact `unknown type:
+public.vector` before this change and passes (extension installed +
+dense round-trip + `hybrid_search` returns the chunk) after. Like the
+other DB-backed e2e suites it's excluded from the no-DB CI unit job and
+runs locally / against a deployment.
+
+No schema or data migration. Operators who already worked around this
+by hand (`CREATE EXTENSION vector` + restart) are unaffected; the
+extension creation is idempotent.
+
 ## 0.7.3 — 2026-06-05  *(patch — `seahorse-db` BM25 metadata + `sparse_model=bm25` index param; AKB hybrid_search e2e 21/25 against live SeahorseDB)*
 
 ### `sparse_model: "bm25"` is required on the INVERTED index
