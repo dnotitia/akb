@@ -99,6 +99,26 @@ def get_vector_store() -> VectorStore:
             auto_create=settings.seahorsedb_auto_create,
             timeout=settings.seahorsedb_request_timeout_secs,
         )
+    elif driver == "seahorse-db-grpc":
+        # gRPC sibling of `seahorse-db`. Same Coral coordinator on the
+        # same port (Coral merges REST + gRPC into one listener), so we
+        # reuse the seahorsedb_* settings. Opt-in only — `seahorse-db`
+        # is the documented production path.
+        from .seahorse_db_grpc import SeahorseDbGrpcStore
+        if not settings.seahorsedb_coordinator_url:
+            raise RuntimeError(
+                "vector_store_driver=seahorse-db-grpc requires "
+                "seahorsedb_coordinator_url (Coral host:port — the same "
+                "endpoint the REST driver uses; scheme is stripped)."
+            )
+        _singleton = SeahorseDbGrpcStore(
+            coordinator_url=settings.seahorsedb_coordinator_url,
+            table_name=settings.seahorsedb_table_name,
+            dense_dim=settings.embed_dimensions,
+            distance=settings.seahorsedb_distance,
+            auto_create=settings.seahorsedb_auto_create,
+            timeout=settings.seahorsedb_request_timeout_secs,
+        )
     else:
         # Unreachable given the Literal at config load; kept for safety
         # against future config refactors.

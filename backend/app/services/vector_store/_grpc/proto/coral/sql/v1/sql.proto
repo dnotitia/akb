@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package coral.sql.v1;
+
+import "coral/common/v1/common.proto";
+
+service SqlService {
+  rpc ExecuteSql(ExecuteSqlRequest) returns (SqlResultSetResponse);
+  rpc ExecuteSqlPlan(ExecuteSqlPlanRequest) returns (SqlResultSetResponse);
+}
+
+message SqlRequestOptions {
+  optional string index_name = 1;
+  optional bool no_use_index = 2;
+}
+
+message ExecuteSqlRequest {
+  string sql = 1;
+  SqlRequestOptions options = 2;
+}
+
+message ExecuteSqlPlanRequest {
+  string sql = 1;
+  SqlRequestOptions options = 2;
+}
+
+message SqlResultSetResponse {
+  bytes arrow_ipc_stream = 1;
+  coral.common.v1.RequestMetrics metrics = 2;
+}

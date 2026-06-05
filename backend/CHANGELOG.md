@@ -5,6 +5,77 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.0 — 2026-06-06  *(minor — `seahorse-db-grpc` driver, opt-in gRPC sibling of `seahorse-db`)*
+
+A second SeahorseDB driver that talks gRPC to the same Coral coordinator (port and config are shared with `seahorse-db`; only the wire format differs). Opt-in via `vector_store_driver: seahorse-db-grpc`. The REST `seahorse-db` driver remains the documented production path; the gRPC variant is shipped as `experimental` until it clears its own QPS / recall benchmark.
+
+### Why
+
+0.7.7's release notes called out two real bugs we caught only because the wire happened to be JSON — i64 overflow on the PK column (`arrow_json::Decoder` rejects unsigned > 2^63 - 1 with a generic 500) and double-IDF/double-saturation on BM25 sparse weights. Both were client bugs, but the i64 surface is a JSON-parsing artifact. Typed gRPC (protobuf int64 for the PK, Arrow IPC for streamed search results, explicit message types for the dense and sparse legs) makes the type contract obvious at the wire boundary instead of letting "any uint64 value" reach Coral as untyped JSON. The intent is not to retire the REST driver — it works — but to give operators a transport with stricter typing on the same backend.
+
+### What ships
+
+- `backend/app/services/vector_store/seahorse_db_grpc.py` — new driver, ~470 lines.
+- `backend/app/services/vector_store/_seahorse_common.py` — `chunk_id_to_label`, `encode_sparse_string`, `validate_uuid_for_sql`. Shared by both `seahorse_db.py` (REST) and `seahorse_db_grpc.py` (gRPC); the REST driver re-exports them under their old underscore names for backwards compatibility within this package.
+- `backend/tests/test_seahorse_db_grpc_unit.py` — 31 mock-based unit tests covering protobuf wire shapes for every Protocol method, Arrow IPC decode round-trip, SQL-injection guards on `delete_point` and `hybrid_search`'s `source_id` filter, and CRUD parity with the REST driver.
+- `backend/tests/test_sparse_weight_convention.py` — cross-driver regression. Parametrised over every value in `vector_store_driver`'s Literal; fails if the encoder's `_use_raw_weights()` flag doesn't match a deliberately-declared `_EXPECTED` table. Caught the gRPC driver's silent inheritance of 0.7.7's bug before merge.
+  - Five Protocol methods:
+    - `health` → `HealthService.Check`
+    - `ensure_collection` → `TableService.GetTable` + `CreateTable` (typed `CreateTableSpec`; no Arrow IPC schema bytes needed)
+    - `upsert_one` → `IngestService.InsertJsonl` (same JSONL bytes the REST driver ships — keeps the 0.7.7 signed-i64 label fix and the raw-mode BM25 fix shared at the encoder level)
+    - `delete_point` → `IngestService.DeleteTableData`
+    - `hybrid_search` → `QueryService.HybridSearch` (server streaming; chunks are Arrow IPC stream bytes decoded with pyarrow)
+  - Sparse + label helpers (`_chunk_id_to_label`, `_encode_sparse_string`, `_validate_uuid_for_sql`) are imported from `seahorse_db.py` so encoder bugs fixed in one place don't drift between drivers.
+- `backend/app/services/vector_store/_grpc/proto/coral/**` — vendored Coral `.proto` files and `grpc_tools.protoc`-generated stubs. Source pinned at SeahorseDB monorepo commit `e1364f27` (`SDDEV-244/monorepo-coral-sparse`). Regeneration procedure documented in `_grpc/README.md`.
+- `backend/app/services/vector_store/factory.py` — new `elif driver == "seahorse-db-grpc":` branch that reuses the existing `seahorsedb_*` settings (same Coral, same port, same auto-create flag).
+- `backend/app/config.py` — `vector_store_driver` Literal extended with `"seahorse-db-grpc"`.
+- `backend/pyproject.toml` — three new runtime deps:
+  - `grpcio==1.81.0` (the floor `grpc_tools.protoc` 1.81 emits in generated `_pb2_grpc` files)
+  - `protobuf==6.33.6` (inside grpcio 1.81's `>=6.33.5,<7.0.0` range)
+  - `pyarrow==22.0.0` (decode `ResultStreamChunk` Arrow IPC bytes)
+
+### Wire details worth remembering
+
+(All discovered during local validation; recorded here so the next reader doesn't have to rediscover them.)
+
+- `CreateTableRequest.table` is `CreateTableSpec`, **not** `TableInfo` — so the schema can be described column-by-column in proto-native form and an Arrow IPC schema-bytes payload is not required.
+- `DenseVectorSearchConfig.vectors` is `repeated FloatVector` (not wrapped in `DenseQueryVectors`); `SparseVectorSearchConfig.vectors` is `repeated string`. The wrapper messages exist in the proto but only inside `VectorQuery`, not inside the SearchConfig path.
+- `FusionConfig.parameters` carries the RRF `k`. The REST driver pins `k=60`; the gRPC driver does the same via `FusionParameters(k=60)`. Leaving it as the server default silently shifts fused ordering vs the REST stream.
+- BM25 `SparseSearchParameters` and `SparseMetadata` are sent together. Coral returns `INVALID_ARGUMENT "BM25 parameters (k/b) require N, avgdl, and df metadata"` if you send parameters without metadata. The driver mirrors the REST driver's "send metadata only when stats + query tokens exist" gate, which is an asymmetry that affects both drivers when the corpus stats haven't loaded — flagged as follow-up.
+
+### Verification
+
+- Local Coral (port 53286) — each Protocol method individually exercised; round-trip with create / health / upsert (one row, then five rows) / hybrid search returning Arrow-decoded hits / delete.
+- `test_hybrid_search_e2e.sh` — full 25 scenarios against a backend whose `vector_store_driver` was flipped to `seahorse-db-grpc`. Pass: 25 / Fail: 0. Same result the REST driver gets on the same harness.
+- `bash scripts/check.sh` — green. The generated stubs are excluded from ruff via `pyproject.toml`'s `extend-exclude` since they're vendored, not hand-written.
+
+### Caveats
+
+- **Experimental**: not yet a recommended production driver. Use `seahorse-db` (REST) unless you have a measurement that says otherwise. QPS / recall benchmark against the REST driver is queued as the next follow-up.
+- **CI does not exercise the gRPC path** — no live Coral in CI. The driver's import-time correctness and the unit tests under `backend/tests/test_seahorse_db_grpc_unit.py` (also in this release) are what CI catches; end-to-end behaviour relies on the local 25-scenario run an operator does before flipping the production config.
+- **BM25 metadata asymmetry** (pre-existing, also in REST): both drivers send `parameters` whenever a search runs, but `metadata` only when `bm25_stats` has populated values. On a fresh corpus where `total_docs == 0` Coral will reject the hybrid search until the stats catch up. Filed as a follow-up to fix in both drivers.
+- **Three new runtime deps** raise the wheel size for everyone, not just gRPC users. We considered an optional dep group (`pip install akb[seahorse-grpc]`) and decided against it: AKB ships and is run as a container image, and ~50 MB inside Docker is not a meaningful constraint. The "extra failure mode if deps are missing" argument we initially gave for landing them as required is weaker — a `try: import grpc` in the factory branch would handle that in three lines. Revisit if a non-container distribution emerges; until then the call is "we don't gate wheel size for non-container users", said out loud.
+
+### Mid-merge design review — what it caught
+
+Before merging, an independent reviewer walked the week's changes (0.5.x → 0.8.0 working tree) and flagged two real issues that this section now reflects.
+
+**Blocker — the gRPC driver inherited 0.7.7's bug.** `sparse_encoder._use_raw_weights()` was a literal equality check against the string `"seahorse-db"`; the new `"seahorse-db-grpc"` driver fell through to the pre-baked branch (saturated TF × IDF), which is exactly the double-IDF/double-saturation shape 0.7.7 fixed for the REST driver. The 25-scenario hybrid e2e still passed because RRF fusion with a healthy dense leg masks BM25 weight drift unless the test set is specifically engineered to surface it (ours isn't, yet). Fixed by switching the gate to a frozenset (`_RAW_WEIGHT_DRIVERS = {"seahorse-db", "seahorse-db-grpc"}`), and added `backend/tests/test_sparse_weight_convention.py` — a `typing.get_args`-driven regression that fails the moment the `vector_store_driver` Literal grows a value not declared in the test's `_EXPECTED` convention table. Next time a Coral-family transport lands, the contributor either declares its BM25 convention out loud or the test goes red on PR.
+
+**Hygiene — load-bearing cross-file private import.** The gRPC driver was reaching into `seahorse_db.py` for `_chunk_id_to_label`, `_encode_sparse_string`, and `_validate_uuid_for_sql`. Pragmatic, but it made the REST driver both "a driver" and "the home of shared helpers", which is the separation-of-concerns violation 0.7.0's seahorse-cloud / seahorse-db split was supposed to enforce. Promoted the three helpers to `backend/app/services/vector_store/_seahorse_common.py`; both drivers now import them from the same first-class module. No behaviour change, but the contract is now public-to-this-package instead of "please don't break me".
+
+**Acknowledged but deferred** (filed as follow-ups, not blockers for this release):
+
+- The `_use_raw_weights()` frozenset is still the wrong shape architecturally; the cleaner fix is to put `sparse_weight_convention` on the driver class (or the Protocol) and have the encoder ask the driver, not the settings. Doing it now would change every driver implementation; doing it next release lets us measure the gRPC variant first.
+- `seahorse-db-grpc` could have been a `seahorsedb_transport: rest|grpc` flag on a single `seahorse-db` enum value instead of a separate enum entry; that would have moved the choice off the driver-factory axis. Worth considering before a third Coral transport (Arrow IPC streaming ingest, eventually).
+- 0.7.0's split was completed at the wrong altitude — sparse weight ownership ended up on the wrong side of the seam. 0.7.7 plumbed driver-awareness *backwards* into `sparse_encoder` to compensate, and 0.8.0 now leans on that workaround. The next time we touch this area, the goal should be to move BM25 convention ownership onto the driver and stop the encoder from reading config.
+
+### Not deployed
+
+prod + demo are unchanged (pgvector). The dogfood stack we built to evaluate `seahorse-db-grpc` lives outside this repo (gitignored internal manifests); details in `deploy/k8s/internal/seahorse-db/README.md` and the AKB product vault `seahorsedb-rust-on-prem-dogfood-k8s-deployment-reference.md`.
+
+---
+
 ## 0.7.9 — 2026-06-05  *(patch — `scripts/migrate_pgvector_to_seahorsedb.py`: bulk migrate without re-embedding)*
 
 The default driver-switch path (flip `vector_store_driver`, restart, let `embed_worker` rebuild) re-calls the embedding API for every chunk. On a production-sized vault that's real OpenRouter cost and real wall-clock time. The dense vectors are already sitting in pgvector's `vector_index.chunks` table, so we don't have to.

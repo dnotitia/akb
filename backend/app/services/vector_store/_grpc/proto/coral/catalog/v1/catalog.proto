@@ -1,0 +1,392 @@
+syntax = "proto3";
+
+package coral.catalog.v1;
+
+import "coral/common/v1/common.proto";
+
+service CatalogAdminService {
+  rpc GetCatalogStorageDump(GetCatalogStorageDumpRequest) returns (GetCatalogStorageDumpResponse);
+  rpc GetCatalogCacheDump(GetCatalogCacheDumpRequest) returns (GetCatalogCacheDumpResponse);
+  rpc GetCatalogCacheStats(coral.common.v1.Empty) returns (GetCatalogCacheStatsResponse);
+  rpc GetCatalogCacheConfig(coral.common.v1.Empty) returns (GetCatalogCacheConfigResponse);
+  rpc RefreshCatalogCache(coral.common.v1.Empty) returns (RefreshCatalogCacheResponse);
+  rpc InvalidateCatalogCache(InvalidateCatalogCacheRequest) returns (InvalidateCatalogCacheResponse);
+}
+
+message TableConfigurations {
+  optional int32 active_set_size_limit = 1;
+  optional int32 max_threads = 2;
+}
+
+message AssignedNodes {
+  repeated string writer_nodes = 1;
+  repeated string reader_nodes = 2;
+}
+
+message TablePlacement {
+  AssignedNodes assigned_nodes = 1;
+}
+
+enum ScalarType {
+  SCALAR_TYPE_UNSPECIFIED = 0;
+  SCALAR_TYPE_INT64 = 1;
+  SCALAR_TYPE_FLOAT64 = 2;
+  SCALAR_TYPE_BOOL = 3;
+  SCALAR_TYPE_STRING = 4;
+}
+
+enum VectorElement {
+  VECTOR_ELEMENT_UNSPECIFIED = 0;
+  VECTOR_ELEMENT_FLOAT32 = 1;
+}
+
+message DenseVectorType {
+  VectorElement element = 1;
+  uint32 dim = 2;
+}
+
+message SparseVectorType {}
+
+message ColumnType {
+  oneof kind {
+    ScalarType scalar = 1;
+    DenseVectorType dense_vector = 2;
+    SparseVectorType sparse_vector = 3;
+  }
+}
+
+message Column {
+  string name = 1;
+  ColumnType column_type = 2;
+  bool nullable = 3;
+  optional uint32 max_length = 4;
+}
+
+enum SegmentationStrategy {
+  SEGMENTATION_STRATEGY_UNSPECIFIED = 0;
+  SEGMENTATION_STRATEGY_VALUE = 1;
+  SEGMENTATION_STRATEGY_HASH = 2;
+}
+
+enum SegmentationComposition {
+  SEGMENTATION_COMPOSITION_UNSPECIFIED = 0;
+  SEGMENTATION_COMPOSITION_SINGLE = 1;
+  SEGMENTATION_COMPOSITION_HIERARCHICAL = 2;
+  SEGMENTATION_COMPOSITION_COMPOSITE = 3;
+}
+
+message ExternalSegmentation {
+  SegmentationStrategy strategy = 1;
+  repeated string columns = 2;
+  optional uint32 buckets = 3;
+  optional SegmentationComposition composition = 4;
+}
+
+message IndexParams {
+  optional string space = 1;
+  optional uint32 ef_construction = 2;
+  optional uint32 m = 3;
+  optional string sparse_model = 4;
+}
+
+message ExternalIndex {
+  string type = 1;
+  string column = 2;
+  IndexParams params = 3;
+}
+
+enum SegmentType {
+  SEGMENT_TYPE_UNSPECIFIED = 0;
+  SEGMENT_TYPE_UNDEFINED = 1;
+  SEGMENT_TYPE_VALUE = 2;
+  SEGMENT_TYPE_HASH = 3;
+}
+
+enum SegmentKeyCompositionType {
+  SEGMENT_KEY_COMPOSITION_TYPE_UNSPECIFIED = 0;
+  SEGMENT_KEY_COMPOSITION_TYPE_SINGLE = 1;
+  SEGMENT_KEY_COMPOSITION_TYPE_HIERARCHICAL = 2;
+  SEGMENT_KEY_COMPOSITION_TYPE_COMPOSITE = 3;
+}
+
+message SegmentationInfo {
+  SegmentType segment_type = 1;
+  repeated string segment_keys = 2;
+  optional uint32 num_buckets = 3;
+  optional SegmentKeyCompositionType segment_key_composition_type = 4;
+}
+
+message InternalIndexInfo {
+  string column_name = 1;
+  string index_type = 2;
+  IndexParams parameters = 3;
+}
+
+message ExternalTableDefinition {
+  repeated Column columns = 1;
+  repeated string primary_key = 2;
+  ExternalSegmentation segmentation = 3;
+  repeated ExternalIndex indexes = 4;
+}
+
+message InternalTableDefinition {
+  coral.common.v1.ArrowSchema schema = 1;
+  SegmentationInfo segmentation_info = 2;
+  repeated InternalIndexInfo index_info = 3;
+}
+
+message Table {
+  string table_name = 1;
+  TableConfigurations configurations = 2;
+  oneof definition {
+    ExternalTableDefinition external = 3;
+    InternalTableDefinition internal = 4;
+  }
+}
+
+message CreateTableSpec {
+  string table_name = 1;
+  repeated Column columns = 2;
+  repeated string primary_key = 3;
+  ExternalSegmentation segmentation = 4;
+  repeated ExternalIndex indexes = 5;
+  TableConfigurations configurations = 6;
+  TablePlacement placement = 7;
+}
+
+message TableIdentity {
+  string table_name = 1;
+  string oid = 2;
+}
+
+enum NodeType {
+  NODE_TYPE_UNSPECIFIED = 0;
+  NODE_TYPE_READER = 1;
+  NODE_TYPE_WRITER = 2;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_IN_RECOVERY = 1;
+  NODE_STATE_ACTIVE = 2;
+  NODE_STATE_INACTIVE = 3;
+}
+
+enum NodeStage {
+  NODE_STAGE_UNSPECIFIED = 0;
+  NODE_STAGE_INIT = 1;
+  NODE_STAGE_LOADING = 2;
+  NODE_STAGE_SUBSCRIBING = 3;
+  NODE_STAGE_RUNNING = 4;
+}
+
+enum SegmentAssignmentStatus {
+  SEGMENT_ASSIGNMENT_STATUS_UNSPECIFIED = 0;
+  SEGMENT_ASSIGNMENT_STATUS_SYNCING = 1;
+  SEGMENT_ASSIGNMENT_STATUS_SYNCED = 2;
+  SEGMENT_ASSIGNMENT_STATUS_REMOVING = 3;
+  SEGMENT_ASSIGNMENT_STATUS_FAILED = 4;
+  SEGMENT_ASSIGNMENT_STATUS_UNKNOWN = 5;
+}
+
+message NodeCheckpointInfo {
+  optional int64 last_set_number = 1;
+  repeated string set_versions = 2;
+  map<string, coral.common.v1.StringValues> set_index_counts = 3;
+}
+
+message SegmentAssignment {
+  string segment_oid = 1;
+  SegmentAssignmentStatus status = 2;
+  string failure_reason = 3;
+  NodeCheckpointInfo checkpoint = 4;
+}
+
+message TableAssignment {
+  string table_oid = 1;
+  map<string, SegmentAssignment> segments = 2;
+}
+
+message NodeInfo {
+  int32 version = 1;
+  int32 format_version = 2;
+  NodeType node_type = 3;
+  NodeState state = 4;
+  NodeStage node_stage = 5;
+  string last_updated = 6;
+  string node_address = 7;
+  map<string, TableAssignment> assigned_tables = 8;
+}
+
+message NodeRecord {
+  string node_id = 1;
+  NodeInfo node_info = 2;
+}
+
+enum CacheEntryType {
+  CACHE_ENTRY_TYPE_UNSPECIFIED = 0;
+  CACHE_ENTRY_TYPE_NODE = 1;
+  CACHE_ENTRY_TYPE_TABLE = 2;
+  CACHE_ENTRY_TYPE_SEGMENT = 3;
+}
+
+enum TableOperationalStatus {
+  TABLE_OPERATIONAL_STATUS_UNSPECIFIED = 0;
+  TABLE_OPERATIONAL_STATUS_ACTIVE = 1;
+  TABLE_OPERATIONAL_STATUS_CREATING_IN_PROGRESS = 2;
+  TABLE_OPERATIONAL_STATUS_CREATING_FAILED = 3;
+  TABLE_OPERATIONAL_STATUS_PREPARING_REBALANCE = 4;
+  TABLE_OPERATIONAL_STATUS_REBALANCING_IN_PROGRESS = 5;
+  TABLE_OPERATIONAL_STATUS_REBALANCING_FAILED = 6;
+}
+
+message TableOperationSegmentFailure {
+  string segment_id = 1;
+  SegmentAssignmentStatus status = 2;
+  string failure_reason = 3;
+}
+
+message TableOperationNodeFailure {
+  string node_id = 1;
+  repeated TableOperationSegmentFailure segments = 2;
+}
+
+message TableOperationFailure {
+  string summary = 1;
+  string detected_at = 2;
+  repeated TableOperationNodeFailure node_failures = 3;
+}
+
+message TableRebalancingContext {
+  repeated string reader_nodes = 1;
+  repeated string writer_nodes = 2;
+  optional string strategy = 3;
+  optional string started_at = 4;
+  optional TableOperationFailure failure = 5;
+}
+
+message TableCreationContext {
+  optional string started_at = 1;
+  optional TableOperationFailure failure = 2;
+}
+
+message SegmentReference {
+  string segment_id = 1;
+  string segment_oid = 2;
+}
+
+message KafkaInfo {
+  string topic = 1;
+  int32 partition = 2;
+}
+
+message ColumnMinMaxValue {
+  coral.common.v1.ScalarValue min = 1;
+  coral.common.v1.ScalarValue max = 2;
+}
+
+message SegmentAssignmentSnapshot {
+  repeated string readers = 1;
+  string writer = 2;
+}
+
+message TableInfo {
+  string table_name = 1;
+  int32 version = 2;
+  int32 format_version = 3;
+  string oid = 4;
+  coral.common.v1.ArrowSchema schema = 5;
+  optional SegmentationInfo segmentation_info = 6;
+  repeated InternalIndexInfo index_info = 7;
+  optional int32 active_set_size_limit = 8;
+  optional int32 max_threads = 9;
+  repeated SegmentReference segments = 10;
+  optional TableOperationalStatus status = 11;
+  optional TableRebalancingContext rebalancing_context = 12;
+  optional TableCreationContext creation_context = 13;
+}
+
+message SegmentInfo {
+  string oid = 1;
+  int32 version = 2;
+  int32 format_version = 3;
+  KafkaInfo kafka_info = 4;
+  map<string, ColumnMinMaxValue> column_min_max = 5;
+  repeated string reader = 6;
+  string writer = 7;
+  optional SegmentAssignmentSnapshot migration_source = 8;
+}
+
+message CacheEntryValue {
+  oneof kind {
+    NodeInfo node_info = 1;
+    TableInfo table_info = 2;
+    SegmentInfo segment_info = 3;
+  }
+}
+
+message GetCatalogStorageDumpRequest {
+  optional string pattern = 1;
+  optional uint32 limit = 2;
+}
+
+message CatalogStorageDumpEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message GetCatalogStorageDumpResponse {
+  repeated CatalogStorageDumpEntry entries = 1;
+}
+
+message GetCatalogCacheDumpRequest {
+  optional CacheEntryType entry_type = 1;
+  bool include_value = 2;
+  bool invalidated_only = 3;
+  bool expired_only = 4;
+  optional uint32 limit = 5;
+  optional string cursor = 6;
+}
+
+message CacheEntryDump {
+  string key = 1;
+  CacheEntryType cache_type = 2;
+  uint64 created_at_epoch_millis = 3;
+  uint64 ttl_seconds = 4;
+  bool invalidated = 5;
+  CacheEntryValue value = 6;
+}
+
+message GetCatalogCacheDumpResponse {
+  repeated CacheEntryDump cache_entries = 1;
+  optional string next_cursor = 2;
+}
+
+message GetCatalogCacheStatsResponse {
+  uint64 nodes_count = 1;
+  uint64 tables_count = 2;
+  uint64 segments_count = 3;
+  uint64 total_count = 4;
+}
+
+message GetCatalogCacheConfigResponse {
+  uint64 default_ttl_seconds = 1;
+  bool invalidation_subscriber_active = 2;
+  string invalidation_channel = 3;
+  uint64 invalidation_reconnect_interval_seconds = 4;
+  uint64 invalidation_heartbeat_interval_seconds = 5;
+}
+
+message RefreshCatalogCacheResponse {
+  bool refreshed = 1;
+}
+
+message InvalidateCatalogCacheRequest {
+  string key = 1;
+  bool publish = 2;
+}
+
+message InvalidateCatalogCacheResponse {
+  bool invalidated = 1;
+  optional bool published = 2;
+}

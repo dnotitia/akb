@@ -1,0 +1,231 @@
+syntax = "proto3";
+
+package coral.query.v1;
+
+import "coral/common/v1/common.proto";
+
+service QueryService {
+  rpc ScanTableData(ScanTableDataRequest) returns (stream ResultStreamEvent);
+  rpc VectorSearch(VectorSearchRequest) returns (stream ResultStreamEvent);
+  rpc HybridSearch(HybridSearchRequest) returns (stream ResultStreamEvent);
+  rpc VectorSearchExactKnn(VectorSearchExactKnnRequest) returns (stream ResultStreamEvent);
+  rpc DataPlan(DataPlanRequest) returns (DataPlanResponse);
+}
+
+message ResultStreamHeader {
+  uint32 num_result_sets = 1;
+}
+
+message ResultSetBoundary {
+  uint32 result_set_index = 1;
+  uint32 record_batch_count = 2;
+}
+
+message ResultStreamChunk {
+  bytes chunk = 1;
+}
+
+message ResultStreamFooter {
+  coral.common.v1.RequestMetrics metrics = 1;
+}
+
+message ResultStreamEvent {
+  oneof event {
+    ResultStreamHeader header = 1;
+    ResultSetBoundary result_set_boundary = 2;
+    ResultStreamChunk chunk = 3;
+    ResultStreamFooter footer = 4;
+  }
+}
+
+message ScanRequestOptions {
+  optional bool include_metrics = 1;
+  optional bool allow_writer = 2;
+  optional bool include_internal_columns = 3;
+}
+
+message SearchRequestOptions {
+  optional bool allow_writer = 1;
+}
+
+message ScanTableDataRequest {
+  string table_name = 1;
+  ScanRequestOptions options = 2;
+  optional string projection = 3;
+  optional string filter = 4;
+  optional int32 limit = 5;
+}
+
+message DenseSearchParameters {
+  optional uint32 ef_search = 1;
+}
+
+message SparseSearchParameters {
+  optional float k = 1;
+  optional float b = 2;
+}
+
+message SparseMetadata {
+  uint64 n = 1;
+  float avgdl = 2;
+  repeated string df = 3;
+}
+
+message FloatVector {
+  repeated float values = 1;
+}
+
+message DenseQueryVectors {
+  repeated FloatVector vectors = 1;
+  DenseSearchParameters parameters = 2;
+}
+
+message SparseQueryVectors {
+  repeated string vectors = 1;
+  SparseSearchParameters parameters = 2;
+  SparseMetadata metadata = 3;
+}
+
+message VectorQuery {
+  oneof query {
+    DenseQueryVectors dense = 1;
+    SparseQueryVectors sparse = 2;
+  }
+}
+
+message VectorSearchRequest {
+  string table_name = 1;
+  string index_name = 2;
+  SearchRequestOptions options = 3;
+  int32 top_k = 4;
+  VectorQuery query = 5;
+  optional string projection = 6;
+  optional string filter = 7;
+}
+
+message VectorSearchExactKnnRequest {
+  string table_name = 1;
+  string index_name = 2;
+  SearchRequestOptions options = 3;
+  int32 top_k = 4;
+  VectorQuery query = 5;
+  optional string projection = 6;
+  optional string filter = 7;
+}
+
+message DenseVectorSearchConfig {
+  string column = 1;
+  repeated FloatVector vectors = 2;
+  DenseSearchParameters parameters = 3;
+}
+
+message SparseVectorSearchConfig {
+  string column = 1;
+  repeated string vectors = 2;
+  SparseSearchParameters parameters = 3;
+  SparseMetadata metadata = 4;
+}
+
+message FusionParameters {
+  optional uint32 k = 1;
+  optional float alpha = 2;
+}
+
+message FusionConfig {
+  string type = 1;
+  FusionParameters parameters = 2;
+}
+
+message HybridSearchRequest {
+  string table_name = 1;
+  SearchRequestOptions options = 2;
+  int32 top_k = 3;
+  DenseVectorSearchConfig dense = 4;
+  SparseVectorSearchConfig sparse = 5;
+  FusionConfig fusion = 6;
+  optional string projection = 7;
+  optional string filter = 8;
+}
+
+message DataPlanRequest {
+  string table_name = 1;
+  optional string projection = 2;
+  optional string filter = 3;
+  optional bool allow_writer = 4;
+}
+
+message SetVersionEntry {
+  int64 set = 1;
+  int64 version = 2;
+}
+
+message NodeSetVersions {
+  string node_id = 1;
+  string node_type = 2;
+  optional int64 last_set_number = 3;
+  repeated SetVersionEntry versions = 4;
+  optional int64 num_latest_matches = 5;
+  optional int64 num_latest_mismatches = 6;
+}
+
+message NodeSearchRanges {
+  string node_id = 1;
+  string node_type = 2;
+  repeated string search_scopes = 3;
+}
+
+message SegmentPlanDetail {
+  string segment_id = 1;
+  int64 last_inactive_set = 2;
+  repeated SetVersionEntry latest_versions = 3;
+  repeated NodeSetVersions readers = 4;
+  NodeSetVersions writer = 5;
+  repeated NodeSearchRanges segment_distribution = 6;
+}
+
+message SegmentLastSet {
+  string segment_id = 1;
+  optional int64 last_set_number = 2;
+}
+
+message EmptyRangeDiagnostic {
+  string node_id = 1;
+  string node_type = 2;
+  string node_address = 3;
+  repeated string assigned_segments_for_table = 4;
+  repeated SegmentLastSet segment_last_sets = 5;
+}
+
+message NodeSegmentRawSnapshot {
+  string segment_id = 1;
+  optional int64 last_set_number = 2;
+  repeated SetVersionEntry versions = 3;
+}
+
+message RawNodeAssignments {
+  string node_id = 1;
+  string node_type = 2;
+  string node_address = 3;
+  repeated NodeSegmentRawSnapshot assigned_segments = 4;
+}
+
+message PruningFilter {
+  string filter_expression = 1;
+}
+
+message SegmentPruningInfo {
+  bool enabled = 1;
+  uint64 total_segments_available = 2;
+  uint64 segments_pruned = 3;
+  repeated PruningFilter pruning_filters = 4;
+}
+
+message DataPlanResponse {
+  string table_name = 1;
+  optional string filter = 2;
+  optional SegmentPruningInfo segment_pruning = 3;
+  repeated SegmentPlanDetail segments = 4;
+  repeated NodeSearchRanges final_distribution = 5;
+  repeated EmptyRangeDiagnostic empty_range_diagnostics = 6;
+  repeated RawNodeAssignments raw_node_assignments = 7;
+}

@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package coral.storage.v1;
+
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_JSONL = 1;
+  FILE_FORMAT_PARQUET = 2;
+}
+
+enum StorageType {
+  STORAGE_TYPE_UNSPECIFIED = 0;
+  STORAGE_TYPE_LOCAL = 1;
+  STORAGE_TYPE_AWS = 2;
+  STORAGE_TYPE_S3 = 3;
+  STORAGE_TYPE_GCP = 4;
+  STORAGE_TYPE_AZURE = 5;
+  STORAGE_TYPE_CEPH = 6;
+  STORAGE_TYPE_MINIO = 7;
+  STORAGE_TYPE_S3_COMPATIBLE = 8;
+}
+
+message CloudStorageCredentials {
+  optional string access_key = 1;
+  optional string secret_key = 2;
+}
+
+message CloudStorageOptions {
+  optional string region = 1;
+  optional string endpoint = 2;
+  optional bool virtual_hosted_style = 3;
+  optional bool allow_http = 4;
+}
+
+message StorageConfig {
+  StorageType storage_type = 1;
+  optional string bucket = 2;
+  optional CloudStorageCredentials credentials = 3;
+  optional CloudStorageOptions options = 4;
+}
+
+message Paths {
+  repeated string paths = 1;
+  optional StorageConfig storage_config = 2;
+}

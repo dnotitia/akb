@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package coral.health.v1;
+
+service HealthService {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string message = 1;
+  int32 visit_count = 2;
+}

@@ -77,48 +77,11 @@ from .base import VectorHit, VectorStoreUnavailable, has_dense
 logger = logging.getLogger("akb.vector_store.seahorse_db")
 
 
-def _validate_uuid_for_sql(s: str) -> str:
-    """Reject anything that isn't a UUID before interpolating into a
-    SQL WHERE clause. AKB source_ids are always UUIDs; this is purely
-    defense in depth against any caller mistake."""
-    uuid.UUID(s)
-    return s
-
-
-def _encode_sparse_string(
-    indices: list[int], values: list[float],
-) -> str:
-    """Encode AKB's parallel sparse arrays into Coral's
-    ``"term_id:weight term_id:weight"`` string format (space-separated,
-    one pair per token). Verified against the live Coral hybrid
-    search request handler — sparse vectors arrive as a single string
-    on this column, not as a list of pairs or as a JSON sub-object."""
-    if not indices:
-        return ""
-    return " ".join(f"{int(t)}:{float(w):.6g}" for t, w in zip(indices, values))
-
-
-def _chunk_id_to_label(chunk_id: str) -> int:
-    """UUID -> SeahorseDB i64 label.
-
-    First 8 bytes of the UUID's binary form, interpreted big-endian as
-    **signed** i64. The signedness matters: Coral's JSONL ingest
-    parses INT64 columns through Arrow, which rejects unsigned values
-    > 2^63 - 1 with ``ComponentError::Arrow`` and surfaces as HTTP 500
-    ``error_code 500233 "Internal error"`` with no row context. About
-    half of all random UUIDs have a high bit set in their first 8
-    bytes, so an unsigned variant of this function reliably 500s on
-    roughly that fraction of inserts under sustained load — exactly the
-    pattern we filed as SeahorseDB#433. ``signed=True`` keeps the full
-    64-bit space addressable on the i64 side and removes that failure
-    mode.
-
-    Collisions are birthday-paradox bounded — ~2^32 chunks per table
-    before a 50% chance of any pair colliding, far beyond any realistic
-    vault. Signedness has no effect on collision probability.
-    """
-    raw = uuid.UUID(chunk_id).bytes
-    return int.from_bytes(raw[:8], "big", signed=True)
+from ._seahorse_common import (
+    chunk_id_to_label as _chunk_id_to_label,
+    encode_sparse_string as _encode_sparse_string,
+    validate_uuid_for_sql as _validate_uuid_for_sql,
+)
 
 
 class SeahorseDbStore:

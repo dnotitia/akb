@@ -1,0 +1,249 @@
+syntax = "proto3";
+
+package coral.segment.v1;
+
+import "coral/catalog/v1/catalog.proto";
+
+service SegmentService {
+  rpc RetrySegments(RetrySegmentsRequest) returns (RetrySegmentsResponse);
+  rpc GetSegmentsStatus(GetSegmentsStatusRequest) returns (GetSegmentsStatusResponse);
+  rpc RebalancePlan(RebalancePlanRequest) returns (RebalancePlanResponse);
+  rpc RebalanceCommit(RebalanceCommitRequest) returns (RebalanceCommitResponse);
+  rpc GetRebalanceStatus(GetRebalanceStatusRequest) returns (GetRebalanceStatusResponse);
+}
+
+enum SegmentRetryMode {
+  SEGMENT_RETRY_MODE_UNSPECIFIED = 0;
+  SEGMENT_RETRY_MODE_AUTO = 1;
+  SEGMENT_RETRY_MODE_CREATE = 2;
+  SEGMENT_RETRY_MODE_REBALANCE = 3;
+}
+
+enum SegmentsStatusMode {
+  SEGMENTS_STATUS_MODE_UNSPECIFIED = 0;
+  SEGMENTS_STATUS_MODE_ACTIVE = 1;
+  SEGMENTS_STATUS_MODE_CREATE = 2;
+  SEGMENTS_STATUS_MODE_REBALANCE = 3;
+}
+
+enum TableOperationSegmentExpectation {
+  TABLE_OPERATION_SEGMENT_EXPECTATION_UNSPECIFIED = 0;
+  TABLE_OPERATION_SEGMENT_EXPECTATION_ADD = 1;
+  TABLE_OPERATION_SEGMENT_EXPECTATION_REMOVE = 2;
+}
+
+enum TableOperationObservedSegmentStatus {
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_UNSPECIFIED = 0;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_SYNCING = 1;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_SYNCED = 2;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_REMOVING = 3;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_FAILED = 4;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_UNKNOWN = 5;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_DELETED = 6;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_NOT_TRACKED = 7;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_MISSING_NODE_INFO = 8;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_MISSING_TABLE_ASSIGNMENT = 9;
+  TABLE_OPERATION_OBSERVED_SEGMENT_STATUS_MISSING_SEGMENT_ASSIGNMENT = 10;
+}
+
+enum RebalanceStrategy {
+  REBALANCE_STRATEGY_UNSPECIFIED = 0;
+  REBALANCE_STRATEGY_BALANCED_MIN_MOVES = 1;
+  REBALANCE_STRATEGY_STRICT_ALGORITHMIC = 2;
+}
+
+message RetrySegmentsRequest {
+  string table_name = 1;
+  SegmentRetryMode mode = 2;
+  bool only_failed = 3;
+  bool skip_unsubscribed = 4;
+  bool dry_run = 5;
+  optional uint32 max_targets = 6;
+}
+
+message SegmentsRetrySkipInfo {
+  string reason = 1;
+}
+
+message SegmentsRetryNodeObservations {
+  bool missing_nodeinfo = 1;
+  bool missing_table_assignment = 2;
+  uint32 missing_segment_count = 3;
+  uint32 failed_segment_count = 4;
+  uint32 synced_segment_count = 5;
+  uint32 not_removed_segment_count = 6;
+}
+
+message SegmentsRetryNodeResult {
+  string node_id = 1;
+  repeated string published_segments = 2;
+  optional SegmentsRetrySkipInfo skipped = 3;
+  SegmentsRetryNodeObservations observations = 4;
+}
+
+message SegmentsRetrySummary {
+  string mode = 1;
+  uint32 total_nodes = 2;
+  uint32 published_segment_count = 3;
+  uint32 skipped_node_count = 4;
+  bool truncated = 5;
+}
+
+message RetrySegmentsResponse {
+  string table_name = 1;
+  string table_status = 2;
+  SegmentsRetrySummary summary = 3;
+  repeated SegmentsRetryNodeResult nodes = 4;
+}
+
+message GetSegmentsStatusRequest {
+  string table_name = 1;
+}
+
+message TableOperationSegmentFailure {
+  string segment_id = 1;
+  coral.catalog.v1.SegmentAssignmentStatus status = 2;
+  string failure_reason = 3;
+}
+
+message TableOperationNodeFailure {
+  string node_id = 1;
+  repeated TableOperationSegmentFailure segments = 2;
+}
+
+message TableOperationFailure {
+  string summary = 1;
+  string detected_at = 2;
+  repeated TableOperationNodeFailure node_failures = 3;
+}
+
+message TableOperationSegmentStatus {
+  string segment_id = 1;
+  TableOperationSegmentExpectation expected = 2;
+  TableOperationObservedSegmentStatus observed = 3;
+  optional string failure_reason = 4;
+}
+
+message TableOperationNodeSegmentStatus {
+  string node_id = 1;
+  repeated TableOperationSegmentStatus segments = 2;
+}
+
+message TableOperationPollingInfo {
+  string evaluated_at = 1;
+  repeated TableOperationNodeSegmentStatus nodes = 2;
+}
+
+message SegmentsStatusSummary {
+  uint32 total = 1;
+  uint32 synced = 2;
+  uint32 failed = 3;
+  uint32 pending = 4;
+}
+
+message GetSegmentsStatusResponse {
+  string table_name = 1;
+  string table_status = 2;
+  SegmentsStatusMode mode = 3;
+  optional string started_at = 4;
+  optional uint64 ttl_seconds = 5;
+  optional TableOperationFailure failure = 6;
+  optional TableOperationPollingInfo polling = 7;
+  optional SegmentsStatusSummary summary = 8;
+}
+
+message RebalancePlanRequest {
+  string table_name = 1;
+  repeated string reader_nodes = 2;
+  repeated string writer_nodes = 3;
+  optional RebalanceStrategy strategy = 4;
+}
+
+message RebalanceNodeLoad {
+  string node_id = 1;
+  uint32 count = 2;
+}
+
+message RebalancePlanSummary {
+  uint32 total_segments = 1;
+  uint32 writer_moves = 2;
+  uint32 reader_moves = 3;
+  uint32 unchanged_count = 4;
+  repeated RebalanceNodeLoad writer_load_before = 5;
+  repeated RebalanceNodeLoad writer_load_after = 6;
+  repeated RebalanceNodeLoad reader_load_before = 7;
+  repeated RebalanceNodeLoad reader_load_after = 8;
+}
+
+message RebalanceSegmentSide {
+  string writer = 1;
+  repeated string readers = 2;
+}
+
+message RebalanceSegmentChangeFlag {
+  bool writer = 1;
+  bool readers = 2;
+}
+
+message RebalanceSegmentEntry {
+  string segment_id = 1;
+  RebalanceSegmentSide before = 2;
+  RebalanceSegmentSide after = 3;
+  RebalanceSegmentChangeFlag changed = 4;
+}
+
+message SegmentAssignmentSnapshot {
+  string segment_id = 1;
+  repeated string readers = 2;
+  string writer = 3;
+}
+
+message SegmentStructureSnapshot {
+  optional coral.catalog.v1.SegmentationInfo segmentation_info = 1;
+  repeated string segment_ids = 2;
+  map<string, SegmentAssignmentSnapshot> segment_assignments = 3;
+}
+
+message RebalanceCommitRequest {
+  string table_name = 1;
+  repeated string reader_nodes = 2;
+  repeated string writer_nodes = 3;
+  optional RebalanceStrategy strategy = 4;
+  int32 expected_table_version = 5;
+  SegmentStructureSnapshot expected_segment_structure = 6;
+}
+
+message RebalancePlanResponse {
+  string table_name = 1;
+  int32 expected_table_version = 2;
+  RebalanceStrategy strategy = 3;
+  SegmentStructureSnapshot expected_segment_structure = 4;
+  repeated string effective_reader_nodes = 5;
+  repeated string effective_writer_nodes = 6;
+  RebalancePlanSummary summary = 7;
+  repeated RebalanceSegmentEntry segments = 8;
+  RebalanceCommitRequest commit_template = 9;
+}
+
+message RebalanceCommitResponse {
+  string table_name = 1;
+  int32 new_table_version = 2;
+  string status = 3;
+  RebalancePlanSummary summary = 4;
+  repeated RebalanceSegmentEntry segments = 5;
+  repeated string effective_reader_nodes = 6;
+  repeated string effective_writer_nodes = 7;
+}
+
+message GetRebalanceStatusRequest {
+  string table_name = 1;
+}
+
+message GetRebalanceStatusResponse {
+  string table_name = 1;
+  string status = 2;
+  optional string started_at = 3;
+  optional uint64 ttl_seconds = 4;
+  optional TableOperationFailure failure = 5;
+  optional TableOperationPollingInfo polling = 6;
+}

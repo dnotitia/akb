@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package coral.utility.v1;
+
+import "coral/catalog/v1/catalog.proto";
+import "coral/common/v1/common.proto";
+import "coral/storage/v1/storage.proto";
+
+service UtilityService {
+  rpc GetSchemaFromParquet(GetSchemaFromParquetRequest) returns (SchemaInferenceResponse);
+  rpc NormalizeCreateTableSchema(NormalizeCreateTableSchemaRequest) returns (SchemaInferenceResponse);
+}
+
+message GetSchemaFromParquetRequest {
+  coral.storage.v1.Paths paths = 1;
+  optional bool internal_schema = 2;
+}
+
+message NormalizeCreateTableSchemaRequest {
+  coral.common.v1.ArrowSchema schema = 1;
+  optional bytes first_batch_arrow_ipc = 2;
+  optional string seahorse_schema_metadata_json = 3;
+  optional bool internal_schema = 4;
+}
+
+message SchemaInferenceResponse {
+  repeated coral.catalog.v1.Column columns = 1;
+  repeated string primary_key = 2;
+  optional coral.catalog.v1.ExternalSegmentation segmentation = 3;
+  repeated coral.catalog.v1.ExternalIndex indexes = 4;
+  optional coral.common.v1.ArrowSchema schema = 5;
+}
