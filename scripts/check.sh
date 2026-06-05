@@ -17,8 +17,16 @@ step "ruff (backend)"
 ruff check backend/
 
 # ─── backend: mypy (types) ─────────────────────────────────────────
+# `--python-version 3.11` matches both pyproject.toml's `requires-python`
+# and the CI runner's `actions/setup-python` pin. Without it the analyzer
+# picks up whatever Python the dev's `mypy` binary was installed against
+# (3.11 / 3.13 / 3.14 all currently in flight on team machines), and
+# different runtimes' typing modules can disagree on third-party stubs —
+# which is the bug shape we hit in 0.6.4 (local: 18 errors, CI: green).
+# Setting it explicitly here keeps `bash scripts/check.sh` deterministic
+# regardless of which venv is active.
 step "mypy (backend)"
-(cd backend && mypy app/ mcp_server/)
+(cd backend && mypy --python-version 3.14 app/ mcp_server/)
 
 # ─── backend: bandit (security) ────────────────────────────────────
 # Gate at medium severity — low-level findings on `random`, `try/except
