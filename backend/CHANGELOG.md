@@ -5,6 +5,95 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.6 — 2026-06-05  *(patch — `seahorse-db` BM25-only fallback documented as structurally unsupported)*
+
+### What
+
+0.7.3 left "BM25-only / dense-less path" in the gap list. After
+trying to wire it in 0.7.6 we hit a structural blocker:
+
+```bash
+$ curl -X POST $CORAL/v2/tables -d '{
+    "table_name": "...",
+    "columns": [
+        {"name": "embedding", "type": {"name": "DENSE_VECTOR", ...}, "nullable": true},
+        ...
+    ], ...
+}'
+HTTP 400
+error_code 400101
+"Invalid argument: Vector column 'embedding' must not be nullable"
+```
+
+`coral-models/src/api/schema.rs` says the field can carry
+`nullable: true`, but the field's own docstring warns "even if this
+is set to true for Vector type, the server may reject it at
+validation time" — and the live Coral does exactly that on every
+build we've tested. There's no honest way to insert a sparse-only
+row, and therefore no honest way to retrieve one.
+
+Three workarounds were considered and rejected:
+
+1. **Zero-vector for dense=None**. The HNSW index treats every
+   sparse-only row as equidistant from any dense query, so dense
+   recall silently degrades to "random sparse subset" and fusion
+   results become noise. Pretending the row had a vector when it
+   doesn't is dishonest under the AKB sparse_encoder contract.
+2. **`bm25_only` BOOL column + dense-leg filter**. Adds an always-on
+   `WHERE bm25_only = false` to every hybrid_search and a separate
+   sparse-only search path. Big driver change, but the catalog
+   constraint above means we'd still have to write a synthetic
+   embedding value — there's no "skip dense" Coral can express on
+   insert. Same dishonest-on-disk problem as (1), with more
+   moving parts.
+3. **A second sparse-only table alongside the hybrid one**. Doubles
+   the operational surface (two Coral tables, two segment streams,
+   two indexing-state checkpoints) for a feature parity the other
+   drivers expose for free. Not worth it.
+
+### Changes
+
+- `seahorse_db.py` module docstring now states BM25-only is
+  structurally unsupported, with a citation to the catalog 400 and
+  the schema.rs docstring.
+- `upsert_one(dense=None)` and `hybrid_search(query_dense=None)` both
+  raise `VectorStoreUnavailable` with the structural reason and the
+  "use pgvector or qdrant" recommendation in the message. Same
+  behavior as 0.7.3, just clearer about *why* it's permanent.
+- `config.py`'s `vector_store_driver` docstring carries a new
+  paragraph spelling out which drivers tolerate `embed_base_url`
+  being unset/unreachable (pgvector / qdrant) and which don't
+  (both seahorse drivers). Operators picking a driver now have
+  the embed-API-availability dimension in front of them.
+
+### What this means for operators
+
+- If `embed_base_url` is reliable in your environment (OpenRouter,
+  managed embed endpoint, OpenAI), `seahorse-db` is fine — every
+  AKB chunk has a real embedding and the driver behaves like the
+  others.
+- If `embed_base_url` may be empty (self-hosted, no model yet) OR
+  intermittent (degraded endpoint), `seahorse-db` will stall the
+  indexing queue on `dense=None` chunks until the endpoint
+  recovers. Use `pgvector` or `qdrant` if that's the failure mode
+  you need to absorb.
+
+### Not deployed
+
+prod + demo still pgvector. The 4 e2e fails 0.7.3 reported stay open
+— this release closes the BM25-only path as "won't fix in driver";
+the other three (Coral 500 #SeahorseDB/433, Kafka eventual
+consistency budget, retry policy) are still upstream-side.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- Coral live-rejection of `nullable: true` on the vector column
+  confirmed by direct curl against `POST /v2/tables`. Documented
+  inline.
+
+---
+
 ## 0.7.5 — 2026-06-05  *(patch — `test_seahorse_db_e2e.sh` rewritten with content-type asserts + 0.7.3 wire formats; 13/13 against live Coral)*
 
 ### What

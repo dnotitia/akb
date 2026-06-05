@@ -115,6 +115,16 @@ class Settings(BaseModel):
     #     Reader(s) + Redis + Kafka + sparse-embedding yourself).
     # Pre-0.7.0 there was only one `seahorse` enum value that meant
     # cloud — config migration is `seahorse` → `seahorse-cloud`.
+    #
+    # BM25-only resilience: only `pgvector` (and the
+    # similarly-permissive `qdrant`) tolerate ``embed_base_url``
+    # being unset or unreachable — the embed_worker's BM25 fallback
+    # writes ``dense=NULL`` rows and ``hybrid_search`` serves them
+    # from the sparse leg alone. Both `seahorse-cloud` and
+    # `seahorse-db` reject the catalog migration that would allow a
+    # NULL embedding column, so on those drivers an embed-API
+    # outage stalls the indexing queue. Pick a driver that matches
+    # your embedding-availability assumptions.
     vector_store_driver: Literal[
         "qdrant", "pgvector", "seahorse-cloud", "seahorse-db"
     ] = "qdrant"

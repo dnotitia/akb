@@ -45,6 +45,20 @@ some AKB integration tests) need to poll Coral's
 visibility. ``embed_worker`` is fine — it marks `vector_indexed_at`
 on Kafka-accept, and the next search-time gap is the same gap any
 async indexing pipeline has.
+
+**BM25-only fallback is NOT supported by this driver.** pgvector
+ships ``dense IS NULL`` rows + a partial HNSW index when the
+embedding API is unavailable, so AKB's ``embed_base_url`` can be left
+unset and the BM25 leg still serves results. Coral rejects that path
+at the catalog level: ``POST /v2/tables`` with ``embedding`` column
+``nullable: true`` returns ``HTTP 400 error_code 400101 "Vector
+column 'embedding' must not be nullable"`` (see
+``coral-models/src/api/schema.rs`` — the field's own docstring warns
+"server may reject it at validation time even if nullable=true").
+Both ``upsert_one(dense=None)`` and ``hybrid_search(query_dense=None)``
+therefore raise ``VectorStoreUnavailable`` immediately. Operators
+who need BM25-only resilience should run pgvector or qdrant; an
+``embed_base_url`` outage will fail the upsert path here.
 """
 
 from __future__ import annotations
@@ -257,13 +271,21 @@ class SeahorseDbStore:
         if has_dense(dense):
             record["embedding"] = dense
         else:
-            # Schema requires embedding NOT NULL; we don't yet have a
-            # BM25-only path for seahorse-db. Surface explicitly so the
-            # worker's per-row failure path catches it instead of Coral
-            # rejecting the whole row with a less specific error.
+            # Coral's CreateTableRequest rejects ``nullable: true`` on
+            # vector columns at validation time (HTTP 400 error_code
+            # 400101 "Vector column 'embedding' must not be nullable",
+            # see module docstring). There's no honest way to upsert
+            # a sparse-only row into this schema, so we fail loud and
+            # let the worker's per-row failure path catch it instead
+            # of Coral's whole-batch rejection with a less specific
+            # error. Operators who need BM25-only resilience under an
+            # embed-API outage should run pgvector or qdrant.
             raise VectorStoreUnavailable(
-                "seahorse-db driver requires a dense embedding per row; "
-                "BM25-only fallback (dense=None) is not yet supported."
+                "seahorse-db requires a dense embedding per row "
+                "(Coral schema forbids NULL on vector columns). "
+                "BM25-only fallback is structurally unsupported by "
+                "this driver — use pgvector / qdrant if "
+                "embed_base_url may be unset or unreachable."
             )
 
         body = json.dumps(record, separators=(",", ":"))
@@ -362,13 +384,20 @@ class SeahorseDbStore:
         """
         # Dense-only and sparse-only modes both need a non-empty
         # ``vectors`` payload on the empty-side config or Coral
-        # returns 400. We could fall back to the single-leg vector
-        # search endpoints when one side is missing, but that's a
-        # bigger driver change — for now both legs must be present.
+        # returns 400. The single-leg vector-search endpoints
+        # (``/v2/tables/{name}/data/indexes/{index}/vector-search``)
+        # exist, but the corresponding upsert path is structurally
+        # blocked by Coral's NOT NULL on the embedding column (see
+        # module docstring), so we can't reach a state where this
+        # branch would be useful for AKB — the table can never
+        # contain a sparse-only row to retrieve. Failing loud here
+        # is consistent with `upsert_one`'s dense=None refusal.
         if not has_dense(query_dense):
             raise VectorStoreUnavailable(
-                "seahorse-db hybrid_search requires query_dense; "
-                "dense-less query path is not yet implemented."
+                "seahorse-db hybrid_search requires query_dense "
+                "(Coral schema forbids NULL on the embedding column, "
+                "so a sparse-only row can never exist to retrieve). "
+                "Use pgvector / qdrant for BM25-only search."
             )
 
         sparse_string = _encode_sparse_string(
