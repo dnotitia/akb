@@ -50,6 +50,14 @@ htmlcov/
 /deploy/k8s/aws-internal/
 /deploy/k8s/aws-demo-internal/
 
+# docker-compose overlays for local-only validation against private
+# images (e.g. dn-inc's commercial SeahorseDB stack). The tracked
+# `docker-compose.yaml` stays generic; operator-specific overlays live
+# here. `docker compose` auto-merges any `docker-compose.override.yaml`
+# in CWD on top of the base file.
+/docker-compose.override.yaml
+/docker-compose.*.override.yaml
+
 # Benchmark runtime artifacts (NDJSON shards, per-worker logs, smoke
 # outputs). The runner writes here at execution time; nothing under
 # /eval/reports/ belongs in source control.
