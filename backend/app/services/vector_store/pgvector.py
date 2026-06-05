@@ -134,6 +134,16 @@ class PgvectorStore:
                 )
             return await self._get_main_pool()
         if self._own_pool is None:
+            # Bootstrap the extension BEFORE building a pool whose `init`
+            # callback registers the pgvector codec. register_vector ->
+            # asyncpg.set_type_codec('vector', ...) can't build a codec
+            # for a type that doesn't exist yet and raises
+            # `ValueError: unknown type: public.vector` — which would
+            # abort pool creation on any DB where `CREATE EXTENSION
+            # vector` has never run (e.g. a fresh `pgvector/pgvector`
+            # DB: the extension is *available* but not *created*). See #117.
+            await self._bootstrap_extension(self._dsn)
+
             async def _init(conn):
                 # Register pgvector binary codec on every conn the
                 # pool hands out — list[float] in, list[float] out,
@@ -149,6 +159,19 @@ class PgvectorStore:
                 init=_init,
             )
         return self._own_pool
+
+    @staticmethod
+    async def _bootstrap_extension(dsn: str) -> None:
+        """`CREATE EXTENSION IF NOT EXISTS vector` over a one-off conn.
+
+        Used to guarantee the `vector` type exists before any code path
+        registers the pgvector codec (pool `init`). Idempotent; cheap.
+        """
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        finally:
+            await conn.close()
 
     async def _ensure_codec(self, conn) -> None:
         """Register the pgvector binary codec on `conn` once. Conns
@@ -221,7 +244,6 @@ class PgvectorStore:
             try:
                 pool = await self._pool()
                 async with pool.acquire() as c:
-                    await self._ensure_codec(c)
                     async with c.transaction():
                         # advisory_xact_lock auto-releases on tx end
                         # (commit OR rollback OR conn close), so a
@@ -230,7 +252,19 @@ class PgvectorStore:
                             "SELECT pg_advisory_xact_lock($1)",
                             _advisory_lock_key(self._schema),
                         )
+                        # _do_ensure's first statement is CREATE EXTENSION
+                        # IF NOT EXISTS vector. Register the pgvector codec
+                        # only AFTER it, so the `vector` type exists when
+                        # set_type_codec introspects — otherwise asyncpg
+                        # raises `ValueError: unknown type: public.vector`
+                        # on a fresh DB. This is the shared-main-pool path
+                        # (its conns carry no register_vector init
+                        # callback, unlike our own pool). See #117. The
+                        # same transaction/connection sees its own
+                        # uncommitted CREATE EXTENSION, so registering here
+                        # is safe.
                         await self._do_ensure(c)
+                        await self._ensure_codec(c)
             except asyncpg.PostgresError as e:
                 raise VectorStoreUnavailable(f"schema setup failed: {e}") from e
             self._ensured_collection = True
