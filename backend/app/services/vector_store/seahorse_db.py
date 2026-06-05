@@ -375,6 +375,37 @@ class SeahorseDbStore:
             query_sparse_indices, query_sparse_values,
         )
 
+        # BM25 metadata + parameters: Coral defaults gave noticeably
+        # worse recall on the 25-scenario hybrid e2e (BM25-en /
+        # BM25-ko / cross-vault-B all missed). Ship our corpus stats
+        # (`N`, `avgdl`) + the per-term df for the query's vocabulary.
+        # Cheap when the vocab is small (typical Kiwi-tokenised
+        # Korean queries are 3-8 tokens), one extra PG fetch per
+        # search. AKB's stats are already cached in sparse_encoder
+        # with a TTL.
+        from app.services import sparse_encoder
+        bm25_stats = await sparse_encoder.load_stats()
+        n_docs = int(bm25_stats.get("total_docs") or 0)
+        avgdl = float(bm25_stats.get("avgdl") or 0.0)
+        sparse_params: dict[str, Any] = {
+            "k": float(bm25_stats.get("k1") or 1.5),
+            "b": float(bm25_stats.get("b") or 0.75),
+        }
+        sparse_metadata: dict[str, Any] | None = None
+        if n_docs > 0 and avgdl > 0 and query_sparse_indices:
+            df_map = await sparse_encoder.load_df_for_terms(query_sparse_indices)
+            # Coral's SparseMetadata.df is `Vec<String>` — one entry per
+            # query vector, each string is "term_id:df term_id:df ...".
+            df_str = " ".join(
+                f"{int(t)}:{int(df_map.get(int(t), 0))}"
+                for t in query_sparse_indices
+            )
+            sparse_metadata = {
+                "N": n_docs,
+                "avgdl": avgdl,
+                "df": [df_str],
+            }
+
         payload: dict[str, Any] = {
             "top_k": limit,
             "dense": {
@@ -387,14 +418,15 @@ class SeahorseDbStore:
             "sparse": {
                 "column": "sparse",
                 "vectors": [sparse_string or " "],
-                # BM25 parameters/metadata omitted on purpose — see
-                # the docstring; Coral picks defaults.
+                "parameters": sparse_params,
             },
             "fusion": {"type": "rrf", "parameters": {"k": 60}},
             "projection": (
                 "chunk_id, source_type, source_id, section_path, content"
             ),
         }
+        if sparse_metadata is not None:
+            payload["sparse"]["metadata"] = sparse_metadata
         if source_ids:
             # SQL WHERE clause — Coral parses this directly. Each
             # `source_id` is a UUID, so the IN list is safe to
@@ -522,6 +554,13 @@ class SeahorseDbStore:
                 {
                     "type": "inverted",
                     "column": "sparse",
+                    # Coral rejects hybrid-search with
+                    # `BM25 sparse scoring requires sparse_model=bm25 index`
+                    # when this is omitted, even though the index is
+                    # created either way. Pin to bm25 explicitly so the
+                    # search-time path can apply our (k, b, N, avgdl, df)
+                    # metadata.
+                    "params": {"sparse_model": "bm25"},
                 },
             ],
         }
