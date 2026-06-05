@@ -2,12 +2,13 @@
 
 Driver matrix:
 
-| `vector_store_driver` | required settings                                   |
-| --------------------- | --------------------------------------------------- |
-| `qdrant`              | `vector_url` (+ optional `vector_api_key`)          |
-| `pgvector`            | `vector_store_dsn` blank reuses main PG             |
-| `seahorse`            | `seahorse_token` + `seahorse_tenant_uuid` + one of  |
-|                       | `seahorse_table_name` / `seahorse_table_uuid`       |
+| `vector_store_driver` | required settings                                          |
+| --------------------- | ---------------------------------------------------------- |
+| `qdrant`              | `vector_url` (+ optional `vector_api_key`)                 |
+| `pgvector`            | `vector_store_dsn` blank reuses main PG                    |
+| `seahorse-cloud`      | `seahorse_cloud_token` + `seahorse_cloud_tenant_uuid` +    |
+|                       | one of `seahorse_cloud_table_name` / `..._table_uuid`      |
+| `seahorse-db`         | `seahorsedb_coordinator_url` (single Coral HTTP URL)       |
 
 The driver and sparse-shape values are validated at config load
 (pydantic Literals); the factory only needs to dispatch.
@@ -54,30 +55,49 @@ def get_vector_store() -> VectorStore:
             sparse_shape=settings.vector_store_sparse_shape,
             get_main_pool=get_pool,
         )
-    elif driver == "seahorse":
-        from .seahorse import SeahorseStore
-        if not settings.seahorse_token:
+    elif driver == "seahorse-cloud":
+        from .seahorse_cloud import SeahorseCloudStore
+        if not settings.seahorse_cloud_token:
             raise RuntimeError(
-                "vector_store_driver=seahorse requires seahorse_token (Bearer) "
-                "in secret.yaml."
+                "vector_store_driver=seahorse-cloud requires "
+                "seahorse_cloud_token (Bearer) in secret.yaml."
             )
-        if not settings.seahorse_tenant_uuid:
+        if not settings.seahorse_cloud_tenant_uuid:
             raise RuntimeError(
-                "vector_store_driver=seahorse requires seahorse_tenant_uuid."
+                "vector_store_driver=seahorse-cloud requires "
+                "seahorse_cloud_tenant_uuid."
             )
-        if not (settings.seahorse_table_name or settings.seahorse_table_uuid):
+        if not (
+            settings.seahorse_cloud_table_name
+            or settings.seahorse_cloud_table_uuid
+        ):
             raise RuntimeError(
-                "vector_store_driver=seahorse requires either "
-                "seahorse_table_name or seahorse_table_uuid."
+                "vector_store_driver=seahorse-cloud requires either "
+                "seahorse_cloud_table_name or seahorse_cloud_table_uuid."
             )
-        _singleton = SeahorseStore(
-            management_url=settings.seahorse_management_url,
-            token=settings.seahorse_token,
-            tenant_uuid=settings.seahorse_tenant_uuid,
-            table_name=settings.seahorse_table_name or None,
-            table_uuid=settings.seahorse_table_uuid or None,
+        _singleton = SeahorseCloudStore(
+            management_url=settings.seahorse_cloud_management_url,
+            token=settings.seahorse_cloud_token,
+            tenant_uuid=settings.seahorse_cloud_tenant_uuid,
+            table_name=settings.seahorse_cloud_table_name or None,
+            table_uuid=settings.seahorse_cloud_table_uuid or None,
             dense_dim=settings.embed_dimensions,
-            auto_create=settings.seahorse_auto_create,
+            auto_create=settings.seahorse_cloud_auto_create,
+        )
+    elif driver == "seahorse-db":
+        from .seahorse_db import SeahorseDbStore
+        if not settings.seahorsedb_coordinator_url:
+            raise RuntimeError(
+                "vector_store_driver=seahorse-db requires "
+                "seahorsedb_coordinator_url (Coral HTTP API)."
+            )
+        _singleton = SeahorseDbStore(
+            coordinator_url=settings.seahorsedb_coordinator_url,
+            table_name=settings.seahorsedb_table_name,
+            dense_dim=settings.embed_dimensions,
+            distance=settings.seahorsedb_distance,
+            auto_create=settings.seahorsedb_auto_create,
+            timeout=settings.seahorsedb_request_timeout_secs,
         )
     else:
         # Unreachable given the Literal at config load; kept for safety

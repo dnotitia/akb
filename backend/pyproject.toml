@@ -1,6 +1,6 @@
 [project]
 name = "akb"
-version = "0.6.6"
+version = "0.7.0"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.14"
 # Runtime deps are exact-pinned for the same reproducibility reason

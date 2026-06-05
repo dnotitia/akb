@@ -106,7 +106,18 @@ class Settings(BaseModel):
     public_base_url: str = ""
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
-    vector_store_driver: Literal["qdrant", "pgvector", "seahorse"] = "qdrant"
+    #
+    # The two `seahorse-*` drivers are intentionally separate:
+    #   - `seahorse-cloud` talks to the managed Seahorse Cloud BFF +
+    #     per-table data-plane host (zero infrastructure to run).
+    #   - `seahorse-db`    talks to a self-hosted SeahorseDB Coral
+    #     coordinator (single HTTP URL; you run Coral + Writer +
+    #     Reader(s) + Redis + Kafka + sparse-embedding yourself).
+    # Pre-0.7.0 there was only one `seahorse` enum value that meant
+    # cloud — config migration is `seahorse` → `seahorse-cloud`.
+    vector_store_driver: Literal[
+        "qdrant", "pgvector", "seahorse-cloud", "seahorse-db"
+    ] = "qdrant"
 
     # Pgvector driver settings.
     vector_store_dsn: str = ""              # blank = reuse main PG pool
@@ -125,12 +136,28 @@ class Settings(BaseModel):
     # for table lifecycle + per-table data-plane host. The driver
     # discovers the data-plane host from the management lookup; only
     # set the management URL + token + tenant + table identifier.
-    seahorse_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
-    seahorse_token: str = ""                # secret.yaml — Bearer (shsk_...)
-    seahorse_tenant_uuid: str = ""
-    seahorse_table_name: str = ""           # one of (table_name, table_uuid) required
-    seahorse_table_uuid: str = ""
-    seahorse_auto_create: bool = False      # auto-provision the AKB-shaped table
+    seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
+    seahorse_cloud_token: str = ""          # secret.yaml — Bearer (shsk_...)
+    seahorse_cloud_tenant_uuid: str = ""
+    seahorse_cloud_table_name: str = ""     # one of (table_name, table_uuid) required
+    seahorse_cloud_table_uuid: str = ""
+    seahorse_cloud_auto_create: bool = False  # auto-provision the AKB-shaped table
+
+    # SeahorseDB (self-hosted) driver settings. Single-URL entry: the
+    # Coral coordinator's HTTP API. Coral handles routing to the
+    # underlying Writer/Reader cluster, so the driver does not need
+    # to know about individual nodes. `seahorsedb_table_name` is the
+    # logical table the AKB chunks go into; the driver auto-creates
+    # it with the AKB sparse+dense shape when `seahorsedb_auto_create`
+    # is true and the table is absent on startup.
+    seahorsedb_coordinator_url: str = "http://localhost:3003"
+    seahorsedb_table_name: str = "akb_chunks"
+    seahorsedb_distance: Literal["cosine", "l2", "ip"] = "cosine"
+    seahorsedb_auto_create: bool = True
+    # HTTP timeout for Coral calls. Inserts go through Kafka (async)
+    # so the request itself is fast; raise this if upstream Kafka
+    # broker latency spikes on your deployment.
+    seahorsedb_request_timeout_secs: float = 30.0
 
     # Indexing worker — claim size per batch. Larger = fewer round-trips
     # to the embedding API but longer per-batch wall clock and bigger

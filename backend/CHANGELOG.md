@@ -5,6 +5,104 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.0 — 2026-06-05  *(minor — split `seahorse` driver into `seahorse-cloud` + new self-hosted `seahorse-db`)*
+
+### What
+
+Two vector-store drivers under the Seahorse brand, separated:
+
+- **`seahorse-cloud`** (renamed from `seahorse`) — talks to the
+  managed Seahorse Cloud BFF + per-table data-plane host. Zero
+  infrastructure to run; you supply tenant + token + table.
+- **`seahorse-db`** (new) — talks to a self-hosted SeahorseDB cluster
+  via its Coral coordinator HTTP API. You run Coral + Writer +
+  Reader(s) + Redis + Kafka + sparse-embedding-server yourself
+  (SeahorseDB monorepo's `deploy/docker-compose.yml` brings up a
+  minimal stack on one box).
+
+The pre-0.7.0 single `seahorse` driver value implicitly meant
+cloud. Keeping the name ambiguous would have been a footgun the
+moment a self-hosted user filled in `seahorsedb_coordinator_url`
+expecting the same enum value to "just work".
+
+### Driver matrix now
+
+| `vector_store_driver` | required settings                                       |
+| --------------------- | ------------------------------------------------------- |
+| `qdrant`              | `vector_url` (+ optional `vector_api_key`)              |
+| `pgvector`            | `vector_store_dsn` blank reuses main PG                 |
+| `seahorse-cloud`      | `seahorse_cloud_token` + `seahorse_cloud_tenant_uuid` + |
+|                       | one of `..._table_name` / `..._table_uuid`              |
+| `seahorse-db`         | `seahorsedb_coordinator_url` (Coral HTTP API)           |
+
+### Config migration (BREAKING)
+
+If you were using the `seahorse` driver pre-0.7.0:
+
+```diff
+-vector_store_driver: seahorse
+-seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
+-seahorse_token: "shsk_..."
+-seahorse_tenant_uuid: "..."
+-seahorse_table_name: "..."
+-seahorse_auto_create: true
++vector_store_driver: seahorse-cloud
++seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/bff"
++seahorse_cloud_token: "shsk_..."
++seahorse_cloud_tenant_uuid: "..."
++seahorse_cloud_table_name: "..."
++seahorse_cloud_auto_create: true
+```
+
+`pydantic` config has `extra="forbid"`, so an un-migrated `seahorse_*`
+key fails the app launch loudly with the bad key name — no silent
+fallback. That's intentional; a half-migrated config silently
+sending writes to the wrong driver is the worst possible outcome.
+
+Default driver is unchanged (`qdrant`). prod + demo run `pgvector`,
+so neither is affected by this rename.
+
+### New driver implementation notes
+
+- Surface area: 5 methods (`ensure_collection`, `health`, `upsert_one`,
+  `delete_point`, `hybrid_search`) — same Protocol as the other drivers,
+  no service-layer changes needed.
+- Coral endpoint mapping is documented at the top of
+  `backend/app/services/vector_store/seahorse_db.py`.
+- Sparse encoding: AKB's parallel `sparse_indices` + `sparse_values`
+  arrays are zipped into Coral's `[[term_id, weight], ...]` shape at
+  the driver boundary. The rest of AKB stays Coral-shape-free.
+- Label mapping: SeahorseDB identifies records by `u64` labels; AKB
+  uses UUID `chunk_id`. We take the first 8 bytes of the UUID
+  (big-endian). Birthday-paradox safe to ~2^32 chunks per table.
+- Eventual consistency: Coral's `POST /data` returns on Kafka-accept,
+  not on visibility. `embed_worker` marks `vector_indexed_at` at the
+  same point — the search-visibility gap (~10-30s) is the same
+  asymmetry any async-indexing pipeline has.
+- Race-safety: documented as ⚠ in `base.py`'s audit table; Coral
+  serializes concurrent `POST /catalog/tables` server-side so peer
+  startups mostly converge, but no advisory-lock-grade guarantee
+  like pgvector.
+
+### What this PR does NOT do
+
+- No production migration. prod + demo stay on `pgvector`. A future
+  PR may add an opt-in seahorse-db validation tier; that's a separate
+  decision based on operational ergonomics of running the 7-container
+  SeahorseDB stack.
+- No integration test against a live Coral. The driver is type-checked
+  and unit-friendly; an e2e is the next PR once we decide where the
+  SeahorseDB stack lives (host machine vs CI runner vs neither).
+- No proxy/frontend change.
+
+### Verification
+
+- `bash scripts/check.sh` — green (ruff + mypy + tsc + vitest + secrets).
+- `mypy --python-version 3.14 app/services/vector_store/` —
+  `Success: no issues found in 7 source files`.
+
+---
+
 ## 0.6.6 — 2026-06-05  *(patch — clear the 18 mypy errors 0.6.5 exposed + exact-pin runtime deps)*
 
 The 0.6.5 Python 3.11 → 3.14 bump closed the "CI runs a different
