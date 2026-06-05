@@ -20,12 +20,15 @@ jobs:
       # ── Python ─────────────────────────────────────────────────
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
           # No cache — the only python deps we need here are listed
           # in the next step; full backend runtime isn't installed.
       - name: Install backend lint/type/sec tools + detect-secrets
-        # Same versions as backend/pyproject.toml [project.optional-dependencies] dev.
-        run: pip install 'ruff>=0.6.0' 'mypy>=1.10.0' 'bandit[toml]>=1.7.0' 'detect-secrets>=1.5.0'
+        # Exact-pinned to match backend/pyproject.toml [project.optional-dependencies] dev.
+        # Floor-only specifiers let a silent dep upgrade flip the same
+        # commit's CI from pass→fail (or fail→pass) without anyone
+        # noticing — bump these intentionally, in lockstep with pyproject.toml.
+        run: pip install 'ruff==0.15.16' 'mypy==2.1.0' 'bandit[toml]==1.9.4' 'detect-secrets==1.5.0'
 
       # ── Node / pnpm (for tsc + vitest in scripts/check.sh) ────
       - uses: pnpm/action-setup@v4

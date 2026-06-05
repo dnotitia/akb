@@ -5,6 +5,94 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.6.5 — 2026-06-05  *(patch — pin static-analysis tooling + Python 3.11 → 3.14)*
+
+### Python 3.11 → 3.14
+
+`backend/Dockerfile`'s `FROM python:3.11-slim` was four years stale
+(3.11 released 2022-10) and starting to gate us out of newer typing
+features and faster MCP / pgvector library cuts. Bumped to
+`python:3.14-slim` end-to-end:
+
+- `backend/Dockerfile`: `python:3.11-slim` → `python:3.14-slim`.
+- `backend/pyproject.toml`: `requires-python = ">=3.11"` → `>=3.14`,
+  `[tool.mypy] python_version = "3.11"` → `"3.14"`,
+  `[tool.ruff] target-version = "py311"` → `"py314"`.
+- `.github/workflows/check.yml` + `backend-pytest.yml`:
+  `python-version: '3.11'` → `'3.14'`.
+- `scripts/check.sh` mypy `--python-version 3.11` → `3.14`.
+
+Dependency-wheel check before pulling the trigger:
+- `kiwipiepy 0.23.1` — Cython native binding; ships cp314 wheels for
+  Linux x86_64/aarch64, macOS, Windows. ✓
+- `asyncpg 0.31.0`, `bcrypt 5.0.0` — native; ship cp314. ✓
+- `pgvector 0.4.2`, `pyjwt 2.13.0`, `mcp 1.27.2` — pure-python sdist,
+  Python-version-agnostic. ✓
+
+Local docker-compose build of `python:3.14-slim`-based backend image
+succeeded; all three regression suites passed against the rebuilt
+backend:
+- `test_publications_e2e.sh` — 97/97
+- `test_mcp_e2e.sh` — 76/76
+- `test_hybrid_search_e2e.sh` — 25/25
+
+### Static-analysis tooling pin
+
+`backend/pyproject.toml`'s `dev` deps and `.github/workflows/check.yml`'s
+tool install line both used floor-only version specifiers (`>=`) for
+`mypy`, `ruff`, `bandit`, and `detect-secrets`. A silent upgrade of one
+of those tools (or their transitive type-stub deps) could flip the same
+commit's CI from pass→fail or fail→pass on a re-run, without anyone
+noticing the gate had changed under them.
+
+This is exactly the shape of the 0.6.4 surprise: local `mypy 2.1.0`
+showed 18 errors on the exact ref CI marked green. Both ends ran
+`mypy 2.1.0`, but the runtime Python (CI 3.11 vs local 3.13) and the
+lack of any explicit stub pin made the analyzer reach different
+conclusions. We caught it by accident because of an unrelated production
+incident — the gate that's supposed to catch type regressions wasn't
+itself reproducible.
+
+### How
+
+- `backend/pyproject.toml`'s `dev` deps are exact-pinned: `pytest==9.0.3`,
+  `pytest-asyncio==1.3.0`, `ruff==0.15.16`, `mypy==2.1.0`,
+  `bandit[toml]==1.9.4`.
+- `.github/workflows/check.yml` mirrors the same exact pins on its
+  direct install line (it pre-dates the pyproject `dev` group and
+  installs the four tools directly, not via `pip install -e '.[dev]'`,
+  so it has to keep its own list in sync — comment added).
+- `backend-pytest.yml` already uses `pip install -e '.[dev]'`, so it
+  picks up the pyproject pins automatically.
+
+Bumps to any of these tools are now an explicit code change, not a
+`pip install` side-effect.
+
+### Honest scope note
+
+This release does **not** fix the 18 local mypy errors in
+`git_service.py` / `mcp_server/server.py` / `qdrant.py` /
+`events_publisher.py` that the Python 3.11-vs-3.13 mismatch surfaced.
+Those need a separate look — most appear to be real type ambiguities in
+code we didn't touch in the 0.6.x line. Tracked as a follow-up.
+
+Only the four lint/type/sec tools are pinned. Runtime deps in the main
+`dependencies` block are still floor-only. The risk profile is asymmetric
+— a runtime-dep silent upgrade tends to fail loud (import errors, API
+mismatch), while an analyzer silent upgrade fails quiet (gate changes
+meaning). Starting where the silent-failure risk is highest; runtime
+pinning is a separate follow-up worth doing once we have a lock-file
+workflow.
+
+### Verification
+
+- `pip install -e '.[dev]'` resolves to the exact versions above.
+- CI install step uses the same pins.
+- 0.6.4 prod incident's reproducibility gap is closed for this category
+  of failure.
+
+---
+
 ## 0.6.4 — 2026-06-05  *(patch — `ensure_collection` race-safety, post-mortem of a real prod incident)*
 
 ### What happened
