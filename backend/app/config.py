@@ -19,6 +19,53 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class AuditSettings(BaseModel):
+    """Compliance-grade audit log — **producer-only**. AKB emits an
+    append-only, hash-chained JSON-lines audit stream and (optionally)
+    hands the daily rolled file off to a WORM bucket; the operator's SIEM
+    owns storage / query / retention under its own regime. Full rationale
+    and the rejected alternatives are in `backend/CHANGELOG.md` 0.8.1.
+
+    Its own nested section (`audit:` in app.yaml) so the surface can grow —
+    redaction rules, per-action levels, signing keys, syslog/webhook sinks —
+    without scattering `audit_*` keys across the flat top level.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Local append target. In k8s mount a PVC here — a pod-local emptyDir
+    # loses un-uploaded lines on restart.
+    log_dir: str = "/data/audit"
+    # Log read/query tool calls too (K8s "Metadata" level — no bodies).
+    # State-changing calls are ALWAYS logged regardless of this flag. Set
+    # false to cut volume on read-heavy deployments.
+    log_reads: bool = True
+    # S3 bucket for the daily handoff. Blank → file-only (the SIEM tails
+    # the file; nothing is uploaded or pruned). Provision the bucket with
+    # Object Lock for true WORM — AKB never creates it (lock mode can only
+    # be set at bucket creation).
+    bucket: str = ""
+    # Dedicated audit-storage credentials. Blank fields fall back to the
+    # system S3 connection (`s3_endpoint_url` / `s3_access_key` / …) —
+    # convenient for small deploys, but for real segregation of duties
+    # point these at a SEPARATE audit account. Give the app a *write-only*
+    # credential (PutObject, no Delete) on an Object-Lock bucket: AKB never
+    # deletes bucket objects (only the local handoff buffer is pruned), so
+    # a compromise of the app's primary S3 key cannot rewrite or erase the
+    # audit trail.
+    endpoint_url: str = ""
+    access_key: str = ""
+    secret_key: str = ""
+    region: str = ""
+    # Uploader tick cadence (seconds). A completed file (older than today)
+    # uploads on the next tick; the local copy is pruned
+    # `local_retention_days` after its date, but only once a bucket upload
+    # is confirmed — a bucket outage accumulates files locally instead of
+    # losing audit.
+    upload_interval_secs: int = 3600
+    local_retention_days: int = 2
+
+
 class Settings(BaseModel):
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
@@ -214,6 +261,10 @@ class Settings(BaseModel):
     redis_password: str = ""
     redis_event_stream: str = "akb:events"
     redis_stream_maxlen: int = 100_000      # XADD MAXLEN ~ ceiling
+
+    # Audit log — its own nested section so the surface can grow without
+    # littering the flat top level. See AuditSettings above.
+    audit: AuditSettings = Field(default_factory=AuditSettings)
 
     @property
     def database_url(self) -> str:

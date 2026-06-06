@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
+from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -120,6 +120,19 @@ def start_workers() -> None:
         started.append("events_publisher")
     else:
         logger.info("events_publisher disabled (redis_url not configured)")
+    # Audit log — producer-only. `init` seeds the per-file hash chain;
+    # the uploader (daily handoff to the WORM bucket) only runs when a
+    # bucket is configured. File-only mode (no bucket) still writes the
+    # JSON-lines stream for a co-located SIEM/Logstash to tail.
+    if settings.audit.enabled:
+        audit_log.init()
+        if settings.audit.bucket:
+            audit_log.start_uploader()
+            started.append("audit_uploader")
+        else:
+            logger.info("audit enabled file-only (audit.bucket not set; no uploader)")
+    else:
+        logger.info("audit disabled (audit.enabled=false)")
     # PG-RBAC periodic reconcile — converges drift caused by silent
     # lifecycle-hook failures (counted in role_sync.metrics_snapshot).
     # Set role_sync_reconcile_interval_secs <= 0 in config to disable.
@@ -133,6 +146,7 @@ def start_workers() -> None:
 
 async def stop_workers() -> None:
     await get_role_sync().stop_reconcile_timer()
+    await audit_log.stop_uploader()
     await events_publisher.stop()
     await metadata_worker.stop()
     await external_git_poller.stop()

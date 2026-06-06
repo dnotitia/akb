@@ -14,7 +14,7 @@ from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, tables
-from app.services import embed_worker, events_publisher, external_git_poller, metadata_worker
+from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.health import vault_health
@@ -213,6 +213,7 @@ async def health():
         "events": await _safe(events_publisher.pending_stats),
         "vector_store": vs_info,
         "rbac": rbac_info,
+        "audit": audit_log.stats(),
     }
 
 
