@@ -5,6 +5,55 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.2 — 2026-06-06  *(patch — bulk migration: `VectorStore.upsert_batch`, REST seahorse-db multi-line JSONL, resume + per-row fallback)*
+
+`scripts/migrate_pgvector_to_seahorsedb.py` was the bottleneck for any operator moving a real-sized vault from pgvector to a self-hosted Coral. 0.7.9's script issued one `upsert_one` per chunk — fine for the first 65 rows we tested with, painful at 350 k. This release routes the script through a new Protocol-level batch path and adds the operational surface every bulk migration actually needs: a checkpoint file so a connection drop doesn't restart from zero, and a per-row fallback so a single transient batch failure doesn't cost a few hundred chunks.
+
+### What ships
+
+**`VectorStore.upsert_batch(chunks, *, conn=None)`** — new Protocol method (`backend/app/services/vector_store/base.py`). Drivers with a native batch shape override; drivers without it delegate to `loop_upsert_batch(self, chunks)`, which is the obvious N-calls-of-`upsert_one` fallback factored into a helper so each driver doesn't paste the same six-line loop.
+
+**`ChunkUpsert` dataclass** — frozen-shape input to `upsert_batch`, mirroring `upsert_one`'s kwargs one-for-one. Adding a column to `upsert_one` means adding it here too; the two methods don't get to drift on what a chunk *is*.
+
+**REST seahorse-db driver (`seahorse_db.py`) — specialised `upsert_batch`**. Builds a single `\n`-joined JSONL body and ships it in one `POST /v2/tables/{name}/data`. Coral's `insert_jsonl_bytes` runs the body through `arrow_json::ReaderBuilder.with_batch_size(reader_batch_size)` (64 by default) and dispatches the resulting record batches segment-by-segment with the eight-way concurrency in `coral/src/ingest/application/insert/dispatch.rs`. Net result: ~`len(chunks)/64` Kafka WAL appends per call instead of one per chunk, and a single HTTP round trip instead of one per chunk. A shared `_record_dict` helper is the single source of truth for the JSON record shape, so `upsert_one` and `upsert_batch` can't drift on column names, sparse encoding, the signed-i64 PK label, or the `dense=None` refusal.
+
+**Fallback `upsert_batch` on the other four drivers** — `pgvector`, `qdrant`, `seahorse-cloud`, `seahorse-db-grpc`. Each does the trivial `await loop_upsert_batch(self, chunks)`. No behaviour change versus 0.8.1; the point is that the Protocol now declares the method everywhere and callers can use it without an `isinstance` narrowing.
+
+**Migration script — `scripts/migrate_pgvector_to_seahorsedb.py`**.
+- Switches from per-row `upsert_one` to `upsert_batch` with `ChunkUpsert` payloads.
+- New `--progress-file <path>` (default `/tmp/akb-migrate-progress.txt`). After every batch the script writes the last shipped `chunk_id` (UUID) via atomic tmp-rename. On startup it reads the file and resumes with a `chunk.id > <stored UUID>` filter on the same `ORDER BY c.id ASC` cursor. The cursor ordering changes from `c.created_at, c.id` to `c.id` only so the resume gate is unambiguous on chunks that share a timestamp. Pass `--progress-file ''` to disable.
+- New `--checkpoint-every <N>` (default 2 048) to tune the checkpoint cadence.
+- When `upsert_batch` raises (the Writer's `batch_insert_via_catalog` returns 503 under sustained load with non-trivial frequency — we measured ~0.15 % of batches on the dogfood stack), the script now falls back to per-row `upsert_one` for the failed batch instead of abandoning the entire 256 chunks. Each row gets its own attempt; failures are reported per `chunk_id`. Slow on the failure path, correct on every row.
+
+### Where this matters
+
+Pgvector users will not see a behaviour change in normal API traffic — `embed_worker` and the search path still use `upsert_one` / `hybrid_search`. The migration script is the only caller of `upsert_batch` in this release; other call sites (an internal reindex task, a future bulk-import endpoint) can adopt the same path without further driver changes.
+
+### What's deliberately out of scope
+
+Native `upsert_batch` for `pgvector`, `qdrant`, and `seahorse-cloud` (a single INSERT VALUES, a single `points_batch`, a single bulk POST respectively). The fallback is correct; native batch is a measurable throughput win on each backend and is queued as a follow-up, but landing five native batch shapes alongside the contract change would have made this release substantially riskier than the actual win it delivers.
+
+The "SeahorseDB has no PK-aware upsert" caveat is real and now appears in the per-row fallback's docstring: if the failing batch had already landed partially on the Writer before raising, the per-row retry can produce duplicates (Coral's `drop_duplicate_primary_key_rows` only dedups *within* a single record batch). The operational pattern of "new target table per dogfood rerun" — which we used throughout the 35 k-chunk validation — sidesteps this; the alternative ("silently lose 256 chunks per transient 503") is worse than the duplicate risk.
+
+### Verification
+
+- `scripts/check.sh` — green.
+- The existing 25-scenario `tests/test_hybrid_search_e2e.sh` covers the REST `seahorse-db` driver including `upsert_one`; the new batch path uses the same `_record_dict` and the same wire format, so the end-to-end behaviour is unchanged. A dedicated batch e2e is queued with the native-batch follow-up so they ship together.
+- Existing unit tests stay green: `test_seahorse_db_grpc_unit.py` (31 tests), `test_sparse_weight_convention.py` (6 tests).
+
+### Files
+
+- `backend/app/services/vector_store/base.py` — `ChunkUpsert` dataclass, `loop_upsert_batch` helper, Protocol `upsert_batch` declaration.
+- `backend/app/services/vector_store/seahorse_db.py` — specialised `upsert_batch`, shared `_record_dict`.
+- `backend/app/services/vector_store/pgvector.py`, `qdrant.py`, `seahorse_cloud.py`, `seahorse_db_grpc.py` — fallback `upsert_batch` delegating to `loop_upsert_batch`.
+- `backend/scripts/migrate_pgvector_to_seahorsedb.py` — batch path, checkpoint resume, per-row fallback, `--progress-file` / `--checkpoint-every` CLI.
+
+### Not deployed
+
+prod + demo remain on pgvector. The dogfood stack we built to validate this path (gitignored manifests under `deploy/k8s/internal/seahorse-db/`) still runs against an out-of-band Coral; throughput observations from that run will be appended to the AKB product vault rather than to this release.
+
+---
+
 ## 0.8.1 — 2026-06-06  *(patch — compliance-grade audit log, producer-only, off by default)*
 
 AKB now emits a structured, append-only, hash-chained **audit log** and

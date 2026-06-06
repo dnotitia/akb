@@ -18,7 +18,7 @@ from typing import Any
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models as qm
 
-from .base import VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
 logger = logging.getLogger("akb.vector_store.qdrant")
 
@@ -158,6 +158,18 @@ class QdrantStore:
         await client.upsert(collection_name=self._collection, points=[point])
 
     # ── Delete ───────────────────────────────────────────────────
+
+    async def upsert_batch(
+        self,
+        chunks: list[ChunkUpsert],
+        *,
+        conn=None,
+    ) -> None:
+        """Fallback batch path — N calls of ``upsert_one``. No native
+        batch shape on this driver yet; the loop preserves the
+        Protocol contract while keeping per-call atomicity unchanged."""
+        from .base import loop_upsert_batch
+        await loop_upsert_batch(self, chunks, conn=conn)
 
     async def delete_point(self, chunk_id: str, *, conn=None) -> None:
         del conn  # external service; can't share PG transaction
