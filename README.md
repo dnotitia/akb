@@ -24,6 +24,21 @@ Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
   [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
 - Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
+## Try it live
+
+A public demo runs at **[akb-demo.agent.seahorse.dnotitia.ai](https://akb-demo.agent.seahorse.dnotitia.ai)**.
+Browse and search a small fictional-organization knowledge base — product docs,
+a company handbook, agent session notes, and an engineering wiki, cross-linked
+by the URI graph — right in your browser, no signup. To wire it into your own
+agent, sign up with any email (a throwaway address is fine) and point the
+[`akb-mcp`](https://www.npmjs.com/package/akb-mcp) proxy at
+`https://akb-demo.agent.seahorse.dnotitia.ai/mcp/`.
+
+> ⚠️ **Throwaway demo.** It is public, wiped and re-seeded weekly, and runs on
+> minimal resources with **no uptime, privacy, or data guarantees**. Don't put
+> anything real or sensitive in it — treat every write as public and ephemeral.
+> For real use, [self-host](#quick-start) in three containers.
+
 ## Why AKB
 
 Most knowledge tools are built for humans clicking through a UI. Agents need a
