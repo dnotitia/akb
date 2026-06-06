@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.dnotitia/akb",
+  "description": "Git-backed org memory for AI agents — hybrid search, tables, files & a URI graph over MCP.",
+  "repository": {
+    "url": "https://github.com/dnotitia/akb",
+    "source": "github"
+  },
+  "version": "2.0.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "akb-mcp",
+      "version": "2.0.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AKB_MCP_URL",
+          "description": "Your AKB backend MCP endpoint, e.g. https://akb.example.com/mcp/ — or try the public demo at https://akb-demo.agent.seahorse.dnotitia.ai/mcp/",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "AKB_PAT",
+          "description": "AKB Personal Access Token (akb_...). Create one in your AKB instance, or sign up on the public demo with any email to get one.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
