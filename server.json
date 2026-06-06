@@ -6,13 +6,13 @@
     "url": "https://github.com/dnotitia/akb",
     "source": "github"
   },
-  "version": "2.0.3",
+  "version": "2.0.4",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "akb-mcp",
-      "version": "2.0.3",
+      "version": "2.0.4",
       "transport": {
         "type": "stdio"
       },
