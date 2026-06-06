@@ -39,3 +39,54 @@ jobs:
         # backend pod (test_indexable_e2e.py, test_rerank_e2e.py).
         # Shell e2e suites under tests/*.sh aren't picked up by pytest.
         run: pytest tests/ -k 'not _e2e' -v --tb=short
+
+  pgvector-e2e:
+    # DB-backed bootstrap tests that the unit job skips (`-k 'not
+    # _e2e'`). They need a real Postgres with pgvector *available but
+    # not created* — the fresh-DB scenario — so they self-skipped in CI
+    # and never ran. This job runs them, guarding the #117-class
+    # extension-bootstrap regressions.
+    #
+    # Caveat: these tests do NOT reproduce the 0.8.3 shared-main-pool
+    # `unknown type: public.vector` manifestation — it passes pre-fix in
+    # isolation even with a faithful backend-pool replica; the deployed
+    # trigger is a startup concurrency race a single-threaded test can't
+    # recreate (see backend/CHANGELOG.md 0.8.3). That case is covered by
+    # a deploy-time reset-cycle check, not here.
+    name: pgvector e2e (live DB)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: akb
+          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
+          POSTGRES_DB: akb
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U akb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install backend (runtime + dev)
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Run pgvector DB-backed e2e tests
+        working-directory: backend
+        env:
+          # Matches the fixture default + the dev compose override.
+          AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+        run: pytest tests/test_pgvector_ext_bootstrap_e2e.py -v --tb=short

@@ -244,6 +244,25 @@ class PgvectorStore:
             try:
                 pool = await self._pool()
                 async with pool.acquire() as c:
+                    # CREATE EXTENSION must be COMMITTED before the codec is
+                    # registered. register_vector -> set_type_codec('vector')
+                    # introspects pg_catalog for the `vector` type; an
+                    # extension created inside the *same uncommitted*
+                    # transaction is NOT resolvable and asyncpg raises
+                    # `ValueError: unknown type: public.vector` on a fresh DB.
+                    #
+                    # The separate-DSN path bootstraps the extension on its
+                    # own committed connection in `_pool()` (see
+                    # `_bootstrap_extension`). The shared-main-pool path
+                    # (`vector_url=""`, dsn is None) skips that, so it must
+                    # commit the extension here — outside the transaction
+                    # block below — before _ensure_codec runs. #117 fixed the
+                    # separate-DSN case but assumed the same-tx create was
+                    # visible to the codec; it is not, so shared-PG self-host
+                    # deployments still broke on a fresh DB (e.g. after a
+                    # demo PVC-wipe reset). This autocommit statement is
+                    # idempotent and a no-op once the extension exists.
+                    await c.execute("CREATE EXTENSION IF NOT EXISTS vector")
                     async with c.transaction():
                         # advisory_xact_lock auto-releases on tx end
                         # (commit OR rollback OR conn close), so a
@@ -252,17 +271,10 @@ class PgvectorStore:
                             "SELECT pg_advisory_xact_lock($1)",
                             _advisory_lock_key(self._schema),
                         )
-                        # _do_ensure's first statement is CREATE EXTENSION
-                        # IF NOT EXISTS vector. Register the pgvector codec
-                        # only AFTER it, so the `vector` type exists when
-                        # set_type_codec introspects — otherwise asyncpg
-                        # raises `ValueError: unknown type: public.vector`
-                        # on a fresh DB. This is the shared-main-pool path
-                        # (its conns carry no register_vector init
-                        # callback, unlike our own pool). See #117. The
-                        # same transaction/connection sees its own
-                        # uncommitted CREATE EXTENSION, so registering here
-                        # is safe.
+                        # _do_ensure re-runs CREATE EXTENSION IF NOT EXISTS
+                        # (no-op now) then builds the schema/tables; the
+                        # codec registers cleanly because the type is
+                        # already committed above.
                         await self._do_ensure(c)
                         await self._ensure_codec(c)
             except asyncpg.PostgresError as e:
