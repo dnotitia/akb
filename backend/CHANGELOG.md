@@ -5,6 +5,27 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.4 — 2026-06-07  *(patch — agent-memory: user_id-keyed vaults + Claude Code SessionEnd reasons)*
+
+Two fixes to the agent-session lifecycle surface (`/api/v1/agent-sessions/*`) that together made the `akb-claude-code` lifecycle plugin unusable for a large class of users. Both were confirmed against a live deployment before the fix.
+
+### 1. Non-ASCII usernames could not provision a memory vault
+`sanitise_username()` NFKD-folds to ASCII and rejects an empty result, so an all-CJK username (e.g. `한병전`) raised `username cannot be safely slugified` and **every** `SessionStart` returned `422` — the user never got a memory vault at all.
+
+The memory vault name is now keyed on the immutable `user_id` (a UUID, always a valid slug) via `memory_vault_name(user_id)` instead of the mutable, possibly-non-ASCII username. Consequences:
+
+- Works for any username, including all-CJK.
+- The name never drifts when a user later changes username / display_name / email. The human-readable identity moved to the vault **`description`** (`_memory_vault_description`), which is refreshed from the current profile on every `SessionStart`.
+- **Back-compat:** `ensure_memory_vault` / `_resolve_memory_vault` probe the pre-migration `agent-memory-{slug(username)}` name and **adopt** an existing vault rather than orphaning it — so vaults provisioned under the old scheme keep working with no data migration. Adoption is **owner-scoped** (`owner_id = user_id`): distinct usernames can slugify to the same legacy name, so the name alone is not proof of ownership — a legacy vault owned by someone else is ignored and the user gets their own canonical vault.
+
+### 2. Claude Code SessionEnd `reason` values were all rejected
+`EndRequest.reason` only accepted the neutral cross-harness set (`completed`/`aborted`/`error`/`window_close`/`user_close`/`stop`), but Claude Code emits `clear`/`logout`/`prompt_input_exit`/`bypass_permissions_disabled`/`other`/`resume`. The plugin forwards the hook reason verbatim, so **every** `SessionEnd` returned `422` and no `recap.md` was ever written.
+
+`reason` now accepts the Claude Code values verbatim too — mirroring how `source` already accepts Claude Code's raw `SessionStart` values — so a plugin needs no client-side mapping table. Unknown reasons are still rejected (`422`).
+
+### Tests
+`backend/tests/test_agent_sessions_e2e.sh` gains coverage for both: Claude Code reasons accepted (§12) and CJK-username provisioning + user_id-keyed vault + description label (§13). Full suite: 37 passed.
+
 ## 0.8.3 — 2026-06-06  *(patch — pgvector bootstrap: commit `CREATE EXTENSION` before codec registration on the shared-main-pool path)*
 
 Semantic search silently returned empty on a **fresh shared-PG deployment** (`vector_store_driver: pgvector` with a blank `vector_url`, i.e. the pgvector index lives in the main application DB). Every search logged `vector hybrid_search failed (unknown type: public.vector); returning empty` and the indexing worker could never drain — chunks stayed `vector_indexed_at IS NULL` forever.

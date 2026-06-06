@@ -36,6 +36,7 @@ from app.services.agent_memory_service import (
     AGENT_ID_MAX_LEN,
     DEFAULT_RECALL_LIMIT,
     EndBody,
+    ReasonLiteral,
     SESSION_ID_MAX_LEN,
     SnapshotBody,
     StartBody,
@@ -71,10 +72,11 @@ class StartRequest(BaseModel):
 
 
 class EndRequest(BaseModel):
-    reason: Literal[
-        "completed", "aborted", "error",
-        "window_close", "user_close", "stop",
-    ]
+    # Accepts each harness's raw SessionEnd reason verbatim (incl. Claude
+    # Code's clear/logout/prompt_input_exit/bypass_permissions_disabled/
+    # other/resume) so the plugin needs no client-side mapping. Single
+    # source of truth lives in the service as `ReasonLiteral`.
+    reason: ReasonLiteral
     summary: str = ""
     outcome: Literal["success", "partial", "abandoned"] = "success"
     touched_uris: list[str] | None = None
