@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.4 — MCP Registry: add `mcpName`
+
+No code change. Adds `"mcpName": "io.github.dnotitia/akb"` to
+`package.json`. The official MCP Registry verifies server ownership by
+matching this field on the published npm package against the registry
+entry's name — so the package must ship it before `akb-mcp` can be
+listed (and cascade to downstream directories). Behaviour is unchanged.
+
 ## 2.0.3 — make MIT licensing explicit
 
 No code change. The proxy has always declared `"license": "MIT"` in
