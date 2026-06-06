@@ -275,6 +275,60 @@ CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
 [ "$CODE" = "401" ] || [ "$CODE" = "403" ] \
   && pass "no auth → $CODE" || fail "no auth" "got $CODE"
 
+# ── 12. Claude Code SessionEnd reasons accepted verbatim ───
+# Regression: every Claude Code SessionEnd `reason` used to 422 (the
+# enum only had the neutral cross-harness values), so the recap was
+# never written. The plugin forwards the hook reason unmodified.
+echo ""
+echo "▸ 12. Claude Code reasons accepted (no client-side mapping)"
+
+for R in clear logout prompt_input_exit bypass_permissions_disabled other resume; do
+  SIDR="cc-reason-${TS}-${R}"
+  curl -sk -X POST "$BASE_URL/api/v1/agent-sessions/$SIDR" \
+    -H "$H_AUTH" -H "$H_JSON" \
+    -d '{"agent_id":"claude-code","source":"startup"}' >/dev/null
+  CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+    "$BASE_URL/api/v1/agent-sessions/$SIDR/end" \
+    -H "$H_AUTH" -H "$H_JSON" \
+    -d "{\"reason\":\"$R\",\"outcome\":\"success\",\"summary\":\"reason $R\"}")
+  [ "$CODE" = "200" ] && pass "SessionEnd reason=$R → 200" \
+    || fail "reason=$R" "expected 200, got $CODE"
+done
+
+# ── 13. Non-ASCII (CJK) username provisions a user_id vault ──
+# Regression: a username that slugifies to empty (e.g. all-Hangul)
+# used to crash provisioning with "username cannot be safely
+# slugified". The vault is now keyed on the immutable user_id.
+echo ""
+echo "▸ 13. CJK username → user_id-keyed vault (no slugify crash)"
+
+CJK_USER="한글유저-${TS}"
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H "$H_JSON" \
+  -d "{\"username\":\"$CJK_USER\",\"email\":\"cjk-${TS}@t.dev\",\"password\":\"test1234\",\"display_name\":\"한글유저\"}" >/dev/null 2>&1
+CJK_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H "$H_JSON" \
+  -d "{\"username\":\"$CJK_USER\",\"password\":\"test1234\"}" \
+  | py 'import sys,json; print(json.load(sys.stdin)["token"])')
+CJK_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $CJK_JWT" -H "$H_JSON" \
+  -d '{"name":"cjk-e2e"}' \
+  | py 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+R=$(curl -sk -o /tmp/cjk_resp.json -w '%{http_code}' -X POST \
+  "$BASE_URL/api/v1/agent-sessions/cjk-${TS}" \
+  -H "Authorization: Bearer $CJK_PAT" -H "$H_JSON" \
+  -d '{"agent_id":"claude-code","source":"startup"}')
+[ "$R" = "200" ] && pass "CJK username SessionStart → 200 (was 422)" \
+  || fail "CJK start" "expected 200, got $R ($(head -c 160 /tmp/cjk_resp.json))"
+CJK_MV=$(py 'import sys,json; print(json.load(open("/tmp/cjk_resp.json"))["memory_vault"])')
+echo "$CJK_MV" | grep -Eq '^agent-memory-[0-9a-f-]{36}$' \
+  && pass "CJK vault keyed on user_id ($CJK_MV)" \
+  || fail "CJK vault name" "not user_id-shaped: $CJK_MV"
+# description carries the human label
+R=$(curl -sk "$BASE_URL/api/v1/vaults" -H "Authorization: Bearer $CJK_PAT")
+echo "$R" | grep -q "한글유저" \
+  && pass "CJK vault description carries display name" \
+  || fail "CJK description" "label missing: ${R:0:200}"
+
 # ── Summary ────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════"

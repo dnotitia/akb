@@ -72,8 +72,13 @@ class StartRequest(BaseModel):
 
 class EndRequest(BaseModel):
     reason: Literal[
-        "completed", "aborted", "error",
-        "window_close", "user_close", "stop",
+        # neutral / cross-harness canonical
+        "completed", "aborted", "error", "window_close", "user_close", "stop",
+        # Claude Code SessionEnd raw reasons — accepted verbatim so the
+        # plugin can forward the hook payload without a mapping table
+        # (mirrors how `source` accepts Claude Code's raw values).
+        "clear", "logout", "prompt_input_exit", "bypass_permissions_disabled",
+        "other", "resume",
     ]
     summary: str = ""
     outcome: Literal["success", "partial", "abandoned"] = "success"

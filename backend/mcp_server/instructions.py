@@ -21,5 +21,5 @@ When writing into a vault:
 6. Reference resources by the akb:// URIs returned by tool calls — do not reassemble paths yourself.
 7. For other surfaces (akb_publish, akb_todo, akb_activity, akb_history), call akb_help() for an overview.
 
-Agent memory is handled outside the MCP tool-use loop — the AKB lifecycle plugin (akb-claude-code, akb-cursor, ...) drives /api/v1/agent-sessions REST endpoints automatically. As an agent, your own memory vault (named agent-memory-{your-username}) is accessible via the normal akb_search / akb_browse / akb_get tools just like any other vault.
+Agent memory is handled outside the MCP tool-use loop — the AKB lifecycle plugin (akb-claude-code, akb-cursor, ...) drives /api/v1/agent-sessions REST endpoints automatically. As an agent, your own memory vault (named agent-memory-{your-user-id}, with your display name in its description) is accessible via the normal akb_search / akb_browse / akb_get tools just like any other vault — find it with akb_list_vaults rather than reconstructing the name.
 """

@@ -4,9 +4,12 @@ Replaces the legacy `memory_service` + `session_service` pair that was
 removed in v0.4.0. The new model layers cleanly on top of the existing
 vault / collection / document primitives:
 
-  - **One memory vault per user**, named ``agent-memory-{username}``,
-    auto-provisioned on first plugin call. Owned by the user, no other
-    grants — naturally owner-only.
+  - **One memory vault per user**, named ``agent-memory-{user_id}``
+    (keyed on the immutable UUID, not the username, so it works for
+    non-ASCII usernames and never drifts on rename), auto-provisioned on
+    first plugin call. The human-readable identity lives in the vault
+    ``description`` and is refreshed each SessionStart. Owned by the
+    user, no other grants — naturally owner-only.
   - **One collection per agent session**, at
     ``sessions/{YYYY-MM-DD}/{agent_id}/{session_id}``. The composite
     ``(agent_id, session_id)`` key avoids collisions when the same user
@@ -44,8 +47,11 @@ logger = logging.getLogger("akb.agent_memory")
 
 # ── Constants ────────────────────────────────────────────────
 
-#: Vault name template. ``{username_safe}`` is the sanitised username —
-#: see ``sanitise_username``.
+#: Vault name template. The slot holds the immutable ``user_id`` (UUID)
+#: for new vaults — see ``memory_vault_name``. The slot name is kept as
+#: ``{username_safe}`` for back-compat with ``legacy_memory_vault_name``,
+#: which still formats it with the sanitised username to locate and adopt
+#: pre-migration vaults.
 MEMORY_VAULT_TEMPLATE = "agent-memory-{username_safe}"
 
 #: Top-level collections inside a memory vault. Folders, not enforced
@@ -75,11 +81,20 @@ AGENT_ID_MAX_LEN = 40
 #: causes. Recorded for analytics; behaviour is identical (idempotent).
 SOURCE_VALUES = ("startup", "resume", "clear", "compact", "first_use")
 
-#: SessionEnd `reason` enum — Cursor sessionEnd's reason verbatim, plus
-#: ``stop`` to cover Claude Code's Stop hook semantics.
+#: SessionEnd `reason` enum. Accepts each harness's raw reason verbatim
+#: — mirroring how ``SOURCE_VALUES`` accepts Claude Code's raw `source`
+#: strings — so a plugin can forward the hook payload unmodified without
+#: a client-side mapping table (the original cause of the 422-on-every-
+#: SessionEnd bug). The first row is the neutral / cross-harness set;
+#: the second row is Claude Code's SessionEnd `reason` values (see the
+#: Claude Code hooks reference). Recorded as a tag for analytics; the
+#: behavioural branch is `outcome`, not `reason`.
 REASON_VALUES = (
-    "completed", "aborted", "error",
-    "window_close", "user_close", "stop",
+    # neutral / cross-harness canonical
+    "completed", "aborted", "error", "window_close", "user_close", "stop",
+    # Claude Code SessionEnd raw reasons
+    "clear", "logout", "prompt_input_exit", "bypass_permissions_disabled",
+    "other", "resume",
 )
 
 #: SessionEnd `outcome` enum — agent-level summary of whether the
@@ -208,8 +223,53 @@ def session_collection_path(date_str: str, agent_id_safe: str, session_id_safe: 
     return f"sessions/{date_str}/{agent_id_safe}/{session_id_safe}"
 
 
-def memory_vault_name(username: str) -> str:
-    return MEMORY_VAULT_TEMPLATE.format(username_safe=sanitise_username(username))
+_UUID_SAFE_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def memory_vault_name(user_id: str) -> str:
+    """Canonical memory-vault name, derived from the immutable ``user_id``.
+
+    A UUID is pure ASCII (``[0-9a-f-]``) so it is *always* a valid vault
+    slug — unlike ``username``, which may be all-CJK (e.g. ``한병전``) and
+    slugify to the empty string, which used to crash provisioning. Keying
+    on ``user_id`` also means the vault name never drifts when a user
+    later changes their username, display_name, or email — those are
+    surfaced through the vault *description* instead (see
+    ``_memory_vault_description``), refreshed on every SessionStart.
+    """
+    if not user_id:
+        raise ValidationError("user_id is required to derive a memory vault name")
+    uid = _UUID_SAFE_RE.sub("", str(user_id).strip().lower())
+    if not uid:
+        raise ValidationError(f"user_id is not vault-name-safe: {user_id!r}")
+    return MEMORY_VAULT_TEMPLATE.format(username_safe=uid)
+
+
+def legacy_memory_vault_name(username: str) -> str | None:
+    """Pre-migration vault name (``agent-memory-{slug(username)}``).
+
+    Returns ``None`` when the username does not slugify (the exact case
+    the user_id-based scheme exists to fix), so callers can probe for an
+    older username-keyed vault and adopt it instead of orphaning it.
+    """
+    try:
+        return MEMORY_VAULT_TEMPLATE.format(username_safe=sanitise_username(username))
+    except ValidationError:
+        return None
+
+
+def _memory_vault_description(
+    username: str, display_name: str | None, email: str | None,
+) -> str:
+    """Human-readable label for the memory vault, kept in the mutable
+    ``description`` so the immutable ``user_id``-keyed name stays stable
+    while the displayed identity tracks the user's current profile."""
+    who = (display_name or "").strip() or username
+    contact = f" <{email}>" if email else ""
+    return (
+        f"Agent dedicated memory for {who}{contact} (login: {username}). "
+        "Auto-provisioned by the AKB lifecycle plugin. Owner-only — no shared access."
+    )
 
 
 # ── Service ──────────────────────────────────────────────────
@@ -230,26 +290,48 @@ class AgentMemoryService:
     async def ensure_memory_vault(self, user_id: str, username: str) -> dict:
         """Return the user's memory vault, creating it if missing.
 
-        Idempotent — repeated calls return the existing vault. The
-        caller is the owner; no grants are added, so the vault is
-        owner-only by default (mirrors AKB's RBAC convention for
-        private vaults).
+        The vault name is keyed on the immutable ``user_id``
+        (``memory_vault_name``) so provisioning works for non-ASCII
+        usernames and never drifts when the user later renames. For
+        back-compat we probe the pre-migration
+        ``agent-memory-{slug(username)}`` name and *adopt* it when the
+        user_id-keyed vault does not exist yet — so existing memory
+        vaults are not orphaned by this change.
+
+        Idempotent — repeated calls return the existing vault and refresh
+        its human-readable ``description`` from the caller's current
+        profile (display_name / email). The caller is the owner; no
+        grants are added, so the vault is owner-only by default.
         """
-        name = memory_vault_name(username)
+        canonical = memory_vault_name(user_id)
+        legacy = legacy_memory_vault_name(username)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", name)
+            prof = await conn.fetchrow(
+                "SELECT username, display_name, email FROM users WHERE id = $1",
+                uuid.UUID(str(user_id)),
+            )
+            name = canonical
+            row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", canonical)
+            if not row and legacy and legacy != canonical:
+                row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", legacy)
+                if row:
+                    name = legacy  # adopt the pre-migration username-keyed vault
+
+        description = _memory_vault_description(
+            prof["username"] if prof else username,
+            prof["display_name"] if prof else None,
+            prof["email"] if prof else None,
+        )
+
         if row:
+            await self._refresh_vault_description(name, description)
             return {"name": name, "vault_id": str(row["id"]), "created": False}
 
         try:
             vault_id = await self.doc_service.create_vault(
-                name=name,
-                description=(
-                    f"Agent dedicated memory for {username}. "
-                    "Auto-provisioned by the AKB lifecycle plugin. "
-                    "Owner-only — no shared access."
-                ),
+                name=canonical,
+                description=description,
                 owner_id=user_id,
                 public_access="none",
             )
@@ -257,16 +339,52 @@ class AgentMemoryService:
             # Race: another concurrent start_session call provisioned
             # it between the SELECT and the create call. Re-read.
             async with pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", name)
+                row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", canonical)
             if not row:
                 raise
-            return {"name": name, "vault_id": str(row["id"]), "created": False}
+            return {"name": canonical, "vault_id": str(row["id"]), "created": False}
 
         logger.info(
             "Auto-provisioned memory vault %s for user %s (%s)",
-            name, username, user_id[:8],
+            canonical, username, str(user_id)[:8],
         )
-        return {"name": name, "vault_id": str(vault_id), "created": True}
+        return {"name": canonical, "vault_id": str(vault_id), "created": True}
+
+    async def _refresh_vault_description(self, vault_name: str, description: str) -> None:
+        """Best-effort sync of the vault's human-readable label. Never
+        fatal — a failed refresh must not block session start."""
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE vaults SET description = $1, updated_at = NOW() "
+                    "WHERE name = $2 AND description IS DISTINCT FROM $1",
+                    description, vault_name,
+                )
+        except Exception:  # noqa: BLE001 — label sync is non-critical
+            logger.warning(
+                "memory vault description refresh failed for %s", vault_name,
+                exc_info=True,
+            )
+
+    async def _resolve_memory_vault(self, user_id: str, username: str) -> str:
+        """Resolve the existing memory-vault name for read/write paths:
+        the user_id-keyed name if present, else an adopted legacy
+        username-keyed vault, else the user_id-keyed name (the
+        not-yet-created default)."""
+        canonical = memory_vault_name(user_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if await conn.fetchval("SELECT 1 FROM vaults WHERE name = $1", canonical):
+                return canonical
+            legacy = legacy_memory_vault_name(username)
+            if (
+                legacy
+                and legacy != canonical
+                and await conn.fetchval("SELECT 1 FROM vaults WHERE name = $1", legacy)
+            ):
+                return legacy
+        return canonical
 
     # ── Session lifecycle ──────────────────────────────────
 
@@ -362,7 +480,7 @@ class AgentMemoryService:
             )
 
         sid_safe = sanitise_session_id(session_id)
-        memory_vault = memory_vault_name(username)
+        memory_vault = await self._resolve_memory_vault(user_id, username)
         existing = await self._find_session_collection_by_sid(memory_vault, sid_safe)
         if not existing:
             raise NotFoundError("agent session", session_id)
@@ -425,7 +543,7 @@ class AgentMemoryService:
         need for a collection-update API that AKB does not yet expose.
         """
         sid_safe = sanitise_session_id(session_id)
-        memory_vault = memory_vault_name(username)
+        memory_vault = await self._resolve_memory_vault(user_id, username)
         existing = await self._find_session_collection_by_sid(memory_vault, sid_safe)
         if not existing:
             raise NotFoundError("agent session", session_id)
@@ -482,7 +600,7 @@ class AgentMemoryService:
         plugins consume the top-N and never paginate further.
         """
         sanitise_session_id(session_id)  # validate shape (raises on bad id); result unused here
-        memory_vault = memory_vault_name(username)
+        memory_vault = await self._resolve_memory_vault(user_id, username)
 
         if not scopes:
             scopes = ["preferences", "learnings"]
@@ -506,7 +624,7 @@ class AgentMemoryService:
         session_id: str,
     ) -> dict:
         sid_safe = sanitise_session_id(session_id)
-        memory_vault = memory_vault_name(username)
+        memory_vault = await self._resolve_memory_vault(user_id, username)
         existing = await self._find_session_collection_by_sid(memory_vault, sid_safe)
         if not existing:
             raise NotFoundError("agent session", session_id)
@@ -530,7 +648,7 @@ class AgentMemoryService:
         limit: int,
         offset: int,
     ) -> dict:
-        memory_vault = memory_vault_name(username)
+        memory_vault = await self._resolve_memory_vault(user_id, username)
         pool = await get_pool()
         clauses = ["v.name = $1", "c.path LIKE 'sessions/%'"]
         args: list = [memory_vault]
