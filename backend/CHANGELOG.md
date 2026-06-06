@@ -5,6 +5,124 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.1 — 2026-06-06  *(patch — compliance-grade audit log, producer-only, off by default)*
+
+AKB now emits a structured, append-only, hash-chained **audit log** and
+(optionally) hands the daily rolled file off to a WORM object-storage
+bucket. AKB is a *producer*: it does not store, query, or retain audit
+data. Off by default; enable with the new `audit:` config section.
+
+### Why producer-only (the design, recorded here deliberately)
+
+AKB is delivered to customer sites. In that setting the customer's
+security org already runs a SIEM (Splunk / QRadar / ArcSight / Elastic /
+Chronicle) and owns retention, WORM, query, and correlation under *its
+own* compliance regime. The dominant and correct pattern for delivered
+software is **"produce, don't own"**: the vendor emits a faithful,
+complete, tamper-evident audit stream in a standard place/format and the
+customer's audit system scrapes it. An AKB-side audit store/query/
+retention tier would be redundant infrastructure the customer doesn't
+want (it fragments their single pane of glass) and would wrongly impose
+our retention policy over theirs.
+
+What a producer still owns — because the customer cannot retrofit it:
+
+- **Completeness** — no lost events, no events for actions that didn't
+  happen. Captured at the source.
+- **A durable handoff buffer** so a collector/bucket outage doesn't lose
+  events.
+- **A standard format** the SIEM can parse.
+- **Tamper-evidence at the source** so the customer can *prove* to its
+  auditor that what it scraped is complete and unaltered.
+
+### Alternatives considered and rejected
+
+- **Transactional outbox (in-tx with the domain write).** The existing
+  `events` outbox binds an event to the PG transaction. But an AKB write
+  already spans PG + git + vector store + S3 and is *not* globally
+  atomic — PG is the authority and the rest reconcile around it. A strict
+  in-tx audit outbox would hold the audit line to a *stronger* consistency
+  standard than the domain operation itself has, for the sake of one rare
+  edge (commit-then-crash-before-log). Not worth the machinery, so the
+  model is uniform **best-effort post-operation append** for reads and
+  writes alike.
+- **Kafka backbone / Debezium → Kafka.** A good *transport* upgrade for
+  multi-sink fanout, but it's a bus, not a system of record: it solves
+  neither atomicity (front) nor immutability (back), and mandating a Kafka
+  cluster raises the floor for self-host OSS users. Left as a possible
+  future sink driver, not a dependency.
+- **A separate audit PG instance.** Only meaningful if AKB owned the
+  query/system-of-record tier — which the producer model gives to the
+  customer's SIEM. A second PG that isn't in the domain transaction buys
+  nothing over a file in terms of atomicity, so it's dropped.
+- **A vendor-side 3-tier WORM/query stack.** Same reason — that's the
+  customer's job.
+
+The capture point is the **Kubernetes audit-backend pattern**: log at the
+API layer (the MCP `_dispatch` chokepoint), not per-service, so one
+instrumentation point covers every read and write uniformly. Per-action
+verbosity follows K8s "levels" — reads are logged at *Metadata* level
+(who/verb/target, no bodies) and can be turned off (`audit.log_reads`);
+state-changing calls are always logged.
+
+### What ships
+
+- `backend/app/services/audit_log.py` — the producer. `record()` /
+  `record_tool()` (best-effort, never raise into the caller),
+  `verify_chain()` (operators/SIEM prove integrity), and a background
+  uploader.
+  - **Hash chain + per-file seq.** Each line carries a monotonic `seq` and
+    `h = sha256(prev_h ‖ canonical(line))`; a dropped/altered/re-ordered
+    line breaks the chain. The chain re-seeds from the on-disk file on
+    restart so it survives a pod bounce.
+  - **Manifest on handoff.** Each uploaded day object gets a sibling
+    `*.manifest.json` (line count, first/last seq, file digest, chain
+    head) so completeness and integrity are checkable from the bucket
+    alone.
+  - **Local file lifecycle.** Day 0 append → day ≥1 upload to bucket →
+    day ≥`local_retention_days` (default 2) prune the local copy, **but
+    only after a confirmed upload**. A bucket outage accumulates files
+    locally and warns; it never deletes un-uploaded audit.
+- `backend/app/config.py` — new nested `audit:` section (`AuditSettings`):
+  `enabled`, `log_dir`, `log_reads`, `bucket`, dedicated S3 credentials
+  (`endpoint_url` / `access_key` / `secret_key` / `region`),
+  `upload_interval_secs`, `local_retention_days`. Nested (not flat
+  `audit_*`) so the surface can grow — redaction, per-action levels,
+  signing keys, syslog/webhook sinks — without littering the top level.
+- **Credential isolation.** The handoff uses a *dedicated* audit-storage
+  credential when set, falling back to the system S3 connection only for
+  convenience. The recommended posture is a **write-only** key
+  (PutObject, no Delete) on a separate Object-Lock account: AKB never
+  deletes bucket objects (only the local buffer is pruned), so a
+  compromise of the app's primary S3 key cannot rewrite or erase the
+  trail. boto3 client construction is centralised in
+  `s3_adapter.make_client()` so the file store and the audit store build
+  clients identically.
+- `backend/mcp_server/server.py` — `call_tool` resolves the actor once,
+  passes it to `_dispatch`, and audits both the success and the
+  last-resort error envelope. `_get_user` audits `auth.denied` when a
+  presented credential is rejected (no token material recorded).
+- `backend/app/services/lifecycle.py` — `audit_log.init()` seeds the
+  chain at startup; the uploader starts only when `audit.bucket` is set
+  (file-only mode still writes the stream for a co-located shipper to
+  tail). Stopped in `stop_workers`.
+- `backend/app/main.py` — `/health` gains an `audit` block (enabled, dir,
+  today's file, seq, bucket, pending-upload count).
+- `backend/tests/test_audit_log.py` — unit tests: append + schema, seq
+  monotonicity, hash-chain verify + tamper detection, restart re-seed,
+  read-skip when `log_reads=false`, write-always-logged, never-raises on
+  an unwritable dir, and the upload/prune lifecycle (with a fake S3).
+- `config/app.yaml.example` — documented (commented) `audit:` section.
+
+### Not yet covered (follow-ups)
+
+- REST `/auth/login` success/failure is not yet audited — auth events that
+  flow through MCP tools are captured at dispatch, but the REST login
+  route is a separate entry point. Tracked for a later pass.
+- Sink drivers beyond `file` + S3 handoff (syslog/CEF, webhook, OTLP) are
+  designed for but not implemented; the `audit:` section is shaped to
+  grow into them.
+
 ## 0.8.0 — 2026-06-06  *(minor — `seahorse-db-grpc` driver, opt-in gRPC sibling of `seahorse-db`)*
 
 A second SeahorseDB driver that talks gRPC to the same Coral coordinator (port and config are shared with `seahorse-db`; only the wire format differs). Opt-in via `vector_store_driver: seahorse-db-grpc`. The REST `seahorse-db` driver remains the documented production path; the gRPC variant is shipped as `experimental` until it clears its own QPS / recall benchmark.

@@ -60,6 +60,7 @@ from app.repositories.document_repo import DocumentRepository
 from mcp_server.tools import TOOLS
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
+from app.services import audit_log
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -112,6 +113,13 @@ async def _get_user() -> _MCPUser:
                 user = await resolve_token(auth_header)
                 if user:
                     return _MCPUser(user.user_id, user.username, is_admin=user.is_admin)
+                # A credential was presented and rejected — that's a
+                # security-relevant event, so audit the denial. No token
+                # material is recorded.
+                audit_log.record(
+                    action="auth.denied", actor="(unauthenticated)",
+                    outcome="error", code="UNAUTHENTICATED",
+                )
     except (LookupError, AttributeError):
         pass
     return _FALLBACK_USER
@@ -1215,8 +1223,12 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Resolve the actor once and reuse it for both dispatch and the audit
+    # line so the two can't disagree on who made the call.
+    user = await _get_user()
     try:
-        result = await _dispatch(name, arguments)
+        result = await _dispatch(name, arguments, user)
+        audit_log.record_tool(name, arguments, user, result)
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
@@ -1225,14 +1237,17 @@ async def call_tool(name: str, arguments: dict):
         # try/except blocks. Specific handlers should still catch their
         # known failure modes and return err(...) with a more precise
         # code; this only catches what nothing else does.
+        envelope = err(str(e), code=INTERNAL)
+        # Audit the failure too — a crashing tool call is exactly what a
+        # security review wants to see. record_tool never raises.
+        audit_log.record_tool(name, arguments, user, envelope)
         return [TextContent(
             type="text",
-            text=json.dumps(err(str(e), code=INTERNAL), ensure_ascii=False, default=str),
+            text=json.dumps(envelope, ensure_ascii=False, default=str),
         )]
 
 
-async def _dispatch(name: str, args: dict):
-    user = await _get_user()
+async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     uid = user.user_id
 
     handler = _HANDLERS.get(name)

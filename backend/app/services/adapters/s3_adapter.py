@@ -65,13 +65,21 @@ _DEFAULT_PRESIGN_TTL = 3600
 _STREAM_CHUNK_SIZE = 64 * 1024
 
 
-def _config() -> dict:
-    return {
-        "aws_access_key_id": settings.s3_access_key,
-        "aws_secret_access_key": settings.s3_secret_key,
-        "config": BotoConfig(signature_version="s3v4"),
-        **({"region_name": settings.s3_region} if settings.s3_region else {}),
-    }
+def make_client(endpoint_url: str, access_key: str, secret_key: str, region: str = ""):
+    """Build a boto3 S3 client for an explicit endpoint + credential set.
+
+    The single place that knows the boto config (sigv4, optional region),
+    so the primary file store (`client`/`presign_client`) and a
+    credential-isolated audit store (`audit_log`) all construct clients the
+    same way instead of each re-deriving the boto kwargs."""
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url or None,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=BotoConfig(signature_version="s3v4"),
+        **({"region_name": region} if region else {}),
+    )
 
 
 def client():
@@ -79,8 +87,9 @@ def client():
     server-side operations (head, get, put, delete)."""
     global _internal_client
     if _internal_client is None:
-        _internal_client = boto3.client(
-            "s3", endpoint_url=settings.s3_endpoint_url, **_config(),
+        _internal_client = make_client(
+            settings.s3_endpoint_url, settings.s3_access_key,
+            settings.s3_secret_key, settings.s3_region,
         )
     return _internal_client
 
@@ -91,9 +100,9 @@ def presign_client():
     internal endpoint when no public URL is configured."""
     global _presign_client
     if _presign_client is None:
-        endpoint = settings.s3_public_url or settings.s3_endpoint_url
-        _presign_client = boto3.client(
-            "s3", endpoint_url=endpoint, **_config(),
+        _presign_client = make_client(
+            settings.s3_public_url or settings.s3_endpoint_url,
+            settings.s3_access_key, settings.s3_secret_key, settings.s3_region,
         )
     return _presign_client
 

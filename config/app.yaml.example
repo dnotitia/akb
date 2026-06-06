@@ -164,3 +164,30 @@ bm25_b: 0.75
 redis_url: ""              # e.g. redis://redis:6379/0
 redis_event_stream: akb:events
 redis_stream_maxlen: 100000
+
+# === Audit log (compliance-grade, producer-only) ===
+# AKB does NOT store/query/retain audit data — it emits an append-only,
+# hash-chained JSON-lines stream and (optionally) hands the daily rolled
+# file off to a WORM bucket. Your SIEM (Splunk/QRadar/Elastic/…) tails
+# the file and owns retention/query under your own compliance regime.
+# Local file lifecycle: today's file is appended to → a completed file is
+# uploaded to the bucket the next day → the local copy is pruned
+# local_retention_days after its date, but only once the upload is
+# confirmed (a bucket outage accumulates files locally, never loses them).
+# Omit the whole section to disable (the default).
+# audit:
+#   enabled: true
+#   log_dir: /data/audit          # mount a PVC here in k8s (not emptyDir)
+#   log_reads: true               # also log read/query calls (no bodies); writes always logged
+#   bucket: ""                    # S3 bucket for daily handoff; blank → file-only. Provision with Object Lock for true WORM.
+#   # Dedicated audit-storage credentials. Blank → reuse the system S3
+#   # connection above (only `bucket` differs). For real segregation of
+#   # duties point these at a SEPARATE account with a WRITE-ONLY key
+#   # (PutObject, no Delete) — AKB never deletes bucket objects, so a
+#   # compromise of the primary S3 key can't erase the audit trail.
+#   endpoint_url: ""
+#   access_key: ""
+#   secret_key: ""
+#   region: ""
+#   upload_interval_secs: 3600
+#   local_retention_days: 2
