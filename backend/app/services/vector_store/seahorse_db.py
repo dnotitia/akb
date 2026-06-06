@@ -71,7 +71,7 @@ from typing import Any
 
 import httpx
 
-from .base import VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
 
 logger = logging.getLogger("akb.vector_store.seahorse_db")
@@ -283,6 +283,102 @@ class SeahorseDbStore:
         if resp.status_code not in (200, 202):
             raise VectorStoreUnavailable(
                 f"Coral POST /v2/tables/{self._table}/data → "
+                f"{resp.status_code}: {resp.text[:200]}"
+            )
+
+    def _record_dict(
+        self,
+        *,
+        chunk_id: str,
+        content: str,
+        section_path: str | None,
+        chunk_index: int,
+        dense: list[float] | None,
+        sparse_indices: list[int],
+        sparse_values: list[float],
+        source_type: str,
+        source_id: str,
+    ) -> dict[str, Any]:
+        """Build the canonical Coral record dict for a single chunk.
+        Shared by ``upsert_one`` and ``upsert_batch`` so the two paths
+        never drift on schema details (column names, sparse encoding,
+        i64 label, the dense-None refusal)."""
+        if not has_dense(dense):
+            raise VectorStoreUnavailable(
+                "seahorse-db requires a dense embedding per row "
+                "(Coral schema forbids NULL on vector columns)."
+            )
+        return {
+            "id": _chunk_id_to_label(chunk_id),
+            "chunk_id": chunk_id,
+            "content": content,
+            "section_path": section_path or "",
+            "chunk_index": chunk_index,
+            "source_type": source_type,
+            "source_id": source_id,
+            "sparse": _encode_sparse_string(sparse_indices, sparse_values),
+            "embedding": dense,
+        }
+
+    async def upsert_batch(
+        self,
+        chunks: list[ChunkUpsert],
+        *,
+        conn=None,
+    ) -> None:
+        """Many records in one HTTP POST. The JSONL body is
+        newline-joined; Coral's ``insert_jsonl_bytes`` reads it through
+        ``arrow_json::ReaderBuilder.with_batch_size(reader_batch_size)``
+        and dispatches the resulting record batches segment-by-segment
+        (``coral/src/ingest/application/insert/dispatch.rs``). One
+        round-trip per call, fewer Kafka WAL appends per row, no change
+        to schema or per-row contract.
+
+        If the batch is empty, no-op. ``dense=None`` rows raise the
+        same ``VectorStoreUnavailable`` as ``upsert_one`` — Coral
+        won't accept a sparse-only row so a partial batch failure
+        here is correct: the caller's outer loop catches it and the
+        offending chunk is reported by ``chunk_id``.
+        """
+        if not chunks:
+            return
+        records = [
+            self._record_dict(
+                chunk_id=c.chunk_id,
+                content=c.content,
+                section_path=c.section_path,
+                chunk_index=c.chunk_index,
+                dense=c.dense,
+                sparse_indices=c.sparse_indices,
+                sparse_values=c.sparse_values,
+                source_type=c.source_type,
+                source_id=c.source_id,
+            )
+            for c in chunks
+        ]
+        body = "\n".join(
+            json.dumps(r, separators=(",", ":")) for r in records
+        )
+        http = await self._http()
+        try:
+            resp = await http.post(
+                f"/v2/tables/{self._table}/data",
+                content=body.encode("utf-8"),
+                headers={"Content-Type": "application/x-ndjson"},
+            )
+        except httpx.HTTPError as e:
+            raise VectorStoreUnavailable(
+                f"Coral POST /v2/tables/{self._table}/data "
+                f"(batch={len(chunks)}): {e}"
+            ) from e
+        if self._is_grpc_fallback(resp):
+            raise VectorStoreUnavailable(
+                f"Coral POST /v2/tables/{self._table}/data batch fell "
+                f"through to the gRPC fallback."
+            )
+        if resp.status_code not in (200, 202):
+            raise VectorStoreUnavailable(
+                f"Coral POST /v2/tables/{self._table}/data batch={len(chunks)} → "
                 f"{resp.status_code}: {resp.text[:200]}"
             )
 

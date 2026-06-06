@@ -99,7 +99,7 @@ from ._seahorse_common import (
     encode_sparse_string as _encode_sparse_string,
     validate_uuid_for_sql as _validate_uuid_for_sql,
 )
-from .base import VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
 
 logger = logging.getLogger("akb.vector_store.seahorse_db_grpc")
@@ -320,6 +320,18 @@ class SeahorseDbGrpcStore:
             raise VectorStoreUnavailable(
                 f"Coral gRPC InsertJsonl: {e.code().name} {e.details()}"
             ) from e
+
+    async def upsert_batch(
+        self,
+        chunks: list[ChunkUpsert],
+        *,
+        conn=None,
+    ) -> None:
+        """Fallback batch path — N calls of ``upsert_one``. No native
+        batch shape on this driver yet; the loop preserves the
+        Protocol contract while keeping per-call atomicity unchanged."""
+        from .base import loop_upsert_batch
+        await loop_upsert_batch(self, chunks, conn=conn)
 
     async def delete_point(self, chunk_id: str, *, conn=None) -> None:
         # Defensive UUID check — same shape as REST driver.

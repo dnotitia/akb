@@ -21,6 +21,29 @@ from typing import Protocol, TypeGuard, runtime_checkable
 
 
 @dataclass
+class ChunkUpsert:
+    """One chunk's worth of upsert input.
+
+    Used by ``VectorStore.upsert_batch`` so a caller can hand the
+    driver many records at once and let the driver pick the right
+    wire shape (Coral's JSONL bytes carry an arbitrary number of
+    lines, Qdrant's PointStruct can be batched, pgvector takes an
+    INSERT VALUES). Mirrors the ``upsert_one`` keyword arguments
+    one-for-one; if a future field lands on ``upsert_one`` it should
+    land here too so the two methods don't drift.
+    """
+    chunk_id: str
+    content: str
+    section_path: str | None
+    chunk_index: int
+    dense: list[float] | None
+    sparse_indices: list[int]
+    sparse_values: list[float]
+    source_type: str
+    source_id: str
+
+
+@dataclass
 class VectorHit:
     """A single search result. `score` is driver-internal (monotonic,
     higher is better) — do not compare across drivers.
@@ -56,6 +79,31 @@ def has_dense(dense: list[float] | None) -> TypeGuard[list[float]]:
     exactly the contract drift this helper exists to prevent.
     """
     return dense is not None and len(dense) > 0
+
+
+async def loop_upsert_batch(
+    store: "VectorStore",
+    chunks: list[ChunkUpsert],
+    *,
+    conn=None,
+) -> None:
+    """Correct-but-slow ``upsert_batch`` fallback. Used by drivers
+    that haven't yet got a native batch shape — they declare
+    ``upsert_batch`` and delegate here so the Protocol stays satisfied
+    without each driver pasting the same loop."""
+    for c in chunks:
+        await store.upsert_one(
+            conn=conn,
+            chunk_id=c.chunk_id,
+            content=c.content,
+            section_path=c.section_path,
+            chunk_index=c.chunk_index,
+            dense=c.dense,
+            sparse_indices=c.sparse_indices,
+            sparse_values=c.sparse_values,
+            source_type=c.source_type,
+            source_id=c.source_id,
+        )
 
 
 @runtime_checkable
@@ -157,6 +205,31 @@ class VectorStore(Protocol):
         `conn` — their writes are external and non-transactional from
         PG's perspective, so recovery for half-completed batches relies
         on `chunk_id` idempotence (the worker can safely re-upsert)."""
+
+    async def upsert_batch(
+        self,
+        chunks: list[ChunkUpsert],
+        *,
+        conn=None,
+    ) -> None:
+        """Upsert many chunks in one driver call.
+
+        Drivers that have a native batch shape (Coral's JSONL or
+        Arrow IPC, Qdrant's ``points_batch``, pgvector's INSERT VALUES)
+        SHOULD override this with a single round-trip — the migration
+        path's whole point is to avoid ``len(chunks)`` separate gRPC /
+        HTTP / SQL trips.
+
+        Drivers that haven't been batched yet can delegate to
+        ``loop_upsert_batch`` below for a correct-but-slow fallback.
+
+        Atomicity is the union of whatever ``upsert_one`` guarantees:
+        if the driver's per-record path is transactional with ``conn``,
+        the batch is too; if it's externally non-transactional, a
+        partial batch failure leaves some records committed and the
+        caller relies on ``chunk_id`` idempotence to retry the rest.
+        """
+        ...
 
     async def delete_point(self, chunk_id: str, *, conn=None) -> None:
         """Remove a single chunk by id. Idempotent."""
