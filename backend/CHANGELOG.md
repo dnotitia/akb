@@ -5,6 +5,26 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.3 — 2026-06-06  *(patch — pgvector bootstrap: commit `CREATE EXTENSION` before codec registration on the shared-main-pool path)*
+
+Semantic search silently returned empty on a **fresh shared-PG deployment** (`vector_store_driver: pgvector` with a blank `vector_url`, i.e. the pgvector index lives in the main application DB). Every search logged `vector hybrid_search failed (unknown type: public.vector); returning empty` and the indexing worker could never drain — chunks stayed `vector_indexed_at IS NULL` forever.
+
+### Root cause
+
+`PgvectorStore.ensure_collection()` ran `CREATE EXTENSION IF NOT EXISTS vector` and then registered the pgvector binary codec (`register_vector` → asyncpg `set_type_codec('vector', …)`) **inside the same uncommitted transaction**. asyncpg's codec introspection cannot resolve a type created by an as-yet-uncommitted `CREATE EXTENSION`, so it raised `ValueError: unknown type: public.vector`. That `ValueError` is not an `asyncpg.PostgresError`, so it escaped `ensure_collection`'s except clause and surfaced at every `hybrid_search`.
+
+#117 (0.7.4) fixed this for the **separate-DSN** pool mode by bootstrapping the extension on its own committed connection in `_pool()` before building the codec-registering pool — but the **shared-main-pool** path (`dsn is None`) never gets that pre-commit, and #117 assumed the same-transaction create was visible to the codec. It is not. The bug only triggers on a DB where the extension has never been created, so existing installs (extension already present) never saw it; the first real exercise of the fresh-shared-pool path was a demo PVC-wipe reset.
+
+### Fix
+
+`ensure_collection()` now issues `CREATE EXTENSION IF NOT EXISTS vector` as a **committed (autocommit) statement before** opening the schema-build transaction, so the `vector` type is resolvable when the codec registers. Idempotent and a no-op once the extension exists; covers both pool modes.
+
+### Verification (and a caveat on the test)
+
+Validated against the actual failing environment — a full demo PVC-wipe **reset → seed → search** cycle on the deployed backend: after the fix the lifecycle logs `Vector store schema ensured (eager init)` (previously `eager init failed: unknown type: public.vector`), the `vector` extension is created with no manual step, and all chunks index (`vector_indexed_at` drains to 0) so search returns hits.
+
+Note this manifestation **does not reproduce in isolation**: running `test_pgvector_ext_bootstrap_e2e.py` against a fresh `pgvector/pgvector:pg16` DB — and even a faithful replica of the backend's pool lifecycle (`min_size=2`, `init.sql` warm-up, real queries, identical asyncpg/pgvector pins) — passes on the *pre-fix* code too. The deployed trigger is almost certainly the lifespan eager-init racing the embed workers to be the first `ensure_collection` caller, which a single-threaded test can't recreate. The pgvector e2e tests are now wired into CI (`pgvector-e2e` job in `backend-pytest.yml`) as general bootstrap hardening for the #117-class scenarios, but they are **not** a gate for this concurrency-specific manifestation — that is covered by the deploy-time reset-cycle check above.
+
 ## 0.8.2 — 2026-06-06  *(patch — bulk migration: `VectorStore.upsert_batch`, REST seahorse-db multi-line JSONL, resume + per-row fallback)*
 
 `scripts/migrate_pgvector_to_seahorsedb.py` was the bottleneck for any operator moving a real-sized vault from pgvector to a self-hosted Coral. 0.7.9's script issued one `upsert_one` per chunk — fine for the first 65 rows we tested with, painful at 350 k. This release routes the script through a new Protocol-level batch path and adds the operational surface every bulk migration actually needs: a checkpoint file so a connection drop doesn't restart from zero, and a per-row fallback so a single transient batch failure doesn't cost a few hundred chunks.
