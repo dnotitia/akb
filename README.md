@@ -283,6 +283,22 @@ have the `events_publisher` worker drain the outbox to a Redis Stream
 groups. Leave blank to disable; events still accumulate in PG and you can
 build an SSE endpoint on top of the LISTEN/NOTIFY trigger without Redis.
 
+### Audit log (optional)
+
+Off by default. Set `audit.enabled: true` in `app.yaml` to emit a structured,
+append-only, **hash-chained** JSON-lines audit log at the MCP dispatch
+chokepoint — every read, write, and auth denial, uniformly. AKB is a
+**producer only**: it does not store, query, or retain audit data; your SIEM
+(Splunk/QRadar/Elastic) scrapes the stream and owns retention under its own
+compliance regime. Each line carries a monotonic `seq` plus
+`sha256(prev ‖ line)`, so the chain can be verified for dropped or altered
+lines and re-seeds from disk across restarts. Optionally hand the daily
+rolled file off to a **WORM** object-storage bucket (`audit.bucket` —
+provision with Object Lock and a write-only key for a true immutable trail);
+the local buffer is pruned only after a confirmed upload. Capture is
+best-effort and never raises into the serving path. See
+`config/app.yaml.example` for the full `audit:` block.
+
 ### Production deployment
 
 For Kubernetes, see [`deploy/k8s/README.md`](./deploy/k8s/README.md). The
@@ -324,6 +340,8 @@ akb/
   Seahorse Cloud, or self-hosted SeahorseDB optional — hybrid dense +
   BM25 sparse, RRF fusion; BM25-only fallback when embed is down)
 - **Event stream** (optional): PG `events` outbox + Redis Streams fanout
+- **Audit log** (optional): hash-chained append-only JSONL at the MCP
+  dispatch point + optional WORM S3 handoff; producer-only (SIEM owns retention)
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
 - **Auth**: JWT + Personal Access Tokens (PATs)
 - **MCP**: Streamable HTTP (backend) + stdio proxy (`akb-mcp` on npm)
