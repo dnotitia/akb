@@ -16,7 +16,7 @@ The memory vault name is now keyed on the immutable `user_id` (a UUID, always a 
 
 - Works for any username, including all-CJK.
 - The name never drifts when a user later changes username / display_name / email. The human-readable identity moved to the vault **`description`** (`_memory_vault_description`), which is refreshed from the current profile on every `SessionStart`.
-- **Back-compat:** `ensure_memory_vault` / `_resolve_memory_vault` probe the pre-migration `agent-memory-{slug(username)}` name and **adopt** an existing vault rather than orphaning it — so vaults provisioned under the old scheme keep working with no data migration.
+- **Back-compat:** `ensure_memory_vault` / `_resolve_memory_vault` probe the pre-migration `agent-memory-{slug(username)}` name and **adopt** an existing vault rather than orphaning it — so vaults provisioned under the old scheme keep working with no data migration. Adoption is **owner-scoped** (`owner_id = user_id`): distinct usernames can slugify to the same legacy name, so the name alone is not proof of ownership — a legacy vault owned by someone else is ignored and the user gets their own canonical vault.
 
 ### 2. Claude Code SessionEnd `reason` values were all rejected
 `EndRequest.reason` only accepted the neutral cross-harness set (`completed`/`aborted`/`error`/`window_close`/`user_close`/`stop`), but Claude Code emits `clear`/`logout`/`prompt_input_exit`/`bypass_permissions_disabled`/`other`/`resume`. The plugin forwards the hook reason verbatim, so **every** `SessionEnd` returned `422` and no `recap.md` was ever written.

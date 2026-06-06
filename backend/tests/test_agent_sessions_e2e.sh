@@ -329,6 +329,49 @@ echo "$R" | grep -q "한글유저" \
   && pass "CJK vault description carries display name" \
   || fail "CJK description" "label missing: ${R:0:200}"
 
+# ── 14. Legacy adoption is owner-scoped (no cross-user hijack) ──
+# Two usernames that slugify to the SAME legacy name (case-fold
+# collision). User A owns a pre-migration vault under that slug; user B
+# must NOT adopt it — B falls through to its own user_id-keyed vault.
+echo ""
+echo "▸ 14. Legacy adoption refuses a vault owned by another user"
+
+SLUG="collide-${TS}"
+LEGACY_NAME="agent-memory-${SLUG}"
+A_USER="Collide-${TS}"   # slug → collide-${TS}
+B_USER="COLLIDE-${TS}"   # slug → collide-${TS}  (same)
+
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H "$H_JSON" \
+  -d "{\"username\":\"$A_USER\",\"email\":\"a-${TS}@t.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+A_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H "$H_JSON" \
+  -d "{\"username\":\"$A_USER\",\"password\":\"test1234\"}" | py 'import sys,json;print(json.load(sys.stdin)["token"])')
+# A provisions the pre-migration (username-keyed) vault it owns.
+ACODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+  "$BASE_URL/api/v1/vaults?name=${LEGACY_NAME}&description=premig-A" \
+  -H "Authorization: Bearer $A_JWT")
+[ "$ACODE" = "200" ] && pass "user A owns legacy vault $LEGACY_NAME" \
+  || fail "A legacy vault" "create got $ACODE"
+# Positive back-compat: A adopts its OWN pre-migration vault (not orphaned).
+A_MV=$(curl -sk -X POST "$BASE_URL/api/v1/agent-sessions/collide-a-${TS}" \
+  -H "Authorization: Bearer $A_JWT" -H "$H_JSON" \
+  -d '{"agent_id":"claude-code","source":"startup"}' | jq_field "['memory_vault']")
+[ "$A_MV" = "$LEGACY_NAME" ] && pass "user A adopts its own legacy vault" \
+  || fail "A adoption" "A resolved to $A_MV (expected $LEGACY_NAME)"
+
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H "$H_JSON" \
+  -d "{\"username\":\"$B_USER\",\"email\":\"b-${TS}@t.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+B_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" -H "$H_JSON" \
+  -d "{\"username\":\"$B_USER\",\"password\":\"test1234\"}" | py 'import sys,json;print(json.load(sys.stdin)["token"])')
+B_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" -H "Authorization: Bearer $B_JWT" -H "$H_JSON" \
+  -d '{"name":"collide-b"}' | py 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+B_MV=$(curl -sk -X POST "$BASE_URL/api/v1/agent-sessions/collide-b-${TS}" \
+  -H "Authorization: Bearer $B_PAT" -H "$H_JSON" \
+  -d '{"agent_id":"claude-code","source":"startup"}' | jq_field "['memory_vault']")
+[ "$B_MV" != "$LEGACY_NAME" ] && echo "$B_MV" | grep -Eq '^agent-memory-[0-9a-f-]{36}$' \
+  && pass "user B got its own user_id vault, not A's legacy ($B_MV)" \
+  || fail "owner-scoped adoption" "B resolved to $B_MV (expected its own uuid vault, not $LEGACY_NAME)"
+
 # ── Summary ────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════"

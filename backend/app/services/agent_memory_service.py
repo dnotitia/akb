@@ -37,6 +37,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal, get_args
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError
@@ -89,13 +90,17 @@ SOURCE_VALUES = ("startup", "resume", "clear", "compact", "first_use")
 #: the second row is Claude Code's SessionEnd `reason` values (see the
 #: Claude Code hooks reference). Recorded as a tag for analytics; the
 #: behavioural branch is `outcome`, not `reason`.
-REASON_VALUES = (
+#: Single source of truth for the accepted reasons. The REST route
+#: imports ``ReasonLiteral`` for its Pydantic field so the HTTP-layer
+#: enum and this service-layer guard can never drift apart.
+ReasonLiteral = Literal[
     # neutral / cross-harness canonical
     "completed", "aborted", "error", "window_close", "user_close", "stop",
     # Claude Code SessionEnd raw reasons
     "clear", "logout", "prompt_input_exit", "bypass_permissions_disabled",
     "other", "resume",
-)
+]
+REASON_VALUES = get_args(ReasonLiteral)
 
 #: SessionEnd `outcome` enum — agent-level summary of whether the
 #: session achieved its goal. Independent of `reason` (a session can
@@ -305,16 +310,26 @@ class AgentMemoryService:
         """
         canonical = memory_vault_name(user_id)
         legacy = legacy_memory_vault_name(username)
+        uid = uuid.UUID(str(user_id))
         pool = await get_pool()
         async with pool.acquire() as conn:
             prof = await conn.fetchrow(
                 "SELECT username, display_name, email FROM users WHERE id = $1",
-                uuid.UUID(str(user_id)),
+                uid,
             )
             name = canonical
             row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", canonical)
             if not row and legacy and legacy != canonical:
-                row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", legacy)
+                # Adopt a pre-migration vault only if THIS user owns it —
+                # distinct usernames can slugify to the same legacy name
+                # (e.g. case-folding or NFKD-stripping collisions), so the
+                # name alone is not proof of ownership. A legacy vault
+                # owned by someone else falls through to creating this
+                # user's own canonical vault.
+                row = await conn.fetchrow(
+                    "SELECT id FROM vaults WHERE name = $1 AND owner_id = $2",
+                    legacy, uid,
+                )
                 if row:
                     name = legacy  # adopt the pre-migration username-keyed vault
 
@@ -378,10 +393,16 @@ class AgentMemoryService:
             if await conn.fetchval("SELECT 1 FROM vaults WHERE name = $1", canonical):
                 return canonical
             legacy = legacy_memory_vault_name(username)
+            # Owner-scoped, same as ensure_memory_vault's adoption: never
+            # resolve to a legacy vault this user does not own (usernames
+            # can slugify to a shared legacy name).
             if (
                 legacy
                 and legacy != canonical
-                and await conn.fetchval("SELECT 1 FROM vaults WHERE name = $1", legacy)
+                and await conn.fetchval(
+                    "SELECT 1 FROM vaults WHERE name = $1 AND owner_id = $2",
+                    legacy, uuid.UUID(str(user_id)),
+                )
             ):
                 return legacy
         return canonical
