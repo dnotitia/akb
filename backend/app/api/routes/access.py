@@ -209,6 +209,49 @@ async def admin_reset_user_password(
     return {"temporary_password": temp, "username": username}
 
 
+class AdminMintTokenRequest(NFCModel):
+    name: str
+    expires_days: int | None = None
+
+
+@router.post(
+    "/admin/users/{user_ref}/tokens",
+    summary="[admin] Mint a PAT for any user (by id or email)",
+)
+async def admin_mint_user_token(
+    user_ref: str,
+    req: AdminMintTokenRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Issue a Personal Access Token on behalf of another user.
+
+    The normal ``POST /auth/tokens`` mints for the *caller*, which forces
+    the caller to know that user's password. A managed control plane that
+    provisions members (and especially after a member SSO-links, retiring
+    their local password) has no password to log in with — so it needs an
+    admin-authenticated way to mint a member's PAT by email. Returns the raw
+    token once, same shape as ``/auth/tokens``.
+    """
+    _require_admin(user)
+    import uuid as _uuid
+    from app.db.postgres import get_pool
+    from app.services.auth_service import create_pat
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            uid = _uuid.UUID(user_ref)
+            row = await conn.fetchrow("SELECT id FROM users WHERE id = $1", uid)
+        except ValueError:
+            # Not a UUID → treat as an email (how the platform keys members).
+            row = await conn.fetchrow(
+                "SELECT id FROM users WHERE email = $1", user_ref
+            )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    return await create_pat(str(row["id"]), req.name, expires_days=req.expires_days)
+
+
 @router.get(
     "/admin/role-state",
     summary="[admin] Diff PG role state against the AKB catalog (read-only)",

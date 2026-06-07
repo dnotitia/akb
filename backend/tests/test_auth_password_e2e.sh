@@ -160,6 +160,46 @@ HTTP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST \
   -H "Authorization: Bearer $ADMIN_JWT")
 [ "$HTTP" = "404" ] && pass "bogus user → 404" || fail "bogus user" "got $HTTP"
 
+# ── 3. Admin mint PAT for another user ─────────────────────
+echo ""
+echo "▸ 3. /admin/users/{ref}/tokens (admin mints a PAT for another user)"
+
+# By email (how the managed platform keys members; needed for SSO-linked
+# users who have no usable password to log in and self-mint).
+MINTED=$(curl -sk -X POST "$BASE_URL/api/v1/admin/users/$USER@t.dev/tokens" \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"admin-minted"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+[ -n "$MINTED" ] && pass "admin mint by email → PAT" || fail "admin mint" "no token"
+
+# The minted PAT authenticates AS the target user.
+MINTED_ID=$(me_user_id "$MINTED")
+[ "$MINTED_ID" = "$USER_ID" ] && pass "minted PAT acts as target" \
+  || fail "minted PAT identity" "got $MINTED_ID want $USER_ID"
+
+# By user-id also works.
+HTTP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST \
+  "$BASE_URL/api/v1/admin/users/$USER_ID/tokens" \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"by-id"}')
+[ "$HTTP" = "200" ] && pass "admin mint by id → 200" || fail "mint by id" "got $HTTP"
+
+# Non-admin → 403. Use a FRESH non-admin user (the earlier admin reset
+# revoked the original target user's sessions, so its JWT would 401).
+NA_JWT=$(register_and_login "pw-e2e-na-$TS" "fresh-na-secret-12")
+HTTP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST \
+  "$BASE_URL/api/v1/admin/users/$USER_ID/tokens" \
+  -H "Authorization: Bearer $NA_JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"x"}')
+[ "$HTTP" = "403" ] && pass "non-admin mint → 403" || fail "non-admin mint" "got $HTTP"
+
+# Unknown user → 404.
+HTTP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST \
+  "$BASE_URL/api/v1/admin/users/nobody-$TS@t.dev/tokens" \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"name":"x"}')
+[ "$HTTP" = "404" ] && pass "unknown user mint → 404" || fail "unknown mint" "got $HTTP"
+
 # Summary
 echo ""
 echo "═══════════════════════════════════"
