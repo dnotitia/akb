@@ -243,13 +243,13 @@ echo "  Node types: $NODE_TYPES"
 HAS_MIXED=$(echo "$R" | python3 -c "import sys,json; nodes=json.load(sys.stdin)['nodes']; types=set(n['resource_type'] for n in nodes); print('doc' in types and 'table' in types)" 2>/dev/null)
 [ "$HAS_MIXED" = "True" ] && pass "Graph has mixed node types (doc+table)" || fail "Graph mixed" "single type only"
 
-# Subgraph from table
-R=$(mcp_call akb_graph "{\"uri\":\"$TABLE_URI\",\"depth\":2}" | mcp_result)
+# Subgraph from table (akb_graph uses `hops`, not `depth`)
+R=$(mcp_call akb_graph "{\"uri\":\"$TABLE_URI\",\"hops\":2}" | mcp_result)
 SUB_NODES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null)
 [ "$SUB_NODES" -ge 2 ] 2>/dev/null && pass "Subgraph from table: $SUB_NODES nodes" || fail "Subgraph" "expected >=2"
 
-# Subgraph from doc via resource_uri
-R=$(mcp_call akb_graph "{\"uri\":\"$DOC1_URI\",\"depth\":1}" | mcp_result)
+# Subgraph from doc via resource_uri (akb_graph uses `hops`, not `depth`)
+R=$(mcp_call akb_graph "{\"uri\":\"$DOC1_URI\",\"hops\":1}" | mcp_result)
 DOC_GRAPH=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null)
 [ "$DOC_GRAPH" -ge 1 ] 2>/dev/null && pass "Subgraph from doc URI: $DOC_GRAPH nodes" || fail "Doc subgraph" "failed"
 
