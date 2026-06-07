@@ -16,22 +16,26 @@ echo "║   Password Recovery E2E                  ║"
 echo "║   Target: $BASE_URL"
 echo "╚══════════════════════════════════════════╝"
 
-# Helper: promote a user to admin via the backend container's Python.
-# `docker compose exec` runs inside the backend image which pip-installed
-# all backend deps (asyncpg is on PATH). NO uv — container does not ship it.
-# stderr stays visible so failures surface in the test log instead of being
-# masked as a downstream "non-admin → 403" misattribution.
+# Portable DB access for the admin bootstrap. Defaults to the cluster via
+# kubectl (matching "run E2E against the deployed URL"); override AKB_PG_EXEC
+# for a local stack, e.g.:
+#   AKB_PG_EXEC="docker compose exec -T postgres"
+#   AKB_PG_EXEC="docker exec -i akb-postgres-1"   (set AKB_PG_USER if needed)
+PG_NS="${AKB_NS:-akb}"
+PG_POD="${AKB_PG_POD:-postgres-0}"
+PG_USER="${AKB_PG_USER:-akbuser}"
+PG_DB="${AKB_PG_DB:-akb}"
+run_psql() {
+  if [ -n "${AKB_PG_EXEC:-}" ]; then
+    ${AKB_PG_EXEC} psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  else
+    kubectl exec -n "$PG_NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  fi
+}
+
+# Helper: promote a user to admin (registration never creates admins).
 promote_admin() {
-  local uname="$1"
-  docker compose exec -T backend python -c "
-import asyncio, asyncpg
-async def go():
-    dsn = 'postgresql://akb:akb@postgres:5432/akb'
-    conn = await asyncpg.connect(dsn)
-    await conn.execute('UPDATE users SET is_admin = TRUE WHERE username = \$1', '$uname')
-    await conn.close()
-asyncio.run(go())
-" >/dev/null
+  run_psql "UPDATE users SET is_admin = TRUE WHERE username = '$1'" >/dev/null
 }
 
 # Helper: register + login → echo JWT
