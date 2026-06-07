@@ -93,6 +93,9 @@ jwt_expire_hours: 24
 # keycloak_client_id: "akb-web"
 # keycloak_public_client: false      # true → PKCE (no client_secret needed)
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
+# keycloak_require_verified_email: true   # refuse id_tokens whose email_verified≠true
+#                                         # (identity is keyed on email). Set false ONLY
+#                                         # for a trusted realm with controlled emails.
 # keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
 # keycloak_post_login_path: "/auth/callback"
 # keycloak_exchange_code_ttl_secs: 60

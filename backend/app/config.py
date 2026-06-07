@@ -172,6 +172,13 @@ class Settings(BaseModel):
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
+    # Identity is keyed on the verified email. By default we REQUIRE the
+    # id_token's `email_verified` claim to be true before provisioning /
+    # adopting an AKB user — otherwise an IdP that allows unverified or
+    # self-asserted emails (open self-registration, social federation)
+    # becomes an account-spoofing vector. Set false ONLY for a trusted
+    # realm where every account's email is controlled out-of-band.
+    keycloak_require_verified_email: bool = True
     # Absolute URL Keycloak redirects the browser back to after login.
     # Must point at the AKB backend callback route and be registered as a
     # valid redirect URI on the Keycloak client, e.g.

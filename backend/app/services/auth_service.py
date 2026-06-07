@@ -203,6 +203,12 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
     if not email:
         # AKB keys identity on email; without it we cannot map to a user.
         raise AuthenticationError("Keycloak account has no email claim")
+    # Identity is keyed on email — refuse unverified emails so a realm that
+    # permits self-asserted addresses can't be used to provision/adopt an
+    # AKB account under someone else's email. Gated so a trusted realm can
+    # opt out (keycloak_require_verified_email=false).
+    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+        raise AuthenticationError("Identity provider has not verified this email address")
     display_name = claims.get("name") or claims.get("preferred_username")
     preferred_username = claims.get("preferred_username") or email.split("@")[0]
 
@@ -239,31 +245,59 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
         else:
             user_id = uuid.uuid4()
             uname = await _unique_username(conn, preferred_username)
-            # INSERT + outbox event in one tx so a rollback drops both.
-            async with conn.transaction():
-                await conn.execute(
+            try:
+                # INSERT + outbox event in one tx so a rollback drops both.
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        INSERT INTO users (id, username, email, password_hash,
+                                           display_name, auth_provider)
+                        VALUES ($1, $2, $3, $4, $5, 'keycloak')
+                        """,
+                        user_id, uname, email, _SSO_SENTINEL_HASH, display_name,
+                    )
+                    await emit_event(
+                        conn,
+                        "auth.user_provisioned",
+                        actor_id=str(user_id),
+                        payload={"auth_provider": "keycloak", "email": email},
+                    )
+                new_user_id = user_id
+                not_before = None
+                user_payload = {
+                    "id": str(user_id),
+                    "username": uname,
+                    "email": email,
+                    "display_name": display_name,
+                    "is_admin": False,
+                }
+            except asyncpg.UniqueViolationError:
+                # Concurrent first-login for the same email won the race.
+                # Re-fetch and treat as the existing user (idempotent JIT)
+                # instead of bubbling a raw 500.
+                row = await conn.fetchrow(
                     """
-                    INSERT INTO users (id, username, email, password_hash,
-                                       display_name, auth_provider)
-                    VALUES ($1, $2, $3, $4, $5, 'keycloak')
+                    SELECT id, username, email, display_name, is_admin,
+                           tokens_revoked_before, auth_provider
+                      FROM users WHERE email = $1
                     """,
-                    user_id, uname, email, _SSO_SENTINEL_HASH, display_name,
+                    email,
                 )
-                await emit_event(
-                    conn,
-                    "auth.user_provisioned",
-                    actor_id=str(user_id),
-                    payload={"auth_provider": "keycloak", "email": email},
-                )
-            new_user_id = user_id
-            not_before = None
-            user_payload = {
-                "id": str(user_id),
-                "username": uname,
-                "email": email,
-                "display_name": display_name,
-                "is_admin": False,
-            }
+                if row is None or row["auth_provider"] != "keycloak":
+                    raise ConflictError(
+                        "An account with this email already exists; "
+                        "SSO linking is not enabled. Contact an admin."
+                    )
+                user_id = row["id"]
+                uname = row["username"]
+                not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+                user_payload = {
+                    "id": str(row["id"]),
+                    "username": row["username"],
+                    "email": row["email"],
+                    "display_name": row["display_name"],
+                    "is_admin": row["is_admin"],
+                }
 
     # PG-native RBAC: create the per-user role outside the insert's
     # connection, mirroring register(). Best-effort — the reconciler at

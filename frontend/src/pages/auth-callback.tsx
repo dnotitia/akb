@@ -26,9 +26,12 @@ export default function AuthCallbackPage() {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     const redirect = params.get("redirect") || "/";
-    const safeRedirect = redirect.startsWith("/") && !redirect.startsWith("//")
-      ? redirect
-      : "/";
+    // Same-site path only — mirror the backend _safe_redirect_path guard
+    // (block scheme-relative "//" and backslash tricks).
+    const safeRedirect =
+      redirect.startsWith("/") && !redirect.startsWith("//") && !redirect.includes("\\")
+        ? redirect
+        : "/";
 
     if (!code) {
       navigate("/auth?sso_error=missing_code", { replace: true });
