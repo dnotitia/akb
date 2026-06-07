@@ -1,13 +1,19 @@
-"""REST API routes for auth — register, login, PAT management."""
+"""REST API routes for auth — register, login, PAT management, Keycloak SSO."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+import urllib.parse
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 
 from app.api.deps import get_current_user
-from app.exceptions import NotFoundError
+from app.config import settings
+from app.exceptions import AKBError, NotFoundError
 from app.services.auth_service import (
     AuthenticatedUser,
     register,
     login,
+    login_with_keycloak_claims,
     create_pat,
     list_pats,
     revoke_pat,
@@ -15,6 +21,8 @@ from app.services.auth_service import (
     update_profile,
 )
 from app.util.text import NFCModel
+
+logger = logging.getLogger("akb.auth.routes")
 
 router = APIRouter()
 
@@ -59,6 +67,140 @@ async def register_user(req: RegisterRequest):
 @router.post("/auth/login", summary="Login and get JWT")
 async def login_user(req: LoginRequest):
     return await login(req.username, req.password)
+
+
+# ── Public auth config (lets the SPA decide which login options to show) ──
+
+@router.get("/auth/config", summary="Public auth configuration")
+async def auth_config():
+    """Unauthenticated. Tells the frontend whether the optional Keycloak
+    SSO button should be shown and where it points. Reveals no secrets."""
+    return {
+        "keycloak": {
+            "enabled": settings.keycloak_enabled,
+            # SPA appends ?redirect=<path> when navigating here.
+            "login_url": "/api/v1/auth/keycloak/login" if settings.keycloak_enabled else None,
+        }
+    }
+
+
+# ── Keycloak OIDC (optional) ──────────────────────────────────────────
+#
+# Only mounted-effective when keycloak_enabled. Each handler 404s when
+# SSO is off so a disabled deployment exposes no live SSO surface.
+
+class KeycloakExchangeRequest(NFCModel):
+    code: str
+
+
+def _require_keycloak() -> None:
+    if not settings.keycloak_enabled:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Keycloak SSO is not enabled")
+
+
+def _safe_redirect_path(raw: str | None) -> str:
+    """Only allow same-site path redirects (must start with a single '/').
+
+    Blocks open-redirects: '//evil.com', 'https://evil.com', backslash and
+    scheme-relative tricks all collapse to '/'.
+    """
+    if not raw or not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
+        return "/"
+    return raw
+
+
+@router.get("/auth/keycloak/login", summary="Begin Keycloak SSO login")
+async def keycloak_login(redirect: str = "/"):
+    _require_keycloak()
+    from app.services.keycloak_oidc import get_keycloak_oidc
+    url = await get_keycloak_oidc().begin_login(_safe_redirect_path(redirect))
+    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/auth/keycloak/callback", summary="Keycloak SSO redirect callback")
+async def keycloak_callback(request: Request):
+    _require_keycloak()
+    from app.services.keycloak_oidc import get_keycloak_oidc, issue_exchange_code
+
+    params = request.query_params
+    # Keycloak signals user-side errors (e.g. access_denied) as query params.
+    if err := params.get("error"):
+        return _sso_error_redirect(err)
+    code = params.get("code")
+    state = params.get("state")
+    if not code or not state:
+        return _sso_error_redirect("missing_code_or_state")
+
+    svc = get_keycloak_oidc()
+    flow = await svc.consume_state(state)
+    if flow is None:
+        # Unknown/expired/replayed state — CSRF guard.
+        return _sso_error_redirect("invalid_state")
+
+    try:
+        tokens = await svc.exchange_code_for_tokens(code, flow.get("code_verifier"))
+        id_token = tokens.get("id_token")
+        if not id_token:
+            return _sso_error_redirect("no_id_token")
+        claims = await svc.verify_id_token(id_token)
+        login_response = await login_with_keycloak_claims(claims)
+    except AKBError as e:
+        # Don't leak detail into the URL; log server-side, show a code.
+        logger.warning("Keycloak SSO callback failed: %s", e)
+        return _sso_error_redirect("auth_failed")
+
+    # Hand the SPA a one-time code; the token is delivered via POST /exchange.
+    # Stash the Keycloak id_token too so the SPA can pass it back as
+    # id_token_hint on logout (seamless RP-initiated logout, no KC prompt).
+    one_time = await issue_exchange_code({**login_response, "kc_id_token": id_token})
+    dest = _safe_redirect_path(flow.get("redirect_path", "/"))
+    target = (
+        f"{settings.keycloak_post_login_path}"
+        f"?code={urllib.parse.quote(one_time)}"
+        f"&redirect={urllib.parse.quote(dest, safe='')}"
+    )
+    return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/auth/keycloak/logout", summary="RP-initiated Keycloak logout")
+async def keycloak_logout(id_token_hint: str | None = None):
+    """End the Keycloak SSO session (so the next SSO login prompts again /
+    can switch user). AKB already cleared its own JWT client-side; this
+    redirects the browser to Keycloak's end_session_endpoint, which then
+    redirects back to the AKB login page.
+
+    `id_token_hint` (optional) makes the logout seamless (no Keycloak
+    confirmation page). The SPA passes the Keycloak id_token it received at
+    exchange time; without it, Keycloak may show a logout confirmation."""
+    _require_keycloak()
+    from app.services.keycloak_oidc import get_keycloak_oidc
+    post_logout = settings.public_base_url.rstrip("/") + "/auth"
+    url = get_keycloak_oidc().logout_url(
+        id_token_hint=id_token_hint, post_logout_redirect=post_logout
+    )
+    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+
+
+@router.post("/auth/keycloak/exchange", summary="Exchange one-time SSO code for a JWT")
+async def keycloak_exchange(req: KeycloakExchangeRequest):
+    _require_keycloak()
+    from app.services.keycloak_oidc import redeem_exchange_code
+    result = await redeem_exchange_code(req.code)
+    if result is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Invalid or expired exchange code"
+        )
+    # Same {token, user} shape as POST /auth/login.
+    return result
+
+
+def _sso_error_redirect(reason: str) -> RedirectResponse:
+    """Bounce a failed SSO browser navigation back to the login page with a
+    short reason code the SPA can surface (avoids dumping JSON at the user)."""
+    return RedirectResponse(
+        f"/auth?sso_error={urllib.parse.quote(reason, safe='')}",
+        status_code=status.HTTP_302_FOUND,
+    )
 
 
 @router.get("/auth/me", summary="Get current user info")

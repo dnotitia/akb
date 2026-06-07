@@ -13,6 +13,36 @@ export function getToken(): string | null {
   return _token;
 }
 
+// ── SSO session marker (optional Keycloak) ──
+// Records whether the *current* session was obtained via Keycloak SSO, so
+// "Sign out" can also end the Keycloak session (RP-initiated logout) —
+// otherwise the live KC session would silently re-authenticate on the next
+// SSO click. Local-auth sessions never set this, so their logout is
+// unaffected. We also keep the KC id_token to pass as id_token_hint for a
+// prompt-free logout.
+const SSO_FLAG = "akb_sso";
+const KC_HINT = "akb_kc_id_token";
+
+export function markSsoSession(kcIdToken?: string) {
+  localStorage.setItem(SSO_FLAG, "1");
+  if (kcIdToken) localStorage.setItem(KC_HINT, kcIdToken);
+}
+
+export function clearSsoSession() {
+  localStorage.removeItem(SSO_FLAG);
+  localStorage.removeItem(KC_HINT);
+}
+
+export function isSsoSession(): boolean {
+  return localStorage.getItem(SSO_FLAG) === "1";
+}
+
+/** Backend RP-initiated logout endpoint (bounces to KC end_session → /auth). */
+export function keycloakLogoutUrl(): string {
+  const hint = localStorage.getItem(KC_HINT);
+  return `${API_BASE}/auth/keycloak/logout${hint ? `?id_token_hint=${encodeURIComponent(hint)}` : ""}`;
+}
+
 /**
  * Error thrown by `api()` when the server returns a structured 4xx/5xx body
  * (FastAPI `HTTPException(detail=dict)`). Inherits from `Error` so existing
@@ -121,6 +151,25 @@ export const authLogin = (username: string, password: string) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
+  }).then(parseAuthResponse);
+
+export interface AuthConfig {
+  keycloak: { enabled: boolean; login_url: string | null };
+}
+
+/** Public auth config — drives whether the optional SSO button shows.
+ * Falls back to SSO-disabled if the endpoint is unreachable/old. */
+export const getAuthConfig = (): Promise<AuthConfig> =>
+  fetch(`${API_BASE}/auth/config`)
+    .then((r) => (r.ok ? r.json() : { keycloak: { enabled: false, login_url: null } }))
+    .catch(() => ({ keycloak: { enabled: false, login_url: null } }));
+
+/** Redeem the one-time SSO code from the Keycloak callback for an AKB JWT. */
+export const keycloakExchange = (code: string) =>
+  fetch(`${API_BASE}/auth/keycloak/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
   }).then(parseAuthResponse);
 
 // ── Auth (token) ──

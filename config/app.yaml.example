@@ -78,6 +78,33 @@ s3_region: ""
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 
+# === Auth — Keycloak OIDC (OPTIONAL external IdP; OFF by default) ===
+# Leave keycloak_enabled false and AKB uses local username/password + PAT
+# exactly as before — none of the keys below are read and the SSO routes
+# return 404. Turn it on to add an SSO login button; on success AKB
+# JIT-provisions a user (by email) and issues a normal AKB JWT. Keycloak
+# is authentication only — it never drives AKB authorization.
+# Full design: docs/designs/keycloak-oidc/00-overview.md
+#
+# keycloak_enabled: false
+# keycloak_server_url: "https://auth.example.com"   # no /realms suffix (browser-facing; sets the issuer)
+# keycloak_internal_url: ""          # optional backchannel URL (server→Keycloak); blank → use server_url
+# keycloak_realm: "akb"
+# keycloak_client_id: "akb-web"
+# keycloak_public_client: false      # true → PKCE (no client_secret needed)
+# keycloak_verify_ssl: true          # false only for local self-signed Keycloak
+# keycloak_require_verified_email: true   # refuse id_tokens whose email_verified≠true
+#                                         # (identity is keyed on email). Set false ONLY
+#                                         # for a trusted realm with controlled emails.
+# keycloak_link_by_email: false           # link SSO to a pre-existing same-email account
+#                                         # (e.g. one the managed control plane provisioned).
+#                                         # Keeps the user_id/PATs; only links VERIFIED emails.
+#                                         # Default false = no silent merge (OSS-safe).
+# keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
+# keycloak_post_login_path: "/auth/callback"
+# keycloak_exchange_code_ttl_secs: 60
+# keycloak_client_secret lives in secret.yaml (never commit it)
+
 # === Server ===
 host: 0.0.0.0
 port: 8000
