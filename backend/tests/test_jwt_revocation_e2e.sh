@@ -18,6 +18,22 @@ BASE_URL="${AKB_URL:-http://localhost:8001}"
 TS=$(date +%s)
 PASS=0; FAIL=0; ERRORS=()
 
+# Portable DB access (admin bootstrap). Defaults to the cluster via kubectl
+# — matching "run E2E against the deployed URL". Override AKB_PG_EXEC for a
+# local stack, e.g. AKB_PG_EXEC="docker compose exec -T postgres" or
+# AKB_PG_EXEC="docker exec -i akb-postgres-1" (and AKB_PG_USER as needed).
+PG_NS="${AKB_NS:-akb}"
+PG_POD="${AKB_PG_POD:-postgres-0}"
+PG_USER="${AKB_PG_USER:-akbuser}"
+PG_DB="${AKB_PG_DB:-akb}"
+run_psql() {
+  if [ -n "${AKB_PG_EXEC:-}" ]; then
+    ${AKB_PG_EXEC} psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  else
+    kubectl exec -n "$PG_NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  fi
+}
+
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 
@@ -101,11 +117,7 @@ TGT_JWT=$(register_and_login "$TARGET")
 
 ADMINU="jwtad-$TS"
 register_and_login "$ADMINU" >/dev/null
-docker compose -p akb-audit \
-  -f /Users/kwoo2/Desktop/storage/akb-audit/docker-compose.yaml \
-  -f /Users/kwoo2/Desktop/storage/akb-audit/docker-compose.audit.yaml \
-  exec -T postgres psql -U akb -d akb -c \
-  "UPDATE users SET is_admin = true WHERE username = '$ADMINU';" >/dev/null
+run_psql "UPDATE users SET is_admin = true WHERE username = '$ADMINU'" >/dev/null
 
 # Login again to pick up the now-admin flag (is_admin is read live, but
 # need a JWT to call admin endpoints).

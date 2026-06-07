@@ -25,14 +25,22 @@ ERRORS=()
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 
-# Skip when not running against a k8s-deployed backend.
-if ! command -v kubectl >/dev/null 2>&1; then
-  echo "kubectl not available — skipping events DB verification"
+# DB verification needs either AKB_PG_EXEC (local override) or kubectl
+# (cluster). Skip only when neither is available.
+if [ -z "${AKB_PG_EXEC:-}" ] && ! command -v kubectl >/dev/null 2>&1; then
+  echo "no AKB_PG_EXEC and kubectl unavailable — skipping events DB verification"
   exit 0
 fi
 
 run_psql() {
-  kubectl exec -n "$NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  # Portable: AKB_PG_EXEC overrides for a local stack (e.g.
+  # "docker compose exec -T postgres" or "docker exec -i akb-postgres-1");
+  # default targets the cluster via kubectl.
+  if [ -n "${AKB_PG_EXEC:-}" ]; then
+    ${AKB_PG_EXEC} psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  else
+    kubectl exec -n "$NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  fi
 }
 
 echo "▸ Setup"

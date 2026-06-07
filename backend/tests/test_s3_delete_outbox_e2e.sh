@@ -24,13 +24,20 @@ ERRORS=()
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 
-if ! command -v kubectl >/dev/null 2>&1; then
-  echo "kubectl not available — skipping outbox verification"
+if [ -z "${AKB_PG_EXEC:-}" ] && ! command -v kubectl >/dev/null 2>&1; then
+  echo "no AKB_PG_EXEC and kubectl unavailable — skipping outbox verification"
   exit 0
 fi
 
 run_psql() {
-  kubectl exec -n "$NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  # Portable: AKB_PG_EXEC overrides for a local stack (e.g.
+  # "docker compose exec -T postgres" or "docker exec -i akb-postgres-1");
+  # default targets the cluster via kubectl.
+  if [ -n "${AKB_PG_EXEC:-}" ]; then
+    ${AKB_PG_EXEC} psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  else
+    kubectl exec -n "$NS" "$PG_POD" -- psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+  fi
 }
 
 echo "▸ Setup"
@@ -56,7 +63,7 @@ curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT" \
 # Insert a synthetic vault_files row directly (skip S3 upload step —
 # we're testing the DB-side outbox enqueue, not the S3 round-trip).
 VAULT_ID=$(run_psql "SELECT id FROM vaults WHERE name = '$VAULT'")
-FILE_ID=$(run_psql "INSERT INTO vault_files (vault_id, collection, name, s3_key, mime_type, size_bytes, description, created_by) VALUES ('$VAULT_ID', '', 'synthetic.txt', '$VAULT/$(date +%s)_synthetic.txt', 'text/plain', 12, '', '$USER') RETURNING id" | head -n 1)
+FILE_ID=$(run_psql "INSERT INTO vault_files (vault_id, collection_id, name, s3_key, mime_type, size_bytes, description, created_by) VALUES ('$VAULT_ID', NULL, 'synthetic.txt', '$VAULT/$(date +%s)_synthetic.txt', 'text/plain', 12, '', '$USER') RETURNING id" | head -n 1)
 S3_KEY=$(run_psql "SELECT s3_key FROM vault_files WHERE id = '$FILE_ID'" | head -n 1)
 
 [ -n "$FILE_ID" ] && pass "synthetic file row inserted ($FILE_ID)" || { fail "setup" "no file row"; exit 1; }
