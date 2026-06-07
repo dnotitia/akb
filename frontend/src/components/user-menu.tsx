@@ -8,7 +8,7 @@ import {
   Settings as SettingsIcon,
   Sun,
 } from "lucide-react";
-import { getMe, setToken } from "@/lib/api";
+import { getMe, setToken, isSsoSession, clearSsoSession, keycloakLogoutUrl } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 
 interface User {
@@ -129,8 +129,20 @@ export function UserMenu() {
 
           <DropdownMenu.Item
             onSelect={() => {
+              const sso = isSsoSession();
+              // Build the KC logout URL (reads the id_token_hint) BEFORE
+              // clearing the session, otherwise the hint is gone and
+              // Keycloak falls back to a "Do you want to log out?" prompt.
+              const kcLogout = sso ? keycloakLogoutUrl() : null;
               setToken(null);
-              navigate("/auth");
+              clearSsoSession();
+              if (kcLogout) {
+                // RP-initiated logout: end the Keycloak session too, then
+                // KC redirects back to /auth. Full navigation (not SPA).
+                window.location.href = kcLogout;
+              } else {
+                navigate("/auth");
+              }
             }}
             className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-destructive outline-none data-[highlighted]:bg-destructive/10"
           >

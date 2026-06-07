@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowRight, Loader2 } from "lucide-react";
-import { authLogin, authRegister, getAuthConfig, setToken } from "@/lib/api";
+import { authLogin, authRegister, clearSsoSession, getAuthConfig, setToken } from "@/lib/api";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
@@ -182,6 +182,9 @@ export default function AuthPage() {
         return;
       }
       setToken(r.token);
+      // Local-auth session — make sure no stale SSO marker triggers a
+      // Keycloak logout when this user signs out.
+      clearSsoSession();
       if ("PasswordCredential" in window) {
         const cred = new PasswordCredential({ id: username, password });
         navigator.credentials.store(cred).catch(() => {});

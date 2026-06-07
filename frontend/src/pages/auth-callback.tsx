@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2 } from "lucide-react";
-import { keycloakExchange, setToken } from "@/lib/api";
+import { keycloakExchange, markSsoSession, setToken } from "@/lib/api";
 
 /**
  * Keycloak SSO landing page. The backend callback redirects the browser
@@ -43,6 +43,8 @@ export default function AuthCallbackPage() {
           return;
         }
         setToken(r.token);
+        // Mark this as an SSO session so Sign out also ends the KC session.
+        markSsoSession(r.kc_id_token);
         navigate(safeRedirect, { replace: true });
       })
       .catch(() => {

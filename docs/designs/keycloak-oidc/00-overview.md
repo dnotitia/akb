@@ -119,9 +119,12 @@ so the SPA reuses `setToken()` and the rest of the Bearer flow verbatim.
 **Modified (additive only)**
 - `backend/app/api/routes/auth.py` — add `GET /auth/config` (public),
   `GET /auth/keycloak/login`, `GET /auth/keycloak/callback`,
-  `POST /auth/keycloak/exchange`. Each SSO route `_require_keycloak()`s
-  → **404 when disabled**. Same-site `_safe_redirect_path()` guard blocks
-  open-redirects; callback failures bounce to `/auth?sso_error=<code>`.
+  `POST /auth/keycloak/exchange`, `GET /auth/keycloak/logout`. Each SSO
+  route `_require_keycloak()`s → **404 when disabled**. Same-site
+  `_safe_redirect_path()` guard blocks open-redirects; callback failures
+  bounce to `/auth?sso_error=<code>`. The callback also stashes the KC
+  `id_token` in the exchange payload so the SPA can pass it as
+  `id_token_hint` for a prompt-free RP-initiated logout.
 - `backend/app/services/auth_service.py` — add
   `login_with_keycloak_claims(claims) -> {token, user}` (JIT-provision by
   email + `on_user_create`, dedup on re-login, `ConflictError` if a
@@ -205,7 +208,11 @@ keycloak_client_secret: "<from Keycloak client credentials>"
 - Token refresh: AKB JWT is short-lived and re-obtained by re-login through
   Keycloak (SSO session makes this seamless). A silent-refresh endpoint can
   be added later if needed.
-- Single-logout / front-channel logout.
+- RP-initiated logout IS implemented (`GET /auth/keycloak/logout` →
+  Keycloak `end_session_endpoint`, seamless via `id_token_hint`; the SPA
+  triggers it only for SSO-originated sessions via a localStorage marker,
+  so local-auth logout is untouched). Still out of scope: Keycloak
+  front-channel/back-channel single-logout that notifies *other* RPs.
 - Account linking UX when a local user and a Keycloak email collide
   (v1: same-email login adopts the existing row; surface a clear error if
   the existing row is `auth_provider='local'` until linking is designed).

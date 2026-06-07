@@ -150,7 +150,9 @@ async def keycloak_callback(request: Request):
         return _sso_error_redirect("auth_failed")
 
     # Hand the SPA a one-time code; the token is delivered via POST /exchange.
-    one_time = await issue_exchange_code(login_response)
+    # Stash the Keycloak id_token too so the SPA can pass it back as
+    # id_token_hint on logout (seamless RP-initiated logout, no KC prompt).
+    one_time = await issue_exchange_code({**login_response, "kc_id_token": id_token})
     dest = _safe_redirect_path(flow.get("redirect_path", "/"))
     target = (
         f"{settings.keycloak_post_login_path}"
@@ -158,6 +160,25 @@ async def keycloak_callback(request: Request):
         f"&redirect={urllib.parse.quote(dest, safe='')}"
     )
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/auth/keycloak/logout", summary="RP-initiated Keycloak logout")
+async def keycloak_logout(id_token_hint: str | None = None):
+    """End the Keycloak SSO session (so the next SSO login prompts again /
+    can switch user). AKB already cleared its own JWT client-side; this
+    redirects the browser to Keycloak's end_session_endpoint, which then
+    redirects back to the AKB login page.
+
+    `id_token_hint` (optional) makes the logout seamless (no Keycloak
+    confirmation page). The SPA passes the Keycloak id_token it received at
+    exchange time; without it, Keycloak may show a logout confirmation."""
+    _require_keycloak()
+    from app.services.keycloak_oidc import get_keycloak_oidc
+    post_logout = settings.public_base_url.rstrip("/") + "/auth"
+    url = get_keycloak_oidc().logout_url(
+        id_token_hint=id_token_hint, post_logout_redirect=post_logout
+    )
+    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/auth/keycloak/exchange", summary="Exchange one-time SSO code for a JWT")
