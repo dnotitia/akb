@@ -9,6 +9,20 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ============================================================
+-- Migration ledger — records which migration scripts have been applied
+-- so they are NOT re-run on every boot. Several migrations ALTER the hot
+-- `chunks` table (ACCESS EXCLUSIVE lock); re-running them each startup
+-- races live workers' open transactions and can stall a rolling deploy.
+-- With the ledger, a steady-state boot runs zero migration DDL.
+-- (init.sql itself is still re-run every boot — it is pure CREATE … IF
+-- NOT EXISTS and takes no conflicting locks.)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename   TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
 -- Users
 -- ============================================================
 CREATE TABLE IF NOT EXISTS users (

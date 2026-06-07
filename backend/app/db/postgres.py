@@ -83,9 +83,57 @@ def _load_migration(filename: str):
     return module
 
 
+async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, backoff: float = 4.0) -> None:
+    """Apply one migration under a bounded lock_timeout, retrying on a lock
+    conflict, then record it in the ledger.
+
+    Migrations that ALTER `chunks` need an ACCESS EXCLUSIVE lock. During a
+    rolling deploy the outgoing pod's workers may still hold an open
+    transaction on that table; without a bound the ALTER would block until
+    the connection's 30s statement_timeout cancels it (QueryCanceledError),
+    crashing startup. A short lock_timeout makes us fail fast and retry
+    until the lock clears (the server also kills idle-in-transaction holders
+    at 60s). The pooled connection's state is reset on release, so the
+    per-migration `SET lock_timeout` does not leak to other callers.
+    """
+    import logging
+    log = logging.getLogger("akb.migrations")
+    for attempt in range(retries):
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SET lock_timeout = '5s'")
+                await module.migrate(conn=conn)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (filename) VALUES ($1) "
+                    "ON CONFLICT (filename) DO NOTHING",
+                    filename,
+                )
+            return
+        except (asyncpg.LockNotAvailableError, asyncpg.QueryCanceledError) as e:
+            if attempt < retries - 1:
+                log.warning(
+                    "Migration %s blocked on a lock (attempt %d/%d): %s — retrying in %.0fs",
+                    filename, attempt + 1, retries, e, backoff,
+                )
+                await asyncio.sleep(backoff)
+            else:
+                raise
+
+
 async def _apply_migrations() -> None:
-    """Run all idempotent migration scripts in order. Safe to call repeatedly."""
+    """Apply migration scripts once each, in order. Safe to call repeatedly.
+
+    A `schema_migrations` ledger records applied files so steady-state boots
+    run ZERO migration DDL — see the ledger note in init.sql for why that
+    matters (the `chunks` ALTERs take an ACCESS EXCLUSIVE lock that races
+    live workers during a rolling deploy). Unrecorded migrations run via
+    :func:`_run_one_migration` (bounded lock_timeout + retry).
+    """
     pool = await get_pool()
+    async with pool.acquire() as conn:
+        applied = {
+            r["filename"] for r in await conn.fetch("SELECT filename FROM schema_migrations")
+        }
     for filename in (
         "002_public_shares.py",     # legacy is_public/public_slug → public_shares
         "003_rename_public_shares.py",  # public_shares → publications
@@ -120,8 +168,9 @@ async def _apply_migrations() -> None:
         "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
         "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
     ):
+        if filename in applied:
+            continue
         module = _load_migration(filename)
         if module is None:
             continue
-        async with pool.acquire() as conn:
-            await module.migrate(conn=conn)
+        await _run_one_migration(pool, filename, module)
