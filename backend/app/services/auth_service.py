@@ -42,7 +42,14 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return bcrypt.checkpw(password.encode(), password_hash.encode())
+    # Defensive: an SSO-provisioned account stores a non-bcrypt sentinel
+    # hash (see provision_keycloak_user). bcrypt.checkpw raises ValueError
+    # on a malformed hash; treat that as "no match" so a stray local-login
+    # attempt against an SSO account returns 401, not 500.
+    try:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except ValueError:
+        return False
 
 
 # ── JWT ──────────────────────────────────────────────────────
@@ -127,11 +134,16 @@ async def login(username: str, password: str) -> dict:
         row = await conn.fetchrow(
             """
             SELECT id, username, email, password_hash, display_name, is_admin,
-                   tokens_revoked_before
+                   tokens_revoked_before, auth_provider
               FROM users WHERE username = $1 OR email = $1
             """,
             username,
         )
+        # SSO-provisioned accounts have no usable local password. Reject
+        # the local-login path explicitly with the same generic message
+        # so we don't leak which accounts are SSO-backed.
+        if row and row["auth_provider"] != "local":
+            raise AuthenticationError("Invalid credentials")
         if not row or not verify_password(password, row["password_hash"]):
             raise AuthenticationError("Invalid credentials")
 
@@ -153,6 +165,114 @@ async def login(username: str, password: str) -> dict:
                 "is_admin": row["is_admin"],
             },
         }
+
+
+# ── Keycloak SSO (optional external IdP) ─────────────────────────────
+#
+# bcrypt hashes start with "$2"; this sentinel is deliberately NOT a
+# valid bcrypt hash, so an SSO account can never be authenticated through
+# /auth/login (verify_password returns False on the malformed hash, and
+# login() refuses non-'local' providers up front anyway).
+_SSO_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
+
+
+async def _unique_username(conn, base: str | None) -> str:
+    """Derive a unique username from a Keycloak claim, suffixing on collision."""
+    base = (base or "").strip() or "user"
+    candidate = base
+    for _ in range(8):
+        taken = await conn.fetchval("SELECT 1 FROM users WHERE username = $1", candidate)
+        if not taken:
+            return candidate
+        candidate = f"{base}-{secrets.token_hex(2)}"
+    return f"{base}-{secrets.token_hex(4)}"
+
+
+async def login_with_keycloak_claims(claims: dict) -> dict:
+    """Map a verified Keycloak ID token to an AKB session.
+
+    First login JIT-provisions an AKB user (keyed by email) and its
+    per-user PG role; subsequent logins reuse the row. Returns the same
+    ``{token, user}`` shape as :func:`login` so the SSO callback path is
+    indistinguishable downstream.
+
+    Keycloak is authentication only — ``realm_access.roles`` are NOT
+    mapped to AKB ``is_admin`` or vault grants here (see the design doc).
+    """
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        # AKB keys identity on email; without it we cannot map to a user.
+        raise AuthenticationError("Keycloak account has no email claim")
+    display_name = claims.get("name") or claims.get("preferred_username")
+    preferred_username = claims.get("preferred_username") or email.split("@")[0]
+
+    pool = await get_pool()
+    new_user_id: uuid.UUID | None = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, username, email, display_name, is_admin,
+                   tokens_revoked_before, auth_provider
+              FROM users WHERE email = $1
+            """,
+            email,
+        )
+        if row is not None:
+            if row["auth_provider"] != "keycloak":
+                # A local account already owns this email. Auto-linking is
+                # deliberately out of scope (design doc) — fail loudly
+                # rather than silently merging identities.
+                raise ConflictError(
+                    "An account with this email already exists with password "
+                    "login; SSO linking is not enabled. Contact an admin."
+                )
+            user_id = row["id"]
+            uname = row["username"]
+            not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+            user_payload = {
+                "id": str(row["id"]),
+                "username": row["username"],
+                "email": row["email"],
+                "display_name": row["display_name"],
+                "is_admin": row["is_admin"],
+            }
+        else:
+            user_id = uuid.uuid4()
+            uname = await _unique_username(conn, preferred_username)
+            # INSERT + outbox event in one tx so a rollback drops both.
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO users (id, username, email, password_hash,
+                                       display_name, auth_provider)
+                    VALUES ($1, $2, $3, $4, $5, 'keycloak')
+                    """,
+                    user_id, uname, email, _SSO_SENTINEL_HASH, display_name,
+                )
+                await emit_event(
+                    conn,
+                    "auth.user_provisioned",
+                    actor_id=str(user_id),
+                    payload={"auth_provider": "keycloak", "email": email},
+                )
+            new_user_id = user_id
+            not_before = None
+            user_payload = {
+                "id": str(user_id),
+                "username": uname,
+                "email": email,
+                "display_name": display_name,
+                "is_admin": False,
+            }
+
+    # PG-native RBAC: create the per-user role outside the insert's
+    # connection, mirroring register(). Best-effort — the reconciler at
+    # next startup rebuilds any role this misses.
+    if new_user_id is not None:
+        await get_role_sync().on_user_create(new_user_id)
+
+    token = create_jwt(str(user_id), uname, not_before=not_before)
+    return {"token": token, "user": user_payload}
 
 
 class BadPasswordChange(Exception):

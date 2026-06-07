@@ -1,0 +1,57 @@
+# OPTIONAL local Keycloak overlay — for developing/testing the optional
+# Keycloak SSO login path. NOT part of the default stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up
+#
+# Then enable SSO in config/app.yaml (these match the imported realm
+# `deploy/keycloak-dev/akb-realm.json` and the split localhost/container URLs):
+#
+#   keycloak_enabled: true
+#   keycloak_server_url: "http://localhost:8080"      # browser-facing → issuer
+#   keycloak_internal_url: "http://keycloak:8080"     # backend → keycloak container
+#   keycloak_realm: "akb"
+#   keycloak_client_id: "akb-web"
+#   keycloak_verify_ssl: false
+#   keycloak_redirect_uri: "http://localhost:3000/api/v1/auth/keycloak/callback"
+#
+# and in config/secret.yaml:
+#   keycloak_client_secret: "local-akb-dev-secret"
+#
+# Test user (in the imported realm): alice / alice-password (alice@example.com).
+#
+# The realm import ships a FIXED dev client secret ("local-akb-dev-secret").
+# That is a throwaway local value (same spirit as the hard-coded `akb`
+# Postgres password in docker-compose.yaml) — never reuse it anywhere real.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Public (browser-facing) URL → pins the token `iss` to localhost:8080.
+      KC_HOSTNAME: http://localhost:8080
+      # Allow server-side (backend→keycloak:8080) calls under a different
+      # host than KC_HOSTNAME without rejection.
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak-dev:/opt/keycloak/data/import:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # 26.x exposes health on the management port (9000) by default; the
+      # realm OIDC discovery doc is a reliable readiness signal on 8080.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  backend:
+    # Backend must be able to resolve the `keycloak` service name for the
+    # backchannel (token + JWKS) calls.
+    depends_on:
+      keycloak:
+        condition: service_started

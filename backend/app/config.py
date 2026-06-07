@@ -141,6 +141,51 @@ class Settings(BaseModel):
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
 
+    # Auth — Keycloak OIDC (OPTIONAL external IdP). Disabled by default.
+    #
+    # When `keycloak_enabled` is false NONE of these are read and AKB uses
+    # local username/password + PAT exactly as before — the SSO routes
+    # return 404 and zero Keycloak code runs. Enabling adds an SSO login
+    # path that, on success, JIT-provisions an AKB user (keyed by email)
+    # and issues a normal AKB JWT; the internal user model, PG-native
+    # RBAC, and PATs are all unchanged. Keycloak is authentication only —
+    # it never drives AKB authorization.
+    #
+    # Flat `keycloak_*` keys (matching jwt_* / s3_* / embed_*) so the
+    # secret can live in secret.yaml without the shallow app.yaml+secret.yaml
+    # merge clobbering a nested block. Derived OIDC endpoints are computed
+    # properties off `keycloak_issuer` — no .well-known fetch needed.
+    #
+    # See docs/designs/keycloak-oidc/00-overview.md.
+    keycloak_enabled: bool = False
+    keycloak_server_url: str = ""          # e.g. https://auth.example.com (no /realms suffix)
+    # Optional backchannel base URL for server→Keycloak calls (token
+    # exchange + JWKS). Defaults to keycloak_server_url. Set this only
+    # when the backend reaches Keycloak at a different address than the
+    # browser does — split-horizon ingress in prod, or the
+    # localhost-vs-container-DNS gap in local docker. The issuer and the
+    # browser-facing authorization/logout endpoints always use
+    # keycloak_server_url, so the `iss` claim stays the public URL.
+    keycloak_internal_url: str = ""
+    keycloak_realm: str = "akb"
+    keycloak_client_id: str = "akb-web"
+    keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
+    keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
+    keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
+    # Absolute URL Keycloak redirects the browser back to after login.
+    # Must point at the AKB backend callback route and be registered as a
+    # valid redirect URI on the Keycloak client, e.g.
+    #   http://localhost:3000/api/v1/auth/keycloak/callback
+    keycloak_redirect_uri: str = ""
+    # SPA path the callback bounces the browser to with a one-time code.
+    # Relative → resolves against the request origin (same host the user
+    # is already on), so it works for both :3000 dev proxy and prod ingress.
+    keycloak_post_login_path: str = "/auth/callback"
+    # One-time exchange-code TTL (seconds). The callback hands the SPA a
+    # short-lived opaque code; the SPA trades it for the AKB JWT over a
+    # POST so the token never rides in a URL. Keep this small.
+    keycloak_exchange_code_ttl_secs: int = 60
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
@@ -265,6 +310,43 @@ class Settings(BaseModel):
     # Audit log — its own nested section so the surface can grow without
     # littering the flat top level. See AuditSettings above.
     audit: AuditSettings = Field(default_factory=AuditSettings)
+
+    # ── Keycloak OIDC derived endpoints ───────────────────────────
+    # All computed off the realm issuer so only server_url + realm are
+    # configured. Standard Keycloak OIDC paths under /realms/<realm>.
+
+    @property
+    def keycloak_issuer(self) -> str:
+        # Public issuer — must equal the `iss` claim Keycloak stamps on
+        # tokens (driven by the browser-facing hostname).
+        return f"{self.keycloak_server_url.rstrip('/')}/realms/{self.keycloak_realm}"
+
+    @property
+    def _keycloak_backchannel_issuer(self) -> str:
+        # Internal realm base for server→Keycloak calls; falls back to the
+        # public URL when no separate backchannel address is configured.
+        base = (self.keycloak_internal_url or self.keycloak_server_url).rstrip("/")
+        return f"{base}/realms/{self.keycloak_realm}"
+
+    @property
+    def keycloak_authorization_endpoint(self) -> str:
+        # Browser-facing → public issuer.
+        return f"{self.keycloak_issuer}/protocol/openid-connect/auth"
+
+    @property
+    def keycloak_token_endpoint(self) -> str:
+        # Server→Keycloak → backchannel issuer.
+        return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/token"
+
+    @property
+    def keycloak_jwks_uri(self) -> str:
+        # Server→Keycloak → backchannel issuer.
+        return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
+
+    @property
+    def keycloak_end_session_endpoint(self) -> str:
+        # Browser-facing → public issuer.
+        return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
 
     @property
     def database_url(self) -> str:

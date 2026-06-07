@@ -6,6 +6,7 @@ import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
 import AuthPage from "@/pages/auth";
 import AuthForgotPage from "@/pages/auth-forgot";
+import AuthCallbackPage from "@/pages/auth-callback";
 import HomePage from "@/pages/home";
 import VaultPage from "@/pages/vault";
 import VaultIndexPage from "@/pages/vault-index";
@@ -50,6 +51,7 @@ createRoot(document.getElementById("root")!).render(
       <Routes>
         <Route path="/auth" element={<AuthPage />} />
         <Route path="/auth/forgot" element={<AuthForgotPage />} />
+        <Route path="/auth/callback" element={<AuthCallbackPage />} />
         <Route path="/p/:slug" element={<PublicationPage />} />
         <Route element={<Layout />}>
           <Route path="/" element={<HomePage />} />

@@ -123,6 +123,25 @@ export const authLogin = (username: string, password: string) =>
     body: JSON.stringify({ username, password }),
   }).then(parseAuthResponse);
 
+export interface AuthConfig {
+  keycloak: { enabled: boolean; login_url: string | null };
+}
+
+/** Public auth config — drives whether the optional SSO button shows.
+ * Falls back to SSO-disabled if the endpoint is unreachable/old. */
+export const getAuthConfig = (): Promise<AuthConfig> =>
+  fetch(`${API_BASE}/auth/config`)
+    .then((r) => (r.ok ? r.json() : { keycloak: { enabled: false, login_url: null } }))
+    .catch(() => ({ keycloak: { enabled: false, login_url: null } }));
+
+/** Redeem the one-time SSO code from the Keycloak callback for an AKB JWT. */
+export const keycloakExchange = (code: string) =>
+  fetch(`${API_BASE}/auth/keycloak/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  }).then(parseAuthResponse);
+
 // ── Auth (token) ──
 export const getMe = () => api<any>("/auth/me");
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>

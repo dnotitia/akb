@@ -117,6 +117,8 @@ async def _apply_migrations() -> None:
         "030_resource_content_hash.py",         # documents/vault_files content_hash projection for manifests and preconditions
         "031_drop_memories_sessions.py",        # drop legacy memories+sessions tables; agent memory is now vault-shaped
         "032_drop_supersedes.py",               # drop never-used documents.supersedes column (status leaned to draft/active/archived)
+        "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
+        "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
     ):
         module = _load_migration(filename)
         if module is None:

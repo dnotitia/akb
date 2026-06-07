@@ -33,6 +33,22 @@ def _validate_required_settings() -> None:
             "publication response carries an absolute share_url; e.g. "
             "https://akb.example.com)"
         )
+    # Keycloak is OPTIONAL — only validate its config when it's turned on.
+    # When enabled, an incomplete config would 500 mid-login instead of
+    # failing the deploy, so fail fast here.
+    if settings.keycloak_enabled:
+        if not settings.keycloak_server_url:
+            missing.append("keycloak_server_url (keycloak_enabled is true)")
+        if not settings.keycloak_redirect_uri:
+            missing.append(
+                "keycloak_redirect_uri (keycloak_enabled is true — the "
+                "backend callback URL registered on the Keycloak client)"
+            )
+        if not settings.keycloak_public_client and not settings.keycloak_client_secret:
+            missing.append(
+                "keycloak_client_secret (confidential client — set it in "
+                "secret.yaml, or set keycloak_public_client: true for PKCE)"
+            )
     if missing:
         raise RuntimeError(
             "Required configuration missing:\n  - " + "\n  - ".join(missing)
@@ -158,4 +174,8 @@ async def stop_workers() -> None:
 
 async def shutdown_storage() -> None:
     await http_pool.close_client()
+    # Close the optional Keycloak OIDC client if it was ever constructed.
+    if settings.keycloak_enabled:
+        from app.services.keycloak_oidc import get_keycloak_oidc
+        await get_keycloak_oidc().aclose()
     await close_pool()

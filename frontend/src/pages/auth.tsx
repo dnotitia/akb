@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowRight, Loader2 } from "lucide-react";
-import { authLogin, authRegister, setToken } from "@/lib/api";
+import { authLogin, authRegister, getAuthConfig, setToken } from "@/lib/api";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
@@ -122,6 +122,28 @@ export default function AuthPage() {
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [ssoLoginUrl, setSsoLoginUrl] = useState<string | null>(null);
+
+  // Optional Keycloak SSO: show the button only if the backend reports it
+  // enabled. Also surface a friendly message if the callback bounced us
+  // back with ?sso_error=… (browser-level redirect can't return JSON).
+  useEffect(() => {
+    getAuthConfig().then((cfg) => {
+      if (cfg.keycloak.enabled && cfg.keycloak.login_url) {
+        setSsoLoginUrl(cfg.keycloak.login_url);
+      }
+    });
+    const params = new URLSearchParams(window.location.search);
+    const ssoErr = params.get("sso_error");
+    if (ssoErr) setError(`SSO login failed (${ssoErr}). Please try again.`);
+  }, []);
+
+  function startSso() {
+    if (!ssoLoginUrl) return;
+    // Preserve where the user was headed (default home).
+    const redirect = "/";
+    window.location.href = `${ssoLoginUrl}?redirect=${encodeURIComponent(redirect)}`;
+  }
 
   const title = useTyped("Agent Knowledgebase", 60);
   const subText =
@@ -356,6 +378,24 @@ export default function AuthPage() {
                 />
               </TabsContent>
             </Tabs>
+
+            {ssoLoginUrl && (
+              <div className="mt-6">
+                <div className="relative mb-5 flex items-center gap-3">
+                  <div className="tw-rule-dashed h-px flex-1" aria-hidden />
+                  <span className="coord text-foreground-muted">or</span>
+                  <div className="tw-rule-dashed h-px flex-1" aria-hidden />
+                </div>
+                <button
+                  type="button"
+                  onClick={startSso}
+                  className="tw-key flex w-full items-center justify-center gap-2 border border-foreground bg-background px-4 py-2.5 font-mono text-sm font-semibold uppercase tracking-[0.12em] text-foreground"
+                >
+                  Sign in with SSO
+                  <ArrowRight className="h-4 w-4" aria-hidden />
+                </button>
+              </div>
+            )}
           </section>
         </div>
 
