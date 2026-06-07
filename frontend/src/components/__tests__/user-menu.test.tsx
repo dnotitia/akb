@@ -12,6 +12,10 @@ vi.mock("@/lib/api", () => ({
     is_admin: false,
   }),
   setToken: vi.fn(),
+  // SSO-aware sign-out helpers (default: not an SSO session → local logout).
+  isSsoSession: vi.fn().mockReturnValue(false),
+  clearSsoSession: vi.fn(),
+  keycloakLogoutUrl: vi.fn().mockReturnValue("/api/v1/auth/keycloak/logout"),
 }));
 
 vi.mock("@/hooks/use-theme", () => ({
