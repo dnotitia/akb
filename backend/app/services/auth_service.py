@@ -9,6 +9,7 @@ Handles:
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -113,19 +114,33 @@ async def register(username: str, email: str, password: str, display_name: str |
         if existing:
             raise ConflictError("Username or email already exists")
 
-        await conn.execute(
+        # Bootstrap: the very first account in a fresh deployment becomes
+        # admin, so a brand-new instance has an operator without a manual
+        # DB edit. `NOT EXISTS (… users)` is evaluated against the table
+        # state before this row, so only a truly empty users table grants
+        # it — existing deployments never retroactively promote anyone.
+        is_admin = await conn.fetchval(
             """
-            INSERT INTO users (id, username, email, password_hash, display_name)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
+            VALUES ($1, $2, $3, $4, $5, NOT EXISTS (SELECT 1 FROM users))
+            RETURNING is_admin
             """,
             user_id, username, email, pw_hash, display_name,
+        )
+
+    if is_admin:
+        logging.getLogger("akb.auth").info(
+            "Bootstrap: first user %r registered — granted admin", username
         )
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.
     await get_role_sync().on_user_create(user_id)
 
-    return {"user_id": str(user_id), "username": username, "email": email}
+    return {
+        "user_id": str(user_id), "username": username, "email": email,
+        "is_admin": is_admin,
+    }
 
 
 async def login(username: str, password: str) -> dict:
@@ -262,12 +277,17 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
             uname = await _unique_username(conn, preferred_username)
             try:
                 # INSERT + outbox event in one tx so a rollback drops both.
+                # First account in a fresh deployment becomes admin (same
+                # bootstrap rule as local register); NOT EXISTS sees the
+                # pre-insert table so only a truly empty users table grants it.
                 async with conn.transaction():
-                    await conn.execute(
+                    is_admin = await conn.fetchval(
                         """
                         INSERT INTO users (id, username, email, password_hash,
-                                           display_name, auth_provider)
-                        VALUES ($1, $2, $3, $4, $5, 'keycloak')
+                                           display_name, auth_provider, is_admin)
+                        VALUES ($1, $2, $3, $4, $5, 'keycloak',
+                                NOT EXISTS (SELECT 1 FROM users))
+                        RETURNING is_admin
                         """,
                         user_id, uname, email, _SSO_SENTINEL_HASH, display_name,
                     )
@@ -277,6 +297,10 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
                         actor_id=str(user_id),
                         payload={"auth_provider": "keycloak", "email": email},
                     )
+                if is_admin:
+                    logging.getLogger("akb.auth").info(
+                        "Bootstrap: first user %r (SSO) provisioned — granted admin", uname
+                    )
                 new_user_id = user_id
                 not_before = None
                 user_payload = {
@@ -284,7 +308,7 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
                     "username": uname,
                     "email": email,
                     "display_name": display_name,
-                    "is_admin": False,
+                    "is_admin": is_admin,
                 }
             except asyncpg.UniqueViolationError:
                 # Concurrent first-login for the same email won the race.
