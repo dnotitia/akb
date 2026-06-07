@@ -69,12 +69,14 @@ CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"$TABLE\",\"description\":\"customers\",\"columns\":[{\"name\":\"email\",\"type\":\"text\"},{\"name\":\"age\",\"type\":\"number\"}]}")
-assert_keys "create" "$CREATE" kind id vault name columns
+# Tables are URI-addressed (no `d-` id like documents) — the envelope key
+# is `uri`, not `id`.
+assert_keys "create" "$CREATE" kind uri vault name columns
 assert_value "create" "$CREATE" "v=d['kind']" "table"
 assert_value "create" "$CREATE" "v=d['vault']" "$VAULT"
 assert_value "create" "$CREATE" "v=d['name']" "$TABLE"
 
-TABLE_ID=$(echo "$CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+TABLE_URI=$(echo "$CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["uri"])')
 
 echo ""
 echo "▸ 2. List tables — envelope shape"
@@ -87,7 +89,7 @@ assert_value "list" "$LIST" "v=d['vault']" "$VAULT"
 assert_value "list" "$LIST" "v=d['total']" "1"
 assert_value "list" "$LIST" "v=d['items'][0]['kind']" "table"
 assert_value "list" "$LIST" "v=d['items'][0]['name']" "$TABLE"
-assert_value "list" "$LIST" "v=d['items'][0]['id']" "$TABLE_ID"
+assert_value "list" "$LIST" "v=d['items'][0]['uri']" "$TABLE_URI"
 
 echo ""
 echo "▸ 3. SQL SELECT — envelope shape (rows → items)"
@@ -113,7 +115,7 @@ echo "▸ 4. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
-assert_keys "drop" "$DROP" kind id vault name deleted
+assert_keys "drop" "$DROP" kind uri vault name deleted
 assert_value "drop" "$DROP" "v=d['kind']" "table"
 assert_value "drop" "$DROP" "v=d['vault']" "$VAULT"
 assert_value "drop" "$DROP" "v=d['name']" "$TABLE"

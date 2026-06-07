@@ -16,7 +16,10 @@ echo "$RESP" | grep -q "{vault}" && pass "{vault} placeholder kept intact" || fa
 echo "$RESP" | grep -q '\${{secrets.X}}' && pass "Secrets placeholder literal" || fail "T5" "secrets placeholder collapsed"
 
 echo "▸ Content-Type is text/markdown"
-CT=$(curl -sk -I "$BASE_URL/api/v1/help/skill-template" | grep -i "^content-type:" | tr -d '\r')
+# Inspect the GET response headers (-D -). The route is GET-only, so a HEAD
+# (`curl -I`) returns 405 application/json — that would be testing the wrong
+# thing, not the actual content type the endpoint serves.
+CT=$(curl -sk -o /dev/null -D - "$BASE_URL/api/v1/help/skill-template" | grep -i "^content-type:" | tr -d '\r')
 echo "$CT" | grep -qi "text/markdown" && pass "Content-Type text/markdown" || fail "T6" "Content-Type should be text/markdown, got: $CT"
 
 echo ""

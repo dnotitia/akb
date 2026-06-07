@@ -227,20 +227,25 @@ echo "▸ 6. Empty Vault Operations"
 EMPTY_VAULT="def-empty-$(date +%s)"
 m "akb_create_vault" "{\"name\":\"$EMPTY_VAULT\",\"description\":\"empty\"}" >/dev/null
 
-# Browse empty vault
+# Browse a fresh vault. Every non-mirror vault is seeded with a starter
+# overview/vault-skill.md (document_service seeds it on create), so a fresh
+# vault is not literally empty — it carries just that seed. Assert a small
+# bounded count (catches a vault that wrongly accumulates content) rather
+# than 0.
 R=$(m "akb_browse" "{\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_ITEMS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
-[ "$EMPTY_ITEMS" = "0" ] && pass "Browse empty vault: 0 items" || fail "Empty browse" "items=$EMPTY_ITEMS"
+[ "$EMPTY_ITEMS" -le 2 ] 2>/dev/null && pass "Browse fresh vault: $EMPTY_ITEMS items (seeded vault-skill)" || fail "Empty browse" "items=$EMPTY_ITEMS"
 
 # Search empty vault
 R=$(m "akb_search" "{\"query\":\"anything\",\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_SEARCH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$EMPTY_SEARCH" = "0" ] && pass "Search empty vault: 0 results" || fail "Empty vault search" "$R"
 
-# Activity on new vault — may have init commit
+# Activity on a fresh vault — the init commit plus the seeded vault-skill
+# commit (≤2).
 R=$(m "akb_activity" "{\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_ACT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('activity',[])))" 2>/dev/null)
-[ "$EMPTY_ACT" -le 1 ] 2>/dev/null && pass "Activity on new vault: $EMPTY_ACT entries (init commit)" || fail "Empty activity" "entries=$EMPTY_ACT"
+[ "$EMPTY_ACT" -le 2 ] 2>/dev/null && pass "Activity on new vault: $EMPTY_ACT entries (init + skill seed)" || fail "Empty activity" "entries=$EMPTY_ACT"
 
 m "akb_delete_vault" "{\"name\":\"$EMPTY_VAULT\"}" >/dev/null 2>&1
 

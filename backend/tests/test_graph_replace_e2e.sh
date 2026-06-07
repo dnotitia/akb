@@ -151,7 +151,7 @@ REL_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 [ "$REL_COUNT" -ge 1 ] 2>/dev/null && pass "Relations visible from A ($REL_COUNT)" || fail "Relations" "$R"
 
 # Check graph
-R=$(m1 "akb_graph" "{\"uri\":\"$URI_A\",\"depth\":1}")
+R=$(m1 "akb_graph" "{\"uri\":\"$URI_A\",\"hops\":1}")
 NODES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('nodes',[])))" 2>/dev/null)
 EDGES=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('edges',[])))" 2>/dev/null)
 [ "$NODES" -ge 2 ] 2>/dev/null && pass "Graph: $NODES nodes, $EDGES edges" || fail "Graph" "$R"
