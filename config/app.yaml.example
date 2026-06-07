@@ -96,6 +96,10 @@ jwt_expire_hours: 24
 # keycloak_require_verified_email: true   # refuse id_tokens whose email_verified≠true
 #                                         # (identity is keyed on email). Set false ONLY
 #                                         # for a trusted realm with controlled emails.
+# keycloak_link_by_email: false           # link SSO to a pre-existing same-email account
+#                                         # (e.g. one the managed control plane provisioned).
+#                                         # Keeps the user_id/PATs; only links VERIFIED emails.
+#                                         # Default false = no silent merge (OSS-safe).
 # keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
 # keycloak_post_login_path: "/auth/callback"
 # keycloak_exchange_code_ttl_secs: 60

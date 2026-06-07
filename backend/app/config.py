@@ -179,6 +179,20 @@ class Settings(BaseModel):
     # becomes an account-spoofing vector. Set false ONLY for a trusted
     # realm where every account's email is controlled out-of-band.
     keycloak_require_verified_email: bool = True
+    # Link an SSO login to a pre-existing AKB account that has the SAME
+    # email but a different auth_provider (e.g. a local/password account).
+    #
+    # Default false → such a collision is rejected (no silent identity
+    # merge; the OSS-safe default). Set true for a MANAGED deployment where
+    # the control plane intentionally pre-provisions an AKB user (+ PAT) for
+    # a member and that same person then logs in via SSO — without linking,
+    # every pre-provisioned member is locked out of SSO. Linking keeps the
+    # existing user_id, so the member's PAT, vault ownership and grants all
+    # survive. SAFE ONLY with verified emails: a cross-provider link is
+    # refused unless the id_token's email_verified is true, regardless of
+    # keycloak_require_verified_email, so a relaxed realm can't be used to
+    # take over an existing account by asserting its email.
+    keycloak_link_by_email: bool = False
     # Absolute URL Keycloak redirects the browser back to after login.
     # Must point at the AKB backend callback route and be registered as a
     # valid redirect URI on the Keycloak client, e.g.

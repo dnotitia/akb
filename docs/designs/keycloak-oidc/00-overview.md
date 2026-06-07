@@ -213,9 +213,21 @@ keycloak_client_secret: "<from Keycloak client credentials>"
   triggers it only for SSO-originated sessions via a localStorage marker,
   so local-auth logout is untouched). Still out of scope: Keycloak
   front-channel/back-channel single-logout that notifies *other* RPs.
-- Account linking UX when a local user and a Keycloak email collide
-  (v1: same-email login adopts the existing row; surface a clear error if
-  the existing row is `auth_provider='local'` until linking is designed).
+- Account linking: a same-email collision with a non-`keycloak` account is
+  rejected by default (`ConflictError`, no silent merge). Opt-in
+  `keycloak_link_by_email` (default false) links the SSO identity to the
+  existing account — keeping its `user_id`, PATs, vault ownership and
+  grants — and flips `auth_provider` to `keycloak`. A cross-provider link
+  requires the id_token's `email_verified` to be true (independent of
+  `keycloak_require_verified_email`) so a relaxed realm can't take over an
+  account by asserting its email. This is what the **managed akb-platform**
+  needs: its operator pre-provisions an AKB user (+PAT) per member via
+  `/auth/register` (local), and the same member then logs in via SSO —
+  without linking, every pre-provisioned member is locked out. (Platform
+  wiring: set `keycloak_link_by_email: true` + `keycloak_require_verified_email:
+  true` in the per-tenant AKB backend config. PAT *rotation* after a member
+  has SSO-linked still needs an admin mint API — separate follow-up, since
+  the operator currently mints by logging in with the now-retired password.)
 
 ## Local test harness
 

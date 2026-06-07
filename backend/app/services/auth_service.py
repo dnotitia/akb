@@ -225,12 +225,27 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
         )
         if row is not None:
             if row["auth_provider"] != "keycloak":
-                # A local account already owns this email. Auto-linking is
-                # deliberately out of scope (design doc) — fail loudly
-                # rather than silently merging identities.
-                raise ConflictError(
-                    "An account with this email already exists with password "
-                    "login; SSO linking is not enabled. Contact an admin."
+                # A different-provider account (e.g. a local/password user the
+                # managed control plane pre-provisioned) already owns this
+                # email. Link it to this SSO identity only when explicitly
+                # enabled AND the email is verified — otherwise fail loudly
+                # rather than silently merging / risking takeover.
+                if not settings.keycloak_link_by_email:
+                    raise ConflictError(
+                        "An account with this email already exists with password "
+                        "login; SSO linking is not enabled. Contact an admin."
+                    )
+                if claims.get("email_verified") is not True:
+                    raise AuthenticationError(
+                        "Cannot link SSO to the existing account: email is not "
+                        "verified by the identity provider"
+                    )
+                # Adopt: keep the existing user_id (and thus its PATs, vault
+                # ownership, grants). Flip auth_provider to 'keycloak' so the
+                # now-unused local password can no longer be used to log in.
+                await conn.execute(
+                    "UPDATE users SET auth_provider = 'keycloak' WHERE id = $1",
+                    row["id"],
                 )
             user_id = row["id"]
             uname = row["username"]
@@ -283,10 +298,27 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
                     """,
                     email,
                 )
-                if row is None or row["auth_provider"] != "keycloak":
+                if row is None:
                     raise ConflictError(
                         "An account with this email already exists; "
                         "SSO linking is not enabled. Contact an admin."
+                    )
+                if row["auth_provider"] != "keycloak":
+                    # Same link-by-email rule as the non-race path.
+                    if not settings.keycloak_link_by_email:
+                        raise ConflictError(
+                            "An account with this email already exists with "
+                            "password login; SSO linking is not enabled. "
+                            "Contact an admin."
+                        )
+                    if claims.get("email_verified") is not True:
+                        raise AuthenticationError(
+                            "Cannot link SSO to the existing account: email is "
+                            "not verified by the identity provider"
+                        )
+                    await conn.execute(
+                        "UPDATE users SET auth_provider = 'keycloak' WHERE id = $1",
+                        row["id"],
                     )
                 user_id = row["id"]
                 uname = row["username"]
