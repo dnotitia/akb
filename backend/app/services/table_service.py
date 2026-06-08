@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, NotFoundError
+from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -141,7 +141,7 @@ async def create_table(
     # pg_table_name maps any punctuation to underscore — allowing hyphens
     # would let `mcp-items` and `mcp_items` collide on the PG side.
     if not _TABLE_NAME_RE.fullmatch(name):
-        raise ValueError(
+        raise ValidationError(
             f"Invalid table name {name!r}: must match {_TABLE_NAME_RE.pattern}"
         )
     pool = await get_pool()
@@ -170,6 +170,18 @@ async def create_table(
                 )
 
             pg_name = table_data_repo.pg_table_name(vault["name"], name)
+            # Refuse names whose PG identifier would overflow NAMEDATALEN.
+            # PG truncates silently, and role_sync then refuses to GRANT on
+            # the over-long name (raising deep in the stack as a 500). Catch
+            # it here as a clean 422 that names the culprit, before any DDL.
+            if len(pg_name) > table_data_repo.PG_IDENT_MAX_LEN:
+                raise ValidationError(
+                    f"Table name too long: the PostgreSQL identifier "
+                    f"{pg_name!r} is {len(pg_name)} chars, over the "
+                    f"{table_data_repo.PG_IDENT_MAX_LEN}-char limit. Shorten "
+                    f"the vault name ({vault['name']!r}) or table name "
+                    f"({name!r})."
+                )
             try:
                 await table_data_repo.create_dynamic_table(conn, pg_name, columns)
                 await table_registry_repo.insert(

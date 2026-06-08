@@ -13,6 +13,7 @@ can't silently re-introduce the all-underscore drop-out.
 from __future__ import annotations
 
 from app.repositories.table_data_repo import (
+    PG_IDENT_MAX_LEN,
     pg_short_name,
     pg_table_name,
     rewrite_table_names,
@@ -83,3 +84,24 @@ def test_rewriter_leaves_quoted_identifier_alone():
     table_map = {"______": "vt_demo__________"}
     sql = 'SELECT * FROM "______" LIMIT 1'
     assert rewrite_table_names(sql, table_map) == sql
+
+
+# ── identifier length boundary (E08) ───────────────────────────
+
+
+def test_pg_ident_max_len_is_namedatalen_minus_one():
+    """PG's default NAMEDATALEN is 64; usable identifier length is 63.
+    Lock the constant so a refactor can't silently change the bound
+    `table_service` and `role_sync` both rely on."""
+    assert PG_IDENT_MAX_LEN == 63
+
+
+def test_pg_table_name_length_boundary():
+    """E08 regression: a long vault + long table name can push
+    `vt_<vault>__<table>` exactly one byte over the limit, where PG
+    would silently truncate (risking a GRANT collision). Pin the math
+    that `create_table`'s pre-check guards against."""
+    fits = pg_table_name("a" * 27, "b" * 31)  # 3 + 27 + 2 + 31 = 63
+    over = pg_table_name("a" * 27, "b" * 32)  # 3 + 27 + 2 + 32 = 64
+    assert len(fits) == PG_IDENT_MAX_LEN
+    assert len(over) == PG_IDENT_MAX_LEN + 1
