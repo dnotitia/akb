@@ -147,8 +147,12 @@ export default function DocumentPage() {
     if (d.path && d.path !== docId) {
       navigate(`/vault/${name}/doc/${encodeURIComponent(d.path)}`, { replace: true });
     }
-    if (d.id) {
-      getRelations(name!, d.id).then((r) => setRelations(r.relations || [])).catch(() => {});
+    if (d.path) {
+      // getRelations builds the canonical akb:// URI from the vault-relative
+      // *path* (docUri). The GET response exposes no internal `id` — `uri`/
+      // `path` is the sole identifier — so keying this off `d.id` (always
+      // undefined) meant relations never loaded on the document page.
+      getRelations(name!, d.path).then((r) => setRelations(r.relations || [])).catch(() => {});
     }
     if (d.path) {
       loadHistory(name!, d.path);
@@ -703,7 +707,7 @@ export default function DocumentPage() {
                   })}
                 </ol>
                 <Link
-                  to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.id ? docUri(name!, doc.path) : "")}`}
+                  to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.path ? docUri(name!, doc.path) : "")}`}
                   className="mt-3 inline-flex items-center gap-1 text-xs text-accent hover:underline"
                 >
                   <GitGraph className="h-3 w-3" aria-hidden /> Open in graph →

@@ -28,8 +28,11 @@ const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
 
 function makeDoc(overrides: Record<string, unknown> = {}) {
+  // NB: the real GET /documents response exposes NO internal `id` — `uri`/
+  // `path` is the sole identifier (see DocumentResponse). The mock must
+  // mirror that, or guards keyed off `d.id` look fine in tests yet are
+  // always-false in production.
   return {
-    id: "0c37e906-6db0-48c2-ac5d-576d0797b3f7",
     path: "notes/hello.md",
     title: "DocTitle",
     content: SAMPLE_CONTENT,
@@ -99,6 +102,16 @@ describe("DocumentPage view toggle", () => {
     ).toBeInTheDocument();
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
+  });
+
+  it("loads relations keyed by the document path (not a nonexistent id)", async () => {
+    // Regression: the panel used to fetch via `d.id`, which the API never
+    // returns, so relations silently never loaded ("No relations yet.").
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("heading", { level: 1, name: "BodyHeading" });
+    await waitFor(() =>
+      expect(getRelationsMock).toHaveBeenCalledWith("v", "notes/hello.md"),
+    );
   });
 
   it("?view=raw renders the raw markdown inside <pre>", async () => {
