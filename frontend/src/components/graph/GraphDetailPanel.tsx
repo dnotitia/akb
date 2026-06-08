@@ -4,6 +4,8 @@ import { ChevronDown, ChevronRight, ExternalLink, Pin, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
 import { getDocument, getRelations, getProvenance, drillDown } from "@/lib/api";
 import { ALL_NODE_KINDS, ALL_RELATIONS, type NodeKind, type RelationKind, kindToSegment } from "./graph-types";
 import { Section } from "./Section";
@@ -95,6 +97,31 @@ export function GraphDetailPanel({
         </button>
       </header>
 
+      {docQuery.isLoading ? (
+        // Progressive-loading: a skeleton stands in for the fetch so the
+        // panel never reads as "nothing showed up" while data is in flight.
+        <div className="px-3 py-3 flex flex-col gap-3" aria-busy="true">
+          <Skeleton className="h-7 w-3/4" />
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-5/6" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      ) : docQuery.isError ? (
+        // Error-recovery: reuse the app's standard EmptyState (same shape the
+        // graph canvas uses for its load failure). A node can point at a
+        // deleted/renamed doc, or the fetch can transiently fail — surface it
+        // with a retry path instead of rendering blank.
+        <EmptyState
+          title="Couldn't load this resource."
+          description={String((docQuery.error as Error)?.message || docQuery.error || "unknown error")}
+          action={
+            <Button size="sm" variant="outline" onClick={() => docQuery.refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      ) : (
+        <>
       <div className="px-3 py-3 border-b border-border">
         <h2 className="font-serif text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
         <p className="coord text-foreground-muted truncate" title={uri}>{uri}</p>
@@ -235,6 +262,8 @@ export function GraphDetailPanel({
           </div>
         )}
       </Section>
+        </>
+      )}
     </aside>
   );
 }
