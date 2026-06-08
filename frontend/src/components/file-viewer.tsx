@@ -71,12 +71,12 @@ export function FileViewer({ slug, data }: Props) {
           <div className="coord mb-8">{data.name}</div>
         )}
 
-        <div className="border border-border mt-8">
-          <div className="border-b border-border bg-foreground text-background px-3 py-1.5 flex items-center justify-between">
-            <span className="coord-ink" style={{ color: "var(--color-paper)" }}>
+        <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm mt-8">
+          <div className="border-b border-border bg-surface-2 text-foreground px-3 py-1.5 flex items-center justify-between">
+            <span className="coord-ink">
               ⊞ PREVIEW
             </span>
-            <span className="coord-ink" style={{ color: "var(--color-paper)" }}>
+            <span className="coord-ink">
               {kind.toUpperCase()}
             </span>
           </div>

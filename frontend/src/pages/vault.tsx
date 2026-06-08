@@ -8,6 +8,7 @@ import { EmptyState } from "@/components/empty-state";
 import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
 import { SkillStatusChip } from "@/components/skill/skill-status-chip";
+import { StatTile } from "@/components/ui/stat-tile";
 
 interface VaultInfo {
   name: string;
@@ -131,13 +132,13 @@ export default function VaultPage() {
         VAULT · {name?.toUpperCase()} · akb://{name}
       </div>
 
-      {/* Serif display title */}
-      <h1 className="font-serif text-[54px] leading-[0.95] tracking-[-0.03em] text-foreground mb-3">
-        {name}<span className="text-foreground-muted">.</span>
+      {/* Display title */}
+      <h1 className="font-display text-[44px] leading-[1.0] tracking-tight text-foreground mb-3">
+        {name}<span className="text-accent">.</span>
       </h1>
 
       {info?.description && (
-        <p className="font-serif-italic text-[17px] leading-[1.55] text-foreground-muted mb-1">
+        <p className="text-[16px] leading-[1.55] text-foreground-muted mb-1 max-w-2xl">
           {info.description}
         </p>
       )}
@@ -188,31 +189,19 @@ export default function VaultPage() {
         </div>
       </div>
 
-      {/* Ledger — 4-stat strip */}
-      <div className="mt-10 pt-6 border-t border-border">
-        <div className="grid grid-cols-4">
-          {counts &&
-            (
-              [
-                ["collections", counts.collections, "dirs"],
-                ["documents", counts.documents, "md"],
-                ["tables", counts.tables, "rows"],
-                ["files", counts.files, "bytes"],
-              ] as Array<[string, number, string]>
-            ).map(([label, value, kind], i) => (
-              <div
-                key={label}
-                className={i < 3 ? "pr-6 border-r border-border" : "pl-6"}
-                style={i > 0 ? { paddingLeft: "1.25rem" } : undefined}
-              >
-                <div className="coord mb-2">{label.toUpperCase()}</div>
-                <div className="font-serif text-[36px] leading-none tabular-nums text-foreground mb-2">
-                  {String(value).padStart(2, "0")}
-                </div>
-                <div className="coord">{kind}</div>
-              </div>
-            ))}
-        </div>
+      {/* Ledger — 4-stat tiles */}
+      <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {counts &&
+          (
+            [
+              ["collections", counts.collections, "dirs"],
+              ["documents", counts.documents, "md"],
+              ["tables", counts.tables, "rows"],
+              ["files", counts.files, "bytes"],
+            ] as Array<[string, number, string]>
+          ).map(([label, value, kind]) => (
+            <StatTile key={label} label={label} value={value} kind={kind} />
+          ))}
       </div>
 
       {/* Recent writes — primary */}
@@ -228,7 +217,7 @@ export default function VaultPage() {
             description="Documents written via agent will appear here."
           />
         ) : (
-          <ol className="border border-border bg-surface divide-y divide-border">
+          <ol className="rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm">
             {recent.map((c, i) => (
               <li key={c.doc_id + c.changed_at}>
                 <Link
@@ -292,7 +281,7 @@ export default function VaultPage() {
         {commitsOpen && (
           <div
             id="commit-log-list"
-            className="mt-2 border border-border bg-surface p-3 overflow-x-auto"
+            className="mt-2 rounded-[var(--radius-lg)] border border-border bg-surface p-3 overflow-x-auto shadow-sm"
           >
             {!commitsLoaded ? (
               <div className="coord">LOADING…</div>

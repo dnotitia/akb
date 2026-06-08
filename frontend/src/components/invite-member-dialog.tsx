@@ -190,7 +190,7 @@ export function InviteMemberDialog({
           {/* Role picker */}
           <div className="space-y-1.5">
             <Label className="coord-ink">ROLE</Label>
-            <div className="grid grid-cols-3 gap-px border border-border bg-border">
+            <div className="grid grid-cols-3 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
               {(["reader", "writer", "admin"] as Role[]).map((r) => {
                 const active = role === r;
                 return (
@@ -199,9 +199,9 @@ export function InviteMemberDialog({
                     type="button"
                     onClick={() => setRole(r)}
                     aria-pressed={active}
-                    className={`px-3 py-2 text-sm font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
+                    className={`px-3 py-2 text-sm font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                       active
-                        ? "bg-foreground text-background"
+                        ? "bg-primary text-primary-foreground"
                         : "bg-surface text-foreground hover:bg-surface-muted"
                     }`}
                   >

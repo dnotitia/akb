@@ -1,11 +1,8 @@
-import { useMemo, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getDocument, getVaultSkillPreview } from "@/lib/api";
-import { sanitizeLinkUrl } from "@/lib/utils";
-import { parseHeadings, slugify } from "@/lib/markdown";
+import { MarkdownRender } from "@/components/markdown-render";
 import { SkillBanner } from "@/components/skill/skill-banner";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -86,11 +83,6 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
     }
   }
 
-  const markdownComponents = useMemo(
-    () => buildHeadingComponents(doc?.content || ""),
-    [doc?.content],
-  );
-
   if (isLoading) {
     return (
       <div className="py-8 coord">
@@ -136,12 +128,10 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
           id="docview-panel-rendered"
           role="tabpanel"
           aria-labelledby="docview-tab-rendered"
-          className="prose dark:prose-invert min-w-0"
+          className="min-w-0"
           style={{ maxWidth: "100%" }}
         >
-          <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-            {doc.content || ""}
-          </Markdown>
+          <MarkdownRender markdown={doc.content || ""} />
         </div>
       ) : (
         <div
@@ -207,16 +197,14 @@ function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
       <div
         role="tablist"
         aria-label="Document view"
-        className="inline-flex border border-border"
+        className="inline-flex items-center gap-1 rounded-[var(--radius-md)] bg-surface-2 p-1"
       >
         {tabs.map((t, i) => {
           const isPanelTab = t.key !== "extra";
-          const cls = `px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-            i > 0 ? "border-l border-border" : ""
-          } ${
+          const cls = `px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
             t.selected
-              ? "bg-foreground text-background"
-              : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+              ? "bg-surface text-foreground shadow-sm"
+              : "text-foreground-muted hover:text-foreground"
           }`;
           return (
             <button
@@ -237,35 +225,6 @@ function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
       </div>
     </div>
   );
-}
-
-// ── Heading renderer helpers ─────────────────────────────────────
-
-function buildHeadingComponents(markdown: string) {
-  const slugQueue = parseHeadings(markdown).map((h) => h.slug);
-  let cursor = 0;
-  const make = (level: 1 | 2 | 3 | 4 | 5 | 6) => (props: any) => {
-    const id = slugQueue[cursor++] ?? slugify(flattenText(props.children)) ?? `heading-${level}`;
-    const Tag = `h${level}` as any;
-    return <Tag id={id} {...props} />;
-  };
-  // Strip `javascript:` / `data:` / other non-navigation schemes from
-  // markdown link targets — react-markdown otherwise hands the raw href
-  // straight to <a>, so a malicious doc could ship a clickable XSS.
-  const SafeLink = ({ href, ...props }: any) => (
-    <a {...props} href={sanitizeLinkUrl(href)} rel="noopener noreferrer" />
-  );
-  return {
-    h1: make(1), h2: make(2), h3: make(3), h4: make(4), h5: make(5), h6: make(6),
-    a: SafeLink,
-  };
-}
-
-function flattenText(children: any): string {
-  if (typeof children === "string") return children;
-  if (Array.isArray(children)) return children.map(flattenText).join("");
-  if (children?.props?.children) return flattenText(children.props.children);
-  return "";
 }
 
 // ── Agent preview (skill docs only) ─────────────────────────────

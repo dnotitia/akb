@@ -115,7 +115,7 @@ export default function TablePage() {
         <div
           role="alert"
           aria-live="polite"
-          className="border border-destructive p-3 mt-6"
+          className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-3 mt-6"
         >
           <div className="coord-spark mb-1 text-destructive">⚠ QUERY FAILED</div>
           <p className="text-sm text-destructive font-mono">{error}</p>
@@ -139,11 +139,11 @@ export default function TablePage() {
             role="region"
             aria-label={`Preview rows for ${table}`}
             tabIndex={0}
-            className="border border-border bg-surface overflow-x-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="rounded-[var(--radius-lg)] border border-border bg-surface overflow-hidden shadow-sm overflow-x-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-border">
+                <tr className="border-b border-border bg-surface-2">
                   <th
                     scope="col"
                     className="px-3 py-2 text-left font-mono text-[10px] uppercase tracking-wider text-foreground-muted border-r border-border w-10"

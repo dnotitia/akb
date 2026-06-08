@@ -2,9 +2,10 @@ import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams, matc
 import { useEffect, useState } from "react";
 import { Search as SearchIcon } from "lucide-react";
 import { getToken } from "@/lib/api";
-import { useMeasuredHeight } from "@/hooks/use-measured-height";
 import { useHealth } from "@/hooks/use-health";
 import { UserMenu } from "@/components/user-menu";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { Logo } from "@/components/logo";
 import { IndexingBadge } from "@/components/status-badge";
 import { ErrorBoundary } from "@/components/error-boundary";
 
@@ -49,24 +50,7 @@ export function Layout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname, searchParams]);
 
-  // All hooks must run unconditionally on every render — the auth gate
-  // below short-circuits to <Navigate>, so calling hooks AFTER it would
-  // violate rules-of-hooks the first time the component mounts logged-in
-  // and then logs out.
   const wide = isVaultShellRoute(location.pathname);
-  const [headerRef, headerHeight] = useMeasuredHeight();
-
-  // System-wide indexing pressure: aggregate of pending embeddings + pending
-  // Vector-store backfill across every vault. Lives here (not on
-  // per-vault pages) because /health is global — surfacing it on a
-  // vault page made users think it was vault-scoped.
-  //
-  // Backend reports `pending` as "vector_indexed_at IS NULL" — a superset
-  // of `abandoned` (retry-exhausted chunks). The badge should show only
-  // the *active* indexing pressure (= pending − abandoned), otherwise
-  // abandoned rows look like a stuck counter that never decreases.
-  // Abandoned rows are reaped by delete_worker after a grace window;
-  // until then they're surfaced through the separate `abandoned` chip.
   const { data: health } = useHealth(!!getToken());
 
   if (!getToken()) {
@@ -78,57 +62,29 @@ export function Layout() {
     : null;
   const indexingAbandoned: number = upsert?.abandoned || 0;
 
-  // Vault workspace routes lock to viewport height and supply their own
-  // internal scroll regions (tree / content / etc.). Non-vault routes keep
-  // natural document scroll with the footer at the bottom.
+  // Vault workspace routes lock to viewport height (own internal scroll). Other
+  // routes keep natural document scroll with the footer at the bottom.
   const rootClass = wide
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
-    : "min-h-screen bg-background text-foreground";
+    : "min-h-screen flex flex-col bg-background text-foreground";
 
   return (
-    <div
-      className={rootClass}
-      style={{ ["--header-h" as any]: headerHeight ? `${headerHeight}px` : "96px" }}
-    >
-      {/* ── Header ─────────────────────────────────────────────── */}
-      <header
-        ref={headerRef}
-        className={
-          wide
-            ? "shrink-0 bg-background border-b border-border"
-            : "sticky top-0 z-40 bg-background/95 backdrop-blur border-b border-border"
-        }
-      >
-        {/* Coordinate strip */}
-        <div className="border-b border-border">
-          <div className="mx-auto flex max-w-[1400px] items-center justify-between gap-3 px-6 py-1">
-            <div className="coord">§ AKB · Agent Knowledgebase</div>
-            <div className="flex items-center gap-3">
-              <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
-              <div className="coord hidden md:block">
-                {new Date().toUTCString().slice(0, 22).toUpperCase()}
-              </div>
-              <div className="coord">v1.0</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Main bar */}
-        <div className="mx-auto flex max-w-[1400px] items-center gap-4 px-6 h-14">
-          {/* Logo */}
+    <div className={rootClass}>
+      {/* ── Glass app header ───────────────────────────────────────── */}
+      <header className="app-header sticky top-0 z-40 shrink-0">
+        <div className="mx-auto flex max-w-[1600px] items-center gap-4 px-5 h-16">
+          {/* Brand */}
           <Link
             to="/"
-            className="flex items-baseline gap-2 group focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label="AKB home"
+            className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            <span className="font-mono text-base font-semibold tracking-tight group-hover:text-accent transition-colors">
-              AKB
-            </span>
-            <span className="coord hidden sm:inline">/ v1.0</span>
+            <Logo size={30} subtitle />
           </Link>
 
-          {/* Search */}
+          {/* Global search */}
           <form
-            className="flex-1 max-w-xl flex h-9"
+            className="flex-1 max-w-3xl hidden sm:flex h-10"
             onSubmit={(e) => {
               e.preventDefault();
               if (!searchQuery.trim()) return;
@@ -139,90 +95,84 @@ export function Layout() {
             role="search"
             aria-label="Search knowledge base"
           >
-            <div className="flex border border-border border-r-0 h-full">
-              <button
-                type="button"
-                onClick={() => setSearchMode("dense")}
-                title="Semantic hybrid search (dense + BM25 + cross-encoder rerank)"
-                aria-pressed={searchMode === "dense"}
-                className={`px-2.5 h-full font-mono text-[10px] tracking-wider transition-colors cursor-pointer ${
-                  searchMode === "dense"
-                    ? "bg-foreground text-background"
-                    : "text-foreground hover:bg-surface-muted"
-                }`}
-              >
-                SEMANTIC
-              </button>
-              <button
-                type="button"
-                onClick={() => setSearchMode("literal")}
-                title="Literal substring / regex search"
-                aria-pressed={searchMode === "literal"}
-                className={`px-2.5 h-full font-mono text-[10px] tracking-wider border-l border-border transition-colors cursor-pointer ${
-                  searchMode === "literal"
-                    ? "bg-foreground text-background"
-                    : "text-foreground hover:bg-surface-muted"
-                }`}
-              >
-                LITERAL
-              </button>
-            </div>
-            <label className="sr-only" htmlFor="header-search">
-              Search
-            </label>
-            <div className="relative flex-1 flex items-center border border-border h-full px-3 focus-within:border-accent transition-colors bg-surface">
-              <SearchIcon
-                className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none"
-                aria-hidden
-              />
-              <input
-                id="header-search"
-                type="search"
-                placeholder={searchMode === "dense" ? "Search (semantic)" : "Search (literal)"}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
-              />
+            <div className="flex w-full items-stretch rounded-[var(--radius-md)] border border-border bg-surface overflow-hidden focus-within:border-primary focus-within:ring-2 focus-within:ring-ring/30 transition-colors">
+              <div className="flex shrink-0 p-1 gap-0.5">
+                {(["dense", "literal"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setSearchMode(mode)}
+                    title={
+                      mode === "dense"
+                        ? "Semantic hybrid search (dense + BM25 + rerank)"
+                        : "Literal substring / regex search"
+                    }
+                    aria-pressed={searchMode === mode}
+                    className={`px-3 rounded-[var(--radius-sm)] text-xs font-medium transition-token cursor-pointer ${
+                      searchMode === mode
+                        ? "bg-primary text-primary-foreground"
+                        : "text-foreground-muted hover:bg-surface-muted"
+                    }`}
+                  >
+                    {mode === "dense" ? "Semantic" : "Literal"}
+                  </button>
+                ))}
+              </div>
+              <div className="relative flex flex-1 items-center pr-3">
+                <SearchIcon
+                  className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none"
+                  aria-hidden
+                />
+                <label className="sr-only" htmlFor="header-search">Search</label>
+                <input
+                  id="header-search"
+                  type="search"
+                  placeholder={searchMode === "dense" ? "Search knowledge…" : "Literal search…"}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="flex-1 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
+                />
+              </div>
             </div>
           </form>
 
-          {/* Nav */}
-          <nav
-            aria-label="Primary"
-            className="flex items-center gap-1 ml-auto"
-          >
-            <NavLink to="/" active={location.pathname === "/"} label="01" name="Home" />
+          {/* Nav + actions */}
+          <nav aria-label="Primary" className="flex items-center gap-1 ml-auto">
+            <NavLink to="/" active={location.pathname === "/"} name="Home" />
             <NavLink
               to="/vault"
               active={location.pathname.startsWith("/vault") && location.pathname !== "/vault/new"}
-              label="02"
               name="Vaults"
             />
-            <div className="mx-1 h-6 w-px bg-border" aria-hidden />
+            <div className="mx-1.5 h-6 w-px bg-border" aria-hidden />
+            <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
+            <ThemeToggle />
             <UserMenu />
           </nav>
         </div>
       </header>
 
       {/* Content */}
-      <main
-        className={
-          wide
-            ? "flex-1 min-h-0 fade-in"
-            : "mx-auto max-w-[1400px] px-6 py-8 fade-in"
-        }
-      >
-        <ErrorBoundary resetKeys={[location.pathname]}>
-          <Outlet />
-        </ErrorBoundary>
+      <main className={wide ? "flex-1 min-h-0 animate-in" : "flex-1 animate-in"}>
+        {wide ? (
+          <ErrorBoundary resetKeys={[location.pathname]}>
+            <Outlet />
+          </ErrorBoundary>
+        ) : (
+          <div className="mx-auto max-w-[1400px] px-6 py-8">
+            <ErrorBoundary resetKeys={[location.pathname]}>
+              <Outlet />
+            </ErrorBoundary>
+          </div>
+        )}
       </main>
 
       {/* Footer — hidden on vault workspace routes (viewport-locked) */}
       {!wide && (
-        <footer className="border-t border-border mt-16">
-          <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 py-2">
-            <div className="coord">© Dnotitia / Seahorse</div>
-            <div className="coord hidden md:block">AGENT KNOWLEDGEBASE</div>
+        <footer className="border-t border-border">
+          <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 py-3">
+            <div className="coord">© Dnotitia · Seahorse</div>
+            <div className="coord hidden md:block">Agent Knowledgebase</div>
             <div className="coord">v1.0</div>
           </div>
         </footer>
@@ -231,29 +181,18 @@ export function Layout() {
   );
 }
 
-function NavLink({
-  to,
-  active,
-  label,
-  name,
-}: {
-  to: string;
-  active: boolean;
-  label: string;
-  name: string;
-}) {
+function NavLink({ to, active, name }: { to: string; active: boolean; name: string }) {
   return (
     <Link
       to={to}
       aria-current={active ? "page" : undefined}
-      className={`group flex items-baseline gap-1.5 px-2 py-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-        active ? "text-accent" : "text-foreground hover:text-accent"
+      className={`rounded-[var(--radius-md)] px-3 py-1.5 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+        active
+          ? "bg-surface-muted text-foreground"
+          : "text-foreground-muted hover:text-foreground hover:bg-surface-muted/60"
       }`}
     >
-      <span className={`coord ${active ? "text-accent" : "group-hover:text-accent"}`}>
-        {label}
-      </span>
-      <span className="text-sm font-medium">{name}</span>
+      {name}
     </Link>
   );
 }

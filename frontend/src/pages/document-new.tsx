@@ -167,7 +167,7 @@ export default function DocumentNewPage() {
         <span className="text-foreground">NEW DOCUMENT</span>
       </nav>
 
-      <header className="border-b border-border pb-4 mb-0">
+      <header className="pb-4">
         <div className="coord-spark mb-2">§ NEW DOCUMENT</div>
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           New document.
@@ -181,7 +181,7 @@ export default function DocumentNewPage() {
 
       <form
         onSubmit={handleSubmit}
-        className="border border-border border-t-0 bg-surface p-8 space-y-5"
+        className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-8 space-y-5"
       >
         <div className="space-y-1.5">
           <Label htmlFor="doc-title">
@@ -225,7 +225,7 @@ export default function DocumentNewPage() {
               id="doc-type"
               value={type}
               onChange={(e) => setType(e.target.value as DocType)}
-              className="w-full h-9 px-3 bg-surface border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+              className="w-full h-9 px-3 rounded-[var(--radius-md)] bg-surface border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
             >
               {DOC_TYPES.map((t) => (
                 <option key={t} value={t}>
@@ -297,7 +297,7 @@ export default function DocumentNewPage() {
           <div
             role="alert"
             aria-live="polite"
-            className="border border-destructive px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
+            className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
           >
             ⚠ {error.toUpperCase()}
           </div>

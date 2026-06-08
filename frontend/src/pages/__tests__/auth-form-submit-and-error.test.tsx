@@ -70,7 +70,7 @@ describe("AuthPage · login happy path", () => {
     renderAuth();
     await u.type(screen.getByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "pw-1234");
-    await u.click(screen.getByRole("button", { name: /enter the base/i }));
+    await u.click(screen.getByRole("button", { name: /sign in/i }));
     await waitFor(() =>
       expect(mockedLogin).toHaveBeenCalledWith("alice", "pw-1234"),
     );
@@ -115,7 +115,7 @@ describe("AuthPage · error surface", () => {
     renderAuth();
     await u.type(screen.getByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
-    await u.click(screen.getByRole("button", { name: /enter the base/i }));
+    await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/Bad credentials/);
     expect(mockedSetToken).not.toHaveBeenCalled();
@@ -128,7 +128,7 @@ describe("AuthPage · error surface", () => {
     renderAuth();
     await u.type(screen.getByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
-    await u.click(screen.getByRole("button", { name: /enter the base/i }));
+    await u.click(screen.getByRole("button", { name: /sign in/i }));
     await screen.findByRole("alert");
     // Radix TabsTrigger renders as a button — getByText is the
     // narrowest selector that works in jsdom (Radix's tab role

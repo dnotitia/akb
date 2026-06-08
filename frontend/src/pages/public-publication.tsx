@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { ArrowUpRight } from "lucide-react";
+import { MarkdownRender } from "@/components/markdown-render";
 import {
   getPublication,
   type PublicationResponse,
@@ -199,7 +198,7 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           <div
             role="alert"
             aria-live="polite"
-            className="border border-destructive p-4 mb-8"
+            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
           >
             <div className="coord-spark mb-1 text-destructive">⚠ CONTENT UNAVAILABLE</div>
             <p className="text-sm text-foreground">
@@ -212,7 +211,7 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           <div
             role="alert"
             aria-live="polite"
-            className="border border-destructive p-4 mb-8"
+            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
           >
             <div className="coord-spark mb-1 text-destructive">⚠ SECTION NOT FOUND</div>
             <p className="text-sm text-foreground">
@@ -223,9 +222,8 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           </div>
         )}
 
-        <div className="prose dark:prose-invert prose-lg max-w-none font-display-body">
-          <Markdown remarkPlugins={[remarkGfm]}>{data.content || ""}</Markdown>
-        </div>
+        <MarkdownRender markdown={data.content || ""} className="text-[16px] font-display-body" />
+
       </div>
     </article>
   );
@@ -255,7 +253,7 @@ function ErrorPage({ error }: { error: PublicationError }) {
     <div className="min-h-screen flex items-center justify-center bg-background px-6 text-foreground">
       <div className="w-full max-w-2xl fade-up">
         <div className="coord-spark mb-3">{coord}</div>
-        <div className="border border-border bg-surface p-10 relative">
+        <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-10 relative">
           <h1 className="font-display-tight text-6xl lg:text-7xl text-foreground leading-none">
             {title.split(" ").slice(0, -1).join(" ")}
             <br />

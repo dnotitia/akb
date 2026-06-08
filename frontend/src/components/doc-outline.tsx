@@ -21,14 +21,14 @@ export function DocumentOutline({
           const indent = h.level - minLevel;
           const isActive = activeSlug === h.slug;
           return (
-            <li key={h.slug} style={{ paddingLeft: `${indent * 10}px` }}>
+            <li key={h.slug} style={{ marginLeft: `${indent * 12}px` }}>
               <a
                 href={`#${h.slug}`}
                 aria-current={isActive ? "true" : undefined}
-                className={`block py-[3px] leading-snug border-l-2 pl-2 -ml-[2px] transition-colors ${
+                className={`block py-1 px-2 rounded-[var(--radius-sm)] leading-snug transition-colors ${
                   isActive
-                    ? "border-accent text-accent font-medium"
-                    : "border-transparent text-foreground-muted hover:text-foreground hover:border-border-strong"
+                    ? "bg-accent/10 text-accent font-medium"
+                    : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
                 }`}
               >
                 <span title={h.text} className="truncate block text-[12px]">{h.text}</span>

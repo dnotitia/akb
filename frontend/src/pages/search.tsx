@@ -4,6 +4,7 @@ import { ExternalLink, File, FileText, Lightbulb, Search as SearchIcon, Sparkles
 import { searchDocs, grepDocs, listVaults, type GrepDoc } from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
+import { Select } from "@/components/ui/select";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { parseUri } from "@/lib/uri";
@@ -215,9 +216,9 @@ export default function SearchPage() {
   return (
     <div className="fade-up max-w-[1280px] mx-auto">
       <div className="coord-spark mb-3">§ SEARCH</div>
-      <h1 className="font-serif text-[42px] leading-[1] tracking-[-0.02em] text-foreground mb-6">
+      <h1 className="font-display text-3xl tracking-tight text-foreground mb-6">
         {scopedVault ? scopedVault : "Query the base"}
-        <span className="text-foreground-muted">.</span>
+        <span className="text-accent">.</span>
       </h1>
 
       {/* Doc-type filter chips — client-side filter on doc_type field of
@@ -229,7 +230,7 @@ export default function SearchPage() {
         <button
           type="button"
           onClick={() => setActiveTypes(new Set(ALL_TYPES))}
-          className="px-2 h-7 border border-border font-mono text-[10px] uppercase tracking-[0.12em]"
+          className="px-2 h-7 rounded-[var(--radius-md)] border border-border font-mono text-[10px] uppercase tracking-[0.12em]"
         >
           ALL
         </button>
@@ -241,7 +242,7 @@ export default function SearchPage() {
             aria-pressed={activeTypes.has(t)}
             onClick={() => toggleType(t)}
             className={cn(
-              "inline-flex items-center gap-1 px-2 h-7 border font-mono text-[10px] uppercase tracking-[0.12em]",
+              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border font-mono text-[10px] uppercase tracking-[0.12em]",
               activeTypes.has(t)
                 ? "border-foreground text-foreground"
                 : "border-border text-foreground-muted opacity-70",
@@ -265,32 +266,32 @@ export default function SearchPage() {
         role="search"
         aria-label={scopedVault ? `Search within ${scopedVault}` : "Search all vaults"}
       >
-        <div className="flex border border-border border-r-0 h-full shrink-0">
+        <div className="flex border border-border border-r-0 h-full shrink-0 rounded-l-[var(--radius-md)] overflow-hidden">
           <button
             type="button"
             onClick={() => switchMode("dense")}
             aria-pressed={mode === "dense"}
             title="Semantic hybrid search (dense + BM25 + cross-encoder rerank)"
-            className={`px-3 h-full font-mono text-[11px] tracking-wider transition-colors cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-colors cursor-pointer ${
               mode === "dense"
-                ? "bg-foreground text-background"
+                ? "bg-surface-2 text-foreground"
                 : "text-foreground hover:bg-surface-muted"
             }`}
           >
-            SEMANTIC
+            Semantic
           </button>
           <button
             type="button"
             onClick={() => switchMode("literal")}
             aria-pressed={mode === "literal"}
             title="Literal substring / regex search"
-            className={`px-3 h-full font-mono text-[11px] tracking-wider border-l border-border transition-colors cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-colors cursor-pointer ${
               mode === "literal"
-                ? "bg-foreground text-background"
+                ? "bg-surface-2 text-foreground"
                 : "text-foreground hover:bg-surface-muted"
             }`}
           >
-            LITERAL
+            Literal
           </button>
         </div>
         <div className="relative flex-1 flex items-center border border-border h-full px-3 focus-within:border-accent transition-colors bg-surface">
@@ -317,9 +318,9 @@ export default function SearchPage() {
         </div>
         <button
           type="submit"
-          className="px-4 h-full font-mono text-[11px] tracking-wider bg-accent text-accent-foreground hover:bg-accent/90 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="px-4 h-full rounded-r-[var(--radius-md)] font-medium text-xs bg-accent text-accent-foreground hover:bg-accent/90 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
-          SEARCH
+          Search
         </button>
       </form>
 
@@ -338,42 +339,34 @@ export default function SearchPage() {
       )}
 
       {!scopedVault && vaults.length > 0 && (
-        <div className="border border-border flex items-stretch flex-wrap bg-surface mb-6">
-          <div className="coord px-4 py-2 border-r border-border flex items-center">
-            SCOPE
-          </div>
-          <button
-            onClick={() => switchVault("")}
-            aria-pressed={vault === ""}
-            className={`px-3 py-2 font-mono text-xs tracking-wider border-r border-border transition-colors cursor-pointer ${
-              vault === ""
-                ? "bg-foreground text-background"
-                : "text-foreground hover:bg-surface-muted"
-            }`}
+        <div className="flex items-center gap-3 mb-6">
+          <span className="coord shrink-0">Scope</span>
+          <Select
+            value={vault}
+            onChange={(e) => switchVault(e.target.value)}
+            aria-label="Search scope — limit to a vault"
+            className="h-9 w-auto min-w-[220px] max-w-sm"
           >
-            ALL VAULTS
-          </button>
-          {vaults.map((v) => (
+            <option value="">All vaults ({vaults.length})</option>
+            {vaults.map((v) => (
+              <option key={v.name} value={v.name}>{v.name}</option>
+            ))}
+          </Select>
+          {vault && (
             <button
-              key={v.name}
-              onClick={() => switchVault(v.name)}
-              aria-pressed={vault === v.name}
-              className={`px-3 py-2 font-mono text-xs tracking-wider border-r border-border transition-colors cursor-pointer ${
-                vault === v.name
-                  ? "bg-foreground text-background"
-                  : "text-foreground hover:bg-surface-muted"
-              }`}
+              onClick={() => switchVault("")}
+              className="coord hover:text-accent transition-colors cursor-pointer"
             >
-              {v.name}
+              clear
             </button>
-          ))}
+          )}
         </div>
       )}
 
       {showLiteralHint && (
         <div
           role="note"
-          className="border border-border px-6 py-3 text-sm flex items-center gap-3 bg-surface-muted mb-4"
+          className="rounded-[var(--radius-lg)] border border-border px-6 py-3 text-sm flex items-center gap-3 bg-surface-muted mb-4"
         >
           <Lightbulb className="h-4 w-4 text-accent shrink-0" aria-hidden />
           <span className="text-foreground">
@@ -390,7 +383,7 @@ export default function SearchPage() {
       )}
 
       {loading && (
-        <div className="border border-border p-6 bg-surface space-y-3">
+        <div className="rounded-[var(--radius-lg)] border border-border p-6 bg-surface shadow-sm space-y-3">
           <Skeleton className="h-4 w-48" />
           <Skeleton className="h-16" />
           <Skeleton className="h-16" />
@@ -421,7 +414,7 @@ export default function SearchPage() {
       {truncated && hint && total > 0 && !loading && (
         <div
           role="note"
-          className="mt-6 border border-warning/40 bg-warning/5 px-4 py-2.5 coord text-xs leading-relaxed"
+          className="mt-6 rounded-[var(--radius-md)] border border-warning/40 bg-warning/5 px-4 py-2.5 coord text-xs leading-relaxed"
           aria-label="Result set may be incomplete"
         >
           <span className="coord-ink mr-2">▲ TRUNCATED</span>
@@ -467,7 +460,7 @@ export default function SearchPage() {
       )}
 
       {total > 0 && mode === "literal" && (
-        <section className="border border-border bg-surface mt-6" aria-label="Literal results">
+        <section className="rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm mt-6" aria-label="Literal results">
           <header className="border-b border-border px-4 py-2 flex items-baseline justify-between">
             <span className="coord-ink">§ RESULTS · LITERAL</span>
             <span className="coord tabular-nums">
@@ -528,7 +521,7 @@ export default function SearchPage() {
 
 function DenseResultList({ items }: { items: DenseResult[] }) {
   return (
-    <ol className="border border-border bg-surface divide-y divide-border">
+    <ol className="rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm divide-y divide-border">
       {items.map((r, i) => (
         <li key={r.uri}>
           <Link

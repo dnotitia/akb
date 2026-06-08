@@ -86,13 +86,13 @@ export default function FilePage() {
         <div
           role="alert"
           aria-live="polite"
-          className="border border-destructive p-3 mt-6"
+          className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-3 mt-6"
         >
           <div className="coord-spark text-destructive">⚠ {error.toUpperCase()}</div>
         </div>
       )}
 
-      <div className="mt-8 border border-border bg-surface p-10 text-center">
+      <div className="mt-8 rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-10 text-center">
         <File className="h-12 w-12 text-foreground-muted mx-auto mb-4" aria-hidden />
         <p className="text-sm font-medium text-foreground">Inline preview pending</p>
         <p className="mt-1 text-sm text-foreground-muted max-w-md mx-auto leading-relaxed">

@@ -118,7 +118,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
 
   return (
     <aside
-      className="flex flex-col h-full overflow-y-auto border-r border-border bg-surface"
+      className="flex flex-col overflow-y-auto m-2 rounded-[var(--radius-lg)] border border-border bg-surface shadow-md rail-scroll"
       aria-label="Graph controls"
     >
       {onCollapse && (
@@ -145,7 +145,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search documents"
             aria-label="Search documents"
-            className="w-full h-9 pl-6 pr-2 bg-background border border-border text-[11px] focus:outline-none focus:border-accent"
+            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus:border-accent"
           />
         </div>
         {hits.length > 0 && (
@@ -224,9 +224,9 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "inline-flex items-center h-7 px-2 border font-mono text-[10px] uppercase tracking-[0.12em]",
+                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold",
                 view.types.has(k)
-                  ? "border-foreground text-foreground"
+                  ? "border-primary bg-primary/10 text-primary"
                   : "border-border text-foreground-muted opacity-70",
               )}
             >
@@ -246,9 +246,9 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               aria-label={`Toggle ${r}`}
               aria-pressed={view.relations.has(r)}
               className={cn(
-                "inline-flex items-center h-7 px-2 border font-mono text-[10px] uppercase tracking-[0.12em] text-left",
+                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold text-left",
                 view.relations.has(r)
-                  ? "border-foreground text-foreground"
+                  ? "border-primary bg-primary/10 text-primary"
                   : "border-border text-foreground-muted opacity-70",
               )}
             >
@@ -322,7 +322,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             }}
             placeholder="Name this view"
             aria-label="View name"
-            className="w-full h-7 px-2 bg-background border border-accent text-[11px] focus:outline-none mb-1"
+            className="w-full h-7 px-2 rounded-[var(--radius-sm)] bg-background border border-accent text-[11px] focus:outline-none mb-1"
           />
         )}
         {saved.length === 0 && savingName === null ? (

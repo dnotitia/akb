@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { keycloakExchange, markSsoSession, setToken } from "@/lib/api";
+import { Logo } from "@/components/logo";
 
 /**
  * Keycloak SSO landing page. The backend callback redirects the browser
@@ -56,16 +57,19 @@ export default function AuthCallbackPage() {
   }, [navigate]);
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-      <div className="flex flex-col items-center gap-4 font-mono text-sm text-foreground-muted">
-        {error ? (
-          <span>Redirecting…</span>
-        ) : (
-          <>
-            <Loader2 className="h-6 w-6 animate-spin" aria-hidden />
-            <span>Completing sign-in…</span>
-          </>
-        )}
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
+      <div className="hero-glow w-full max-w-md mx-auto fade-up flex flex-col items-center gap-8">
+        <Logo size={40} subtitle />
+        <div className="flex flex-col items-center gap-4 coord">
+          {error ? (
+            <span>Redirecting…</span>
+          ) : (
+            <>
+              <Loader2 className="h-6 w-6 animate-spin text-accent" aria-hidden />
+              <span>Completing sign-in…</span>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

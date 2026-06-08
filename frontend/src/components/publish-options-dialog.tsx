@@ -133,7 +133,7 @@ export function PublishOptionsDialog({
           {/* Expiry */}
           <div>
             <Label className="coord-ink mb-1.5 block">EXPIRES</Label>
-            <div className="grid grid-cols-5 gap-px border border-border bg-border">
+            <div className="grid grid-cols-5 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
               {EXPIRY_PRESETS.map((p) => {
                 const active = expiresIn === p.value;
                 return (
@@ -142,9 +142,9 @@ export function PublishOptionsDialog({
                     type="button"
                     onClick={() => setExpiresIn(p.value)}
                     aria-pressed={active}
-                    className={`px-2 py-2 text-xs font-mono uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
+                    className={`px-2 py-2 text-xs font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                       active
-                        ? "bg-foreground text-background"
+                        ? "bg-primary text-primary-foreground"
                         : "bg-surface text-foreground hover:bg-surface-muted"
                     }`}
                   >

@@ -1,175 +1,204 @@
+/* AKB design system — unified with the akb-platform family.
+   dnotitia palette (teal primary #004059, Lamborghini orange accent #E55E2C),
+   Pretendard typography, soft cool-gray surfaces, 12px radius, glass + aurora
+   atmosphere. Tailwind v4 @theme bridge. Token *alias names* are kept stable so
+   every existing shadcn-style component inherits the new look unchanged; only
+   the values changed. Family-native names (teal/orange/surface-2/subtle) are
+   added alongside for new components. */
+
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-@import "@fontsource/ibm-plex-sans/300.css";
-@import "@fontsource/ibm-plex-sans/400.css";
-@import "@fontsource/ibm-plex-sans/500.css";
-@import "@fontsource/ibm-plex-sans/600.css";
-@import "@fontsource/ibm-plex-sans/700.css";
+/* Pretendard (bundled npm webfont — closed-network safe, no CDN) + JetBrains mono */
+@import "pretendard/dist/web/variable/pretendardvariable.css";
 @import "@fontsource-variable/jetbrains-mono";
-@import "@fontsource-variable/fraunces";
-@import "@fontsource/ibm-plex-serif/400.css";
-@import "@fontsource/ibm-plex-serif/500.css";
-@import "@fontsource/ibm-plex-serif/600.css";
-@import "@fontsource/ibm-plex-serif/400-italic.css";
-@import "@fontsource/ibm-plex-serif/500-italic.css";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  /* ── Primitives (legacy names, kept as aliases for older utilities) ── */
-  --color-paper: #faf9f5;
-  --color-ink: #0a0908;
-  --color-smoke: #75716b;
-  --color-whisper: #ecebe6;
-  --color-spark: #ff4d12;
-  --color-ember: #c63d09;
+  /* ── dnotitia brand ─────────────────────────────────────────────── */
+  --color-teal: #004059;
+  --color-teal-2: #0a6f86;
+  --color-orange: #e55e2c;
 
-  /* ── Semantic tokens (light default) ──────────────────────────────── */
-  --color-background: #faf9f5;
+  /* ── Semantic tokens (light default) ────────────────────────────── */
+  --color-background: #f6f7f9;
   --color-surface: #ffffff;
-  --color-surface-muted: #ecebe6;
-  --color-foreground: #0a0908;
-  --color-foreground-muted: #75716b;
-  --color-border: #0a0908;
-  --color-border-strong: #0a0908;
-  --color-accent: #ff4d12;
-  --color-accent-foreground: #faf9f5;
-  --color-success: #16a34a;
-  --color-success-foreground: #04200d;  /* dark green text on success bg */
-  --color-warning: #ca8a04;
-  --color-destructive: #c63d09;
-  --color-destructive-foreground: #faf9f5;
-  --color-ring: #ff4d12;
-  --color-info: #3b82f6;
-  --color-good: #16a34a;
+  --color-surface-2: #ebeef2;
+  --color-surface-muted: #ebeef2;     /* AKB alias == family surface-2 */
+  --color-foreground: #1d1d1f;
+  --color-foreground-muted: #5e6068;
+  --color-subtle: #94989e;
+  --color-border: #dfe3e8;
+  --color-border-strong: #c8ced6;
 
-  /* shadcn alias (existing components inherit) */
-  --color-primary: #0a0908;
-  --color-primary-foreground: #faf9f5;
-  --color-secondary: #ecebe6;
-  --color-secondary-foreground: #0a0908;
-  --color-muted: #ecebe6;
-  --color-muted-foreground: #75716b;
+  --color-accent: #e55e2c;
+  --color-accent-foreground: #ffffff;
+  --color-success: #228b54;
+  --color-success-foreground: #04200d;
+  --color-warning: #b06000;
+  --color-danger: #c42424;
+  --color-destructive: #c42424;
+  --color-destructive-foreground: #ffffff;
+  --color-ring: #004059;
+  --color-info: #1d627c;
+  --color-good: #228b54;
+
+  /* shadcn alias set (existing components inherit) — primary is teal now */
+  --color-primary: #004059;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #ebeef2;
+  --color-secondary-foreground: #1d1d1f;
+  --color-muted: #ebeef2;
+  --color-muted-foreground: #5e6068;
   --color-card: #ffffff;
-  --color-card-foreground: #0a0908;
-  --color-input: #0a0908;
+  --color-card-foreground: #1d1d1f;
+  --color-input: #dfe3e8;
   --color-popover: #ffffff;
-  --color-popover-foreground: #0a0908;
+  --color-popover-foreground: #1d1d1f;
 
-  /* Typography */
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
-  --font-serif: "IBM Plex Serif", "Tiempos Text", "Iowan Old Style", Georgia, serif;
-  --font-display: "Fraunces Variable", "Fraunces", ui-serif, Georgia, serif;
+  /* legacy primitive aliases (kept so any old utility refs still resolve) */
+  --color-paper: #f6f7f9;
+  --color-ink: #1d1d1f;
+  --color-smoke: #5e6068;
+  --color-whisper: #ebeef2;
+  --color-spark: #e55e2c;
+  --color-ember: #c42424;
 
-  /* Motion */
-  --duration-fast: 150ms;
-  --duration-base: 200ms;
-  --duration-slow: 300ms;
-  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  /* ── Typography — Pretendard everywhere (family unification) ─────── */
+  --font-sans: "Pretendard Variable", "Pretendard", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-serif: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
+  --font-display: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
+
+  /* ── Radius — soft, rounded family look (12px controls, 14px cards,
+     16px modals/hero — mirrors seahorse/akb-platform) ─────────────── */
+  --radius: 0.875rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;   /* buttons, inputs, chips */
+  --radius-lg: 0.875rem;  /* cards, panels, lists */
+  --radius-xl: 1rem;      /* dialogs, hero marks */
+
+  /* ── Elevation — soft, cool-tinted shadows ──────────────────────── */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.07), 0 2px 6px rgba(16, 24, 40, 0.05);
+  --shadow-lg: 0 16px 40px rgba(16, 24, 40, 0.1), 0 6px 14px rgba(16, 24, 40, 0.06);
+
+  /* ── Glass / translucency ───────────────────────────────────────── */
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(255, 255, 255, 0.5);
+  --glass-blur: 12px;
+
+  /* ── Motion ─────────────────────────────────────────────────────── */
+  --duration-fast: 120ms;
+  --duration-base: 220ms;
+  --duration-slow: 420ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in: cubic-bezier(0.4, 0, 1, 1);
-  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
-
-  /* Sharp by default */
-  --radius-sm: 0;
-  --radius-md: 0;
-  --radius-lg: 0;
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
 }
 
-/* ── Dark mode overrides ─────────────────────────────────────────── */
+/* ── Dark mode — overrides semantic tokens; brand teal/orange persist ─ */
 .dark {
-  --color-background: #0f172a;
-  --color-surface: #1b2336;
-  --color-surface-muted: #272f42;
-  --color-foreground: #f8fafc;
-  --color-foreground-muted: #94a3b8;
-  --color-border: #334155;
-  --color-border-strong: #475569;
-  --color-accent: #ff4d12;
-  --color-accent-foreground: #0f172a;
-  --color-success: #22c55e;
-  --color-success-foreground: #0a1f12;  /* dark text on lighter success */
-  --color-warning: #eab308;
-  --color-destructive: #ef4444;
-  --color-destructive-foreground: #f8fafc;
-  --color-ring: #ff4d12;
-  --color-info: #60a5fa;
-  --color-good: #7ea563;
+  color-scheme: dark;
+  --color-background: #0b0f14;
+  --color-surface: #121821;
+  --color-surface-2: #1b2430;
+  --color-surface-muted: #1b2430;
+  --color-foreground: #e7eaef;
+  --color-foreground-muted: #9aa4af;
+  --color-subtle: #6b7682;
+  --color-border: #26303c;
+  --color-border-strong: #36424f;
 
-  --color-primary: #f8fafc;
-  --color-primary-foreground: #0f172a;
-  --color-secondary: #272f42;
-  --color-secondary-foreground: #f8fafc;
-  --color-muted: #272f42;
-  --color-muted-foreground: #94a3b8;
-  --color-card: #1b2336;
-  --color-card-foreground: #f8fafc;
-  --color-input: #334155;
-  --color-popover: #1b2336;
-  --color-popover-foreground: #f8fafc;
+  --color-accent: #e55e2c;
+  --color-accent-foreground: #ffffff;
+  --color-success: #3fb27a;
+  --color-success-foreground: #0a1f12;
+  --color-warning: #d9912f;
+  --color-danger: #e06464;
+  --color-destructive: #e06464;
+  --color-destructive-foreground: #0b0f14;
+  --color-ring: #0a6f86;
+  --color-info: #4aa3c4;
+  --color-good: #3fb27a;
+
+  --color-primary: #0a6f86;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #1b2430;
+  --color-secondary-foreground: #e7eaef;
+  --color-muted: #1b2430;
+  --color-muted-foreground: #9aa4af;
+  --color-card: #121821;
+  --color-card-foreground: #e7eaef;
+  --color-input: #26303c;
+  --color-popover: #121821;
+  --color-popover-foreground: #e7eaef;
+
+  --color-whisper: #1b2430;
+
+  --glass-bg: rgba(18, 24, 33, 0.62);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.55);
 }
 
 /* ── Global ──────────────────────────────────────────────────────── */
-html, body {
-  font-family: var(--font-sans);
-  background: var(--color-background);
-  color: var(--color-foreground);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  font-feature-settings: "ss01", "ss02";
-}
-
-*, *::before, *::after {
+* {
   border-color: var(--color-border);
 }
 
-::selection {
-  background: var(--color-accent);
-  color: var(--color-accent-foreground);
+html, body, #root {
+  height: 100%;
+  margin: 0;
 }
 
-/* ── Typography utilities ────────────────────────────────────────── */
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background-color: var(--color-teal);
+  color: #fff;
+}
+
+/* ── Typography utilities — all Pretendard now ───────────────────── */
 .font-display {
   font-family: var(--font-display);
-  font-optical-sizing: auto;
-  font-variation-settings: "opsz" 144, "SOFT" 30;
-  font-weight: 400;
-  letter-spacing: -0.025em;
-  line-height: 0.95;
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .font-display-tight {
   font-family: var(--font-display);
-  font-optical-sizing: auto;
-  font-variation-settings: "opsz" 144, "SOFT" 30;
-  font-weight: 500;
-  letter-spacing: -0.04em;
-  line-height: 0.92;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
 }
 
-/* Publication prose body (Fraunces readable body, editorial tone) */
 .font-display-body {
-  font-family: var(--font-display);
-  font-variation-settings: "opsz" 14, "SOFT" 30;
+  font-family: var(--font-sans);
   font-weight: 400;
   letter-spacing: 0;
   line-height: 1.75;
 }
 
-/* Archive-grade serif — for internal display hierarchy (vault titles, doc H1).
-   Obsidian-like read-focus with warm tone. IBM Plex Serif. */
 .font-serif {
   font-family: var(--font-serif);
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: -0.015em;
 }
 
 .font-serif-italic {
   font-family: var(--font-serif);
-  font-weight: 400;
-  font-style: italic;
-  letter-spacing: -0.005em;
+  font-weight: 500;
+  font-style: normal;
+  letter-spacing: -0.01em;
 }
 
 .font-mono {
@@ -177,31 +206,38 @@ html, body {
   font-feature-settings: "zero", "ss01";
 }
 
+/* signature mono "coordinate" labels — retoned to family palette */
 .coord {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: var(--color-foreground-muted);
-}
-
-.coord-ink {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: var(--color-foreground);
-}
-
-.coord-spark {
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-family: var(--font-sans);
+  font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.09em;
+  color: var(--color-foreground-muted);
+}
+.coord-ink {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--color-foreground);
+}
+.coord-spark {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
   color: var(--color-accent);
+}
+
+/* colored category eyebrow (feature tiles) */
+.eyebrow {
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -210,33 +246,139 @@ h1, h2, h3, h4, h5, h6 {
   letter-spacing: -0.012em;
 }
 
-/* tabular figures for numeric columns */
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── Glass + atmosphere (family signature) ───────────────────────── */
+.glass {
+  background-color: var(--glass-bg);
+  backdrop-filter: saturate(180%) blur(var(--glass-blur));
+  -webkit-backdrop-filter: saturate(180%) blur(var(--glass-blur));
+  border-color: var(--glass-border);
+}
+
+/* App header: glass + thin teal→orange gradient underline + soft lift */
+.app-header {
+  background-color: var(--glass-bg);
+  backdrop-filter: saturate(180%) blur(var(--glass-blur));
+  -webkit-backdrop-filter: saturate(180%) blur(var(--glass-blur));
+  border-bottom: 1px solid transparent;
+  border-image: linear-gradient(90deg, rgba(0, 64, 89, 0.35), rgba(229, 94, 44, 0.35)) 1;
+  box-shadow: 0 1px 0 rgba(16, 24, 40, 0.02), 0 8px 24px -16px rgba(0, 64, 89, 0.25);
+}
+
+/* Gradient brand wordmark */
+.brand-gradient {
+  background: linear-gradient(92deg, var(--color-teal) 0%, #0a6f86 45%, var(--color-orange) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.brand-mark {
+  filter: drop-shadow(0 2px 6px rgba(0, 64, 89, 0.18));
+}
+
+/* Aurora: soft fixed gradient-mesh glow behind everything */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(45rem 45rem at 8% -12%, rgba(0, 64, 89, 0.1), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.09), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(0, 64, 89, 0.06), transparent 60%);
+}
+#root {
+  position: relative;
+  z-index: 1;
+}
+.dark body::before {
+  background:
+    radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.22), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.16), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.14), transparent 60%);
+}
+
+/* interactive card: lift + shadow on hover */
+.card-hover {
+  transition:
+    transform var(--duration-base) var(--ease-out),
+    box-shadow var(--duration-base) var(--ease-out);
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+/* focused radial spotlight behind a hero mark (auth/landing) */
+.hero-glow {
+  position: relative;
+}
+.hero-glow::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 28rem;
+  height: 28rem;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, rgba(229, 94, 44, 0.22), rgba(0, 64, 89, 0.12) 35%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+.hero-glow > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Feature iconography (colored gradient tiles) ────────────────── */
+.feature-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 16px;
+  color: #fff;
+  box-shadow: var(--shadow-md);
+}
+.feat-knowledge { background: linear-gradient(135deg, #0a6f86, #14b8a6); }
+.feat-agent     { background: linear-gradient(135deg, #5b6ef5, #8b5cf6); }
+.feat-memory    { background: linear-gradient(135deg, #e8932f, #e55e2c); }
+.feat-collector { background: linear-gradient(135deg, #2f7fe8, #22b8d9); }
+.feat-metering  { background: linear-gradient(135deg, #e55e2c, #d9434f); }
+.feat-members   { background: linear-gradient(135deg, #7c4ddc, #b05cf6); }
+.feat-neutral   { background: linear-gradient(135deg, #5e6068, #8a8f98); }
+.feat-eyebrow-knowledge { color: #14b8a6; }
+.feat-eyebrow-agent     { color: #8b5cf6; }
+.feat-eyebrow-memory    { color: #e8932f; }
+.feat-eyebrow-collector { color: #22b8d9; }
+.feat-eyebrow-metering  { color: #e07a3c; }
+.feat-eyebrow-members   { color: #b05cf6; }
+.feat-eyebrow-neutral   { color: var(--color-foreground-muted); }
+
 /* ── Motion ──────────────────────────────────────────────────────── */
+@keyframes akb-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.animate-in {
+  animation: akb-in var(--duration-slow) var(--ease-out) both;
+}
+
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-
 @keyframes fade-in {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
+.fade-up { animation: fade-up var(--duration-slow) var(--ease-out) both; }
+.fade-in { animation: fade-in var(--duration-base) var(--ease-out) both; }
 
-.fade-up {
-  animation: fade-up var(--duration-slow) var(--ease-out) both;
-}
-
-.fade-in {
-  animation: fade-in var(--duration-base) var(--ease-out) both;
-}
-
-.stagger > * {
-  animation: fade-up var(--duration-slow) var(--ease-out) both;
-}
+.stagger > * { animation: fade-up var(--duration-slow) var(--ease-out) both; }
 .stagger > *:nth-child(1) { animation-delay: 40ms; }
 .stagger > *:nth-child(2) { animation-delay: 80ms; }
 .stagger > *:nth-child(3) { animation-delay: 120ms; }
@@ -246,6 +388,14 @@ h1, h2, h3, h4, h5, h6 {
 .stagger > *:nth-child(7) { animation-delay: 280ms; }
 .stagger > *:nth-child(8) { animation-delay: 320ms; }
 
+.transition-token {
+  transition:
+    background-color var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out),
+    border-color var(--duration-fast) var(--ease-in-out),
+    box-shadow var(--duration-fast) var(--ease-in-out);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 1ms !important;
@@ -253,28 +403,26 @@ h1, h2, h3, h4, h5, h6 {
     transition-duration: 1ms !important;
     scroll-behavior: auto !important;
   }
+  .card-hover:hover { transform: none; }
 }
 
-/* ── Focus ring (accent-safe, used on accent-colored surfaces) ───── */
-.focus-ring {
-  outline: none;
-}
+/* ── Focus ring ──────────────────────────────────────────────────── */
+.focus-ring { outline: none; }
 .focus-ring:focus-visible {
   outline: 2px solid var(--color-ring);
   outline-offset: 2px;
 }
 
-/* ── Prose (markdown) — reading-first, quiet by default ──────────── */
+/* ── Prose (markdown) — reading-first ────────────────────────────── */
 .prose {
   color: var(--color-foreground);
-  max-width: 70ch;
+  max-width: 72ch;
   line-height: 1.75;
 }
-
 .prose a {
-  color: var(--color-foreground);
+  color: var(--color-primary);
   text-decoration: underline;
-  text-decoration-color: var(--color-foreground-muted);
+  text-decoration-color: color-mix(in srgb, var(--color-primary) 40%, transparent);
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
   transition: color 150ms, text-decoration-color 150ms;
@@ -290,27 +438,24 @@ h1, h2, h3, h4, h5, h6 {
 }
 .prose h2 { font-size: 1.5em; margin-top: 2em; margin-bottom: 0.6em; }
 .prose h3 { font-size: 1.2em; margin-top: 1.6em; margin-bottom: 0.4em; }
-
-/* Inline code: soft muted tone, no border — blends with text */
 .prose code {
   font-family: var(--font-mono);
-  background: var(--color-surface-muted);
+  background: var(--color-surface-2);
   color: var(--color-foreground);
-  padding: 0.08em 0.32em;
+  padding: 0.08em 0.36em;
   font-size: 0.88em;
-  border-radius: 0;
+  border-radius: 6px;
   font-weight: 500;
 }
-/* Strip the default prose wrapping quotes around inline code */
 .prose code::before, .prose code::after { content: none; }
-
 .prose pre {
   font-family: var(--font-mono);
-  background: var(--color-surface-muted);
+  background: var(--color-surface-2);
   color: var(--color-foreground);
   padding: 1em;
   overflow-x: auto;
   border: 1px solid var(--color-border);
+  border-radius: var(--radius);
   font-size: 0.88em;
 }
 .prose pre code {
@@ -330,41 +475,44 @@ h1, h2, h3, h4, h5, h6 {
 .prose li { margin-top: 0.35em; margin-bottom: 0.35em; }
 .prose li p { margin-top: 0.2em; margin-bottom: 0.2em; }
 .prose hr { border-color: var(--color-border); }
-
-/* Wide markdown tables stay inside the reading column on mobile by
-   becoming horizontally scrollable instead of pushing the page wider. */
 .prose table {
   display: block;
   overflow-x: auto;
   max-width: 100%;
   border-collapse: collapse;
 }
+.dark .prose, .dark .prose strong { color: var(--color-foreground); }
+.dark .prose h1, .dark .prose h2, .dark .prose h3, .dark .prose h4 { color: var(--color-foreground); }
 
-.dark .prose { color: var(--color-foreground); }
-.dark .prose strong { color: var(--color-foreground); }
-.dark .prose h1, .dark .prose h2, .dark .prose h3, .dark .prose h4 {
-  color: var(--color-foreground);
+/* ── MarkdownRender (.akb-md) — KaTeX math ───────────────────────
+   The shared <MarkdownRender> component styles block elements via its
+   components map; KaTeX, however, injects its own DOM (.katex-display)
+   that we can't reach through react-markdown's component overrides. So
+   the display-math card + inline color land here, scoped to .akb-md. */
+.akb-md .katex { color: var(--color-foreground); }
+.akb-md .katex-display {
+  margin: 1.25rem 0;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
 }
-.dark .prose a { text-decoration-color: var(--color-foreground-muted); }
+.akb-md .katex-display > .katex { white-space: nowrap; }
 
-/* ── Hairline utilities (preserved from v0.5) ────────────────────── */
+/* ── Hairline + misc utilities (preserved) ──────────────────────── */
 .hairline-b { border-bottom: 1px solid var(--color-border); }
 .hairline-t { border-top: 1px solid var(--color-border); }
 .hairline-l { border-left: 1px solid var(--color-border); }
 .hairline-r { border-right: 1px solid var(--color-border); }
+.whisper-bg { background: var(--color-surface-2); }
 
-/* ── Whisper background (preserved as semantic-muted alias) ──────── */
-.whisper-bg { background: var(--color-surface-muted); }
-
-/* ── Dotted background (auth/landing hero only) ──────────────────── */
 .dotted {
   background-image: radial-gradient(var(--color-border) 1px, transparent 1px);
   background-size: 12px 12px;
 }
 
-/* ── Rail scroll — subtle scrollbar for secondary side panels ──────
-   Used when a rail pane (outline, history) can overflow. Keeps the
-   scrollbar faint so it doesn't compete with the primary content. */
 .rail-scroll { scrollbar-gutter: stable; scrollbar-width: thin; }
 .rail-scroll::-webkit-scrollbar { width: 6px; }
 .rail-scroll::-webkit-scrollbar-track { background: transparent; }

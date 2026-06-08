@@ -61,10 +61,10 @@ export default function VaultActivityPage() {
       </div>
 
       <div className="coord mb-3">VAULT · {name.toUpperCase()} · ACTIVITY</div>
-      <h1 className="font-serif text-[44px] leading-[0.95] tracking-[-0.03em] text-foreground mb-2">
-        Activity<span className="text-foreground-muted">.</span>
+      <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
+        Activity<span className="text-accent">.</span>
       </h1>
-      <p className="font-serif-italic text-[16px] leading-[1.55] text-foreground-muted mb-10 max-w-prose">
+      <p className="text-sm leading-relaxed text-foreground-muted mb-10 max-w-prose">
         Every commit landed in this vault. Filter by who made it — agents and humans
         share the same log.
       </p>
@@ -102,7 +102,7 @@ export default function VaultActivityPage() {
                 key={a}
                 type="button"
                 onClick={() => setAuthor(a)}
-                className="inline-flex items-baseline gap-1 px-2 py-1 border border-border text-xs hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                className="inline-flex items-baseline gap-1 px-2 py-1 rounded-[var(--radius-md)] border border-border text-xs hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
                 <span className="font-mono">{a}</span>
                 <span className="coord tabular-nums">{n}</span>
@@ -114,7 +114,7 @@ export default function VaultActivityPage() {
 
       {/* List */}
       {error ? (
-        <div role="alert" className="border border-destructive p-3 mt-4 text-sm">
+        <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-3 mt-4 text-sm">
           <span className="coord-spark mb-1 block text-destructive">⚠ FAILED TO LOAD</span>
           {error}
         </div>
@@ -130,7 +130,7 @@ export default function VaultActivityPage() {
           }
         />
       ) : (
-        <ol className="border border-border bg-surface divide-y divide-border mt-0">
+        <ol className="rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm divide-y divide-border mt-4">
           {entries.map((e, i) => {
             const filesCount = e.files?.length || 0;
             const primary = e.files?.[0];

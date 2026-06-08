@@ -390,7 +390,7 @@ function CanvasButton({
       title={label}
       aria-label={label}
       aria-pressed={active}
-      className={`inline-flex items-center justify-center h-8 w-8 border focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer ${
+      className={`inline-flex items-center justify-center h-8 w-8 rounded-[var(--radius-md)] border shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer ${
         active
           ? "bg-accent/10 border-accent text-accent"
           : "bg-surface border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"

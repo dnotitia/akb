@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   ArrowRight,
@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PageHeader } from "@/components/ui/page-header";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -20,6 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { RoleBadge } from "@/components/status-badge";
+import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
   getRecent,
@@ -29,8 +31,7 @@ import {
   getVaultInfo,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-
-const MCP_URL = `${window.location.origin}/mcp/`;
+import { mcpInstallSnippets } from "@/lib/mcp-snippets";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 
@@ -78,6 +79,8 @@ export default function HomePage() {
   const [newName, setNewName] = useState("");
   const [tab, setTab] = useState<Tab>("claude");
   const [vaultFilter, setVaultFilter] = useState("");
+  const [quickstartOpen, setQuickstartOpen] = useState(false);
+  const quickstartChecked = useRef(false);
   const location = useLocation();
 
   useEffect(() => {
@@ -123,7 +126,16 @@ export default function HomePage() {
   async function loadPATs() {
     try {
       const d = await listPATs();
-      setPats(d.tokens || []);
+      const toks = d.tokens || [];
+      setPats(toks);
+      // First-run quickstart: surface the connect flow once when a fresh
+      // account has no tokens yet (unless the user opted out).
+      if (!quickstartChecked.current) {
+        quickstartChecked.current = true;
+        if (toks.length === 0 && localStorage.getItem(QUICKSTART_DISMISS_KEY) !== "1") {
+          setQuickstartOpen(true);
+        }
+      }
     } catch {
       /* non-fatal: leave pats empty */
     }
@@ -152,42 +164,7 @@ export default function HomePage() {
   }
 
   const pat = activePat || "<YOUR_PAT>";
-  const snippets = useMemo(
-    () => ({
-      claude: `claude mcp add --scope user akb -- npx akb-mcp --url ${MCP_URL} --pat ${pat} --insecure`,
-      cursor: JSON.stringify(
-        {
-          mcpServers: {
-            akb: { command: "npx", args: ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"] },
-          },
-        },
-        null,
-        2,
-      ),
-      codex: `codex mcp add akb -- npx akb-mcp --url ${MCP_URL} --pat ${pat} --insecure`,
-      vscode: JSON.stringify(
-        {
-          servers: {
-            akb: { type: "stdio", command: "npx", args: ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"] },
-          },
-        },
-        null,
-        2,
-      ),
-      openclaw: JSON.stringify(
-        {
-          mcp: {
-            servers: {
-              akb: { command: "npx", args: ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"] },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-    }),
-    [pat],
-  );
+  const snippets = useMemo(() => mcpInstallSnippets(pat), [pat]);
 
   const q = vaultFilter.trim().toLowerCase();
   const filteredVaults = q
@@ -200,20 +177,21 @@ export default function HomePage() {
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
     <div className="fade-up">
-      {/* Masthead tagline — editorial signature (matches /auth's
-          Fraunces + accent italic treatment), one line so returning
-          users pass over it quickly. */}
-      <p
-        className={
-          "font-display-tight mb-10 leading-[1.05] tracking-tight text-foreground " +
-          "text-3xl sm:text-4xl lg:text-[40px] lg:mb-12"
+      {/* Page header — centralized design-system primitive */}
+      <PageHeader
+        title="Workspace"
+        subtitle="Wire your agent into the base — vaults, recent activity, and connection tokens."
+        actions={
+          <Button asChild variant="accent" size="md">
+            <Link to="/vault/new">
+              <Plus className="h-4 w-4" aria-hidden />
+              New vault
+            </Link>
+          </Button>
         }
-      >
-        Wire your agent{" "}
-        <span className="italic text-accent">into the base</span>.
-      </p>
+      />
 
-      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-x-10 gap-y-10">
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
       {/* ── Main column ──────────────────────────────────────── */}
       <div className="space-y-10 min-w-0">
         {/* § 01 Recent — top priority, the jump-back-in list. */}
@@ -230,7 +208,7 @@ export default function HomePage() {
               description="Recent document writes across all your vaults will appear here."
             />
           ) : (
-            <ol className="border-x border-b border-border divide-y divide-border">
+            <ol className="mt-3 rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm">
               {recent.map((c, i) => (
                 <li key={c.doc_id + c.changed_at}>
                   <Link
@@ -303,7 +281,7 @@ export default function HomePage() {
           ) : filteredVaults.length === 0 ? (
             <EmptyState title={`No matches for "${vaultFilter}"`} />
           ) : (
-            <ol className="border border-border divide-y divide-border">
+            <ol className="mt-3 rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm">
               {filteredVaults.map((v, i) => {
                 const m = vaultMetrics[v.name];
                 const lastActivity = m?.last_activity;
@@ -358,7 +336,7 @@ export default function HomePage() {
       {/* ── Right rail ───────────────────────────────────────── */}
       <aside className="space-y-8 min-w-0">
         {/* Summary stats */}
-        <section className="border border-border bg-surface">
+        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
           <div className="border-b border-border px-4 py-2">
             <span className="coord-ink">§ AT A GLANCE</span>
           </div>
@@ -375,7 +353,7 @@ export default function HomePage() {
 
         {/* Connect — always open. Mint + snippet tabs kept; prompt examples
             moved to docs-territory since they're one-time guidance. */}
-        <section className="border border-border bg-surface">
+        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
           <div className="flex items-baseline justify-between gap-2 px-4 py-3">
             <span className="coord-ink">§ CONNECT</span>
             <div className="flex items-baseline gap-3">
@@ -471,7 +449,7 @@ export default function HomePage() {
                   </TabsList>
                   <TabsContent value={tab}>
                     <div className="border border-border">
-                      <div className="flex items-center justify-between border-b border-border bg-foreground text-background px-2 py-1">
+                      <div className="flex items-center justify-between border-b border-border bg-surface-2 text-foreground px-2 py-1">
                         <span className="font-mono text-[9px] uppercase tracking-wider truncate">
                           {tab === "claude" && "TERMINAL"}
                           {tab === "cursor" && "mcp.json"}
@@ -547,6 +525,12 @@ export default function HomePage() {
           await revokePAT(pendingRevoke.token_id);
           await loadPATs();
         }}
+      />
+
+      <QuickstartDialog
+        open={quickstartOpen}
+        onOpenChange={setQuickstartOpen}
+        onTokenCreated={loadPATs}
       />
     </div>
   );

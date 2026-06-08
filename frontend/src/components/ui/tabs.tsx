@@ -11,7 +11,7 @@ const TabsList = forwardRef<
   <TabsPrimitive.List
     ref={ref}
     className={cn(
-      "inline-flex items-stretch gap-0 border-b border-border",
+      "inline-flex items-center gap-1 rounded-[var(--radius-md)] bg-surface-2 p-1",
       className,
     )}
     {...props}
@@ -26,17 +26,13 @@ const TabsTrigger = forwardRef<
   <TabsPrimitive.Trigger
     ref={ref}
     className={cn(
-      "inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium",
-      "text-foreground-muted hover:text-foreground hover:bg-surface-muted/60",
-      "border-b-[3px] border-transparent -mb-px",
-      // Active tab — filled surface + strong accent underline + accent coord numerals
-      "data-[state=active]:text-foreground",
-      "data-[state=active]:font-semibold",
-      "data-[state=active]:bg-surface",
-      "data-[state=active]:border-accent",
+      "inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-[var(--radius-sm)] text-sm font-medium whitespace-nowrap",
+      "text-foreground-muted hover:text-foreground",
+      // Active tab — soft raised pill (segmented control), accent coord numerals
+      "data-[state=active]:bg-surface data-[state=active]:text-foreground data-[state=active]:shadow-sm",
       "data-[state=active]:[&_.coord]:text-accent",
-      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-      "transition-colors duration-150 cursor-pointer",
+      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+      "transition-token cursor-pointer",
       className,
     )}
     {...props}

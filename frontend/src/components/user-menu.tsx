@@ -55,10 +55,10 @@ export function UserMenu() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Account menu — ${label}`}
-        className="inline-flex h-9 items-center gap-2 border border-border bg-surface px-2 text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer"
+        className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
       >
         <span
-          className="inline-flex h-5 w-5 items-center justify-center bg-accent text-accent-foreground font-mono text-[10px] font-semibold"
+          className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-[var(--color-teal)] to-[var(--color-teal-2)] text-white font-mono text-[10px] font-semibold"
           aria-hidden
         >
           {initial}
@@ -71,7 +71,7 @@ export function UserMenu() {
         <DropdownMenu.Content
           align="end"
           sideOffset={6}
-          className="z-50 min-w-[240px] border border-border bg-surface p-1 shadow-none"
+          className="z-50 min-w-[240px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           {/* Identity header */}
           <div className="px-3 py-2 border-b border-border mb-1">
@@ -102,7 +102,7 @@ export function UserMenu() {
                   type="button"
                   onClick={() => setTheme(opt)}
                   aria-pressed={active}
-                  className={`flex-1 inline-flex items-center justify-center gap-1 h-7 text-xs font-mono uppercase tracking-wider border transition-colors cursor-pointer ${
+                  className={`flex-1 inline-flex items-center justify-center gap-1 h-7 text-xs font-medium rounded-[var(--radius-md)] border transition-colors cursor-pointer ${
                     active
                       ? "border-accent text-accent bg-accent/5"
                       : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"
