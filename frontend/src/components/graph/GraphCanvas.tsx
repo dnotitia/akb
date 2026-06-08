@@ -200,6 +200,24 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // Selected node: a glowing accent halo ring so the selection is
+      // unmistakable (the inner accent border alone read too subtly).
+      if (isSelected) {
+        const pad = 5;
+        ctx.save();
+        ctx.shadowColor = colors.accent;
+        ctx.shadowBlur = 12;
+        ctx.strokeStyle = colors.accent;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(
+          x - NODE_SIZE / 2 - pad,
+          y - NODE_SIZE / 2 - pad,
+          NODE_SIZE + pad * 2,
+          NODE_SIZE + pad * 2,
+        );
+        ctx.restore();
+      }
+
       if (isPinned) {
         ctx.fillStyle = colors.accent;
         ctx.fillRect(x + NODE_SIZE / 2 - 3, y - NODE_SIZE / 2, 3, 3);
