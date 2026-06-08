@@ -33,6 +33,17 @@ export interface GraphEdge {
   relation: RelationKind;
 }
 
+/** A related-resource reference from the detail panel's RELATIONS list —
+ *  carries enough (name, kind, relation, direction) to materialize the node
+ *  AND its edge in the graph when the relation isn't currently rendered. */
+export interface RelatedRef {
+  uri: string;
+  name: string;
+  kind: NodeKind;
+  relation: RelationKind;
+  direction: "incoming" | "outgoing";
+}
+
 export interface GraphView {
   entry?: string;
   // BFS traversal radius in edge hops from the entry node. The
