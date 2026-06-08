@@ -23,6 +23,7 @@ from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import VectorHit, get_vector_store
 from app.services.rerank_service import RerankError, rerank
+from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
 
@@ -115,8 +116,15 @@ class SearchService:
         limit: int = 10,
         user_id: str | None = None,
         include_archived: bool = False,
+        source_uris: list[str] | None = None,
     ) -> SearchResponse:
-        """Hybrid search across documents. See module docstring for flow."""
+        """Hybrid search across documents. See module docstring for flow.
+
+        ``source_uris`` (optional) restricts the search to a specific set of
+        resources — each is resolved to its (ACL-checked) source id and
+        intersected with the other filters, so retrieval runs only inside that
+        set. An empty/omitted list means no restriction (default behaviour).
+        """
         # ACL guard mirroring `grep` below: when neither vault nor
         # user_id scopes the query, the prefilter block ends up
         # skipped (has_filters=False) and `_run_vector_search` runs
@@ -142,7 +150,7 @@ class SearchService:
 
         # Always pre-filter when user_id is provided so we never leak
         # documents from vaults the user can't read.
-        has_filters = any([vault, collection, doc_type, tags, user_id])
+        has_filters = any([vault, collection, doc_type, tags, user_id, source_uris])
         candidate_source_ids: list[str] | None = None
 
         if has_filters:
@@ -157,6 +165,18 @@ class SearchService:
                     is_admin = bool(await conn.fetchval(
                         "SELECT is_admin FROM users WHERE id = $1", user_uuid,
                     ))
+
+                # Resolve an explicit `source_uris` scope to per-kind source
+                # ids. ACL is NOT enforced here — the candidate queries below
+                # carry the owner/grant/public predicate, so any resolved id
+                # the user can't read is dropped from the final candidate set.
+                src_doc_ids: list[str] = []
+                src_table_ids: list[str] = []
+                src_file_ids: list[str] = []
+                if source_uris:
+                    src_doc_ids, src_table_ids, src_file_ids = (
+                        await self._resolve_source_uris(conn, source_uris)
+                    )
 
                 def _vault_acl(param_idx: int) -> tuple[str | None, list]:
                     """Returns (sql_fragment, params) for the
@@ -191,6 +211,10 @@ class SearchService:
                     conditions.append(acl_sql)
                     params.extend(acl_params); idx += 1
 
+                if source_uris:
+                    conditions.append(f"d.id = ANY(${idx}::uuid[])")
+                    params.append(src_doc_ids); idx += 1
+
                 # Default-hide archived documents from discovery; opt back in
                 # with include_archived=true. (Status literal — no bind param;
                 # only the document candidate query carries doc status.)
@@ -221,6 +245,9 @@ class SearchService:
                     if acl_sql:
                         t_conds.append(acl_sql)
                         t_params.extend(acl_params)
+                    if source_uris:
+                        t_conds.append(f"t.id = ANY(${len(t_params) + 1}::uuid[])")
+                        t_params.append(src_table_ids)
                     q = "SELECT t.id FROM vault_tables t JOIN vaults v ON t.vault_id = v.id"
                     if t_conds:
                         q += " WHERE " + " AND ".join(t_conds)
@@ -244,6 +271,9 @@ class SearchService:
                     if acl_sql:
                         f_conds.append(acl_sql)
                         f_params.extend(acl_params)
+                    if source_uris:
+                        f_conds.append(f"f.id = ANY(${len(f_params) + 1}::uuid[])")
+                        f_params.append(src_file_ids)
                     q = (
                         "SELECT f.id FROM vault_files f "
                         "JOIN vaults v ON f.vault_id = v.id "
@@ -324,6 +354,72 @@ class SearchService:
             hint=hint,
             results=results,
         )
+
+    async def _resolve_source_uris(
+        self, conn, source_uris: list[str]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Resolve a list of ``akb://`` resource URIs into per-kind source ids
+        ``(doc_ids, table_ids, file_ids)`` for the candidate prefilter.
+
+        - doc   → ``documents.id`` matched by path OR id (canonical doc URIs
+          carry the full vault-relative path; ``find_by_ref`` semantics)
+        - table → ``vault_tables.id`` matched by ``name`` (UNIQUE per vault)
+        - file  → the URI identifier IS the file uuid; validated, used as-is
+
+        Unparseable / non-resource (coll/vault) / unknown URIs are skipped.
+        ACL is applied later by the candidate queries, so this resolution is
+        purely structural.
+        """
+        doc_refs_by_vault: dict[str, list[str]] = {}
+        table_names_by_vault: dict[str, list[str]] = {}
+        file_ids: list[str] = []
+        for u in source_uris:
+            p = parse_uri(u)
+            if p is None or p.identifier is None:
+                continue
+            if p.kind == "doc":
+                doc_refs_by_vault.setdefault(p.vault, []).append(p.identifier)
+            elif p.kind == "table":
+                table_names_by_vault.setdefault(p.vault, []).append(p.identifier)
+            elif p.kind == "file":
+                try:
+                    uuid.UUID(p.identifier)
+                except ValueError:
+                    continue
+                file_ids.append(p.identifier)
+
+        vault_names = set(doc_refs_by_vault) | set(table_names_by_vault)
+        vault_id_by_name: dict[str, uuid.UUID] = {}
+        if vault_names:
+            rows = await conn.fetch(
+                "SELECT id, name FROM vaults WHERE name = ANY($1)", list(vault_names)
+            )
+            vault_id_by_name = {r["name"]: r["id"] for r in rows}
+
+        doc_ids: list[str] = []
+        for vname, refs in doc_refs_by_vault.items():
+            vid = vault_id_by_name.get(vname)
+            if vid is None:
+                continue
+            rows = await conn.fetch(
+                "SELECT id FROM documents "
+                "WHERE vault_id = $1 AND (path = ANY($2) OR id::text = ANY($2))",
+                vid, refs,
+            )
+            doc_ids.extend(str(r["id"]) for r in rows)
+
+        table_ids: list[str] = []
+        for vname, names in table_names_by_vault.items():
+            vid = vault_id_by_name.get(vname)
+            if vid is None:
+                continue
+            rows = await conn.fetch(
+                "SELECT id FROM vault_tables WHERE vault_id = $1 AND name = ANY($2)",
+                vid, names,
+            )
+            table_ids.extend(str(r["id"]) for r in rows)
+
+        return doc_ids, table_ids, file_ids
 
     async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
         from app.services.index_service import SOURCE_TYPES

@@ -509,6 +509,7 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         limit=args.get("limit", 10),
         user_id=uid,
         include_archived=args.get("include_archived", False),
+        source_uris=args.get("source_uris"),
     )
     return result.model_dump()
 

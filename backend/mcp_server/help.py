@@ -182,6 +182,11 @@ Combines **vector similarity** (semantic meaning) with **keyword matching**.
 akb_search(query="how does authentication work")
 akb_search(query="gRPC vs REST", vault="engineering", type="decision")
 akb_search(query="invoice", tags=["finance"])
+# restrict to a known set of resources (hybrid retrieval runs only inside them):
+akb_search(query="auth flow", source_uris=[
+    "akb://engineering/coll/specs/doc/auth.md",
+    "akb://engineering/coll/decisions/doc/oauth.md",
+])
 ```
 
 **Results include:**
