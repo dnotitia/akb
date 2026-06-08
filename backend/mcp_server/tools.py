@@ -349,6 +349,17 @@ TOOLS = [
                     "default": False,
                     "description": "Include archived documents. Default false — `status: archived` docs are hidden from search.",
                 },
+                "source_uris": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Restrict the search to a specific set of already-known resources "
+                        "by their canonical akb:// URIs (e.g. from a previous akb_search / "
+                        "akb_browse). Hybrid retrieval (dense + BM25 + ranking) runs only "
+                        "inside this set, intersected with the other filters and your access. "
+                        "Omit for the normal whole-vault search."
+                    ),
+                },
             },
             "required": ["query"],
         },
