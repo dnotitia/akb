@@ -16,9 +16,10 @@ What changed is *where* and *how* it's reported:
 - `table_service.create_table` now pre-validates the identifier length immediately after deriving `pg_table_name(...)` and **before any DDL**, raising `ValidationError` (HTTP **422**) with a message that names the offending identifier, its length, the limit, and which name (vault or table) to shorten.
 - The sibling name-shape check (the `_TABLE_NAME_RE` guard) was likewise raising a bare `ValueError` → 500; it now raises `ValidationError` (422) too, so every malformed-name rejection is a clean 4xx.
 - The 63-byte bound is now a single named constant `table_data_repo.PG_IDENT_MAX_LEN`, consumed by both the new pre-check and `role_sync`'s defense-in-depth guard (no more magic `63` in two places).
+- **MCP transport:** `ValidationError` is an `AKBError`, not a `ValueError`, so the `akb_create_table` handler's `except ValueError` would have let these rejections fall to the dispatch catch-all as `code="internal"` instead of `invalid_argument`. The handler now catches `ValidationError` (→ `invalid_argument`) and `ConflictError` (→ `conflict`, previously also mis-coded `internal`), keeping the error caller-actionable for agents.
 
 ### Tests
-`tests/test_table_identifier_unit.py` pins the constant and the 63/64-byte boundary math. New `tests/test_table_name_length_unit.py` exercises `create_table` with a fake pool: the exact E08 trigger returns 422 **and** never reaches `create_dynamic_table`, and a malformed name returns 422 (not 500). Both run in CI (no DB).
+`tests/test_table_identifier_unit.py` pins the constant and the 63/64-byte boundary math. `tests/test_table_name_length_unit.py` exercises `create_table` with a fake pool: the exact E08 trigger returns 422 **and** never reaches `create_dynamic_table`, a 63-byte identifier passes the guard (off-by-one fence), and a malformed name returns 422 (not 500) — all CI (no DB). `tests/test_mcp_e2e.sh` §11 asserts the over-long name comes back as `invalid_argument` over the real JSON-RPC transport (post-deploy).
 
 ## 0.8.4 — 2026-06-07  *(patch — agent-memory: user_id-keyed vaults + Claude Code SessionEnd reasons)*
 
