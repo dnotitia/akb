@@ -1,7 +1,7 @@
 // frontend/src/components/graph/GraphCanvas.tsx
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
-import { Pause, Play, Maximize2, Minus, Plus } from "lucide-react";
+import { Pause, Play, Maximize2, Minus, Plus, Boxes } from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
 import {
   RELATION_DASH,
@@ -11,6 +11,7 @@ import {
   type GraphColors,
 } from "./graph-types";
 import { endpointUri } from "./use-graph-data";
+import { groupPaint, forceCluster, drawClusterHulls, isDarkBg, CLUSTER_STRENGTH } from "./cluster";
 
 export interface GraphCanvasHandle {
   centerOnNode: (uri: string) => void;
@@ -64,6 +65,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
   const [frozen, setFrozen] = useState(false);
+  const [clustered, setClustered] = useState(true);
 
   useImperativeHandle(
     ref,
@@ -85,12 +87,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    if (degraded || frozen) {
-      fg.d3Force("center", null);
-      fg.pauseAnimation();
-    } else {
-      fg.resumeAnimation();
-    }
+    // Pause the sim while frozen/degraded. We intentionally leave the built-in
+    // 'center' force installed — pausing already stops all ticks, and nulling
+    // center permanently would let the layout drift off-centre on a later
+    // resume/reheat.
+    if (degraded || frozen) fg.pauseAnimation();
+    else fg.resumeAnimation();
   }, [degraded, frozen]);
 
   // Auto fit-to-view once when nodes first populate
@@ -104,6 +106,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     return () => clearTimeout(t);
   }, [nodes.length]);
 
+  // node.group is assigned at data ingest (use-graph-data.ts), so it travels
+  // with the node and this stays a pure filter.
   const visibleNodes = useMemo(
     () => nodes.filter((n) => !hidden.has(n.uri)),
     [nodes, hidden],
@@ -121,31 +125,67 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [visibleNodes, visibleEdges],
   );
 
+  // Group colors adapt to the active theme (lighter on dark bg, darker on
+  // light bg) so cluster rings/hulls never wash out.
+  const dark = useMemo(() => isDarkBg(colors.background), [colors]);
+
+  // Install/remove the cluster force on the three STATE inputs only — not on
+  // graphData. force-graph already re-feeds nodes + reheats to alpha(1) on
+  // every data change, so depending on graphData here would double-reheat and
+  // jolt the layout on every selection/filter. Cleanup nulls the force so a
+  // StrictMode double-mount stays symmetric.
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    const on = clustered && !degraded && !frozen;
+    fg.d3Force("cluster", on ? (forceCluster(CLUSTER_STRENGTH) as never) : null);
+    // Repaint after a toggle/resume: while the engine is live a reheat both
+    // re-clumps the layout and forces a redraw — so turning clusters OFF
+    // actually clears the hulls instead of leaving them until the next pan.
+    if (!degraded && !frozen) fg.d3ReheatSimulation();
+    return () => {
+      fgRef.current?.d3Force("cluster", null);
+    };
+  }, [clustered, degraded, frozen]);
+
+  // Draw the rounded cluster hulls under the nodes/links each frame.
+  const renderFramePre = useCallback(
+    (ctx: CanvasRenderingContext2D, scale: number) => {
+      if (!clustered) return;
+      drawClusterHulls(ctx, graphData.nodes as GraphNode[], scale, dark);
+    },
+    [clustered, graphData, dark],
+  );
+
   const paintNode = useCallback(
     (n: RenderNode, ctx: CanvasRenderingContext2D, scale: number) => {
       const x = n.x || 0;
       const y = n.y || 0;
       const isSelected = n.uri === selected;
       const isPinned = pinned.has(n.uri);
+      // Cluster membership re-tints the node ring (keeping the kind-based
+      // fill + glyph so document/table/file stay distinguishable). Selection
+      // always wins; ungrouped nodes keep their kind stroke.
+      const groupStroke = clustered && n.group ? groupPaint(n.group, dark).node : null;
 
       ctx.beginPath();
       ctx.rect(x - NODE_SIZE / 2, y - NODE_SIZE / 2, NODE_SIZE, NODE_SIZE);
       switch (n.kind) {
         case "document":
           ctx.fillStyle = colors.surfaceMuted;
-          ctx.strokeStyle = isSelected ? colors.accent : colors.foreground;
+          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.foreground);
           ctx.lineWidth = isSelected ? 2.5 : 1.5;
           ctx.setLineDash([]);
           break;
         case "table":
           ctx.fillStyle = colors.surface;
-          ctx.strokeStyle = colors.accent;
+          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.accent);
           ctx.lineWidth = isSelected ? 2.5 : 1.5;
           ctx.setLineDash([]);
           break;
         case "file":
           ctx.fillStyle = "transparent";
-          ctx.strokeStyle = isSelected ? colors.accent : colors.foregroundMuted;
+          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.foregroundMuted);
           ctx.lineWidth = isSelected ? 2.5 : 1;
           ctx.setLineDash([3, 2]);
           break;
@@ -177,7 +217,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         ctx.fillText(label, x, y + NODE_SIZE / 2 + 4);
       }
     },
-    [colors, selected, pinned],
+    [colors, selected, pinned, clustered, dark],
   );
 
   const paintLink = useCallback(
@@ -241,6 +281,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     >
       <div className="absolute top-3 left-3 z-10 flex gap-1">
         <CanvasButton
+          onClick={() => setClustered((c) => !c)}
+          label={clustered ? "Hide clusters" : "Show clusters"}
+          icon={Boxes}
+          active={clustered}
+        />
+        <CanvasButton
           onClick={() => setFrozen((f) => !f)}
           label={frozen ? "Resume" : "Freeze"}
           icon={frozen ? Play : Pause}
@@ -270,6 +316,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkTarget="target"
         nodeCanvasObject={paintNode as never}
         linkCanvasObject={paintLink as never}
+        onRenderFramePre={renderFramePre as never}
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
         linkDirectionalArrowColor={colors.foregroundMuted}
@@ -293,10 +340,13 @@ function CanvasButton({
   onClick,
   label,
   icon: Icon,
+  active = false,
 }: {
   onClick: () => void;
   label: string;
   icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+  /** Renders a pressed/accent state for toggle buttons. */
+  active?: boolean;
 }) {
   return (
     <button
@@ -304,7 +354,12 @@ function CanvasButton({
       onClick={onClick}
       title={label}
       aria-label={label}
-      className="inline-flex items-center justify-center h-8 w-8 bg-surface border border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer"
+      aria-pressed={active}
+      className={`inline-flex items-center justify-center h-8 w-8 border focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer ${
+        active
+          ? "bg-accent/10 border-accent text-accent"
+          : "bg-surface border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+      }`}
     >
       <Icon className="h-3 w-3" aria-hidden />
     </button>

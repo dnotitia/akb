@@ -2,6 +2,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { getGraph, getRelations, type RelationRow } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
+import { groupOf } from "./cluster";
 import {
   ALL_NODE_KINDS,
   type GraphEdge,
@@ -128,6 +129,7 @@ function rowToNeighbor(row: RelationRow): GraphNode | null {
     uri: row.uri,
     name: row.name || row.uri,
     kind: normalizeKind(row.resource_type),
+    group: groupOf(row.uri),
   };
 }
 
@@ -181,6 +183,7 @@ export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
     name: entry,
     kind: "document",
     doc_id: entry,
+    group: groupOf(seedResp.uri),
   };
   const nodesByUri = new Map<string, GraphNode>([[seedNode.uri, seedNode]]);
   const edgeKeys = new Set<string>();
@@ -250,6 +253,7 @@ export function useFullGraph(vault: string, enabled: boolean) {
         uri: n.uri,
         name: n.name || n.uri,
         kind: normalizeKind(n.resource_type),
+        group: groupOf(n.uri),
       }));
       const edges: GraphEdge[] = resp.edges
         .map((e) => {
