@@ -53,10 +53,30 @@ export default function GraphPage() {
     setOverlay({ nodes: [], edges: [] });
   }, [view.entry, view.hops, vault]);
 
-  const merged = useMemo(() => {
-    const m = mergeGraph(base || { nodes: [], edges: [] }, overlay);
-    return applyFilters(m, view);
-  }, [base, overlay, view]);
+  // Selection is highlight-only and MUST NOT relayout the graph. `view` is a
+  // fresh object on every selection (URL search change → queryToView), so
+  // depending on `view` here rebuilt `merged` — and thus graphData identity —
+  // on every click, which made force-graph reheat the simulation (alpha=1)
+  // and the clusters drift farther apart each click. Recompute only when the
+  // graph STRUCTURE changes (data, overlay, filters, entry/hops); a stable
+  // structureKey across selection keeps graphData identity stable → no reheat.
+  const structureKey = useMemo(
+    () =>
+      JSON.stringify({
+        entry: view.entry ?? null,
+        hops: view.hops,
+        types: [...view.types].sort(),
+        relations: [...view.relations].sort(),
+      }),
+    [view],
+  );
+  const merged = useMemo(
+    () => applyFilters(mergeGraph(base || { nodes: [], edges: [] }, overlay), view),
+    // `selected` is intentionally excluded; structureKey captures every view
+    // field that affects graph structure/filtering.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [base, overlay, structureKey],
+  );
 
   const canvasRef = useRef<GraphCanvasHandle>(null);
 
