@@ -216,6 +216,66 @@ async def test_document_update_rejects_stale_expected_content_hash() -> None:
     }
 
 
+class _RecordingGit:
+    """Captures the `commit` argument read_file is invoked with."""
+
+    def __init__(self, raw: str):
+        self.raw = raw
+        self.read_commits: list[str | None] = []
+
+    def read_file(self, vault: str, path: str, commit: str | None = None) -> str:
+        self.read_commits.append(commit)
+        return self.raw
+
+
+@pytest.mark.asyncio
+async def test_document_get_reads_body_at_current_commit_not_head(monkeypatch) -> None:
+    """E03 regression: get() must read the body at the row's current_commit,
+    not the floating vault HEAD. Reading HEAD lets a concurrent writer advance
+    git between the DB-row read and the git read, so a single response could
+    carry a body and a current_commit from different writers. Pinning the read
+    to current_commit keeps the (content, current_commit) pair consistent."""
+    commit = "d" * 40
+    row = {
+        "id": uuid.uuid4(),
+        "vault_name": "race-vault",
+        "path": "race/probe.md",
+        "title": "Probe",
+        "doc_type": "note",
+        "status": "active",
+        "summary": None,
+        "domain": None,
+        "created_by": "tester",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+        "current_commit": commit,
+        "content_hash": None,
+        "hash_algorithm": None,
+        "content_hash_commit": None,
+        "tags": [],
+    }
+    git = _RecordingGit("---\ntitle: Probe\n---\nWRITER_07\n")
+    service = DocumentService(git=git)
+
+    async def fake_repos():
+        return _FakeVaultRepo(uuid.uuid4()), _FakeDocRepo(row), object()
+
+    async def fake_public_slug(vault: str, path: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_repos", fake_repos)
+    monkeypatch.setattr(service, "_get_public_slug", fake_public_slug)
+
+    result = await service.get("race-vault", "race/probe.md")
+
+    # The body must be read pinned to current_commit, never the floating HEAD.
+    assert git.read_commits == [commit], (
+        f"get() read the body at {git.read_commits!r}, expected [{commit!r}] "
+        "(reading HEAD reintroduces the E03 read-side race)"
+    )
+    assert result.current_commit == commit
+
+
 # ── akb_put status option ──────────────────────────────────────────
 
 
