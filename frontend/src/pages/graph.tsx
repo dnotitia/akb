@@ -17,6 +17,7 @@ import {
 } from "@/components/graph/use-graph-data";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
 import { kindToSegment, type GraphEdge, type GraphNode, type GraphView } from "@/components/graph/graph-types";
+import { parseUri } from "@/lib/uri";
 
 const DOUBLECLICK_MS = 250;
 
@@ -194,7 +195,7 @@ export default function GraphPage() {
             ref={canvasRef}
             nodes={merged.nodes}
             edges={merged.edges}
-            selected={view.selected}
+            selected={selectedNode?.uri}
             pinned={pinned}
             hidden={hidden}
             degraded={degraded}
@@ -210,11 +211,15 @@ export default function GraphPage() {
           docId={selectedDocId}
           kind={selectedNode.kind}
           uri={selectedNode.uri}
-          onSelectUri={(uri) => {
-            const sel = docIdFromUri(uri) ?? uri;
-            setView({ ...view, selected: sel });
+          onOpenUri={(openUri) => {
+            // Clicking a related resource navigates to its own document page
+            // (using the target URI's OWN vault, which may differ).
+            const p = parseUri(openUri);
+            const id = docIdFromUri(openUri);
+            if (!p || !id || (p.kind !== "doc" && p.kind !== "table" && p.kind !== "file")) return;
+            navigate(`/vault/${p.vault}/${p.kind}/${encodeURIComponent(id)}`);
           }}
-          onFitToNode={(uri) => canvasRef.current?.centerOnNode(uri)}
+          onFitToNode={(fitUri) => canvasRef.current?.centerOnNode(fitUri)}
           onClose={() => setView({ ...view, selected: undefined })}
           onTogglePin={() => {
             setPinned((prev) => {

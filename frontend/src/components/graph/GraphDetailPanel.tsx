@@ -15,7 +15,8 @@ interface Props {
   docId: string;
   kind: NodeKind;
   uri: string;
-  onSelectUri: (uri: string) => void;
+  /** Navigate to (open) the related resource's own document page. */
+  onOpenUri: (uri: string) => void;
   onFitToNode: (uri: string) => void;
   onClose: () => void;
   onTogglePin?: () => void;
@@ -47,7 +48,7 @@ export function GraphDetailPanel({
   docId,
   kind,
   uri,
-  onSelectUri,
+  onOpenUri,
   onFitToNode,
   onClose,
   onTogglePin,
@@ -187,7 +188,7 @@ export function GraphDetailPanel({
                 relation={g.relation}
                 direction="out"
                 rows={g.rows}
-                onSelectUri={onSelectUri}
+                onOpenUri={onOpenUri}
                 onFitToNode={onFitToNode}
               />
             ))}
@@ -197,7 +198,7 @@ export function GraphDetailPanel({
                 relation={g.relation}
                 direction="in"
                 rows={g.rows}
-                onSelectUri={onSelectUri}
+                onOpenUri={onOpenUri}
                 onFitToNode={onFitToNode}
               />
             ))}
@@ -302,13 +303,13 @@ function RelGroup({
   relation,
   direction,
   rows,
-  onSelectUri,
+  onOpenUri,
   onFitToNode,
 }: {
   relation: RelationKind;
   direction: "in" | "out";
   rows: GroupedRel["rows"];
-  onSelectUri: (uri: string) => void;
+  onOpenUri: (uri: string) => void;
   onFitToNode: (uri: string) => void;
 }) {
   return (
@@ -318,20 +319,26 @@ function RelGroup({
       </p>
       <ul className="flex flex-col gap-px pl-2">
         {rows.map((r) => (
-          <li key={r.other_uri} className="flex items-center gap-1">
+          <li key={r.other_uri} className="group flex items-center gap-1">
+            {/* Primary click opens the related document's own page. */}
             <button
               type="button"
-              onClick={() => onSelectUri(r.other_uri)}
-              title={r.other_name}
-              className="flex-1 text-left text-[11px] hover:text-accent truncate"
+              onClick={() => onOpenUri(r.other_uri)}
+              title={`${r.other_name} — 열기`}
+              className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-accent hover:underline cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              {r.other_name}
+              <span className="truncate">{r.other_name}</span>
+              <ExternalLink
+                className="h-2.5 w-2.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                aria-hidden
+              />
             </button>
             <button
               type="button"
               onClick={() => onFitToNode(r.other_uri)}
-              aria-label="Center on node"
-              className="text-foreground-muted hover:text-foreground"
+              aria-label="Locate in graph"
+              title="Locate in graph"
+              className="shrink-0 text-foreground-muted hover:text-foreground cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               ⌖
             </button>

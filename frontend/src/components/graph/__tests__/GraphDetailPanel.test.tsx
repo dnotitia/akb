@@ -60,7 +60,7 @@ describe("GraphDetailPanel · document node", () => {
           docId="d-1"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onOpenUri={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -72,6 +72,34 @@ describe("GraphDetailPanel · document node", () => {
     expect(screen.getByText("alpha")).toBeTruthy();
     expect(screen.getByText(/depends_on/i)).toBeTruthy();
     expect(screen.getByText(/line1/)).toBeTruthy();
+  });
+
+  it("calls onOpenUri with the target when a related document is clicked", async () => {
+    getDocument.mockResolvedValue({ doc_id: "d-1", title: "Hello", content: "" });
+    getRelations.mockResolvedValue({
+      doc_id: "d-1",
+      uri: "akb://akb/doc/x",
+      relations: [
+        { direction: "outgoing", relation: "depends_on", uri: "akb://akb/doc/y", name: "Y", resource_type: "document" },
+      ],
+    });
+    const onOpenUri = vi.fn();
+    const u = userEvent.setup();
+    render(
+      wrap(
+        <GraphDetailPanel
+          vault="akb"
+          docId="d-1"
+          kind="document"
+          uri="akb://akb/doc/x"
+          onOpenUri={onOpenUri}
+          onFitToNode={() => {}}
+          onClose={() => {}}
+        />,
+      ),
+    );
+    await u.click(await screen.findByRole("button", { name: "Y" }));
+    expect(onOpenUri).toHaveBeenCalledWith("akb://akb/doc/y");
   });
 
   it("defers META fetches until the section expands", async () => {
@@ -91,7 +119,7 @@ describe("GraphDetailPanel · document node", () => {
           docId="d-1"
           kind="document"
           uri="u"
-          onSelectUri={() => {}}
+          onOpenUri={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -116,7 +144,7 @@ describe("GraphDetailPanel · fetch states", () => {
           docId="d-x"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onOpenUri={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -142,7 +170,7 @@ describe("GraphDetailPanel · fetch states", () => {
           docId="d-x"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onOpenUri={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -170,7 +198,7 @@ describe("GraphDetailPanel · table node", () => {
           docId="t-1"
           kind="table"
           uri="u"
-          onSelectUri={() => {}}
+          onOpenUri={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
