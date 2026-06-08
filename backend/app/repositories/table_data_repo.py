@@ -45,6 +45,14 @@ def _sanitize_pg_part(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "_", s.lower().replace("-", "_"))
 
 
+# PostgreSQL truncates identifiers past NAMEDATALEN-1 (63 bytes by
+# default) *silently*. A truncated `vt_*` name could collide with a
+# different table — so we refuse, rather than truncate, names that
+# don't fit. `role_sync._is_safe_pg_table_name` enforces the same bound
+# as defense-in-depth; this constant is the single source for both.
+PG_IDENT_MAX_LEN = 63
+
+
 def pg_table_name(vault_name: str, table_name: str) -> str:
     """Return the PG table name for a vault-scoped table:
     `vt_{sanitised_vault}__{sanitised_table}`."""

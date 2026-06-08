@@ -5,6 +5,21 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.5 — 2026-06-08  *(patch — table create: clean 422 for over-long PG identifiers instead of an opaque 500)*
+
+Creating a table whose PostgreSQL identifier `vt_<vault>__<table>` would exceed PostgreSQL's 63-byte `NAMEDATALEN` limit failed with an **opaque HTTP 500**. The over-long name passed table creation but tripped `role_sync._is_safe_pg_table_name` during the in-transaction `GRANT`, which `raise`d `ValueError("unsafe pg_table_name … refusing grant")` deep in the stack. Found by a concurrency test (E08) whose long ephemeral vault name (`prod-conc-…`, 27 chars) + long table name (32 chars) produced a 64-char identifier — exactly one byte over.
+
+The safety check is **correct and stays** — PG *silently truncates* identifiers past 63 bytes, so granting on a truncated `vt_*` name risks a truncation-collision where a privilege lands on the wrong table. We must refuse, not truncate.
+
+What changed is *where* and *how* it's reported:
+
+- `table_service.create_table` now pre-validates the identifier length immediately after deriving `pg_table_name(...)` and **before any DDL**, raising `ValidationError` (HTTP **422**) with a message that names the offending identifier, its length, the limit, and which name (vault or table) to shorten.
+- The sibling name-shape check (the `_TABLE_NAME_RE` guard) was likewise raising a bare `ValueError` → 500; it now raises `ValidationError` (422) too, so every malformed-name rejection is a clean 4xx.
+- The 63-byte bound is now a single named constant `table_data_repo.PG_IDENT_MAX_LEN`, consumed by both the new pre-check and `role_sync`'s defense-in-depth guard (no more magic `63` in two places).
+
+### Tests
+`tests/test_table_identifier_unit.py` pins the constant and the 63/64-byte boundary math. New `tests/test_table_name_length_unit.py` exercises `create_table` with a fake pool: the exact E08 trigger returns 422 **and** never reaches `create_dynamic_table`, and a malformed name returns 422 (not 500). Both run in CI (no DB).
+
 ## 0.8.4 — 2026-06-07  *(patch — agent-memory: user_id-keyed vaults + Claude Code SessionEnd reasons)*
 
 Two fixes to the agent-session lifecycle surface (`/api/v1/agent-sessions/*`) that together made the `akb-claude-code` lifecycle plugin unusable for a large class of users. Both were confirmed against a live deployment before the fix.

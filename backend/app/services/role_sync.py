@@ -78,6 +78,8 @@ from typing import Optional
 
 import asyncpg
 
+from app.repositories.table_data_repo import PG_IDENT_MAX_LEN
+
 logger = logging.getLogger("akb.role_sync")
 
 
@@ -122,8 +124,12 @@ _VT_TABLE_RE = re.compile(r"^vt_[a-z0-9_]+__[a-z0-9_]+$")
 
 def _is_safe_pg_table_name(name: str) -> bool:
     """Guard before interpolating a `vt_*` name into raw SQL. Upstream
-    `pg_table_name` already sanitizes; this is defense-in-depth."""
-    return bool(_VT_TABLE_RE.match(name)) and len(name) <= 63
+    `pg_table_name` already sanitizes; this is defense-in-depth.
+
+    Over-long names are refused here too, but `table_service.create_table`
+    pre-validates the length and returns a clean 422 — so a well-formed
+    request never reaches this guard with an over-long name."""
+    return bool(_VT_TABLE_RE.match(name)) and len(name) <= PG_IDENT_MAX_LEN
 
 
 # ── Reconcile report ──────────────────────────────────────────
