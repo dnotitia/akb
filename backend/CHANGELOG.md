@@ -5,6 +5,19 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.6 — 2026-06-08  *(patch — GET document: read body at the row's current_commit, not floating HEAD (E03 read-side race))*
+
+`GET /documents/{vault}/{id}` (`akb_get`) assembled its response from **two unsynchronized reads**: the body via `git.read_file(vault, path)` — which reads the *floating vault HEAD* — and `current_commit` from the DB row. Under concurrent updates to the **same** document, a writer could advance git HEAD and the DB row between those two reads, so a single response carried a `content` and a `current_commit` belonging to **different writers** (the "E03" symptom: body ↔ current_commit disagree).
+
+Reproduced against the live cluster: at quiescence the two always agree (writes are correctly serialized by the PG path-lock + git vault-lock, so there is no persistent divergence and no data loss), but **during** a 20-writer / 6-reader hammer ~44% of GET responses were internally inconsistent.
+
+Fix: `document_service.get` now reads the body **at `row["current_commit"]`** instead of HEAD, so the `(content, current_commit)` pair is consistent by construction (and semantically correct — `current_commit` is the document's version pointer, whereas HEAD is vault-wide and can even point at another document's commit). A NULL `current_commit` on legacy rows falls back to HEAD inside `read_file`, so there is no behavior change for un-pinned documents.
+
+This is a *read-path* fix; it does not touch the (correct) write serialization. The earlier read-path hypotheses (repo caching, bare-vs-worktree ref divergence) were ruled out — the real cause was the non-atomic two-source assembly in `get()`.
+
+### Tests
+`tests/test_document_hash_contract_unit.py` gains `test_document_get_reads_body_at_current_commit_not_head`, which asserts `read_file` is invoked with the row's `current_commit` (a revert to the HEAD read fails it). Verified end-to-end with a concurrent read/write harness against the deployed cluster: inconsistent GETs dropped from ~44% to 0.
+
 ## 0.8.5 — 2026-06-08  *(patch — table create: clean 422 for over-long PG identifiers instead of an opaque 500)*
 
 Creating a table whose PostgreSQL identifier `vt_<vault>__<table>` would exceed PostgreSQL's 63-byte `NAMEDATALEN` limit failed with an **opaque HTTP 500**. The over-long name passed table creation but tripped `role_sync._is_safe_pg_table_name` during the in-transaction `GRANT`, which `raise`d `ValueError("unsafe pg_table_name … refusing grant")` deep in the stack. Found by a concurrency test (E08) whose long ephemeral vault name (`prod-conc-…`, 27 chars) + long table name (32 chars) produced a 64-char identifier — exactly one byte over.

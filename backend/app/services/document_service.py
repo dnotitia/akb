@@ -411,7 +411,17 @@ class DocumentService:
         if not row:
             raise NotFoundError("Document", doc_ref)
 
-        content = await asyncio.to_thread(self.git.read_file, vault, row["path"])
+        # Read the body at the row's recorded commit, NOT the floating vault
+        # HEAD. This GET assembles `content` (from git) and `current_commit`
+        # (from the DB row) in two separate reads; reading the body at HEAD
+        # lets a concurrent writer advance git/DB between them, so a single
+        # response could carry a body and a current_commit from *different*
+        # writers (E03). Pinning the read to row["current_commit"] makes the
+        # (content, current_commit) pair consistent by construction. A NULL
+        # current_commit (legacy rows) falls back to HEAD inside read_file.
+        content = await asyncio.to_thread(
+            self.git.read_file, vault, row["path"], row["current_commit"]
+        )
         body = ""
         if content:
             _, body = _parse_markdown(content)
