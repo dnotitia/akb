@@ -51,18 +51,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("GraphCanvas — cluster wiring", () => {
-  it("installs the cluster force + reheats + passes the hull render hook when clustering is on (default)", () => {
+  it("installs the cluster + collide forces and reheats when clustering is on (default)", () => {
     render(<GraphCanvas {...baseProps} />);
 
     const clusterCalls = d3Force.mock.calls.filter((c) => c[0] === "cluster");
+    const collideCalls = d3Force.mock.calls.filter((c) => c[0] === "collide");
     expect(clusterCalls.length).toBeGreaterThan(0);
-    // most recent install passed a force FUNCTION (not null)
+    expect(collideCalls.length).toBeGreaterThan(0);
+    // most recent installs passed a force FUNCTION (not null)
     expect(typeof clusterCalls[clusterCalls.length - 1][1]).toBe("function");
+    expect(typeof collideCalls[collideCalls.length - 1][1]).toBe("function");
     expect(d3ReheatSimulation).toHaveBeenCalled();
-    expect(typeof lastProps.onRenderFramePre).toBe("function");
   });
 
-  it("toggling clusters off nulls the force and flips aria-pressed", () => {
+  it("toggling clusters off nulls the forces and flips aria-pressed", () => {
     render(<GraphCanvas {...baseProps} />);
 
     const onBtn = screen.getByRole("button", { name: /hide clusters/i });
@@ -73,8 +75,11 @@ describe("GraphCanvas — cluster wiring", () => {
 
     const clusterCalls = d3Force.mock.calls.filter((c) => c[0] === "cluster");
     expect(clusterCalls.length).toBeGreaterThan(0);
-    // every cluster call after toggling off must remove the force (null)
+    // every cluster + collide call after toggling off must remove the force
     expect(clusterCalls.every((c) => c[1] === null)).toBe(true);
+    expect(
+      d3Force.mock.calls.filter((c) => c[0] === "collide").every((c) => c[1] === null),
+    ).toBe(true);
 
     expect(screen.getByRole("button", { name: /show clusters/i })).toHaveAttribute(
       "aria-pressed",
