@@ -32,9 +32,12 @@ export function SummaryFold({ summary, prominent = false, className = "my-4" }: 
   if (!summary) return null;
   const needsFold = summary.length > FOLD_THRESHOLD;
 
+  // Non-prominent (document page): span the full column so the summary's
+  // right edge lines up with the title / FrontmatterCard above it, which
+  // fill the column. The prominent (public-share hero) keeps a prose measure.
   const textCls = prominent
     ? "font-serif-italic text-foreground-muted text-[15px] leading-[1.6] max-w-prose"
-    : "font-serif-italic text-foreground-muted text-sm leading-[1.55] max-w-prose";
+    : "font-serif-italic text-foreground-muted text-sm leading-[1.55]";
 
   if (!needsFold) {
     return (
