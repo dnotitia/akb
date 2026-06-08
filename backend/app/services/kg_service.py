@@ -297,7 +297,23 @@ async def unlink_resources(
     delete an edge from another vault by spelling its URIs.
     The MCP handler already gates by vault access, but the service-level
     interface now enforces it too.
+
+    Endpoints are canonicalized first, exactly as ``link_resources`` does
+    on write, so a non-canonical but parseable input (slash-suffixed or
+    legacy ``akb://V/doc/{coll}/{name}`` shape) still matches the canonical
+    edge that link stored — otherwise the DELETE would silently remove
+    nothing. Both callers (MCP ``akb_unlink`` and REST ``DELETE /relations``)
+    inherit this; resolution stays centralized in the service, not
+    duplicated per surface.
     """
+    # Mirror link_resources' canonicalization (canonicalize_resource_uri).
+    src_parsed = parse_uri(source_uri)
+    if src_parsed:
+        source_uri = canonicalize_resource_uri(src_parsed) or source_uri
+    tgt_parsed = parse_uri(target_uri)
+    if tgt_parsed:
+        target_uri = canonicalize_resource_uri(tgt_parsed) or target_uri
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         params: list = [source_uri, target_uri]
