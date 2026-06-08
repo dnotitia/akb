@@ -11,7 +11,16 @@ import {
   type GraphColors,
 } from "./graph-types";
 import { endpointUri } from "./use-graph-data";
-import { groupPaint, forceCluster, drawClusterHulls, isDarkBg, CLUSTER_STRENGTH } from "./cluster";
+import {
+  groupColor,
+  forceCluster,
+  forceCollide,
+  isDarkBg,
+  CLUSTER_STRENGTH,
+  COLLIDE_RADIUS,
+  CHARGE_STRENGTH,
+  DEFAULT_CHARGE,
+} from "./cluster";
 
 export interface GraphCanvasHandle {
   centerOnNode: (uri: string) => void;
@@ -129,33 +138,30 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // light bg) so cluster rings/hulls never wash out.
   const dark = useMemo(() => isDarkBg(colors.background), [colors]);
 
-  // Install/remove the cluster force on the three STATE inputs only — not on
-  // graphData. force-graph already re-feeds nodes + reheats to alpha(1) on
+  // Install/remove the clustering forces on the three STATE inputs only — not
+  // on graphData. force-graph already re-feeds nodes + reheats to alpha(1) on
   // every data change, so depending on graphData here would double-reheat and
-  // jolt the layout on every selection/filter. Cleanup nulls the force so a
+  // jolt the layout on every selection/filter. Cleanup nulls the forces so a
   // StrictMode double-mount stays symmetric.
+  //
+  // While clustering: forceCluster pulls each group together, forceCollide
+  // keeps nodes spaced (so clumps aren't cramped), and the global charge is
+  // softened so separate clusters sit closer together rather than flying
+  // apart. All restored/removed when clustering is off.
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
     const on = clustered && !degraded && !frozen;
     fg.d3Force("cluster", on ? (forceCluster(CLUSTER_STRENGTH) as never) : null);
-    // Repaint after a toggle/resume: while the engine is live a reheat both
-    // re-clumps the layout and forces a redraw — so turning clusters OFF
-    // actually clears the hulls instead of leaving them until the next pan.
+    fg.d3Force("collide", on ? (forceCollide(COLLIDE_RADIUS) as never) : null);
+    const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
+    charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
     if (!degraded && !frozen) fg.d3ReheatSimulation();
     return () => {
       fgRef.current?.d3Force("cluster", null);
+      fgRef.current?.d3Force("collide", null);
     };
   }, [clustered, degraded, frozen]);
-
-  // Draw the rounded cluster hulls under the nodes/links each frame.
-  const renderFramePre = useCallback(
-    (ctx: CanvasRenderingContext2D, scale: number) => {
-      if (!clustered) return;
-      drawClusterHulls(ctx, graphData.nodes as GraphNode[], scale, dark);
-    },
-    [clustered, graphData, dark],
-  );
 
   const paintNode = useCallback(
     (n: RenderNode, ctx: CanvasRenderingContext2D, scale: number) => {
@@ -166,7 +172,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // Cluster membership re-tints the node ring (keeping the kind-based
       // fill + glyph so document/table/file stay distinguishable). Selection
       // always wins; ungrouped nodes keep their kind stroke.
-      const groupStroke = clustered && n.group ? groupPaint(n.group, dark).node : null;
+      const groupStroke = clustered && n.group ? groupColor(n.group, dark) : null;
 
       ctx.beginPath();
       ctx.rect(x - NODE_SIZE / 2, y - NODE_SIZE / 2, NODE_SIZE, NODE_SIZE);
@@ -316,7 +322,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkTarget="target"
         nodeCanvasObject={paintNode as never}
         linkCanvasObject={paintLink as never}
-        onRenderFramePre={renderFramePre as never}
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
         linkDirectionalArrowColor={colors.foregroundMuted}
