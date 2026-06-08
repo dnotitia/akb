@@ -147,7 +147,7 @@ export default function VaultActivityPage() {
                   <span className="font-mono text-[11px] text-accent tabular-nums">
                     {(e.hash || "").slice(0, 7)}
                   </span>
-                  <span className="font-mono text-xs text-foreground truncate">
+                  <span title={e.agent || e.author || "unknown"} className="font-mono text-xs text-foreground truncate">
                     <GitCommit
                       className="inline-block h-3 w-3 mr-1 text-info -translate-y-px"
                       aria-hidden
@@ -155,7 +155,7 @@ export default function VaultActivityPage() {
                     {e.agent || e.author || "unknown"}
                   </span>
                   <div className="min-w-0">
-                    <div className="text-sm tracking-tight truncate text-foreground group-hover:text-accent">
+                    <div title={e.subject || primary?.path || "(no subject)"} className="text-sm tracking-tight truncate text-foreground group-hover:text-accent">
                       {e.subject || primary?.path || "(no subject)"}
                     </div>
                     {primary && (

@@ -229,6 +229,7 @@ export function VaultExplorer({
       <header className="border-b border-border px-3 py-2 flex items-center justify-between gap-2 shrink-0">
         <Link
           to={`/vault/${vault}`}
+          title={vault}
           className="font-mono text-sm font-semibold truncate text-foreground hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           {vault}
@@ -432,7 +433,7 @@ const TreeRow = memo(function TreeRow({
             className="h-3 w-3 shrink-0 text-foreground-muted group-hover:text-accent transition-colors"
             aria-hidden
           />
-          <span className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
+          <span title={node.name} className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
           {count > 0 && <span className="coord ml-auto shrink-0">{count}</span>}
         </button>
         {canWrite && onCreateSubCollection && (
@@ -490,7 +491,7 @@ const TreeRow = memo(function TreeRow({
         className={`h-3 w-3 shrink-0 ${leafIconColor} group-hover:text-accent transition-colors`}
         aria-hidden
       />
-      <span className="truncate text-[13px] text-foreground group-hover:text-accent">{node.name}</span>
+      <span title={node.name} className="truncate text-[13px] text-foreground group-hover:text-accent">{node.name}</span>
       {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
     </Link>
   );

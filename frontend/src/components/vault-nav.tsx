@@ -170,7 +170,7 @@ function NavItem({
         )}
       >
         <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        <span className="truncate">{label}</span>
+        <span title={label} className="truncate">{label}</span>
       </Link>
     );
   }
@@ -190,7 +190,7 @@ function NavItem({
         className="flex items-center gap-2 px-2 flex-1 min-w-0 h-7 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
       >
         <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        <span className="truncate">{label}</span>
+        <span title={label} className="truncate">{label}</span>
       </Link>
       <button
         type="button"

@@ -219,7 +219,7 @@ export function GraphDetailPanel({
           {sectionsOpen && (
             <ul className="mb-2 flex flex-col gap-px">
               {(secQuery.data?.sections || []).map((s: any, i: number) => (
-                <li key={i} className="coord truncate">‣ {s.heading || s.title || `section ${i}`}</li>
+                <li key={i} title={s.heading || s.title || `section ${i}`} className="coord truncate">‣ {s.heading || s.title || `section ${i}`}</li>
               ))}
             </ul>
           )}
@@ -322,6 +322,7 @@ function RelGroup({
             <button
               type="button"
               onClick={() => onSelectUri(r.other_uri)}
+              title={r.other_name}
               className="flex-1 text-left text-[11px] hover:text-accent truncate"
             >
               {r.other_name}

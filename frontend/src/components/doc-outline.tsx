@@ -31,7 +31,7 @@ export function DocumentOutline({
                     : "border-transparent text-foreground-muted hover:text-foreground hover:border-border-strong"
                 }`}
               >
-                <span className="truncate block text-[12px]">{h.text}</span>
+                <span title={h.text} className="truncate block text-[12px]">{h.text}</span>
               </a>
             </li>
           );

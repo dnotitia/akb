@@ -240,14 +240,14 @@ export default function HomePage() {
                     <span className="coord tabular-nums">
                       {String(i + 1).padStart(2, "0")}
                     </span>
-                    <span className="coord font-mono tabular-nums truncate">
+                    <span title={c.vault} className="coord font-mono tabular-nums truncate">
                       {c.vault}
                     </span>
                     <div className="min-w-0">
-                      <div className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-accent">
+                      <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-accent">
                         {c.title}
                       </div>
-                      <div className="coord truncate">{c.path}</div>
+                      <div title={c.path} className="coord truncate">{c.path}</div>
                     </div>
                     <span className="coord tabular-nums w-[52px] text-right">
                       {timeAgo(c.changed_at)}
@@ -510,7 +510,7 @@ export default function HomePage() {
                         key={p.token_id}
                         className="flex items-center justify-between gap-2 px-2 py-1.5 text-xs"
                       >
-                        <span className="truncate text-foreground font-medium">{p.name}</span>
+                        <span title={p.name} className="truncate text-foreground font-medium">{p.name}</span>
                         <div className="flex items-center gap-2 shrink-0">
                           <span className="coord tabular-nums">
                             {p.last_used_at ? timeAgo(p.last_used_at) : "—"}

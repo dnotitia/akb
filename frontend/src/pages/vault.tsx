@@ -242,10 +242,10 @@ export default function VaultPage() {
                     {String(i + 1).padStart(2, "0")}
                   </span>
                   <div className="min-w-0">
-                    <div className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-accent">
+                    <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-accent">
                       {c.title}
                     </div>
-                    <div className="coord truncate">{c.path}</div>
+                    <div title={c.path} className="coord truncate">{c.path}</div>
                   </div>
                   <div className="flex items-baseline gap-3 shrink-0">
                     <span className="coord font-mono tabular-nums">
@@ -316,11 +316,11 @@ export default function VaultPage() {
                         className="group grid grid-cols-[70px_140px_1fr_auto_54px] gap-3 py-1 items-baseline hover:bg-surface-muted -mx-2 px-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         <span className="text-accent">{(c.hash || "").slice(0, 7)}</span>
-                        <span className="text-foreground truncate">
+                        <span title={c.agent || c.author || "unknown"} className="text-foreground truncate">
                           <span className="text-info">◆ </span>
                           {c.agent || c.author || "unknown"}
                         </span>
-                        <span className="text-foreground truncate">
+                        <span title={c.subject || filePath} className="text-foreground truncate">
                           {c.subject || filePath}
                           {filesCount > 1 && (
                             <span className="text-foreground-muted"> · +{filesCount - 1}</span>

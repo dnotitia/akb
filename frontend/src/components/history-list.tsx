@@ -180,7 +180,10 @@ function RowContent({
       <span className={active ? "text-accent" : "text-accent"}>
         {(entry.hash || "").slice(0, 7)}
       </span>
-      <span className={cn("truncate", active ? "text-accent" : "text-foreground-muted")}>
+      <span
+        title={`${entry.agent || entry.author || "unknown"}${entry.subject ? ` · ${entry.subject}` : ""}`}
+        className={cn("truncate", active ? "text-accent" : "text-foreground-muted")}
+      >
         <span className={active ? "text-accent" : "text-foreground-muted"}>
           {entry.agent || entry.author || "unknown"}
         </span>

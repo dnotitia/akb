@@ -239,7 +239,7 @@ export default function VaultMembersPage() {
                     </span>
                   )}
                 </div>
-                <div className="coord truncate">{m.email}</div>
+                <div title={m.email} className="coord truncate">{m.email}</div>
               </div>
               <div className="flex items-center gap-3 shrink-0">
                 {canManage && m.role !== "owner" && currentUser && m.username !== currentUser.username ? (

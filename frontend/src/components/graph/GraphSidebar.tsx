@@ -157,7 +157,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                   onClick={() => commitEntry(h)}
                   className="w-full flex items-center justify-between gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-muted"
                 >
-                  <span className="truncate">{h.title}</span>
+                  <span title={h.title} className="truncate">{h.title}</span>
                   <span className="coord">{h.type}</span>
                 </button>
               </li>
@@ -166,7 +166,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
         {view.entry && hits.length === 0 && (
           <div className="mt-1 flex items-center justify-between gap-2 px-2 h-7 text-[11px] bg-surface-muted">
-            <span className="truncate">entry: {view.entry}</span>
+            <span title={`entry: ${view.entry}`} className="truncate">entry: {view.entry}</span>
             <button
               type="button"
               onClick={() => onChange({ ...view, entry: undefined })}
@@ -278,6 +278,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => onChange({ ...view, entry: r.doc_id })}
+                  title={r.title}
                   className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:bg-accent/10 active:text-foreground truncate"
                 >
                   {r.title}
@@ -333,6 +334,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => onNavigate(s.url)}
+                  title={s.name}
                   className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:opacity-60 transition-opacity duration-150 truncate"
                 >
                   {s.name}

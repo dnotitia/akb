@@ -76,11 +76,11 @@ export function UserMenu() {
           {/* Identity header */}
           <div className="px-3 py-2 border-b border-border mb-1">
             <div className="coord">ACCOUNT</div>
-            <div className="text-sm font-medium text-foreground truncate mt-0.5">
+            <div title={label} className="text-sm font-medium text-foreground truncate mt-0.5">
               {label}
             </div>
             {user?.email && (
-              <div className="font-mono text-[11px] text-foreground-muted truncate">
+              <div title={user.email} className="font-mono text-[11px] text-foreground-muted truncate">
                 {user.email}
               </div>
             )}
