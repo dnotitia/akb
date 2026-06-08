@@ -50,6 +50,10 @@ def _sanitize_pg_part(s: str) -> str:
 # different table — so we refuse, rather than truncate, names that
 # don't fit. `role_sync._is_safe_pg_table_name` enforces the same bound
 # as defense-in-depth; this constant is the single source for both.
+# Note the bound is in *bytes*: `_sanitize_pg_part` maps every non-ASCII
+# character to `_`, so the identifier is pure ASCII and a `len()`
+# char-count equals PG's byte count — the equivalence breaks if a future
+# change ever lets multibyte characters through.
 PG_IDENT_MAX_LEN = 63
 
 

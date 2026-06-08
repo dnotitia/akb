@@ -302,6 +302,14 @@ R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"mcp_items\",\"co
 TBL_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 [ -n "$TBL_URI" ] && pass "akb_create_table ($TBL_URI)" || fail "akb_create_table" "no uri"
 
+# Over-long name → the derived `vt_<vault>__<table>` PG identifier exceeds
+# NAMEDATALEN (63). Must come back as a caller-fixable `invalid_argument`,
+# NOT an opaque `internal` (regression guard for the ValidationError fix:
+# the MCP handler's except must catch ValidationError, not just ValueError).
+LONGNAME=$(printf 'a%.0s' {1..70})
+CODE=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"$LONGNAME\",\"columns\":[{\"name\":\"x\",\"type\":\"text\"}]}" | mcp_result_field "['code']")
+[ "$CODE" = "invalid_argument" ] && pass "akb_create_table over-long name → invalid_argument" || fail "akb_create_table over-long name" "expected invalid_argument, got '$CODE'"
+
 # Insert via akb_sql
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO mcp_items (product, qty) VALUES ('Widget', 100), ('Gadget', 50)\"}" | mcp_result)
 SQL_RES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null)

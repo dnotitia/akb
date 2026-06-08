@@ -87,6 +87,39 @@ async def test_create_table_rejects_overlong_pg_name(monkeypatch):
     assert str(table_service.table_data_repo.PG_IDENT_MAX_LEN) in ei.value.message
 
 
+async def test_create_table_accepts_pg_name_at_limit(monkeypatch):
+    """Lower boundary: a 63-byte identifier (vault 27 + table 31) must
+    PASS the length guard. Proves the check is `>` not `>=`/off-by-one —
+    the math test alone can't catch a guard that rejects a legit 63-char
+    name. We stub create_dynamic_table to record it was reached, then
+    abort so the fake conn never has to carry the full DDL."""
+    vault_name = "prod-conc-1780908249-8ml717"        # 27 chars
+    table_name = "report_metrics_1780908249_8ml71"    # 31 chars → 3+27+2+31 = 63
+    assert len(table_service.table_data_repo.pg_table_name(vault_name, table_name)) == 63
+
+    async def _fake_get_pool():
+        return _FakePool(_FakeConn(vault_name))
+
+    monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
+
+    reached = {}
+
+    async def _reached_then_stop(*a, **k):
+        reached["ddl"] = True  # guard let the 63-char name through
+        raise RuntimeError("stop after guard")
+
+    monkeypatch.setattr(table_service.table_data_repo, "create_dynamic_table", _reached_then_stop)
+
+    with pytest.raises(RuntimeError, match="stop after guard"):
+        await table_service.create_table(
+            uuid.uuid4(),
+            table_name,
+            [{"name": "amount", "type": "integer"}],
+            actor_id="tester",
+        )
+    assert reached.get("ddl"), "the 63-char name was wrongly rejected by the length guard"
+
+
 async def test_create_table_invalid_name_is_422_not_500():
     """The sibling name-shape check raises ValidationError synchronously
     (before `get_pool`), so a malformed name is a clean 422 rather than an

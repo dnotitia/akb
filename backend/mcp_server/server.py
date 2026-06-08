@@ -29,7 +29,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent
 
 from app.db.postgres import get_pool, init_db, close_pool
-from app.exceptions import ConflictError, NotFoundError
+from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
@@ -828,8 +828,14 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             description=args.get("description", ""),
             collection=collection or None,
         )
-    except ValueError as e:
+    except (ValidationError, ValueError) as e:
+        # ValidationError: bad table name / over-long PG identifier (422).
+        # ValueError: still raised by _validate_column_name. Both are
+        # caller-fixable — keep the precise invalid_argument code rather
+        # than letting them fall to the dispatch catch-all as `internal`.
         return err(str(e), code=INVALID_ARGUMENT)
+    except ConflictError as e:
+        return err(str(e), code=CONFLICT)
 
 
 @_h("akb_sql")
