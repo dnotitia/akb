@@ -20,9 +20,16 @@ from app.services import table_service
 pytestmark = pytest.mark.asyncio
 
 
-class _FakeTx:
+class _AsyncCtx:
+    """Async context manager yielding a fixed value — covers both shapes
+    create_table enters: ``pool.acquire()`` (→ conn) and
+    ``conn.transaction()`` (→ value unused)."""
+
+    def __init__(self, value=None):
+        self._value = value
+
     async def __aenter__(self):
-        return self
+        return self._value
 
     async def __aexit__(self, *exc):
         return False
@@ -33,23 +40,14 @@ class _FakeConn:
         self._vault_name = vault_name
 
     def transaction(self):
-        return _FakeTx()
+        return _AsyncCtx()
 
     async def fetchrow(self, sql: str, *params):
         if "FROM vaults" in sql:
             return {"name": self._vault_name}
+        # find_by_name's "FROM vault_tables" lookup → no existing table,
+        # so create_table proceeds to the length guard (no ConflictError).
         return None
-
-
-class _FakeAcquire:
-    def __init__(self, conn):
-        self._conn = conn
-
-    async def __aenter__(self):
-        return self._conn
-
-    async def __aexit__(self, *exc):
-        return False
 
 
 class _FakePool:
@@ -57,7 +55,7 @@ class _FakePool:
         self._conn = conn
 
     def acquire(self):
-        return _FakeAcquire(self._conn)
+        return _AsyncCtx(self._conn)
 
 
 async def test_create_table_rejects_overlong_pg_name(monkeypatch):
@@ -66,17 +64,10 @@ async def test_create_table_rejects_overlong_pg_name(monkeypatch):
     table_name = "report_metrics_1780908249_8ml717"   # 32 chars
     assert len(table_service.table_data_repo.pg_table_name(vault_name, table_name)) == 64
 
-    conn = _FakeConn(vault_name)
-
     async def _fake_get_pool():
-        return _FakePool(conn)
+        return _FakePool(_FakeConn(vault_name))
 
     monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
-
-    async def _no_existing(*a, **k):
-        return None
-
-    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", _no_existing)
 
     async def _must_not_run(*a, **k):
         raise AssertionError("create_dynamic_table must not run for an over-long name")
@@ -96,9 +87,10 @@ async def test_create_table_rejects_overlong_pg_name(monkeypatch):
     assert str(table_service.table_data_repo.PG_IDENT_MAX_LEN) in ei.value.message
 
 
-async def test_create_table_invalid_name_is_422_not_500(monkeypatch):
-    """The sibling name-shape check now also raises ValidationError, so a
-    malformed name is a clean 422 rather than an uncaught ValueError 500."""
+async def test_create_table_invalid_name_is_422_not_500():
+    """The sibling name-shape check raises ValidationError synchronously
+    (before `get_pool`), so a malformed name is a clean 422 rather than an
+    uncaught ValueError 500 — no pool fixture needed."""
     with pytest.raises(ValidationError) as ei:
         await table_service.create_table(
             uuid.uuid4(),
