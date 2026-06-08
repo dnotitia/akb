@@ -251,16 +251,28 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       if (!src || !tgt) return;
       const dash = RELATION_DASH[l.relation];
       const isAccent = l.relation === "implements" || l.relation === "derived_from";
+      // Edges touching the selected node light up (accent + thicker + glow);
+      // the rest dim so the selected node's connections stand out.
+      const incident = selected != null && (src.uri === selected || tgt.uri === selected);
+      ctx.save();
       ctx.beginPath();
       ctx.moveTo(src.x || 0, src.y || 0);
       ctx.lineTo(tgt.x || 0, tgt.y || 0);
-      ctx.strokeStyle = isAccent ? colors.accent : colors.foregroundMuted;
-      ctx.lineWidth = l.relation === "attached_to" ? 1 : 1.5;
+      if (incident) {
+        ctx.strokeStyle = colors.accent;
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = colors.accent;
+        ctx.shadowBlur = 6;
+      } else {
+        ctx.strokeStyle = isAccent ? colors.accent : colors.foregroundMuted;
+        ctx.lineWidth = l.relation === "attached_to" ? 1 : 1.5;
+        if (selected != null) ctx.globalAlpha = 0.3;
+      }
       ctx.setLineDash(dash);
       ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.restore();
     },
-    [colors],
+    [colors, selected],
   );
 
   const handleNodeClick = useCallback(

@@ -17,7 +17,6 @@ import {
 } from "@/components/graph/use-graph-data";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
 import { kindToSegment, type GraphEdge, type GraphNode, type GraphView } from "@/components/graph/graph-types";
-import { parseUri } from "@/lib/uri";
 
 const DOUBLECLICK_MS = 250;
 
@@ -211,13 +210,11 @@ export default function GraphPage() {
           docId={selectedDocId}
           kind={selectedNode.kind}
           uri={selectedNode.uri}
-          onOpenUri={(openUri) => {
-            // Clicking a related resource navigates to its own document page
-            // (using the target URI's OWN vault, which may differ).
-            const p = parseUri(openUri);
-            const id = docIdFromUri(openUri);
-            if (!p || !id || (p.kind !== "doc" && p.kind !== "table" && p.kind !== "file")) return;
-            navigate(`/vault/${p.vault}/${p.kind}/${encodeURIComponent(id)}`);
+          onSelectUri={(selUri) => {
+            // Select (highlight) the related node in the graph — stay here,
+            // don't navigate away.
+            const sel = docIdFromUri(selUri) ?? selUri;
+            setView({ ...view, selected: sel });
           }}
           onFitToNode={(fitUri) => canvasRef.current?.centerOnNode(fitUri)}
           onClose={() => setView({ ...view, selected: undefined })}
