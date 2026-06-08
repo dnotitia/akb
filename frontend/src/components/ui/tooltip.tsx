@@ -14,7 +14,7 @@ const TooltipContent = forwardRef<
     ref={ref}
     sideOffset={sideOffset}
     className={cn(
-      "z-50 border border-border bg-foreground px-2 py-1 text-xs text-background font-mono uppercase tracking-wider",
+      "z-50 rounded-[var(--radius-sm)] border border-border bg-foreground px-2 py-1 text-xs text-background font-medium tracking-wide",
       "data-[state=delayed-open]:animate-in data-[state=closed]:animate-out",
       className,
     )}

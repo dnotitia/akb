@@ -268,7 +268,7 @@ export function VaultExplorer({
           placeholder="Filter in vault…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="w-full h-9 px-2 bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent focus-visible:ring-0 transition-colors"
+          className="w-full h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent focus-visible:ring-0 transition-colors"
           aria-label="Filter tree"
         />
       </div>

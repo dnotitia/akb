@@ -157,10 +157,10 @@ export default function VaultMembersPage() {
       <div className="coord mb-3">
         VAULT · {name.toUpperCase()} · MEMBERS
       </div>
-      <h1 className="font-serif text-[44px] leading-[0.95] tracking-[-0.03em] text-foreground mb-2">
-        Members<span className="text-foreground-muted">.</span>
+      <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
+        Members<span className="text-accent">.</span>
       </h1>
-      <p className="font-serif-italic text-[16px] leading-[1.55] text-foreground-muted mb-10 max-w-prose">
+      <p className="text-sm leading-relaxed text-foreground-muted mb-10 max-w-prose">
         Who can read or write to this vault. The owner holds the keys; admins can
         invite or revoke; writers can mutate content; readers see everything but
         change nothing.
@@ -187,7 +187,7 @@ export default function VaultMembersPage() {
       </header>
 
       {undoTarget && (
-        <div role="status" className="flex items-center gap-3 px-3 py-2 border border-border bg-surface-muted mb-4 mt-4">
+        <div role="status" className="flex items-center gap-3 px-3 py-2 rounded-[var(--radius-md)] border border-border bg-surface-muted mb-4 mt-4">
           <span className="text-sm text-foreground">
             Changed {undoTarget.username} from {undoTarget.prev.toUpperCase()} to {undoTarget.next.toUpperCase()}.
           </span>
@@ -201,14 +201,14 @@ export default function VaultMembersPage() {
         </div>
       )}
       {undoError && (
-        <div role="alert" className="px-3 py-2 border border-destructive bg-destructive/10 text-destructive text-xs font-mono mb-4 mt-4">
+        <div role="alert" className="px-3 py-2 rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 text-destructive text-xs font-mono mb-4 mt-4">
           Undo failed: {undoError}
         </div>
       )}
 
       {/* List */}
       {error ? (
-        <div role="alert" className="border border-destructive p-3 mt-4 text-sm">
+        <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-3 mt-4 text-sm">
           <span className="coord-spark mb-1 block text-destructive">
             ⚠ FAILED TO LOAD MEMBERS
           </span>
@@ -219,7 +219,7 @@ export default function VaultMembersPage() {
       ) : members.length === 0 ? (
         <EmptyState title="No members on record" description="Even the owner row should appear here — try refreshing." />
       ) : (
-        <ol className="border border-border bg-surface divide-y divide-border">
+        <ol className="mt-4 rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm divide-y divide-border">
           {members.map((m, i) => (
             <li
               key={m.username}

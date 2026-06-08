@@ -116,13 +116,13 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
     renderAt("/search?q=k8s");
     await waitFor(() => expect(mockedSearch).toHaveBeenCalledTimes(1));
     const u = userEvent.setup();
-    // Two buttons render with text "LITERAL": the mode toggle (with
-    // aria-pressed) and the short-query hint link below. The toggle
+    // The mode toggle ("Literal", with aria-pressed) and the short-query
+    // hint link below ("LITERAL") both reference literal mode. The toggle
     // is the only one with aria-pressed set.
     const toggle = screen
-      .getAllByRole("button", { name: "LITERAL" })
+      .getAllByRole("button", { name: "Literal" })
       .find((b) => b.hasAttribute("aria-pressed"));
-    if (!toggle) throw new Error("LITERAL toggle button not found");
+    if (!toggle) throw new Error("Literal toggle button not found");
     await u.click(toggle);
     await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", undefined));
   });

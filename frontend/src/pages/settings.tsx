@@ -392,9 +392,12 @@ export default function SettingsPage() {
 
       <header className="mb-6">
         <div className="coord-spark mb-2">§ SETTINGS</div>
-        <h1 className="text-3xl font-semibold tracking-tight text-foreground">
+        <h1 className="font-display text-3xl text-foreground">
           Settings
         </h1>
+        <p className="mt-1.5 text-sm text-foreground-muted">
+          Manage your account, connection tokens, and preferences.
+        </p>
       </header>
 
       <Tabs value={activeTab} onValueChange={setTab}>
@@ -420,7 +423,7 @@ export default function SettingsPage() {
           {/* Account card */}
           <form
             onSubmit={handleSaveProfile}
-            className="border border-border bg-surface"
+            className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden"
           >
             <header className="border-b border-border px-6 py-3">
               <span className="coord-ink">§ ACCOUNT</span>
@@ -471,7 +474,7 @@ export default function SettingsPage() {
 
           {/* Change password card */}
           <section
-            className="border border-border bg-surface"
+            className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden"
             aria-labelledby="change-pw-heading"
           >
             <header className="border-b border-border px-6 py-3">
@@ -548,7 +551,7 @@ export default function SettingsPage() {
         {/* Tokens — PATs + fresh token banner when minted */}
         <TabsContent value="tokens" className="pt-6 space-y-4 max-w-4xl">
           {newPat && (
-            <section className="border border-destructive bg-destructive/5">
+            <section className="rounded-[var(--radius-lg)] border border-destructive bg-destructive/5 shadow-sm overflow-hidden">
               <div className="border-b border-destructive px-4 py-2 flex items-baseline justify-between">
                 <div>
                   <span className="coord-spark text-destructive">⊛ FRESH TOKEN — COPY NOW</span>
@@ -564,7 +567,7 @@ export default function SettingsPage() {
               </div>
               <div className="p-6 space-y-4">
                 <div className="flex items-center gap-3">
-                  <code className="flex-1 font-mono text-xs text-foreground break-all border border-border px-3 py-2 bg-surface">
+                  <code className="flex-1 font-mono text-xs text-foreground break-all rounded-[var(--radius-md)] border border-border px-3 py-2 bg-surface">
                     {showPat ? newPat : newPat.slice(0, 12) + "•".repeat(20)}
                   </code>
                   <button
@@ -587,8 +590,8 @@ export default function SettingsPage() {
                   </button>
                 </div>
 
-                <div className="border border-border">
-                  <div className="border-b border-border bg-foreground text-background px-3 py-1.5 flex items-center justify-between">
+                <div className="rounded-[var(--radius-md)] border border-border overflow-hidden">
+                  <div className="border-b border-border bg-surface-2 text-foreground px-3 py-1.5 flex items-center justify-between">
                     <span className="font-mono text-[10px] uppercase tracking-wider">
                       CURSOR / WINDSURF — settings.json
                     </span>
@@ -611,7 +614,7 @@ export default function SettingsPage() {
           )}
 
           {/* Active tokens — primary content on this tab (management). */}
-          <section className="border border-border bg-surface">
+          <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
               <span className="coord-ink">§ ACTIVE TOKENS</span>
               <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
@@ -620,7 +623,7 @@ export default function SettingsPage() {
               {!pats || pats.length === 0 ? (
                 <EmptyState title="No tokens yet — mint one below." />
               ) : (
-                <div className="border border-border divide-y divide-border">
+                <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
                   {(pats ?? []).map((p, i) => (
                     <div key={p.token_id} className="px-4 py-3 space-y-1.5">
                       {/* Line 1 — identity */}
@@ -680,7 +683,7 @@ export default function SettingsPage() {
           </section>
 
           {/* Collapsible setup guide */}
-          <div className="border border-border bg-surface">
+          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <button
               type="button"
               onClick={toggleSetup}
@@ -765,7 +768,7 @@ export default function SettingsPage() {
                     </p>
 
                     {/* Client tabs */}
-                    <div className="flex flex-wrap border border-border">
+                    <div className="flex flex-wrap rounded-[var(--radius-md)] border border-border overflow-hidden">
                       {(
                         [
                           ["claude", "Claude Code"],
@@ -774,16 +777,14 @@ export default function SettingsPage() {
                           ["vscode", "VS Code"],
                           ["openclaw", "OpenClaw"],
                         ] as [ClientTab, string][]
-                      ).map(([id, label], i) => (
+                      ).map(([id, label]) => (
                         <button
                           key={id}
                           type="button"
                           onClick={() => setClientTab(id)}
                           className={`flex-1 min-w-[140px] text-left px-3 py-2 transition-colors ${
-                            i > 0 ? "border-l border-border" : ""
-                          } ${
                             clientTab === id
-                              ? "bg-foreground text-background"
+                              ? "bg-surface-2 text-foreground"
                               : "hover:bg-surface-muted cursor-pointer"
                           }`}
                         >
@@ -795,8 +796,8 @@ export default function SettingsPage() {
                     </div>
 
                     {/* Snippet */}
-                    <div className="border border-border">
-                      <div className="flex items-center justify-between border-b border-border bg-foreground text-background px-3 py-1.5">
+                    <div className="rounded-[var(--radius-md)] border border-border overflow-hidden">
+                      <div className="flex items-center justify-between border-b border-border bg-surface-2 text-foreground px-3 py-1.5">
                         <span className="font-mono text-[10px] uppercase tracking-wider truncate">
                           {clientTab === "claude" && "TERMINAL"}
                           {clientTab === "cursor" && "mcpServers schema — per-client path below"}
@@ -887,7 +888,7 @@ export default function SettingsPage() {
         {/* Preferences — status display only; real control lives in header UserMenu */}
         <TabsContent value="preferences" className="pt-6 max-w-4xl space-y-6">
           {/* Theme — status only. Real control lives in the header UserMenu. */}
-          <div className="border border-border bg-surface">
+          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3">
               <span className="coord-ink">§ THEME</span>
             </header>
@@ -911,7 +912,7 @@ export default function SettingsPage() {
           </div>
 
           {/* Future placeholder card */}
-          <div className="border border-border bg-surface opacity-60">
+          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden opacity-60">
             <header className="border-b border-border px-6 py-3">
               <span className="coord-ink">§ MORE PREFERENCES</span>
             </header>
@@ -945,7 +946,7 @@ export default function SettingsPage() {
                 aria-label="Sort users"
                 value={adminSort}
                 onChange={(e) => setAdminSort(e.target.value as AdminSort)}
-                className="h-9 px-3 bg-surface border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+                className="h-9 px-3 bg-surface rounded-[var(--radius-md)] border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
               >
                 <option value="recent">Recent first</option>
                 <option value="oldest">Oldest first</option>
@@ -959,7 +960,7 @@ export default function SettingsPage() {
               [{filteredUsers.length} matching of {users?.length ?? 0}]
             </div>
 
-            <div className="border border-border bg-surface">
+            <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
               <div className="p-6">
                 {!users ? (
                   <div className="coord">LOADING…</div>
@@ -972,7 +973,7 @@ export default function SettingsPage() {
                     }
                   />
                 ) : (
-                  <div className="border border-border divide-y divide-border">
+                  <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
                     {filteredUsers.map((u, i) => (
                       <div
                         key={u.id}

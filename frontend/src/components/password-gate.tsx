@@ -47,7 +47,7 @@ export function PasswordGate({ slug, onSuccess }: Props) {
               onChange={(e) => setPassword(e.target.value)}
               placeholder="passphrase"
               autoFocus
-              className="w-full h-11 px-3 border border-border bg-transparent font-mono text-sm placeholder:text-foreground-muted placeholder:uppercase placeholder:tracking-wider placeholder:text-xs focus:outline-none focus:border-accent"
+              className="w-full h-11 px-3 rounded-[var(--radius-md)] border border-border bg-transparent font-mono text-sm placeholder:text-foreground-muted placeholder:uppercase placeholder:tracking-wider placeholder:text-xs focus:outline-none focus:border-accent"
             />
             {error && (
               <div className="border border-destructive p-2 coord-spark" style={{ color: "var(--color-destructive)" }}>
@@ -57,7 +57,7 @@ export function PasswordGate({ slug, onSuccess }: Props) {
             <button
               type="submit"
               disabled={loading || !password}
-              className="w-full h-11 border border-border bg-foreground text-background font-medium tracking-tight hover:bg-accent hover:border-accent disabled:opacity-40 disabled:hover:bg-foreground disabled:hover:border-border transition-colors"
+              className="w-full h-11 rounded-[var(--radius-md)] border border-primary bg-primary text-primary-foreground font-medium tracking-tight shadow-sm hover:bg-primary/90 disabled:opacity-40 transition-token"
             >
               {loading ? "verifying…" : "→ unlock"}
             </button>

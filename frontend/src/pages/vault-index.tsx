@@ -12,7 +12,7 @@ export default function VaultIndexPage() {
     <div className="h-full flex items-center justify-center p-10">
       <div className="max-w-md text-center">
         <div className="coord-spark mb-4">§ Vaults</div>
-        <h1 className="text-3xl font-semibold tracking-tight text-foreground mb-3">
+        <h1 className="font-display text-3xl tracking-tight text-foreground mb-3">
           Pick a vault
         </h1>
         <p className="text-sm text-foreground-muted leading-relaxed mb-6">

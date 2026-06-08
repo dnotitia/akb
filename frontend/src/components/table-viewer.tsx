@@ -120,8 +120,8 @@ export function TableViewer({ slug, initialData }: Props) {
         </h1>
 
         {hasParams && (
-          <div className="border border-border mb-6">
-            <div className="border-b border-border px-4 py-2 flex items-baseline justify-between">
+          <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm mb-6">
+            <div className="border-b border-border bg-surface-2 px-4 py-2 flex items-baseline justify-between">
               <span className="coord-ink">§ PARAMETERS</span>
               <span className="coord">[{Object.keys(paramDefs).length}]</span>
             </div>
@@ -142,15 +142,14 @@ export function TableViewer({ slug, initialData }: Props) {
                       setParams((p) => ({ ...p, [name]: e.target.value }))
                     }
                     placeholder={def.default !== undefined ? String(def.default) : ""}
-                    className="w-44 h-9 px-2 border border-border bg-transparent font-mono text-xs focus:outline-none focus:border-accent"
+                    className="w-44 h-9 px-2 rounded-[var(--radius-md)] border border-border bg-transparent font-mono text-xs focus:outline-none focus:border-accent"
                   />
                 </div>
               ))}
               <button
                 type="submit"
                 disabled={loading}
-                className="h-9 px-4 border border-border bg-foreground text-background coord-ink hover:bg-accent hover:border-accent disabled:opacity-40"
-                style={{ color: "var(--color-paper)" }}
+                className="h-9 px-4 rounded-[var(--radius-md)] bg-accent text-accent-foreground border border-accent coord-ink hover:bg-accent/90 disabled:opacity-40"
               >
                 {loading ? "RUNNING…" : "→ APPLY"}
               </button>
@@ -159,7 +158,7 @@ export function TableViewer({ slug, initialData }: Props) {
         )}
 
         {error && (
-          <div className="border border-destructive p-3 mb-6">
+          <div className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-3 mb-6">
             <div className="coord-spark mb-1" style={{ color: "var(--color-destructive)" }}>
               ⚠ QUERY FAILED
             </div>
@@ -168,17 +167,17 @@ export function TableViewer({ slug, initialData }: Props) {
         )}
 
         {/* Table */}
-        <div className="border border-border overflow-x-auto">
+        <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="bg-foreground text-background">
+            <thead className="bg-surface-2 text-foreground">
               <tr>
-                <th className="coord-ink px-3 py-2 text-left border-r border-paper/20" style={{ color: "var(--color-paper)" }}>
+                <th className="coord-ink px-3 py-2 text-left border-r border-border">
                   #
                 </th>
                 {cols.map((c) => (
                   <th
                     key={c}
-                    className="px-3 py-2 text-left font-mono text-[11px] uppercase tracking-wider border-r border-paper/20 last:border-r-0 whitespace-nowrap"
+                    className="px-3 py-2 text-left font-mono text-[11px] uppercase tracking-wider text-foreground-muted border-r border-border last:border-r-0 whitespace-nowrap"
                   >
                     {c}
                   </th>

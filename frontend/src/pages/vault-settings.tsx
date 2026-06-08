@@ -133,10 +133,10 @@ export default function VaultSettingsPage() {
       </div>
 
       <div className="coord mb-3">VAULT · {name.toUpperCase()} · SETTINGS</div>
-      <h1 className="font-serif text-[44px] leading-[0.95] tracking-[-0.03em] text-foreground mb-2">
-        Settings<span className="text-foreground-muted">.</span>
+      <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
+        Settings<span className="text-accent">.</span>
       </h1>
-      <p className="font-serif-italic text-[16px] leading-[1.55] text-foreground-muted mb-2 max-w-prose">
+      <p className="text-sm leading-relaxed text-foreground-muted mb-2 max-w-prose">
         Vault metadata, public access, and lifecycle controls.
       </p>
       <div className="mb-10">
@@ -148,7 +148,7 @@ export default function VaultSettingsPage() {
       </div>
 
       {!canEdit && info && (
-        <div role="status" className="border border-border bg-surface-muted px-4 py-2 mb-8 text-xs">
+        <div role="status" className="rounded-[var(--radius-md)] border border-border bg-surface-muted px-4 py-2 mb-8 text-xs">
           Read-only view — only the owner can change these settings. Your role: {info.role}.
         </div>
       )}
@@ -189,7 +189,7 @@ export default function VaultSettingsPage() {
 
           <div>
             <Label className="coord-ink mb-1.5 block">PUBLIC ACCESS</Label>
-            <div className="grid grid-cols-3 gap-px border border-border bg-border">
+            <div className="grid grid-cols-3 gap-px rounded-[var(--radius-md)] overflow-hidden border border-border bg-border">
               {(["none", "reader", "writer"] as PublicAccess[]).map((v) => {
                 const active = publicAccess === v;
                 const Icon = v === "none" ? Lock : Globe;
@@ -202,7 +202,7 @@ export default function VaultSettingsPage() {
                     disabled={!canEdit || saving}
                     className={`px-3 py-2 text-sm font-mono uppercase tracking-wider transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50 disabled:cursor-not-allowed ${
                       active
-                        ? "bg-foreground text-background"
+                        ? "bg-surface-2 text-foreground"
                         : "bg-surface text-foreground hover:bg-surface-muted cursor-pointer"
                     }`}
                   >
@@ -220,7 +220,7 @@ export default function VaultSettingsPage() {
           </div>
 
           {error && (
-            <div role="alert" className="border border-destructive p-2 text-xs text-destructive">
+            <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
               {error}
             </div>
           )}
@@ -254,7 +254,7 @@ export default function VaultSettingsPage() {
           </header>
 
           <div className="space-y-5">
-            <div className="border border-border p-4">
+            <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-4">
               <div className="flex items-baseline justify-between flex-wrap gap-y-3">
                 <div className="min-w-0 pr-4">
                   <h3 className="text-base font-semibold tracking-tight mb-1">
@@ -286,7 +286,7 @@ export default function VaultSettingsPage() {
               </div>
             </div>
 
-            <div className="border border-border p-4">
+            <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-4">
               <h3 className="text-base font-semibold tracking-tight mb-1">
                 Transfer ownership
               </h3>
@@ -311,7 +311,7 @@ export default function VaultSettingsPage() {
             </span>
           </header>
 
-          <div className="border border-destructive p-4">
+          <div className="rounded-[var(--radius-lg)] border border-destructive/50 bg-destructive/5 p-4">
             <div className="flex items-baseline justify-between flex-wrap gap-y-3">
               <div className="min-w-0 pr-4">
                 <h3 className="text-base font-semibold tracking-tight mb-1 text-destructive">
@@ -344,7 +344,7 @@ export default function VaultSettingsPage() {
             <span id="diag-h" className="coord-ink">§ DIAGNOSTICS</span>
             <span className="coord">indexing pipeline</span>
           </header>
-          <div className="grid grid-cols-2 gap-px border border-border bg-border">
+          <div className="grid grid-cols-2 gap-px rounded-[var(--radius-lg)] overflow-hidden border border-border bg-border shadow-sm">
             <DiagCell title="INDEXING" stats={vaultHealth.vector_store?.backfill?.upsert} />
             <DiagCell title="METADATA" stats={vaultHealth.metadata_backfill} />
           </div>

@@ -23,13 +23,14 @@ import {
   updateDocument,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { docUri } from "@/lib/uri";
+import { docUri, parseUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
 import { SummaryFold } from "@/components/summary-fold";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Panel } from "@/components/ui/panel";
 import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
@@ -316,20 +317,20 @@ export default function DocumentPage() {
   return (
     <div
       className={`grid grid-cols-1 gap-x-10 gap-y-6 fade-up ${
-        inEditMode ? "" : "xl:grid-cols-[minmax(0,1fr)_260px]"
+        inEditMode ? "" : "lg:grid-cols-[minmax(0,1fr)_280px]"
       }`}
     >
       <article
         ref={setArticleEl}
         className={`min-w-0 w-full ${
-          inEditMode ? "max-w-none" : "max-w-[1020px] justify-self-center"
+          inEditMode ? "max-w-none" : "max-w-[880px]"
         }`}
       >
         {commitHash && (
           <div
             role="status"
             aria-live="polite"
-            className="border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap"
+            className="rounded-[var(--radius-lg)] border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap shadow-sm"
           >
             <div className="flex items-baseline gap-2 min-w-0">
               <span className="coord-spark text-accent shrink-0">⊙ HISTORICAL VIEW</span>
@@ -346,7 +347,7 @@ export default function DocumentPage() {
                 p.delete("commit");
                 setSearchParams(p, { replace: false });
               }}
-              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider border border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider rounded-[var(--radius-sm)] border border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               ← Back to latest
             </button>
@@ -363,8 +364,8 @@ export default function DocumentPage() {
           )}
         </div>
 
-        {/* Serif display title */}
-        <h1 className="font-serif text-[40px] leading-[1.05] tracking-[-0.02em] text-foreground mb-3">
+        {/* Display title */}
+        <h1 className="font-display text-[40px] leading-[1.05] tracking-tight text-foreground mb-3">
           {doc.title}
         </h1>
 
@@ -390,7 +391,7 @@ export default function DocumentPage() {
           <div
             role="alert"
             aria-live="polite"
-            className="border border-destructive px-3 py-2 mb-6 text-xs font-mono uppercase tracking-wider text-destructive"
+            className="rounded-[var(--radius-md)] border border-destructive bg-destructive/5 px-3 py-2 mb-6 text-xs font-mono uppercase tracking-wider text-destructive"
           >
             ⚠ {publishError.toUpperCase()}
           </div>
@@ -412,7 +413,7 @@ export default function DocumentPage() {
               <div
                 role="tablist"
                 aria-label="Document view"
-                className="inline-flex border border-border"
+                className="inline-flex items-center gap-1 rounded-[var(--radius-md)] bg-surface-2 p-1"
                 onKeyDown={(e) => {
                   // Roving tabindex within the strip — Arrow keys move
                   // focus, Enter/Space (handled by the button itself)
@@ -440,9 +441,9 @@ export default function DocumentPage() {
                   aria-controls="doc-panel-rendered"
                   tabIndex={-1}
                   onClick={() => setView("rendered")}
-                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  RENDERED
+                  Rendered
                 </button>
                 <button
                   role="tab"
@@ -451,9 +452,9 @@ export default function DocumentPage() {
                   aria-controls="doc-panel-raw"
                   tabIndex={-1}
                   onClick={() => setView("raw")}
-                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border transition-colors cursor-pointer text-foreground-muted hover:text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  RAW
+                  Raw
                 </button>
                 <button
                   role="tab"
@@ -461,9 +462,9 @@ export default function DocumentPage() {
                   aria-selected={true}
                   aria-controls="doc-panel-edit"
                   tabIndex={0}
-                  className="px-2.5 py-1 text-[11px] font-mono uppercase tracking-wider border-l border-border bg-foreground text-background cursor-default"
+                  className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] bg-surface text-foreground shadow-sm cursor-default"
                 >
-                  EDIT{isDirty ? "*" : ""}
+                  Edit{isDirty ? "*" : ""}
                 </button>
               </div>
             </div>
@@ -500,7 +501,7 @@ export default function DocumentPage() {
                 <div
                   role="alert"
                   aria-live="polite"
-                  className="border border-destructive px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
+                  className="rounded-[var(--radius-md)] border border-destructive bg-destructive/5 px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
                 >
                   ⚠ {bodyError.toUpperCase()}
                 </div>
@@ -573,91 +574,81 @@ export default function DocumentPage() {
       </article>
 
       {!inEditMode && (
-      <aside className="xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100dvh-13rem)] flex flex-col text-sm min-h-0">
-        {!commitHash && (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner") && (
-          <div className="shrink-0 pb-3 mb-3 border-b border-border space-y-2">
-            {doc.type !== "skill" && (
-              <button
-                onClick={() => setEditOpen(true)}
-                className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                <Pencil className="h-3 w-3" aria-hidden />
-                Edit details
-              </button>
-            )}
-            <button
-              onClick={() => setDeleteOpen(true)}
-              className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border text-foreground-muted hover:border-destructive hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              <Trash2 className="h-3 w-3" aria-hidden />
-              Delete document
-            </button>
-          </div>
-        )}
-
-        {!commitHash && (
-          <div className="shrink-0 pb-3 mb-3 border-b border-border">
-            {doc.is_public && doc.public_slug ? (
-              <div className="flex flex-col gap-1.5 text-xs">
-                <div className="coord">§ PUBLISHED</div>
-                <div title={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground truncate">
-                  /p/{doc.public_slug}
+      <aside className="lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100dvh-9rem)] flex flex-col text-sm min-h-0">
+        {!commitHash && (() => {
+          const canWrite = vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
+          const rowCls =
+            "w-full flex items-center gap-2.5 px-3 py-2.5 text-sm transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
+          return (
+            <Panel className="shrink-0 mb-4 divide-y divide-border">
+              {canWrite && doc.type !== "skill" && (
+                <button onClick={() => setEditOpen(true)} className={`${rowCls} text-foreground hover:bg-surface-muted`}>
+                  <Pencil className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
+                  Edit details
+                </button>
+              )}
+              {canWrite && (
+                <button onClick={() => setDeleteOpen(true)} className={`${rowCls} text-foreground-muted hover:bg-destructive/5 hover:text-destructive`}>
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                  Delete document
+                </button>
+              )}
+              {doc.is_public && doc.public_slug ? (
+                <div className="px-3 py-2.5 text-xs">
+                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <span className="coord-spark">§ Published</span>
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        onClick={copyPublicLink}
+                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                      >
+                        {copied ? <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden /> : <ExternalLink className="h-3 w-3" aria-hidden />}
+                        {copied ? "Copied" : "Copy"}
+                      </button>
+                      <button
+                        onClick={handleUnpublish}
+                        disabled={publishing}
+                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50"
+                      >
+                        {publishing ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <Lock className="h-3 w-3" aria-hidden />}
+                        {publishing ? "…" : "Unpublish"}
+                      </button>
+                    </div>
+                  </div>
+                  <div title={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground-muted truncate">
+                    /p/{doc.public_slug}
+                  </div>
                 </div>
-                <div className="flex items-center gap-3 text-[11px]">
-                  <button
-                    onClick={copyPublicLink}
-                    className="inline-flex items-center gap-1 text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                  >
-                    {copied ? (
-                      <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden />
-                    ) : (
-                      <ExternalLink className="h-3 w-3" aria-hidden />
-                    )}
-                    {copied ? "Copied" : "Copy link"}
-                  </button>
-                  <button
-                    onClick={handleUnpublish}
-                    disabled={publishing}
-                    className="inline-flex items-center gap-1 text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50"
-                  >
-                    {publishing ? (
-                      <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                    ) : (
-                      <Lock className="h-3 w-3" aria-hidden />
-                    )}
-                    {publishing ? "Unpublishing…" : "Unpublish"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <button
-                onClick={() => setPublishOpen(true)}
-                disabled={publishing}
-                className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs border border-border hover:border-accent hover:text-accent transition-colors disabled:opacity-50 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                <Unlock className="h-3 w-3" aria-hidden />
-                Publish to /p/…
-              </button>
-            )}
-          </div>
-        )}
+              ) : (
+                <button
+                  onClick={() => setPublishOpen(true)}
+                  disabled={publishing}
+                  className={`${rowCls} text-foreground hover:bg-surface-muted hover:text-accent disabled:opacity-50`}
+                >
+                  <Unlock className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
+                  Publish to /p/…
+                </button>
+              )}
+            </Panel>
+          );
+        })()}
 
         <Tabs defaultValue="outline" className="flex flex-col min-h-0 flex-1">
-          <TabsList className="shrink-0">
-            <TabsTrigger value="outline" className="gap-1.5">
+          <TabsList className="shrink-0 w-full">
+            <TabsTrigger value="outline" className="flex-1 min-w-0 gap-1 px-2">
               Outline
-              <span className="coord tabular-nums">[{headingCount(doc.content)}]</span>
+              <span className="coord tabular-nums">{headingCount(doc.content)}</span>
             </TabsTrigger>
-            <TabsTrigger value="relations" className="gap-1.5">
+            <TabsTrigger value="relations" className="flex-1 min-w-0 gap-1 px-2">
               Relations
               {relations.length > 0 && (
-                <span className="coord tabular-nums">[{relations.length}]</span>
+                <span className="coord tabular-nums">{relations.length}</span>
               )}
             </TabsTrigger>
-            <TabsTrigger value="history" className="gap-1.5">
+            <TabsTrigger value="history" className="flex-1 min-w-0 gap-1 px-2">
               History
               {provenance.length > 0 && (
-                <span className="coord tabular-nums">[{provenance.length}]</span>
+                <span className="coord tabular-nums">{provenance.length}</span>
               )}
             </TabsTrigger>
           </TabsList>
@@ -677,16 +668,19 @@ export default function DocumentPage() {
               <>
                 <ol className="font-mono text-[11px] leading-[1.9] space-y-0.5">
                   {relations.map((r, i) => {
-                    const m = /^akb:\/\/([^/]+)\/(doc|table|file)\/(.+)$/.exec(r.uri || "");
-                    const targetVault = m?.[1] ?? name;
-                    const targetType = m?.[2] ?? r.resource_type;
-                    const targetRef = m?.[3] ?? "";
+                    // Use the canonical URI parser (handles the `/coll/.../doc/`
+                    // form) — a flat regex missed collection docs and produced
+                    // an empty ref → `/vault/x/doc/` → blank screen.
+                    const p = parseUri(r.uri);
+                    const targetVault = p?.vault ?? name;
+                    const targetType = p?.kind ?? r.resource_type;
+                    const targetRef = p?.id ?? "";
                     let href = "#";
-                    if (targetType === "doc") {
+                    if (targetRef && targetType === "doc") {
                       href = `/vault/${targetVault}/doc/${encodeURIComponent(targetRef)}`;
-                    } else if (targetType === "table") {
+                    } else if (targetRef && targetType === "table") {
                       href = `/vault/${targetVault}/table/${encodeURIComponent(targetRef)}`;
-                    } else if (targetType === "file") {
+                    } else if (targetRef && targetType === "file") {
                       href = `/vault/${targetVault}/file/${encodeURIComponent(targetRef)}`;
                     }
                     const label = r.name || targetRef || r.uri;
@@ -821,7 +815,7 @@ function FrontmatterCard({ doc }: { doc: any }) {
   if (rows.length === 0) return null;
 
   return (
-    <div className="border border-border bg-surface px-4 py-3 font-mono text-[11px] leading-[1.85]">
+    <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3 font-mono text-[11px] leading-[1.85] shadow-sm">
       {rows.map(([k, v], i) => (
         <div key={i}>
           <span className="text-foreground-muted">{k}:</span> {v}

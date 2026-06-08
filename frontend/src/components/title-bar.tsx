@@ -11,10 +11,12 @@ export interface Crumb {
 export function TitleBar({
   crumbs,
   right,
+  left,
   className,
 }: {
   crumbs: Crumb[];
   right?: ReactNode;
+  left?: ReactNode;
   className?: string;
 }) {
   const navigate = useNavigate();
@@ -32,11 +34,12 @@ export function TitleBar({
   return (
     <div
       className={cn(
-        "flex items-center gap-2.5 h-9 px-4 border-b border-border bg-surface",
-        "font-mono text-[10px] uppercase tracking-wider text-foreground-muted",
+        "flex items-center gap-2.5 h-10 px-3 border-b border-border bg-surface/80 backdrop-blur",
+        "text-[11px] uppercase tracking-wider font-medium text-foreground-muted",
         className,
       )}
     >
+      {left}
       <button
         type="button"
         onClick={handleBack}
@@ -118,12 +121,12 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
             to={href}
             aria-current={active ? "page" : undefined}
             className={cn(
-              "inline-flex items-center gap-1 px-2 h-6 border transition-colors",
+              "inline-flex items-center gap-1 px-2.5 h-7 rounded-[var(--radius-sm)] border transition-token",
               "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
               active && accent
                 ? "border-accent bg-accent/10 text-accent"
                 : active
-                  ? "border-foreground-muted bg-surface-muted text-foreground"
+                  ? "border-primary/40 bg-primary/10 text-primary"
                   : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted",
             )}
           >

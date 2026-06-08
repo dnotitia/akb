@@ -180,13 +180,13 @@ export default function GraphPage() {
         // Collapsed rail: the sole "expand" affordance. The matching
         // "collapse" control lives in the sidebar header (GraphSidebar
         // onCollapse) so there is exactly one toggle, always on the left.
-        <div className="flex flex-col items-center border-r border-border bg-surface">
+        <div className="flex flex-col items-center">
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
             aria-label="Show sidebar"
             title="Show sidebar"
-            className="h-9 w-9 mt-2 inline-flex items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="h-9 w-9 m-2 inline-flex items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             <PanelLeftOpen className="h-4 w-4" />
           </button>

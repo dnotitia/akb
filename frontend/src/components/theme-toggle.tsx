@@ -21,7 +21,7 @@ export function ThemeToggle() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Theme: ${LABELS[theme]}`}
-        className="inline-flex h-9 w-9 items-center justify-center border border-border bg-surface text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer"
+        className="inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
       >
         <Icon className="h-4 w-4" aria-hidden />
       </DropdownMenu.Trigger>
@@ -29,7 +29,7 @@ export function ThemeToggle() {
         <DropdownMenu.Content
           align="end"
           sideOffset={4}
-          className="z-50 min-w-[140px] border border-border bg-surface p-1 shadow-none"
+          className="z-50 min-w-[140px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           {(["light", "dark", "system"] as const).map((opt) => {
             const OptIcon = ICONS[opt];

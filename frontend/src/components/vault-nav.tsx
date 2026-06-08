@@ -106,7 +106,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter"
             aria-label="Filter vaults"
-            className="w-full h-9 pl-6 pr-2 bg-background border border-border text-[11px] text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent transition-colors"
+            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent transition-colors"
           />
         </div>
       </div>

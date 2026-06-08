@@ -7,9 +7,33 @@ import {
   PlateLeaf,
   type PlateElementProps,
   type PlateLeafProps,
+  useEditorRef,
+  useEditorState,
   usePlateEditor,
 } from "platejs/react";
 import { MarkdownPlugin } from "@platejs/markdown";
+import { toggleList, ListStyleType } from "@platejs/list";
+import { upsertLink } from "@platejs/link";
+import { insertTable } from "@platejs/table";
+import {
+  Bold,
+  Italic,
+  Strikethrough,
+  Code,
+  Code2,
+  List,
+  ListOrdered,
+  Quote,
+  Minus,
+  Link2,
+  Table as TableIcon,
+  Undo2,
+  Redo2,
+  Heading1,
+  Heading2,
+  Heading3,
+  Pilcrow,
+} from "lucide-react";
 import {
   BlockquotePlugin,
   BoldPlugin,
@@ -240,6 +264,206 @@ const components: Record<string, React.FC<any>> = {
   [StrikethroughPlugin.key]: StrikethroughLeaf,
 };
 
+// ── Formatting ribbon ─────────────────────────────────────────────────────
+// A sticky toolbar rendered inside <Plate> (so the buttons can reach the live
+// editor via useEditorRef / useEditorState). It only mutates the editor through
+// the v53 transform/query API verified against the installed type defs:
+//   marks   → editor.tf.toggleMark(key) / editor.api.marks()
+//   blocks  → editor.tf.setNodes({ type }) / editor.api.block()
+//   lists   → toggleList(editor, { listStyleType })  (@platejs/list)
+//   link    → upsertLink(editor, { url })            (@platejs/link)
+//   table   → insertTable(editor, {...})             (@platejs/table)
+//   history → editor.tf.undo() / editor.tf.redo()
+
+const TOOLBAR_BTN =
+  "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] " +
+  "text-foreground-muted transition-token cursor-pointer hover:bg-surface-muted hover:text-foreground " +
+  "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40 disabled:pointer-events-none";
+
+const TOOLBAR_BTN_ACTIVE =
+  "bg-surface text-foreground shadow-sm";
+
+const TOOLBAR_GROUP =
+  "inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-1";
+
+interface RibbonButtonProps {
+  label: string;
+  active?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}
+
+function RibbonButton({ label, active, onClick, children }: RibbonButtonProps) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={active}
+      title={label}
+      // Prevent the editor from losing its selection when the button is pressed.
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      className={cn(TOOLBAR_BTN, active && TOOLBAR_BTN_ACTIVE)}
+    >
+      {children}
+    </button>
+  );
+}
+
+function EditorToolbar() {
+  // useEditorState re-renders on editor changes so active states stay in sync;
+  // useEditorRef gives a stable handle for the mutating callbacks.
+  const editor = useEditorRef();
+  const state = useEditorState();
+
+  // Active mark lookup — editor.api.marks() returns the marks that would apply
+  // at the current selection (null when none).
+  const marks = (state.api.marks() ?? {}) as Record<string, unknown>;
+  const isMark = (key: string) => Boolean(marks[key]);
+
+  // Active block type — the highest block at the selection.
+  const blockEntry = state.api.block();
+  const blockType = blockEntry
+    ? ((blockEntry[0] as { type?: string }).type ?? ParagraphPlugin.key)
+    : undefined;
+  const isBlock = (type: string) => blockType === type;
+
+  const toggleMark = (key: string) => editor.tf.toggleMark(key);
+
+  // Block-type toggle: set the type, or fall back to paragraph if already set.
+  const setBlock = (type: string) => {
+    editor.tf.setNodes({
+      type: isBlock(type) ? ParagraphPlugin.key : type,
+    });
+  };
+
+  const insertHr = () => {
+    editor.tf.insertNodes({
+      type: HorizontalRulePlugin.key,
+      children: [{ text: "" }],
+    });
+  };
+
+  const onLink = () => {
+    // Only meaningful on a non-collapsed selection; upsertLink wraps it.
+    if (state.api.isExpanded()) {
+      upsertLink(editor, { url: "https://" });
+    }
+  };
+
+  const onTable = () => {
+    insertTable(editor, { rowCount: 3, colCount: 3, header: true });
+  };
+
+  return (
+    <div
+      contentEditable={false}
+      className={cn(
+        "sticky top-0 z-10 flex flex-wrap items-center gap-1.5",
+        "border-b border-border bg-surface/90 px-2 py-1.5 backdrop-blur",
+        "rounded-t-[var(--radius-sm)] select-none",
+      )}
+    >
+      {/* Block types */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton
+          label="Paragraph"
+          active={isBlock(ParagraphPlugin.key)}
+          onClick={() => setBlock(ParagraphPlugin.key)}
+        >
+          <Pilcrow className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Heading 1" active={isBlock(H1Plugin.key)} onClick={() => setBlock(H1Plugin.key)}>
+          <Heading1 className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Heading 2" active={isBlock(H2Plugin.key)} onClick={() => setBlock(H2Plugin.key)}>
+          <Heading2 className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Heading 3" active={isBlock(H3Plugin.key)} onClick={() => setBlock(H3Plugin.key)}>
+          <Heading3 className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+
+      {/* Marks */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton label="Bold" active={isMark(BoldPlugin.key)} onClick={() => toggleMark(BoldPlugin.key)}>
+          <Bold className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Italic" active={isMark(ItalicPlugin.key)} onClick={() => toggleMark(ItalicPlugin.key)}>
+          <Italic className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton
+          label="Strikethrough"
+          active={isMark(StrikethroughPlugin.key)}
+          onClick={() => toggleMark(StrikethroughPlugin.key)}
+        >
+          <Strikethrough className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Inline code" active={isMark(CodePlugin.key)} onClick={() => toggleMark(CodePlugin.key)}>
+          <Code className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+
+      {/* Lists */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton
+          label="Bulleted list"
+          onClick={() => toggleList(editor, { listStyleType: ListStyleType.Disc })}
+        >
+          <List className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton
+          label="Numbered list"
+          onClick={() => toggleList(editor, { listStyleType: ListStyleType.Decimal })}
+        >
+          <ListOrdered className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+
+      {/* Blocks: quote, code block, rule */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton
+          label="Blockquote"
+          active={isBlock(BlockquotePlugin.key)}
+          onClick={() => setBlock(BlockquotePlugin.key)}
+        >
+          <Quote className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton
+          label="Code block"
+          active={isBlock(CodeBlockPlugin.key)}
+          onClick={() => setBlock(CodeBlockPlugin.key)}
+        >
+          <Code2 className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Horizontal rule" onClick={insertHr}>
+          <Minus className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+
+      {/* Link + table */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton label="Insert link on selection" onClick={onLink}>
+          <Link2 className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Insert table" onClick={onTable}>
+          <TableIcon className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+
+      {/* History */}
+      <div className={TOOLBAR_GROUP}>
+        <RibbonButton label="Undo" onClick={() => editor.tf.undo()}>
+          <Undo2 className="h-4 w-4" />
+        </RibbonButton>
+        <RibbonButton label="Redo" onClick={() => editor.tf.redo()}>
+          <Redo2 className="h-4 w-4" />
+        </RibbonButton>
+      </div>
+    </div>
+  );
+}
+
 // ── Public component ──────────────────────────────────────────────────────
 
 export interface MarkdownEditorProps {
@@ -291,6 +515,7 @@ export function MarkdownEditor({
         onChange(md);
       }}
     >
+      {!readOnly && <EditorToolbar />}
       <PlateContent
         autoFocus={autoFocus}
         readOnly={readOnly}

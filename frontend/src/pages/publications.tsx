@@ -117,11 +117,11 @@ export default function PublicationsPage() {
         VAULT · {name?.toUpperCase()} · PUBLICATIONS
       </div>
 
-      <h1 className="font-serif text-[54px] leading-[0.95] tracking-[-0.03em] text-foreground mb-3">
-        published<span className="text-foreground-muted">.</span>
+      <h1 className="font-display text-[44px] leading-[1.0] tracking-tight text-foreground mb-3">
+        published<span className="text-accent">.</span>
       </h1>
 
-      <p className="font-serif-italic text-[17px] leading-[1.55] text-foreground-muted mb-8">
+      <p className="text-[16px] leading-[1.55] text-foreground-muted mb-8 max-w-2xl">
         Public-read links for this vault. Unpublish any time — the /p/ URL stops
         resolving immediately.
       </p>
@@ -146,7 +146,7 @@ export default function PublicationsPage() {
             description="Publish a document or table from its page to create a public /p/ link."
           />
         ) : (
-          <ol className="border border-border bg-surface divide-y divide-border">
+          <ol className="rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm">
             {items.map((p, i) => {
               const Icon = RESOURCE_ICON[p.resource_type];
               return (
