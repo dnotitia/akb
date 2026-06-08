@@ -60,7 +60,7 @@ describe("GraphDetailPanel · document node", () => {
           docId="d-1"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -74,7 +74,7 @@ describe("GraphDetailPanel · document node", () => {
     expect(screen.getByText(/line1/)).toBeTruthy();
   });
 
-  it("calls onSelectUri with the target when a related document is clicked", async () => {
+  it("calls onSelectRelated with the target when a related document is clicked", async () => {
     getDocument.mockResolvedValue({ doc_id: "d-1", title: "Hello", content: "" });
     getRelations.mockResolvedValue({
       doc_id: "d-1",
@@ -83,7 +83,7 @@ describe("GraphDetailPanel · document node", () => {
         { direction: "outgoing", relation: "depends_on", uri: "akb://akb/doc/y", name: "Y", resource_type: "document" },
       ],
     });
-    const onSelectUri = vi.fn();
+    const onSelectRelated = vi.fn();
     const u = userEvent.setup();
     render(
       wrap(
@@ -92,14 +92,22 @@ describe("GraphDetailPanel · document node", () => {
           docId="d-1"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={onSelectUri}
+          onSelectRelated={onSelectRelated}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
       ),
     );
     await u.click(await screen.findByRole("button", { name: "Y" }));
-    expect(onSelectUri).toHaveBeenCalledWith("akb://akb/doc/y");
+    expect(onSelectRelated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        uri: "akb://akb/doc/y",
+        name: "Y",
+        kind: "document",
+        relation: "depends_on",
+        direction: "outgoing",
+      }),
+    );
   });
 
   it("defers META fetches until the section expands", async () => {
@@ -119,7 +127,7 @@ describe("GraphDetailPanel · document node", () => {
           docId="d-1"
           kind="document"
           uri="u"
-          onSelectUri={() => {}}
+          onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -144,7 +152,7 @@ describe("GraphDetailPanel · fetch states", () => {
           docId="d-x"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -170,7 +178,7 @@ describe("GraphDetailPanel · fetch states", () => {
           docId="d-x"
           kind="document"
           uri="akb://akb/doc/x"
-          onSelectUri={() => {}}
+          onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,
@@ -198,7 +206,7 @@ describe("GraphDetailPanel · table node", () => {
           docId="t-1"
           kind="table"
           uri="u"
-          onSelectUri={() => {}}
+          onSelectRelated={() => {}}
           onFitToNode={() => {}}
           onClose={() => {}}
         />,

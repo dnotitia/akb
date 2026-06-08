@@ -16,7 +16,8 @@ import {
   docIdFromUri,
 } from "@/components/graph/use-graph-data";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
-import { kindToSegment, type GraphEdge, type GraphNode, type GraphView } from "@/components/graph/graph-types";
+import { kindToSegment, type GraphEdge, type GraphNode, type GraphView, type RelatedRef } from "@/components/graph/graph-types";
+import { groupOf } from "@/components/graph/cluster";
 
 const DOUBLECLICK_MS = 250;
 
@@ -130,6 +131,34 @@ export default function GraphPage() {
   }, [merged, view.selected]);
   const detailOpen = !!selectedNode && !!selectedDocId;
 
+  // Clicking a relation in the detail panel selects that node in the graph.
+  // If it isn't currently rendered (filtered out, or outside the loaded
+  // neighbourhood), add it — plus the edge connecting it to the current node —
+  // to the session overlay first, so it appears and can be highlighted.
+  function handleSelectRelated(rel: RelatedRef) {
+    const present = merged.nodes.some((n) => n.uri === rel.uri);
+    if (!present) {
+      const node: GraphNode = { uri: rel.uri, name: rel.name, kind: rel.kind, group: groupOf(rel.uri) };
+      const sourceUri = selectedNode?.uri;
+      const edge: GraphEdge | null = sourceUri
+        ? rel.direction === "outgoing"
+          ? { source: sourceUri, target: rel.uri, relation: rel.relation }
+          : { source: rel.uri, target: sourceUri, relation: rel.relation }
+        : null;
+      setOverlay((prev) => ({
+        nodes: prev.nodes.some((n) => n.uri === rel.uri) ? prev.nodes : [...prev.nodes, node],
+        edges:
+          edge &&
+          !prev.edges.some(
+            (e) => e.source === edge.source && e.target === edge.target && e.relation === edge.relation,
+          )
+            ? [...prev.edges, edge]
+            : prev.edges,
+      }));
+    }
+    setView({ ...view, selected: docIdFromUri(rel.uri) ?? rel.uri });
+  }
+
   const gridCols = `${sidebarOpen ? "240px" : "40px"} 1fr ${detailOpen ? "320px" : "0px"}`;
 
   return (
@@ -210,12 +239,7 @@ export default function GraphPage() {
           docId={selectedDocId}
           kind={selectedNode.kind}
           uri={selectedNode.uri}
-          onSelectUri={(selUri) => {
-            // Select (highlight) the related node in the graph — stay here,
-            // don't navigate away.
-            const sel = docIdFromUri(selUri) ?? selUri;
-            setView({ ...view, selected: sel });
-          }}
+          onSelectRelated={handleSelectRelated}
           onFitToNode={(fitUri) => canvasRef.current?.centerOnNode(fitUri)}
           onClose={() => setView({ ...view, selected: undefined })}
           onTogglePin={() => {

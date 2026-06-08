@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { getDocument, getRelations, getProvenance, drillDown } from "@/lib/api";
-import { ALL_NODE_KINDS, ALL_RELATIONS, type NodeKind, type RelationKind, kindToSegment } from "./graph-types";
+import { ALL_NODE_KINDS, ALL_RELATIONS, type NodeKind, type RelationKind, type RelatedRef, kindToSegment } from "./graph-types";
 import { Section } from "./Section";
 
 interface Props {
@@ -15,8 +15,9 @@ interface Props {
   docId: string;
   kind: NodeKind;
   uri: string;
-  /** Select (highlight) the related resource's node in the graph. */
-  onSelectUri: (uri: string) => void;
+  /** Select (highlight) the related resource's node in the graph — adding it
+   *  to the graph first if it isn't currently rendered. */
+  onSelectRelated: (rel: RelatedRef) => void;
   onFitToNode: (uri: string) => void;
   onClose: () => void;
   onTogglePin?: () => void;
@@ -48,7 +49,7 @@ export function GraphDetailPanel({
   docId,
   kind,
   uri,
-  onSelectUri,
+  onSelectRelated,
   onFitToNode,
   onClose,
   onTogglePin,
@@ -188,7 +189,7 @@ export function GraphDetailPanel({
                 relation={g.relation}
                 direction="out"
                 rows={g.rows}
-                onSelectUri={onSelectUri}
+                onSelectRelated={onSelectRelated}
                 onFitToNode={onFitToNode}
               />
             ))}
@@ -198,7 +199,7 @@ export function GraphDetailPanel({
                 relation={g.relation}
                 direction="in"
                 rows={g.rows}
-                onSelectUri={onSelectUri}
+                onSelectRelated={onSelectRelated}
                 onFitToNode={onFitToNode}
               />
             ))}
@@ -303,13 +304,13 @@ function RelGroup({
   relation,
   direction,
   rows,
-  onSelectUri,
+  onSelectRelated,
   onFitToNode,
 }: {
   relation: RelationKind;
   direction: "in" | "out";
   rows: GroupedRel["rows"];
-  onSelectUri: (uri: string) => void;
+  onSelectRelated: (rel: RelatedRef) => void;
   onFitToNode: (uri: string) => void;
 }) {
   return (
@@ -320,12 +321,19 @@ function RelGroup({
       <ul className="flex flex-col gap-px pl-2">
         {rows.map((r) => (
           <li key={r.other_uri} className="group flex items-center gap-1">
-            {/* Click selects + centers the related node in the graph (it
-                highlights there) rather than navigating away. */}
+            {/* Click selects + centers the related node in the graph (added
+                to the graph first if it isn't currently rendered) rather than
+                navigating away. */}
             <button
               type="button"
               onClick={() => {
-                onSelectUri(r.other_uri);
+                onSelectRelated({
+                  uri: r.other_uri,
+                  name: r.other_name,
+                  kind: r.other_type,
+                  relation,
+                  direction: direction === "out" ? "outgoing" : "incoming",
+                });
                 onFitToNode(r.other_uri);
               }}
               title={`${r.other_name} — 그래프에서 선택`}
