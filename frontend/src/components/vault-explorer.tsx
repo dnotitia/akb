@@ -1,9 +1,10 @@
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
   File,
+  FilePlus,
   FileText,
   FolderPlus,
   Network,
@@ -67,6 +68,7 @@ export function VaultExplorer({
   onRefetchReady,
 }: VaultExplorerProps) {
   const { tree, loading, error, refetch } = useVaultTree(vault);
+  const navigate = useNavigate();
   const refreshCtx = useVaultRefresh();
   // Prefer the explicit prop; otherwise fall back to context. This lets
   // tests render the explorer with no provider and still wire mutation
@@ -298,6 +300,11 @@ export function VaultExplorer({
               vault={vault}
               onToggle={toggle}
               canWrite={canWrite}
+              onCreateDoc={(node) =>
+                navigate(
+                  `/vault/${vault}/doc/new?collection=${encodeURIComponent(node.path)}`,
+                )
+              }
               onCreateSubCollection={(node) => openCreate(node.path)}
               onDeleteCollection={(node) =>
                 setDeleteTarget({
@@ -403,10 +410,13 @@ interface RowProps {
    *  collection row. Parent opens the create dialog with this node's
    *  path prefilled as the parent. */
   onCreateSubCollection?: (node: TreeNode) => void;
+  /** Fired when the user clicks the doc icon on a collection row. Parent
+   *  routes to the new-document page with this collection prefilled. */
+  onCreateDoc?: (node: TreeNode) => void;
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onCreateSubCollection,
+  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, onDeleteCollection, onCreateSubCollection, onCreateDoc,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -435,6 +445,21 @@ const TreeRow = memo(function TreeRow({
           <span className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
           {count > 0 && <span className="coord ml-auto shrink-0">{count}</span>}
         </button>
+        {canWrite && onCreateDoc && (
+          <button
+            type="button"
+            onClick={(e) => {
+              // Stop the row's expand-toggle from also firing.
+              e.stopPropagation();
+              onCreateDoc(node);
+            }}
+            title={`New document in ${node.path}`}
+            aria-label={`Create document in ${node.path}`}
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-accent transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            <FilePlus className="h-3 w-3" aria-hidden />
+          </button>
+        )}
         {canWrite && onCreateSubCollection && (
           <button
             type="button"
