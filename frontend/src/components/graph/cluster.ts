@@ -20,14 +20,17 @@ import type { GraphNode } from "./graph-types";
  *  like `weekly-updates/<week>/<topic>` this groups by WEEK at depth 2
  *  (everything under one top-level collection would otherwise be one blob). */
 export const GROUP_DEPTH = 2;
-/** How hard same-group nodes are pulled toward their shared centroid. */
-export const CLUSTER_STRENGTH = 0.22;
-/** Minimum spacing radius per node (px) — stops clumps from cramming. */
-export const COLLIDE_RADIUS = 15;
+/** How hard same-group nodes are pulled toward their shared centroid. Gentle
+ *  on purpose: a soft pull lets links + charge shape each group into an
+ *  organic neighbourhood rather than crushing it into a tight ball. */
+export const CLUSTER_STRENGTH = 0.15;
+/** Minimum spacing radius per node (px) — breathing room so nodes read
+ *  individually instead of cramming. */
+export const COLLIDE_RADIUS = 20;
 /** Global node repulsion while clustering. Less negative than d3's -30
  *  default, so separate clusters sit CLOSER together instead of flying apart;
  *  forceCollide handles local spacing instead of charge. */
-export const CHARGE_STRENGTH = -14;
+export const CHARGE_STRENGTH = -16;
 /** d3 / force-graph default many-body charge, restored when clustering off. */
 export const DEFAULT_CHARGE = -30;
 
