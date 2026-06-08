@@ -20,6 +20,9 @@ export interface GraphNode {
   kind: NodeKind;
   doc_id?: string;
   doc_type?: string;
+  /** Cluster id (top-level collection) for grouping/coloring/hulls.
+   *  Derived from the URI at render time; null = ungrouped. See cluster.ts. */
+  group?: string | null;
   // simulation-owned positional state
   x?: number; y?: number; vx?: number; vy?: number; fx?: number; fy?: number;
 }
