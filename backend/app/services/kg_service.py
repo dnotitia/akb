@@ -34,6 +34,22 @@ logger = logging.getLogger("akb.graph")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 # Matches akb:// URIs anywhere in text
 _AKB_URI_RE = re.compile(r"akb://[^\s\)>`]+")
+# Code spans — fenced blocks (``` / ~~~) and inline (`…`). Anything inside
+# is example/snippet text, NOT a real link: a session report quoting
+# `akb://project-akb/...`, a regex example `akb://\1/coll/\2/doc/\3`, or a
+# JSON fragment `"incidents/a.md"` must NOT become a graph edge to a
+# (usually non-existent) target. Strip code before scanning for links.
+_FENCED_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+
+def strip_code_spans(content: str) -> str:
+    """Remove fenced + inline code spans so example links inside them are not
+    extracted as relations. Replaces each span with a space to preserve
+    surrounding token boundaries."""
+    content = _FENCED_CODE_RE.sub(" ", content)
+    content = _INLINE_CODE_RE.sub(" ", content)
+    return content
 
 
 # ── Link extraction from markdown body ───────────────────────
@@ -42,8 +58,9 @@ def extract_markdown_links(content: str) -> list[str]:
     """Extract internal document references from markdown links.
 
     Returns list of targets (paths, doc IDs, or akb:// URIs).
-    Filters out external URLs (http/https/mailto).
+    Filters out external URLs (http/https/mailto) and code-span contents.
     """
+    content = strip_code_spans(content)
     targets: list[str] = []
     seen: set[str] = set()
 
