@@ -628,7 +628,7 @@ export default function SettingsPage() {
                         <span className="coord tabular-nums shrink-0">
                           {String(i + 1).padStart(2, "0")}
                         </span>
-                        <span className="text-sm font-medium truncate text-foreground">
+                        <span title={p.name} className="text-sm font-medium truncate text-foreground">
                           {p.name}
                         </span>
                         <code className="font-mono text-[11px] text-foreground-muted">
@@ -985,16 +985,17 @@ export default function SettingsPage() {
                           </span>
                           <span
                             data-testid="admin-user-name"
+                            title={u.username}
                             className="text-sm font-medium truncate text-foreground"
                           >
                             {u.username}
                           </span>
                           {u.display_name && u.display_name !== u.username && (
-                            <span className="text-sm text-foreground-muted truncate hidden sm:inline">
+                            <span title={u.display_name} className="text-sm text-foreground-muted truncate hidden sm:inline">
                               {u.display_name}
                             </span>
                           )}
-                          <code className="font-mono text-[11px] text-foreground-muted truncate hidden md:inline">
+                          <code title={u.email} className="font-mono text-[11px] text-foreground-muted truncate hidden md:inline">
                             {u.email}
                           </code>
                           {u.is_admin && (

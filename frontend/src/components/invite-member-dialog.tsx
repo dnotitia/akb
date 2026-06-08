@@ -168,16 +168,16 @@ export function InviteMemberDialog({
                           }`}
                         >
                           <div className="flex items-baseline gap-2">
-                            <span className="font-mono text-sm font-medium truncate">
+                            <span title={u.username} className="font-mono text-sm font-medium truncate">
                               {u.username}
                             </span>
                             {u.display_name && (
-                              <span className="text-xs text-foreground-muted truncate">
+                              <span title={u.display_name} className="text-xs text-foreground-muted truncate">
                                 {u.display_name}
                               </span>
                             )}
                           </div>
-                          <div className="coord truncate">{u.email}</div>
+                          <div title={u.email} className="coord truncate">{u.email}</div>
                         </button>
                       </li>
                     );

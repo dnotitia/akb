@@ -162,6 +162,7 @@ export default function PublicationsPage() {
                       <Icon className="h-3.5 w-3.5 shrink-0 translate-y-0.5 text-foreground-muted" aria-hidden />
                       <Link
                         to={resourceHref(p)}
+                        title={p.title || p.slug}
                         className="text-sm font-medium tracking-tight truncate text-foreground hover:text-accent"
                       >
                         {p.title || p.slug}
@@ -176,7 +177,7 @@ export default function PublicationsPage() {
                         />
                       )}
                     </div>
-                    <div className="coord truncate mt-1 font-mono">
+                    <div title={`/p/${p.slug}`} className="coord truncate mt-1 font-mono">
                       /p/{p.slug}
                     </div>
                   </div>

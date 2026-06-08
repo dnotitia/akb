@@ -62,6 +62,15 @@ describe("VaultExplorer — rendering", () => {
     expect(screen.getByRole("treeitem", { name: /audit_log/ })).toBeInTheDocument();
   });
 
+  it("exposes the full name via a title attribute so truncated rows reveal it on hover", async () => {
+    renderAt("/vault/v");
+    // Collection row: the name span carries title=name for the CSS-truncated label.
+    const collectionName = await screen.findByText("architecture");
+    expect(collectionName).toHaveAttribute("title", "architecture");
+    // Leaf row (root-level table is visible without expanding any collection).
+    expect(screen.getByText("audit_log")).toHaveAttribute("title", "audit_log");
+  });
+
   it("exposes ARIA treeview semantics", async () => {
     renderAt("/vault/v");
     const tree = await screen.findByRole("tree", { name: /v explorer/ });

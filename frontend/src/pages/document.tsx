@@ -596,7 +596,7 @@ export default function DocumentPage() {
             {doc.is_public && doc.public_slug ? (
               <div className="flex flex-col gap-1.5 text-xs">
                 <div className="coord">§ PUBLISHED</div>
-                <div className="font-mono text-[11px] text-foreground truncate">
+                <div title={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground truncate">
                   /p/{doc.public_slug}
                 </div>
                 <div className="flex items-center gap-3 text-[11px]">
@@ -694,7 +694,7 @@ export default function DocumentPage() {
                           className="grid grid-cols-[88px_1fr] gap-1.5 py-0.5 group hover:bg-surface-muted -mx-1 px-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                         >
                           <span className={relColor}>{r.relation || "relates"}</span>
-                          <span className="text-foreground truncate group-hover:text-accent">
+                          <span title={label} className="text-foreground truncate group-hover:text-accent">
                             → {label}
                           </span>
                         </Link>
