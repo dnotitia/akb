@@ -1,6 +1,6 @@
 // frontend/src/components/graph/GraphSidebar.tsx
 import { useEffect, useRef, useState } from "react";
-import { Search as SearchIcon, X } from "lucide-react";
+import { PanelLeftClose, Search as SearchIcon, X } from "lucide-react";
 import { searchDocs } from "@/lib/api";
 import { useGraphHistory } from "@/hooks/use-graph-history";
 import { useDebounce } from "@/hooks/use-debounce";
@@ -20,6 +20,8 @@ interface Props {
   view: GraphView;
   onChange: (next: GraphView) => void;
   onNavigate: (queryString: string) => void;
+  /** When provided, renders a collapse control in the sidebar header. */
+  onCollapse?: () => void;
 }
 
 interface SearchHit {
@@ -28,7 +30,7 @@ interface SearchHit {
   type: NodeKind;
 }
 
-export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
+export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: Props) {
   const { recent, pushRecent, clearRecent, saved, saveView, deleteView } =
     useGraphHistory(vault);
   const [query, setQuery] = useState("");
@@ -119,6 +121,21 @@ export function GraphSidebar({ vault, view, onChange, onNavigate }: Props) {
       className="flex flex-col h-full overflow-y-auto border-r border-border bg-surface"
       aria-label="Graph controls"
     >
+      {onCollapse && (
+        <div className="flex items-center justify-between h-9 px-2 border-b border-border shrink-0">
+          <span className="coord text-foreground-muted">GRAPH</span>
+          <button
+            type="button"
+            onClick={onCollapse}
+            aria-label="Hide sidebar"
+            title="Hide sidebar"
+            className="inline-flex h-6 w-6 items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
       <Section label="ENTRY POINT" className="px-2">
         <div className="relative">
           <SearchIcon className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-foreground-muted pointer-events-none" />

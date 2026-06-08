@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { PanelLeftOpen } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
@@ -93,15 +93,21 @@ export default function GraphPage() {
     // TODO(graph-context-menu): floating menu with Pin/Unpin/Hide/Copy/Open-new-tab.
   }
 
-  const selectedNode = view.selected
-    ? merged.nodes.find(
-        (n) =>
-          n.uri === view.selected ||
-          n.doc_id === view.selected ||
-          docIdFromUri(n.uri) === view.selected,
-      )
-    : undefined;
-  const selectedDocId = selectedNode ? (selectedNode.doc_id || docIdFromUri(selectedNode.uri)) : null;
+  // Resolve the selected node + its lookup id once per (graph, selection)
+  // change rather than on every render — the find scans up to ~200 nodes and
+  // each comparison may parse a URI.
+  const { selectedNode, selectedDocId } = useMemo(() => {
+    const node = view.selected
+      ? merged.nodes.find(
+          (n) =>
+            n.uri === view.selected ||
+            n.doc_id === view.selected ||
+            docIdFromUri(n.uri) === view.selected,
+        )
+      : undefined;
+    const docId = node ? node.doc_id || docIdFromUri(node.uri) : null;
+    return { selectedNode: node, selectedDocId: docId };
+  }, [merged, view.selected]);
   const detailOpen = !!selectedNode && !!selectedDocId;
 
   const gridCols = `${sidebarOpen ? "240px" : "40px"} 1fr ${detailOpen ? "320px" : "0px"}`;
@@ -119,28 +125,26 @@ export default function GraphPage() {
           onNavigate={(qs) => {
             navigate({ search: qs.startsWith("?") ? qs : `?${qs}` }, { replace: true });
           }}
+          onCollapse={() => setSidebarOpen(false)}
         />
       ) : (
-        <button
-          type="button"
-          onClick={() => setSidebarOpen(true)}
-          aria-label="Open sidebar"
-          className="h-9 w-9 m-2 inline-flex items-center justify-center border border-border bg-surface text-foreground-muted hover:text-foreground"
-        >
-          <PanelLeftOpen className="h-4 w-4" />
-        </button>
+        // Collapsed rail: the sole "expand" affordance. The matching
+        // "collapse" control lives in the sidebar header (GraphSidebar
+        // onCollapse) so there is exactly one toggle, always on the left.
+        <div className="flex flex-col items-center border-r border-border bg-surface">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Show sidebar"
+            title="Show sidebar"
+            className="h-9 w-9 mt-2 inline-flex items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <PanelLeftOpen className="h-4 w-4" />
+          </button>
+        </div>
       )}
 
       <div className="relative bg-background overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setSidebarOpen((v) => !v)}
-          aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-          className="absolute top-3 right-3 z-10 h-8 w-8 inline-flex items-center justify-center bg-surface border border-border text-foreground-muted hover:text-foreground"
-        >
-          {sidebarOpen ? <PanelLeftClose className="h-3 w-3" /> : <PanelLeftOpen className="h-3 w-3" />}
-        </button>
-
         {degraded && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-warning/10 border border-warning text-warning px-3 py-1 font-mono text-[10px] uppercase">
             {rawNodeCount} nodes — pick an entry point to explore

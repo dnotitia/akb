@@ -1,6 +1,7 @@
 // frontend/src/components/graph/use-graph-data.ts
 import { useQuery } from "@tanstack/react-query";
 import { getGraph, getRelations, type RelationRow } from "@/lib/api";
+import { parseUri } from "@/lib/uri";
 import {
   ALL_NODE_KINDS,
   type GraphEdge,
@@ -134,9 +135,39 @@ function rowToNeighbor(row: RelationRow): GraphNode | null {
 // Multi-segment paths (e.g. `specs/2026/foo.md`) are preserved intact —
 // `find_by_ref` on the backend matches the metadata `id` or the `path LIKE`
 // fallback against this full tail.
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Resolve the backend lookup identifier from a resource URI.
+ *
+ * Thin adapter over `parseUri` in `lib/uri.ts` — the single source of
+ * truth for the AKB URI scheme (it mirrors backend `uri_service.py`).
+ * `parseUri().id` already yields the right identifier per kind:
+ *  - doc   → the document *path* within the vault (`collPath/basename`)
+ *  - table → the table name
+ *  - file  → the file id (uuid)
+ *
+ * We add only what's specific to backend lookups: restrict to addressable
+ * resource kinds (vault/coll URIs carry no document id → null) and
+ * percent-decode, since `getDocument`/`getRelations`/… expect the decoded
+ * path. Delegating keeps graph node selection + BFS expansion from drifting
+ * when the scheme evolves — the prior hand-rolled regex only matched the
+ * legacy root shape, so collection-scoped docs (the common case) resolved
+ * to null and the detail panel never opened.
+ */
 export function docIdFromUri(uri: string): string | null {
-  const m = uri.match(/^akb:\/\/[^/]+\/(?:doc|table|file)\/(.+)$/);
-  return m ? decodeURIComponent(m[1]) : null;
+  const parsed = parseUri(uri);
+  if (!parsed || (parsed.kind !== "doc" && parsed.kind !== "table" && parsed.kind !== "file")) {
+    return null;
+  }
+  // parseUri preserves raw URI encoding; decode for the backend lookup.
+  return safeDecode(parsed.id);
 }
 
 export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {

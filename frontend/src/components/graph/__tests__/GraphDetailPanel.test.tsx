@@ -104,6 +104,56 @@ describe("GraphDetailPanel · document node", () => {
   });
 });
 
+describe("GraphDetailPanel · fetch states", () => {
+  it("shows an error state with a retry control when the document fetch fails", async () => {
+    getDocument.mockRejectedValue(new Error("404 not found"));
+    getRelations.mockResolvedValue({ doc_id: "d-x", uri: "u", relations: [] });
+
+    render(
+      wrap(
+        <GraphDetailPanel
+          vault="akb"
+          docId="d-x"
+          kind="document"
+          uri="akb://akb/doc/x"
+          onSelectUri={() => {}}
+          onFitToNode={() => {}}
+          onClose={() => {}}
+        />,
+      ),
+    );
+
+    expect(await screen.findByText(/couldn't load this resource/i)).toBeTruthy();
+    expect(screen.getByText(/404 not found/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
+  });
+
+  it("re-fetches when Retry is clicked", async () => {
+    getDocument
+      .mockRejectedValueOnce(new Error("transient"))
+      .mockResolvedValueOnce({ doc_id: "d-x", title: "Recovered", content: "" });
+    getRelations.mockResolvedValue({ doc_id: "d-x", uri: "u", relations: [] });
+
+    const u = userEvent.setup();
+    render(
+      wrap(
+        <GraphDetailPanel
+          vault="akb"
+          docId="d-x"
+          kind="document"
+          uri="akb://akb/doc/x"
+          onSelectUri={() => {}}
+          onFitToNode={() => {}}
+          onClose={() => {}}
+        />,
+      ),
+    );
+
+    await u.click(await screen.findByRole("button", { name: /retry/i }));
+    expect(await screen.findByText("Recovered")).toBeTruthy();
+  });
+});
+
 describe("GraphDetailPanel · table node", () => {
   it("does not show preview for tables", async () => {
     getDocument.mockResolvedValue({

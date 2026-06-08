@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { mergeGraph, bfsExpand, applyFilters, isDegraded } from "../use-graph-data";
+import { mergeGraph, bfsExpand, applyFilters, isDegraded, docIdFromUri } from "../use-graph-data";
+import { docUri } from "@/lib/uri";
 import { DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
 
 describe("mergeGraph", () => {
@@ -96,6 +97,55 @@ describe("isDegraded", () => {
   it("flips at > 500 raw nodes (unfiltered count)", () => {
     expect(isDegraded(500)).toBe(false);
     expect(isDegraded(501)).toBe(true);
+  });
+});
+
+describe("docIdFromUri", () => {
+  // The regression this guards: before the canonical-aware rewrite the
+  // regex only matched `akb://V/doc/...`, so collection-scoped docs (the
+  // common case) returned null — the detail panel never opened and BFS
+  // neighbour expansion silently dropped every collection node.
+  it("resolves a collection-scoped doc to its full vault-relative path", () => {
+    expect(docIdFromUri("akb://gnu/coll/specs/2026/doc/api.md")).toBe("specs/2026/api.md");
+  });
+
+  it("resolves a single-segment collection doc", () => {
+    expect(docIdFromUri("akb://v/coll/notes/doc/hello.md")).toBe("notes/hello.md");
+  });
+
+  it("resolves a vault-root doc (no collection segment)", () => {
+    expect(docIdFromUri("akb://v/doc/readme.md")).toBe("readme.md");
+  });
+
+  it("resolves the legacy multi-segment root shape (root regex captures full tail)", () => {
+    expect(docIdFromUri("akb://v/doc/specs/legacy/api.md")).toBe("specs/legacy/api.md");
+  });
+
+  it("returns the bare identifier for tables and files (collection part dropped)", () => {
+    expect(docIdFromUri("akb://v/coll/data/table/metrics")).toBe("metrics");
+    expect(docIdFromUri("akb://v/table/metrics")).toBe("metrics");
+    expect(docIdFromUri("akb://v/coll/assets/file/8f1c.png")).toBe("8f1c.png");
+    expect(docIdFromUri("akb://v/file/8f1c.png")).toBe("8f1c.png");
+  });
+
+  it("percent-decodes spaces in collection path and leaf", () => {
+    expect(docIdFromUri("akb://v/coll/my%20notes/doc/a%20b.md")).toBe("my notes/a b.md");
+  });
+
+  it("returns null for vault-only and collection-only URIs", () => {
+    expect(docIdFromUri("akb://v")).toBeNull();
+    expect(docIdFromUri("akb://v/coll/specs/2026")).toBeNull();
+  });
+
+  it("returns null for unparseable input", () => {
+    expect(docIdFromUri("not-a-uri")).toBeNull();
+    expect(docIdFromUri("")).toBeNull();
+  });
+
+  it("round-trips with the docUri builder for nested collection paths", () => {
+    for (const path of ["readme.md", "notes/hello.md", "specs/2026/api.md", "a/b/c/d.md"]) {
+      expect(docIdFromUri(docUri("v", path))).toBe(path);
+    }
   });
 });
 
