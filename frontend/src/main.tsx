@@ -25,6 +25,24 @@ import VaultSettingsPage from "@/pages/vault-settings";
 import VaultActivityPage from "@/pages/vault-activity";
 import "./index.css";
 
+// Vite dispatches `vite:preloadError` on window when a dynamically-imported
+// chunk fails to load — the classic stale-deploy symptom: a client holding
+// an old index.html requests a chunk hash a newer build has removed, so the
+// fetch 404s (or, with the old nginx config, returned index.html and failed
+// to parse as a module). Recover by reloading once onto the fresh build.
+// (The event type ships with vite/client.)
+const PRELOAD_RELOAD_AT = "akb.preloadReloadAt";
+window.addEventListener("vite:preloadError", (event) => {
+  // Loop guard: if we already reloaded for this in the last 10s, the chunk
+  // is genuinely broken (not merely stale) — let the error surface to the
+  // ErrorBoundary instead of reloading forever.
+  const last = Number(sessionStorage.getItem(PRELOAD_RELOAD_AT) || 0);
+  if (Date.now() - last < 10_000) return;
+  sessionStorage.setItem(PRELOAD_RELOAD_AT, String(Date.now()));
+  event.preventDefault(); // we're handling it — suppress the default throw
+  window.location.reload();
+});
+
 // Old /vault/:name/skill URLs now redirect to the underlying guide doc;
 // removed the dedicated page because it duplicated DocumentPage.
 function SkillRedirect() {
