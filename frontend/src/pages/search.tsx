@@ -85,7 +85,10 @@ export default function SearchPage() {
   // query param is honored only on the global `/search` route.
   const { name: scopedVault } = useParams<{ name: string }>();
   const q = searchParams.get("q") || "";
-  const mode = (searchParams.get("mode") as Mode) || "dense";
+  // Sanitize instead of a bare cast: an unknown ?mode= must fall back to dense,
+  // not slip through as a truthy non-dense value that routes to grep with
+  // neither toggle highlighted.
+  const mode: Mode = searchParams.get("mode") === "literal" ? "literal" : "dense";
   const queryVault = searchParams.get("v") || "";
   const vault = scopedVault || queryVault;
 

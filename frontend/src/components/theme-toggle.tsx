@@ -21,7 +21,7 @@ export function ThemeToggle() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Theme: ${LABELS[theme]}`}
-        className="inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
+        className="inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
       >
         <Icon className="h-4 w-4" aria-hidden />
       </DropdownMenu.Trigger>
@@ -41,7 +41,7 @@ export function ThemeToggle() {
                 <DropdownMenu.RadioItem
                   key={opt}
                   value={opt}
-                  className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-muted"
+                  className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
                 >
                   <OptIcon className="h-4 w-4" aria-hidden />
                   <span>{LABELS[opt]}</span>

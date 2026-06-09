@@ -1,5 +1,6 @@
-import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Component, useEffect, useRef, type ErrorInfo, type ReactNode } from "react";
 import { RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 interface Props {
   children: ReactNode;
@@ -57,6 +58,13 @@ export class ErrorBoundary extends Component<Props, State> {
 }
 
 function DefaultFallback({ error, reset }: { error: Error; reset: () => void }) {
+  // Move focus to the recovery action when the fallback mounts — otherwise a
+  // keyboard user's focus is stranded on a control that just unmounted, and
+  // role=alert only announces, it doesn't move focus.
+  const retryRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    retryRef.current?.focus();
+  }, []);
   return (
     <div className="flex items-center justify-center p-12" role="alert">
       <div className="max-w-md text-center">
@@ -67,14 +75,10 @@ function DefaultFallback({ error, reset }: { error: Error; reset: () => void }) 
         <p className="text-sm text-foreground-muted leading-relaxed mb-6">
           {error.message || "An unexpected error occurred."}
         </p>
-        <button
-          type="button"
-          onClick={reset}
-          className="inline-flex items-center gap-2 border border-border bg-surface px-3 py-1.5 text-sm text-foreground hover:bg-surface-muted transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
+        <Button ref={retryRef} variant="outline" size="sm" onClick={reset}>
           <RefreshCw className="h-4 w-4" aria-hidden />
           Try again
-        </button>
+        </Button>
       </div>
     </div>
   );
