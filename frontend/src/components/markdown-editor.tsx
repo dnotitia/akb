@@ -232,11 +232,11 @@ const components: Record<string, React.FC<any>> = {
   [ParagraphPlugin.key]: ParagraphElement,
   [H1Plugin.key]: makeHeading(
     "h1",
-    "font-serif text-[32px] leading-[1.15] tracking-[-0.02em] mt-8 mb-4",
+    "font-semibold text-[32px] leading-[1.15] tracking-[-0.02em] mt-8 mb-4",
   ),
   [H2Plugin.key]: makeHeading(
     "h2",
-    "font-serif text-[24px] leading-[1.2] tracking-[-0.015em] mt-7 mb-3",
+    "font-semibold text-[24px] leading-[1.2] tracking-[-0.015em] mt-7 mb-3",
   ),
   [H3Plugin.key]: makeHeading("h3", "font-semibold text-[19px] mt-6 mb-2"),
   [H4Plugin.key]: makeHeading("h4", "font-semibold text-[17px] mt-5 mb-2"),

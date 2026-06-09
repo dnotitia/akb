@@ -371,7 +371,7 @@ export default function DocumentPage() {
 
         {/* Byline in serif italic */}
         {(doc.created_by || doc.updated_at) && (
-          <div className="font-serif-italic text-[14px] text-foreground-muted mb-7">
+          <div className="font-medium tracking-[-0.01em] text-[14px] text-foreground-muted mb-7">
             {doc.created_by && (
               <>
                 Written by{" "}

@@ -110,7 +110,7 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
 
   if (mime.startsWith("image/")) {
     return (
-      <div className="flex justify-center bg-whisper p-6">
+      <div className="flex justify-center bg-surface-2 p-6">
         <img src={directUrl} alt={name} className="max-w-full max-h-[80vh]" />
       </div>
     );
