@@ -73,14 +73,21 @@ export function isDarkBg(bg: string): boolean {
 
 const colorCache = new Map<string, string>();
 
+// Curated on-brand hue set for cluster rings — cool teals/sage + warm
+// oranges/amber, anchored on the teal/orange brand. Replaces the former
+// full-spectrum 0-360 rainbow (which surfaced off-brand blues/purples/magenta).
+// hashHue() (0-359) buckets a group into one of these, keeping clusters
+// distinguishable without leaving the brand palette.
+const CLUSTER_HUES = [192, 200, 178, 160, 30, 18, 40];
+
 /** Stable, theme-aware ring color for a group key (memoized — called per
  *  visible node every frame). Darker on a light background so it reads. */
 export function groupColor(group: string, dark = true): string {
   const key = `${group}|${dark ? 1 : 0}`;
   const cached = colorCache.get(key);
   if (cached) return cached;
-  const h = hashHue(group);
-  const col = dark ? `hsl(${h}, 65%, 62%)` : `hsl(${h}, 60%, 42%)`;
+  const h = CLUSTER_HUES[hashHue(group) % CLUSTER_HUES.length];
+  const col = dark ? `hsl(${h}, 58%, 60%)` : `hsl(${h}, 52%, 38%)`;
   colorCache.set(key, col);
   return col;
 }

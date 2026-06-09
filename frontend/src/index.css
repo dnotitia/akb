@@ -327,19 +327,24 @@ body::before {
   color: #fff;
   box-shadow: var(--shadow-md);
 }
-.feat-knowledge { background: linear-gradient(135deg, #0a6f86, #14b8a6); }
-.feat-agent     { background: linear-gradient(135deg, #5b6ef5, #8b5cf6); }
+/* Per-capability tiles — curated to the teal↔orange brand family
+   (cool teals + warm ambers/oranges + neutral). No off-brand
+   purple/blue/magenta. Distinguishable via hue+lightness within the
+   brand. Eyebrow labels are neutral-muted (Swiss) — the tile carries
+   the color identity. */
+.feat-knowledge { background: linear-gradient(135deg, #004059, #0a6f86); }
+.feat-agent     { background: linear-gradient(135deg, #0a6f86, #18a0a0); }
 .feat-memory    { background: linear-gradient(135deg, #e8932f, #e55e2c); }
-.feat-collector { background: linear-gradient(135deg, #2f7fe8, #22b8d9); }
-.feat-metering  { background: linear-gradient(135deg, #e55e2c, #d9434f); }
-.feat-members   { background: linear-gradient(135deg, #7c4ddc, #b05cf6); }
+.feat-collector { background: linear-gradient(135deg, #2c5561, #5a8fa0); }
+.feat-metering  { background: linear-gradient(135deg, #e55e2c, #c44a1e); }
+.feat-members   { background: linear-gradient(135deg, #5e6068, #8a8f98); }
 .feat-neutral   { background: linear-gradient(135deg, #5e6068, #8a8f98); }
-.feat-eyebrow-knowledge { color: #14b8a6; }
-.feat-eyebrow-agent     { color: #8b5cf6; }
-.feat-eyebrow-memory    { color: #e8932f; }
-.feat-eyebrow-collector { color: #22b8d9; }
-.feat-eyebrow-metering  { color: #e07a3c; }
-.feat-eyebrow-members   { color: #b05cf6; }
+.feat-eyebrow-knowledge,
+.feat-eyebrow-agent,
+.feat-eyebrow-memory,
+.feat-eyebrow-collector,
+.feat-eyebrow-metering,
+.feat-eyebrow-members,
 .feat-eyebrow-neutral   { color: var(--color-foreground-muted); }
 
 /* ── Motion ──────────────────────────────────────────────────────── */
