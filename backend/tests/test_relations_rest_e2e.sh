@@ -199,6 +199,11 @@ CODE=$(rdel_code "$PAT2" "$URI_A" "$URI_B" "references")
 CODE=$(rdel_code "$PAT1" "$COLL_URI" "$URI_B" "references")
 [ "$CODE" = "400" ] && pass "unlink from coll URI → 400 (matches POST, no false success)" || fail "DELETE coll reject" "got $CODE"
 
+# DELETE relation is typed RelationType | None → a non-vocab value is
+# rejected by request validation (422), mirroring POST's bad-enum 422.
+CODE=$(rdel_code "$PAT1" "$URI_A" "$URI_B" "bogus_rel")
+[ "$CODE" = "422" ] && pass "unlink with bad relation enum → 422" || fail "DELETE bad relation" "got $CODE"
+
 # relation omitted → remove ALL edges between the two
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"references\"}" >/dev/null
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"related_to\"}" >/dev/null

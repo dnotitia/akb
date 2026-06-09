@@ -35,6 +35,14 @@ URI-addressable.
 from mcp.types import Tool
 
 from app.services import template_registry
+from app.services.kg_service import LINK_RELATION_TYPES
+
+# The link/unlink relation vocabulary is defined once in kg_service; the
+# tool schemas below derive from it so the MCP surface and the REST
+# `RelationType` model can never drift. `_REL_LIST` is the human-readable
+# spelling reused across descriptions.
+_REL_ENUM = list(LINK_RELATION_TYPES)
+_REL_LIST = ", ".join(LINK_RELATION_TYPES)
 
 
 TOOLS = [
@@ -461,7 +469,7 @@ TOOLS = [
             "properties": {
                 "uri": {"type": "string", "description": "Resource URI (akb://vault/doc/path, akb://vault/table/name, akb://vault/file/uuid)"},
                 "direction": {"type": "string", "enum": ["incoming", "outgoing", "both"], "default": "both"},
-                "type": {"type": "string", "description": "Filter by relation type (depends_on, related_to, implements, references, attached_to)"},
+                "type": {"type": "string", "description": f"Filter by relation type ({_REL_LIST})"},
             },
             "required": ["uri"],
         },
@@ -498,7 +506,7 @@ TOOLS = [
         description=(
             "Create a relation between any two resources (documents, tables, files). "
             "Source and target are AKB URIs. "
-            "Relation types: depends_on, related_to, implements, references, attached_to, derived_from. "
+            f"Relation types: {_REL_LIST}. "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
         inputSchema={
@@ -509,7 +517,7 @@ TOOLS = [
                 "relation": {
                     "type": "string",
                     "description": "Relation type",
-                    "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from"],
+                    "enum": _REL_ENUM,
                 },
             },
             "required": ["source", "target", "relation"],
@@ -526,7 +534,11 @@ TOOLS = [
             "properties": {
                 "source": {"type": "string", "description": "Source resource URI"},
                 "target": {"type": "string", "description": "Target resource URI"},
-                "relation": {"type": "string", "description": "Specific relation type to remove (omit to remove all)"},
+                "relation": {
+                    "type": "string",
+                    "description": f"Specific relation type to remove, one of: {_REL_LIST} (omit to remove all)",
+                    "enum": _REL_ENUM,
+                },
             },
             "required": ["source", "target"],
         },

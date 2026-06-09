@@ -6,7 +6,7 @@ The frontend constructs the URI from `vault` + `path` (or file uuid)
 before calling these endpoints.
 """
 
-from typing import Literal
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -15,6 +15,7 @@ from app.db.postgres import get_pool
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.kg_service import (
+    LinkRelationType as RelationType,
     get_resource_relations,
     get_graph,
     get_provenance,
@@ -25,6 +26,7 @@ from app.services.uri_service import parse_uri
 from app.util.text import NFCModel
 
 router = APIRouter()
+logger = logging.getLogger("akb.api.knowledge")
 
 
 def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str, str, str]:
@@ -55,16 +57,11 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
 # ── Relation write surface (link / unlink) ───────────────────
 #
 # REST twins of the MCP akb_link / akb_unlink handlers. Same writer
-# gate, same-vault guard, and (for POST) the same relation vocabulary —
-# the two surfaces must accept and reject identically.
-
-# Kept in lockstep with the MCP akb_link tool schema
-# (mcp_server/tools.py): a relation that akb_link rejects must not
-# sneak in through POST /relations.
-RelationType = Literal[
-    "depends_on", "related_to", "implements",
-    "references", "attached_to", "derived_from",
-]
+# gate, same-vault guard, and the same relation vocabulary — the two
+# surfaces must accept and reject identically. `RelationType` is the
+# single-source `LinkRelationType` from kg_service (which the MCP
+# akb_link tool schema also derives from), so a relation one surface
+# rejects can never sneak in through the other.
 
 
 class LinkRequest(NFCModel):
@@ -86,11 +83,24 @@ _LINK_ERR_STATUS = {
 
 
 def _bridge_service_error(result: dict) -> dict:
-    """Raise HTTPException when a kg_service call returned an err() dict."""
+    """Raise HTTPException when a kg_service call returned an err() dict.
+
+    A non-dict result (a future service refactor returning a model, or a
+    bare value) is passed through untouched rather than crashing on
+    ``.get``. An err whose ``code`` isn't in the status map falls back to
+    400 but is logged, so a newly-introduced service code surfaces in the
+    logs instead of silently collapsing to a generic 400.
+    """
+    if not isinstance(result, dict):
+        return result
     code = result.get("code")
     if code is not None:
+        status = _LINK_ERR_STATUS.get(code)
+        if status is None:
+            logger.warning("Unmapped kg_service error code %r → 400", code)
+            status = 400
         raise HTTPException(
-            status_code=_LINK_ERR_STATUS.get(code, 400),
+            status_code=status,
             detail=result.get("error", "relation operation failed"),
         )
     return result
@@ -145,9 +155,10 @@ async def create_relation(
 async def delete_relation(
     source: str = Query(..., description="Source resource URI"),
     target: str = Query(..., description="Target resource URI"),
-    relation: str | None = Query(
+    relation: RelationType | None = Query(
         None,
-        description="Relation type to remove; omit to remove all edges between the two",
+        description="Relation type to remove (one of the link vocabulary); "
+        "omit to remove all edges between the two",
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
