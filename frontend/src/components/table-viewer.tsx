@@ -1,9 +1,17 @@
 import { useState } from "react";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   getPublication,
   publicationCsvUrl,
   type PublicationResponse,
 } from "@/lib/api";
+
+// Cap rendered rows so a large shared result set can't mount millions of DOM
+// nodes; the full set is available via the CSV download.
+const ROW_RENDER_CAP = 500;
 
 interface Props {
   slug: string;
@@ -68,11 +76,11 @@ export function TableViewer({ slug, initialData }: Props) {
           <div className="text-sm font-medium flex items-center gap-1">
             {data.mode === "snapshot" ? (
               <>
-                <span className="text-accent">⊛</span> snapshot
+                <span className="text-info" aria-hidden>⊛</span> snapshot
               </>
             ) : (
               <>
-                <span className="text-accent">●</span> live
+                <span className="text-success" aria-hidden>●</span> live
               </>
             )}
           </div>
@@ -98,17 +106,18 @@ export function TableViewer({ slug, initialData }: Props) {
           <a
             href={publicationCsvUrl(slug, params)}
             download
-            className="block coord hover:text-accent"
+            className="block coord hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             ↓ DOWNLOAD CSV
           </a>
           <button
             onClick={reload}
             disabled={loading}
-            className="block coord hover:text-accent text-left disabled:opacity-50"
+            className="block coord hover:text-link text-left disabled:opacity-50 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             {loading ? "↻ LOADING…" : "↻ REFRESH"}
           </button>
+          <span className="sr-only" role="status" aria-live="polite">{loading ? "Loading results" : ""}</span>
         </div>
       </aside>
 
@@ -131,53 +140,46 @@ export function TableViewer({ slug, initialData }: Props) {
             >
               {Object.entries(paramDefs).map(([name, def]) => (
                 <div key={name} className="flex flex-col gap-1">
-                  <label className="coord">
+                  <Label htmlFor={`param-${name}`} className="coord">
                     {name} ({def.type || "text"})
-                    {def.required && <span className="text-accent ml-1">*</span>}
-                  </label>
-                  <input
+                    {def.required && <span className="text-accent-strong ml-1" aria-label="required">*</span>}
+                  </Label>
+                  <Input
+                    id={`param-${name}`}
                     type={def.type === "number" || def.type === "int" ? "number" : "text"}
                     value={params[name] ?? ""}
                     onChange={(e) =>
                       setParams((p) => ({ ...p, [name]: e.target.value }))
                     }
                     placeholder={def.default !== undefined ? String(def.default) : ""}
-                    className="w-44 h-9 px-2 rounded-[var(--radius-md)] border border-border bg-transparent font-mono text-xs focus:outline-none focus:border-accent"
+                    className="w-44 h-9 font-mono text-xs"
                   />
                 </div>
               ))}
-              <button
-                type="submit"
-                disabled={loading}
-                className="h-9 px-4 rounded-[var(--radius-md)] bg-accent text-accent-foreground border border-accent coord-ink hover:bg-accent/90 disabled:opacity-40"
-              >
-                {loading ? "RUNNING…" : "→ APPLY"}
-              </button>
+              <Button type="submit" variant="accent" loading={loading} className="h-9">
+                {loading ? "Running…" : "Apply"}
+              </Button>
             </form>
           </div>
         )}
 
         {error && (
-          <div className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-3 mb-6">
-            <div className="coord-spark mb-1" style={{ color: "var(--color-destructive)" }}>
-              ⚠ QUERY FAILED
-            </div>
-            <p className="text-sm">{error}</p>
-          </div>
+          <Alert variant="destructive" title="Query failed" className="mb-6">{error}</Alert>
         )}
 
         {/* Table */}
         <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full text-sm" aria-label={data.title || "Query results"}>
             <thead className="bg-surface-2 text-foreground">
               <tr>
-                <th className="coord-ink px-3 py-2 text-left border-r border-border">
+                <th scope="col" className="coord-ink px-3 py-2 text-left border-r border-border">
                   #
                 </th>
                 {cols.map((c) => (
                   <th
                     key={c}
-                    className="px-3 py-2 text-left font-mono text-[11px] uppercase tracking-wider text-foreground-muted border-r border-border last:border-r-0 whitespace-nowrap"
+                    scope="col"
+                    className="px-3 py-2 text-left font-mono text-[11px] tracking-wide text-foreground-muted border-r border-border last:border-r-0 whitespace-nowrap"
                   >
                     {c}
                   </th>
@@ -185,18 +187,19 @@ export function TableViewer({ slug, initialData }: Props) {
               </tr>
             </thead>
             <tbody>
-              {(data.rows || []).map((row, i) => (
+              {(data.rows || []).slice(0, ROW_RENDER_CAP).map((row, i) => (
                 <tr
                   key={i}
-                  className={`border-t border-border hover:bg-accent/5 transition-colors`}
+                  className="border-t border-border hover:bg-surface-hover transition-colors"
                 >
-                  <td className="coord px-3 py-2 border-r border-border">
+                  <td className="coord px-3 py-2 border-r border-border tabular-nums">
                     {String(i + 1).padStart(2, "0")}
                   </td>
                   {cols.map((c) => (
                     <td
                       key={c}
-                      className="px-3 py-2 font-mono text-[12px] border-r border-border last:border-r-0 whitespace-nowrap"
+                      className={`px-3 py-2 font-mono text-[12px] border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
+                      title={formatCellFull(row[c])}
                     >
                       {formatCell(row[c])}
                     </td>
@@ -209,20 +212,32 @@ export function TableViewer({ slug, initialData }: Props) {
                     colSpan={cols.length + 1}
                     className="px-3 py-12 text-center coord"
                   >
-                    — NO ROWS —
+                    — no rows —
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        {(data.rows?.length || 0) > ROW_RENDER_CAP && (
+          <p className="coord mt-3">
+            Showing first {ROW_RENDER_CAP} of {total} rows — download the CSV for the full result.
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
-function formatCell(v: any): string {
+function formatCellFull(v: any): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
+}
+
+// Display cap — a single huge cell shouldn't hold a multi-KB text node; the
+// full value is still available via the cell's title tooltip.
+function formatCell(v: any): string {
+  const s = formatCellFull(v);
+  return s.length > 200 ? s.slice(0, 200) + "…" : s;
 }

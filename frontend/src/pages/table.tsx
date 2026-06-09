@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { EmptyState } from "@/components/empty-state";
+import { Alert } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface Column {
   name: string;
@@ -22,31 +24,39 @@ export default function TablePage() {
   const [cols, setCols] = useState<string[]>([]);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [limit] = useState(50);
 
   useEffect(() => {
     if (!vault || !table) return;
+    let cancelled = false;
     // Reset stale state from previous param before re-fetch resolves.
     setInfo(null);
     setRows([]);
     setCols([]);
     setTotal(0);
     setError("");
+    setLoading(true);
     const t = localStorage.getItem("akb_token") || "";
     fetch(`/api/v1/tables/${vault}`, { headers: { Authorization: `Bearer ${t}` } })
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json().catch(() => null) : null))
       .then((d) => {
+        if (cancelled || !d) return;
         const found = (d.items || []).find((x: any) => x.name === table);
         if (found) setInfo(found);
       })
       .catch(() => {});
+    // Quote the identifier so reserved/upper/space-bearing names don't produce
+    // malformed SQL. (PG ACL still bounds visibility via SET LOCAL ROLE.)
+    const ident = `"${(table || "").replace(/"/g, '""')}"`;
     fetch(`/api/v1/tables/${vault}/sql`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-      body: JSON.stringify({ sql: `SELECT * FROM ${table} LIMIT ${limit}` }),
+      body: JSON.stringify({ sql: `SELECT * FROM ${ident} LIMIT ${limit}` }),
     })
       .then((r) => r.json())
       .then((d) => {
+        if (cancelled) return;
         if (d.error || d.detail) {
           setError(d.error || d.detail);
           return;
@@ -55,13 +65,15 @@ export default function TablePage() {
         setCols(d.columns || []);
         setTotal(d.total ?? d.items?.length ?? 0);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => !cancelled && setError(String(e)))
+      .finally(() => !cancelled && setLoading(false));
+    return () => { cancelled = true; };
   }, [vault, table, limit]);
 
   return (
     <div className="min-w-0 fade-up max-w-[1280px] mx-auto">
       <div className="coord mb-3">
-        VAULT · {vault?.toUpperCase()} · TABLE · {table?.toUpperCase()}
+        VAULT · {vault} · TABLE · {table}
       </div>
 
       <header className="flex items-baseline justify-between flex-wrap gap-x-4 gap-y-2 pb-3 border-b border-border">
@@ -103,7 +115,7 @@ export default function TablePage() {
                 <span className="text-foreground-muted">{(c.type || "text").toLowerCase()}</span>
                 {c.primary_key && <span className="coord-spark">PK</span>}
                 {c.required && !c.primary_key && (
-                  <span className="text-accent" aria-label="required">*</span>
+                  <span className="text-accent-strong" aria-label="required">*</span>
                 )}
               </div>
             ))}
@@ -112,14 +124,9 @@ export default function TablePage() {
       )}
 
       {error && (
-        <div
-          role="alert"
-          aria-live="polite"
-          className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-3 mt-6"
-        >
-          <div className="coord-spark mb-1 text-destructive">⚠ QUERY FAILED</div>
-          <p className="text-sm text-destructive font-mono">{error}</p>
-        </div>
+        <Alert variant="destructive" title="Query failed" className="mt-6">
+          <span className="font-mono">{error}</span>
+        </Alert>
       )}
 
       {/* Rows preview */}
@@ -132,7 +139,13 @@ export default function TablePage() {
           </span>
         </div>
 
-        {rows.length === 0 && !error ? (
+        {loading ? (
+          <div className="space-y-2" role="status" aria-live="polite" aria-label="Loading rows">
+            <Skeleton className="h-8 w-full rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-8 w-full rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-8 w-full rounded-[var(--radius-sm)]" />
+          </div>
+        ) : rows.length === 0 && !error ? (
           <EmptyState title="No rows" />
         ) : (
           <div
@@ -154,7 +167,7 @@ export default function TablePage() {
                     <th
                       key={c}
                       scope="col"
-                      className="px-3 py-2 text-left font-mono text-[10px] uppercase tracking-wider text-foreground-muted border-r border-border last:border-r-0 whitespace-nowrap"
+                      className="px-3 py-2 text-left font-mono text-[10px] tracking-wide text-foreground-muted border-r border-border last:border-r-0 whitespace-nowrap"
                     >
                       {c}
                     </th>
@@ -163,15 +176,15 @@ export default function TablePage() {
               </thead>
               <tbody className="divide-y divide-border">
                 {rows.map((row, i) => (
-                  <tr key={i} className="hover:bg-surface-muted transition-colors">
+                  <tr key={i} className="hover:bg-surface-hover transition-colors">
                     <td className="coord px-3 py-1.5 border-r border-border tabular-nums">
                       {String(i + 1).padStart(2, "0")}
                     </td>
                     {cols.map((c) => (
                       <td
                         key={c}
-                        className="px-3 py-1.5 font-mono text-[12px] text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate tabular-nums"
-                        title={String(row[c] ?? "")}
+                        className={`px-3 py-1.5 font-mono text-[12px] text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
+                        title={formatCell(row[c])}
                       >
                         {formatCell(row[c])}
                       </td>
