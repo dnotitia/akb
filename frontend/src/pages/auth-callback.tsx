@@ -60,12 +60,12 @@ export default function AuthCallbackPage() {
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
       <div className="hero-glow w-full max-w-md mx-auto fade-up flex flex-col items-center gap-8">
         <Logo size={40} subtitle />
-        <div className="flex flex-col items-center gap-4 coord">
+        <div className="flex flex-col items-center gap-4 coord" role="status" aria-live="polite">
           {error ? (
             <span>Redirecting…</span>
           ) : (
             <>
-              <Loader2 className="h-6 w-6 animate-spin text-accent" aria-hidden />
+              <Loader2 className="h-6 w-6 animate-spin text-primary" aria-hidden />
               <span>Completing sign-in…</span>
             </>
           )}

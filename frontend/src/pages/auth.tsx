@@ -83,12 +83,15 @@ export default function AuthPage() {
       </div>
 
       <main className="relative w-full max-w-5xl grid lg:grid-cols-2 gap-10 lg:gap-16 items-center fade-up">
+        {/* Page heading for small screens, where the visual hero (and its h1)
+            is display:none — keeps every breakpoint with exactly one h1. */}
+        <h1 className="sr-only lg:hidden">AKB — the base your agents remember</h1>
         {/* LEFT — brand hero */}
         <section className="hidden lg:flex flex-col gap-8 pr-4">
           <Logo size={42} subtitle />
           <div>
             <h1 className="font-display text-5xl leading-[1.05] tracking-tight text-foreground">
-              The base your<br />agents <span className="brand-gradient">remember.</span>
+              The base your<br />agents <span className="text-primary">remember.</span>
             </h1>
             <p className="mt-5 text-[15px] leading-relaxed text-foreground-muted max-w-md">
               A unified knowledge base for AI agents — documents, tables, and files
