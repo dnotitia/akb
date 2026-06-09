@@ -13,6 +13,11 @@ const badgeVariants = cva(
         outline: "border-border bg-transparent text-foreground-muted",
         destructive: "border-destructive bg-destructive text-destructive-foreground",
         success: "border-success bg-transparent text-success",
+        // filled semantic variants (backed by the completed -foreground quads)
+        // for chips that need a solid fill (PUBLISHED, degraded, indexed …).
+        "success-solid": "border-success bg-success text-success-foreground",
+        "warning-solid": "border-warning bg-warning text-warning-foreground",
+        "info-solid": "border-info bg-info text-info-foreground",
         // accent badges use accent-STRONG: outline badges need it for the
         // text (10px → no large-text exemption); filled badges for white-on-bg.
         info: "border-accent-strong bg-transparent text-accent-strong",

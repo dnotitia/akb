@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -70,14 +71,7 @@ export function ConfirmDialog({
             </DialogDescription>
           )}
         </DialogHeader>
-        {error && (
-          <p
-            role="alert"
-            className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-          >
-            {error}
-          </p>
-        )}
+        {error && <Alert variant="destructive">{error}</Alert>}
         <DialogFooter>
           <Button
             type="button"

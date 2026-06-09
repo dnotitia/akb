@@ -1,60 +1,45 @@
 # AKB Web — Design System
 
 Unified with the **akb-platform family** (akb-platform + seahorse-mcp-agent-server):
-the Dnotitia palette, Pretendard typography, soft cool-gray surfaces, 12px radius,
-glass + aurora atmosphere.
+the Dnotitia palette, Pretendard typography, soft cool-gray surfaces, rounded
+corners, glass + aurora atmosphere.
 
 This system is **centrally governed**: one token source, a shared primitive
-vocabulary, and a build guard that blocks drift.
+vocabulary, and a build guard that blocks drift. Everything below resolves from
+`src/index.css` — when this doc and the code disagree, the code wins, and this
+doc is wrong (fix it).
 
-## 1. Single source of truth — `src/index.css`
+---
 
-All design tokens live in the Tailwind v4 `@theme { … }` block (+ a `.dark`
-override). **Nothing else in the app hardcodes a color.** Change a token here and
-the whole UI re-skins, because every surface reads `var(--color-*)`.
+## 1. Identity & principles
 
-| Token | Light | Role |
-|---|---|---|
-| `--color-teal` / `--color-primary` | `#004059` | brand primary — headers, links, primary buttons |
-| `--color-teal-2` | `#0a6f86` | mid-teal (gradients, dark primary) |
-| `--color-orange` / `--color-accent` | `#E55E2C` | accent — CTAs (create/publish), toggles, highlights |
-| `--color-background` | `#f6f7f9` | page canvas (cool gray) |
-| `--color-surface` | `#ffffff` | cards |
-| `--color-surface-2` / `--color-surface-muted` | `#ebeef2` | insets, hover, code headers |
-| `--color-foreground` / `-muted` / `--color-subtle` | `#1d1d1f` / `#5e6068` / `#94989e` | text ramp |
-| `--color-border` / `-strong` | `#dfe3e8` / `#c8ced6` | hairlines |
-| `--color-success` / `--color-warning` / `--color-danger` | | semantic |
-| `--radius` / `-sm` / `-md` / `-lg` | `.75rem` / `.5` / `.75` / `.75` | corner rounding |
+AKB is a **Swiss-minimalist developer/agent knowledge tool** (desktop web). The
+interface is calm, high-contrast, and sparsely decorated; type weight, spacing,
+and hairlines carry hierarchy, and color is used with discipline.
 
-Fonts: `--font-sans` = **Pretendard** (bundled npm webfont), `--font-mono` = JetBrains Mono.
-`--font-display` / `--font-serif` also map to Pretendard (family unification).
+- **One brand axis**: teal primary `#004059` + a single orange accent `#e55e2c`.
+  Teal is *interactive/identity*; orange is *one marquee moment per screen*.
+- **Accessibility is a floor, not a nice-to-have**: every foreground/background
+  pair clears **WCAG AA (4.5:1 text / 3:1 UI)**; AAA where it's free.
+- **Tokens only**: components never hardcode a color/radius/shadow — they read
+  `var(--color-*)` / Tailwind token classes. A build guard enforces it.
+- **Compose, don't re-roll**: build pages from the primitive vocabulary
+  (`components/ui/*`), not bespoke inline markup.
+- **Light = paper-cool, dark = slate.** The two themes are authored together;
+  dark is a tonal re-map, never a naive inversion. Test both.
 
-Signature utilities (also in index.css): `.glass`, `.app-header`, `body::before`
-aurora, `.brand-gradient`, `.card-hover`, `.feature-tile` + `.feat-*`, `.coord*`
-mono eyebrows, `.animate-in` / `.fade-up`.
+---
 
-## 2. Primitive vocabulary — `src/components/ui/`
+## 2. Single source of truth — `src/index.css`
 
-Compose pages from these instead of re-writing patterns inline:
+All design tokens live in the Tailwind v4 `@theme { … }` block (light) with a
+`.dark { … }` override. Change a token here and the whole UI re-skins, because
+every surface reads `var(--color-*)`. The dark block re-tones the *same* token
+names, so a `text-link` or `bg-surface-hover` utility is correct in both modes.
 
-| Primitive | Use |
-|---|---|
-| `Button` | `default` (teal) · `accent` (orange CTA) · `outline` · `ghost` · `destructive` · `link` |
-| `Panel` + `PanelHeader` | the canonical rounded `surface` container (border, soft shadow) |
-| `PageHeader` | canonical masthead: `font-display` title + muted subtitle + actions slot |
-| `StatTile` | labelled metric tile (big tabular numeral) |
-| `Eyebrow` | the `§ LABEL` mono coordinate label (`tone: muted/ink/spark`) |
-| `CodeSnippet` | copyable code block with a soft header bar |
-| `Badge` / `RoleBadge` / status badges | pill tags, role/status tones |
-| `Input` / `Textarea` / `Select` / `Dialog` / `Tabs` | form + overlay primitives (pre-rounded, teal focus ring) |
-| `Logo` + `.feature-tile`/`.feat-*` (CSS) | brand lockup + per-capability gradient tiles |
+### Governance — `scripts/design-check.mjs`
 
-Shell: `Layout` (glass `app-header` + content) and `VaultShell` (header + content,
-collection tree in a left **slide-over** toggled by the Tree button / ⌘\).
-
-## 3. Governance — `scripts/design-check.mjs`
-
-Runs in `pnpm build` (`pnpm design:check` to run standalone). Fails the build on:
+Runs in `npm run build` (`npm run design:check` standalone). Fails the build on:
 
 1. **Hardcoded 6-digit hex** in component source — colors must be tokens.
 2. The **`bg-foreground text-background`** slab — a pre-redesign idiom; use
@@ -62,9 +47,248 @@ Runs in `pnpm build` (`pnpm design:check` to run standalone). Fails the build on
 
 Exempt: `src/index.css` (the token defs) and test/story files.
 
-## 4. Rules of thumb
+**Per-change gate:** `npm run design:check && npm run typecheck && npm run lint && npm run test`.
 
-- Container/card → `Panel` (or `rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm`); divided lists add `overflow-hidden`.
-- Page top → `PageHeader`. Section label → `Eyebrow` / `PanelHeader`.
-- Primary action = teal `Button`; create/publish = `accent`. Never a raw dark slab.
-- Color/radius come from tokens only — the guard enforces it.
+---
+
+## 3. Color tokens — core ramps
+
+| Token (`--color-…`) | Light | Dark | Role |
+|---|---|---|---|
+| `teal` / `primary` | `#004059` | `#0a6f86` | brand primary — headers, primary buttons, active fills |
+| `teal-2` | `#0a6f86` | — | mid-teal (gradients) |
+| `orange` / `accent` | `#e55e2c` | `#e55e2c` | bright accent — borders, tints, dots, glows, **decoration only on light** |
+| `accent-strong` (+`-foreground` `#fff`) | `#c44a1e` | `#c44a1e` | accent for **white-text fills & light orange text** (4.83:1 AA) |
+| `background` | `#f6f7f9` | `#0b0f14` | page canvas (cool gray) |
+| `surface` | `#ffffff` | `#121821` | cards, list rows, inputs |
+| `surface-2` / `surface-muted` | `#ebeef2` | `#1b2430` | insets, code headers (alias pair) |
+| `foreground` | `#1d1d1f` | `#e7eaef` | body text |
+| `foreground-muted` | `#5e6068` | `#9aa4af` | secondary text, coord labels |
+| `subtle` | `#767a82` | `#828c98` | tertiary/meta text (AA-legal: 4.54 / 4.52:1) |
+| `border` / `border-strong` | `#dfe3e8` / `#c8ced6` | `#26303c` / `#36424f` | hairlines / emphasis edge |
+| `ring` | `#004059` | `#0a6f86` | `focus-visible` outline |
+
+> **Aliases (one role, two names — keep in sync):** `surface-muted == surface-2`,
+> `destructive == danger`, `good == success`. Prefer the canonical name
+> (`surface-2`, `destructive`, `success`); the twins exist for back-compat and
+> are being migrated out.
+
+---
+
+## 4. Semantic color families
+
+Each state is a **quad**: `base` (text/border), `-foreground` (text on a filled
+chip), `-soft` (tinted banner bg), `-soft-foreground` (text on the tint). Base
+values are darkened in light so they clear AA **as text**. Semantic color always
+pairs with an icon or label — never color as the only signal.
+
+| Family | base (L/D) | foreground (L/D) | soft bg (L/D) | soft fg (L/D) |
+|---|---|---|---|---|
+| **success** | `#1e7d4b` / `#3fb27a` | `#04200d` / `#0a1f12` | `#e7f4ec` / `#13271c` | `#176b3f` / `#7fd4a6` |
+| **warning** | `#9a5400` / `#d9912f` | `#fff` / `#0b0f14` | `#fdf1e3` / `#2a1d0a` | `#8a4b00` / `#e8b878` |
+| **info** | `#1d627c` / `#4aa3c4` | `#fff` / `#04222e` | `#e6f0f4` / `#0f2730` | `#19566c` / `#9ed1e2` |
+| **destructive**/danger | `#c42424` / `#e06464` | `#fff` / `#0b0f14` | `#fbeaea` / `#2a1212` | `#a81f1f` / `#f0a0a0` |
+
+- **Filled** chip/button → `bg-{family} text-{family}-foreground`
+  (`Badge` variants `destructive`, `success-solid`, `warning-solid`, `info-solid`).
+  Note **dark warning uses dark text on fill** (white-on-`#d9912f` = 2.61:1, fails).
+- **Soft** banner/callout → the `Alert` primitive (`bg-{family}-soft
+  text-{family}-soft-foreground` + a tinted border).
+- **Outline** chip → `border-{family} text-{family} bg-transparent`.
+
+---
+
+## 5. Interaction-state tokens
+
+Solid tokens that replace the old `/opacity` and `color-mix` state hacks (those
+mis-tint on the dark canvas). **Interactive = teal; hover = neutral lift;
+selected = teal-tinted.**
+
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| `link` | `#0a6f86` | `#4aa3c4` | clickable **text** (links, row/breadcrumb hover) — `text-link` / `hover:text-link` |
+| `link-hover` | `#004059` | `#8fd6ea` | link hover (darkens light, brightens dark) |
+| `surface-hover` | `#f0f2f5` | `#1f2935` | row/list/ghost **hover** fill |
+| `surface-active` | `#e3e7ec` | `#26303c` | **pressed** fill |
+| `surface-selected` (+`-foreground` `#004059`/`#9fd4e6`) | `#e0eef2` | `#0f2a33` | **selected/current** row, active tab, current nav item — teal-tinted, never gray, never `bg-accent/10` |
+
+Disabled state = a single value app-wide: `opacity-50` + `disabled:` semantics
+(not the old four different `opacity-40/50/60/70`).
+
+---
+
+## 6. Color placement rules
+
+1. **Interactive = teal, always.** Every link, link/row/breadcrumb hover, active
+   nav/tab/toggle, and focus emphasis uses the teal family (`text-link` /
+   `hover:text-link`, or `bg-primary` for active fills). Never `hover:text-accent`.
+2. **Orange = one marquee moment per screen, fills only.** Exactly one filled
+   primary CTA per view via `Button variant="accent"` (= accent-strong, 4.83:1).
+   Orange may also appear as: the brand wordmark gradient, `coord-spark` eyebrow,
+   tinted callout cards (`bg-accent/5 border-accent`), the hero glow, and `feat-*`
+   tiles. Orange is **never** interactive text and **never** a second filled CTA.
+3. **Bright `accent` `#e55e2c` = decoration only on light** (borders, 5% tints,
+   dots, cluster/aurora glows, dark-mode `coord-spark`). Light orange **text**
+   must use `accent-strong` (`#c44a1e`, 4.83:1) — bright orange text is 3.52:1 (fail).
+4. **Selected vs hover vs pressed are distinct.** Selected = teal-tinted
+   `surface-selected` (+ optional left border); hover = neutral `surface-hover`;
+   pressed = `surface-active`. Selection is hue-coded, hover is lightness-coded.
+5. **Semantic owns meaning, never the brand pair.** success/warning/info/
+   destructive carry state and always pair color with an icon/label. Teal and
+   orange are identity, not status — never use them to mean ok/error.
+6. **Dataviz uses the `--color-cat-*` scale only** (no raw `hsl()`/hex islands).
+7. **Disabled = one value app-wide** (`opacity-50`).
+
+---
+
+## 7. Categorical / dataviz scale
+
+A 6-step categorical scale on the **teal→orange brand arc + one neutral**,
+**lightness-ramped** so categories stay separable under color-vision deficiency
+(hue alone is not relied on). Used by graph clusters and `.feat-*` tiles — no
+off-brand competing hue. `cat-5 == accent-strong`, `cat-6 == foreground-muted`.
+
+| | cat-1 | cat-2 | cat-3 | cat-4 | cat-5 | cat-6 |
+|---|---|---|---|---|---|---|
+| **Light** | `#1f5a6e` | `#2f8f94` | `#4f9c7a` | `#b9791b` | `#c44a1e` | `#5e6068` |
+| **Dark** | `#4aa6bd` | `#45c2c6` | `#63d29f` | `#e3a13f` | `#f0744a` | `#9aa4af` |
+
+Floors: ≥3:1 ring/stroke contrast on the canvas; tile **fills** put white text on
+the darker stop. Light/dark is handled by the token layer, not per-component math.
+
+---
+
+## 8. Typography
+
+| Family | Var | Used for |
+|---|---|---|
+| **Pretendard Variable** (bundled npm webfont) | `--font-sans` / `--font-display` | all UI, headings, masthead |
+| **JetBrains Mono Variable** | `--font-mono` | code, vault names, coord labels, tabular columns |
+
+- **Body = `text-sm` (14px).** Headings via `font-display` (Pretendard 700, tight
+  tracking). Weights used: **400 / 500 / 600 / 700** only.
+- **Numbers in tables/lists/stats: `tabular-nums`** (prevents async jitter).
+- **All-caps is reserved for `.coord*` / eyebrow chrome and tab labels** — never
+  `.toUpperCase()` user-facing copy (error/help text stays sentence case).
+- Coord labels: `.coord` (muted), `.coord-ink` (foreground), `.coord-spark`
+  (accent-strong in light / bright accent in dark — the one AA-tuned exception).
+  Minimum label size **10.5px**. Prefer the `<Eyebrow tone="muted|ink|spark">`
+  primitive over hand-writing the class.
+- *Roadmap:* a paired `--text-*` scale is being introduced to fold the ~140
+  arbitrary `text-[Npx]` onto named steps; until then match the nearest existing
+  size and avoid new arbitrary pixels.
+
+---
+
+## 9. Spacing & layout rhythm
+
+- **Spacing = Tailwind's 4px ramp** (no custom `--spacing` token — the absence is
+  deliberate). Section gaps `gap-y-10`, card padding `p-4`, list row `py-3`,
+  dense row `py-1.5`.
+- **Container**: `max-w-[1400px]` for app routes; the vault shell is full-bleed
+  with a left slide-over tree.
+- **Control heights**: `h-8` (32, dense rails) · `h-9` (36, default) · `h-10`
+  (40, inputs) · `h-11` (44, hero CTA). Keep tappable controls ≥ 36px.
+- **Borders are structural** — most surfaces are defined by 1px `border` hairlines
+  plus a soft shadow, not heavy fills. `divide-y divide-border` for list rows.
+
+---
+
+## 10. Radius, elevation, z-index
+
+- **Radius**: `--radius-sm .5rem` (chips, focus insets) · `-md .75` (buttons,
+  inputs) · `-lg .875` (cards, panels, lists) · `-xl 1rem` (dialogs, hero) ·
+  `-full 9999px` (pills, avatars, dots). Always `rounded-[var(--radius-*)]`.
+- **Elevation** (3-tier rule): `shadow-xs` hairline lift · `shadow-sm` resting
+  cards · `shadow-md` popover/raised tile · `shadow-lg` modal/menu · `shadow-xl`
+  hover peak. Cool-tinted in light, deeper alpha in dark.
+- **Z-index ladder** (reference via `z-[var(--z-*)]`): `base 0` · `raised 10` ·
+  `sticky 20` · `header 40` · `overlay 50` · `modal 55` · `popover 60` ·
+  `tooltip 70` · `toast 80`. One ladder so a menu/tooltip opened inside a modal
+  sits above it and toasts sit above everything.
+
+---
+
+## 11. Motion & atmosphere
+
+- **Tokens**: `--duration-fast 120ms` (hover/color) · `-base 220ms`
+  (tabs/dropdowns) · `-slow 420ms` (page fade, modal). Easing `--ease-out`
+  (entering) / `--ease-in` (exiting). Use `.transition-token` for color/shadow
+  micro-transitions; `.fade-up` / `.fade-in` / `.stagger` for entrances.
+- `prefers-reduced-motion: reduce` collapses every animation to 1ms — **never**
+  re-introduce motion with inline styles.
+- **Atmosphere** (family signature, used sparingly so chrome recedes and content
+  leads): `.app-header` (near-solid surface + faint blur + hairline), `body::before`
+  aurora (very low-alpha gradient mesh), `.hero-glow` (auth/landing only),
+  `.brand-gradient` wordmark, `.feature-tile` + `.feat-*` capability tiles.
+
+---
+
+## 12. Primitive catalog — `src/components/ui/`
+
+Compose pages from these instead of re-writing patterns inline.
+
+| Primitive | Use |
+|---|---|
+| `Button` | `default` (teal) · `accent` (orange CTA) · `outline` · `secondary` · `ghost` · `destructive` · `link`. Sizes `sm/md/lg/icon`. `loading` prop = spinner + disable + `aria-busy`. |
+| `Panel` + `PanelHeader` | canonical rounded `surface` container (border + soft shadow); `inset` clips divided lists. |
+| `PageHeader` | masthead: `font-display` title + muted subtitle + actions slot. |
+| `StatTile` | labelled metric tile (big tabular numeral). |
+| `Eyebrow` | the `§ LABEL` mono coordinate label (`tone: muted/ink/spark`). |
+| `CodeSnippet` | copyable code block with a soft header bar (insecure-origin safe). |
+| `Alert` | tinted notice banner — `destructive/warning/info/success` on the `-soft` quads; assertive `role=alert` for destructive/warning, polite `role=status` otherwise; icon + text always. |
+| `Badge` / `RoleBadge` / status badges | pill tags; outline + `*-solid` filled semantic variants; role/doc/system tones. |
+| `Input` / `Textarea` / `Select` / `Label` / `TagInput` | form primitives — pre-rounded, teal focus ring, `aria-[invalid]` hooks. |
+| `Dialog` / `ConfirmDialog` | overlay primitives; `ConfirmDialog` surfaces a rejected `onConfirm` inline (`Alert`) and stays open for retry. |
+| `Tabs` / `Tooltip` / `Skeleton` | segmented control / hint / loading placeholder. |
+| `Logo` + `.feature-tile`/`.feat-*` | brand lockup + per-capability gradient tiles. |
+
+Shell: `Layout` (glass `app-header` + content) and `VaultShell` (header + content,
+collection tree in a left slide-over toggled by the Tree button / ⌘\).
+
+*Roadmap primitives* (high-drift inline patterns being extracted): `IndexRow`
+(numbered list row), `ToggleGroup`/`ToggleChip` (segmented selection),
+`MetaList`/`MetaItem` (rail `dl`), `LoadingState` (`role=status` loading line +
+skeleton), `InlineCode` (single-token mono chip). Until shipped, match the
+existing inline pattern and flag for extraction.
+
+---
+
+## 13. Accessibility floor
+
+| Rule | Contract |
+|---|---|
+| **Contrast** | text ≥ 4.5:1, large/UI ≥ 3:1, in **both** modes. Tokens are pre-verified — re-verify when you adjust one. |
+| **Color not the only signal** | pair every status color with an icon or text label. |
+| **Focus ring** | every interactive element keeps the `focus-visible:ring-2 ring-ring ring-offset-2` pattern (icon buttons included). Never remove it. |
+| **Icon-only button** | `aria-label` required + `<Icon aria-hidden />`. |
+| **Labels** | every input has a visible `<Label>` or an `sr-only` label; placeholder is not a label. |
+| **Async / loading** | wrap loading + show-once secrets in `role=status aria-live=polite`; surface errors with `role=alert` (the `Alert` primitive). |
+| **Destructive action** | `ConfirmDialog`, never `window.confirm()`. |
+| **Reduced motion** | respected globally — don't override. |
+
+---
+
+## 14. Anti-patterns
+
+- ❌ Raw hex / `hsl()` islands in components (use tokens; the guard blocks hex).
+- ❌ New arbitrary `text-[Npx]` / `leading-[…]` (use the scale / nearest step).
+- ❌ `/opacity` or `color-mix` as a *state* (use `surface-hover/active/selected`).
+- ❌ A second marquee orange CTA, or orange as interactive **text**.
+- ❌ `bg-accent/10` for "selected" (use `surface-selected`).
+- ❌ Color as the only signal; `.toUpperCase()` on user-facing copy.
+- ❌ `rounded-*`/`shadow-*` bare values (use the token scale).
+- ❌ `bg-foreground text-background` slab (the guard blocks it).
+- ❌ `window.confirm()` / `alert()`; placeholder-only labels; removed focus rings.
+
+---
+
+## 15. Building a new page
+
+1. Read this file.
+2. `PageHeader` for the masthead → `Panel` / `PanelHeader` for sections.
+3. Compose from the primitive catalog (§12) before writing inline markup.
+4. Colors/radii/shadows from tokens only — teal for interactive, **one** orange
+   CTA, semantic + icon for status, `surface-selected` for current.
+5. Loading/empty/error are three distinct states; secrets + async use `role=status`.
+6. Run the gate: `npm run design:check && npm run typecheck && npm run lint && npm run test`.

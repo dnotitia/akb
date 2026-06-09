@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { AlertCircle, Rocket, Plus, Copy, Check, Eye, EyeOff } from "lucide-react";
+import { Rocket, Plus, Copy, Check, Eye, EyeOff } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -8,6 +8,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -139,10 +140,7 @@ export function QuickstartDialog({
                 </Button>
               </div>
               {mintError && (
-                <p role="alert" className="flex items-start gap-1.5 text-xs text-destructive">
-                  <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-px" aria-hidden />
-                  {mintError}
-                </p>
+                <Alert variant="destructive" className="text-xs">{mintError}</Alert>
               )}
             </>
           )}

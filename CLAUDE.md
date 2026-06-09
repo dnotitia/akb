@@ -7,6 +7,33 @@
 - **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, zero dependencies, stdio ↔ HTTP bridge
 - **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Plate (`platejs` markdown editor; lazy-loaded in Edit / New-document flows)
 
+## Frontend Design System
+
+**Read `frontend/DESIGN_SYSTEM.md` before any frontend UI work** — it is the
+authoritative reference for the design system (akb-platform family: Dnotitia
+teal/orange palette, Pretendard, rounded corners, soft shadows, glass + aurora).
+Centrally governed:
+
+- **One token source**: `frontend/src/index.css` — all colors/radii/shadows/motion
+  live in the Tailwind v4 `@theme { … }` block (+ a `.dark` override). Components
+  **never hardcode a hex** — they read `var(--color-*)` / Tailwind token classes.
+  Brand: teal `#004059` (`--color-primary`, links/primary actions/active) +
+  orange `#e55e2c` (`--color-accent`, highlights) with `--color-accent-strong`
+  `#c44a1e` for white-text fills (WCAG AA). Light = paper-cool; `.dark` = slate.
+- **Primitive vocabulary**: `frontend/src/components/ui/*` — compose pages from
+  `Button`/`Panel`+`PanelHeader`/`PageHeader`/`StatTile`/`Eyebrow`/`CodeSnippet`/
+  `Badge`/`Input`/`Textarea`/`Select`/`Dialog`/`ConfirmDialog`/`Tabs`/`Tooltip`
+  instead of re-rolling patterns inline.
+- **Build guard**: `frontend/scripts/design-check.mjs` (`npm run design:check`,
+  also in `build`) fails on raw 6-digit hex in components + the legacy
+  `bg-foreground text-background` slab. Exempt: `index.css` + tests.
+- **Color placement**: teal = interactive text/links/active/primary buttons;
+  orange = exactly one marquee CTA per view (create/publish) + fresh-token
+  highlights — never a second competing orange; semantic state always pairs
+  color with an icon/text (never color alone).
+- **Frontend check gate** (run before committing frontend changes):
+  `cd frontend && npm run design:check && npm run typecheck && npm run lint && npm run test`.
+
 ## 2-Layer MCP Architecture
 
 Backend (Streamable HTTP) handles all business logic. Proxy (stdio) handles local filesystem operations.

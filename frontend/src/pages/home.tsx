@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
-  AlertCircle,
   ArrowRight,
   Copy,
   Eye,
@@ -12,6 +11,7 @@ import {
   Table as TableIcon,
   Trash2,
 } from "lucide-react";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/ui/page-header";
 import { Panel } from "@/components/ui/panel";
@@ -506,10 +506,7 @@ export default function HomePage() {
                   </Button>
                 </form>
                 {mintError && (
-                  <p role="alert" className="mt-2 flex items-start gap-1.5 text-xs text-destructive">
-                    <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-px" aria-hidden />
-                    {mintError}
-                  </p>
+                  <Alert variant="destructive" className="mt-2 text-xs">{mintError}</Alert>
                 )}
 
                 {activePat && (
