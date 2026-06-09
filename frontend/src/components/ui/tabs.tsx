@@ -31,7 +31,7 @@ const TabsTrigger = forwardRef<
       // Active tab — soft raised pill (segmented control), accent coord numerals
       "data-[state=active]:bg-surface data-[state=active]:text-foreground data-[state=active]:shadow-sm",
       "data-[state=active]:[&_.coord]:text-accent",
-      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-2",
       "transition-token cursor-pointer",
       className,
     )}

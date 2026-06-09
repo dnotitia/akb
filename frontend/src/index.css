@@ -34,6 +34,12 @@
 
   --color-accent: #e55e2c;
   --color-accent-foreground: #ffffff;
+  /* Filled-accent surfaces (buttons/badges with white text) use the darker
+     `accent-strong`: white-on-#c44a1e = 4.83:1 (WCAG AA). The bright #e55e2c
+     stays for borders, text-accent, dots and highlights where no white text
+     sits on it. One token swap re-skins every filled-accent call site. */
+  --color-accent-strong: #c44a1e;
+  --color-accent-strong-foreground: #ffffff;
   --color-success: #228b54;
   --color-success-foreground: #04200d;
   --color-warning: #b06000;
@@ -113,6 +119,8 @@
 
   --color-accent: #e55e2c;
   --color-accent-foreground: #ffffff;
+  --color-accent-strong: #c44a1e;
+  --color-accent-strong-foreground: #ffffff;
   --color-success: #3fb27a;
   --color-success-foreground: #0a1f12;
   --color-warning: #d9912f;

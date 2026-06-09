@@ -1,5 +1,6 @@
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
+import { Loader2 } from "lucide-react";
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { cn } from "@/lib/utils";
 
@@ -16,8 +17,10 @@ const buttonVariants = cva(
       variant: {
         default:
           "bg-primary text-primary-foreground border border-primary shadow-sm hover:bg-primary/90",
+        // Filled accent CTA — uses accent-STRONG so white text clears WCAG AA
+        // (4.83:1). The bright --color-accent is reserved for non-text accent.
         accent:
-          "bg-accent text-accent-foreground border border-accent shadow-sm hover:bg-accent/90",
+          "bg-accent-strong text-accent-strong-foreground border border-accent-strong shadow-sm hover:bg-accent-strong/90",
         outline:
           "bg-surface text-foreground border border-border hover:bg-surface-muted hover:border-border-strong",
         secondary:
@@ -27,7 +30,7 @@ const buttonVariants = cva(
         destructive:
           "bg-destructive text-destructive-foreground border border-destructive shadow-sm hover:bg-destructive/90",
         link:
-          "bg-transparent text-primary underline-offset-4 hover:underline hover:text-accent h-auto px-0",
+          "bg-transparent text-primary underline-offset-4 hover:underline hover:text-primary/80 h-auto px-0",
       },
       size: {
         sm: "h-8 px-3 text-xs",
@@ -45,17 +48,32 @@ export interface ButtonProps
   extends ButtonHTMLAttributes<HTMLButtonElement>,
     VariantProps<typeof buttonVariants> {
   asChild?: boolean;
+  /** Show a spinner, disable the button, and announce aria-busy. Ignored when
+   *  `asChild` is set (Slot requires a single child). */
+  loading?: boolean;
 }
 
 const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, asChild = false, ...props }, ref) => {
+  ({ className, variant, size, asChild = false, loading = false, disabled, children, ...props }, ref) => {
     const Comp = asChild ? Slot : "button";
+    if (asChild) {
+      return (
+        <Comp ref={ref} className={cn(buttonVariants({ variant, size, className }))} {...props}>
+          {children}
+        </Comp>
+      );
+    }
     return (
       <Comp
         ref={ref}
         className={cn(buttonVariants({ variant, size, className }))}
+        disabled={disabled || loading}
+        aria-busy={loading || undefined}
         {...props}
-      />
+      >
+        {loading && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
+        {children}
+      </Comp>
     );
   },
 );

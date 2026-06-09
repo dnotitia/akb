@@ -13,11 +13,13 @@ const badgeVariants = cva(
         outline: "border-border bg-transparent text-foreground-muted",
         destructive: "border-destructive bg-destructive text-destructive-foreground",
         success: "border-success bg-transparent text-success",
-        info: "border-accent bg-transparent text-accent",
-        spark: "border-accent bg-accent text-accent-foreground",
+        // accent badges use accent-STRONG: outline badges need it for the
+        // text (10px → no large-text exemption); filled badges for white-on-bg.
+        info: "border-accent-strong bg-transparent text-accent-strong",
+        spark: "border-accent-strong bg-accent-strong text-accent-strong-foreground",
 
         /* role badges — filled for write-authority, outline for read-only */
-        owner: "border-accent bg-accent text-accent-foreground",
+        owner: "border-accent-strong bg-accent-strong text-accent-strong-foreground",
         admin: "border-primary bg-primary text-primary-foreground",
         writer: "border-primary bg-transparent text-primary",
         reader: "border-border bg-surface-muted text-foreground-muted",
@@ -29,7 +31,7 @@ const badgeVariants = cva(
 
         /* system status */
         pending: "border-warning bg-transparent text-warning",
-        syncing: "border-accent bg-transparent text-accent",
+        syncing: "border-accent-strong bg-transparent text-accent-strong",
         error: "border-destructive bg-transparent text-destructive",
       },
     },

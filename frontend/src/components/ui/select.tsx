@@ -8,6 +8,7 @@ const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSelectElem
       className={cn(
         "flex h-10 w-full appearance-none rounded-[var(--radius-md)] border border-border bg-surface pl-3 pr-9 py-2 text-sm text-foreground",
         "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+        "aria-[invalid=true]:border-destructive aria-[invalid=true]:focus-visible:ring-destructive",
         "disabled:opacity-50 disabled:cursor-not-allowed",
         "transition-colors duration-150",
         "bg-[right_0.75rem_center] bg-no-repeat cursor-pointer",
