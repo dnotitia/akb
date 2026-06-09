@@ -5,6 +5,26 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.7 — 2026-06-10  *(minor — Keycloak SSO: cross-origin companion-app post-login redirect allowlist)*
+
+A single AKB backend can act as the identity owner for a small family of first-party apps on **different origins** (e.g. reef at `reef-<slug>.<domain>` alongside akb's own `akb-<slug>.<domain>`), each delegating to the *same* tenant Keycloak client instead of registering its own. The blocker was that the SSO post-login redirect was a **single per-instance** `keycloak_post_login_path`: the callback always bounced the one-time code to that one same-site path, and `_safe_redirect_path()` collapsed any cross-origin redirect (open-redirect guard). So akb's own SPA and a companion app could not both complete SSO — they fought over one global path, and pointing `keycloak_post_login_path` at the companion's absolute URL (the earlier workaround) just broke akb's own SPA instead.
+
+New optional setting **`keycloak_post_login_allowed_origins`** (list, default empty) lifts this **per request** without weakening the open-redirect guard:
+
+- A companion app starts SSO via `GET /auth/keycloak/login?redirect=<absolute-URL-on-an-allowlisted-origin>`; the callback delivers the one-time `code` straight to that URL (origin + path + its own query preserved). It then exchanges the code server-side via the existing `POST /auth/keycloak/exchange` — same single-use, ≤60s-TTL guarantees as the akb-SPA path, now delivered to a vetted origin.
+- akb's own SPA (a same-site `redirect` path) is unchanged: code goes to `keycloak_post_login_path?code=&redirect=<safe path>`.
+- **Empty list ⇒ identical to before.** No origin can ever receive the code; behaviour is 100% the pre-existing same-site flow.
+- **Open-redirect protection preserved.** Any redirect whose origin is not explicitly listed — absolute URLs, scheme-relative `//host`, and `https://trusted@evil.com` userinfo spoofs — collapses to the safe same-site path. Origins match as `scheme://host[:port]`.
+- **Re-validated at delivery.** The origin is checked at `begin_login` *and* again in the callback, so a config change during the ≤10-min flow window can only ever tighten where the code goes; flow-state values are never trusted blindly.
+- No new trust in the companion: it still stores no Keycloak client/secret/realm — identity stays owned by AKB.
+
+This is the AKB-side counterpart to the reef SSO-delegation work (reef-test REEF-102 / REEF-112) and supersedes the "point `keycloak_post_login_path` at the companion's absolute URL" workaround, which could satisfy only one origin per instance.
+
+`backend/app/api/routes/auth.py` gains `_normalize_origin` / `_allowed_companion_origin` / `_with_query_param` / `_post_login_target`; `keycloak_login` and `keycloak_callback` route through them. `backend/app/config.py` adds the setting (default empty). `config/app.yaml.example` and `docs/designs/keycloak-oidc/00-overview.md` document it.
+
+### Tests
+`tests/test_keycloak_redirect_unit.py` (new, 21 cases, no DB) pins the allowlist gate and the open-redirect guard: origin normalization (host lowercasing, port retention, non-http rejection), the userinfo-spoof rejection even when the trusted origin is listed, empty-list ⇒ same-site for every input, listed-origin code delivery with existing query preserved, and unlisted/absolute/scheme-relative collapse to the safe path.
+
 ## 0.8.6 — 2026-06-08  *(patch — GET document: read body at the row's current_commit, not floating HEAD (E03 read-side race))*
 
 `GET /documents/{vault}/{id}` (`akb_get`) assembled its response from **two unsynchronized reads**: the body via `git.read_file(vault, path)` — which reads the *floating vault HEAD* — and `current_commit` from the DB row. Under concurrent updates to the **same** document, a writer could advance git HEAD and the DB row between those two reads, so a single response carried a `content` and a `current_commit` belonging to **different writers** (the "E03" symptom: body ↔ current_commit disagree).
