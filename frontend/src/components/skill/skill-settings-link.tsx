@@ -13,7 +13,7 @@ interface Props {
 export function SkillSettingsLink({ vault, defined, updatedAt }: Props) {
   return (
     <div className="flex items-center justify-between gap-3 py-3 border-b border-border">
-      <div className="flex items-center gap-3 text-[12px]">
+      <div className="flex items-center gap-3 text-xs">
         <SkillBadge defined={defined} />
         <span>
           Vault guide · {defined ? "✓ defined" : "✗ undefined"}
@@ -21,9 +21,13 @@ export function SkillSettingsLink({ vault, defined, updatedAt }: Props) {
         </span>
       </div>
       {defined ? (
-        <Link to={`/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`}>
-          <Button variant="outline" size="sm">Configure →</Button>
-        </Link>
+        // Button asChild renders a single styled <a> (avoids an invalid
+        // <button> nested inside <a>) and carries the focus-visible ring.
+        <Button asChild variant="outline" size="sm">
+          <Link to={`/vault/${vault}/doc/${encodeURIComponent("overview/vault-skill.md")}`}>
+            Configure →
+          </Link>
+        </Button>
       ) : (
         <SkillCreateButton vault={vault} variant="outline" />
       )}
