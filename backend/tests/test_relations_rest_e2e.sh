@@ -124,6 +124,10 @@ URI_V2=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT2\",\"collection\":\"specs\"
   && pass "4 docs created ($URI_A …)" || { fail "Docs" "missing URIs"; exit 1; }
 
 MISSING="akb://$VAULT1/doc/specs/does-not-exist"
+# A coll URI: parseable, carries an identifier, same vault — so it clears
+# _shared_link_vault + the writer check and reaches the service. link/unlink
+# must both reject it (collections are navigation aids, never edge endpoints).
+COLL_URI="akb://$VAULT1/coll/specs"
 
 # ── 1. POST /relations — happy path + round-trip ─────────────
 echo ""
@@ -160,6 +164,9 @@ CODE=$(rpost_code "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_V2\",\"relat
 CODE=$(rpost_code "$PAT1" "{\"source\":\"not-a-uri\",\"target\":\"$URI_B\",\"relation\":\"references\"}")
 [ "$CODE" = "400" ] && pass "malformed source URI → 400" || fail "bad uri" "got $CODE"
 
+CODE=$(rpost_code "$PAT1" "{\"source\":\"$COLL_URI\",\"target\":\"$URI_B\",\"relation\":\"references\"}")
+[ "$CODE" = "400" ] && pass "link from coll URI → 400 (not a linkable kind)" || fail "POST coll reject" "got $CODE"
+
 CODE=$(rpost_code "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$MISSING\",\"relation\":\"references\"}")
 [ "$CODE" = "404" ] && pass "nonexistent target resource → 404" || fail "missing target" "got $CODE"
 
@@ -184,6 +191,13 @@ REMOVED=$(rdel "$PAT1" "$URI_A" "$URI_B" "references" | python3 -c "import sys,j
 
 CODE=$(rdel_code "$PAT2" "$URI_A" "$URI_B" "references")
 [ "$CODE" = "403" ] && pass "reader cannot unlink → 403" || fail "reader unlink gate" "got $CODE"
+
+# Regression (PR #168 review): a coll URI must be REJECTED (400), not
+# silently 200 + {"unlinked":0}. canonicalize_resource_uri returns None for
+# coll, which previously fell back to the raw URI → zero-row DELETE → a
+# false success. POST rejects the same URI 400; unlink must match it.
+CODE=$(rdel_code "$PAT1" "$COLL_URI" "$URI_B" "references")
+[ "$CODE" = "400" ] && pass "unlink from coll URI → 400 (matches POST, no false success)" || fail "DELETE coll reject" "got $CODE"
 
 # relation omitted → remove ALL edges between the two
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"references\"}" >/dev/null

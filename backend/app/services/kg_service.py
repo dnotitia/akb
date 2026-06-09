@@ -298,21 +298,46 @@ async def unlink_resources(
     The MCP handler already gates by vault access, but the service-level
     interface now enforces it too.
 
-    Endpoints are canonicalized first, exactly as ``link_resources`` does
-    on write, so a non-canonical but parseable input (slash-suffixed or
-    legacy ``akb://V/doc/{coll}/{name}`` shape) still matches the canonical
-    edge that link stored — otherwise the DELETE would silently remove
-    nothing. Both callers (MCP ``akb_unlink`` and REST ``DELETE /relations``)
+    Endpoints are validated and canonicalized first, exactly as
+    ``link_resources`` does on write, so the two surfaces accept and
+    reject identically. A non-canonical but parseable input (slash-
+    suffixed or legacy ``akb://V/doc/{coll}/{name}`` shape) is rewritten
+    to the canonical form link stored — otherwise the DELETE would
+    silently remove nothing. An unparseable URI, or a non-linkable
+    ``coll``/``vault`` URI (which ``link_resources`` rejects up front),
+    is rejected here too rather than falling through to a zero-row DELETE
+    that returns a misleading ``{"unlinked": 0}`` success — that false
+    success is the asymmetry the matching ``POST`` 400 would never show.
+    Both callers (MCP ``akb_unlink`` and REST ``DELETE /relations``)
     inherit this; resolution stays centralized in the service, not
     duplicated per surface.
     """
-    # Mirror link_resources' canonicalization (canonicalize_resource_uri).
+    # Mirror link_resources' validation + canonicalization. canonicalize_
+    # resource_uri returns None for exactly the non-linkable kinds
+    # (coll/vault), so a None result is the same "not a linkable kind"
+    # signal link_resources rejects with INVALID_ARGUMENT.
     src_parsed = parse_uri(source_uri)
-    if src_parsed:
-        source_uri = canonicalize_resource_uri(src_parsed) or source_uri
     tgt_parsed = parse_uri(target_uri)
-    if tgt_parsed:
-        target_uri = canonicalize_resource_uri(tgt_parsed) or target_uri
+    if not src_parsed:
+        return err(f"Invalid source URI: {source_uri}", code=INVALID_URI)
+    if not tgt_parsed:
+        return err(f"Invalid target URI: {target_uri}", code=INVALID_URI)
+    src_canon = canonicalize_resource_uri(src_parsed)
+    tgt_canon = canonicalize_resource_uri(tgt_parsed)
+    if src_canon is None:
+        return err(
+            f"Cannot unlink from a {src_parsed.kind} URI ({source_uri}). "
+            "Linkable kinds: ('doc', 'table', 'file').",
+            code=INVALID_ARGUMENT,
+        )
+    if tgt_canon is None:
+        return err(
+            f"Cannot unlink to a {tgt_parsed.kind} URI ({target_uri}). "
+            "Linkable kinds: ('doc', 'table', 'file').",
+            code=INVALID_ARGUMENT,
+        )
+    source_uri = src_canon
+    target_uri = tgt_canon
 
     pool = await get_pool()
     async with pool.acquire() as conn:
