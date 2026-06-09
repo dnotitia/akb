@@ -47,10 +47,10 @@ export function RoleSelect({ vault, member, onChanged }: Props) {
           aria-label={`Change role for ${member.username}`}
           className={cn(
             badgeVariants({ variant: member.role }),
-            "appearance-none pr-5 cursor-pointer",
+            "appearance-none pr-5 cursor-pointer transition-token",
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-            "hover:brightness-110 transition-[filter] duration-150",
-            "disabled:opacity-60 disabled:cursor-wait",
+            "hover:border-border-strong",
+            "disabled:opacity-50 disabled:cursor-wait",
           )}
         >
           {OPTIONS.map((r) => (

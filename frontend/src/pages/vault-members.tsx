@@ -10,6 +10,7 @@ import {
   transferOwnership,
 } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { InviteMemberDialog } from "@/components/invite-member-dialog";
@@ -130,10 +131,10 @@ export default function VaultMembersPage() {
       <div className="flex items-baseline justify-between mb-6 flex-wrap gap-y-2">
         <Link
           to={`/vault/${name}`}
-          className="inline-flex items-center gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name.toUpperCase()}
+          BACK TO {name}
         </Link>
         {info?.role && (
           info.role_source === "public" ? (
@@ -155,7 +156,7 @@ export default function VaultMembersPage() {
       </div>
 
       <div className="coord mb-3">
-        VAULT · {name.toUpperCase()} · MEMBERS
+        VAULT · {name} · MEMBERS
       </div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
         Members<span className="text-accent">.</span>
@@ -189,33 +190,26 @@ export default function VaultMembersPage() {
       {undoTarget && (
         <div role="status" className="flex items-center gap-3 px-3 py-2 rounded-[var(--radius-md)] border border-border bg-surface-muted mb-4 mt-4">
           <span className="text-sm text-foreground">
-            Changed {undoTarget.username} from {undoTarget.prev.toUpperCase()} to {undoTarget.next.toUpperCase()}.
+            Changed {undoTarget.username} from {undoTarget.prev} to {undoTarget.next}.
           </span>
           <button
             type="button"
             onClick={handleUndo}
-            className="text-xs font-mono uppercase tracking-wider text-accent hover:underline cursor-pointer"
+            className="text-xs font-mono uppercase tracking-wider text-link hover:text-link-hover hover:underline cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             Undo
           </button>
         </div>
       )}
       {undoError && (
-        <div role="alert" className="px-3 py-2 rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 text-destructive text-xs font-mono mb-4 mt-4">
-          Undo failed: {undoError}
-        </div>
+        <Alert variant="destructive" className="mb-4 mt-4">Undo failed: {undoError}</Alert>
       )}
 
       {/* List */}
       {error ? (
-        <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-3 mt-4 text-sm">
-          <span className="coord-spark mb-1 block text-destructive">
-            ⚠ FAILED TO LOAD MEMBERS
-          </span>
-          {error}
-        </div>
+        <Alert variant="destructive" title="Failed to load members" className="mt-4">{error}</Alert>
       ) : members === null ? (
-        <div className="coord px-3 py-3">— LOADING —</div>
+        <div className="coord px-3 py-3" role="status" aria-live="polite">— LOADING —</div>
       ) : members.length === 0 ? (
         <EmptyState title="No members on record" description="Even the owner row should appear here — try refreshing." />
       ) : (
@@ -268,7 +262,7 @@ export default function VaultMembersPage() {
                     onClick={() => setPendingTransfer(m)}
                     aria-label={`Transfer ownership to ${m.username}`}
                     title="Transfer ownership"
-                    className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                    className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                   >
                     <Crown className="h-3 w-3" aria-hidden />
                     Transfer
@@ -297,7 +291,7 @@ export default function VaultMembersPage() {
       {!canManage && members && (
         <p className="coord mt-6 flex items-center gap-2">
           <UserCog className="h-3 w-3" aria-hidden />
-          ROSTER IS READ-ONLY · YOUR ROLE IS {info?.role?.toUpperCase() || "—"}
+          ROSTER IS READ-ONLY · YOUR ROLE IS {info?.role || "—"}
         </p>
       )}
 

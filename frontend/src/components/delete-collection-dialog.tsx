@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { ApiError, deleteCollection, type CollectionDeleteResult } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -152,34 +153,18 @@ export function DeleteCollectionDialog({
 
         {isCascade && (
           <div className="space-y-4">
-            {/* Destructive alert banner — strongest visual cue. The
-             *  bulleted enumeration replaces the previous inline doc/file
-             *  body sentence so users see counts in a list form that
-             *  scans faster, and the heading is mono uppercase to mirror
-             *  the visual language used elsewhere for warnings. */}
-            <div
-              role="alert"
-              className="border border-destructive/40 bg-destructive/10 p-3 flex items-start gap-3"
-            >
-              <AlertTriangle
-                className="h-5 w-5 shrink-0 text-destructive mt-0.5"
-                aria-hidden
-              />
-              <div className="flex-1 min-w-0 space-y-2">
-                <p className="font-mono text-xs uppercase tracking-wide font-semibold text-destructive">
-                  Permanent deletion · cannot be undone
-                </p>
-                <ul className="list-disc pl-5 text-sm text-foreground space-y-0.5">
-                  {items.map((line) => (
-                    <li key={line}>{line}</li>
-                  ))}
-                  <li>
-                    Path{" "}
-                    <code className="font-mono font-semibold">{path}</code>
-                  </li>
-                </ul>
-              </div>
-            </div>
+            {/* Destructive callout — the <Alert> primitive supplies role=alert
+                + the AlertTriangle icon + the danger-soft token surface. */}
+            <Alert variant="destructive" title="Permanent deletion · cannot be undone">
+              <ul className="list-disc pl-5 space-y-0.5">
+                {items.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+                <li>
+                  Path <code className="font-mono font-semibold">{path}</code>
+                </li>
+              </ul>
+            </Alert>
 
             <div>
               <Label
@@ -206,14 +191,7 @@ export function DeleteCollectionDialog({
           </div>
         )}
 
-        {error && (
-          <div
-            role="alert"
-            className="border border-destructive p-2 text-xs text-destructive"
-          >
-            {error}
-          </div>
-        )}
+        {error && <Alert variant="destructive">{error}</Alert>}
 
         <DialogFooter>
           <Button
@@ -228,16 +206,10 @@ export function DeleteCollectionDialog({
             type="button"
             variant="destructive"
             onClick={handleDelete}
-            disabled={!canDelete || working}
+            loading={working}
+            disabled={!canDelete}
           >
-            {working ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Deleting…
-              </>
-            ) : (
-              "Delete"
-            )}
+            {working ? "Deleting…" : "Delete"}
           </Button>
         </DialogFooter>
       </DialogContent>

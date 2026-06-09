@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { deleteVaultPermanent } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -74,14 +75,11 @@ export function DeleteVaultDialog({
         </DialogHeader>
 
         <div className="space-y-4">
-          <div className="border border-destructive bg-destructive/5 p-3">
-            <p className="coord-spark text-destructive mb-2">⚠ NO RECOVERY PATH</p>
-            <p className="text-xs text-foreground leading-relaxed">
-              If you only want to make the vault read-only, use{" "}
-              <span className="font-mono">Archive</span> in the lifecycle section
-              instead — that's reversible. Delete is final.
-            </p>
-          </div>
+          <Alert variant="warning" title="No recovery path">
+            If you only want to make the vault read-only, use{" "}
+            <span className="font-mono">Archive</span> in the lifecycle section
+            instead — that's reversible. Delete is final.
+          </Alert>
 
           <div>
             <Label htmlFor="confirm-name" className="coord-ink mb-1.5 block">
@@ -102,11 +100,7 @@ export function DeleteVaultDialog({
             </p>
           </div>
 
-          {error && (
-            <div role="alert" className="border border-destructive p-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
+          {error && <Alert variant="destructive">{error}</Alert>}
         </div>
 
         <DialogFooter>
@@ -122,16 +116,10 @@ export function DeleteVaultDialog({
             type="button"
             variant="destructive"
             onClick={handleDelete}
-            disabled={!matches || working}
+            loading={working}
+            disabled={!matches}
           >
-            {working ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Deleting…
-              </>
-            ) : (
-              "Delete forever"
-            )}
+            {working ? "Deleting…" : "Delete forever"}
           </Button>
         </DialogFooter>
       </DialogContent>

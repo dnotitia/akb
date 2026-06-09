@@ -78,6 +78,9 @@ export function ConfirmDialog({
             variant="outline"
             onClick={() => onOpenChange(false)}
             disabled={isBusy}
+            // Destructive dialogs focus Cancel, not Confirm, so a stray Enter on
+            // open can't fire the irreversible action.
+            autoFocus={variant === "destructive"}
           >
             {cancelLabel}
           </Button>
@@ -86,7 +89,7 @@ export function ConfirmDialog({
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={handleConfirm}
             disabled={isBusy}
-            autoFocus
+            autoFocus={variant !== "destructive"}
           >
             {isBusy ? "Working…" : confirmLabel}
           </Button>

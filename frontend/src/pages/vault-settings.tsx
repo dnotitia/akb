@@ -10,6 +10,7 @@ import {
   updateVault,
 } from "@/lib/api";
 import { SkillSettingsLink } from "@/components/skill/skill-settings-link";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -124,15 +125,15 @@ export default function VaultSettingsPage() {
       <div className="flex items-baseline justify-between mb-6 flex-wrap gap-y-2">
         <Link
           to={`/vault/${name}`}
-          className="inline-flex items-center gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name.toUpperCase()}
+          BACK TO {name}
         </Link>
         {info?.role && <RoleBadge role={info.role} />}
       </div>
 
-      <div className="coord mb-3">VAULT · {name.toUpperCase()} · SETTINGS</div>
+      <div className="coord mb-3">VAULT · {name} · SETTINGS</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
         Settings<span className="text-accent">.</span>
       </h1>
@@ -188,8 +189,12 @@ export default function VaultSettingsPage() {
           )}
 
           <div>
-            <Label className="coord-ink mb-1.5 block">PUBLIC ACCESS</Label>
-            <div className="grid grid-cols-3 gap-px rounded-[var(--radius-md)] overflow-hidden border border-border bg-border">
+            <Label id="public-access-label" className="coord-ink mb-1.5 block">PUBLIC ACCESS</Label>
+            <div
+              role="group"
+              aria-labelledby="public-access-label"
+              className="grid grid-cols-3 gap-px rounded-[var(--radius-md)] overflow-hidden border border-border bg-border"
+            >
               {(["none", "reader", "writer"] as PublicAccess[]).map((v) => {
                 const active = publicAccess === v;
                 const Icon = v === "none" ? Lock : Globe;
@@ -202,8 +207,8 @@ export default function VaultSettingsPage() {
                     disabled={!canEdit || saving}
                     className={`px-3 py-2 text-sm font-mono uppercase tracking-wider transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50 disabled:cursor-not-allowed ${
                       active
-                        ? "bg-surface-2 text-foreground"
-                        : "bg-surface text-foreground hover:bg-surface-muted cursor-pointer"
+                        ? "bg-surface-selected text-surface-selected-foreground"
+                        : "bg-surface text-foreground hover:bg-surface-hover cursor-pointer"
                     }`}
                   >
                     <span className="inline-flex items-center justify-center gap-1.5">
@@ -219,25 +224,22 @@ export default function VaultSettingsPage() {
             </p>
           </div>
 
-          {error && (
-            <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
+          {error && <Alert variant="destructive">{error}</Alert>}
 
           {canEdit && (
             <div className="flex items-center gap-3">
               <Button
-                variant="accent"
+                variant="default"
                 onClick={handleSave}
-                disabled={!dirty || saving}
+                loading={saving}
+                disabled={!dirty}
               >
-                <Save className="h-4 w-4" aria-hidden />
+                {!saving && <Save className="h-4 w-4" aria-hidden />}
                 {saving ? "Saving…" : "Save changes"}
               </Button>
-              {savedAt && (
-                <span className="coord-spark fade-in">SAVED</span>
-              )}
+              <span role="status" aria-live="polite">
+                {savedAt && <span className="coord-spark fade-in">SAVED</span>}
+              </span>
               {dirty && !savedAt && !saving && (
                 <span className="coord">UNSAVED CHANGES</span>
               )}

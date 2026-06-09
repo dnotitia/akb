@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { searchUsers, grantAccess } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -147,24 +148,24 @@ export function InviteMemberDialog({
               />
             </div>
 
-            <div className="border border-border max-h-56 overflow-y-auto rail-scroll">
+            <div className="border border-border max-h-[min(14rem,30vh)] overflow-y-auto rail-scroll">
               {searching && hits.length === 0 ? (
-                <div className="coord px-3 py-2">— SEARCHING —</div>
+                <div className="coord px-3 py-2" role="status" aria-live="polite">— SEARCHING —</div>
               ) : hits.length === 0 ? (
-                <div className="coord px-3 py-2">— NO MATCHES —</div>
+                <div className="coord px-3 py-2" role="status">— NO MATCHES —</div>
               ) : (
-                <ul className="divide-y divide-border">
+                <ul role="listbox" aria-label="Search results" className="divide-y divide-border">
                   {hits.map((u) => {
                     const active = selected?.username === u.username;
                     return (
-                      <li key={u.username}>
+                      <li key={u.username} role="option" aria-selected={active}>
                         <button
                           type="button"
                           onClick={() => setSelected(u)}
                           className={`w-full text-left px-3 py-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset cursor-pointer ${
                             active
-                              ? "bg-accent/10 text-accent"
-                              : "hover:bg-surface-muted text-foreground"
+                              ? "bg-surface-selected text-surface-selected-foreground"
+                              : "hover:bg-surface-hover text-foreground"
                           }`}
                         >
                           <div className="flex items-baseline gap-2">
@@ -201,8 +202,8 @@ export function InviteMemberDialog({
                     aria-pressed={active}
                     className={`px-3 py-2 text-sm font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                       active
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-surface text-foreground hover:bg-surface-muted"
+                        ? "bg-surface-selected text-surface-selected-foreground"
+                        : "bg-surface text-foreground hover:bg-surface-hover"
                     }`}
                   >
                     {r}
@@ -215,11 +216,7 @@ export function InviteMemberDialog({
             </p>
           </div>
 
-          {error && (
-            <div role="alert" className="border border-destructive p-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
+          {error && <Alert variant="destructive">{error}</Alert>}
         </div>
 
         <DialogFooter>
@@ -233,18 +230,12 @@ export function InviteMemberDialog({
           </Button>
           <Button
             type="button"
-            variant="accent"
+            variant="default"
             onClick={handleGrant}
-            disabled={!selected || granting}
+            loading={granting}
+            disabled={!selected}
           >
-            {granting ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Granting…
-              </>
-            ) : (
-              `Grant ${role}`
-            )}
+            {granting ? "Granting…" : `Grant ${role}`}
           </Button>
         </DialogFooter>
       </DialogContent>
