@@ -1,5 +1,5 @@
 // frontend/src/components/graph/GraphDetailPanel.tsx
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Crosshair, ExternalLink, Pin, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
@@ -57,6 +57,12 @@ export function GraphDetailPanel({
 }: Props) {
   const [metaOpen, setMetaOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
+  // Move focus into the panel when a new node is selected so AT users land on
+  // the freshly-revealed detail (the panel appears with no other notification).
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    titleRef.current?.focus();
+  }, [docId]);
 
   const docQuery = useQuery<DocResponse>({
     queryKey: ["document", vault, docId],
@@ -91,7 +97,11 @@ export function GraphDetailPanel({
   }
 
   return (
-    <aside className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface">
+    <aside
+      className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface"
+      role="region"
+      aria-label={`Details for ${kind} ${docId}`}
+    >
       <header className="flex items-center justify-between px-3 py-2 border-b border-border">
         <span className="coord">{kind} · {docId}</span>
         <button onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground">
@@ -125,17 +135,35 @@ export function GraphDetailPanel({
       ) : (
         <>
       <div className="px-3 py-3 border-b border-border">
-        <h2 className="font-semibold tracking-[-0.015em] text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
+        <h2
+          ref={titleRef}
+          tabIndex={-1}
+          className="font-semibold tracking-[-0.015em] text-2xl leading-tight mb-1 focus:outline-none"
+        >
+          {doc?.title || "…"}
+        </h2>
         <p className="coord text-foreground-muted truncate" title={uri}>{uri}</p>
         <div className="flex flex-wrap gap-1 mt-3">
           <Button size="sm" variant="accent" onClick={openDoc}>
             <ExternalLink className="h-3 w-3" /> Open
           </Button>
-          <Button size="sm" variant="outline" onClick={() => navigator.clipboard.writeText(uri)}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => navigator.clipboard?.writeText(uri).catch(() => {})}
+          >
             Copy URI
           </Button>
           {onTogglePin && (
-            <Button size="sm" variant={pinned ? "accent" : "outline"} onClick={onTogglePin} aria-pressed={!!pinned}>
+            // Pin is a toggle, not a CTA — when pinned it reads as a teal
+            // selected control, not a second filled-orange marquee.
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onTogglePin}
+              aria-pressed={!!pinned}
+              className={pinned ? "bg-surface-selected text-surface-selected-foreground border-primary" : undefined}
+            >
               <Pin className="h-3 w-3" /> {pinned ? "Pinned" : "Pin"}
             </Button>
           )}
@@ -336,8 +364,8 @@ function RelGroup({
                 });
                 onFitToNode(r.other_uri);
               }}
-              title={`${r.other_name} — 그래프에서 선택`}
-              className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              title={`${r.other_name} — select in graph`}
+              className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-link cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <span className="truncate">{r.other_name}</span>
               <Crosshair

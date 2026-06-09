@@ -129,7 +129,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             onClick={onCollapse}
             aria-label="Hide sidebar"
             title="Hide sidebar"
-            className="inline-flex h-6 w-6 items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="inline-flex h-6 w-6 items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-hover cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <PanelLeftClose className="h-3.5 w-3.5" />
           </button>
@@ -145,7 +145,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search documents"
             aria-label="Search documents"
-            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus:border-accent"
+            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus:border-primary"
           />
         </div>
         {hits.length > 0 && (
@@ -155,7 +155,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => commitEntry(h)}
-                  className="w-full flex items-center justify-between gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-muted"
+                  className="w-full flex items-center justify-between gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-hover"
                 >
                   <span title={h.title} className="truncate">{h.title}</span>
                   <span className="coord">{h.type}</span>
@@ -226,8 +226,8 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               className={cn(
                 "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold",
                 view.types.has(k)
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "border-border text-foreground-muted opacity-70",
+                  ? "border-primary bg-surface-selected text-surface-selected-foreground"
+                  : "border-border text-foreground-muted hover:bg-surface-hover",
               )}
             >
               {k}
@@ -248,8 +248,8 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               className={cn(
                 "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold text-left",
                 view.relations.has(r)
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "border-border text-foreground-muted opacity-70",
+                  ? "border-primary bg-surface-selected text-surface-selected-foreground"
+                  : "border-border text-foreground-muted hover:bg-surface-hover",
               )}
             >
               {r}
@@ -279,7 +279,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                   type="button"
                   onClick={() => onChange({ ...view, entry: r.doc_id })}
                   title={r.title}
-                  className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:bg-accent/10 active:text-foreground truncate"
+                  className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:bg-surface-active truncate"
                 >
                   {r.title}
                 </button>
@@ -322,7 +322,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             }}
             placeholder="Name this view"
             aria-label="View name"
-            className="w-full h-7 px-2 rounded-[var(--radius-sm)] bg-background border border-accent text-[11px] focus:outline-none mb-1"
+            className="w-full h-7 px-2 rounded-[var(--radius-sm)] bg-background border border-input text-[11px] focus:outline-none mb-1"
           />
         )}
         {saved.length === 0 && savingName === null ? (
@@ -335,7 +335,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                   type="button"
                   onClick={() => onNavigate(s.url)}
                   title={s.name}
-                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-muted active:opacity-60 transition-opacity duration-150 truncate"
+                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:opacity-60 transition-opacity duration-150 truncate"
                 >
                   {s.name}
                 </button>

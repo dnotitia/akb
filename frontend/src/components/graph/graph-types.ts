@@ -72,6 +72,10 @@ export interface GraphColors {
   foregroundMuted: string;
   accent: string;
   border: string;
+  /** Tokenized categorical scale (--color-cat-1..6) for cluster coloring.
+   *  getComputedStyle already returns the .dark-overridden value, so this
+   *  is the single source of truth for cluster colors in both themes. */
+  cat: string[];
 }
 
 export function readColors(): GraphColors {
@@ -85,6 +89,7 @@ export function readColors(): GraphColors {
     foregroundMuted: pick("--color-foreground-muted"),
     accent: pick("--color-accent"),
     border: pick("--color-border"),
+    cat: [1, 2, 3, 4, 5, 6].map((i) => root.getPropertyValue(`--color-cat-${i}`).trim() || "gray"),
   };
 }
 

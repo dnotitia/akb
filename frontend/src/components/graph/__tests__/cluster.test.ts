@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest";
 import {
   groupOf,
   groupColor,
-  isDarkBg,
   forceCluster,
   forceCollide,
   COLLIDE_RADIUS,
@@ -33,23 +32,23 @@ describe("groupOf", () => {
 });
 
 describe("groupColor", () => {
-  it("is deterministic and theme-aware", () => {
-    expect(groupColor("w/1")).toBe(groupColor("w/1"));
-    expect(groupColor("w/1", false)).not.toBe(groupColor("w/1", true));
-    expect(groupColor("w/1")).toMatch(/^hsl\(/);
+  // The tokenized categorical scale (--color-cat-1..6) resolved by readColors().
+  const cat = ["#1f5a6e", "#2f8f94", "#4f9c7a", "#b9791b", "#c44a1e", "#5e6068"];
+
+  it("is deterministic for a group key", () => {
+    expect(groupColor("w/1", cat)).toBe(groupColor("w/1", cat));
   });
 
-  it("usually distinguishes different groups by hue", () => {
-    expect(groupColor("w/1")).not.toBe(groupColor("w/2"));
+  it("returns a color drawn from the provided categorical scale", () => {
+    expect(cat).toContain(groupColor("w/1", cat));
   });
-});
 
-describe("isDarkBg", () => {
-  it("classifies dark vs light hex backgrounds, defaulting to dark", () => {
-    expect(isDarkBg("#0f172a")).toBe(true);
-    expect(isDarkBg("#faf9f5")).toBe(false);
-    expect(isDarkBg("#fff")).toBe(false);
-    expect(isDarkBg("oklch(0.2 0 0)")).toBe(true);
+  it("usually distinguishes different groups", () => {
+    expect(groupColor("w/1", cat)).not.toBe(groupColor("w/2", cat));
+  });
+
+  it("falls back to a neutral when the scale is empty", () => {
+    expect(groupColor("x", [])).toBe("gray");
   });
 });
 
