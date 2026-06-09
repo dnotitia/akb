@@ -70,7 +70,7 @@ async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
   if (res.status === 401) {
     setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth";
+    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
     throw new Error("Unauthorized");
   }
   if (!res.ok) {
@@ -99,7 +99,7 @@ async function apiText(path: string, opts?: RequestInit): Promise<string> {
   const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
   if (res.status === 401) {
     setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth";
+    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
     throw new Error("Unauthorized");
   }
   if (!res.ok) {

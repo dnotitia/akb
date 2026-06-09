@@ -47,7 +47,7 @@ export function Logo({
             akb
           </span>
           {subtitle && (
-            <span className="coord mt-0.5" style={{ fontSize: 9 }}>
+            <span className="coord mt-0.5">
               knowledgebase
             </span>
           )}

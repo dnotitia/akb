@@ -1,9 +1,17 @@
-import { Link } from "react-router-dom";
+import { useEffect } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
+import { getToken } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
 
 export default function AuthForgotPage() {
+  const navigate = useNavigate();
+  // This route sits outside the Layout auth gate — bounce signed-in users home.
+  useEffect(() => {
+    if (getToken()) navigate("/", { replace: true });
+  }, [navigate]);
+
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
       <div className="absolute right-4 top-4 z-10">

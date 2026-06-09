@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { Monitor, Moon, Sun } from "lucide-react";
+import { Check, Monitor, Moon, Sun } from "lucide-react";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 
 const ICONS: Record<Theme, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>> = {
@@ -31,20 +31,27 @@ export function ThemeToggle() {
           sideOffset={4}
           className="z-50 min-w-[140px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
-          {(["light", "dark", "system"] as const).map((opt) => {
-            const OptIcon = ICONS[opt];
-            return (
-              <DropdownMenu.Item
-                key={opt}
-                onSelect={() => setTheme(opt)}
-                className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-muted"
-              >
-                <OptIcon className="h-4 w-4" aria-hidden />
-                <span>{LABELS[opt]}</span>
-                {theme === opt && <span className="coord-spark ml-auto">ON</span>}
-              </DropdownMenu.Item>
-            );
-          })}
+          {/* RadioGroup → each item is role=menuitemradio with aria-checked, so
+              the active theme is exposed to assistive tech (not just an "ON"
+              text marker). The check is teal, not the low-contrast orange. */}
+          <DropdownMenu.RadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
+            {(["light", "dark", "system"] as const).map((opt) => {
+              const OptIcon = ICONS[opt];
+              return (
+                <DropdownMenu.RadioItem
+                  key={opt}
+                  value={opt}
+                  className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-muted"
+                >
+                  <OptIcon className="h-4 w-4" aria-hidden />
+                  <span>{LABELS[opt]}</span>
+                  <DropdownMenu.ItemIndicator className="ml-auto">
+                    <Check className="h-4 w-4 text-primary" aria-hidden />
+                  </DropdownMenu.ItemIndicator>
+                </DropdownMenu.RadioItem>
+              );
+            })}
+          </DropdownMenu.RadioGroup>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>

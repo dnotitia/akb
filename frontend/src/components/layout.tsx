@@ -54,7 +54,11 @@ export function Layout() {
   const { data: health } = useHealth(!!getToken());
 
   if (!getToken()) {
-    return <Navigate to="/auth" replace />;
+    // Preserve where the user was headed so /auth can return them there after
+    // signing in (deep-linked / shared URLs don't dump everyone on home).
+    const dest = location.pathname + location.search;
+    const to = dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
+    return <Navigate to={to} replace />;
   }
   const upsert = health?.vector_store?.backfill?.upsert;
   const indexingPending: number | null = upsert
