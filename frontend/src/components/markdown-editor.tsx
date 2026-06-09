@@ -126,7 +126,7 @@ function LinkElement(props: PlateElementProps) {
       // href is read-only in the editor; opening links is handled outside the
       // editing surface (cmd-click). We still set href for serialization round-trip.
       attributes={{ ...props.attributes, href: safe, rel: "noopener noreferrer" }}
-      className="text-accent underline underline-offset-2 hover:no-underline"
+      className="text-link underline underline-offset-2 hover:no-underline"
     />
   );
 }
@@ -146,8 +146,14 @@ function ListItemElement(props: PlateElementProps) {
 }
 
 function TableElement(props: PlateElementProps) {
+  // Wide tables scroll within themselves instead of pushing the whole
+  // authoring surface into a page-level horizontal scroll.
   return (
-    <PlateElement {...props} as="table" className="my-4 w-full border border-border text-sm" />
+    <PlateElement
+      {...props}
+      as="table"
+      className="my-4 w-full border border-border text-sm block overflow-x-auto max-w-full"
+    />
   );
 }
 
@@ -277,11 +283,12 @@ const components: Record<string, React.FC<any>> = {
 
 const TOOLBAR_BTN =
   "inline-flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] " +
-  "text-foreground-muted transition-token cursor-pointer hover:bg-surface-muted hover:text-foreground " +
-  "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40 disabled:pointer-events-none";
+  "text-foreground-muted transition-token cursor-pointer hover:bg-surface-hover hover:text-foreground " +
+  "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 disabled:pointer-events-none";
 
+// An engaged format button is a SELECTED state — teal-tinted, hue-coded.
 const TOOLBAR_BTN_ACTIVE =
-  "bg-surface text-foreground shadow-sm";
+  "bg-surface-selected text-surface-selected-foreground";
 
 const TOOLBAR_GROUP =
   "inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-1";
@@ -358,14 +365,16 @@ function EditorToolbar() {
   return (
     <div
       contentEditable={false}
+      role="toolbar"
+      aria-label="Text formatting"
       className={cn(
         "sticky top-0 z-10 flex flex-wrap items-center gap-1.5",
-        "border-b border-border bg-surface/90 px-2 py-1.5 backdrop-blur",
+        "border-b border-border bg-surface px-2 py-1.5",
         "rounded-t-[var(--radius-sm)] select-none",
       )}
     >
       {/* Block types */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="Block type">
         <RibbonButton
           label="Paragraph"
           active={isBlock(ParagraphPlugin.key)}
@@ -385,7 +394,7 @@ function EditorToolbar() {
       </div>
 
       {/* Marks */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="Marks">
         <RibbonButton label="Bold" active={isMark(BoldPlugin.key)} onClick={() => toggleMark(BoldPlugin.key)}>
           <Bold className="h-4 w-4" />
         </RibbonButton>
@@ -405,7 +414,7 @@ function EditorToolbar() {
       </div>
 
       {/* Lists */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="Lists">
         <RibbonButton
           label="Bulleted list"
           onClick={() => toggleList(editor, { listStyleType: ListStyleType.Disc })}
@@ -421,7 +430,7 @@ function EditorToolbar() {
       </div>
 
       {/* Blocks: quote, code block, rule */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="Blocks">
         <RibbonButton
           label="Blockquote"
           active={isBlock(BlockquotePlugin.key)}
@@ -442,7 +451,7 @@ function EditorToolbar() {
       </div>
 
       {/* Link + table */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="Insert">
         <RibbonButton label="Insert link on selection" onClick={onLink}>
           <Link2 className="h-4 w-4" />
         </RibbonButton>
@@ -452,7 +461,7 @@ function EditorToolbar() {
       </div>
 
       {/* History */}
-      <div className={TOOLBAR_GROUP}>
+      <div className={TOOLBAR_GROUP} role="group" aria-label="History">
         <RibbonButton label="Undo" onClick={() => editor.tf.undo()}>
           <Undo2 className="h-4 w-4" />
         </RibbonButton>
@@ -476,6 +485,11 @@ export interface MarkdownEditorProps {
   autoFocus?: boolean;
   readOnly?: boolean;
   className?: string;
+  /** Accessible name for the contenteditable region (it carries role=textbox
+   * but no native label). Pass one of these so SR users hear the field name. */
+  ariaLabel?: string;
+  ariaLabelledby?: string;
+  required?: boolean;
 }
 
 export function MarkdownEditor({
@@ -485,6 +499,9 @@ export function MarkdownEditor({
   autoFocus,
   readOnly,
   className,
+  ariaLabel,
+  ariaLabelledby,
+  required,
 }: MarkdownEditorProps) {
   const editor = usePlateEditor({
     plugins,
@@ -520,6 +537,9 @@ export function MarkdownEditor({
         autoFocus={autoFocus}
         readOnly={readOnly}
         placeholder={placeholder}
+        aria-label={ariaLabel}
+        aria-labelledby={ariaLabelledby}
+        aria-required={required || undefined}
         className={cn(
           "min-h-[360px] w-full outline-none cursor-text",
           // `prose` defaults to max-width: 65ch — explicitly override so
@@ -530,7 +550,7 @@ export function MarkdownEditor({
           // PlateContent renders a div whose direct children are blocks; we
           // want the editor to look like an article surface, not a textarea.
           "border border-border bg-surface px-5 py-4",
-          "hover:border-foreground-muted focus-within:border-accent focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
+          "hover:border-foreground-muted focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background transition-colors",
           // Plate marks the first empty leaf with `data-slate-placeholder`
           // when the editor is empty; surface it so a blank editor isn't a
           // mysterious silent box.

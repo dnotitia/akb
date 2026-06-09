@@ -510,6 +510,7 @@ export default function DocumentPage() {
                     }
                     setEditingContent(md);
                   }}
+                  ariaLabel="Document body (markdown)"
                   autoFocus
                 />
               </Suspense>

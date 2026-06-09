@@ -22,20 +22,28 @@ export function TagInput({
   maxTags = 50,
 }: TagInputProps) {
   const [draft, setDraft] = useState("");
+  const [live, setLive] = useState("");
 
   function commit() {
     const v = draft.trim().replace(/^#/, "").slice(0, maxTagLength);
     if (!v) return;
+    // Keep the draft text on rejection so the user sees what didn't take.
     if (value.length >= maxTags) {
-      setDraft("");
+      setLive(`Tag limit reached (${maxTags})`);
       return;
     }
-    if (!value.includes(v)) onChange([...value, v]);
+    if (value.includes(v)) {
+      setLive(`"${v}" is already added`);
+      return;
+    }
+    onChange([...value, v]);
+    setLive(`Added tag ${v}`);
     setDraft("");
   }
 
   function remove(t: string) {
     onChange(value.filter((x) => x !== t));
+    setLive(`Removed tag ${t}`);
   }
 
   return (
@@ -52,7 +60,7 @@ export function TagInput({
                 type="button"
                 onClick={() => remove(t)}
                 aria-label={`Remove tag ${t}`}
-                className="text-foreground-muted hover:text-destructive cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className="text-foreground-muted hover:text-destructive cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <X className="h-3 w-3" aria-hidden />
               </button>
@@ -76,6 +84,7 @@ export function TagInput({
         onBlur={commit}
         placeholder={placeholder}
       />
+      <span className="sr-only" role="status" aria-live="polite">{live}</span>
     </>
   );
 }
