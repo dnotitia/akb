@@ -48,8 +48,8 @@ export function TitleBar({
         title="Go back"
         className={cn(
           "inline-flex items-center justify-center h-6 w-6 -ml-1",
-          "text-foreground-muted hover:text-foreground hover:bg-surface-muted",
-          "disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent",
+          "text-foreground-muted hover:text-foreground hover:bg-surface-hover",
+          "disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent",
           "transition-colors duration-150",
           "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
           "cursor-pointer",
@@ -114,7 +114,6 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
     <div className="flex items-center gap-1">
       {actions.map(([k, label, href, Icon]) => {
         const active = k === page;
-        const accent = k === "graph";
         return (
           <Link
             key={k}
@@ -123,11 +122,10 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
             className={cn(
               "inline-flex items-center gap-1 px-2.5 h-7 rounded-[var(--radius-sm)] border transition-token",
               "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-              active && accent
-                ? "border-accent bg-accent/10 text-accent"
-                : active
-                  ? "border-primary/40 bg-primary/10 text-primary"
-                  : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted",
+              // Selection is teal app-wide — no per-tab orange special-case.
+              active
+                ? "border-transparent bg-surface-selected text-surface-selected-foreground"
+                : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover",
             )}
           >
             <Icon className="h-3 w-3" aria-hidden />

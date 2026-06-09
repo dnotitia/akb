@@ -34,6 +34,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import {
+  AlertCircle,
   Check,
   Copy,
   Info,
@@ -220,11 +221,14 @@ function CodeBlock({ language, code }: { language?: string; code: string }) {
         >
           {copied ? (
             <>
-              <Check className="w-3 h-3 text-[var(--color-success)]" strokeWidth={2.5} />
-              <span className="text-[var(--color-success)]">Copied</span>
+              <Check className="w-3 h-3 text-success" strokeWidth={2.5} aria-hidden />
+              <span className="text-success">Copied</span>
             </>
           ) : failed ? (
-            <span className="text-[var(--color-danger)]">Failed</span>
+            <>
+              <AlertCircle className="w-3 h-3 text-destructive" aria-hidden />
+              <span className="text-destructive">Failed</span>
+            </>
           ) : (
             <>
               <Copy className="w-3 h-3" strokeWidth={2} />
@@ -233,7 +237,7 @@ function CodeBlock({ language, code }: { language?: string; code: string }) {
           )}
         </button>
       </div>
-      <pre className="px-4 pb-3 pt-2.5 overflow-auto max-h-[480px] text-[13px] leading-relaxed font-mono text-foreground/90 whitespace-pre">
+      <pre className="px-4 pb-3 pt-2.5 overflow-auto max-h-[480px] text-[13px] leading-relaxed font-mono text-foreground whitespace-pre">
         {code}
       </pre>
     </div>
@@ -246,59 +250,59 @@ type AlertKind = "note" | "tip" | "important" | "warning" | "caution";
 interface AlertConfig {
   label: string;
   icon: LucideIcon;
-  /** glyph color (token via arbitrary value) */
+  /** glyph color (semantic base token) */
   iconClass: string;
-  /** tinted card surface (color-mix off the token) */
+  /** tinted card surface (solid -soft token + hairline) */
   cardClass: string;
   /** icon-tile surface */
   tileClass: string;
+  /** card body text (AA on the soft surface) */
+  textClass: string;
 }
 
+// Solid -soft semantic quads (flip correctly on the dark canvas; the old
+// color-mix tints did not). note→info, tip→success, warning, caution→danger;
+// `important` keeps the brand orange as legitimate decoration.
 const ALERTS: Record<AlertKind, AlertConfig> = {
   note: {
     label: "Note",
     icon: Info,
-    iconClass: "text-primary",
-    cardClass:
-      "bg-[color-mix(in_srgb,var(--color-primary)_7%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--color-primary)_20%,transparent)]",
-    tileClass:
-      "bg-[color-mix(in_srgb,var(--color-primary)_14%,transparent)]",
+    iconClass: "text-info",
+    cardClass: "bg-info-soft border border-info/30",
+    tileClass: "bg-info/15",
+    textClass: "text-info-soft-foreground",
   },
   tip: {
     label: "Tip",
     icon: Lightbulb,
-    iconClass: "text-[var(--color-success)]",
-    cardClass:
-      "bg-[color-mix(in_srgb,var(--color-success)_8%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--color-success)_22%,transparent)]",
-    tileClass:
-      "bg-[color-mix(in_srgb,var(--color-success)_14%,transparent)]",
+    iconClass: "text-success",
+    cardClass: "bg-success-soft border border-success/30",
+    tileClass: "bg-success/15",
+    textClass: "text-success-soft-foreground",
   },
   important: {
     label: "Important",
     icon: Sparkles,
-    iconClass: "text-accent",
-    cardClass:
-      "bg-[color-mix(in_srgb,var(--color-accent)_8%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--color-accent)_22%,transparent)]",
-    tileClass:
-      "bg-[color-mix(in_srgb,var(--color-accent)_14%,transparent)]",
+    iconClass: "text-accent-strong",
+    cardClass: "bg-accent/5 border border-accent/30",
+    tileClass: "bg-accent/15",
+    textClass: "text-foreground",
   },
   warning: {
     label: "Warning",
     icon: AlertTriangle,
-    iconClass: "text-[var(--color-warning)]",
-    cardClass:
-      "bg-[color-mix(in_srgb,var(--color-warning)_9%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--color-warning)_24%,transparent)]",
-    tileClass:
-      "bg-[color-mix(in_srgb,var(--color-warning)_16%,transparent)]",
+    iconClass: "text-warning",
+    cardClass: "bg-warning-soft border border-warning/30",
+    tileClass: "bg-warning/15",
+    textClass: "text-warning-soft-foreground",
   },
   caution: {
     label: "Caution",
     icon: OctagonAlert,
-    iconClass: "text-[var(--color-danger)]",
-    cardClass:
-      "bg-[color-mix(in_srgb,var(--color-danger)_9%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--color-danger)_24%,transparent)]",
-    tileClass:
-      "bg-[color-mix(in_srgb,var(--color-danger)_16%,transparent)]",
+    iconClass: "text-destructive",
+    cardClass: "bg-danger-soft border border-destructive/30",
+    tileClass: "bg-destructive/15",
+    textClass: "text-danger-soft-foreground",
   },
 };
 
@@ -372,7 +376,7 @@ function MarkdownAlert({
       >
         <Icon className={cn("w-4 h-4", cfg.iconClass)} strokeWidth={2.25} />
       </span>
-      <div className="min-w-0 flex-1 text-[14px] text-foreground leading-relaxed [&_p:first-child]:mt-0 [&_p:last-child]:mb-0">
+      <div className={cn("min-w-0 flex-1 text-[14px] leading-relaxed [&_p:first-child]:mt-0 [&_p:last-child]:mb-0", cfg.textClass)}>
         {children}
       </div>
     </div>
@@ -396,7 +400,7 @@ function TaskListItem({ children }: { children: React.ReactNode }) {
         className={cn(
           "mt-[6px] shrink-0 w-[15px] h-[15px] rounded-[5px] border transition-token",
           checked
-            ? "bg-accent border-accent text-[var(--color-accent-foreground)] flex items-center justify-center"
+            ? "bg-success border-success text-success-foreground flex items-center justify-center"
             : "bg-surface border-border-strong",
         )}
       >
@@ -443,7 +447,10 @@ function buildComponents(markdown: string) {
   const heading =
     (level: 1 | 2 | 3 | 4 | 5 | 6, cls: string) =>
     ({ node: _node, children, ...props }: any) => {
-      const Tag = `h${level}` as any;
+      // Demote one semantic level: the page already owns the single <h1>, so a
+      // body that starts with `# ` must not emit a second top-level heading.
+      // Tag is demoted; the visual class + slug/id are unchanged.
+      const Tag = `h${Math.min(level + 1, 6)}` as any;
       return (
         <Tag id={nextId(children, level)} className={cls} {...props}>
           {children}
@@ -568,7 +575,7 @@ function buildComponents(markdown: string) {
         <a
           href={safe}
           {...(external ? { rel: "noopener noreferrer", target: "_blank" } : {})}
-          className="text-accent underline decoration-accent/40 underline-offset-[3px] decoration-1 hover:decoration-accent transition-token break-words"
+          className="text-link underline decoration-link/40 underline-offset-[3px] decoration-1 hover:text-link-hover hover:decoration-link-hover transition-token break-words"
           {...props}
         >
           {children}
@@ -590,7 +597,7 @@ function buildComponents(markdown: string) {
       if (inline) {
         return (
           <code
-            className="font-mono text-[0.875em] px-1.5 py-0.5 mx-[1px] rounded-[var(--radius-sm)] bg-surface-2 text-primary ring-1 ring-[color-mix(in_srgb,var(--color-primary)_15%,transparent)] wrap-anywhere"
+            className="font-mono text-[0.875em] px-1.5 py-0.5 mx-[1px] rounded-[var(--radius-sm)] bg-surface-2 text-primary border border-border wrap-anywhere"
             {...props}
           >
             {children}
@@ -656,7 +663,7 @@ function buildComponents(markdown: string) {
     ),
     th: ({ node: _node, children, ...props }: any) => (
       <th
-        className="px-4 py-2.5 text-left font-semibold text-foreground-muted border-b border-border whitespace-nowrap text-[0.82em] uppercase tracking-[0.04em]"
+        className="px-4 py-2.5 text-left font-semibold text-foreground-muted border-b border-border whitespace-nowrap text-[0.86em]"
         {...props}
       >
         {children}

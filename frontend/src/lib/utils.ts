@@ -45,7 +45,9 @@ export function sanitizeLinkUrl(raw: string | null | undefined): string {
 
 export function timeAgo(iso: string | null | undefined): string {
   if (!iso) return "-";
-  const diff = Date.now() - new Date(iso).getTime();
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "-"; // corrupt/non-ISO → fallback, never "NaNm ago"
+  const diff = Date.now() - t;
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return "just now";
   if (mins < 60) return `${mins}m ago`;

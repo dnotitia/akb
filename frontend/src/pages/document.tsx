@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -28,9 +28,11 @@ import { parseHeadings } from "@/lib/markdown";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
 import { SummaryFold } from "@/components/summary-fold";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Panel } from "@/components/ui/panel";
+import { Badge } from "@/components/ui/badge";
 import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
@@ -43,11 +45,11 @@ import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 const RELATION_COLOR: Record<string, string> = {
-  implements: "text-good",
+  implements: "text-success",
   depends_on: "text-info",
   references: "text-info",
   related_to: "text-foreground-muted",
-  attached_to: "text-good",
+  attached_to: "text-success",
   derived_from: "text-warning",
 };
 
@@ -69,7 +71,10 @@ export default function DocumentPage() {
           ? "agent"
           : "rendered";
   const [relations, setRelations] = useState<any[]>([]);
+  const [relationsError, setRelationsError] = useState(false);
   const [provenance, setProvenance] = useState<any[]>([]);
+  const [historyError, setHistoryError] = useState(false);
+  const [pendingView, setPendingView] = useState<DocView | null>(null);
   const [docOverride, setDocOverride] = useState<any>(null);
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState("");
@@ -97,21 +102,20 @@ export default function DocumentPage() {
     !commitHash &&
     (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
 
-  const setView = (next: DocView) => {
-    if (view === "edit" && next !== "edit" && isDirty) {
-      // Explicit save mirrors the frontmatter dialog UX — losing edits
-      // silently on tab switch would be the wrong default.
-      const ok = window.confirm(
-        "Discard unsaved changes? Your edits will be lost.",
-      );
-      if (!ok) return;
-      setEditingContent(originalContent);
-      setEditorKey((k) => k + 1);
-    }
+  const applyView = (next: DocView) => {
     const p = new URLSearchParams(searchParams);
     if (next === "rendered") p.delete("view");
     else p.set("view", next);
     setSearchParams(p, { replace: true });
+  };
+  const setView = (next: DocView) => {
+    // Leaving Edit with unsaved changes routes through a ConfirmDialog
+    // (design system bans window.confirm); the actual switch happens on confirm.
+    if (view === "edit" && next !== "edit" && isDirty) {
+      setPendingView(next);
+      return;
+    }
+    applyView(next);
   };
 
   useEffect(() => {
@@ -130,12 +134,17 @@ export default function DocumentPage() {
   });
 
   const doc = docOverride ?? docQuery.data ?? null;
+  // Parse headings once for the outline-tab count (the outline + renderer each
+  // re-scan internally; this removes the third pass that ran on every render).
+  const headingSlugs = useMemo(() => parseHeadings(doc?.content || ""), [doc?.content]);
 
   useEffect(() => {
     const d = docQuery.data;
     setDocOverride(null);
     setProvenance([]);
     setRelations([]);
+    setRelationsError(false);
+    setHistoryError(false);
     setBodyError("");
     if (!d) return;
     const body = d.content || "";
@@ -153,7 +162,9 @@ export default function DocumentPage() {
       // *path* (docUri). The GET response exposes no internal `id` — `uri`/
       // `path` is the sole identifier — so keying this off `d.id` (always
       // undefined) meant relations never loaded on the document page.
-      getRelations(name!, d.path).then((r) => setRelations(r.relations || [])).catch(() => {});
+      getRelations(name!, d.path)
+        .then((r) => setRelations(r.relations || []))
+        .catch(() => setRelationsError(true));
     }
     if (d.path) {
       loadHistory(name!, d.path);
@@ -178,6 +189,32 @@ export default function DocumentPage() {
     setBodyError("");
     try {
       await updateDocument(name, docId, { content: editingContent });
+      const now = new Date().toISOString();
+      // Optimistically advance content + updated_at so the byline reads
+      // "last changed just now" without waiting for a refetch.
+      setDocOverride({
+        ...(doc || {}),
+        content: editingContent,
+        updated_at: now,
+      });
+      setOriginalContent(editingContent);
+      // Sidebar refresh is best-effort — its failure must not leave the
+      // user looking at a "still dirty" editor after a successful save.
+      try {
+        refetchTree();
+      } catch {
+        // intentionally swallowed
+      }
+      // Commit `savedAt` before the view switch so the SAVED badge
+      // renders in its own paint; bundling it with `setSearchParams`
+      // lets React squash the indicator into the same commit as the
+      // tab-strip remount and the user never sees it.
+      flushSync(() => {
+        flashSaved();
+      });
+      const p = new URLSearchParams(searchParams);
+      p.delete("view");
+      setSearchParams(p, { replace: true });
     } catch (e: unknown) {
       const status = e instanceof ApiError ? e.status : 0;
       // 5xx responses can carry stack traces or SQL fragments — never
@@ -190,36 +227,11 @@ export default function DocumentPage() {
             ? e.message
             : "Save failed.";
       setBodyError(safe);
+    } finally {
+      // Always clear the spinner — a post-await setState throwing must not
+      // leave the editor stuck on "Saving…".
       setSavingBody(false);
-      return;
     }
-    const now = new Date().toISOString();
-    // Optimistically advance content + updated_at so the byline reads
-    // "last changed just now" without waiting for a refetch.
-    setDocOverride({
-      ...(doc || {}),
-      content: editingContent,
-      updated_at: now,
-    });
-    setOriginalContent(editingContent);
-    // Sidebar refresh is best-effort — its failure must not leave the
-    // user looking at a "still dirty" editor after a successful save.
-    try {
-      refetchTree();
-    } catch {
-      // intentionally swallowed
-    }
-    // Commit `savedAt` before the view switch so the SAVED badge
-    // renders in its own paint; bundling it with `setSearchParams`
-    // lets React squash the indicator into the same commit as the
-    // tab-strip remount and the user never sees it.
-    flushSync(() => {
-      flashSaved();
-    });
-    const p = new URLSearchParams(searchParams);
-    p.delete("view");
-    setSearchParams(p, { replace: true });
-    setSavingBody(false);
   }
 
   const savedTimerRef = useRef<number | null>(null);
@@ -258,12 +270,14 @@ export default function DocumentPage() {
       );
       if (!r.ok) {
         setProvenance([]);
+        setHistoryError(true);
         return;
       }
       const d = await r.json();
       setProvenance(d.activity || []);
     } catch {
       setProvenance([]);
+      setHistoryError(true);
     }
   }
 
@@ -306,9 +320,15 @@ export default function DocumentPage() {
 
   async function copyPublicLink() {
     const url = `${location.origin}/p/${doc.public_slug}`;
-    await navigator.clipboard.writeText(url);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    // clipboard is undefined on insecure (plain-HTTP) origins — guard so the
+    // copy never throws an unhandled rejection and the UI doesn't stick.
+    try {
+      await navigator.clipboard?.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard blocked — link stays visible to copy manually */
+    }
   }
 
   const commitShort = doc.current_commit?.slice(0, 7);
@@ -322,6 +342,7 @@ export default function DocumentPage() {
     >
       <article
         ref={setArticleEl}
+        aria-labelledby="doc-title"
         className={`min-w-0 w-full ${
           inEditMode ? "max-w-none" : "max-w-[880px]"
         }`}
@@ -333,10 +354,10 @@ export default function DocumentPage() {
             className="rounded-[var(--radius-lg)] border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap shadow-sm"
           >
             <div className="flex items-baseline gap-2 min-w-0">
-              <span className="coord-spark text-accent shrink-0">⊙ HISTORICAL VIEW</span>
+              <span className="coord-spark shrink-0">⊙ HISTORICAL VIEW</span>
               <span className="text-sm text-foreground">
                 Viewing version{" "}
-                <code className="font-mono text-accent">{commitHash.slice(0, 7)}</code>
+                <code className="font-mono text-accent-strong">{commitHash.slice(0, 7)}</code>
                 {" "}— writes are disabled until you return to the latest version.
               </span>
             </div>
@@ -347,7 +368,7 @@ export default function DocumentPage() {
                 p.delete("commit");
                 setSearchParams(p, { replace: false });
               }}
-              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider rounded-[var(--radius-sm)] border border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider rounded-[var(--radius-sm)] border border-accent-strong text-accent-strong hover:bg-accent-strong hover:text-accent-strong-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               ← Back to latest
             </button>
@@ -359,23 +380,23 @@ export default function DocumentPage() {
           {commitShort && (
             <>
               {" · HEAD "}
-              <span className="text-accent">{commitShort}</span>
+              <span className="text-accent-strong">{commitShort}</span>
             </>
           )}
         </div>
 
         {/* Display title */}
-        <h1 className="font-display text-[40px] leading-[1.05] tracking-tight text-foreground mb-3">
+        <h1 id="doc-title" className="font-display text-[28px] lg:text-[34px] xl:text-[40px] leading-[1.05] tracking-tight text-foreground mb-3 break-words">
           {doc.title}
         </h1>
 
-        {/* Byline in serif italic */}
+        {/* Byline */}
         {(doc.created_by || doc.updated_at) && (
           <div className="font-medium tracking-[-0.01em] text-[14px] text-foreground-muted mb-7">
             {doc.created_by && (
               <>
                 Written by{" "}
-                <span className="not-italic text-accent">{doc.created_by}</span>
+                <span className="text-foreground">{doc.created_by}</span>
                 {doc.updated_at && <>, last changed {timeAgo(doc.updated_at)}</>}.
               </>
             )}
@@ -388,13 +409,7 @@ export default function DocumentPage() {
         <SummaryFold summary={doc.summary} className="mt-4 mb-7" />
 
         {publishError && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-md)] border border-destructive bg-destructive/5 px-3 py-2 mb-6 text-xs font-mono uppercase tracking-wider text-destructive"
-          >
-            ⚠ {publishError.toUpperCase()}
-          </div>
+          <Alert variant="destructive" className="mb-6">{publishError}</Alert>
         )}
 
         {inEditMode ? (
@@ -404,7 +419,7 @@ export default function DocumentPage() {
                 <span
                   role="status"
                   aria-live="polite"
-                  className="coord text-good inline-flex items-baseline gap-1"
+                  className="coord text-success inline-flex items-baseline gap-1"
                 >
                   <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
                   SAVED
@@ -434,11 +449,13 @@ export default function DocumentPage() {
                   buttons[next]?.focus();
                 }}
               >
+                {/* Rendered/Raw are navigation triggers here (their panels live
+                    in DocumentView, unmounted while editing) — no aria-controls
+                    so we don't point at non-existent ids. */}
                 <button
                   role="tab"
                   id="doc-tab-rendered"
                   aria-selected={false}
-                  aria-controls="doc-panel-rendered"
                   tabIndex={-1}
                   onClick={() => setView("rendered")}
                   className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -449,7 +466,6 @@ export default function DocumentPage() {
                   role="tab"
                   id="doc-tab-raw"
                   aria-selected={false}
-                  aria-controls="doc-panel-raw"
                   tabIndex={-1}
                   onClick={() => setView("raw")}
                   className="px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer text-foreground-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -497,15 +513,7 @@ export default function DocumentPage() {
                   autoFocus
                 />
               </Suspense>
-              {bodyError && (
-                <div
-                  role="alert"
-                  aria-live="polite"
-                  className="rounded-[var(--radius-md)] border border-destructive bg-destructive/5 px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
-                >
-                  ⚠ {bodyError.toUpperCase()}
-                </div>
-              )}
+              {bodyError && <Alert variant="destructive">{bodyError}</Alert>}
               <div className="flex items-center justify-between">
                 <div className="coord">
                   {isDirty && <span className="text-warning">UNSAVED CHANGES</span>}
@@ -547,7 +555,7 @@ export default function DocumentPage() {
                 <span
                   role="status"
                   aria-live="polite"
-                  className="coord text-good inline-flex items-baseline gap-1"
+                  className="coord text-success inline-flex items-baseline gap-1"
                 >
                   <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
                   SAVED
@@ -582,7 +590,7 @@ export default function DocumentPage() {
           return (
             <Panel className="shrink-0 mb-4 divide-y divide-border">
               {canWrite && doc.type !== "skill" && (
-                <button onClick={() => setEditOpen(true)} className={`${rowCls} text-foreground hover:bg-surface-muted`}>
+                <button onClick={() => setEditOpen(true)} className={`${rowCls} text-foreground hover:bg-surface-hover`}>
                   <Pencil className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
                   Edit details
                 </button>
@@ -600,7 +608,7 @@ export default function DocumentPage() {
                     <div className="flex items-center gap-2.5">
                       <button
                         onClick={copyPublicLink}
-                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                        className="inline-flex items-center gap-1 text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
                       >
                         {copied ? <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden /> : <ExternalLink className="h-3 w-3" aria-hidden />}
                         {copied ? "Copied" : "Copy"}
@@ -623,7 +631,7 @@ export default function DocumentPage() {
                 <button
                   onClick={() => setPublishOpen(true)}
                   disabled={publishing}
-                  className={`${rowCls} text-foreground hover:bg-surface-muted hover:text-accent disabled:opacity-50`}
+                  className={`${rowCls} text-foreground hover:bg-surface-hover hover:text-link disabled:opacity-50`}
                 >
                   <Unlock className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
                   Publish to /p/…
@@ -637,7 +645,7 @@ export default function DocumentPage() {
           <TabsList className="shrink-0 w-full">
             <TabsTrigger value="outline" className="flex-1 min-w-0 gap-1 px-2">
               Outline
-              <span className="coord tabular-nums">{headingCount(doc.content)}</span>
+              <span className="coord tabular-nums">{headingSlugs.length}</span>
             </TabsTrigger>
             <TabsTrigger value="relations" className="flex-1 min-w-0 gap-1 px-2">
               Relations
@@ -664,10 +672,12 @@ export default function DocumentPage() {
             value="relations"
             className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
           >
-            {relations.length > 0 ? (
+            {relationsError ? (
+              <Alert variant="destructive">Failed to load relations.</Alert>
+            ) : relations.length > 0 ? (
               <>
                 <ol className="font-mono text-[11px] leading-[1.9] space-y-0.5">
-                  {relations.map((r, i) => {
+                  {relations.map((r) => {
                     // Use the canonical URI parser (handles the `/coll/.../doc/`
                     // form) — a flat regex missed collection docs and produced
                     // an empty ref → `/vault/x/doc/` → blank screen.
@@ -686,13 +696,13 @@ export default function DocumentPage() {
                     const label = r.name || targetRef || r.uri;
                     const relColor = RELATION_COLOR[r.relation] || "text-foreground-muted";
                     return (
-                      <li key={i}>
+                      <li key={`${r.relation}:${r.uri}`}>
                         <Link
                           to={href}
-                          className="grid grid-cols-[88px_1fr] gap-1.5 py-0.5 group hover:bg-surface-muted -mx-1 px-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                          className="grid grid-cols-[minmax(64px,88px)_1fr] gap-1.5 py-0.5 group hover:bg-surface-hover -mx-1 px-1 rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                         >
                           <span className={relColor}>{r.relation || "relates"}</span>
-                          <span title={label} className="text-foreground truncate group-hover:text-accent">
+                          <span title={label} className="text-foreground truncate group-hover:text-link">
                             → {label}
                           </span>
                         </Link>
@@ -702,7 +712,7 @@ export default function DocumentPage() {
                 </ol>
                 <Link
                   to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.path ? docUri(name!, doc.path) : "")}`}
-                  className="mt-3 inline-flex items-center gap-1 text-xs text-accent hover:underline"
+                  className="mt-3 inline-flex items-center gap-1 text-xs text-link hover:text-link-hover hover:underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <GitGraph className="h-3 w-3" aria-hidden /> Open in graph →
                 </Link>
@@ -714,21 +724,25 @@ export default function DocumentPage() {
 
           <TabsContent
             value="history"
-            className="flex-1 min-h-0 overflow-hidden pr-1 pt-3"
+            className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
           >
-            <HistoryList
-              entries={provenance as any}
-              selectedHash={commitHash}
-              onSelect={(hash) => {
-                const p = new URLSearchParams(searchParams);
-                if (commitHash === hash) {
-                  p.delete("commit");
-                } else {
-                  p.set("commit", hash);
-                }
-                setSearchParams(p, { replace: false });
-              }}
-            />
+            {historyError ? (
+              <Alert variant="destructive">Failed to load history.</Alert>
+            ) : (
+              <HistoryList
+                entries={provenance as any}
+                selectedHash={commitHash}
+                onSelect={(hash) => {
+                  const p = new URLSearchParams(searchParams);
+                  if (commitHash === hash) {
+                    p.delete("commit");
+                  } else {
+                    p.set("commit", hash);
+                  }
+                  setSearchParams(p, { replace: false });
+                }}
+              />
+            )}
           </TabsContent>
         </Tabs>
       </aside>
@@ -769,6 +783,22 @@ export default function DocumentPage() {
           navigate(`/vault/${name}`);
         }}
       />
+
+      <ConfirmDialog
+        open={pendingView !== null}
+        onOpenChange={(o) => !o && setPendingView(null)}
+        title="Discard unsaved changes?"
+        description="Your edits to the document body will be lost."
+        confirmLabel="Discard changes"
+        variant="destructive"
+        onConfirm={() => {
+          const next = pendingView;
+          setEditingContent(originalContent);
+          setEditorKey((k) => k + 1);
+          setPendingView(null);
+          if (next) applyView(next);
+        }}
+      />
     </div>
   );
 }
@@ -778,35 +808,36 @@ function FrontmatterCard({ doc }: { doc: any }) {
   const rows: Array<[string, React.ReactNode]> = [];
   if (doc.type) rows.push(["type", <span className="text-foreground">{doc.type}</span>]);
   if (doc.status) {
-    const statusColor =
-      doc.status === "active" ? "text-good" :
-      doc.status === "archived" ? "text-warning" :
-      "text-foreground-muted";
-    rows.push(["status", <span className={statusColor}>{doc.status}</span>]);
+    // Status carries a shape (Badge), not color alone (WCAG 1.4.1).
+    const variant =
+      doc.status === "active" ? "active" :
+      doc.status === "archived" ? "archived" :
+      "draft";
+    rows.push(["status", <Badge variant={variant}>{doc.status}</Badge>]);
   }
   if (doc.domain) rows.push(["domain", <span className="text-foreground">{doc.domain}</span>]);
   if (doc.tags?.length) {
     rows.push([
       "tags",
-      <span className="text-info">{doc.tags.map((t: string) => `#${t}`).join(" ")}</span>,
+      <span className="text-info break-words">{doc.tags.map((t: string) => `#${t}`).join(" ")}</span>,
     ]);
   }
   if (doc.depends_on?.length) {
     rows.push([
       "depends_on",
-      <span className="text-foreground-muted">{doc.depends_on.join(", ")}</span>,
+      <span className="text-foreground-muted break-words">{doc.depends_on.join(", ")}</span>,
     ]);
   }
   if (doc.related_to?.length) {
     rows.push([
       "related_to",
-      <span className="text-foreground-muted">{doc.related_to.join(", ")}</span>,
+      <span className="text-foreground-muted break-words">{doc.related_to.join(", ")}</span>,
     ]);
   }
   if (doc.is_public) {
     rows.push([
       "published",
-      <span className="text-accent">
+      <span className="text-foreground break-all">
         /p/{doc.public_slug}
       </span>,
     ]);
@@ -815,16 +846,13 @@ function FrontmatterCard({ doc }: { doc: any }) {
   if (rows.length === 0) return null;
 
   return (
-    <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3 font-mono text-[11px] leading-[1.85] shadow-sm">
-      {rows.map(([k, v], i) => (
-        <div key={i}>
+    <Panel className="px-4 py-3 font-mono text-[11px] leading-[1.85]">
+      {rows.map(([k, v]) => (
+        <div key={k}>
           <span className="text-foreground-muted">{k}:</span> {v}
         </div>
       ))}
-    </div>
+    </Panel>
   );
 }
 
-function headingCount(markdown: string | undefined): number {
-  return parseHeadings(markdown || "").length;
-}

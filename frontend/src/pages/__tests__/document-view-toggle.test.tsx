@@ -96,9 +96,10 @@ afterEach(() => {
 describe("DocumentPage view toggle", () => {
   it("renders Markdown by default", async () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
-    // Wait for the markdown body heading to render through react-markdown.
+    // Body markdown headings are demoted one level (the page title is the sole
+    // <h1>), so the body `# BodyHeading` renders as an <h2>.
     expect(
-      await screen.findByRole("heading", { level: 1, name: "BodyHeading" }),
+      await screen.findByRole("heading", { level: 2, name: "BodyHeading" }),
     ).toBeInTheDocument();
     // The raw <pre> should NOT be present.
     expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
@@ -108,7 +109,7 @@ describe("DocumentPage view toggle", () => {
     // Regression: the panel used to fetch via `d.id`, which the API never
     // returns, so relations silently never loaded ("No relations yet.").
     renderAt("/vault/v/doc/notes%2Fhello.md");
-    await screen.findByRole("heading", { level: 1, name: "BodyHeading" });
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
     await waitFor(() =>
       expect(getRelationsMock).toHaveBeenCalledWith("v", "notes/hello.md"),
     );
@@ -121,7 +122,7 @@ describe("DocumentPage view toggle", () => {
     expect(pre.textContent).toBe(SAMPLE_CONTENT);
     // The rendered-markdown body heading should NOT be present.
     expect(
-      screen.queryByRole("heading", { level: 1, name: "BodyHeading" }),
+      screen.queryByRole("heading", { level: 2, name: "BodyHeading" }),
     ).not.toBeInTheDocument();
     // No `.prose` container is rendered in raw mode.
     expect(document.querySelector(".prose")).toBeNull();
@@ -132,7 +133,7 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     // Wait for the page to settle in rendered mode.
-    await screen.findByRole("heading", { level: 1, name: "BodyHeading" });
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
 
     const rawTab = screen.getByRole("tab", { name: "RAW" });
     const renderedTab = screen.getByRole("tab", { name: "RENDERED" });
@@ -174,11 +175,11 @@ describe("DocumentPage view toggle", () => {
       expect(writeText).toHaveBeenCalledWith(SAMPLE_CONTENT);
     });
 
-    // Button text flips to COPIED while the 1.5s feedback timer runs.
+    // Same button element (React reuses the node); after copy its visible text
+    // flips to COPIED and its aria-label flips to "Markdown copied".
     await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: /copy markdown/i }),
-      ).toHaveTextContent("COPIED");
+      expect(copy).toHaveTextContent("COPIED");
     });
+    expect(copy).toHaveAccessibleName(/markdown copied/i);
   });
 });
