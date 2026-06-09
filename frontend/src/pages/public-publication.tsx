@@ -13,6 +13,7 @@ import { SummaryFold } from "@/components/summary-fold";
 import { TableViewer } from "@/components/table-viewer";
 import { FileViewer } from "@/components/file-viewer";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 
 export default function PublicationPage() {
@@ -51,6 +52,15 @@ export default function PublicationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  // Per-publication document title (WCAG 2.4.2). The password gate sets its
+  // own neutral title (it must not leak a sealed doc's subject), so skip it
+  // here while gated.
+  useEffect(() => {
+    if (needsPassword) return;
+    if (data?.title) document.title = `${data.title} · AKB`;
+    else if (error) document.title = "Unavailable · AKB";
+  }, [data, error, needsPassword]);
+
   if (!slug) return null;
 
   if (needsPassword) {
@@ -64,7 +74,7 @@ export default function PublicationPage() {
   if (!data) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background text-foreground">
-        <div className="coord">— Loading —</div>
+        <div className="coord" role="status" aria-live="polite">— Loading —</div>
       </div>
     );
   }
@@ -77,7 +87,7 @@ export default function PublicationPage() {
           <div className="coord">§ AKB · PUBLIC PUBLICATION</div>
           <div className="coord hidden md:block">SLUG · {slug}</div>
           <div className="coord">
-            {data.resource_type.replace("_", " ").toUpperCase()}
+            {data.resource_type.replace("_", " ")}
           </div>
         </div>
       </div>
@@ -89,7 +99,7 @@ export default function PublicationPage() {
             href="/"
             className="group flex items-baseline gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            <span className="font-display text-3xl leading-none tracking-tight group-hover:text-accent transition-colors">
+            <span className="font-display text-3xl leading-none tracking-tight group-hover:text-primary transition-colors">
               AKB
             </span>
             <span className="coord hidden sm:inline">/ knowledgebase</span>
@@ -116,7 +126,7 @@ export default function PublicationPage() {
           <div className="coord">© Dnotitia / Seahorse</div>
           <a
             href="/"
-            className="coord inline-flex items-center gap-1 hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="coord inline-flex items-center gap-1 hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <ArrowUpRight className="h-3 w-3" aria-hidden />
             AKB.HOME
@@ -195,31 +205,16 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
         <SummaryFold summary={data.summary} prominent className="mt-4 mb-10" />
 
         {data.content_unavailable && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
-          >
-            <div className="coord-spark mb-1 text-destructive">⚠ CONTENT UNAVAILABLE</div>
-            <p className="text-sm text-foreground">
-              The underlying document is no longer accessible from the base.
-            </p>
-          </div>
+          <Alert variant="destructive" title="Content unavailable" className="mb-8">
+            The underlying document is no longer accessible from the base.
+          </Alert>
         )}
 
         {data.section_not_found && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
-          >
-            <div className="coord-spark mb-1 text-destructive">⚠ SECTION NOT FOUND</div>
-            <p className="text-sm text-foreground">
-              Section{" "}
-              <code className="font-mono">{data.section_filter}</code> wasn't
-              matched. Showing the full document.
-            </p>
-          </div>
+          <Alert variant="warning" title="Section not found" className="mb-8">
+            Section <code className="font-mono">{data.section_filter}</code> wasn't
+            matched. Showing the full document.
+          </Alert>
         )}
 
         <MarkdownRender markdown={data.content || ""} className="text-[16px] font-display-body" />
@@ -266,10 +261,10 @@ function ErrorPage({ error }: { error: PublicationError }) {
           </p>
           <a
             href="/"
-            className="mt-8 inline-flex items-baseline gap-2 border-b-2 border-border hover:border-accent transition-colors pb-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="group mt-8 inline-flex items-baseline gap-2 border-b-2 border-border hover:border-primary transition-colors pb-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            <ArrowUpRight className="h-4 w-4 text-accent" aria-hidden />
-            <span className="font-medium hover:text-accent">Take me to AKB</span>
+            <ArrowUpRight className="h-4 w-4 text-foreground-muted group-hover:text-primary transition-colors" aria-hidden />
+            <span className="font-medium group-hover:text-primary transition-colors">Take me to AKB</span>
           </a>
         </div>
       </div>
