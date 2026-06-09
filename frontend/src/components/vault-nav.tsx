@@ -79,7 +79,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
               disabled={loading}
               title="Refresh vaults"
               aria-label="Refresh vaults"
-              className="text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-60"
+              className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-default disabled:opacity-50"
             >
               <RefreshCw
                 className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}
@@ -89,7 +89,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
             <Link
               to="/vault/new"
               aria-label="New vault"
-              className="text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+              className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
             >
               <Plus className="h-3 w-3" aria-hidden />
             </Link>
@@ -106,7 +106,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter"
             aria-label="Filter vaults"
-            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent transition-colors"
+            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
           />
         </div>
       </div>
@@ -143,7 +143,6 @@ function NavItem({
   label,
   icon: Icon,
   active,
-  accent,
   onActiveClick,
   treeOpen,
 }: {
@@ -151,7 +150,6 @@ function NavItem({
   label: string;
   icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   active?: boolean;
-  accent?: boolean;
   onActiveClick?: () => void;
   treeOpen?: boolean;
 }) {
@@ -164,9 +162,8 @@ function NavItem({
         className={cn(
           "flex items-center gap-2 px-2 h-7 text-sm transition-colors",
           "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-          active && accent && "bg-accent/10 text-accent",
-          active && !accent && "bg-surface-muted text-foreground border-l-2 border-accent -ml-[2px]",
-          !active && "text-foreground-muted hover:text-foreground hover:bg-surface-muted",
+          active && "bg-surface-selected text-surface-selected-foreground border-l-2 border-primary -ml-[2px]",
+          !active && "text-foreground-muted hover:text-foreground hover:bg-surface-hover",
         )}
       >
         <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -180,7 +177,7 @@ function NavItem({
     <div
       className={cn(
         "flex items-center h-7 text-sm transition-colors",
-        accent ? "bg-accent/10 text-accent" : "bg-surface-muted text-foreground border-l-2 border-accent -ml-[2px]",
+        "bg-surface-selected text-surface-selected-foreground border-l-2 border-primary -ml-[2px]",
       )}
       aria-current="page"
     >

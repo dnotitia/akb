@@ -110,7 +110,7 @@ export function VaultShell() {
               onClick={() => setTreeVisible(true)}
               title="Show tree (⌘\\)"
               aria-label="Show vault tree"
-              className="my-2 ml-2 self-start inline-flex h-9 w-7 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-muted transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+              className="my-2 ml-2 self-start inline-flex h-9 w-7 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
             >
               <ChevronsRight className="h-4 w-4" aria-hidden />
             </button>
@@ -125,6 +125,9 @@ export function VaultShell() {
               className="shrink-0 overflow-hidden transition-[width] duration-300 ease-out"
               style={{ width: visible ? tree.width + 8 : 0 }}
               aria-hidden={!visible}
+              // `inert` removes the collapsed subtree from the tab order + a11y
+              // tree together (aria-hidden alone leaves its links tabbable).
+              inert={!visible}
             >
               <div className="h-full py-2 pl-2" style={{ width: tree.width + 8 }}>
                 <aside
@@ -138,7 +141,7 @@ export function VaultShell() {
                       onClick={() => setTreeVisible(false)}
                       title="Collapse (⌘\\)"
                       aria-label="Collapse vault tree"
-                      className="inline-flex h-6 w-6 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:text-foreground hover:bg-surface-muted transition-token cursor-pointer"
+                      className="inline-flex h-6 w-6 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token cursor-pointer"
                     >
                       <ChevronsLeft className="h-4 w-4" aria-hidden />
                     </button>
@@ -166,7 +169,7 @@ export function VaultShell() {
               {...tree.handlers}
               className="group relative z-10 w-2 shrink-0 cursor-col-resize touch-none"
             >
-              <div className="mx-auto h-full w-px bg-transparent transition-colors group-hover:bg-accent group-active:bg-accent" />
+              <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
             </div>
           )}
 

@@ -187,7 +187,10 @@ describe("VaultExplorer — error & empty", () => {
   it("shows a message when browse fails", async () => {
     browseMock.mockRejectedValueOnce(new Error("boom"));
     renderAt("/vault/v");
-    expect(await screen.findByText(/⚠ boom/)).toBeInTheDocument();
+    // The error now renders through the <Alert variant="destructive"> primitive
+    // (role=alert + icon), not a hand-rolled "⚠ {error}" line.
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/boom/);
   });
 
   it("shows EMPTY when the vault has no items", async () => {

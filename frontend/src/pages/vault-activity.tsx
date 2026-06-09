@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, GitCommit, Search as SearchIcon, X } from "lucide-react";
 import { getVaultActivity, type ActivityEntry } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { EmptyState } from "@/components/empty-state";
 import { useDebounce } from "@/hooks/use-debounce";
@@ -49,18 +50,18 @@ export default function VaultActivityPage() {
   if (!name) return null;
 
   return (
-    <div className="fade-up max-w-[1280px] mx-auto">
+    <div className="fade-up">
       <div className="flex items-baseline justify-between mb-6 flex-wrap gap-y-2">
         <Link
           to={`/vault/${name}`}
-          className="inline-flex items-center gap-1.5 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name.toUpperCase()}
+          BACK TO {name}
         </Link>
       </div>
 
-      <div className="coord mb-3">VAULT · {name.toUpperCase()} · ACTIVITY</div>
+      <div className="coord mb-3">VAULT · {name} · ACTIVITY</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
         Activity<span className="text-accent">.</span>
       </h1>
@@ -102,7 +103,7 @@ export default function VaultActivityPage() {
                 key={a}
                 type="button"
                 onClick={() => setAuthor(a)}
-                className="inline-flex items-baseline gap-1 px-2 py-1 rounded-[var(--radius-md)] border border-border text-xs hover:border-accent hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                className="inline-flex items-baseline gap-1 px-2 py-1 rounded-[var(--radius-md)] border border-border text-xs hover:border-border-strong hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
                 <span className="font-mono">{a}</span>
                 <span className="coord tabular-nums">{n}</span>
@@ -114,12 +115,9 @@ export default function VaultActivityPage() {
 
       {/* List */}
       {error ? (
-        <div role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 p-3 mt-4 text-sm">
-          <span className="coord-spark mb-1 block text-destructive">⚠ FAILED TO LOAD</span>
-          {error}
-        </div>
+        <Alert variant="destructive" title="Failed to load" className="mt-4">{error}</Alert>
       ) : entries === null || (loading && entries.length === 0) ? (
-        <div className="coord px-3 py-8">— LOADING —</div>
+        <div className="coord px-3 py-8" role="status" aria-live="polite">— LOADING —</div>
       ) : entries.length === 0 ? (
         <EmptyState
           title={author ? `No commits by "${author}"` : "No activity yet"}
@@ -142,9 +140,9 @@ export default function VaultActivityPage() {
               <li key={(e.hash || "") + i}>
                 <Link
                   to={link}
-                  className="group grid grid-cols-[70px_140px_1fr_auto] items-baseline gap-3 px-3 py-2 hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="group grid grid-cols-[70px_140px_1fr_auto] items-baseline gap-3 px-3 py-2 hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
-                  <span className="font-mono text-[11px] text-accent tabular-nums">
+                  <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
                     {(e.hash || "").slice(0, 7)}
                   </span>
                   <span title={e.agent || e.author || "unknown"} className="font-mono text-xs text-foreground truncate">
@@ -155,7 +153,7 @@ export default function VaultActivityPage() {
                     {e.agent || e.author || "unknown"}
                   </span>
                   <div className="min-w-0">
-                    <div title={e.subject || primary?.path || "(no subject)"} className="text-sm tracking-tight truncate text-foreground group-hover:text-accent">
+                    <div title={e.subject || primary?.path || "(no subject)"} className="text-sm tracking-tight truncate text-foreground group-hover:text-link">
                       {e.subject || primary?.path || "(no subject)"}
                     </div>
                     {primary && (
