@@ -6,16 +6,27 @@ The frontend constructs the URI from `vault` + `path` (or file uuid)
 before calling these endpoints.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services.kg_service import get_resource_relations, get_graph, get_provenance
+from app.services.kg_service import (
+    LinkRelationType as RelationType,
+    get_resource_relations,
+    get_graph,
+    get_provenance,
+    link_resources,
+    unlink_resources,
+)
 from app.services.uri_service import parse_uri
+from app.util.text import NFCModel
 
 router = APIRouter()
+logger = logging.getLogger("akb.api.knowledge")
 
 
 def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str, str, str]:
@@ -43,6 +54,72 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
     return vault, rtype, ident
 
 
+# ── Relation write surface (link / unlink) ───────────────────
+#
+# REST twins of the MCP akb_link / akb_unlink handlers. Same writer
+# gate, same-vault guard, and the same relation vocabulary — the two
+# surfaces must accept and reject identically. `RelationType` is the
+# single-source `LinkRelationType` from kg_service (which the MCP
+# akb_link tool schema also derives from), so a relation one surface
+# rejects can never sneak in through the other.
+
+
+class LinkRequest(NFCModel):
+    source: str
+    target: str
+    relation: RelationType
+    metadata: dict | None = None
+
+
+# kg_service.link_resources returns an err()-envelope dict instead of
+# raising (the MCP path passes that envelope through verbatim). REST
+# must translate it to the matching HTTP status; unknown codes → 400.
+_LINK_ERR_STATUS = {
+    "not_found": 404,
+    "self_link": 400,
+    "invalid_uri": 400,
+    "invalid_argument": 400,
+}
+
+
+def _bridge_service_error(result: dict) -> dict:
+    """Raise HTTPException when a kg_service call returned an err() dict.
+
+    A non-dict result (a future service refactor returning a model, or a
+    bare value) is passed through untouched rather than crashing on
+    ``.get``. An err whose ``code`` isn't in the status map falls back to
+    400 but is logged, so a newly-introduced service code surfaces in the
+    logs instead of silently collapsing to a generic 400.
+    """
+    if not isinstance(result, dict):
+        return result
+    code = result.get("code")
+    if code is not None:
+        status = _LINK_ERR_STATUS.get(code)
+        if status is None:
+            logger.warning("Unmapped kg_service error code %r → 400", code)
+            status = 400
+        raise HTTPException(
+            status_code=status,
+            detail=result.get("error", "relation operation failed"),
+        )
+    return result
+
+
+def _shared_link_vault(source: str, target: str) -> str:
+    """Parse both endpoints and enforce the same-vault rule, mirroring
+    the MCP link/unlink handlers. Returns the shared vault name; raises
+    400 on a malformed URI or a cross-vault pair."""
+    source_vault, _, _ = _parse_resource_uri(source)
+    target_vault, _, _ = _parse_resource_uri(target)
+    if source_vault != target_vault:
+        raise HTTPException(
+            status_code=400,
+            detail="source and target must belong to the same vault",
+        )
+    return source_vault
+
+
 @router.get("/relations", summary="Get resource relations (1-hop)")
 async def resource_relations(
     uri: str = Query(..., description="Resource URI"),
@@ -58,6 +135,39 @@ async def resource_relations(
         direction=direction, relation_type=type,
     )
     return {"uri": uri, "relations": relations}
+
+
+@router.post("/relations", summary="Create a relation edge (link)")
+async def create_relation(
+    req: LinkRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    vault = _shared_link_vault(req.source, req.target)
+    await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await link_resources(
+        vault, req.source, req.target, req.relation,
+        created_by=user.username, metadata=req.metadata,
+    )
+    return _bridge_service_error(result)
+
+
+@router.delete("/relations", summary="Remove a relation edge (unlink)")
+async def delete_relation(
+    source: str = Query(..., description="Source resource URI"),
+    target: str = Query(..., description="Target resource URI"),
+    relation: RelationType | None = Query(
+        None,
+        description="Relation type to remove (one of the link vocabulary); "
+        "omit to remove all edges between the two",
+    ),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    vault = _shared_link_vault(source, target)
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await unlink_resources(
+        source, target, relation_type=relation, vault_id=access["vault_id"],
+    )
+    return _bridge_service_error(result)
 
 
 @router.get("/graph", summary="Get knowledge graph (nodes + edges)")
