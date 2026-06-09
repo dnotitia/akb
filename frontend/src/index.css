@@ -213,6 +213,13 @@ body {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.09em;
+  /* Light: the bright --color-accent (#e55e2c) only clears 3.52:1 on white —
+     AA-fail at this size. Use accent-STRONG (#c44a1e, 4.83:1). Dark keeps the
+     bright accent (override below) since the darker tone regresses on a dark
+     surface. */
+  color: var(--color-accent-strong);
+}
+.dark .coord-spark {
   color: var(--color-accent);
 }
 

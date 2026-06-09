@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Rocket, Plus, Loader2, Copy, Check, Eye, EyeOff } from "lucide-react";
+import { AlertCircle, Rocket, Plus, Copy, Check, Eye, EyeOff } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -33,6 +33,7 @@ export function QuickstartDialog({
 }) {
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
+  const [mintError, setMintError] = useState<string | null>(null);
   const [pat, setPat] = useState<string | null>(null);
   const [showPat, setShowPat] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -41,22 +42,31 @@ export function QuickstartDialog({
   const snippets = useMemo(() => mcpInstallSnippets(pat || "<YOUR_PAT>"), [pat]);
 
   async function mint() {
+    setMintError(null);
     setCreating(true);
     try {
       const r = await createPAT(name.trim() || "agent-token");
       setPat(r.token);
       onTokenCreated?.();
-    } catch {
-      /* surfaced by the error boundary */
+    } catch (e) {
+      // No app-wide toast system — surface the failure inline or the user just
+      // sees the button settle with no token and no explanation.
+      setMintError(e instanceof Error ? e.message : "Couldn't mint a token. Please try again.");
     }
     setCreating(false);
   }
 
-  function copyPat() {
+  async function copyPat() {
     if (!pat) return;
-    navigator.clipboard.writeText(pat);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    // clipboard is undefined on insecure origins — guard so copying a
+    // show-once token never throws silently.
+    try {
+      await navigator.clipboard?.writeText(pat);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard blocked — token stays visible to copy manually */
+    }
   }
 
   function dontShowAgain() {
@@ -85,33 +95,56 @@ export function QuickstartDialog({
         <div className="space-y-2">
           <div className="coord-spark">Step 1 · Mint a token</div>
           {pat ? (
-            <div className="rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
+            <div
+              className="rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3"
+              role="status"
+              aria-live="polite"
+            >
               <div className="coord-spark mb-1.5">Fresh token — copy it now (shown once)</div>
               <div className="flex items-center gap-2">
                 <code className="flex-1 font-mono text-xs text-foreground break-all leading-snug">
                   {showPat ? pat : pat.slice(0, 12) + "•".repeat(16)}
                 </code>
-                <button onClick={() => setShowPat((v) => !v)} aria-label={showPat ? "Hide" : "Show"} className="text-foreground-muted hover:text-accent cursor-pointer shrink-0">
-                  {showPat ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                {/* full token always reachable by SR even while masked */}
+                {!showPat && <span className="sr-only">Token value: {pat}</span>}
+                <button
+                  onClick={() => setShowPat((v) => !v)}
+                  aria-label={showPat ? "Hide token" : "Show token"}
+                  className="text-foreground-muted hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                >
+                  {showPat ? <EyeOff className="h-4 w-4" aria-hidden /> : <Eye className="h-4 w-4" aria-hidden />}
                 </button>
-                <button onClick={copyPat} aria-label="Copy token" className="text-foreground-muted hover:text-accent cursor-pointer shrink-0">
-                  {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
+                <button
+                  onClick={copyPat}
+                  aria-label={copied ? "Token copied" : "Copy token"}
+                  className="text-foreground-muted hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                >
+                  {copied ? <Check className="h-4 w-4 text-success" aria-hidden /> : <Copy className="h-4 w-4" aria-hidden />}
                 </button>
               </div>
             </div>
           ) : (
-            <div className="flex gap-2">
-              <Input
-                placeholder="Token name (e.g. my-laptop)"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && mint()}
-              />
-              <Button variant="accent" onClick={mint} disabled={creating} className="shrink-0">
-                {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                Mint token
-              </Button>
-            </div>
+            <>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Token name (e.g. my-laptop)"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && mint()}
+                  aria-invalid={mintError ? true : undefined}
+                />
+                <Button variant="accent" onClick={mint} loading={creating} className="shrink-0">
+                  {!creating && <Plus className="h-4 w-4" aria-hidden />}
+                  Mint token
+                </Button>
+              </div>
+              {mintError && (
+                <p role="alert" className="flex items-start gap-1.5 text-xs text-destructive">
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-px" aria-hidden />
+                  {mintError}
+                </p>
+              )}
+            </>
           )}
         </div>
 

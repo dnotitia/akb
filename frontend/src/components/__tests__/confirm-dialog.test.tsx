@@ -76,4 +76,19 @@ describe("ConfirmDialog", () => {
 
     resolve();
   });
+
+  it("surfaces a rejected confirm inline and keeps the dialog open", async () => {
+    const onConfirm = vi.fn(() => Promise.reject(new Error("Network down")));
+    const user = userEvent.setup();
+    render(<Harness onConfirm={onConfirm} />);
+    await user.click(screen.getByText("Open"));
+    await user.click(screen.getByRole("button", { name: "Revoke" }));
+
+    // The failure shows in a role=alert region instead of silently stalling…
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/Network down/);
+    // …and the dialog stays open so the user can retry.
+    expect(screen.getByText("Revoke token?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Revoke" })).not.toBeDisabled();
+  });
 });

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -35,13 +35,25 @@ export function ConfirmDialog({
   busy = false,
 }: ConfirmDialogProps) {
   const [internalBusy, setInternalBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const isBusy = busy || internalBusy;
 
+  // Clear any stale error each time the dialog (re)opens so a prior failure
+  // doesn't bleed into the next confirmation.
+  useEffect(() => {
+    if (open) setError(null);
+  }, [open]);
+
   async function handleConfirm() {
+    setError(null);
     setInternalBusy(true);
     try {
       await onConfirm();
       onOpenChange(false);
+    } catch (e) {
+      // Keep the dialog open and surface the failure inline — previously a
+      // rejected onConfirm left the dialog stuck with no feedback.
+      setError(e instanceof Error ? e.message : "Something went wrong. Please try again.");
     } finally {
       setInternalBusy(false);
     }
@@ -58,6 +70,14 @@ export function ConfirmDialog({
             </DialogDescription>
           )}
         </DialogHeader>
+        {error && (
+          <p
+            role="alert"
+            className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+          >
+            {error}
+          </p>
+        )}
         <DialogFooter>
           <Button
             type="button"
