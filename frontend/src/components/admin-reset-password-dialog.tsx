@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Check, Copy, Key, Loader2 } from "lucide-react";
+import { Check, Copy, Key } from "lucide-react";
 import { adminResetPassword } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -49,11 +50,13 @@ export function AdminResetPasswordDialog({ userId, username, open, onOpenChange 
   async function handleCopy() {
     if (!tempPassword) return;
     try {
-      await navigator.clipboard.writeText(tempPassword);
+      // clipboard is undefined on insecure (plain-HTTP) origins — guard with
+      // `?.` so a copy never throws an uncaught TypeError with no feedback.
+      await navigator.clipboard?.writeText(tempPassword);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // clipboard failure is silent — user can re-click
+      // clipboard failure is silent — user can re-click / select manually
     }
   }
 
@@ -76,19 +79,14 @@ export function AdminResetPasswordDialog({ userId, username, open, onOpenChange 
               will be able to log in with the generated password and then change
               it from Settings.
             </p>
-            {error && (
-              <p role="alert" className="text-destructive text-xs font-mono">{error}</p>
-            )}
+            {error && <Alert variant="destructive">{error}</Alert>}
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="border border-destructive/40 bg-destructive/10 p-3 flex items-start gap-2">
-              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-destructive" aria-hidden />
-              <div className="text-xs text-foreground">
-                Share this with the user out-of-band (Slack, in person, etc.).
-                It cannot be retrieved again.
-              </div>
-            </div>
+          <div className="space-y-3" role="status" aria-live="polite">
+            <Alert variant="warning">
+              Share this with the user out-of-band (Slack, in person, etc.).
+              It cannot be retrieved again.
+            </Alert>
             <div className="relative">
               <pre
                 data-testid="temp-password"
@@ -99,8 +97,8 @@ export function AdminResetPasswordDialog({ userId, username, open, onOpenChange 
               <button
                 type="button"
                 onClick={handleCopy}
-                aria-label="Copy temporary password"
-                className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-accent border border-border bg-surface"
+                aria-label={copied ? "Temporary password copied" : "Copy temporary password"}
+                className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-primary border border-border bg-surface rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
               >
                 {copied ? <><Check className="h-3 w-3" aria-hidden /> COPIED</> : <><Copy className="h-3 w-3" aria-hidden /> COPY</>}
               </button>
@@ -114,8 +112,7 @@ export function AdminResetPasswordDialog({ userId, username, open, onOpenChange 
               <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={working}>
                 Cancel
               </Button>
-              <Button onClick={handleGenerate} disabled={working}>
-                {working && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
+              <Button onClick={handleGenerate} loading={working}>
                 Generate
               </Button>
             </>
