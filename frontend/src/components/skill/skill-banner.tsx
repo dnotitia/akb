@@ -47,7 +47,7 @@ export function SkillBanner({ vault, docId }: Props) {
     <div className="flex items-center justify-between h-9 px-3 border-b border-border bg-surface">
       <div className="flex items-center gap-3">
         <SkillBadge defined />
-        <span className="font-serif italic text-[13px] text-foreground-muted">
+        <span className="italic font-semibold tracking-[-0.015em] text-[13px] text-foreground-muted">
           Agents writing into this vault read this first.
         </span>
         {error && (

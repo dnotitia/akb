@@ -77,7 +77,7 @@ export default function FilePage() {
       </header>
 
       {info?.description && (
-        <p className="font-serif-italic text-[17px] leading-[1.55] text-foreground-muted mt-3">
+        <p className="font-medium tracking-[-0.01em] text-[17px] leading-[1.55] text-foreground-muted mt-3">
           {info.description}
         </p>
       )}

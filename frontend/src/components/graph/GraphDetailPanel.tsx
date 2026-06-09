@@ -125,7 +125,7 @@ export function GraphDetailPanel({
       ) : (
         <>
       <div className="px-3 py-3 border-b border-border">
-        <h2 className="font-serif text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
+        <h2 className="font-semibold tracking-[-0.015em] text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
         <p className="coord text-foreground-muted truncate" title={uri}>{uri}</p>
         <div className="flex flex-wrap gap-1 mt-3">
           <Button size="sm" variant="accent" onClick={openDoc}>

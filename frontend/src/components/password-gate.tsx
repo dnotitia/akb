@@ -29,7 +29,7 @@ export function PasswordGate({ slug, onSuccess }: Props) {
     <div className="min-h-screen flex items-center justify-center bg-surface px-6">
       <div className="w-full max-w-md fade-up">
         <div className="coord mb-3">§ AKB · PUBLIC · RESTRICTED</div>
-        <div className="border border-border p-8 grain relative">
+        <div className="border border-border p-8 relative">
           <div className="font-display-tight text-5xl text-foreground leading-none">
             Sealed.
           </div>

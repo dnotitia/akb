@@ -36,8 +36,8 @@ export function SummaryFold({ summary, prominent = false, className = "my-4" }: 
   // right edge lines up with the title / FrontmatterCard above it, which
   // fill the column. The prominent (public-share hero) keeps a prose measure.
   const textCls = prominent
-    ? "font-serif-italic text-foreground-muted text-[15px] leading-[1.6] max-w-prose"
-    : "font-serif-italic text-foreground-muted text-sm leading-[1.55]";
+    ? "font-medium tracking-[-0.01em] text-foreground-muted text-[15px] leading-[1.6] max-w-prose"
+    : "font-medium tracking-[-0.01em] text-foreground-muted text-sm leading-[1.55]";
 
   if (!needsFold) {
     return (

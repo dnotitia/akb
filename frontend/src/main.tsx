@@ -23,6 +23,7 @@ import PublicationPage from "@/pages/public-publication";
 import VaultMembersPage from "@/pages/vault-members";
 import VaultSettingsPage from "@/pages/vault-settings";
 import VaultActivityPage from "@/pages/vault-activity";
+import NotFoundPage from "@/pages/not-found";
 import "./index.css";
 
 // Vite dispatches `vite:preloadError` on window when a dynamically-imported
@@ -91,6 +92,9 @@ createRoot(document.getElementById("root")!).render(
           </Route>
           <Route path="/search" element={<SearchPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          {/* Catch-all: an unmatched URL used to render a blank page with no
+              recovery. Render NotFound inside the shell instead. */}
+          <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>
     </BrowserRouter>
