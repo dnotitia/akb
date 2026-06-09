@@ -242,14 +242,16 @@ h1, h2, h3, h4, h5, h6 {
   border-color: var(--glass-border);
 }
 
-/* App header: glass + thin teal→orange gradient underline + soft lift */
+/* App header: near-solid surface + a quiet hairline (Swiss). Was a glassy
+   blur with a teal→orange gradient underline + heavy lift — dialed back so
+   the workspace chrome recedes and content leads. A faint blur remains for
+   when content scrolls under it. */
 .app-header {
-  background-color: var(--glass-bg);
-  backdrop-filter: saturate(180%) blur(var(--glass-blur));
-  -webkit-backdrop-filter: saturate(180%) blur(var(--glass-blur));
-  border-bottom: 1px solid transparent;
-  border-image: linear-gradient(90deg, rgba(0, 64, 89, 0.35), rgba(229, 94, 44, 0.35)) 1;
-  box-shadow: 0 1px 0 rgba(16, 24, 40, 0.02), 0 8px 24px -16px rgba(0, 64, 89, 0.25);
+  background-color: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  backdrop-filter: saturate(130%) blur(8px);
+  -webkit-backdrop-filter: saturate(130%) blur(8px);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
 }
 
 /* Gradient brand wordmark */
@@ -271,9 +273,9 @@ body::before {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(45rem 45rem at 8% -12%, rgba(0, 64, 89, 0.1), transparent 60%),
-    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.09), transparent 55%),
-    radial-gradient(50rem 30rem at 50% 120%, rgba(0, 64, 89, 0.06), transparent 60%);
+    radial-gradient(45rem 45rem at 8% -12%, rgba(0, 64, 89, 0.055), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.045), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(0, 64, 89, 0.03), transparent 60%);
 }
 #root {
   position: relative;
@@ -281,9 +283,9 @@ body::before {
 }
 .dark body::before {
   background:
-    radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.22), transparent 60%),
-    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.16), transparent 55%),
-    radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.14), transparent 60%);
+    radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.1), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.075), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.06), transparent 60%);
 }
 
 /* interactive card: lift + shadow on hover */
