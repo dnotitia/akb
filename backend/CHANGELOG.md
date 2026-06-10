@@ -5,6 +5,12 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.9 — 2026-06-10  *(patch — register migration 035 in the runtime applier + guard test)*
+
+Migrations run from an **explicit hardcoded list** in `_apply_migrations` (`app/db/postgres.py`), not by globbing the directory — a deliberate design so a steady-state boot runs zero DDL. 0.8.8 added `035_fix_wikilink_alias_edges.py` but **not** its entry in that list, so the migration shipped as a **no-op**: the file was in the image but never invoked, and the already-corrupted edges stayed corrupted on deploy.
+
+This registers `035_fix_wikilink_alias_edges.py` so it actually runs, and adds `tests/test_migrations_registered_unit.py` — a guard that fails if any `0NN_*.py` migration file on disk is missing from the applier list (with a tiny documented allowlist for the two applied via init.sql). That guard would have caught the 0.8.8 omission in CI.
+
 ## 0.8.8 — 2026-06-10  *(patch — knowledge graph: wikilink-alias edge corruption + implicit-edge existence validation)*
 
 Body-link extraction had **no handling for Obsidian wikilinks** `[[target|alias]]`. The greedy bare-`akb://` scan (`_AKB_URI_RE`) then swallowed the alias's first word onto the target — a References line like `[[akb://v/coll/decisions/doc/x.md|PWC Query Performance Optimization]]` produced the edge target `akb://v/coll/decisions/doc/x.md|PWC` (matching stopped at the first space). One bug, two symptoms:
