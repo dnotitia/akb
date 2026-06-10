@@ -314,10 +314,10 @@ export default function HomePage() {
                   <li key={`${c.doc_id}:${c.changed_at ?? ""}:${i}`}>
                     <Link
                       to={`/vault/${c.vault}/doc/${c.doc_id}`}
-                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto_64px] items-baseline gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto_64px] items-center gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
                       <span
-                        className="inline-flex h-5 w-5 self-baseline translate-y-0.5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
                         style={{
                           color: tone,
                           backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
@@ -332,17 +332,17 @@ export default function HomePage() {
                         </div>
                         <div title={c.path} className="coord truncate">{c.path}</div>
                       </div>
-                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px] self-baseline" title={c.vault}>
+                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px]" title={c.vault}>
                         <VaultChip name={c.vault} size="sm" />
-                        <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
+                        <span className="truncate font-mono text-xs text-foreground-muted">{c.vault}</span>
                       </span>
                       {fresh ? (
-                        <span className="inline-flex items-center justify-end gap-1 text-right self-baseline text-[11px] font-medium tabular-nums text-accent-strong">
+                        <span className="inline-flex items-center justify-end gap-1 text-right text-[11px] font-medium tabular-nums text-accent-strong">
                           <span className="h-1.5 w-1.5 rounded-full bg-accent-strong" aria-hidden />
                           {timeAgo(c.changed_at)}
                         </span>
                       ) : (
-                        <span className="coord tabular-nums text-right self-baseline">
+                        <span className="coord tabular-nums text-right">
                           {timeAgo(c.changed_at)}
                         </span>
                       )}
