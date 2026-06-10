@@ -125,11 +125,11 @@ export default function PublicationsPage() {
   return (
     <div className="fade-up max-w-[1280px] mx-auto">
       <div className="coord mb-3">
-        VAULT · {name} · PUBLICATIONS
+        Vault · <span className="font-mono">{name}</span> · Publications
       </div>
 
-      <h1 className="font-display text-[44px] leading-[1.0] tracking-tight text-foreground mb-3">
-        published<span className="text-accent">.</span>
+      <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3">
+        Published
       </h1>
 
       <p className="text-[16px] leading-[1.55] text-foreground-muted mb-8 max-w-2xl">
@@ -139,7 +139,7 @@ export default function PublicationsPage() {
 
       <section aria-labelledby="pubs-heading">
         <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-          <span id="pubs-heading" className="coord-ink">§ PUBLICATIONS</span>
+          <span id="pubs-heading" className="coord-ink">Publications</span>
           <span className="coord tabular-nums">
             [{items === null ? "…" : items.length}]
           </span>
@@ -156,7 +156,7 @@ export default function PublicationsPage() {
             }
           />
         ) : items === null ? (
-          <div className="coord py-6" role="status" aria-live="polite">— LOADING —</div>
+          <div className="coord py-6" role="status" aria-live="polite">Loading…</div>
         ) : items.length === 0 ? (
           <EmptyState
             title="No publications yet"
@@ -200,13 +200,13 @@ export default function PublicationsPage() {
                   </div>
                   <div className="flex items-baseline gap-4 shrink-0">
                     <span className="coord tabular-nums hidden md:inline">
-                      VIEWS {p.view_count ?? 0}
+                      Views {p.view_count ?? 0}
                       {p.max_views ? ` / ${p.max_views}` : ""}
                     </span>
                     <span className="coord tabular-nums hidden sm:inline">
                       {p.expires_at
-                        ? `EXPIRES ${timeAgo(p.expires_at).replace("ago", "").trim()}`
-                        : "EVERGREEN"}
+                        ? `Expires ${timeAgo(p.expires_at).replace("ago", "").trim()}`
+                        : "Evergreen"}
                     </span>
                     <span className="coord tabular-nums">
                       {timeAgo(p.created_at)}
@@ -216,7 +216,7 @@ export default function PublicationsPage() {
                       <button
                         onClick={() => copyLink(p)}
                         aria-label={copiedId === p.slug ? "Public link copied" : "Copy public link"}
-                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         {copiedId === p.slug ? (
                           <>
@@ -235,7 +235,7 @@ export default function PublicationsPage() {
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label="Open public page"
-                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         <ExternalLink className="h-3 w-3" aria-hidden />
                         Open
@@ -245,7 +245,7 @@ export default function PublicationsPage() {
                       onClick={() => setPendingRevoke(p)}
                       disabled={revokingId === p.slug}
                       aria-label="Unpublish"
-                      className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs font-mono uppercase tracking-wider text-destructive hover:bg-surface-hover transition-colors cursor-pointer disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                      className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
                       {revokingId === p.slug ? (
                         <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
@@ -265,7 +265,7 @@ export default function PublicationsPage() {
       {items !== null && items.length > 0 && (
         <p className="coord mt-6 flex items-center gap-2">
           <Globe className="h-3 w-3" aria-hidden />
-          PUBLIC · READ-ONLY · NO AUTH REQUIRED
+          Public · Read-only · No auth required
         </p>
       )}
 

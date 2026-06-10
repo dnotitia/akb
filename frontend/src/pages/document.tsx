@@ -285,7 +285,7 @@ export default function DocumentPage() {
     const errorMsg = (docQuery.error as Error)?.message ?? "Unknown error";
     return (
       <div className="py-8 fade-up">
-        <div className="coord-spark mb-2">⚠ ERROR</div>
+        <div className="coord-spark mb-2">⚠ Error</div>
         <p className="text-destructive mb-6 max-w-xl">{errorMsg}</p>
         <Button asChild variant="outline">
           <Link to={`/vault/${name}`}>
@@ -354,7 +354,7 @@ export default function DocumentPage() {
             className="rounded-[var(--radius-lg)] border border-accent bg-accent/5 px-4 py-2 mb-4 flex items-center justify-between gap-3 flex-wrap shadow-sm"
           >
             <div className="flex items-baseline gap-2 min-w-0">
-              <span className="coord-spark shrink-0">⊙ HISTORICAL VIEW</span>
+              <span className="coord-spark shrink-0">⊙ Historical view</span>
               <span className="text-sm text-foreground">
                 Viewing version{" "}
                 <code className="font-mono text-accent-strong">{commitHash.slice(0, 7)}</code>
@@ -368,25 +368,25 @@ export default function DocumentPage() {
                 p.delete("commit");
                 setSearchParams(p, { replace: false });
               }}
-              className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider rounded-[var(--radius-sm)] border border-accent-strong text-accent-strong hover:bg-accent-strong hover:text-accent-strong-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex items-center gap-1 px-2 h-7 text-xs rounded-[var(--radius-sm)] border border-accent-strong text-accent-strong hover:bg-accent-strong hover:text-accent-strong-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               ← Back to latest
             </button>
           </div>
         )}
-        {/* Mono meta line */}
+        {/* Meta line */}
         <div className="coord mb-2">
-          DOC · {docUri(name!, doc.path)}
+          Doc · <span className="font-mono">{docUri(name!, doc.path)}</span>
           {commitShort && (
             <>
               {" · HEAD "}
-              <span className="text-accent-strong">{commitShort}</span>
+              <span className="font-mono text-accent-strong">{commitShort}</span>
             </>
           )}
         </div>
 
         {/* Display title */}
-        <h1 id="doc-title" className="font-display text-[28px] lg:text-[34px] xl:text-[40px] leading-[1.05] tracking-tight text-foreground mb-3 break-words">
+        <h1 id="doc-title" className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3 break-words">
           {doc.title}
         </h1>
 
@@ -422,7 +422,7 @@ export default function DocumentPage() {
                   className="coord text-success inline-flex items-baseline gap-1"
                 >
                   <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
-                  SAVED
+                  Saved
                 </span>
               )}
               <div
@@ -491,10 +491,10 @@ export default function DocumentPage() {
               className="space-y-3"
             >
               <div className="coord flex items-center justify-between">
-                <span>EDITING BODY</span>
+                <span>Editing body</span>
                 <span className="text-foreground-muted normal-case tracking-normal font-sans">
                   Title, type, tags and other metadata are managed separately
-                  via <span className="font-mono uppercase tracking-wider">Edit details</span> →
+                  via <span className="font-medium">Edit details</span> →
                 </span>
               </div>
               <Suspense fallback={<MarkdownEditorFallback />}>
@@ -517,7 +517,7 @@ export default function DocumentPage() {
               {bodyError && <Alert variant="destructive">{bodyError}</Alert>}
               <div className="flex items-center justify-between">
                 <div className="coord">
-                  {isDirty && <span className="text-warning">UNSAVED CHANGES</span>}
+                  {isDirty && <span className="text-warning">Unsaved changes</span>}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
@@ -559,7 +559,7 @@ export default function DocumentPage() {
                   className="coord text-success inline-flex items-baseline gap-1"
                 >
                   <CheckCircle2 className="h-3 w-3 self-center" aria-hidden />
-                  SAVED
+                  Saved
                 </span>
               </div>
             )}
@@ -572,7 +572,7 @@ export default function DocumentPage() {
               extraTab={
                 canEdit
                   ? {
-                      label: `EDIT${isDirty ? "*" : ""}`,
+                      label: `Edit${isDirty ? "*" : ""}`,
                       onClick: () => setView("edit"),
                     }
                   : undefined
@@ -605,7 +605,7 @@ export default function DocumentPage() {
               {doc.is_public && doc.public_slug ? (
                 <div className="px-3 py-2.5 text-xs">
                   <div className="flex items-center justify-between gap-2 mb-1.5">
-                    <span className="coord-spark">§ Published</span>
+                    <span className="coord-spark">Published</span>
                     <div className="flex items-center gap-2.5">
                       <button
                         onClick={copyPublicLink}
@@ -807,37 +807,37 @@ export default function DocumentPage() {
 // ── Frontmatter metadata card ─────────────────────────────────
 function FrontmatterCard({ doc }: { doc: any }) {
   const rows: Array<[string, React.ReactNode]> = [];
-  if (doc.type) rows.push(["type", <span className="text-foreground">{doc.type}</span>]);
+  if (doc.type) rows.push(["Type", <span className="text-foreground">{doc.type}</span>]);
   if (doc.status) {
     // Status carries a shape (Badge), not color alone (WCAG 1.4.1).
     const variant =
       doc.status === "active" ? "active" :
       doc.status === "archived" ? "archived" :
       "draft";
-    rows.push(["status", <Badge variant={variant}>{doc.status}</Badge>]);
+    rows.push(["Status", <Badge variant={variant}>{doc.status}</Badge>]);
   }
-  if (doc.domain) rows.push(["domain", <span className="text-foreground">{doc.domain}</span>]);
+  if (doc.domain) rows.push(["Domain", <span className="text-foreground">{doc.domain}</span>]);
   if (doc.tags?.length) {
     rows.push([
-      "tags",
+      "Tags",
       <span className="text-info break-words">{doc.tags.map((t: string) => `#${t}`).join(" ")}</span>,
     ]);
   }
   if (doc.depends_on?.length) {
     rows.push([
-      "depends_on",
+      "Depends on",
       <span className="text-foreground-muted break-words">{doc.depends_on.join(", ")}</span>,
     ]);
   }
   if (doc.related_to?.length) {
     rows.push([
-      "related_to",
+      "Related to",
       <span className="text-foreground-muted break-words">{doc.related_to.join(", ")}</span>,
     ]);
   }
   if (doc.is_public) {
     rows.push([
-      "published",
+      "Published",
       <span className="text-foreground break-all">
         /p/{doc.public_slug}
       </span>,

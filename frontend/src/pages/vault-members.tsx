@@ -134,7 +134,7 @@ export default function VaultMembersPage() {
           className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name}
+          Back to {name}
         </Link>
         {info?.role && (
           info.role_source === "public" ? (
@@ -145,7 +145,7 @@ export default function VaultMembersPage() {
             >
               <Badge variant="info">
                 <Globe className="h-3 w-3" aria-hidden />
-                PUBLIC
+                Public
               </Badge>
               <RoleBadge role={info.role} />
             </div>
@@ -156,10 +156,10 @@ export default function VaultMembersPage() {
       </div>
 
       <div className="coord mb-3">
-        VAULT · {name} · MEMBERS
+        Vault · <span className="font-mono">{name}</span> · Members
       </div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
-        Members<span className="text-accent">.</span>
+        Members
       </h1>
       <p className="text-sm leading-relaxed text-foreground-muted mb-10 max-w-prose">
         Who can read or write to this vault. The owner holds the keys; admins can
@@ -170,7 +170,7 @@ export default function VaultMembersPage() {
       {/* Header with invite button */}
       <header className="flex items-baseline justify-between gap-3 pb-3 border-b border-border mb-0">
         <div className="flex items-baseline gap-3">
-          <span className="coord-ink">§ ROSTER</span>
+          <span className="coord-ink">Roster</span>
           <span className="coord tabular-nums">
             [{members ? members.length : "··"}]
           </span>
@@ -195,7 +195,7 @@ export default function VaultMembersPage() {
           <button
             type="button"
             onClick={handleUndo}
-            className="text-xs font-mono uppercase tracking-wider text-link hover:text-link-hover hover:underline cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="text-xs text-link hover:text-link-hover hover:underline cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             Undo
           </button>
@@ -209,7 +209,7 @@ export default function VaultMembersPage() {
       {error ? (
         <Alert variant="destructive" title="Failed to load members" className="mt-4">{error}</Alert>
       ) : members === null ? (
-        <div className="coord px-3 py-3" role="status" aria-live="polite">— LOADING —</div>
+        <div className="coord px-3 py-3" role="status" aria-live="polite">Loading…</div>
       ) : members.length === 0 ? (
         <EmptyState title="No members on record" description="Even the owner row should appear here — try refreshing." />
       ) : (
@@ -262,7 +262,7 @@ export default function VaultMembersPage() {
                     onClick={() => setPendingTransfer(m)}
                     aria-label={`Transfer ownership to ${m.username}`}
                     title="Transfer ownership"
-                    className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                    className="inline-flex items-center gap-1 px-2 h-7 text-xs text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                   >
                     <Crown className="h-3 w-3" aria-hidden />
                     Transfer
@@ -273,7 +273,7 @@ export default function VaultMembersPage() {
                     type="button"
                     onClick={() => setPendingRevoke(m)}
                     aria-label={`Revoke ${m.username}`}
-                    className="inline-flex items-center gap-1 px-2 h-7 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                    className="inline-flex items-center gap-1 px-2 h-7 text-xs text-foreground-muted hover:text-destructive transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                   >
                     <Trash2 className="h-3 w-3" aria-hidden />
                     Revoke
@@ -291,7 +291,7 @@ export default function VaultMembersPage() {
       {!canManage && members && (
         <p className="coord mt-6 flex items-center gap-2">
           <UserCog className="h-3 w-3" aria-hidden />
-          ROSTER IS READ-ONLY · YOUR ROLE IS {info?.role || "—"}
+          Roster is read-only · your role is {info?.role || "—"}
         </p>
       )}
 

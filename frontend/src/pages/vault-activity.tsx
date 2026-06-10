@@ -57,13 +57,13 @@ export default function VaultActivityPage() {
           className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name}
+          Back to {name}
         </Link>
       </div>
 
-      <div className="coord mb-3">VAULT · {name} · ACTIVITY</div>
+      <div className="coord mb-3">Vault · {name} · Activity</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
-        Activity<span className="text-accent">.</span>
+        Activity
       </h1>
       <p className="text-sm leading-relaxed text-foreground-muted mb-10 max-w-prose">
         Every commit landed in this vault. Filter by who made it — agents and humans
@@ -97,7 +97,7 @@ export default function VaultActivityPage() {
         </div>
         {authorChips.length > 0 && !author && (
           <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="coord">QUICK</span>
+            <span className="coord">Quick</span>
             {authorChips.map(([a, n]) => (
               <button
                 key={a}
@@ -117,7 +117,7 @@ export default function VaultActivityPage() {
       {error ? (
         <Alert variant="destructive" title="Failed to load" className="mt-4">{error}</Alert>
       ) : entries === null || (loading && entries.length === 0) ? (
-        <div className="coord px-3 py-8" role="status" aria-live="polite">— LOADING —</div>
+        <div className="coord px-3 py-8" role="status" aria-live="polite">Loading…</div>
       ) : entries.length === 0 ? (
         <EmptyState
           title={author ? `No commits by "${author}"` : "No activity yet"}
@@ -183,7 +183,7 @@ export default function VaultActivityPage() {
 
       {entries && entries.length === PAGE_SIZE && (
         <p className="coord mt-4">
-          SHOWING LAST {PAGE_SIZE} ENTRIES · USE FILTER TO NARROW
+          Showing last {PAGE_SIZE} entries · use filter to narrow
         </p>
       )}
     </div>

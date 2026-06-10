@@ -128,8 +128,8 @@ export default function AuthPage() {
         <section className="hidden lg:flex flex-col gap-8 pr-4">
           <Logo size={42} subtitle />
           <div>
-            <h1 className="font-display text-5xl leading-[1.05] tracking-tight text-foreground">
-              The base your<br />agents <span className="text-primary">remember.</span>
+            <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground">
+              The base your<br />agents remember.
             </h1>
             <p className="mt-5 text-[15px] leading-relaxed text-foreground-muted max-w-md">
               A unified knowledge base for AI agents — documents, tables, and files

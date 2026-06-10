@@ -32,14 +32,14 @@ export function CodeSnippet({
   return (
     <div className={cn("rounded-[var(--radius-md)] border border-border overflow-hidden", className)}>
       <div className="flex items-center justify-between gap-2 border-b border-border bg-surface-2 px-2 py-1">
-        <span className="font-mono text-[9px] uppercase tracking-wider text-foreground-muted truncate">
+        <span className="font-mono text-[11px] text-foreground-muted truncate">
           {filename || "snippet"}
         </span>
         <button
           onClick={copy}
           aria-label={copied ? "Snippet copied" : "Copy snippet"}
           className={cn(
-            "inline-flex items-center gap-1 font-mono text-[9px] uppercase tracking-wider cursor-pointer shrink-0 transition-colors rounded-[var(--radius-sm)]",
+            "inline-flex items-center gap-1 text-[11px] font-medium cursor-pointer shrink-0 transition-colors rounded-[var(--radius-sm)]",
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-2",
             copied ? "text-success" : "text-foreground-muted hover:text-primary",
           )}

@@ -128,14 +128,14 @@ export default function VaultSettingsPage() {
           className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK TO {name}
+          Back to {name}
         </Link>
         {info?.role && <RoleBadge role={info.role} />}
       </div>
 
-      <div className="coord mb-3">VAULT · {name} · SETTINGS</div>
+      <div className="coord mb-3">Vault · <span className="font-mono">{name}</span> · Settings</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
-        Settings<span className="text-accent">.</span>
+        Settings
       </h1>
       <p className="text-sm leading-relaxed text-foreground-muted mb-2 max-w-prose">
         Vault metadata, public access, and lifecycle controls.
@@ -157,12 +157,12 @@ export default function VaultSettingsPage() {
       {/* § METADATA */}
       <section className="mb-12" aria-labelledby="meta-h">
         <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-          <span id="meta-h" className="coord-ink">§ METADATA</span>
+          <span id="meta-h" className="coord-ink">Metadata</span>
         </header>
 
         <div className="space-y-5">
           <div>
-            <Label className="coord-ink mb-1.5 block">NAME</Label>
+            <Label className="coord-ink mb-1.5 block">Name</Label>
             <Input value={name} disabled className="font-mono" />
             <p className="text-xs text-foreground-muted mt-1.5">
               Vault names are immutable. Create a new vault and migrate if you need a rename.
@@ -171,7 +171,7 @@ export default function VaultSettingsPage() {
 
           <div>
             <Label htmlFor="vault-description" className="coord-ink mb-1.5 block">
-              DESCRIPTION
+              Description
             </Label>
             <Textarea
               id="vault-description"
@@ -189,7 +189,7 @@ export default function VaultSettingsPage() {
           )}
 
           <div>
-            <Label id="public-access-label" className="coord-ink mb-1.5 block">PUBLIC ACCESS</Label>
+            <Label id="public-access-label" className="coord-ink mb-1.5 block">Public access</Label>
             <div
               role="group"
               aria-labelledby="public-access-label"
@@ -205,7 +205,7 @@ export default function VaultSettingsPage() {
                     onClick={() => canEdit && !saving && setPublicAccess(v)}
                     aria-pressed={active}
                     disabled={!canEdit || saving}
-                    className={`px-3 py-2 text-sm font-mono uppercase tracking-wider transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50 disabled:cursor-not-allowed ${
+                    className={`px-3 py-2 text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:opacity-50 disabled:cursor-not-allowed ${
                       active
                         ? "bg-surface-selected text-surface-selected-foreground"
                         : "bg-surface text-foreground hover:bg-surface-hover cursor-pointer"
@@ -238,10 +238,10 @@ export default function VaultSettingsPage() {
                 {saving ? "Saving…" : "Save changes"}
               </Button>
               <span role="status" aria-live="polite">
-                {savedAt && <span className="coord-spark fade-in">SAVED</span>}
+                {savedAt && <span className="coord-spark fade-in">Saved</span>}
               </span>
               {dirty && !savedAt && !saving && (
-                <span className="coord">UNSAVED CHANGES</span>
+                <span className="coord">Unsaved changes</span>
               )}
             </div>
           )}
@@ -252,7 +252,7 @@ export default function VaultSettingsPage() {
       {canEdit && (
         <section aria-labelledby="lifecycle-h">
           <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-            <span id="lifecycle-h" className="coord-ink">§ LIFECYCLE</span>
+            <span id="lifecycle-h" className="coord-ink">Lifecycle</span>
           </header>
 
           <div className="space-y-5">
@@ -309,7 +309,7 @@ export default function VaultSettingsPage() {
         <section aria-labelledby="danger-h" className="mt-12">
           <header className="flex items-baseline gap-3 pb-3 border-b border-destructive mb-4">
             <span id="danger-h" className="coord-spark text-destructive">
-              § DANGER ZONE
+              Danger zone
             </span>
           </header>
 
@@ -343,12 +343,12 @@ export default function VaultSettingsPage() {
       {vaultHealth && (
         <section aria-labelledby="diag-h" className="mt-12">
           <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
-            <span id="diag-h" className="coord-ink">§ DIAGNOSTICS</span>
+            <span id="diag-h" className="coord-ink">Diagnostics</span>
             <span className="coord">indexing pipeline</span>
           </header>
           <div className="grid grid-cols-2 gap-px rounded-[var(--radius-lg)] overflow-hidden border border-border bg-border shadow-sm">
-            <DiagCell title="INDEXING" stats={vaultHealth.vector_store?.backfill?.upsert} />
-            <DiagCell title="METADATA" stats={vaultHealth.metadata_backfill} />
+            <DiagCell title="Indexing" stats={vaultHealth.vector_store?.backfill?.upsert} />
+            <DiagCell title="Metadata" stats={vaultHealth.metadata_backfill} />
           </div>
           <p className="text-xs text-foreground-muted mt-2 leading-relaxed max-w-prose">
             Backfill workers process new chunks asynchronously after a write.

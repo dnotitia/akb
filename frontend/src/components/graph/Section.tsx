@@ -12,7 +12,7 @@ export function Section({ label, rightAction, children, className }: Props) {
   return (
     <section className={cn("border-b border-border py-3", className)}>
       <div className="flex items-center justify-between mb-2">
-        <span className="coord">§ {label}</span>
+        <span className="coord">{label}</span>
         {rightAction}
       </div>
       {children}

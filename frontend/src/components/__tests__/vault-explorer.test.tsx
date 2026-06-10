@@ -152,14 +152,14 @@ describe("VaultExplorer — role gating", () => {
   it("renders the bottom-of-section '+ NEW COLLECTION' for writer role", async () => {
     vaultInfoMock.mockResolvedValue({ role: "writer" });
     renderAt("/vault/v");
-    expect(await screen.findByText(/\+ NEW COLLECTION/)).toBeInTheDocument();
+    expect(await screen.findByText(/\+ New collection/i)).toBeInTheDocument();
   });
 
   it("hides the bottom-of-section '+ NEW COLLECTION' for reader role", async () => {
     vaultInfoMock.mockResolvedValue({ role: "reader" });
     renderAt("/vault/v");
     await screen.findByRole("button", { name: /architecture/ });
-    expect(screen.queryByText(/\+ NEW COLLECTION/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\+ New collection/i)).not.toBeInTheDocument();
   });
 
   it("renders the per-collection-row '+ sub-collection' button for writer role", async () => {
@@ -196,6 +196,6 @@ describe("VaultExplorer — error & empty", () => {
   it("shows EMPTY when the vault has no items", async () => {
     browseMock.mockResolvedValueOnce({ vault: "v", path: "", items: [] });
     renderAt("/vault/v");
-    expect(await screen.findByText(/— EMPTY —/)).toBeInTheDocument();
+    expect(await screen.findByText(/— Empty —/i)).toBeInTheDocument();
   });
 });

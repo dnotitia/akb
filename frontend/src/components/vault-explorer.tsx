@@ -258,7 +258,7 @@ export function VaultExplorer({
             className="inline-flex items-center gap-1 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <Network className="h-3 w-3" aria-hidden />
-            GRAPH
+            Graph
           </Link>
         </div>
       </header>
@@ -281,13 +281,13 @@ export function VaultExplorer({
         onKeyDown={onKeyDown}
         className="flex-1 overflow-y-auto"
       >
-        {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— LOADING —</div>}
+        {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— Loading —</div>}
         {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
         {!loading && !error && total === 0 && (
-          <div className="coord px-3 py-3" role="status">— EMPTY —</div>
+          <div className="coord px-3 py-3" role="status">— Empty —</div>
         )}
         {!loading && !error && total > 0 && visibleRows.length === 0 && filter && (
-          <div className="coord px-3 py-1.5" role="status">— NO MATCHES —</div>
+          <div className="coord px-3 py-1.5" role="status">— No matches —</div>
         )}
 
         {!loading && !error &&
@@ -337,7 +337,7 @@ export function VaultExplorer({
               onClick={() => setUncapped(true)}
               className="w-full coord px-3 py-2 text-left hover:bg-surface-hover hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
             >
-              ↓ SHOW {fullRows.length - visibleRows.length} MORE
+              ↓ Show {fullRows.length - visibleRows.length} more
             </button>
           )}
 
@@ -351,7 +351,7 @@ export function VaultExplorer({
             className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <FolderPlus className="h-3 w-3" aria-hidden />
-            <span className="coord">+ NEW COLLECTION</span>
+            <span className="coord">+ New collection</span>
           </button>
         )}
       </div>

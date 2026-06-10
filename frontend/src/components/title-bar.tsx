@@ -35,7 +35,7 @@ export function TitleBar({
     <div
       className={cn(
         "flex items-center gap-2.5 h-10 px-3 border-b border-border bg-surface/80 backdrop-blur",
-        "text-[11px] uppercase tracking-wider font-medium text-foreground-muted",
+        "text-xs font-medium text-foreground-muted",
         className,
       )}
     >
@@ -105,10 +105,10 @@ interface VaultActionsProps {
 
 export function VaultActions({ vault, page }: VaultActionsProps) {
   const actions: Array<[VaultPageKind, string, string, React.ComponentType<any>]> = [
-    ["overview", "OVERVIEW", `/vault/${vault}`, Compass],
-    ["search", "SEARCH", `/vault/${vault}/search`, SearchIcon],
-    ["graph", "GRAPH", `/vault/${vault}/graph`, GitGraph],
-    ["publish", "PUBLISH", `/vault/${vault}/publications`, Share2],
+    ["overview", "Overview", `/vault/${vault}`, Compass],
+    ["search", "Search", `/vault/${vault}/search`, SearchIcon],
+    ["graph", "Graph", `/vault/${vault}/graph`, GitGraph],
+    ["publish", "Publish", `/vault/${vault}/publications`, Share2],
   ];
   return (
     <div className="flex items-center gap-1">

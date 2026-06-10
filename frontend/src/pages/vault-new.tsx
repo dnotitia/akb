@@ -92,15 +92,14 @@ export default function VaultNewPage() {
   return (
     <div className="max-w-3xl mx-auto fade-up">
       <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord mb-6">
-        <Link to="/" className="hover:text-link">HOME</Link>
+        <Link to="/" className="hover:text-link">Home</Link>
         <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-        <span className="text-foreground">NEW VAULT</span>
+        <span className="text-foreground">New vault</span>
       </nav>
 
       <header className="mb-6">
-        <div className="coord-spark mb-2">§ NEW VAULT</div>
         <h1 className="font-display text-3xl tracking-tight text-foreground">
-          Create a vault<span className="text-accent">.</span>
+          Create a vault
         </h1>
         <p className="mt-3 text-sm text-foreground-muted max-w-prose">
           A vault is a Git-backed knowledge root. Documents, tables, and files live
@@ -134,7 +133,7 @@ export default function VaultNewPage() {
             aria-describedby={error ? "vault-form-error vault-name-hint" : "vault-name-hint"}
           />
           <div id="vault-name-hint" className="coord">
-            LOWERCASE LETTERS, DIGITS, HYPHENS · BECOMES /vault/&lt;name&gt;
+            Lowercase letters, digits, hyphens · becomes /vault/&lt;name&gt;
           </div>
         </div>
 

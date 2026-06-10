@@ -130,7 +130,7 @@ export function InviteMemberDialog({
           {/* User search */}
           <div className="space-y-1.5">
             <Label htmlFor="invite-search" className="coord-ink">
-              USER
+              User
             </Label>
             <div className="relative">
               <Search
@@ -150,9 +150,9 @@ export function InviteMemberDialog({
 
             <div className="border border-border max-h-[min(14rem,30vh)] overflow-y-auto rail-scroll">
               {searching && hits.length === 0 ? (
-                <div className="coord px-3 py-2" role="status" aria-live="polite">— SEARCHING —</div>
+                <div className="coord px-3 py-2" role="status" aria-live="polite">Searching…</div>
               ) : hits.length === 0 ? (
-                <div className="coord px-3 py-2" role="status">— NO MATCHES —</div>
+                <div className="coord px-3 py-2" role="status">No matches</div>
               ) : (
                 <ul role="listbox" aria-label="Search results" className="divide-y divide-border">
                   {hits.map((u) => {
@@ -190,7 +190,7 @@ export function InviteMemberDialog({
 
           {/* Role picker */}
           <div className="space-y-1.5">
-            <Label className="coord-ink">ROLE</Label>
+            <Label className="coord-ink">Role</Label>
             <div className="grid grid-cols-3 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
               {(["reader", "writer", "admin"] as Role[]).map((r) => {
                 const active = role === r;
@@ -200,7 +200,7 @@ export function InviteMemberDialog({
                     type="button"
                     onClick={() => setRole(r)}
                     aria-pressed={active}
-                    className={`px-3 py-2 text-sm font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
+                    className={`px-3 py-2 text-sm font-medium transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                       active
                         ? "bg-surface-selected text-surface-selected-foreground"
                         : "bg-surface text-foreground hover:bg-surface-hover"

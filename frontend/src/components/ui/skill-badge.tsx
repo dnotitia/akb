@@ -22,7 +22,7 @@ export function SkillBadge({
   return (
     <Badge variant={defined ? "info" : "outline"} aria-label={defaultLabel} {...props}>
       <Sparkles className="h-3 w-3" aria-hidden />
-      GUIDE
+      Guide
       {defined && lineCount != null && ` ✓ ${lineCount}L`}
       {!defined && " ✗"}
       {children}

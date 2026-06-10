@@ -68,11 +68,11 @@ export function TableViewer({ slug, initialData }: Props) {
       {/* Left rail */}
       <aside className="lg:sticky lg:top-8 lg:self-start space-y-5">
         <div>
-          <div className="coord mb-1">TYPE</div>
+          <div className="coord mb-1">Type</div>
           <div className="text-sm font-medium">table query</div>
         </div>
         <div>
-          <div className="coord mb-1">MODE</div>
+          <div className="coord mb-1">Mode</div>
           <div className="text-sm font-medium flex items-center gap-1">
             {data.mode === "snapshot" ? (
               <>
@@ -91,13 +91,13 @@ export function TableViewer({ slug, initialData }: Props) {
           )}
         </div>
         <div>
-          <div className="coord mb-1">ROWS</div>
+          <div className="coord mb-1">Rows</div>
           <div className="font-display-tight text-3xl text-foreground">
             {String(total).padStart(2, "0")}
           </div>
         </div>
         <div>
-          <div className="coord mb-1">COLUMNS</div>
+          <div className="coord mb-1">Columns</div>
           <div className="font-display-tight text-3xl text-foreground">
             {String(cols.length).padStart(2, "0")}
           </div>
@@ -108,14 +108,14 @@ export function TableViewer({ slug, initialData }: Props) {
             download
             className="block coord hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↓ DOWNLOAD CSV
+            ↓ Download CSV
           </a>
           <button
             onClick={reload}
             disabled={loading}
             className="block coord hover:text-link text-left disabled:opacity-50 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            {loading ? "↻ LOADING…" : "↻ REFRESH"}
+            {loading ? "↻ Loading…" : "↻ Refresh"}
           </button>
           <span className="sr-only" role="status" aria-live="polite">{loading ? "Loading results" : ""}</span>
         </div>
@@ -123,15 +123,15 @@ export function TableViewer({ slug, initialData }: Props) {
 
       {/* Main column */}
       <div className="min-w-0">
-        <div className="coord-spark mb-4">§ TABLE QUERY</div>
-        <h1 className="font-display-tight text-5xl lg:text-7xl text-foreground leading-[0.95] tracking-tight mb-8">
+        <div className="coord-spark mb-4">Table query</div>
+        <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-8">
           {data.title || "Query results"}
         </h1>
 
         {hasParams && (
           <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm mb-6">
             <div className="border-b border-border bg-surface-2 px-4 py-2 flex items-baseline justify-between">
-              <span className="coord-ink">§ PARAMETERS</span>
+              <span className="coord-ink">Parameters</span>
               <span className="coord">[{Object.keys(paramDefs).length}]</span>
             </div>
             <form

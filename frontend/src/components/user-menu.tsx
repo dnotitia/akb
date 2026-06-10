@@ -63,7 +63,7 @@ export function UserMenu() {
         >
           {initial}
         </span>
-        <span className="hidden sm:inline font-mono text-[11px] uppercase tracking-wider">
+        <span className="hidden sm:inline text-[13px] font-medium">
           {label}
         </span>
       </DropdownMenu.Trigger>
@@ -75,7 +75,7 @@ export function UserMenu() {
         >
           {/* Identity header */}
           <div className="px-3 py-2 border-b border-border mb-1">
-            <div className="coord">ACCOUNT</div>
+            <div className="coord">Account</div>
             <div title={label} className="text-sm font-medium text-foreground truncate mt-0.5">
               {label}
             </div>
@@ -85,7 +85,7 @@ export function UserMenu() {
               </div>
             )}
             {user?.is_admin && (
-              <div className="coord-spark mt-1">⊛ ADMIN</div>
+              <div className="coord-spark mt-1">Admin</div>
             )}
           </div>
 

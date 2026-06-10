@@ -73,7 +73,7 @@ export default function TablePage() {
   return (
     <div className="min-w-0 fade-up max-w-[1280px] mx-auto">
       <div className="coord mb-3">
-        VAULT · {vault} · TABLE · {table}
+        Vault · {vault} · Table · {table}
       </div>
 
       <header className="flex items-baseline justify-between flex-wrap gap-x-4 gap-y-2 pb-3 border-b border-border">
@@ -105,7 +105,7 @@ export default function TablePage() {
       {info?.columns && info.columns.length > 0 && (
         <section className="mt-6" aria-labelledby="schema-heading">
           <div className="flex items-baseline gap-3 mb-2">
-            <span id="schema-heading" className="coord-ink">§ SCHEMA</span>
+            <span id="schema-heading" className="coord-ink">Schema</span>
             <span className="coord tabular-nums">[{info.columns.length}]</span>
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono">
@@ -132,9 +132,9 @@ export default function TablePage() {
       {/* Rows preview */}
       <section className="mt-6" aria-labelledby="preview-heading">
         <div className="flex items-baseline gap-3 mb-2">
-          <span id="preview-heading" className="coord-ink">§ PREVIEW</span>
+          <span id="preview-heading" className="coord-ink">Preview</span>
           <span className="coord tabular-nums">
-            {total} ROW{total === 1 ? "" : "S"}
+            {total} row{total === 1 ? "" : "s"}
             {info?.row_count && info.row_count > total ? ` of ${info.row_count}` : ""}
           </span>
         </div>

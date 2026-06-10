@@ -80,7 +80,7 @@ export default function FilePage() {
   return (
     <div className="min-w-0 fade-up max-w-[1280px] mx-auto">
       <div className="coord mb-3">
-        VAULT · {vault} · FILE · {info?.name || fileId}
+        Vault · <span className="font-mono">{vault}</span> · File · <span className="font-mono">{info?.name || fileId}</span>
       </div>
 
       <header className="flex items-baseline justify-between flex-wrap gap-x-4 gap-y-2 pb-3 border-b border-border">

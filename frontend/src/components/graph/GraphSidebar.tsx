@@ -123,7 +123,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
     >
       {onCollapse && (
         <div className="flex items-center justify-between h-9 px-2 border-b border-border shrink-0">
-          <span className="coord text-foreground-muted">GRAPH</span>
+          <span className="coord text-foreground-muted">Graph</span>
           <button
             type="button"
             onClick={onCollapse}
@@ -136,7 +136,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         </div>
       )}
 
-      <Section label="ENTRY POINT" className="px-2">
+      <Section label="Entry point" className="px-2">
         <div className="relative">
           <SearchIcon className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-foreground-muted pointer-events-none" />
           <input
@@ -179,7 +179,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
       </Section>
 
-      <Section label="HOPS" className="px-2">
+      <Section label="Hops" className="px-2">
         <div
           className={cn(
             "flex items-center gap-3 text-[11px]",
@@ -214,7 +214,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
       </Section>
 
-      <Section label="TYPES" className="px-2">
+      <Section label="Types" className="px-2">
         <div className="flex flex-wrap gap-1">
           {ALL_NODE_KINDS.map((k) => (
             <button
@@ -224,7 +224,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold",
+                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold",
                 view.types.has(k)
                   ? "border-primary bg-surface-selected text-surface-selected-foreground"
                   : "border-border text-foreground-muted hover:bg-surface-hover",
@@ -236,7 +236,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         </div>
       </Section>
 
-      <Section label="RELATIONS" className="px-2">
+      <Section label="Relations" className="px-2">
         <div className="grid grid-cols-2 gap-1">
           {ALL_RELATIONS.map((r) => (
             <button
@@ -246,7 +246,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               aria-label={`Toggle ${r}`}
               aria-pressed={view.relations.has(r)}
               className={cn(
-                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] uppercase tracking-[0.1em] font-semibold text-left",
+                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold text-left",
                 view.relations.has(r)
                   ? "border-primary bg-surface-selected text-surface-selected-foreground"
                   : "border-border text-foreground-muted hover:bg-surface-hover",
@@ -259,7 +259,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
       </Section>
 
       <Section
-        label="RECENT"
+        label="Recent"
         className="px-2"
         rightAction={
           recent.length > 0 ? (
@@ -290,7 +290,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
       </Section>
 
       <Section
-        label="SAVED VIEWS"
+        label="Saved views"
         className="px-2"
         rightAction={
           <button

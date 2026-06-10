@@ -18,7 +18,7 @@ export function StatTile({
   pad?: boolean;
   className?: string;
 }) {
-  const display = typeof value === "number" ? String(value).padStart(2, "0") : value;
+  const display = String(value);
   return (
     <div
       className={cn(
@@ -27,7 +27,7 @@ export function StatTile({
         className,
       )}
     >
-      <Eyebrow className="mb-1.5 block">{label.toUpperCase()}</Eyebrow>
+      <Eyebrow className="mb-1.5 block">{label}</Eyebrow>
       <div className="font-display text-[30px] leading-none tabular-nums text-foreground mb-1.5">
         {display}
       </div>

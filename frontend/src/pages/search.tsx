@@ -251,10 +251,9 @@ export default function SearchPage() {
                 ? `No results for ${q}`
                 : `${resultCount} results for ${q}`}
       </p>
-      <div className="coord-spark mb-3">§ SEARCH</div>
+      <div className="coord-spark mb-3">Search</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-6">
         {scopedVault ? scopedVault : "Query the base"}
-        <span className="text-accent">.</span>
       </h1>
 
       {/* Doc-type filter chips — client-side filter on doc_type field of
@@ -269,13 +268,13 @@ export default function SearchPage() {
           aria-pressed={allTypesActive}
           onClick={() => setActiveTypes(new Set(ALL_TYPES))}
           className={cn(
-            "px-2 h-7 rounded-[var(--radius-md)] border font-mono text-xs uppercase tracking-[0.12em] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             allTypesActive
               ? "border-transparent bg-surface-selected text-surface-selected-foreground"
               : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
           )}
         >
-          ALL
+          All
         </button>
         {ALL_TYPES.map((t) => (
           <button
@@ -285,7 +284,7 @@ export default function SearchPage() {
             aria-pressed={activeTypes.has(t)}
             onClick={() => toggleType(t)}
             className={cn(
-              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border font-mono text-xs uppercase tracking-[0.12em] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
               activeTypes.has(t)
                 ? "border-transparent bg-surface-selected text-surface-selected-foreground"
                 : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
@@ -371,7 +370,7 @@ export default function SearchPage() {
 
       {scopedVault && (
         <div className="flex items-center gap-3 text-xs mb-6">
-          <span className="coord">SCOPE</span>
+          <span className="coord">Scope</span>
           <span className="font-mono text-foreground">{scopedVault}</span>
           <Link
             to={`/search${q ? `?q=${encodeURIComponent(q)}${mode !== "dense" ? `&mode=${mode}` : ""}` : ""}`}
@@ -521,7 +520,7 @@ export default function SearchPage() {
       {mode === "literal" && literalResults.length > 0 && (
         <section className="rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm mt-6" aria-label="Literal results">
           <header className="border-b border-border px-4 py-2 flex items-baseline justify-between gap-3 flex-wrap">
-            <span className="coord-ink">§ RESULTS · LITERAL</span>
+            <span className="coord-ink">Results · Literal</span>
             <span className="coord tabular-nums">
               {returnedDocs !== total || returnedMatches !== totalMatches
                 ? `[${returnedDocs} of ${total} docs · ${returnedMatches} of ${totalMatches} matches]`

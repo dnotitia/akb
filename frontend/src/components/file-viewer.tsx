@@ -31,11 +31,11 @@ export function FileViewer({ slug, data }: Props) {
       {/* Left rail */}
       <aside className="lg:sticky lg:top-8 lg:self-start space-y-5">
         <div>
-          <div className="coord mb-1">TYPE</div>
+          <div className="coord mb-1">Type</div>
           <div className="text-sm font-medium">file</div>
         </div>
         <div>
-          <div className="coord mb-1">FORMAT</div>
+          <div className="coord mb-1">Format</div>
           <div className="text-sm font-medium font-mono break-all">
             {kind.toUpperCase()}
           </div>
@@ -43,15 +43,15 @@ export function FileViewer({ slug, data }: Props) {
         </div>
         {data.size_bytes !== undefined && (
           <div>
-            <div className="coord mb-1">SIZE</div>
-            <div className="font-display-tight text-2xl text-foreground">
+            <div className="coord mb-1">Size</div>
+            <div className="font-display text-2xl font-semibold tracking-tight text-foreground">
               {formatSize(data.size_bytes)}
             </div>
           </div>
         )}
         {data.collection && (
           <div>
-            <div className="coord mb-1">COLLECTION</div>
+            <div className="coord mb-1">Collection</div>
             <div className="text-sm font-medium font-mono break-all">{data.collection}</div>
           </div>
         )}
@@ -61,15 +61,15 @@ export function FileViewer({ slug, data }: Props) {
             download={data.name}
             className="inline-block coord-spark underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↓ DOWNLOAD ORIGINAL
+            ↓ Download original
           </a>
         </div>
       </aside>
 
       {/* Main column */}
       <div className="min-w-0">
-        <div className="coord-spark mb-4">§ FILE · {kind.toUpperCase()}</div>
-        <h1 className="font-display-tight text-5xl lg:text-6xl text-foreground leading-[0.95] tracking-tight mb-2 break-words">
+        <div className="coord-spark mb-4">File · {kind.toUpperCase()}</div>
+        <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-2 break-words">
           {data.title || data.name}
         </h1>
         {data.title && data.name && data.title !== data.name && (
@@ -79,7 +79,7 @@ export function FileViewer({ slug, data }: Props) {
         <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm mt-8">
           <div className="border-b border-border bg-surface-2 text-foreground px-3 py-1.5 flex items-center justify-between">
             <span className="coord-ink">
-              ⊞ PREVIEW
+              ⊞ Preview
             </span>
             <span className="coord-ink">
               {kind.toUpperCase()}
@@ -108,7 +108,7 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
   if (!directUrl) {
     return (
       <div className="p-8 text-center">
-        <div className="coord">— NO CONTENT AVAILABLE —</div>
+        <div className="coord">— No content available —</div>
       </div>
     );
   }
@@ -142,7 +142,7 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
 
   return (
     <div className="p-12 text-center">
-      <div className="coord mb-2">— PREVIEW UNAVAILABLE —</div>
+      <div className="coord mb-2">— Preview unavailable —</div>
       <p className="text-sm text-foreground-muted">
         No inline view for <code className="font-mono">{mime || "this format"}</code>.
         Use the download link in the side rail.
@@ -156,7 +156,7 @@ function ImageFileBody({ directUrl, name }: { directUrl: string; name: string })
   if (failed) {
     return (
       <div className="p-12 text-center">
-        <div className="coord mb-2">— PREVIEW FAILED —</div>
+        <div className="coord mb-2">— Preview failed —</div>
         <p className="text-sm text-foreground-muted">
           The image couldn't be loaded (the link may have expired). Use the download link in the side rail.
         </p>

@@ -150,9 +150,9 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
             type="button"
             onClick={copyRaw}
             aria-label={copiedRaw ? "Markdown copied" : "Copy markdown"}
-            className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-link border border-border bg-surface rounded-[var(--radius-sm)] transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-foreground-muted hover:text-link border border-border bg-surface rounded-[var(--radius-sm)] transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            {copiedRaw ? "COPIED" : "COPY"}
+            {copiedRaw ? "Copied" : "Copy"}
           </button>
           <pre
             data-testid="doc-raw"
@@ -176,11 +176,11 @@ interface TabStripProps {
 
 function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
   const tabs: Array<{ key: ViewMode | "extra"; label: string; selected: boolean; onActivate: () => void }> = [
-    { key: "rendered", label: "RENDERED", selected: view === "rendered", onActivate: () => onSelect("rendered") },
-    { key: "raw", label: "RAW", selected: view === "raw", onActivate: () => onSelect("raw") },
+    { key: "rendered", label: "Rendered", selected: view === "rendered", onActivate: () => onSelect("rendered") },
+    { key: "raw", label: "Raw", selected: view === "raw", onActivate: () => onSelect("raw") },
   ];
   if (isSkill) {
-    tabs.push({ key: "agent", label: "AGENT", selected: view === "agent", onActivate: () => onSelect("agent") });
+    tabs.push({ key: "agent", label: "Agent", selected: view === "agent", onActivate: () => onSelect("agent") });
   }
   if (extraTab) {
     tabs.push({ key: "extra", label: extraTab.label, selected: false, onActivate: extraTab.onClick });

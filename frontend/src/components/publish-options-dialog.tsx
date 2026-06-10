@@ -122,13 +122,13 @@ export function PublishOptionsDialog({
               />
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium">Require password</div>
-                <div className="coord">VIEWERS MUST ENTER THIS BEFORE READING</div>
+                <div className="coord">Viewers must enter this before reading</div>
               </div>
             </label>
             {requirePassword && (
               <div className="mt-3">
                 <Label htmlFor="pub-pw" className="coord-ink mb-1.5 block">
-                  PUBLICATION PASSWORD
+                  Publication password
                 </Label>
                 <div className="relative">
                   <Input
@@ -156,7 +156,7 @@ export function PublishOptionsDialog({
                   </button>
                 </div>
                 {pwTooShort && (
-                  <p id="pub-pw-help" className="text-destructive text-xs font-mono mt-1">
+                  <p id="pub-pw-help" className="text-destructive text-xs mt-1">
                     Use at least 8 characters.
                   </p>
                 )}
@@ -166,7 +166,7 @@ export function PublishOptionsDialog({
 
           {/* Expiry */}
           <div>
-            <Label className="coord-ink mb-1.5 block">EXPIRES</Label>
+            <Label className="coord-ink mb-1.5 block">Expires</Label>
             <div className="grid grid-cols-5 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
               {EXPIRY_PRESETS.map((p) => {
                 const active = expiresIn === p.value;
@@ -176,7 +176,7 @@ export function PublishOptionsDialog({
                     type="button"
                     onClick={() => setExpiresIn(p.value)}
                     aria-pressed={active}
-                    className={`px-2 py-2 text-xs font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
+                    className={`px-2 py-2 text-xs font-medium transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                       active
                         ? "bg-primary text-primary-foreground"
                         : "bg-surface text-foreground hover:bg-surface-hover"
@@ -195,7 +195,7 @@ export function PublishOptionsDialog({
           {/* Max views */}
           <div>
             <Label htmlFor="pub-max" className="coord-ink mb-1.5 block">
-              MAX VIEWS
+              Max views
             </Label>
             <Input
               id="pub-max"

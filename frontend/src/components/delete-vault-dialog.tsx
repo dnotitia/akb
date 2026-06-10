@@ -83,7 +83,7 @@ export function DeleteVaultDialog({
 
           <div>
             <Label htmlFor="confirm-name" className="coord-ink mb-1.5 block">
-              TYPE THE VAULT NAME TO CONFIRM
+              Type the vault name to confirm
             </Label>
             <Input
               id="confirm-name"

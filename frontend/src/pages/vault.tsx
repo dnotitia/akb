@@ -141,14 +141,14 @@ export default function VaultPage() {
           Couldn't load this vault's overview. Reload the page to retry.
         </Alert>
       )}
-      {/* Mono meta line (.coord already uppercases — no JS .toUpperCase()) */}
+      {/* Meta line — only the URI stays mono */}
       <div className="coord mb-3">
-        VAULT · {name} · akb://{name}
+        Vault · {name} · <span className="font-mono">akb://{name}</span>
       </div>
 
       {/* Display title */}
-      <h1 className="font-display text-[44px] leading-[1.0] tracking-tight text-foreground mb-3">
-        {name}<span className="text-accent">.</span>
+      <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3">
+        {name}
       </h1>
 
       {info?.description && (
@@ -178,7 +178,7 @@ export default function VaultPage() {
               className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               <FilePlus className="h-3 w-3 self-center" aria-hidden />
-              NEW DOC
+              New doc
             </Link>
           )}
           <Link
@@ -186,7 +186,7 @@ export default function VaultPage() {
             className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <Users className="h-3 w-3 self-center" aria-hidden />
-            MEMBERS
+            Members
             {info?.member_count !== undefined && (
               <span className="tabular-nums">[{info.member_count}]</span>
             )}
@@ -197,7 +197,7 @@ export default function VaultPage() {
               className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               <SettingsIcon className="h-3 w-3 self-center" aria-hidden />
-              SETTINGS
+              Settings
             </Link>
           )}
         </div>
@@ -208,10 +208,10 @@ export default function VaultPage() {
         {counts &&
           (
             [
-              ["collections", counts.collections, "dirs"],
-              ["documents", counts.documents, "md"],
-              ["tables", counts.tables, "rows"],
-              ["files", counts.files, "bytes"],
+              ["Collections", counts.collections, "dirs"],
+              ["Documents", counts.documents, "md"],
+              ["Tables", counts.tables, "rows"],
+              ["Files", counts.files, "bytes"],
             ] as Array<[string, number, string]>
           ).map(([label, value, kind]) => (
             <StatTile key={label} label={label} value={value} kind={kind} />
@@ -221,7 +221,7 @@ export default function VaultPage() {
       {/* Recent writes — primary */}
       <section className="mt-10" aria-labelledby="recent-heading">
         <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-          <span id="recent-heading" className="coord-ink">§ RECENT</span>
+          <span id="recent-heading" className="coord-ink">Recent</span>
           <span className="coord tabular-nums">[{recent.length}]</span>
         </div>
 
@@ -281,17 +281,17 @@ export default function VaultPage() {
             ) : (
               <ChevronRight className="h-3 w-3" aria-hidden />
             )}
-            <span id="commit-log-heading" className="coord-ink">§ COMMIT LOG</span>
+            <span id="commit-log-heading" className="coord-ink">Commit log</span>
             {commitsLoaded && (
               <span className="coord tabular-nums">[{activity.length}]</span>
             )}
-            <span className="coord ml-auto">HEAD · MAIN</span>
+            <span className="coord ml-auto">Head · main</span>
           </button>
           <Link
             to={`/vault/${name}/activity`}
             className="coord shrink-0 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↗ FULL ACTIVITY
+            ↗ Full activity
           </Link>
         </div>
 
@@ -301,9 +301,9 @@ export default function VaultPage() {
             className="mt-2 rounded-[var(--radius-lg)] border border-border bg-surface p-3 overflow-x-auto shadow-sm"
           >
             {!commitsLoaded ? (
-              <div className="coord" role="status" aria-live="polite">LOADING…</div>
+              <div className="coord" role="status" aria-live="polite">Loading…</div>
             ) : activity.length === 0 ? (
-              <div className="coord" role="status">NO COMMITS</div>
+              <div className="coord" role="status">No commits</div>
             ) : (
               <ol className="font-mono text-[11px] leading-[1.9]">
                 {activity.map((c, i) => {

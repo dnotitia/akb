@@ -10,7 +10,7 @@ export default function NotFoundPage() {
   return (
     <div className="mx-auto flex max-w-[640px] flex-col items-center px-6 py-24 text-center">
       <p className="coord mb-3">404 · not found</p>
-      <h1 className="font-display text-[40px] leading-[1.1] text-foreground mb-3">
+      <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3">
         Page not found
       </h1>
       <p className="text-foreground-muted mb-8">

@@ -71,7 +71,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
       {/* VAULTS header + filter */}
       <div className="px-2 pt-3 pb-1 shrink-0">
         <div className="px-2 pb-1.5 flex items-center justify-between">
-          <span className="coord">VAULTS</span>
+          <span className="coord">Vaults</span>
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -115,7 +115,7 @@ export function VaultNav({ current, onRefetchReady, onCurrentVaultClick, treeOpe
       <div className="px-2 pb-2 overflow-y-auto flex-1 min-h-0">
         <div className="flex flex-col gap-px">
           {filtered.length === 0 && filter && (
-            <div className="px-2 py-2 coord">— NO MATCHES —</div>
+            <div className="px-2 py-2 coord">— No matches —</div>
           )}
           {filtered.map((v) => {
             const isActive = v.name === current;

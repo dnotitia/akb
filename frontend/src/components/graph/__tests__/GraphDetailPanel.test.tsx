@@ -70,7 +70,7 @@ describe("GraphDetailPanel · document node", () => {
     expect(await screen.findByText("Hello")).toBeTruthy();
     expect(screen.getByText("A nice doc")).toBeTruthy();
     expect(screen.getByText("alpha")).toBeTruthy();
-    expect(screen.getByText(/depends_on/i)).toBeTruthy();
+    expect(screen.getByText(/depends on/i)).toBeTruthy();
     expect(screen.getByText(/line1/)).toBeTruthy();
   });
 

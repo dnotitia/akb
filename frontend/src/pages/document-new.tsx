@@ -177,14 +177,14 @@ export default function DocumentNewPage() {
           to={`/vault/${name}`}
           className="hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
-          {(name || "").toUpperCase()}
+          {name || ""}
         </Link>
         <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-        <span className="text-foreground">NEW DOCUMENT</span>
+        <span className="text-foreground">New document</span>
       </nav>
 
       <header className="pb-4">
-        <Eyebrow tone="spark" className="mb-2 block">§ NEW DOCUMENT</Eyebrow>
+        <Eyebrow tone="spark" className="mb-2 block">New document</Eyebrow>
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           New document.
         </h1>

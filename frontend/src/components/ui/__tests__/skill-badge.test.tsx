@@ -5,13 +5,13 @@ import { SkillBadge } from "../skill-badge";
 describe("SkillBadge", () => {
   it("renders defined state with line count", () => {
     render(<SkillBadge defined lineCount={142} />);
-    expect(screen.getByText(/GUIDE/)).toBeTruthy();
+    expect(screen.getByText(/Guide/)).toBeTruthy();
     expect(screen.getByText(/142L/)).toBeTruthy();
   });
 
   it("renders undefined state with X marker", () => {
     render(<SkillBadge defined={false} />);
-    const txt = screen.getByText(/GUIDE/).textContent || "";
+    const txt = screen.getByText(/Guide/).textContent || "";
     expect(txt).toContain("✗");
   });
 

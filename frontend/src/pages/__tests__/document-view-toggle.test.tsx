@@ -135,8 +135,8 @@ describe("DocumentPage view toggle", () => {
     // Wait for the page to settle in rendered mode.
     await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
 
-    const rawTab = screen.getByRole("tab", { name: "RAW" });
-    const renderedTab = screen.getByRole("tab", { name: "RENDERED" });
+    const rawTab = screen.getByRole("tab", { name: "Raw" });
+    const renderedTab = screen.getByRole("tab", { name: "Rendered" });
     expect(rawTab).toHaveAttribute("aria-selected", "false");
     expect(renderedTab).toHaveAttribute("aria-selected", "true");
     await user.click(rawTab);
@@ -146,8 +146,8 @@ describe("DocumentPage view toggle", () => {
     expect(pre).toBeInTheDocument();
 
     // Selection flips on the segmented control.
-    expect(screen.getByRole("tab", { name: "RAW" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: "RENDERED" })).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByRole("tab", { name: "Raw" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Rendered" })).toHaveAttribute("aria-selected", "false");
 
     // The URL search now contains view=raw.
     expect(screen.getByTestId("location-search")).toHaveTextContent("view=raw");
@@ -165,7 +165,7 @@ describe("DocumentPage view toggle", () => {
 
     await screen.findByTestId("doc-raw");
     const copy = screen.getByRole("button", { name: /copy markdown/i });
-    expect(copy).toHaveTextContent("COPY");
+    expect(copy).toHaveTextContent("Copy");
 
     // Direct .click() avoids userEvent's clipboard-aware setup, which
     // installs its own ClipboardStubImpl and shadows our writeText spy.
@@ -178,7 +178,7 @@ describe("DocumentPage view toggle", () => {
     // Same button element (React reuses the node); after copy its visible text
     // flips to COPIED and its aria-label flips to "Markdown copied".
     await waitFor(() => {
-      expect(copy).toHaveTextContent("COPIED");
+      expect(copy).toHaveTextContent("Copied");
     });
     expect(copy).toHaveAccessibleName(/markdown copied/i);
   });
