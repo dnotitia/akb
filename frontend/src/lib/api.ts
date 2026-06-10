@@ -458,6 +458,8 @@ export interface PublicationResponse {
   summary?: string;
   domain?: string;
   created_by?: string;
+  /** Human author name resolved from created_by (a user id) at read time. */
+  created_by_name?: string;
   created_at?: string;
   updated_at?: string;
   tags?: string[];

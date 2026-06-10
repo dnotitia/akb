@@ -136,7 +136,16 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
         <div className="space-y-5">
           <MetaField label="Type" value={data.type || "document"} />
           {data.domain && <MetaField label="Domain" value={data.domain} />}
-          {data.created_by && <MetaField label="Author" value={data.created_by} />}
+          {(() => {
+            // Prefer the resolved author name; never surface a raw user UUID
+            // on the public page. Fall back to a non-UUID created_by string.
+            const isUuid = (s: string) =>
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+            const author =
+              data.created_by_name ||
+              (data.created_by && !isUuid(data.created_by) ? data.created_by : null);
+            return author ? <MetaField label="Author" value={author} /> : null;
+          })()}
           {data.updated_at && (
             <MetaField label="Updated" value={formatDate(data.updated_at)} tabular />
           )}

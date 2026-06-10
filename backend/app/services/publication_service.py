@@ -778,9 +778,11 @@ async def resolve_document_publication(publication: dict) -> dict:
             """
             SELECT d.path, d.title, d.doc_type, d.status, d.summary, d.domain,
                    d.created_by, d.created_at, d.updated_at, d.tags,
-                   v.name AS vault_name
+                   v.name AS vault_name,
+                   COALESCE(u.display_name, u.username) AS created_by_name
             FROM documents d
             JOIN vaults v ON d.vault_id = v.id
+            LEFT JOIN users u ON u.id::text = d.created_by
             WHERE v.name = $1 AND d.path = $2
             """,
             uri_vault, doc_path,
@@ -817,6 +819,7 @@ async def resolve_document_publication(publication: dict) -> dict:
         "summary": doc_row["summary"],
         "domain": doc_row["domain"],
         "created_by": doc_row["created_by"],
+        "created_by_name": doc_row["created_by_name"],
         "created_at": doc_row["created_at"].isoformat() if doc_row["created_at"] else None,
         "updated_at": doc_row["updated_at"].isoformat() if doc_row["updated_at"] else None,
         "tags": list(doc_row["tags"]) if doc_row["tags"] else [],

@@ -390,18 +390,43 @@ export default function DocumentPage() {
           {doc.title}
         </h1>
 
-        {/* Byline */}
-        {(doc.created_by || doc.updated_at) && (
-          <div className="font-medium tracking-[-0.01em] text-[14px] text-foreground-muted mb-7">
-            {doc.created_by && (
-              <>
-                Written by{" "}
-                <span className="text-foreground">{doc.created_by}</span>
-                {doc.updated_at && <>, last changed {timeAgo(doc.updated_at)}</>}.
-              </>
-            )}
-          </div>
-        )}
+        {/* Byline — resolved author name + avatar (raw id only in the tooltip) */}
+        {(() => {
+          if (!doc.created_by && !doc.updated_at) return null;
+          // created_by is a user UUID for app-authored docs; external-git
+          // imports store a readable author string. Prefer the resolved name;
+          // fall back to a non-UUID raw value; never surface a raw UUID inline.
+          const isUuid = (s: string) =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+          const authorName =
+            doc.created_by_name ||
+            (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
+          const initial = (authorName?.trim()[0] || "?").toUpperCase();
+          return (
+            <div className="flex items-center gap-2 text-[14px] text-foreground-muted mb-7">
+              {doc.created_by && (
+                <span
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-surface-selected text-primary text-[11px] font-semibold"
+                  title={doc.created_by}
+                  aria-hidden
+                >
+                  {initial}
+                </span>
+              )}
+              <span>
+                {authorName ? (
+                  <>
+                    Written by{" "}
+                    <span className="text-foreground font-medium">{authorName}</span>
+                  </>
+                ) : (
+                  "Edited"
+                )}
+                {doc.updated_at && <> · {timeAgo(doc.updated_at)}</>}
+              </span>
+            </div>
+          );
+        })()}
 
         {/* Frontmatter card — mono metadata with semantic colors */}
         <FrontmatterCard doc={doc} />
