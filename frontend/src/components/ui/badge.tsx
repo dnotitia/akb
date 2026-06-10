@@ -13,6 +13,7 @@ const badgeVariants = cva(
         outline: "border-border bg-transparent text-foreground-muted",
         destructive: "border-destructive bg-destructive text-destructive-foreground",
         success: "border-success bg-transparent text-success",
+        warning: "border-warning bg-transparent text-warning",
         // filled semantic variants (backed by the completed -foreground quads)
         // for chips that need a solid fill (PUBLISHED, degraded, indexed …).
         "success-solid": "border-success bg-success text-success-foreground",
