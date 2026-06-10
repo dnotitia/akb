@@ -40,6 +40,14 @@
      sits on it. One token swap re-skins every filled-accent call site. */
   --color-accent-strong: #c44a1e;
   --color-accent-strong-foreground: #ffffff;
+  /* Fresh-token spark — the sanctioned 2nd-orange highlight (recency dot +
+     relative-time text). A SEPARATE token from accent-strong because the two
+     have opposite dark-mode needs: accent-strong stays dark so white text on a
+     FILLED chip clears AA, while spark is used AS text on a surface and must be
+     LIGHT enough to clear AA on the dark canvas. Light == accent-strong
+     (#c44a1e on white = 4.83:1); dark is brightened (#f0744a on #121821 surface
+     = 6.18:1, on hover #1f2935 = 5.10:1) — both AA at the 11px spark size. */
+  --color-spark: #c44a1e;
   /* Semantic families — each a full quad: base (text/border), -foreground
      (text on a filled chip), -soft (tinted banner bg), -soft-foreground
      (text on the tint). base values darkened to clear WCAG AA as text. */
@@ -164,6 +172,9 @@
   --color-accent-foreground: #ffffff;
   --color-accent-strong: #c44a1e;
   --color-accent-strong-foreground: #ffffff;
+  /* Brightened so the fresh-spark text/dot clears WCAG AA on the dark canvas
+     (#f0744a == dark cat-5, keeping the warm ramp consistent). */
+  --color-spark: #f0744a;
   --color-success: #3fb27a;
   --color-success-foreground: #0a1f12;
   --color-success-soft: #13271c;

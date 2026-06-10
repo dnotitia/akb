@@ -306,7 +306,7 @@ export default function HomePage() {
                         <Icon className="h-3 w-3" aria-hidden />
                       </span>
                       <div className="min-w-0">
-                        <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-primary transition-colors">
+                        <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link transition-colors">
                           {c.title}
                         </div>
                         <div title={c.path} className="coord truncate">{c.path}</div>
@@ -316,8 +316,8 @@ export default function HomePage() {
                         <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
                       </span>
                       {fresh ? (
-                        <span className="inline-flex items-center justify-end gap-1 text-right text-[11px] font-medium tabular-nums text-accent-strong">
-                          <span className="h-1.5 w-1.5 rounded-full bg-accent-strong" aria-hidden />
+                        <span className="inline-flex items-center justify-end gap-1 text-right text-[11px] font-medium tabular-nums text-spark">
+                          <span className="h-1.5 w-1.5 rounded-full bg-spark" aria-hidden />
                           {timeAgo(c.changed_at)}
                         </span>
                       ) : (

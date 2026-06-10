@@ -66,7 +66,8 @@ Exempt: `src/index.css` (the token defs) and test/story files.
 | `teal` / `primary` | `#004059` | `#0a6f86` | brand primary — headers, primary buttons, active fills |
 | `teal-2` | `#0a6f86` | — | mid-teal (gradients) |
 | `orange` / `accent` | `#e55e2c` | `#e55e2c` | bright accent — borders, tints, dots, glows, **decoration only on light** |
-| `accent-strong` (+`-foreground` `#fff`) | `#c44a1e` | `#c44a1e` | accent for **white-text fills & light orange text** (4.83:1 AA) |
+| `accent-strong` (+`-foreground` `#fff`) | `#c44a1e` | `#c44a1e` | accent for **white-text fills** (white-on-fill 4.83:1 AA) |
+| `spark` | `#c44a1e` | `#f0744a` | the **fresh-token highlight** (dot + relative-time text). Split from `accent-strong` because the two have opposite dark needs: `accent-strong` stays dark so white text on a filled chip clears AA, while `spark` is used **as text on a surface** and is brightened in dark to clear AA there (6.18:1 on surface, 5.10:1 on hover). |
 | `background` | `#f6f7f9` | `#0b0f14` | page canvas (cool gray) |
 | `surface` | `#ffffff` | `#121821` | cards, list rows, inputs |
 | `surface-2` / `surface-muted` | `#ebeef2` | `#1b2430` | insets, code headers (alias pair) |
@@ -147,9 +148,12 @@ Disabled state = a single value app-wide: `opacity-50` + `disabled:` semantics
 6. **Dataviz uses the `--color-cat-*` scale only** (no raw `hsl()`/hex islands).
 7. **One warm accent per list row — the fresh-token spark.** A just-touched
    row (changed within ~1h, `isFresh` in `lib/utils`) may show exactly one warm
-   accent: an `accent-strong` dot + relative time. It decays as the change ages —
+   accent: a `spark` dot + relative time. It decays as the change ages —
    never a permanent `NEW` badge — and is the only orange a list row may carry.
-   Always pair the dot with the timestamp text (color is never the sole signal).
+   Use the `spark` token (`text-spark`/`bg-spark`), **not** `accent-strong`: the
+   spark renders as text on a surface, so it brightens in dark to clear AA there,
+   whereas `accent-strong` must stay dark for white-on-fill. Always pair the dot
+   with the timestamp text (color is never the sole signal).
    A type-tinted leading icon chip may tint by *kind*, but collapse many types to
    ~3 `cat` hues (never a rainbow) and **skip `cat-5`** so the type tint never
    competes with the spark; the glyph still carries the real distinction.
