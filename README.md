@@ -24,6 +24,28 @@ Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
   [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
 - Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
+## Plugins
+
+Beyond raw MCP access, AKB ships ready-made **agent plugins** for **Claude Code**
+and **Codex** that wrap common vault workflows:
+
+- **akb-wiki** — ingest a source (local file, web URL, GitHub PR / release /
+  commit, Confluence page, or Jira issue) into the vault as a structured
+  document, and answer questions from the vault with grounded, cited synthesis
+  (read-only).
+- **akb-sessions** — capture a coding session as structured notes: a session
+  report plus follow-up tasks, learnings, ideas, and decisions.
+- **akb-claude-code** — a Claude Code lifecycle bridge: hooks anchor each
+  session to your AKB memory vault, injecting preferences and recent learnings
+  at the start and writing a recap at the end.
+
+```
+/plugin marketplace add dnotitia/akb        # Claude Code
+codex plugin marketplace add dnotitia/akb   # Codex
+```
+
+Install details and credentials: [`plugins/`](./plugins/skillpack-plugins.md).
+
 ## Try it live
 
 A public demo runs at **[akb-demo.agent.seahorse.dnotitia.ai](https://akb-demo.agent.seahorse.dnotitia.ai)**.
@@ -336,6 +358,7 @@ akb/
 ├── packages/
 │   └── akb-mcp-client/       # stdio ↔ HTTP MCP proxy (npm: akb-mcp)
 ├── agents/                   # Reference Python agent runtime (think/act loop over MCP)
+├── plugins/                  # Claude Code / Codex agent plugins (ingest, query, session capture, lifecycle)
 ├── templates/                # Doc templates (ADR, PRD, runbook, …) and vault profiles
 ├── design-system/            # Frontend design system docs
 ├── config/

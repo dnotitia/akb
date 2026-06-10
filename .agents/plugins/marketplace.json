@@ -1,0 +1,32 @@
+{
+  "name": "akb-skillpack",
+  "interface": {
+    "displayName": "AKB Skillpack"
+  },
+  "plugins": [
+    {
+      "name": "akb-sessions",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex/akb-sessions"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "akb-wiki",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex/akb-wiki"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "akb": {
+      "command": "npx",
+      "args": [
+        "akb-mcp",
+        "--insecure"
+      ],
+      "env": {
+        "AKB_MCP_URL": "${AKB_MCP_URL}",
+        "AKB_PAT": "${AKB_PAT}"
+      }
+    }
+  }
+}

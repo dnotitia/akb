@@ -1,0 +1,19 @@
+{
+  "name": "akb-wiki",
+  "version": "0.21.1",
+  "description": "LLM-wiki layer for AKB vaults — unified document ingest (any source) and hybrid search.",
+  "author": {
+    "name": "jylkim",
+    "url": "https://github.com/jylkim"
+  },
+  "repository": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "license": "MIT",
+  "keywords": [
+    "akb",
+    "llm-wiki",
+    "ingest",
+    "search",
+    "git",
+    "atlassian"
+  ]
+}

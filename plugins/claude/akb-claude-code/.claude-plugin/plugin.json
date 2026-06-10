@@ -1,0 +1,18 @@
+{
+  "name": "akb-claude-code",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code's session lifecycle into AKB's agent-memory vault.",
+  "author": {
+    "name": "jylkim",
+    "url": "https://github.com/jylkim"
+  },
+  "repository": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "license": "MIT",
+  "keywords": [
+    "akb",
+    "claude-code",
+    "lifecycle",
+    "hooks",
+    "agent-memory"
+  ]
+}
