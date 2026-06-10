@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseHeadings, slugify } from "@/lib/markdown";
+import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
 
 describe("slugify", () => {
   it("lowercases and hyphenates", () => {
@@ -56,5 +56,35 @@ describe("parseHeadings — setext", () => {
   it("doesn't treat --- after an empty line as setext", () => {
     const h = parseHeadings("\n---\n");
     expect(h).toEqual([]);
+  });
+});
+
+describe("stripFrontmatter", () => {
+  it("removes a leading frontmatter block", () => {
+    const md = '---\ntype: decision\ntags: ["a", "b"]\n---\n\n# Real Title\n';
+    expect(stripFrontmatter(md)).toBe("\n# Real Title\n");
+  });
+  it("tolerates an optional BOM before the fence", () => {
+    const md = '﻿---\ntype: note\n---\n# T\n';
+    expect(stripFrontmatter(md)).toBe("# T\n");
+  });
+  it("leaves bodies without leading frontmatter untouched", () => {
+    const md = "# Title\n\nSome --- text\n\n---\n";
+    expect(stripFrontmatter(md)).toBe(md);
+  });
+  it("ignores a fence that isn't at the very start", () => {
+    const md = "intro\n\n---\ntype: x\n---\n";
+    expect(stripFrontmatter(md)).toBe(md);
+  });
+});
+
+describe("parseHeadings — embedded frontmatter", () => {
+  it("doesn't surface a trailing `tags:` line as a heading", () => {
+    const md =
+      '---\ntype: decision\nstatus: active\ntags: ["sparse-embedding-server", "seahorsedb-writer"]\n---\n\n# OOM 대응 내역\n\n## 배경\n';
+    expect(parseHeadings(md).map((x) => x.text)).toEqual([
+      "OOM 대응 내역",
+      "배경",
+    ]);
   });
 });
