@@ -2,11 +2,15 @@ import { type ReactNode, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   AlertTriangle,
+  BookText,
   ChevronDown,
   ChevronRight,
   FileClock,
   FilePlus,
+  Plug,
   Settings as SettingsIcon,
+  Sparkles,
+  Table as TableIcon,
   Users,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -22,6 +26,12 @@ import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-b
 import { useVaultHealth } from "@/hooks/use-vault-health";
 import { SkillStatusChip } from "@/components/skill/skill-status-chip";
 import { StatTile } from "@/components/ui/stat-tile";
+
+interface TableMeta {
+  name: string;
+  row_count?: number;
+  columns?: Array<{ name: string; type: string }>;
+}
 
 interface VaultInfo {
   name: string;
@@ -42,6 +52,9 @@ interface VaultInfo {
   table_count?: number;
   file_count?: number;
   edge_count?: number;
+  // Pre-loaded table schema (name + row_count + columns) — the overview surfaces
+  // it as a tables-at-a-glance band instead of dropping it on a single tile.
+  tables?: TableMeta[];
 }
 
 interface RecentRow {
@@ -199,6 +212,17 @@ export default function VaultPage() {
     };
   }, [name]);
 
+  // Name the browser tab/history entry for this vault (helps tab switching and
+  // screen-reader route-change orientation); restore the app default on leave.
+  useEffect(() => {
+    if (!name) return;
+    const prev = document.title;
+    document.title = `${name} · AKB`;
+    return () => {
+      document.title = prev;
+    };
+  }, [name]);
+
   async function ensureCommitsLoaded(vault: string) {
     if (commitsLoaded) return;
     try {
@@ -219,6 +243,19 @@ export default function VaultPage() {
 
   const canWrite =
     info?.role === "writer" || info?.role === "admin" || info?.role === "owner";
+
+  // "Just getting started" = no real content yet. A freshly created vault is
+  // auto-seeded with an overview/vault-skill.md scaffold, so that one doc
+  // doesn't count as content; gate on the skill probe having settled so the
+  // layout doesn't flip once it resolves. Show an onboarding hero instead of a
+  // barren 1/0/0 stat wall + a lone scaffold commit.
+  const scaffoldDocs = skillExists ? 1 : 0;
+  const isEmpty =
+    !!info &&
+    !skillQuery.isLoading &&
+    (info.document_count ?? 0) - scaffoldDocs <= 0 &&
+    (info.table_count ?? 0) === 0 &&
+    (info.file_count ?? 0) === 0;
 
   return (
     <div className="fade-up">
@@ -332,7 +369,7 @@ export default function VaultPage() {
             Settings
           </Link>
         )}
-        {canWrite && !info?.is_archived && (
+        {canWrite && !info?.is_archived && !isEmpty && (
           <Button asChild variant="accent" size="md" className="ml-auto">
             <Link to={`/vault/${name}/doc/new`}>
               <FilePlus className="h-4 w-4" aria-hidden />
@@ -370,6 +407,16 @@ export default function VaultPage() {
         </div>
       )}
 
+      {/* Empty vault → an onboarding hero instead of a barren wall of dimmed
+          zeros + empty lists. Otherwise: stats → tables → recent → commit log. */}
+      {info && isEmpty ? (
+        <VaultEmptyOnboarding
+          name={name!}
+          canWrite={canWrite}
+          skillDefined={skillExists}
+        />
+      ) : (
+      <>
       {/* Ledger — 4-stat tiles read from the authoritative, depth-safe counts
           in /info. Skeletons reserve the height so the tiles don't pop in. The
           label already names the category, so no jargon unit row; 0 recedes. */}
@@ -389,6 +436,10 @@ export default function VaultPage() {
           Array.from({ length: 4 }).map((_, i) => <StatTileSkeleton key={i} />)
         )}
       </div>
+
+      {info?.tables && info.tables.length > 0 && (
+        <TablesBand name={name!} tables={info.tables} />
+      )}
 
       {/* Recent writes — primary. Same grammar as the Home dashboard's Recent
           activity (loading flag → skeleton, type-tinted leading chip,
@@ -621,6 +672,163 @@ export default function VaultPage() {
           </div>
         )}
       </section>
+      </>
+      )}
     </div>
+  );
+}
+
+const TABLES_PREVIEW = 6;
+
+/** Tables-at-a-glance — name + row/column counts per table, linking to the
+ *  table viewer. Surfaces the schema /info already pre-loads instead of
+ *  collapsing it to a single count tile. */
+function TablesBand({ name, tables }: { name: string; tables: TableMeta[] }) {
+  const shown = tables.slice(0, TABLES_PREVIEW);
+  const more = tables.length - shown.length;
+  return (
+    <section className="mt-8" aria-labelledby="tables-heading">
+      <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
+        <h2 id="tables-heading" className="text-xl font-semibold tracking-tight">
+          Tables
+        </h2>
+        <Badge variant="default" className="tabular-nums">
+          {fmt(tables.length)}
+        </Badge>
+      </div>
+      <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        {shown.map((t) => {
+          const rows = t.row_count ?? 0;
+          const cols = t.columns?.length ?? 0;
+          return (
+            <li key={t.name}>
+              <Link
+                to={`/vault/${name}/table/${encodeURIComponent(t.name)}`}
+                className="group card-hover flex items-center justify-between gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 py-2.5 shadow-sm hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                <span className="inline-flex items-center gap-2 min-w-0">
+                  <span
+                    className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+                    style={{
+                      color: "var(--color-cat-3)",
+                      backgroundColor:
+                        "color-mix(in srgb, var(--color-cat-3) 12%, transparent)",
+                    }}
+                    aria-hidden
+                  >
+                    <TableIcon className="h-3 w-3" aria-hidden />
+                  </span>
+                  <span
+                    title={t.name}
+                    className="truncate text-sm font-medium text-foreground group-hover:text-link transition-colors"
+                  >
+                    {t.name}
+                  </span>
+                </span>
+                <span className="coord tabular-nums shrink-0 whitespace-nowrap">
+                  {fmt(rows)} {rows === 1 ? "row" : "rows"} · {cols}{" "}
+                  {cols === 1 ? "col" : "cols"}
+                </span>
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+      {more > 0 && (
+        <p className="coord mt-2">
+          +{fmt(more)} more {more === 1 ? "table" : "tables"} in the sidebar tree
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** First-run hero for a brand-new (fully empty) vault — owns the single marquee
+ *  orange CTA (the header's is withheld while empty), plus quiet next-step
+ *  cards for writers. Readers get the message without the CTAs. */
+function VaultEmptyOnboarding({
+  name,
+  canWrite,
+  skillDefined,
+}: {
+  name: string;
+  canWrite: boolean;
+  skillDefined: boolean;
+}) {
+  return (
+    <div className="mt-10">
+      <EmptyState
+        icon={
+          <span className="feature-tile feat-knowledge h-14 w-14">
+            <Sparkles className="h-6 w-6" aria-hidden />
+          </span>
+        }
+        title="This vault is just getting started"
+        description={
+          canWrite
+            ? "Nothing here yet — write the first document, describe what it's for, or point an agent at it."
+            : "No content yet. A writer or an agent can add the first documents."
+        }
+        action={
+          canWrite ? (
+            <Button asChild variant="accent" size="md">
+              <Link to={`/vault/${name}/doc/new`}>
+                <FilePlus className="h-4 w-4" aria-hidden />
+                New document
+              </Link>
+            </Button>
+          ) : undefined
+        }
+      />
+      {canWrite && (
+        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <OnboardStep
+            icon={BookText}
+            to={
+              skillDefined
+                ? `/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`
+                : `/vault/${name}/doc/new`
+            }
+            title={skillDefined ? "Edit the vault skill" : "Describe this vault"}
+            body="Tell agents what this vault is for and how to use it."
+          />
+          <OnboardStep
+            icon={Plug}
+            to="/settings?tab=tokens"
+            title="Connect an agent"
+            body="Mint a token and wire up your MCP client to write here."
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OnboardStep({
+  icon: Icon,
+  to,
+  title,
+  body,
+}: {
+  icon: typeof BookText;
+  to: string;
+  title: string;
+  body: string;
+}) {
+  return (
+    <Link
+      to={to}
+      className="group card-hover flex items-start gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3 shadow-sm hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+    >
+      <span className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-surface-muted text-foreground-muted shrink-0 group-hover:text-link transition-colors">
+        <Icon className="h-4 w-4" aria-hidden />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-medium text-foreground group-hover:text-link transition-colors">
+          {title}
+        </span>
+        <span className="block coord mt-0.5">{body}</span>
+      </span>
+    </Link>
   );
 }
