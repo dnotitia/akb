@@ -49,6 +49,7 @@ from app.util.text import fuzzy_hint
 # `table_data_repo`.
 from app.repositories.table_data_repo import (  # noqa: F401
     build_table_name_map,
+    count_statement_separators,
     rewrite_table_names,
 )
 
@@ -512,8 +513,13 @@ async def execute_sql(
         table_map = await table_data_repo.build_table_name_map(conn, vault_names)
         rewritten = table_data_repo.rewrite_table_names(sql, table_map)
 
+        # Literal-aware single-statement boundary (issue #180): a `;`
+        # only counts as a separator outside string literals, quoted
+        # identifiers, comments, and dollar-quoted blocks — same token
+        # classes the rewriter above already walks. Trailing-semicolon
+        # tolerance (`rstrip(";")`) is preserved as-is.
         sql_check = rewritten.rstrip(";").strip()
-        if ";" in sql_check:
+        if count_statement_separators(sql_check) > 0:
             return err(
                 "Multi-statement SQL is not allowed. Send one statement at a time.",
                 code=MULTI_STATEMENT,
