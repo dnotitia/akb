@@ -6,6 +6,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Segmented } from "@/components/ui/segmented";
 import {
   Dialog,
   DialogContent,
@@ -120,9 +121,10 @@ export function InviteMemberDialog({
     <Dialog open={open} onOpenChange={(o) => !granting && onOpenChange(o)}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Invite to {vault}</DialogTitle>
+          <DialogTitle>Add a member to {vault}</DialogTitle>
           <DialogDescription>
-            Find a user, pick a role, send the invite. The user gains access immediately.
+            Find a person with an AKB account, pick a role, and grant access. They
+            gain access immediately.
           </DialogDescription>
         </DialogHeader>
 
@@ -152,7 +154,11 @@ export function InviteMemberDialog({
               {searching && hits.length === 0 ? (
                 <div className="coord px-3 py-2" role="status" aria-live="polite">Searching…</div>
               ) : hits.length === 0 ? (
-                <div className="coord px-3 py-2" role="status">No matches</div>
+                <div className="coord px-3 py-2" role="status">
+                  {debouncedQuery
+                    ? "No matches — only people with an AKB account appear here."
+                    : "Only people with an AKB account appear here."}
+                </div>
               ) : (
                 <ul role="listbox" aria-label="Search results" className="divide-y divide-border">
                   {hits.map((u) => {
@@ -169,7 +175,7 @@ export function InviteMemberDialog({
                           }`}
                         >
                           <div className="flex items-baseline gap-2">
-                            <span title={u.username} className="font-mono text-sm font-medium truncate">
+                            <span title={u.username} className="text-sm font-medium truncate">
                               {u.username}
                             </span>
                             {u.display_name && (
@@ -190,27 +196,17 @@ export function InviteMemberDialog({
 
           {/* Role picker */}
           <div className="space-y-1.5">
-            <Label className="coord-ink">Role</Label>
-            <div className="grid grid-cols-3 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
-              {(["reader", "writer", "admin"] as Role[]).map((r) => {
-                const active = role === r;
-                return (
-                  <button
-                    key={r}
-                    type="button"
-                    onClick={() => setRole(r)}
-                    aria-pressed={active}
-                    className={`px-3 py-2 text-sm font-medium transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
-                      active
-                        ? "bg-surface-selected text-surface-selected-foreground"
-                        : "bg-surface text-foreground hover:bg-surface-hover"
-                    }`}
-                  >
-                    {r}
-                  </button>
-                );
-              })}
-            </div>
+            <Label id="invite-role-label" className="coord-ink">Role</Label>
+            <Segmented
+              aria-labelledby="invite-role-label"
+              value={role}
+              onChange={(v) => setRole(v as Role)}
+              className="grid-cols-3"
+              options={(["reader", "writer", "admin"] as Role[]).map((r) => ({
+                value: r,
+                label: r,
+              }))}
+            />
             <p className="text-xs text-foreground-muted leading-relaxed">
               {ROLE_DESCRIPTIONS[role]}
             </p>
