@@ -200,6 +200,22 @@ def _body_content_hash(body: str) -> str:
     return compute_text_content_hash(body)
 
 
+def _certified_content_hash(md_content: str) -> str:
+    """Hash of the body exactly as a later ``get`` will serve it.
+
+    ``get`` parses the stored markdown (``frontmatter.loads``) and hashes
+    the parsed body — and python-frontmatter strips surrounding
+    whitespace on load. Hashing the raw request body instead certified a
+    write-response hash that no later read would ever confirm whenever
+    the body had leading/trailing whitespace (issue #181). Parsing the
+    composed markdown back makes write-response, DB row, and get agree
+    by construction, and turns the read-side ``_ensure_document_hash``
+    self-heal into a no-op for fresh writes.
+    """
+    _, canonical_body = _parse_markdown(md_content)
+    return _body_content_hash(canonical_body)
+
+
 class DocumentService:
     def __init__(self, git: GitService | None = None):
         self.git = git or GitService()
@@ -424,7 +440,7 @@ class DocumentService:
         if agent_id:
             fm_dict["created_by"] = agent_id
         md_content = _compose_markdown(fm_dict, req.content)
-        content_hash = _body_content_hash(req.content)
+        content_hash = _certified_content_hash(md_content)
 
         # Git commit
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
@@ -722,7 +738,7 @@ class DocumentService:
         new_body = req.content if req.content is not None else current_body
         new_md = _compose_markdown(current_fm, new_body)
         previous_hash = current_hash
-        content_hash = _body_content_hash(new_body)
+        content_hash = _certified_content_hash(new_md)
 
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
