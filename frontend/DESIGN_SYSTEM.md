@@ -27,6 +27,14 @@ and hairlines carry hierarchy, and color is used with discipline.
   (`components/ui/*`), not bespoke inline markup.
 - **Light = paper-cool, dark = slate.** The two themes are authored together;
   dark is a tonal re-map, never a naive inversion. Test both.
+- **One atmosphere budget per view.** The glass/aurora/elevation/micro-viz kit
+  (§10–§11) is a signature used sparingly, so chrome recedes and content leads.
+  Per view: at most **one** masthead brand device (`.aurora-header` wash *or* a
+  `.brand-gradient` wordmark *or* a leading `.feat-*` tile — not stacked), **one**
+  hover-lift surface (`.card-hover`), **one** micro-viz (a rail sparkline /
+  composition meter, suppressed when too sparse to read), and surfaces raised at
+  most **one tier** above resting (`shadow-sm` → `shadow-md`, never higher on a
+  content field). Additive, AA, and dark-correct in both themes.
 
 ---
 
@@ -137,7 +145,15 @@ Disabled state = a single value app-wide: `opacity-50` + `disabled:` semantics
    destructive carry state and always pair color with an icon/label. Teal and
    orange are identity, not status — never use them to mean ok/error.
 6. **Dataviz uses the `--color-cat-*` scale only** (no raw `hsl()`/hex islands).
-7. **Disabled = one value app-wide** (`opacity-50`).
+7. **One warm accent per list row — the fresh-token spark.** A just-touched
+   row (changed within ~1h, `isFresh` in `lib/utils`) may show exactly one warm
+   accent: an `accent-strong` dot + relative time. It decays as the change ages —
+   never a permanent `NEW` badge — and is the only orange a list row may carry.
+   Always pair the dot with the timestamp text (color is never the sole signal).
+   A type-tinted leading icon chip may tint by *kind*, but collapse many types to
+   ~3 `cat` hues (never a rainbow) and **skip `cat-5`** so the type tint never
+   competes with the spark; the glyph still carries the real distinction.
+8. **Disabled = one value app-wide** (`opacity-50`).
 
 ---
 
@@ -156,6 +172,17 @@ off-brand competing hue. `cat-5 == accent-strong`, `cat-6 == foreground-muted`.
 Floors: ≥3:1 ring/stroke contrast on the canvas; tile **fills** put white text on
 the darker stop. Light/dark is handled by the token layer, not per-component math.
 
+**Micro-viz reads as texture, not instrumentation.** An in-row / in-rail micro-viz
+has no axis and no legend — exact numbers live in the `title` tooltip and the
+adjacent counts; the bar/spark carries only shape. A composition bar shows
+proportion (`cat-1`/`cat-3`/`cat-4` = doc/table/file) over a faint full-width
+`surface-muted` track, drawn even when empty so the column always reserves its
+width. A rail sparkline is **one per rail**, built from data already in state (no
+extra fetch): teal (`primary`) bars with the most-recent active day tipped
+`accent`, and **suppressed when too sparse to read as a shape** so a quiet account
+never shows a row of dead bars. Micro-viz is decoration — `aria-hidden` bars plus
+an `sr-only` summary, never the only signal.
+
 ---
 
 ## 8. Typography
@@ -170,6 +197,10 @@ the darker stop. Light/dark is handled by the token layer, not per-component mat
   600 / 700**.
 - **Numbers in tables/lists/stats: `tabular-nums`** (prevents async jitter), in
   Pretendard — not monospace, and **not zero-padded** (`1`, not `01`).
+- **An identifier reads `font-mono` on every surface.** A vault name / id / ref
+  stays mono wherever it appears — as a row's primary name *and* as a secondary
+  chip inside another list — so the same entity never flips between mono and sans.
+  Prose like a document *title* is sans; only identifiers are mono.
 - **Retired the legacy "§ coordinate" terminal/newspaper layer.** No `§` glyphs,
   no all-caps section eyebrows, no wide letter-tracking, no editorial `word.`
   mastheads (a lone colored period / italic colored last word). Section labels
@@ -225,8 +256,16 @@ the darker stop. Light/dark is handled by the token layer, not per-component mat
   re-introduce motion with inline styles.
 - **Atmosphere** (family signature, used sparingly so chrome recedes and content
   leads): `.app-header` (near-solid surface + faint blur + hairline), `body::before`
-  aurora (very low-alpha gradient mesh), `.hero-glow` (auth/landing only),
+  aurora (very low-alpha gradient mesh), `.aurora-header` (header-local wash for a
+  masthead the off-screen global mesh leaves flat — static, `pointer-events:none`,
+  behind the header at z-0, dark-retoned), `.hero-glow` (auth/landing only),
   `.brand-gradient` wordmark, `.feature-tile` + `.feat-*` capability tiles.
+- **Glass on outer shells only.** Apply `.glass` (`--glass-bg`) to shell surfaces
+  — header rails, summary cards — never to reading, input, or code surfaces.
+  Because the text sits over a translucent fill, re-verify it clears AA over
+  `--glass-bg` in **both** themes (it is not a fixed-contrast token). Pair glass
+  with a masthead aurora (`.aurora-header`) so the wash tints the shell — the
+  global `body::before` mesh is anchored off-screen and does not reach it.
 
 ---
 
@@ -237,13 +276,14 @@ Compose pages from these instead of re-writing patterns inline.
 | Primitive | Use |
 |---|---|
 | `Button` | `default` (teal) · `accent` (orange CTA) · `outline` · `secondary` · `ghost` · `destructive` · `link`. Sizes `sm/md/lg/icon`. `loading` prop = spinner + disable + `aria-busy`. |
-| `Panel` + `PanelHeader` | canonical rounded `surface` container (border + soft shadow); `inset` clips divided lists. |
+| `Panel` + `PanelHeader` | canonical rounded `surface` container (border + soft shadow); `inset` (default) clips divided lists. For a `.card-hover` lift (the kit lift-on-hover utility) on rows *inside* a Panel, set `inset={false}` so the row's transform/shadow isn't clipped, re-round the end rows (`[&>li:first-child>a]:rounded-t-[var(--radius-lg)]` / `…:last-child>a]:rounded-b-…`) to keep the divided look at rest, and stack the hovered row above its neighbours (`relative z-0 hover:z-10`). |
 | `PageHeader` | masthead: `font-display` title + muted subtitle + actions slot. |
 | `StatTile` | labelled metric tile (big tabular numeral). |
 | `Eyebrow` | the `§ LABEL` mono coordinate label (`tone: muted/ink/spark`). |
 | `CodeSnippet` | copyable code block with a soft header bar (insecure-origin safe). |
 | `Alert` | tinted notice banner — `destructive/warning/info/success` on the `-soft` quads; assertive `role=alert` for destructive/warning, polite `role=status` otherwise; icon + text always. |
 | `Badge` / `RoleBadge` / status badges | pill tags; outline + `*-solid` filled semantic variants; role/doc/system tones. |
+| `VaultChip` | flat tinted **monogram** tile for a vault — a quiet identity anchor, **not** a glossy avatar or a `feat-*` hero. Swatch is a deterministic `--color-cat-*` picked by `hashHue(name) % 6` (the shared FNV-1a from `lib/utils`, §7), so a vault wears **one color** wherever its name appears — Recent rows and the vault directory. Fill `color-mix(in srgb, <cat> 14%, transparent)`, `rounded-[var(--radius-sm)]`; `sm` (`h-5 w-5`) rides inline in a row, `md` (`h-7 w-7`) anchors a directory row. `aria-hidden` — the readable name always leads. |
 | `Input` / `Textarea` / `Select` / `Label` / `TagInput` | form primitives — pre-rounded, teal focus ring, `aria-[invalid]` hooks. |
 | `Dialog` / `ConfirmDialog` | overlay primitives; `ConfirmDialog` surfaces a rejected `onConfirm` inline (`Alert`) and stays open for retry. |
 | `Tabs` / `Tooltip` / `Skeleton` | segmented control / hint / loading placeholder. |
@@ -283,6 +323,8 @@ existing inline pattern and flag for extraction.
 - ❌ A second marquee orange CTA, or orange as interactive **text**.
 - ❌ `bg-accent/10` for "selected" (use `surface-selected`).
 - ❌ Color as the only signal; `.toUpperCase()` on user-facing copy.
+- ❌ Sibling lists aligned differently (one `items-baseline`, one `items-center`)
+  — parallel lists share one vertical-alignment + row grammar.
 - ❌ `rounded-*`/`shadow-*` bare values (use the token scale).
 - ❌ `bg-foreground text-background` slab (the guard blocks it).
 - ❌ `window.confirm()` / `alert()`; placeholder-only labels; removed focus rings.
