@@ -47,8 +47,7 @@ export default function VaultIndexPage() {
   );
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-[1100px] mx-auto px-6 py-8 fade-up">
+    <div className="max-w-[1100px] mx-auto fade-up">
         <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
           <div className="flex items-baseline gap-3">
             <h1 className="font-display text-2xl font-semibold tracking-tight text-foreground">
@@ -116,7 +115,6 @@ export default function VaultIndexPage() {
         ) : (
           <VaultList vaults={filtered} />
         )}
-      </div>
     </div>
   );
 }
