@@ -10,15 +10,21 @@ export function StatTile({
   value,
   kind,
   pad = true,
+  dimZero = false,
   className,
 }: {
   label: string;
   value: number | string;
   kind?: string;
   pad?: boolean;
+  /** Opt-in: recede the numeral when the value is exactly 0 so empty
+   *  categories read as "nothing here" rather than competing for attention.
+   *  Off by default — existing consumers are unaffected. */
+  dimZero?: boolean;
   className?: string;
 }) {
   const display = String(value);
+  const isZero = dimZero && (value === 0 || value === "0");
   return (
     <div
       className={cn(
@@ -28,7 +34,12 @@ export function StatTile({
       )}
     >
       <Eyebrow className="mb-1.5 block">{label}</Eyebrow>
-      <div className="font-display text-[30px] leading-none tabular-nums text-foreground mb-1.5">
+      <div
+        className={cn(
+          "font-display text-[30px] leading-none tabular-nums mb-1.5",
+          isZero ? "text-foreground-muted" : "text-foreground",
+        )}
+      >
         {display}
       </div>
       {kind && <Eyebrow className="block">{kind}</Eyebrow>}

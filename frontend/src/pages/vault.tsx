@@ -3,8 +3,11 @@ import { Link, useParams } from "react-router-dom";
 import { ChevronDown, ChevronRight, FilePlus, Settings as SettingsIcon, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { browseVault, getDocument, getRecent, getVaultActivity, getVaultInfo } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { isFresh, timeAgo } from "@/lib/utils";
+import { recentIcon, recentTone } from "@/lib/recent";
 import { Alert } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/empty-state";
 import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
@@ -33,6 +36,7 @@ interface RecentRow {
   vault: string;
   path: string;
   title: string;
+  type?: string;
   commit?: string;
   changed_at?: string;
 }
@@ -143,9 +147,11 @@ export default function VaultPage() {
           Couldn't load this vault's overview. Reload the page to retry.
         </Alert>
       )}
-      {/* Meta line — only the URI stays mono */}
+      {/* Meta line — one identity only (the H1 below states the name; the
+          breadcrumb says "where am I"), so don't print the name a third time:
+          just the label + the canonical mono URI. */}
       <div className="coord mb-3">
-        Vault · {name} · <span className="font-mono">akb://{name}</span>
+        Vault · <span className="font-mono">akb://{name}</span>
       </div>
 
       {/* Display title */}
@@ -171,23 +177,12 @@ export default function VaultPage() {
         {!skillQuery.isLoading && (
           <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
         )}
-        <div className="ml-auto flex items-baseline gap-4">
-          {(info?.role === "writer" ||
-            info?.role === "admin" ||
-            info?.role === "owner") && (
-            <Link
-              to={`/vault/${name}/doc/new`}
-              className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              <FilePlus className="h-3 w-3 self-center" aria-hidden />
-              New doc
-            </Link>
-          )}
+        <div className="ml-auto flex items-center gap-4">
           <Link
             to={`/vault/${name}/members`}
-            className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            <Users className="h-3 w-3 self-center" aria-hidden />
+            <Users className="h-3 w-3" aria-hidden />
             Members
             {info?.member_count !== undefined && (
               <span className="tabular-nums">[{info.member_count}]</span>
@@ -196,35 +191,54 @@ export default function VaultPage() {
           {info?.role === "owner" && (
             <Link
               to={`/vault/${name}/settings`}
-              className="inline-flex items-baseline gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              <SettingsIcon className="h-3 w-3 self-center" aria-hidden />
+              <SettingsIcon className="h-3 w-3" aria-hidden />
               Settings
             </Link>
+          )}
+          {(info?.role === "writer" ||
+            info?.role === "admin" ||
+            info?.role === "owner") && (
+            <Button asChild variant="accent" size="md">
+              <Link to={`/vault/${name}/doc/new`}>
+                <FilePlus className="h-4 w-4" aria-hidden />
+                New document
+              </Link>
+            </Button>
           )}
         </div>
       </div>
 
-      {/* Ledger — 4-stat tiles */}
+      {/* Ledger — 4-stat tiles. The label already names the category, so no
+          jargon unit row (dirs/md/rows/bytes); 0-value tiles recede. */}
       <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-3">
         {counts &&
           (
             [
-              ["Collections", counts.collections, "dirs"],
-              ["Documents", counts.documents, "md"],
-              ["Tables", counts.tables, "rows"],
-              ["Files", counts.files, "bytes"],
-            ] as Array<[string, number, string]>
-          ).map(([label, value, kind]) => (
-            <StatTile key={label} label={label} value={value} kind={kind} />
+              ["Collections", counts.collections],
+              ["Documents", counts.documents],
+              ["Tables", counts.tables],
+              ["Files", counts.files],
+            ] as Array<[string, number]>
+          ).map(([label, value]) => (
+            <StatTile key={label} label={label} value={value} dimZero />
           ))}
       </div>
 
-      {/* Recent writes — primary */}
+      {/* Recent writes — primary. Same grammar as the Home dashboard's Recent
+          activity (type-tinted leading chip + fresh-token spark) so a change
+          reads identically across the app. Single-vault context here, so no
+          per-row VaultChip; the git commit ref stays (demoted) since the href
+          is commit-pinned. */}
       <section className="mt-10" aria-labelledby="recent-heading">
         <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-          <span id="recent-heading" className="coord-ink">Recent</span>
-          <span className="coord tabular-nums">[{recent.length}]</span>
+          <h2 id="recent-heading" className="text-xl font-semibold tracking-tight">
+            Recent activity
+          </h2>
+          {recent.length > 0 && (
+            <Badge variant="default" className="tabular-nums">{recent.length}</Badge>
+          )}
         </div>
 
         {recent.length === 0 ? (
@@ -233,18 +247,29 @@ export default function VaultPage() {
             description="Documents written via agent will appear here."
           />
         ) : (
-          <ol className="rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm">
-            {recent.map((c, i) => (
+          <ol className="rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm stagger">
+            {recent.map((c, i) => {
+              const Icon = recentIcon(c.type);
+              const tone = recentTone(c.type);
+              const fresh = isFresh(c.changed_at);
+              return (
               <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
                 <Link
                   to={
                     `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
                     (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
                   }
-                  className="group grid grid-cols-[32px_1fr_auto] items-baseline gap-4 px-3 py-2 hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="group grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2.5 hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
-                  <span className="coord tabular-nums">
-                    {String(i + 1).padStart(2, "0")}
+                  <span
+                    className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+                    style={{
+                      color: tone,
+                      backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                    }}
+                    aria-hidden
+                  >
+                    <Icon className="h-3 w-3" aria-hidden />
                   </span>
                   <div className="min-w-0">
                     <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link">
@@ -252,17 +277,30 @@ export default function VaultPage() {
                     </div>
                     <div title={c.path} className="coord truncate">{c.path}</div>
                   </div>
-                  <div className="flex items-baseline gap-3 shrink-0">
-                    <span className="coord font-mono tabular-nums">
-                      {c.commit?.slice(0, 7)}
-                    </span>
-                    <span className="coord tabular-nums w-[52px] text-right">
-                      {timeAgo(c.changed_at)}
-                    </span>
+                  <div className="flex items-center gap-3 shrink-0">
+                    {c.commit && (
+                      <span
+                        className="coord font-mono tabular-nums"
+                        title={`commit ${c.commit}`}
+                      >
+                        {c.commit.slice(0, 7)}
+                      </span>
+                    )}
+                    {fresh ? (
+                      <span className="inline-flex w-[60px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-accent-strong">
+                        <span className="h-1.5 w-1.5 rounded-full bg-accent-strong" aria-hidden />
+                        {timeAgo(c.changed_at)}
+                      </span>
+                    ) : (
+                      <span className="coord tabular-nums w-[60px] text-right">
+                        {timeAgo(c.changed_at)}
+                      </span>
+                    )}
                   </div>
                 </Link>
               </li>
-            ))}
+              );
+            })}
           </ol>
         )}
       </section>
@@ -287,7 +325,6 @@ export default function VaultPage() {
             {commitsLoaded && (
               <span className="coord tabular-nums">[{activity.length}]</span>
             )}
-            <span className="coord ml-auto">Head · main</span>
           </button>
           <Link
             to={`/vault/${name}/activity`}
@@ -302,6 +339,7 @@ export default function VaultPage() {
             id="commit-log-list"
             className="mt-2 rounded-[var(--radius-lg)] border border-border bg-surface p-3 overflow-x-auto shadow-sm"
           >
+            <div className="coord mb-2 pb-2 border-b border-border">Head · main</div>
             {!commitsLoaded ? (
               <div className="coord" role="status" aria-live="polite">Loading…</div>
             ) : activity.length === 0 ? (
@@ -325,7 +363,7 @@ export default function VaultPage() {
                       >
                         <span className="text-foreground-muted">{(c.hash || "").slice(0, 7)}</span>
                         <span title={c.author_name || c.agent || c.author || "unknown"} className="text-foreground truncate">
-                          <span className="text-info">◆ </span>
+                          <span className="text-foreground-muted">· </span>
                           {c.author_name || c.agent || c.author || "unknown"}
                         </span>
                         <span title={c.subject || filePath} className="text-foreground truncate">

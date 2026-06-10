@@ -22,6 +22,11 @@ const badgeVariants = cva(
         // text (10px → no large-text exemption); filled badges for white-on-bg.
         info: "border-accent-strong bg-transparent text-accent-strong",
         spark: "border-accent-strong bg-accent-strong text-accent-strong-foreground",
+        // true informational/feature chip — teal-blue --color-info (AA as text),
+        // NOT orange. Use for passive "this is configured/available" markers
+        // (e.g. the vault Guide chip) so they don't spend the one-marquee-orange
+        // budget. (The misnamed `info` above is an accent-strong ORANGE highlight.)
+        "info-outline": "border-info bg-transparent text-info",
 
         /* role badges — filled for write-authority, outline for read-only */
         owner: "border-primary bg-surface-selected text-surface-selected-foreground",

@@ -8,13 +8,11 @@ import {
   Copy,
   Eye,
   EyeOff,
-  File as FileIcon,
   FileClock,
   FilePlus,
   FileText,
   FolderPlus,
   Plus,
-  Table as TableIcon,
   Trash2,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
@@ -39,6 +37,7 @@ import {
   revokePAT,
 } from "@/lib/api";
 import { isFresh, timeAgo } from "@/lib/utils";
+import { recentIcon, recentTone } from "@/lib/recent";
 import { mcpInstallSnippets, MCP_AGENT_FILES } from "@/lib/mcp-snippets";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
@@ -57,26 +56,6 @@ interface RecentRow {
   type?: string;
   commit?: string;
   changed_at?: string;
-}
-
-// Leading icon for a recent change, by resource kind. Tables/files use their
-// own glyphs; everything else (notes, specs, decisions, …) reads as a document.
-function recentIcon(type?: string) {
-  if (type === "table" || type === "table_query") return TableIcon;
-  if (type === "file") return FileIcon;
-  return FileText;
-}
-
-// Leading-glyph tint by kind, from the categorical ramp — a pre-attentive
-// "what kind" cue so a doc vs a table vs a file is a glance, not a path-read.
-// All doc-ish types collapse to one hue so 8 rows stay ~3 colors (never a
-// rainbow); the glyph still carries the real distinction. Deliberately skips
-// cat-5 (orange-red) so the type tint never competes with the fresh-token
-// spark, which owns the only warm accent a row may show.
-function recentTone(type?: string): string {
-  if (type === "table" || type === "table_query") return "var(--color-cat-3)";
-  if (type === "file") return "var(--color-cat-4)";
-  return "var(--color-cat-1)";
 }
 
 interface PATRow {
