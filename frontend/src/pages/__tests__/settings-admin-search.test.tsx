@@ -56,7 +56,10 @@ describe("Admin tab search + sort", () => {
     const u = userEvent.setup();
     render(wrap());
     await screen.findByText("alice");
-    await u.selectOptions(screen.getByLabelText(/Sort/i), "vaults");
+    // Sort is now a themed dropdown (Radix), not a native <select>: open it and
+    // pick the option instead of selectOptions.
+    await u.click(screen.getByLabelText(/Sort/i));
+    await u.click(await screen.findByRole("menuitemradio", { name: /Most vaults/i }));
     const usernames = screen.getAllByTestId("admin-user-row").map((el) =>
       el.querySelector("[data-testid='admin-user-name']")?.textContent
     );

@@ -6,7 +6,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { Select } from "@/components/ui/select";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { parseUri } from "@/lib/uri";
@@ -385,17 +385,16 @@ export default function SearchPage() {
       {!scopedVault && vaults.length > 0 && (
         <div className="flex items-center gap-3 mb-6">
           <span className="coord shrink-0">Scope</span>
-          <Select
+          <SelectMenu
             value={vault}
-            onChange={(e) => switchVault(e.target.value)}
+            onValueChange={switchVault}
             aria-label="Search scope — limit to a vault"
             className="h-9 w-auto min-w-[220px] max-w-sm"
-          >
-            <option value="">All vaults ({vaults.length})</option>
-            {vaults.map((v) => (
-              <option key={v.name} value={v.name}>{v.name}</option>
-            ))}
-          </Select>
+            options={[
+              { value: "", label: `All vaults (${vaults.length})` },
+              ...vaults.map((v) => ({ value: v.name, label: v.name })),
+            ]}
+          />
           {vault && (
             <button
               onClick={() => switchVault("")}

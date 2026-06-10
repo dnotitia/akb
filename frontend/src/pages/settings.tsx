@@ -33,7 +33,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { Badge } from "@/components/ui/badge";
 import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -940,18 +940,19 @@ export default function SettingsPage() {
                 aria-label="Search users"
               />
               <Label htmlFor="admin-sort" className="sr-only">Sort</Label>
-              <Select
+              <SelectMenu
                 id="admin-sort"
                 aria-label="Sort users"
                 value={adminSort}
-                onChange={(e) => setAdminSort(e.target.value as AdminSort)}
+                onValueChange={(v) => setAdminSort(v as AdminSort)}
                 className="w-auto min-w-[160px]"
-              >
-                <option value="recent">Recent first</option>
-                <option value="oldest">Oldest first</option>
-                <option value="username">Username A-Z</option>
-                <option value="vaults">Most vaults</option>
-              </Select>
+                options={[
+                  { value: "recent", label: "Recent first" },
+                  { value: "oldest", label: "Oldest first" },
+                  { value: "username", label: "Username A-Z" },
+                  { value: "vaults", label: "Most vaults" },
+                ]}
+              />
             </div>
 
             {/* Match count */}
