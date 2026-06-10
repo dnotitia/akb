@@ -154,9 +154,9 @@ export function VaultShell() {
                   ) : (
                     <div className="flex-1 min-h-0 flex items-center justify-center px-6 text-center">
                       <p className="coord leading-relaxed">
-                        No vault selected.
+                        No vault open.
                         <br />
-                        Pick one from the switcher above.
+                        Select one to see its collections here.
                       </p>
                     </div>
                   )}

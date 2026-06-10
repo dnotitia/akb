@@ -66,7 +66,7 @@ export function VaultSwitcher({
         >
           <div className="max-h-[60vh] overflow-y-auto">
             {vaults.length === 0 ? (
-              <div className="px-3 py-2 coord">No vaults yet</div>
+              <div className="px-3 py-2 coord">{loading ? "Loading…" : "No vaults yet"}</div>
             ) : (
               vaults.map((v) => {
                 const active = v.name === current;
