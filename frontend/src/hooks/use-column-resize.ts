@@ -10,8 +10,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * leaves the thin hit area, and locks body cursor/selection for the
  * duration. Double-clicking the handle resets to `default`.
  *
- * Used by VaultShell for both the vault-nav column and the collection
- * tree column.
+ * Used by VaultShell to resize the collection-tree column (the vault rail
+ * to its left is fixed-width).
  */
 export interface ColumnResizeOptions {
   storageKey: string;
