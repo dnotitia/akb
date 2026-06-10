@@ -82,6 +82,14 @@ export function Layout() {
 
   return (
     <div className={rootClass}>
+      {/* Skip link — first focusable element; jumps keyboard/SR users past the
+          header chrome to the page content on every route. */}
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-[100] focus:rounded-[var(--radius-md)] focus:border focus:border-border focus:bg-surface focus:px-3 focus:py-2 focus:text-sm focus:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Skip to content
+      </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
         <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1600px] items-center gap-4 px-5 h-16">
@@ -165,7 +173,7 @@ export function Layout() {
       </header>
 
       {/* Content */}
-      <main className={wide ? "flex-1 min-h-0 animate-in" : "flex-1 animate-in"}>
+      <main id="main" tabIndex={-1} className={wide ? "flex-1 min-h-0 animate-in focus:outline-none" : "flex-1 animate-in focus:outline-none"}>
         {wide ? (
           <ErrorBoundary resetKeys={[location.pathname, location.search]}>
             <Outlet />

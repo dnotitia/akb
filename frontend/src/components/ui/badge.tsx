@@ -24,7 +24,7 @@ const badgeVariants = cva(
         spark: "border-accent-strong bg-accent-strong text-accent-strong-foreground",
 
         /* role badges — filled for write-authority, outline for read-only */
-        owner: "border-accent-strong bg-accent-strong text-accent-strong-foreground",
+        owner: "border-primary bg-surface-selected text-surface-selected-foreground",
         admin: "border-primary bg-primary text-primary-foreground",
         writer: "border-primary bg-transparent text-primary",
         reader: "border-border bg-surface-muted text-foreground-muted",

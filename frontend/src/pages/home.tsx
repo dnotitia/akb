@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowRight,
+  ChevronDown,
   Copy,
   Eye,
   EyeOff,
   File as FileIcon,
+  FilePlus,
   FileText,
   Plus,
+  Search as SearchIcon,
   Table as TableIcon,
   Trash2,
 } from "lucide-react";
@@ -22,15 +26,13 @@ import { Badge } from "@/components/ui/badge";
 import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { RoleBadge } from "@/components/status-badge";
-import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
+import { VaultList, type VaultRow } from "@/components/vault-list";
 import {
   listVaults,
   getRecent,
   createPAT,
   listPATs,
   revokePAT,
-  getVaultInfo,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { mcpInstallSnippets, MCP_AGENT_FILES } from "@/lib/mcp-snippets";
@@ -40,33 +42,25 @@ type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 // Recent-activity fetch size. The list shows this many; when the result is
 // full we render the count as "N+" rather than implying it's the grand total.
 const RECENT_LIMIT = 8;
-// Cap concurrent /vaults/{v}/info calls — each one fans out into ~10 pooled
-// COUNT queries server-side, so an unbounded forEach over many vaults can
-// exhaust the connection pool.
-const VAULT_INFO_CONCURRENCY = 5;
-
-interface VaultRow {
-  id: string;
-  name: string;
-  description?: string;
-  role?: "owner" | "admin" | "writer" | "reader";
-  status?: string;
-}
-
-interface VaultMetrics {
-  document_count?: number;
-  table_count?: number;
-  file_count?: number;
-  last_activity?: string;
-}
+// How many vaults the Home preview shows before linking out to /vault.
+const VAULT_PREVIEW_LIMIT = 6;
 
 interface RecentRow {
   doc_id: string;
   vault: string;
   path: string;
   title: string;
+  type?: string;
   commit?: string;
   changed_at?: string;
+}
+
+// Leading icon for a recent change, by resource kind. Tables/files use their
+// own glyphs; everything else (notes, specs, decisions, …) reads as a document.
+function recentIcon(type?: string) {
+  if (type === "table" || type === "table_query") return TableIcon;
+  if (type === "file") return FileIcon;
+  return FileText;
 }
 
 interface PATRow {
@@ -78,7 +72,6 @@ interface PATRow {
 
 export default function HomePage() {
   const [vaults, setVaults] = useState<VaultRow[]>([]);
-  const [vaultMetrics, setVaultMetrics] = useState<Record<string, VaultMetrics>>({});
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
@@ -91,46 +84,18 @@ export default function HomePage() {
   const [mintError, setMintError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [tab, setTab] = useState<Tab>("claude");
-  const [vaultFilter, setVaultFilter] = useState("");
-  const [quickstartOpen, setQuickstartOpen] = useState(false);
-  const quickstartChecked = useRef(false);
   const location = useLocation();
+  const navigate = useNavigate();
+  const [homeSearch, setHomeSearch] = useState("");
   const recentCapped = recent.length >= RECENT_LIMIT;
 
   useEffect(() => {
     let cancelled = false;
+    // Per-vault content counts are fetched by <VaultList> for whatever rows it
+    // renders, so Home only needs the bare list (for the count + preview).
     listVaults()
       .then((d) => {
-        if (cancelled) return;
-        const vs: VaultRow[] = d.vaults || [];
-        setVaults(vs);
-        // Enrich each vault row with counts + last-activity. Run in bounded
-        // batches — each /info call fans out server-side, so an unbounded
-        // forEach risks pool exhaustion. Incremental setState keeps the list
-        // usable before every batch resolves.
-        void (async () => {
-          for (let i = 0; i < vs.length; i += VAULT_INFO_CONCURRENCY) {
-            if (cancelled) return;
-            await Promise.all(
-              vs.slice(i, i + VAULT_INFO_CONCURRENCY).map((v) =>
-                getVaultInfo(v.name)
-                  .then((info) => {
-                    if (cancelled) return;
-                    setVaultMetrics((prev) => ({
-                      ...prev,
-                      [v.name]: {
-                        document_count: info?.document_count,
-                        table_count: info?.table_count,
-                        file_count: info?.file_count,
-                        last_activity: info?.last_activity,
-                      },
-                    }));
-                  })
-                  .catch(() => {}),
-              ),
-            );
-          }
-        })();
+        if (!cancelled) setVaults(d.vaults || []);
       })
       .catch(console.error);
     loadRecent(() => cancelled);
@@ -161,10 +126,13 @@ export default function HomePage() {
   useEffect(() => {
     const target = location.hash.slice(1);
     if (target === "vaults" || target === "recent") {
+      // scrollIntoView's `behavior` is a JS option the CSS reduced-motion guard
+      // can't reach, so honor the OS preference explicitly here.
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       requestAnimationFrame(() => {
         document
           .getElementById(target)
-          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+          ?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
       });
     }
   }, [location.hash, location.key]);
@@ -172,16 +140,7 @@ export default function HomePage() {
   async function loadPATs() {
     try {
       const d = await listPATs();
-      const toks = d.tokens || [];
-      setPats(toks);
-      // First-run quickstart: surface the connect flow once when a fresh
-      // account has no tokens yet (unless the user opted out).
-      if (!quickstartChecked.current) {
-        quickstartChecked.current = true;
-        if (toks.length === 0 && localStorage.getItem(QUICKSTART_DISMISS_KEY) !== "1") {
-          setQuickstartOpen(true);
-        }
-      }
+      setPats(d.tokens || []);
     } catch {
       /* non-fatal: leave pats empty */
     }
@@ -223,13 +182,17 @@ export default function HomePage() {
   const pat = activePat || "<YOUR_PAT>";
   const snippets = useMemo(() => mcpInstallSnippets(pat), [pat]);
 
-  const q = vaultFilter.trim().toLowerCase();
-  const filteredVaults = q
-    ? vaults.filter(
-        (v) =>
-          v.name?.toLowerCase().includes(q) || v.description?.toLowerCase().includes(q),
-      )
-    : vaults;
+  // Home shows a preview of the vault directory; the full list (with filter)
+  // lives on /vault. Memoized so <VaultList> doesn't re-fetch metrics on every
+  // unrelated render.
+  const previewVaults = useMemo(
+    () => vaults.slice(0, VAULT_PREVIEW_LIMIT),
+    [vaults],
+  );
+
+  // First run: no vaults AND no tokens. Lead the main column with the connect
+  // flow (the actual first job) instead of two dead-end empty lists.
+  const firstRun = vaults.length === 0 && pats.length === 0;
 
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
@@ -237,22 +200,130 @@ export default function HomePage() {
       {/* Page header — centralized design-system primitive */}
       <PageHeader
         title="Workspace"
-        subtitle="Wire your agent into the base — vaults, recent activity, and connection tokens."
+        subtitle="Your knowledge base for AI agents — browse vaults, see recent changes, and manage agent connections."
         actions={
-          <Button asChild variant="accent" size="md">
-            <Link to="/vault/new">
-              <Plus className="h-4 w-4" aria-hidden />
-              New vault
-            </Link>
-          </Button>
+          <div className="flex items-center gap-2">
+            {vaults.length > 0 && <NewDocAction vaults={vaults} />}
+            <Button asChild variant={vaults.length > 0 ? "outline" : "accent"} size="md">
+              <Link to="/vault/new">
+                <Plus className="h-4 w-4" aria-hidden />
+                New vault
+              </Link>
+            </Button>
+          </div>
         }
       />
 
+      {firstRun && (
+        <Panel className="max-w-2xl p-6 sm:p-8">
+          <h2 className="text-lg font-semibold tracking-tight text-foreground">
+            Connect your first agent
+          </h2>
+          <p className="mt-1 text-sm text-foreground-muted leading-relaxed">
+            Mint a personal access token, drop the snippet into your agent, and it can
+            start reading and writing your knowledge base. Vaults and recent activity
+            show up here once you do.
+          </p>
+
+          <div className="mt-5">
+            <div className="coord-spark mb-2">1 · Mint a token</div>
+            <form onSubmit={handleCreatePAT} className="flex gap-2">
+              <Label htmlFor="onboard-pat" className="sr-only">Token name</Label>
+              <Input
+                id="onboard-pat"
+                type="text"
+                placeholder="Token name (e.g. my-laptop)"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                aria-invalid={mintError ? true : undefined}
+                className="flex-1"
+              />
+              <Button type="submit" variant="accent" loading={creating} disabled={!newName.trim()}>
+                {!creating && <Plus className="h-4 w-4" aria-hidden />}
+                {creating ? "Minting…" : "Mint token"}
+              </Button>
+            </form>
+            {mintError && <Alert variant="destructive" className="mt-2 text-xs">{mintError}</Alert>}
+            {activePat && (
+              <div
+                className="mt-3 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-2.5"
+                role="status"
+                aria-live="polite"
+              >
+                <div className="coord-spark mb-1">New token — copy now</div>
+                <div className="flex items-center gap-1.5">
+                  <code className="flex-1 font-mono text-[11px] text-foreground break-all leading-snug">
+                    {showPat ? activePat : activePat.slice(0, 10) + "•".repeat(14)}
+                  </code>
+                  {!showPat && <span className="sr-only">Token value: {activePat}</span>}
+                  <button
+                    onClick={() => setShowPat(!showPat)}
+                    aria-label={showPat ? "Hide token" : "Show token"}
+                    className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {showPat ? <EyeOff className="h-3.5 w-3.5" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
+                  </button>
+                  <button
+                    onClick={() => copy(activePat, "pat")}
+                    aria-label={copied === "pat" ? "Token copied" : "Copy token"}
+                    className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {copied === "pat" ? <span aria-hidden>OK</span> : <Copy className="h-3.5 w-3.5" aria-hidden />}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-5">
+            <div className="coord-spark mb-2">2 · Drop the snippet</div>
+            <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
+              <TabsList className="flex-wrap">
+                <TabsTrigger value="claude">Claude Code</TabsTrigger>
+                <TabsTrigger value="cursor">Cursor</TabsTrigger>
+                <TabsTrigger value="codex">Codex</TabsTrigger>
+                <TabsTrigger value="vscode">VS Code</TabsTrigger>
+                <TabsTrigger value="openclaw">OpenClaw</TabsTrigger>
+              </TabsList>
+              <TabsContent value={tab}>
+                <CodeSnippet code={snippets[tab]} filename={MCP_AGENT_FILES[tab]} />
+              </TabsContent>
+            </Tabs>
+          </div>
+        </Panel>
+      )}
+
+      {!firstRun && (
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
       {/* ── Main column ──────────────────────────────────────── */}
       <div className="space-y-10 min-w-0">
+        {/* Search — Home is self-sufficient even when the header search is
+            hidden (narrow widths); routes to the full /search page. */}
+        <form
+          role="search"
+          aria-label="Search knowledge base"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const query = homeSearch.trim();
+            if (query) navigate(`/search?q=${encodeURIComponent(query)}`);
+          }}
+          className="relative"
+        >
+          <SearchIcon
+            className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-foreground-muted"
+            aria-hidden
+          />
+          <Input
+            type="search"
+            value={homeSearch}
+            onChange={(e) => setHomeSearch(e.target.value)}
+            placeholder="Search documents, tables, and notes…"
+            aria-label="Search knowledge base"
+            className="h-11 pl-10"
+          />
+        </form>
         {/* § 01 Recent — top priority, the jump-back-in list. */}
-        <section id="recent" className="scroll-mt-24">
+        <section id="recent" className="scroll-mt-24" aria-busy={recentLoading}>
           <header className="flex items-baseline gap-3 pb-3 border-b border-border">
             <h2 className="text-xl font-semibold tracking-tight">Recent activity</h2>
             {!recentLoading && !recentError && (
@@ -261,6 +332,13 @@ export default function HomePage() {
               </span>
             )}
           </header>
+          <span className="sr-only" role="status" aria-live="polite">
+            {recentLoading
+              ? "Loading recent activity"
+              : recentError
+                ? "Could not load recent activity"
+                : `${recent.length} recent change${recent.length === 1 ? "" : "s"}`}
+          </span>
 
           {recentLoading ? (
             <Panel className="mt-3" aria-hidden>
@@ -291,139 +369,28 @@ export default function HomePage() {
             />
           ) : (
             <Panel className="mt-3">
-              <ol className="divide-y divide-border">
-                {recent.map((c, i) => (
+              <ol className="divide-y divide-border stagger">
+                {recent.map((c, i) => {
+                  const Icon = recentIcon(c.type);
+                  return (
                   <li key={`${c.doc_id}:${c.changed_at ?? ""}:${i}`}>
                     <Link
                       to={`/vault/${c.vault}/doc/${c.doc_id}`}
-                      className="group grid grid-cols-[40px_minmax(72px,140px)_minmax(0,1fr)_auto] items-baseline gap-4 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                      className="group grid grid-cols-[20px_minmax(0,1fr)_auto_56px] items-baseline gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
-                      <span className="coord tabular-nums">
-                        {String(i + 1).padStart(2, "0")}
-                      </span>
-                      <span title={c.vault} className="coord font-mono tabular-nums truncate">
-                        {c.vault}
-                      </span>
+                      <Icon className="h-4 w-4 self-baseline translate-y-0.5 text-foreground-muted shrink-0" aria-hidden />
                       <div className="min-w-0">
                         <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-primary transition-colors">
                           {c.title}
                         </div>
                         <div title={c.path} className="coord truncate">{c.path}</div>
                       </div>
-                      <span className="coord tabular-nums w-[52px] text-right">
+                      <Badge variant="secondary" title={c.vault} className="shrink-0 max-w-[140px] truncate self-baseline">
+                        {c.vault}
+                      </Badge>
+                      <span className="coord tabular-nums text-right self-baseline">
                         {timeAgo(c.changed_at)}
                       </span>
-                    </Link>
-                  </li>
-                ))}
-              </ol>
-            </Panel>
-          )}
-        </section>
-
-        {/* § 02 Vaults — list rows with explicit Open → affordance. */}
-        <section id="vaults" className="scroll-mt-24">
-          <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
-            <div className="flex items-baseline gap-3">
-              <h2 className="text-xl font-semibold tracking-tight">Your vaults</h2>
-              <span className="coord tabular-nums">{vaults.length}</span>
-            </div>
-            <div className="flex items-center gap-3">
-              {vaults.length > 5 && (
-                <Input
-                  type="search"
-                  placeholder="Filter vaults"
-                  value={vaultFilter}
-                  onChange={(e) => setVaultFilter(e.target.value)}
-                  aria-label="Filter vaults"
-                  className="h-9 w-40 sm:w-48"
-                />
-              )}
-              <Button asChild variant="outline" size="sm">
-                <Link to="/vault/new">
-                  <Plus className="h-4 w-4" aria-hidden />
-                  New vault
-                </Link>
-              </Button>
-            </div>
-          </header>
-
-          {q && vaults.length > 0 && (
-            <p className="coord mt-3" aria-live="polite">
-              Showing {filteredVaults.length} of {vaults.length}
-            </p>
-          )}
-
-          {vaults.length === 0 ? (
-            <EmptyState
-              title="No vaults yet"
-              description="Mint a token, then ask your agent to create one — or use the button above."
-              action={
-                <Button asChild variant="default" size="sm">
-                  <Link to="/vault/new">
-                    <Plus className="h-4 w-4" aria-hidden />
-                    Create first vault
-                  </Link>
-                </Button>
-              }
-            />
-          ) : filteredVaults.length === 0 ? (
-            <EmptyState
-              title={`No matches for "${vaultFilter}"`}
-              action={
-                <Button variant="outline" size="sm" onClick={() => setVaultFilter("")}>
-                  Clear filter
-                </Button>
-              }
-            />
-          ) : (
-            <Panel className="mt-3">
-              <ol className="divide-y divide-border">
-                {filteredVaults.map((v, i) => {
-                  const m = vaultMetrics[v.name];
-                  const lastActivity = m?.last_activity;
-                  return (
-                  <li key={v.id}>
-                    <Link
-                      to={`/vault/${v.name}`}
-                      className="group grid grid-cols-[40px_minmax(0,1fr)_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                    >
-                      <span className="coord tabular-nums self-baseline">
-                        {String(i + 1).padStart(2, "0")}
-                      </span>
-                      <div className="min-w-0 pr-4">
-                        <div className="flex items-baseline gap-2 flex-wrap mb-1">
-                          <span className="font-mono text-base font-semibold text-foreground group-hover:text-primary transition-colors">
-                            {v.name}
-                          </span>
-                          {v.status === "archived" && (
-                            <Badge variant="archived">archived</Badge>
-                          )}
-                        </div>
-                        {v.description && (
-                          <p
-                            className="text-xs text-foreground-muted leading-relaxed line-clamp-1"
-                            title={v.description}
-                          >
-                            {v.description}
-                          </p>
-                        )}
-                      </div>
-                      {/* Trailing meta as one shrink-0 group so it never eats the
-                          name column. Stats hide below xl where width is tight. */}
-                      <div className="flex items-center gap-3 shrink-0 self-baseline">
-                        <span className="hidden xl:inline-flex">
-                          <VaultStatsCell m={m} />
-                        </span>
-                        <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
-                          {lastActivity ? timeAgo(lastActivity) : m ? "—" : ""}
-                        </span>
-                        {v.role && <RoleBadge role={v.role} />}
-                        <ArrowRight
-                          className="h-4 w-4 shrink-0 text-foreground-muted opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 group-hover:text-primary transition-all"
-                          aria-hidden
-                        />
-                      </div>
                     </Link>
                   </li>
                   );
@@ -432,35 +399,66 @@ export default function HomePage() {
             </Panel>
           )}
         </section>
+
+        {/* § 02 Vaults — a preview of the directory; the full list lives at /vault. */}
+        <section id="vaults" className="scroll-mt-24">
+          <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
+            <div className="flex items-baseline gap-3">
+              <h2 className="text-xl font-semibold tracking-tight">Your vaults</h2>
+              <span className="coord tabular-nums">{vaults.length}</span>
+            </div>
+            {vaults.length > VAULT_PREVIEW_LIMIT && (
+              <Link
+                to="/vault"
+                className="coord inline-flex items-center gap-1 hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                View all {vaults.length}
+                <ArrowRight className="h-3 w-3" aria-hidden />
+              </Link>
+            )}
+          </header>
+
+          {vaults.length === 0 ? (
+            <EmptyState
+              title="No vaults yet"
+              description="Mint a token, then ask your agent to create one — or use the button above."
+              action={
+                <Button asChild variant="accent" size="sm">
+                  <Link to="/vault/new">
+                    <Plus className="h-4 w-4" aria-hidden />
+                    Create first vault
+                  </Link>
+                </Button>
+              }
+            />
+          ) : (
+            <VaultList vaults={previewVaults} />
+          )}
+        </section>
       </div>
 
       {/* ── Right rail ───────────────────────────────────────── */}
-      <aside className="space-y-8 min-w-0">
+      <aside className="space-y-8 min-w-0" aria-label="Workspace summary and connection">
         {/* Summary stats */}
-        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
+        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden" aria-labelledby="rail-glance">
           <div className="border-b border-border px-4 py-2">
-            <span className="coord-ink">At a glance</span>
+            <h2 id="rail-glance" className="coord-ink">At a glance</h2>
           </div>
           <dl className="divide-y divide-border">
-            <RailStat label="Vaults" value={vaults.length} to="/#vaults" />
-            <RailStat
-              label="Tokens"
-              value={pats.length}
-              to="/settings?tab=tokens"
-            />
+            <RailStat label="Vaults" value={vaults.length} />
+            <RailStat label="Tokens" value={pats.length} />
             <RailStat
               label="Recent"
               value={recentCapped ? `${RECENT_LIMIT}+` : recent.length}
-              to="/#recent"
             />
           </dl>
         </section>
 
         {/* Connect — always open. Mint + snippet tabs kept; prompt examples
             moved to docs-territory since they're one-time guidance. */}
-        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
+        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden" aria-labelledby="rail-connect">
           <div className="flex items-baseline justify-between gap-2 px-4 py-3">
-            <span className="coord-ink">Connect</span>
+            <h2 id="rail-connect" className="coord-ink">Connect</h2>
             <div className="flex items-baseline gap-3">
               {pats.length > 0 ? (
                 <span className="coord tabular-nums">{pats.length}</span>
@@ -604,6 +602,7 @@ export default function HomePage() {
         </section>
       </aside>
       </div>
+      )}
 
       <ConfirmDialog
         open={pendingRevoke !== null}
@@ -620,68 +619,56 @@ export default function HomePage() {
           await loadPATs();
         }}
       />
-
-      <QuickstartDialog
-        open={quickstartOpen}
-        onOpenChange={setQuickstartOpen}
-        onTokenCreated={loadPATs}
-      />
     </div>
   );
 }
 
 /**
- * Compact stats cell: icon + count per non-empty category. Blank while
- * metrics are loading; "—" when the vault has no content. Icons replace
- * the "DOCS / TABLES / FILES" labels to keep the cell narrow and scannable.
+ * Primary "write something" action. Creating a vault is rare/structural;
+ * writing a document is the daily job, so this is the marquee accent CTA.
+ * One vault → straight to its new-doc form; several → a small vault picker.
  */
-function VaultStatsCell({ m }: { m?: VaultMetrics }) {
-  if (!m) {
+function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
+  if (vaults.length === 1) {
     return (
-      <span
-        className="coord tabular-nums whitespace-nowrap self-baseline"
-        aria-hidden
-      />
-    );
-  }
-  const d = m.document_count ?? 0;
-  const t = m.table_count ?? 0;
-  const f = m.file_count ?? 0;
-  const title = `${d} document${d === 1 ? "" : "s"} · ${t} table${t === 1 ? "" : "s"} · ${f} file${f === 1 ? "" : "s"}`;
-  if (d + t + f === 0) {
-    return (
-      <span
-        className="coord tabular-nums whitespace-nowrap self-baseline"
-        title={title}
-      >
-        —
-      </span>
+      <Button asChild variant="accent" size="md">
+        <Link to={`/vault/${vaults[0].name}/doc/new`}>
+          <FilePlus className="h-4 w-4" aria-hidden />
+          New document
+        </Link>
+      </Button>
     );
   }
   return (
-    <span
-      className="coord tabular-nums whitespace-nowrap self-baseline inline-flex items-center gap-2"
-      title={title}
-    >
-      {d > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <FileText className="h-3 w-3" aria-hidden />
-          {d}
-        </span>
-      )}
-      {t > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <TableIcon className="h-3 w-3" aria-hidden />
-          {t}
-        </span>
-      )}
-      {f > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <FileIcon className="h-3 w-3" aria-hidden />
-          {f}
-        </span>
-      )}
-    </span>
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <Button variant="accent" size="md">
+          <FilePlus className="h-4 w-4" aria-hidden />
+          New document
+          <ChevronDown className="h-4 w-4 opacity-80" aria-hidden />
+        </Button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={6}
+          className="z-50 max-h-[60vh] overflow-y-auto min-w-[220px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+        >
+          <div className="px-3 py-1.5 coord">Choose a vault</div>
+          {vaults.map((v) => (
+            <DropdownMenu.Item key={v.id} asChild>
+              <Link
+                to={`/vault/${v.name}/doc/new`}
+                className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none rounded-[var(--radius-sm)] data-[highlighted]:bg-surface-hover"
+              >
+                <FileText className="h-4 w-4 text-foreground-muted" aria-hidden />
+                <span className="truncate">{v.name}</span>
+              </Link>
+            </DropdownMenu.Item>
+          ))}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }
 
