@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2 } from "lucide-react";
+import { ArrowLeft, Compass, GitGraph, Search as SearchIcon, Share2, Users } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -99,7 +99,17 @@ export function TitleBar({
   );
 }
 
-export type VaultPageKind = "overview" | "search" | "graph" | "publish";
+// `settings`/`activity` have no top-level tab (reached via the overview action
+// row + breadcrumb) but are listed so they no longer fall through to
+// `overview` and mis-light its tab.
+export type VaultPageKind =
+  | "overview"
+  | "search"
+  | "graph"
+  | "publish"
+  | "members"
+  | "settings"
+  | "activity";
 
 interface VaultActionsProps {
   vault: string;
@@ -111,6 +121,7 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
     ["overview", "Overview", `/vault/${vault}`, Compass],
     ["search", "Search", `/vault/${vault}/search`, SearchIcon],
     ["graph", "Graph", `/vault/${vault}/graph`, GitGraph],
+    ["members", "Members", `/vault/${vault}/members`, Users],
     ["publish", "Publish", `/vault/${vault}/publications`, Share2],
   ];
   return (
@@ -123,7 +134,7 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
             to={href}
             aria-current={active ? "page" : undefined}
             className={cn(
-              "inline-flex items-center gap-1 px-2.5 h-7 rounded-[var(--radius-sm)] border transition-token",
+              "inline-flex items-center gap-1 px-2.5 h-9 rounded-[var(--radius-sm)] border transition-token",
               "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
               // Selection is teal app-wide — no per-tab orange special-case.
               active

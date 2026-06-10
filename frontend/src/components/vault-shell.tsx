@@ -95,19 +95,39 @@ export function VaultShell() {
     if (tableMatch) return [...base, { label: `table · ${decodeURIComponent(tableMatch[1])}` }];
     const fileMatch = location.pathname.match(/^\/vault\/[^/]+\/file\/(.+)$/);
     if (fileMatch) return [...base, { label: `file · ${decodeURIComponent(fileMatch[1]).slice(0, 16)}` }];
+    // Named section sub-routes — label the current location so the breadcrumb's
+    // last (aria-current) crumb isn't the vault name itself on these pages.
+    const SECTION_LABELS: Record<string, string> = {
+      settings: "Settings",
+      members: "Members",
+      activity: "Activity",
+      search: "Search",
+      publications: "Publications",
+    };
+    const tail = location.pathname.split("/").pop() || "";
+    if (SECTION_LABELS[tail]) return [...base, { label: SECTION_LABELS[tail] }];
     return base;
   }, [name, location.pathname]);
 
   const isGraph = location.pathname.endsWith("/graph");
   const isPublications = location.pathname.endsWith("/publications");
   const isSearch = location.pathname.endsWith("/search");
+  const isMembers = location.pathname.endsWith("/members");
+  const isSettings = location.pathname.endsWith("/settings");
+  const isActivity = location.pathname.endsWith("/activity");
   const page: VaultPageKind = isGraph
     ? "graph"
     : isPublications
       ? "publish"
       : isSearch
         ? "search"
-        : "overview";
+        : isMembers
+          ? "members"
+          : isSettings
+            ? "settings"
+            : isActivity
+              ? "activity"
+              : "overview";
 
   // Graph owns the full canvas — the tree is redundant there.
   const showTree = visible && !isGraph;
