@@ -21,6 +21,25 @@ export function slugify(text: string): string {
 }
 
 /**
+ * Strip a leading YAML frontmatter block (`---\n…\n---`) from a body.
+ *
+ * The server-managed frontmatter is removed before content reaches us, but
+ * some documents carry a *second*, author-embedded frontmatter block inside
+ * their body (e.g. distilled docs whose source already had one). That inner
+ * block survives stripping, and its closing `---` would otherwise be read as
+ * a setext underline — turning the last `tags: […]` / `key: value` line into
+ * a spurious heading in both the outline and the rendered body. Removing the
+ * block at the source keeps every consumer (outline, renderer, slug queue)
+ * consistent. Only a block at the very start counts as frontmatter; a `---`
+ * thematic break later in the body is untouched.
+ */
+export function stripFrontmatter(md: string): string {
+  if (!md) return md;
+  const m = /^\uFEFF?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(md);
+  return m ? md.slice(m[0].length) : md;
+}
+
+/**
  * Extract ATX (`# Title`) and setext (`Title\n===`) headings from raw
  * markdown. Fenced code blocks are ignored so `# comment` inside a snippet
  * doesn't pollute the outline, and slugs are made unique by appending
@@ -31,7 +50,7 @@ export function slugify(text: string): string {
  */
 export function parseHeadings(md: string): Heading[] {
   if (!md) return [];
-  const lines = md.split("\n").map((l) => l.replace(/\r$/, ""));
+  const lines = stripFrontmatter(md).split("\n").map((l) => l.replace(/\r$/, ""));
   const seen = new Map<string, number>();
   const out: Heading[] = [];
   let inFence = false;
