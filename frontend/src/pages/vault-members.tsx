@@ -156,7 +156,7 @@ export default function VaultMembersPage() {
       </div>
 
       <div className="coord mb-3">
-        Vault · <span className="font-mono">{name}</span> · Members
+        Vault · <span className="text-foreground">{name}</span> · Members
       </div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-2">
         Members

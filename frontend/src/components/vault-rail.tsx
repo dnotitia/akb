@@ -208,7 +208,7 @@ export function VaultRail({
                   )}
                 >
                   <Box className="h-3.5 w-3.5 shrink-0" aria-hidden />
-                  <span title={v.name} className="font-mono truncate">
+                  <span title={v.name} className="truncate">
                     {v.name}
                   </span>
                 </Link>

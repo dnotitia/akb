@@ -142,7 +142,7 @@ export function CreateCollectionDialog({
           <DialogTitle>New collection</DialogTitle>
           <DialogDescription>
             Create a new collection in{" "}
-            <span className="font-mono font-semibold text-foreground">{vault}</span>.
+            <span className="font-semibold text-foreground">{vault}</span>.
             Paths may be nested (e.g. <span className="font-mono">specs/api</span>).
           </DialogDescription>
         </DialogHeader>

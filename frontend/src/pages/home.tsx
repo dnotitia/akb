@@ -313,7 +313,7 @@ export default function HomePage() {
                       </div>
                       <span className="flex items-center gap-1.5 shrink-0 max-w-[150px]" title={c.vault}>
                         <VaultChip name={c.vault} size="sm" />
-                        <span className="truncate font-mono text-xs text-foreground-muted">{c.vault}</span>
+                        <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
                       </span>
                       {fresh ? (
                         <span className="inline-flex items-center justify-end gap-1 text-right text-[11px] font-medium tabular-nums text-accent-strong">

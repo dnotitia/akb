@@ -85,7 +85,7 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
                 <VaultChip name={v.name} size="md" />
                 <div className="min-w-0 pr-4">
                   <div className="flex items-baseline gap-2 flex-wrap mb-0.5">
-                    <span className="font-mono text-base font-semibold text-foreground group-hover:text-primary transition-colors">
+                    <span className="text-base font-semibold text-foreground group-hover:text-primary transition-colors">
                       {v.name}
                     </span>
                     {v.status === "archived" && <Badge variant="archived">archived</Badge>}

@@ -190,17 +190,19 @@ an `sr-only` summary, never the only signal.
 | Family | Var | Used for |
 |---|---|---|
 | **Pretendard Variable** (bundled npm webfont) | `--font-sans` / `--font-display` | all UI, headings, masthead |
-| **JetBrains Mono Variable** | `--font-mono` | code, vault names, coord labels, tabular columns |
+| **JetBrains Mono Variable** | `--font-mono` | code/secrets, `akb://` URIs, ids/hashes, tabular figures |
 
 - **Body = `text-sm` (14px).** Headings via `font-display` (Pretendard 600/700,
   tight tracking, `text-foreground` — not pure black). Weights: **400 / 500 /
   600 / 700**.
 - **Numbers in tables/lists/stats: `tabular-nums`** (prevents async jitter), in
   Pretendard — not monospace, and **not zero-padded** (`1`, not `01`).
-- **An identifier reads `font-mono` on every surface.** A vault name / id / ref
-  stays mono wherever it appears — as a row's primary name *and* as a secondary
-  chip inside another list — so the same entity never flips between mono and sans.
-  Prose like a document *title* is sans; only identifiers are mono.
+- **Mono is for technical refs, not display names.** Code/secrets, `akb://`
+  URIs, doc ids, and commit hashes read `font-mono`. A vault/collection **name**
+  is a human display name — it reads sans (Pretendard) like the H1, breadcrumb,
+  and tree, so it never flips between mono and sans across surfaces. (The one
+  exception: a delete-to-confirm input whose target string must be typed
+  *exactly* may render that string mono.)
 - **Retired the legacy "§ coordinate" terminal/newspaper layer.** No `§` glyphs,
   no all-caps section eyebrows, no wide letter-tracking, no editorial `word.`
   mastheads (a lone colored period / italic colored last word). Section labels

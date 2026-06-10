@@ -371,7 +371,7 @@ export default function SearchPage() {
       {scopedVault && (
         <div className="flex items-center gap-3 text-xs mb-6">
           <span className="coord">Scope</span>
-          <span className="font-mono text-foreground">{scopedVault}</span>
+          <span className="text-foreground">{scopedVault}</span>
           <Link
             to={`/search${q ? `?q=${encodeURIComponent(q)}${mode !== "dense" ? `&mode=${mode}` : ""}` : ""}`}
             className="ml-auto inline-flex items-center gap-1 text-foreground-muted hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
