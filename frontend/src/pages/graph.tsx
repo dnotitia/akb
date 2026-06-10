@@ -178,20 +178,23 @@ export default function GraphPage() {
           onCollapse={() => setSidebarOpen(false)}
         />
       ) : (
-        // Collapsed rail: the sole "expand" affordance. The matching
-        // "collapse" control lives in the sidebar header (GraphSidebar
-        // onCollapse) so there is exactly one toggle, always on the left.
-        <div className="flex flex-col items-center">
+        // Collapsed: a thin strip with just the expand toggle at the top —
+        // the same pattern as the workspace tree column's collapsed strip, so
+        // collapsing the graph controls feels identical to collapsing the tree.
+        <nav
+          aria-label="Graph controls (collapsed)"
+          className="h-full w-10 flex flex-col items-center py-2"
+        >
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
-            aria-label="Show sidebar"
-            title="Show sidebar"
-            className="h-9 w-9 m-2 inline-flex items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Show graph controls"
+            title="Show graph controls"
+            className="flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
           >
-            <PanelLeftOpen className="h-4 w-4" />
+            <PanelLeftOpen className="h-4 w-4" aria-hidden />
           </button>
-        </div>
+        </nav>
       )}
 
       <div className="relative bg-background overflow-hidden">

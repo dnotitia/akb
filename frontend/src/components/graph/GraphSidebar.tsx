@@ -122,16 +122,16 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
       aria-label="Graph controls"
     >
       {onCollapse && (
-        <div className="flex items-center justify-between h-9 px-2 border-b border-border shrink-0">
-          <span className="coord text-foreground-muted">Graph</span>
+        <div className="flex items-center justify-between h-9 px-3 border-b border-border shrink-0">
+          <span className="coord-ink">Graph</span>
           <button
             type="button"
             onClick={onCollapse}
-            aria-label="Hide sidebar"
-            title="Hide sidebar"
-            className="inline-flex h-6 w-6 items-center justify-center text-foreground-muted hover:text-foreground hover:bg-surface-hover cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Collapse graph controls"
+            title="Collapse graph controls"
+            className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
-            <PanelLeftClose className="h-3.5 w-3.5" />
+            <PanelLeftClose className="h-4 w-4" aria-hidden />
           </button>
         </div>
       )}
