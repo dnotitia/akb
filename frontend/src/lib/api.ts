@@ -409,6 +409,8 @@ export interface ActivityEntry {
   hash?: string;
   agent?: string;
   author?: string;
+  /** Resolved human author name (the raw agent/author is the actor's UUID). */
+  author_name?: string;
   subject?: string;
   summary?: string;
   timestamp?: string;

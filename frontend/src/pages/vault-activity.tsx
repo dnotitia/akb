@@ -39,7 +39,7 @@ export default function VaultActivityPage() {
     if (!entries) return [];
     const counts = new Map<string, number>();
     for (const e of entries) {
-      const a = e.agent || e.author;
+      const a = e.author_name || e.agent || e.author;
       if (a) counts.set(a, (counts.get(a) || 0) + 1);
     }
     return Array.from(counts.entries())
@@ -105,7 +105,7 @@ export default function VaultActivityPage() {
                 onClick={() => setAuthor(a)}
                 className="inline-flex items-baseline gap-1 px-2 py-1 rounded-[var(--radius-md)] border border-border text-xs hover:border-border-strong hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
-                <span className="font-mono">{a}</span>
+                <span>{a}</span>
                 <span className="coord tabular-nums">{n}</span>
               </button>
             ))}
@@ -145,12 +145,12 @@ export default function VaultActivityPage() {
                   <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
                     {(e.hash || "").slice(0, 7)}
                   </span>
-                  <span title={e.agent || e.author || "unknown"} className="font-mono text-xs text-foreground truncate">
+                  <span title={e.author_name || e.agent || e.author || "unknown"} className="text-xs text-foreground truncate">
                     <GitCommit
                       className="inline-block h-3 w-3 mr-1 text-info -translate-y-px"
                       aria-hidden
                     />
-                    {e.agent || e.author || "unknown"}
+                    {e.author_name || e.agent || e.author || "unknown"}
                   </span>
                   <div className="min-w-0">
                     <div title={e.subject || primary?.path || "(no subject)"} className="text-sm tracking-tight truncate text-foreground group-hover:text-link">

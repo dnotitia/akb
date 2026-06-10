@@ -41,6 +41,8 @@ interface ActivityRow {
   hash?: string;
   agent?: string;
   author?: string;
+  /** Resolved human author name (the raw agent/author is the actor's UUID). */
+  author_name?: string;
   subject?: string;
   summary?: string;
   timestamp?: string;
@@ -322,9 +324,9 @@ export default function VaultPage() {
                         className="group grid grid-cols-[70px_140px_1fr_auto_54px] gap-3 py-1 items-baseline hover:bg-surface-hover -mx-2 px-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         <span className="text-foreground-muted">{(c.hash || "").slice(0, 7)}</span>
-                        <span title={c.agent || c.author || "unknown"} className="text-foreground truncate">
+                        <span title={c.author_name || c.agent || c.author || "unknown"} className="text-foreground truncate">
                           <span className="text-info">◆ </span>
-                          {c.agent || c.author || "unknown"}
+                          {c.author_name || c.agent || c.author || "unknown"}
                         </span>
                         <span title={c.subject || filePath} className="text-foreground truncate">
                           {c.subject || filePath}
