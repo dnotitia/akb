@@ -57,8 +57,16 @@ LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
 
 # Matches markdown links: [text](target)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-# Matches akb:// URIs anywhere in text
-_AKB_URI_RE = re.compile(r"akb://[^\s\)>`]+")
+# Matches Obsidian-style wikilinks: [[target]] or [[target|alias]]. Only the
+# target (before the first '|') is the link; the rest is display text. The
+# inner run cannot contain '[' or ']'.
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
+# Matches akb:// URIs anywhere in text. Stops at whitespace, ) > ` AND the
+# wikilink/alias delimiters [ ] | — so a bare-URI scan over a wikilink like
+# `[[akb://…/x.md|Label]]` yields `akb://…/x.md`, not `akb://…/x.md|Label`
+# (the bug where the alias's first word got glued onto the target path,
+# producing an edge to a non-existent doc that no graph node could match).
+_AKB_URI_RE = re.compile(r"akb://[^\s\)\]\[\|>`]+")
 # Code spans — fenced blocks (``` / ~~~) and inline (`…`). Anything inside
 # is example/snippet text, NOT a real link: a session report quoting
 # `akb://project-akb/...`, a regex example `akb://\1/coll/\2/doc/\3`, or a
@@ -89,16 +97,18 @@ def extract_markdown_links(content: str) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
 
-    for match in _MD_LINK_RE.finditer(content):
-        target = match.group(2).strip()
-        if target.startswith(("http://", "https://", "mailto:", "#")):
-            continue
+    def _add(raw: str) -> None:
+        """Normalize one link target and append it (deduped). Filters
+        external URLs / anchors; keeps akb:// URIs verbatim; strips a
+        leading './' and any '#fragment' from relative paths."""
+        target = raw.strip()
+        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+            return
         if target.startswith("akb://"):
             if target not in seen:
                 targets.append(target)
                 seen.add(target)
-            continue
-        # Normalize relative paths
+            return
         target = target.lstrip("./")
         if "#" in target:
             target = target.split("#")[0]
@@ -106,7 +116,17 @@ def extract_markdown_links(content: str) -> list[str]:
             targets.append(target)
             seen.add(target)
 
-    # Also find bare akb:// URIs in body (not inside markdown links)
+    # [text](target)
+    for match in _MD_LINK_RE.finditer(content):
+        _add(match.group(2))
+
+    # [[target]] / [[target|alias]] — the alias after '|' is display text,
+    # not part of the link, so keep only the target. Without this the
+    # alias leaked into the target (see _AKB_URI_RE note above).
+    for match in _WIKILINK_RE.finditer(content):
+        _add(match.group(1).split("|", 1)[0])
+
+    # Also find bare akb:// URIs in body (not inside a markdown / wiki link)
     for match in _AKB_URI_RE.finditer(content):
         uri = match.group(0)
         if uri not in seen:
@@ -760,10 +780,34 @@ async def _store_edge(
             )
             return False
         target_type = parsed.kind
-        # Rebuild from parsed parts so surface variants (extra slash,
-        # coll prefix shape) of the same target collapse under the
-        # edges uniqueness convention — otherwise ON CONFLICT can't dedupe.
         ident = parsed.identifier or ""
+        # Resolve the target's vault (edges may cross vaults) so existence
+        # is checked against the right catalog.
+        target_vault_id = await conn.fetchval(
+            "SELECT id FROM vaults WHERE name = $1", parsed.vault,
+        )
+        if target_vault_id is None:
+            logger.debug(
+                "Skipping edge to %r: target vault %r not found",
+                target_ref, parsed.vault,
+            )
+            return False
+        # Validate the target EXISTS before storing — via the SAME
+        # `_resource_exists` primitive the explicit akb_link path uses, so
+        # the two link paths validate identically (they differ only in
+        # policy: akb_link returns NOT_FOUND, extraction silently skips).
+        # An implicit edge to a non-existent resource can never be drawn and
+        # only pollutes the graph — e.g. a wikilink whose alias leaked into
+        # the path (`…/x.md|Label`), or a forward reference to a doc never
+        # created. The extraction path used to skip this check, which is how
+        # the malformed targets got persisted.
+        if not await _resource_exists(conn, target_vault_id, parsed.kind, ident):
+            logger.debug(
+                "Skipping edge to nonexistent %s %r", parsed.kind, target_ref,
+            )
+            return False
+        # Rebuild from parsed parts so surface variants collapse under the
+        # edges uniqueness convention — otherwise ON CONFLICT can't dedupe.
         if parsed.kind == "doc":
             target_uri = doc_uri(parsed.vault, ident)
         elif parsed.kind == "table":

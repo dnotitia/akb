@@ -5,6 +5,22 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.8 — 2026-06-10  *(patch — knowledge graph: wikilink-alias edge corruption + implicit-edge existence validation)*
+
+Body-link extraction had **no handling for Obsidian wikilinks** `[[target|alias]]`. The greedy bare-`akb://` scan (`_AKB_URI_RE`) then swallowed the alias's first word onto the target — a References line like `[[akb://v/coll/decisions/doc/x.md|PWC Query Performance Optimization]]` produced the edge target `akb://v/coll/decisions/doc/x.md|PWC` (matching stopped at the first space). One bug, two symptoms:
+
+- **Relations panel / `akb_relations`** returned the malformed URI, so "related to" navigation built a broken `…/x.md%7CPWC` link to a non-existent doc.
+- **Graph drew no edges** — the corrupted target matched no document node, so every body-derived edge was silently un-drawable. A vault whose only relations were wikilinks showed all nodes, zero edges.
+
+Three-part fix:
+
+1. **Parser** (`extract_markdown_links`): added a wikilink matcher `[[target|alias]]` that keeps only the target (alias is display text), and tightened `_AKB_URI_RE` to stop at `|`, `[`, `]` so the bare-URI fallback can no longer absorb an alias or a closing `]]`.
+2. **Existence validation** (`_store_edge`): the implicit extraction path now validates the target **exists** before storing — via the *same* `_resource_exists` primitive the explicit `akb_link` path uses (the two paths differ only in policy: `akb_link` returns `NOT_FOUND`, extraction silently skips). An implicit edge to a non-existent resource can never be drawn and only pollutes the graph; previously the URI branch skipped this check, which is how the malformed targets persisted. *Note:* a frontmatter `depends_on` / `related_to` (or body link) whose target does not yet exist is now dropped rather than stored as a dangling edge — a deliberate forward-reference is re-materialized on the next index after the target is created.
+3. **Migration 035** (`035_fix_wikilink_alias_edges.py`): repairs rows already persisted — for each edge whose `target_uri` contains `|`, strips to the real target and, if that target resolves, re-inserts the corrected edge (ON CONFLICT DO NOTHING) and drops the corrupted row; orphans whose cleaned target doesn't resolve are dropped. Idempotent.
+
+### Tests
+`tests/test_kg_extract_links_unit.py` gains wikilink coverage: akb:// + alias strips to the clean URI (and asserts no alias fragment leaks), path + alias, alias-less `[[…]]`, the exact historical "stopped at the space" failure shape, bare-scan dedup, and a wikilink inside a code span staying ignored.
+
 ## 0.8.7 — 2026-06-10  *(minor — Keycloak SSO: cross-origin companion-app post-login redirect allowlist)*
 
 A single AKB backend can act as the identity owner for a small family of first-party apps on **different origins** (e.g. reef at `reef-<slug>.<domain>` alongside akb's own `akb-<slug>.<domain>`), each delegating to the *same* tenant Keycloak client instead of registering its own. The blocker was that the SSO post-login redirect was a **single per-instance** `keycloak_post_login_path`: the callback always bounced the one-time code to that one same-site path, and `_safe_redirect_path()` collapsed any cross-origin redirect (open-redirect guard). So akb's own SPA and a companion app could not both complete SSO — they fought over one global path, and pointing `keycloak_post_login_path` at the companion's absolute URL (the earlier workaround) just broke akb's own SPA instead.
