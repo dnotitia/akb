@@ -1,13 +1,22 @@
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, FilePlus, Settings as SettingsIcon, Users } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  FileClock,
+  FilePlus,
+  Settings as SettingsIcon,
+  Users,
+} from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { browseVault, getDocument, getRecent, getVaultActivity, getVaultInfo } from "@/lib/api";
+import { getDocument, getRecent, getVaultActivity, getVaultInfo } from "@/lib/api";
 import { isFresh, timeAgo } from "@/lib/utils";
 import { recentIcon, recentTone } from "@/lib/recent";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Panel } from "@/components/ui/panel";
 import { EmptyState } from "@/components/empty-state";
 import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { useVaultHealth } from "@/hooks/use-vault-health";
@@ -22,13 +31,17 @@ interface VaultInfo {
   is_external_git?: boolean;
   public_access?: "none" | "reader" | "writer";
   member_count?: number;
-}
-
-interface Counts {
-  collections: number;
-  documents: number;
-  tables: number;
-  files: number;
+  owner?: string;
+  owner_display_name?: string;
+  created_at?: string;
+  last_activity?: string;
+  // Authoritative, depth-safe totals from GET /vaults/:name/info — the headline
+  // counts read straight from these (no client-side browse re-derivation).
+  collection_count?: number;
+  document_count?: number;
+  table_count?: number;
+  file_count?: number;
+  edge_count?: number;
 }
 
 interface RecentRow {
@@ -53,15 +66,73 @@ interface ActivityRow {
   files?: Array<{ path: string; change?: string }>;
 }
 
+const fmt = (n: number) => n.toLocaleString();
+
+/** First prose paragraph of the vault-skill doc, frontmatter + headings
+ *  stripped, for the "About this vault" excerpt. */
+function aboutExcerpt(md?: string): string {
+  if (!md) return "";
+  const body = md.replace(/^---\n[\s\S]*?\n---\n/, "");
+  const out: string[] = [];
+  for (const raw of body.split("\n")) {
+    const t = raw.trim();
+    if (!t || t.startsWith("#") || t.startsWith(">")) {
+      if (out.length) break;
+      continue;
+    }
+    out.push(t);
+  }
+  return out.join(" ");
+}
+
+/** A git per-file change → a single-letter mark with a paired color (color is
+ *  never the only signal: the letter carries the meaning, the title the word). */
+function changeMark(change?: string) {
+  if (!change) return null;
+  const map: Record<string, { letter: string; cls: string }> = {
+    added: { letter: "A", cls: "text-success" },
+    modified: { letter: "M", cls: "text-warning" },
+    deleted: { letter: "D", cls: "text-destructive" },
+    renamed: { letter: "R", cls: "text-link" },
+  };
+  const m =
+    map[change.toLowerCase()] ?? {
+      letter: change.slice(0, 1).toUpperCase(),
+      cls: "text-foreground-muted",
+    };
+  return (
+    <span
+      title={change}
+      aria-label={change}
+      className={`inline-flex h-4 w-4 items-center justify-center rounded-[var(--radius-sm)] text-[10px] font-semibold ${m.cls}`}
+    >
+      {m.letter}
+    </span>
+  );
+}
+
+function StatTileSkeleton() {
+  return (
+    <div
+      className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm px-4 py-3.5"
+      aria-hidden
+    >
+      <div className="h-3 w-16 rounded bg-surface-muted animate-pulse mb-2" />
+      <div className="h-7 w-10 rounded bg-surface-muted animate-pulse" />
+    </div>
+  );
+}
+
 export default function VaultPage() {
   const { name } = useParams<{ name: string }>();
   const [info, setInfo] = useState<VaultInfo | null>(null);
-  const [counts, setCounts] = useState<Counts | null>(null);
+  const [infoError, setInfoError] = useState(false);
   const [recent, setRecent] = useState<RecentRow[]>([]);
+  const [recentLoading, setRecentLoading] = useState(true);
+  const [recentError, setRecentError] = useState(false);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [commitsOpen, setCommitsOpen] = useState(false);
   const [commitsLoaded, setCommitsLoaded] = useState(false);
-  const [loadError, setLoadError] = useState(false);
 
   const vaultHealth = useVaultHealth(name);
   // Same shape as the global header: `pending` from the backend includes
@@ -70,10 +141,8 @@ export default function VaultPage() {
   const vUpsert = vaultHealth?.vector_store?.backfill?.upsert;
   const vaultAbandoned: number = vUpsert?.abandoned || 0;
   const vaultPending: number | null = vaultHealth
-    ? Math.max(
-        0,
-        (vUpsert?.pending || 0) - vaultAbandoned,
-      ) + (vaultHealth.metadata_backfill?.pending || 0)
+    ? Math.max(0, (vUpsert?.pending || 0) - vaultAbandoned) +
+      (vaultHealth.metadata_backfill?.pending || 0)
     : null;
 
   const skillQuery = useQuery({
@@ -86,44 +155,52 @@ export default function VaultPage() {
   const skillLineCount = skillExists
     ? (skillQuery.data!.content || "").split("\n").length
     : undefined;
+  const about = skillExists ? aboutExcerpt(skillQuery.data!.content) : "";
+
+  function loadInfo(vault: string, alive: () => boolean = () => true) {
+    getVaultInfo(vault)
+      .then((d) => alive() && setInfo(d))
+      .catch(() => alive() && setInfoError(true));
+  }
+
+  async function loadRecent(vault: string, alive: () => boolean = () => true) {
+    setRecentLoading(true);
+    setRecentError(false);
+    try {
+      const d = await getRecent(vault, 12);
+      if (!alive()) return;
+      setRecent(d.changes || []);
+    } catch {
+      if (!alive()) return;
+      setRecentError(true);
+    } finally {
+      if (alive()) setRecentLoading(false);
+    }
+  }
 
   useEffect(() => {
     if (!name) return;
     let alive = true;
-    // Reset stale state from previous param before re-fetch resolves.
+    const isAlive = () => alive;
+    // Reset stale state from the previous param before the re-fetch resolves;
+    // the `alive` guard keeps a fast vault switch from clobbering the newer one.
     setInfo(null);
-    setCounts(null);
+    setInfoError(false);
     setRecent([]);
+    setRecentError(false);
+    setRecentLoading(true);
     setActivity([]);
     setCommitsLoaded(false);
     setCommitsOpen(false);
-    setLoadError(false);
-    // A failed overview load must surface (not read as an empty vault); a
-    // fast vault switch must not clobber the newer vault (alive guard).
-    getVaultInfo(name)
-      .then((d) => alive && setInfo(d))
-      .catch(() => alive && setLoadError(true));
-    getRecent(name, 12)
-      .then((d) => alive && setRecent(d.changes || []))
-      .catch(() => alive && setLoadError(true));
-    browseVault(name, undefined, 2)
-      .then((d) => {
-        if (!alive) return;
-        const items = d.items || [];
-        setCounts({
-          collections: items.filter((i: any) => i.type === "collection").length,
-          documents: items.filter((i: any) => i.type === "document").length,
-          tables: items.filter((i: any) => i.type === "table").length,
-          files: items.filter((i: any) => i.type === "file").length,
-        });
-      })
-      .catch(() => alive && setLoadError(true));
-    return () => { alive = false; };
+    loadInfo(name, isAlive);
+    loadRecent(name, isAlive);
+    return () => {
+      alive = false;
+    };
   }, [name]);
 
   async function ensureCommitsLoaded(vault: string) {
     if (commitsLoaded) return;
-    // Use the api() layer (401 redirect + ApiError) instead of a raw fetch.
     try {
       const r = await getVaultActivity(vault, { limit: 20 });
       setActivity(r.activity || []);
@@ -140,13 +217,30 @@ export default function VaultPage() {
     if (next && name) ensureCommitsLoaded(name);
   }
 
+  const canWrite =
+    info?.role === "writer" || info?.role === "admin" || info?.role === "owner";
+
   return (
     <div className="fade-up">
-      {loadError && (
+      {infoError && (
         <Alert variant="destructive" className="mb-4">
-          Couldn't load this vault's overview. Reload the page to retry.
+          Could not load this vault's details. Some information may be missing.
+          <div className="mt-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setInfoError(false);
+                setInfo(null);
+                if (name) loadInfo(name);
+              }}
+            >
+              Try again
+            </Button>
+          </div>
         </Alert>
       )}
+
       {/* Meta line — one identity only (the H1 below states the name; the
           breadcrumb says "where am I"), so don't print the name a third time:
           just the label + the canonical mono URI. */}
@@ -159,13 +253,49 @@ export default function VaultPage() {
         {name}
       </h1>
 
-      {info?.description && (
+      {info?.description ? (
         <p className="text-[16px] leading-[1.55] text-foreground-muted mb-1 max-w-2xl">
           {info.description}
         </p>
-      )}
+      ) : info === null && !infoError ? (
+        <div
+          className="mb-1 h-4 max-w-md rounded bg-surface-muted animate-pulse"
+          aria-hidden
+        />
+      ) : null}
 
-      {/* Meta badges row */}
+      {/* Vitality line — who owns it, how old, how alive. Display names are
+          sans (not mono); last_active_user is a raw UUID server-side so it's
+          intentionally omitted until the endpoint resolves it. Segments join
+          with a "·" only BETWEEN present items (no dangling leading dot when,
+          e.g., the owner has no display name yet). */}
+      {(() => {
+        if (!info) return null;
+        const segs: ReactNode[] = [];
+        if (info.owner_display_name)
+          segs.push(
+            <>
+              Owned by{" "}
+              <span className="text-foreground">{info.owner_display_name}</span>
+            </>,
+          );
+        if (info.created_at) segs.push(<>Created {timeAgo(info.created_at)}</>);
+        if (info.last_activity)
+          segs.push(<>Last active {timeAgo(info.last_activity)}</>);
+        if (!segs.length) return null;
+        return (
+          <div className="coord mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+            {segs.map((s, i) => (
+              <span key={i} className="flex items-center gap-x-2">
+                {i > 0 && <span aria-hidden>·</span>}
+                <span>{s}</span>
+              </span>
+            ))}
+          </div>
+        );
+      })()}
+
+      {/* Identity pills — what this vault IS. */}
       <div className="flex flex-wrap items-center gap-2 mt-4">
         {info?.role && <RoleBadge role={info.role} />}
         <VaultStateBadge
@@ -177,160 +307,257 @@ export default function VaultPage() {
         {!skillQuery.isLoading && (
           <SkillStatusChip vault={name!} defined={skillExists} lineCount={skillLineCount} />
         )}
-        <div className="ml-auto flex items-center gap-4">
-          <Link
-            to={`/vault/${name}/members`}
-            className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <Users className="h-3 w-3" aria-hidden />
-            Members
-            {info?.member_count !== undefined && (
-              <span className="tabular-nums">[{info.member_count}]</span>
-            )}
-          </Link>
-          {info?.role === "owner" && (
-            <Link
-              to={`/vault/${name}/settings`}
-              className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              <SettingsIcon className="h-3 w-3" aria-hidden />
-              Settings
-            </Link>
-          )}
-          {(info?.role === "writer" ||
-            info?.role === "admin" ||
-            info?.role === "owner") && (
-            <Button asChild variant="accent" size="md">
-              <Link to={`/vault/${name}/doc/new`}>
-                <FilePlus className="h-4 w-4" aria-hidden />
-                New document
-              </Link>
-            </Button>
-          )}
-        </div>
       </div>
 
-      {/* Ledger — 4-stat tiles. The label already names the category, so no
-          jargon unit row (dirs/md/rows/bytes); 0-value tiles recede. */}
+      {/* Actions — what you can DO. Secondary nav on the left, the single
+          marquee CTA on the right; kept distinct from the identity pills above
+          so "what it is" never reads as "what to do". */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4">
+        <Link
+          to={`/vault/${name}/members`}
+          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
+        >
+          <Users className="h-3 w-3" aria-hidden />
+          Members
+          {info?.member_count !== undefined && (
+            <span className="tabular-nums">[{fmt(info.member_count)}]</span>
+          )}
+        </Link>
+        {info?.role === "owner" && (
+          <Link
+            to={`/vault/${name}/settings`}
+            className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
+          >
+            <SettingsIcon className="h-3 w-3" aria-hidden />
+            Settings
+          </Link>
+        )}
+        {canWrite && !info?.is_archived && (
+          <Button asChild variant="accent" size="md" className="ml-auto">
+            <Link to={`/vault/${name}/doc/new`}>
+              <FilePlus className="h-4 w-4" aria-hidden />
+              New document
+            </Link>
+          </Button>
+        )}
+      </div>
+
+      {/* Archived vaults are hard read-only server-side, so the write CTA above
+          is withheld — say why rather than routing into a guaranteed failure. */}
+      {info?.is_archived && (
+        <Alert variant="info" className="mt-4">
+          This vault is archived — content is read-only. Existing documents stay
+          browsable; new writes are disabled.
+        </Alert>
+      )}
+
+      {/* About — the vault-skill doc is the best answer to "what is this vault
+          for", so surface its opening on the read-first landing. */}
+      {skillExists && about && (
+        <div className="mt-6 rounded-[var(--radius-lg)] border border-border bg-surface/60 px-4 py-3">
+          <div className="flex items-baseline justify-between gap-3 mb-1.5">
+            <span className="coord-ink">About this vault</span>
+            <Link
+              to={`/vault/${name}/doc/${encodeURIComponent("overview/vault-skill.md")}`}
+              className="coord shrink-0 inline-flex items-center min-h-[28px] hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              Vault skill ↗
+            </Link>
+          </div>
+          <p className="text-sm leading-relaxed text-foreground-muted line-clamp-2">
+            {about}
+          </p>
+        </div>
+      )}
+
+      {/* Ledger — 4-stat tiles read from the authoritative, depth-safe counts
+          in /info. Skeletons reserve the height so the tiles don't pop in. The
+          label already names the category, so no jargon unit row; 0 recedes. */}
       <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-3">
-        {counts &&
+        {info ? (
           (
             [
-              ["Collections", counts.collections],
-              ["Documents", counts.documents],
-              ["Tables", counts.tables],
-              ["Files", counts.files],
+              ["Collections", info.collection_count ?? 0],
+              ["Documents", info.document_count ?? 0],
+              ["Tables", info.table_count ?? 0],
+              ["Files", info.file_count ?? 0],
             ] as Array<[string, number]>
           ).map(([label, value]) => (
-            <StatTile key={label} label={label} value={value} dimZero />
-          ))}
+            <StatTile key={label} label={label} value={fmt(value)} dimZero />
+          ))
+        ) : infoError ? null : (
+          Array.from({ length: 4 }).map((_, i) => <StatTileSkeleton key={i} />)
+        )}
       </div>
 
       {/* Recent writes — primary. Same grammar as the Home dashboard's Recent
-          activity (type-tinted leading chip + fresh-token spark) so a change
-          reads identically across the app. Single-vault context here, so no
-          per-row VaultChip; the git commit ref stays (demoted) since the href
-          is commit-pinned. */}
-      <section className="mt-10" aria-labelledby="recent-heading">
+          activity (loading flag → skeleton, type-tinted leading chip,
+          fresh-token spark, card-hover lift) so a change reads identically
+          across the app. Single-vault context here, so no per-row VaultChip;
+          the git commit ref stays (demoted) since the href is commit-pinned. */}
+      <section
+        className="mt-10"
+        aria-labelledby="recent-heading"
+        aria-busy={recentLoading}
+      >
         <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
           <h2 id="recent-heading" className="text-xl font-semibold tracking-tight">
             Recent activity
           </h2>
-          {recent.length > 0 && (
-            <Badge variant="default" className="tabular-nums">{recent.length}</Badge>
+          {!recentLoading && !recentError && recent.length > 0 && (
+            <Badge variant="default" className="tabular-nums">
+              {recent.length}
+            </Badge>
           )}
         </div>
+        <span className="sr-only" role="status" aria-live="polite">
+          {recentLoading
+            ? "Loading recent activity"
+            : recentError
+              ? "Could not load recent activity"
+              : `${recent.length} recent change${recent.length === 1 ? "" : "s"}`}
+        </span>
 
-        {recent.length === 0 ? (
+        {recentLoading ? (
+          <Panel aria-hidden>
+            <ul className="divide-y divide-border">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <li key={i} className="flex items-center gap-3 px-3 py-2.5">
+                  <span className="h-5 w-5 rounded bg-surface-muted shrink-0" />
+                  <span className="h-3 flex-1 rounded bg-surface-muted" />
+                  <span className="h-2.5 w-14 rounded bg-surface-muted" />
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        ) : recentError ? (
           <EmptyState
-            title="No activity yet"
-            description="Documents written via agent will appear here."
+            icon={
+              <span className="feature-tile feat-neutral h-14 w-14">
+                <AlertTriangle className="h-6 w-6" aria-hidden />
+              </span>
+            }
+            title="Couldn't load recent activity"
+            description="Something went wrong fetching this vault's latest changes."
+            action={
+              <Button variant="outline" size="sm" onClick={() => name && loadRecent(name)}>
+                Retry
+              </Button>
+            }
+          />
+        ) : recent.length === 0 ? (
+          <EmptyState
+            icon={
+              <span className="feature-tile feat-knowledge h-14 w-14">
+                <FileClock className="h-6 w-6" aria-hidden />
+              </span>
+            }
+            title="Nothing written yet"
+            description="Document writes in this vault will appear here."
           />
         ) : (
-          <ol className="rounded-[var(--radius-lg)] border border-border bg-surface divide-y divide-border overflow-hidden shadow-sm stagger">
-            {recent.map((c, i) => {
-              const Icon = recentIcon(c.type);
-              const tone = recentTone(c.type);
-              const fresh = isFresh(c.changed_at);
-              return (
-              <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
-                <Link
-                  to={
-                    `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
-                    (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
-                  }
-                  className="group grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2.5 hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                >
-                  <span
-                    className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
-                    style={{
-                      color: tone,
-                      backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
-                    }}
-                    aria-hidden
-                  >
-                    <Icon className="h-3 w-3" aria-hidden />
-                  </span>
-                  <div className="min-w-0">
-                    <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link">
-                      {c.title}
-                    </div>
-                    <div title={c.path} className="coord truncate">{c.path}</div>
-                  </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    {c.commit && (
+          <Panel inset={false}>
+            {/* inset={false} so a hovered row's lift + shadow aren't clipped;
+                the end rows are re-rounded to keep the divided-panel look. */}
+            <ol className="divide-y divide-border stagger [&>li:first-child>a]:rounded-t-[var(--radius-lg)] [&>li:last-child>a]:rounded-b-[var(--radius-lg)]">
+              {recent.map((c, i) => {
+                const Icon = recentIcon(c.type);
+                const tone = recentTone(c.type);
+                const fresh = isFresh(c.changed_at);
+                return (
+                  <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
+                    <Link
+                      to={
+                        `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
+                        (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
+                      }
+                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2.5 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    >
                       <span
-                        className="coord font-mono tabular-nums"
-                        title={`commit ${c.commit}`}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+                        style={{
+                          color: tone,
+                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                        }}
+                        aria-hidden
                       >
-                        {c.commit.slice(0, 7)}
+                        <Icon className="h-3 w-3" aria-hidden />
                       </span>
-                    )}
-                    {fresh ? (
-                      <span className="inline-flex w-[60px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-accent-strong">
-                        <span className="h-1.5 w-1.5 rounded-full bg-accent-strong" aria-hidden />
-                        {timeAgo(c.changed_at)}
-                      </span>
-                    ) : (
-                      <span className="coord tabular-nums w-[60px] text-right">
-                        {timeAgo(c.changed_at)}
-                      </span>
-                    )}
-                  </div>
-                </Link>
-              </li>
-              );
-            })}
-          </ol>
+                      <div className="min-w-0">
+                        <div
+                          title={c.title}
+                          className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-link transition-colors"
+                        >
+                          {c.title}
+                        </div>
+                        <div title={c.path} className="coord truncate">
+                          {c.path}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3 shrink-0">
+                        {c.commit && (
+                          <span
+                            className="coord font-mono tabular-nums"
+                            title={`commit ${c.commit}`}
+                          >
+                            {c.commit.slice(0, 7)}
+                          </span>
+                        )}
+                        {fresh ? (
+                          <span className="inline-flex w-[60px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-spark">
+                            <span
+                              className="h-1.5 w-1.5 rounded-full bg-spark"
+                              aria-hidden
+                            />
+                            {timeAgo(c.changed_at)}
+                          </span>
+                        ) : (
+                          <span className="coord tabular-nums w-[60px] text-right">
+                            {timeAgo(c.changed_at)}
+                          </span>
+                        )}
+                      </div>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ol>
+          </Panel>
         )}
       </section>
 
-      {/* Commit log — collapsible (secondary detail) */}
+      {/* Commit log — collapsible (secondary detail). The disclosure label is a
+          real <h2> wrapping the button (accordion pattern) so it shows in the
+          screen-reader heading list. */}
       <section className="mt-8 mb-10" aria-labelledby="commit-log-heading">
-        {/* Disclosure button + the FULL ACTIVITY link are SIBLINGS — a <Link>
+        {/* Disclosure button + the full-history link are SIBLINGS — a <Link>
             nested inside a <button> is invalid HTML and breaks keyboard nav. */}
         <div className="flex items-center gap-2 py-2">
-          <button
-            onClick={toggleCommits}
-            aria-expanded={commitsOpen}
-            aria-controls="commit-log-list"
-            className="flex flex-1 items-center gap-2 text-left text-foreground-muted hover:text-foreground transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            {commitsOpen ? (
-              <ChevronDown className="h-3 w-3" aria-hidden />
-            ) : (
-              <ChevronRight className="h-3 w-3" aria-hidden />
-            )}
-            <span id="commit-log-heading" className="coord-ink">Commit log</span>
-            {commitsLoaded && (
-              <span className="coord tabular-nums">[{activity.length}]</span>
-            )}
-          </button>
+          <h2 className="flex-1 min-w-0">
+            <button
+              onClick={toggleCommits}
+              aria-expanded={commitsOpen}
+              aria-controls="commit-log-list"
+              className="flex w-full items-center gap-2 min-h-[36px] -my-1 text-left text-foreground-muted hover:text-foreground transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              {commitsOpen ? (
+                <ChevronDown className="h-3 w-3" aria-hidden />
+              ) : (
+                <ChevronRight className="h-3 w-3" aria-hidden />
+              )}
+              <span id="commit-log-heading" className="coord-ink">
+                Commit log
+              </span>
+              {commitsLoaded && (
+                <span className="coord tabular-nums">[{fmt(activity.length)}]</span>
+              )}
+            </button>
+          </h2>
           <Link
             to={`/vault/${name}/activity`}
-            className="coord shrink-0 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="coord shrink-0 inline-flex items-center min-h-[36px] -my-1 px-1 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↗ Full activity
+            ↗ Full commit history
           </Link>
         </div>
 
@@ -339,17 +566,22 @@ export default function VaultPage() {
             id="commit-log-list"
             className="mt-2 rounded-[var(--radius-lg)] border border-border bg-surface p-3 overflow-x-auto shadow-sm"
           >
-            <div className="coord mb-2 pb-2 border-b border-border">Head · main</div>
+            <div className="coord mb-2 pb-2 border-b border-border">Latest commits</div>
             {!commitsLoaded ? (
-              <div className="coord" role="status" aria-live="polite">Loading…</div>
+              <div className="coord" role="status" aria-live="polite">
+                Loading…
+              </div>
             ) : activity.length === 0 ? (
-              <div className="coord" role="status">No commits</div>
+              <div className="coord" role="status">
+                No commits
+              </div>
             ) : (
-              <ol className="font-mono text-[11px] leading-[1.9]">
+              <ol className="text-xs leading-relaxed min-w-[520px]">
                 {activity.map((c, i) => {
                   const filePath = c.files?.[0]?.path || c.summary || "";
                   const filesCount = c.files?.length || 0;
                   const change = c.files?.[0]?.change;
+                  const author = c.author_name || c.agent || c.author || "unknown";
                   const primaryDocPath = c.files?.[0]?.path;
                   const link = primaryDocPath
                     ? `/vault/${name}/doc/${encodeURIComponent(primaryDocPath)}` +
@@ -359,23 +591,25 @@ export default function VaultPage() {
                     <li key={i}>
                       <Link
                         to={link}
-                        className="group grid grid-cols-[70px_140px_1fr_auto_54px] gap-3 py-1 items-baseline hover:bg-surface-hover -mx-2 px-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        className="group grid grid-cols-[68px_140px_1fr_20px_56px] gap-3 py-1 items-baseline hover:bg-surface-hover -mx-2 px-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
-                        <span className="text-foreground-muted">{(c.hash || "").slice(0, 7)}</span>
-                        <span title={c.author_name || c.agent || c.author || "unknown"} className="text-foreground truncate">
-                          <span className="text-foreground-muted">· </span>
-                          {c.author_name || c.agent || c.author || "unknown"}
+                        <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
+                          {(c.hash || "").slice(0, 7)}
                         </span>
-                        <span title={c.subject || filePath} className="text-foreground truncate">
+                        <span title={author} className="text-foreground truncate">
+                          {author}
+                        </span>
+                        <span
+                          title={c.subject || filePath}
+                          className="text-foreground truncate"
+                        >
                           {c.subject || filePath}
                           {filesCount > 1 && (
                             <span className="text-foreground-muted"> · +{filesCount - 1}</span>
                           )}
                         </span>
-                        <span className="text-foreground-muted text-[10px] tabular-nums text-right">
-                          {change || ""}
-                        </span>
-                        <span className="text-foreground-muted text-[10px] tabular-nums text-right">
+                        <span className="text-center">{changeMark(change)}</span>
+                        <span className="coord tabular-nums text-right">
                           {timeAgo(c.timestamp)}
                         </span>
                       </Link>
