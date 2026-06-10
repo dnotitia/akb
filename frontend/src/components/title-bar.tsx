@@ -57,30 +57,43 @@ export function TitleBar({
       >
         <ArrowLeft className="h-3 w-3" aria-hidden />
       </button>
-      {crumbs.map((c, i) => (
-        <span key={i} className="flex items-center gap-2.5">
-          {i > 0 && <span className="text-foreground-muted">›</span>}
-          {c.to ? (
-            <Link
-              to={c.to}
-              className={cn(
-                "transition-colors hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-                i === crumbs.length - 1 ? "text-foreground" : "text-foreground-muted",
-              )}
-            >
-              {c.label}
-            </Link>
-          ) : (
-            <span
-              className={cn(
-                i === crumbs.length - 1 ? "text-foreground" : "text-foreground-muted",
-              )}
-            >
-              {c.label}
-            </span>
-          )}
-        </span>
-      ))}
+      {crumbs.length > 0 && (
+        <nav aria-label="Breadcrumb">
+          <ol className="flex items-center gap-2.5">
+            {crumbs.map((c, i) => {
+              const isLast = i === crumbs.length - 1;
+              return (
+                <li key={i} className="flex items-center gap-2.5">
+                  {i > 0 && (
+                    <span className="text-foreground-muted" aria-hidden>
+                      ›
+                    </span>
+                  )}
+                  {c.to ? (
+                    <Link
+                      to={c.to}
+                      aria-current={isLast ? "page" : undefined}
+                      className={cn(
+                        "transition-colors hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+                        isLast ? "text-foreground" : "text-foreground-muted",
+                      )}
+                    >
+                      {c.label}
+                    </Link>
+                  ) : (
+                    <span
+                      aria-current={isLast ? "page" : undefined}
+                      className={cn(isLast ? "text-foreground" : "text-foreground-muted")}
+                    >
+                      {c.label}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        </nav>
+      )}
       {right && <div className="ml-auto flex items-center gap-2">{right}</div>}
     </div>
   );
@@ -101,7 +114,7 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
     ["publish", "Publish", `/vault/${vault}/publications`, Share2],
   ];
   return (
-    <div className="flex items-center gap-1">
+    <nav aria-label="Vault sections" className="flex items-center gap-1">
       {actions.map(([k, label, href, Icon]) => {
         const active = k === page;
         return (
@@ -123,6 +136,6 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
           </Link>
         );
       })}
-    </div>
+    </nav>
   );
 }
