@@ -6,7 +6,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
+import { SelectMenu } from "@/components/ui/select-menu";
 import {
   Tooltip,
   TooltipContent,
@@ -153,17 +153,20 @@ export default function VaultNewPage() {
           <Label htmlFor="vault-template">
             Template <span className="normal-case tracking-normal text-foreground-muted">(optional)</span>
           </Label>
-          <Select
+          <SelectMenu
             id="vault-template"
+            aria-label="Vault template"
             value={selectedTemplate}
-            onChange={(e) => setSelectedTemplate(e.target.value)}
-            className="font-mono"
-          >
-            <option value="">None — empty vault</option>
-            {templates.map((t) => (
-              <option key={t.name} value={t.name}>{t.display_name}</option>
-            ))}
-          </Select>
+            onValueChange={setSelectedTemplate}
+            options={[
+              { value: "", label: "None — empty vault" },
+              ...templates.map((t) => ({
+                value: t.name,
+                label: t.display_name,
+                hint: `${t.collection_count} collection${t.collection_count === 1 ? "" : "s"}`,
+              })),
+            ]}
+          />
           {selectedSummary && (
             <div className="coord">
               {selectedSummary.description}

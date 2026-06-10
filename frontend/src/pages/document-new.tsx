@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, ArrowRight, ChevronRight } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { TagInput } from "@/components/ui/tag-input";
 import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -18,7 +18,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 /** Flatten every collection path in the tree (depth-first) for the
- *  COLLECTION datalist. The tree nests sub-collections under their
+ *  collection picker chips. The tree nests sub-collections under their
  *  parent, so a recursive walk yields the full `a/b/c` paths. */
 function collectCollectionPaths(nodes: TreeNode[], out: string[] = []): string[] {
   for (const node of nodes) {
@@ -35,9 +35,9 @@ export default function DocumentNewPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { tree } = useVaultTree(name);
-  // Existing collections power the picker datalist; new names are still
-  // accepted (the field stays a free-text input — "created automatically
-  // if new").
+  // Existing collections power the one-tap picker chips; new names are still
+  // accepted (the field stays a free-text input — created automatically when
+  // the typed path doesn't exist yet).
   const collectionOptions = useMemo(
     () => Array.from(new Set(collectCollectionPaths(tree ?? []))).sort(),
     [tree],
@@ -59,6 +59,19 @@ export default function DocumentNewPage() {
   const [discardOpen, setDiscardOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
+
+  // Make "pick existing vs. create new" explicit (instead of a native datalist
+  // that hides the choice): offer existing collections as one-tap chips and
+  // say plainly whether the typed path is existing or about to be created.
+  const collectionTrimmed = collection.trim();
+  const isExistingCollection = collectionOptions.includes(collectionTrimmed);
+  const matchingCollections = collectionOptions
+    .filter(
+      (c) =>
+        c !== collectionTrimmed &&
+        c.toLowerCase().includes(collectionTrimmed.toLowerCase()),
+    )
+    .slice(0, 8);
 
   const isDirty =
     title.trim() !== "" ||
@@ -240,31 +253,55 @@ export default function DocumentNewPage() {
               required
               aria-required="true"
               aria-invalid={invalidField === "collection" || undefined}
-              list="doc-collection-options"
+              aria-describedby="doc-collection-status"
               autoComplete="off"
             />
-            <datalist id="doc-collection-options">
-              {collectionOptions.map((c) => (
-                <option key={c} value={c} />
-              ))}
-            </datalist>
-            <p className="text-xs text-foreground-muted">
-              Pick an existing path or type a new one — it's created automatically.
+            {matchingCollections.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {matchingCollections.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => {
+                      setCollection(c);
+                      if (invalidField === "collection") setInvalidField(null);
+                      collectionRef.current?.focus();
+                    }}
+                    className="inline-flex items-center rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 font-mono text-xs text-foreground-muted hover:border-border-strong hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+            )}
+            <p
+              id="doc-collection-status"
+              className="flex items-center gap-1.5 text-xs text-foreground-muted"
+            >
+              {collectionTrimmed === "" ? (
+                "Pick an existing folder, or type a new path to create one."
+              ) : isExistingCollection ? (
+                <>
+                  <Check className="h-3 w-3 text-success" aria-hidden />
+                  Existing collection
+                </>
+              ) : (
+                <>
+                  <FolderPlus className="h-3 w-3 text-foreground" aria-hidden />
+                  <span className="text-foreground">New collection</span> — created on save
+                </>
+              )}
             </p>
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="doc-type">Type</Label>
-            <Select
+            <SelectMenu
               id="doc-type"
+              aria-label="Document type"
               value={type}
-              onChange={(e) => setType(e.target.value as DocType)}
-            >
-              {DOC_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </Select>
+              onValueChange={(v) => setType(v as DocType)}
+              options={DOC_TYPES.map((t) => ({ value: t, label: t }))}
+            />
           </div>
         </div>
 
