@@ -4,6 +4,7 @@ import { ArrowRight, File as FileIcon, FileText, Table as TableIcon } from "luci
 import { getVaultInfo } from "@/lib/api";
 import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
+import { VaultChip } from "@/components/ui/vault-chip";
 import { RoleBadge } from "@/components/status-badge";
 import { timeAgo } from "@/lib/utils";
 
@@ -79,10 +80,11 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
             <li key={v.id}>
               <Link
                 to={`/vault/${v.name}`}
-                className="group grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-4 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                className="group grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
+                <VaultChip name={v.name} size="md" />
                 <div className="min-w-0 pr-4">
-                  <div className="flex items-baseline gap-2 flex-wrap mb-1">
+                  <div className="flex items-baseline gap-2 flex-wrap mb-0.5">
                     <span className="font-mono text-base font-semibold text-foreground group-hover:text-primary transition-colors">
                       {v.name}
                     </span>
@@ -97,11 +99,18 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
                     </p>
                   )}
                 </div>
-                <div className="flex items-center gap-3 shrink-0 self-baseline">
+                <div className="flex items-center gap-3 shrink-0">
                   <VaultStatsCell m={m} />
-                  <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
-                    {lastActivity ? timeAgo(lastActivity) : "—"}
-                  </span>
+                  {m ? (
+                    <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
+                      {lastActivity ? timeAgo(lastActivity) : "—"}
+                    </span>
+                  ) : (
+                    <span
+                      className="h-3 w-[56px] rounded bg-surface-muted animate-pulse"
+                      aria-hidden
+                    />
+                  )}
                   {v.role && <RoleBadge role={v.role} />}
                   <ArrowRight
                     className="h-4 w-4 shrink-0 text-foreground-muted opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 group-hover:text-primary transition-all"
@@ -118,48 +127,77 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
 }
 
 /**
- * Compact stats cell: icon + count per non-empty category. A skeleton bar while
- * metrics load (stable row width, no pop-in); "—" when the vault has no content.
+ * A 4px composition meter — the doc/table/file proportion as a tinted texture
+ * cue (cat-1/cat-3/cat-4), NOT a chart: no axis, no legend, exact counts stay
+ * in the cell's tooltip. Empty vaults show a faint full-width track instead of
+ * a bare dash so the column always reserves its width.
+ */
+function CompositionBar({ d, t, f }: { d: number; t: number; f: number }) {
+  const total = d + t + f;
+  if (total === 0) {
+    return <span className="h-1 w-10 shrink-0 rounded-full bg-surface-muted" aria-hidden />;
+  }
+  const seg = (n: number, color: string) =>
+    n > 0 ? (
+      <span style={{ width: `${(n / total) * 100}%`, backgroundColor: color }} />
+    ) : null;
+  return (
+    <span
+      className="inline-flex h-1 w-10 shrink-0 overflow-hidden rounded-full bg-surface-muted"
+      aria-hidden
+    >
+      {seg(d, "var(--color-cat-1)")}
+      {seg(t, "var(--color-cat-3)")}
+      {seg(f, "var(--color-cat-4)")}
+    </span>
+  );
+}
+
+/**
+ * Compact stats cell: a composition meter + icon/count per non-empty category.
+ * A skeleton bar while metrics load (stable row width, no pop-in); the meter
+ * carries the shape, the counts the exact numbers, the tooltip the full
+ * breakdown.
  */
 function VaultStatsCell({ m }: { m?: VaultMetrics }) {
   if (!m) {
     return (
-      <span className="h-3 w-12 rounded bg-surface-muted animate-pulse self-baseline" aria-hidden />
+      <span className="h-3 w-[88px] rounded bg-surface-muted animate-pulse" aria-hidden />
     );
   }
   const d = m.document_count ?? 0;
   const t = m.table_count ?? 0;
   const f = m.file_count ?? 0;
   const title = `${d} document${d === 1 ? "" : "s"} · ${t} table${t === 1 ? "" : "s"} · ${f} file${f === 1 ? "" : "s"}`;
-  if (d + t + f === 0) {
-    return (
-      <span className="coord tabular-nums whitespace-nowrap self-baseline" title={title}>
-        —
-      </span>
-    );
-  }
   return (
     <span
-      className="coord tabular-nums whitespace-nowrap self-baseline inline-flex items-center gap-2"
+      className="coord tabular-nums whitespace-nowrap inline-flex items-center gap-2"
       title={title}
     >
-      {d > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <FileText className="h-3 w-3" aria-hidden />
-          {d}
-        </span>
-      )}
-      {t > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <TableIcon className="h-3 w-3" aria-hidden />
-          {t}
-        </span>
-      )}
-      {f > 0 && (
-        <span className="inline-flex items-center gap-1">
-          <FileIcon className="h-3 w-3" aria-hidden />
-          {f}
-        </span>
+      <CompositionBar d={d} t={t} f={f} />
+      {d + t + f === 0 ? (
+        <span className="text-foreground-muted">—</span>
+      ) : (
+        <>
+          {d > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <FileText className="h-3 w-3" aria-hidden />
+              {d}
+            </span>
+          )}
+          {t > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <TableIcon className="h-3 w-3" aria-hidden />
+              {t}
+            </span>
+          )}
+          {f > 0 && (
+            <span className="inline-flex items-center gap-1">
+              <FileIcon className="h-3 w-3" aria-hidden />
+              {f}
+            </span>
+          )}
+        </>
       )}
     </span>
   );

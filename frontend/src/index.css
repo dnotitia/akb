@@ -372,6 +372,35 @@ body::before {
     radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.06), transparent 60%);
 }
 
+/* Header-local aurora wash — the global body::before mesh is anchored
+   off-screen at the corners, so the masthead itself reads flat. This brings
+   one teal bloom up from the lower-left + a faint orange kiss from the
+   upper-right onto the actual header band, fading out within its own box.
+   Static (no motion), pointer-events:none, behind the header content (z-0). */
+.aurora-header {
+  position: relative;
+}
+.aurora-header::before {
+  content: "";
+  position: absolute;
+  inset: -1.5rem -1rem auto -1rem;
+  height: 200%;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(30rem 16rem at 10% 115%, rgba(0, 64, 89, 0.07), transparent 62%),
+    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.06), transparent 60%);
+}
+.dark .aurora-header::before {
+  background:
+    radial-gradient(30rem 16rem at 10% 115%, rgba(10, 111, 134, 0.13), transparent 62%),
+    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.1), transparent 60%);
+}
+.aurora-header > * {
+  position: relative;
+  z-index: 1;
+}
+
 /* interactive card: lift + shadow on hover */
 .card-hover {
   transition:

@@ -2,14 +2,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
+  AlertTriangle,
   ArrowRight,
   ChevronDown,
   Copy,
   Eye,
   EyeOff,
   File as FileIcon,
+  FileClock,
   FilePlus,
   FileText,
+  FolderPlus,
   Plus,
   Table as TableIcon,
   Trash2,
@@ -26,6 +29,7 @@ import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
+import { VaultChip } from "@/components/ui/vault-chip";
 import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
@@ -34,7 +38,7 @@ import {
   listPATs,
   revokePAT,
 } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { isFresh, timeAgo } from "@/lib/utils";
 import { mcpInstallSnippets, MCP_AGENT_FILES } from "@/lib/mcp-snippets";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
@@ -61,6 +65,18 @@ function recentIcon(type?: string) {
   if (type === "table" || type === "table_query") return TableIcon;
   if (type === "file") return FileIcon;
   return FileText;
+}
+
+// Leading-glyph tint by kind, from the categorical ramp — a pre-attentive
+// "what kind" cue so a doc vs a table vs a file is a glance, not a path-read.
+// All doc-ish types collapse to one hue so 8 rows stay ~3 colors (never a
+// rainbow); the glyph still carries the real distinction. Deliberately skips
+// cat-5 (orange-red) so the type tint never competes with the fresh-token
+// spark, which owns the only warm accent a row may show.
+function recentTone(type?: string): string {
+  if (type === "table" || type === "table_query") return "var(--color-cat-3)";
+  if (type === "file") return "var(--color-cat-4)";
+  return "var(--color-cat-1)";
 }
 
 interface PATRow {
@@ -202,22 +218,26 @@ export default function HomePage() {
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
     <div className="fade-up">
-      {/* Page header — centralized design-system primitive */}
-      <PageHeader
-        title="Workspace"
-        subtitle="Your knowledge base for AI agents — browse vaults, see recent changes, and manage agent connections."
-        actions={
-          <div className="flex items-center gap-2">
-            {vaults.length > 0 && <NewDocAction vaults={vaults} />}
-            <Button asChild variant={vaults.length > 0 ? "outline" : "accent"} size="md">
-              <Link to="/vault/new">
-                <Plus className="h-4 w-4" aria-hidden />
-                New vault
-              </Link>
-            </Button>
-          </div>
-        }
-      />
+      {/* Page header — centralized primitive, wrapped in a header-local aurora
+          wash so the masthead carries brand depth (the global mesh is anchored
+          off-screen). Static, decorative, behind the header content. */}
+      <div className="aurora-header">
+        <PageHeader
+          title="Workspace"
+          subtitle="Your knowledge base for AI agents — browse vaults, see recent changes, and manage agent connections."
+          actions={
+            <div className="flex items-center gap-2">
+              {vaults.length > 0 && <NewDocAction vaults={vaults} />}
+              <Button asChild variant={vaults.length > 0 ? "outline" : "accent"} size="md">
+                <Link to="/vault/new">
+                  <Plus className="h-4 w-4" aria-hidden />
+                  New vault
+                </Link>
+              </Button>
+            </div>
+          }
+        />
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
       {/* ── Main column ──────────────────────────────────────── */}
@@ -227,9 +247,9 @@ export default function HomePage() {
           <header className="flex items-baseline gap-3 pb-3 border-b border-border">
             <h2 className="text-xl font-semibold tracking-tight">Recent activity</h2>
             {!recentLoading && !recentError && (
-              <span className="coord tabular-nums">
+              <Badge variant="default" className="tabular-nums">
                 {recent.length}{recentCapped ? "+" : ""}
-              </span>
+              </Badge>
             )}
           </header>
           <span className="sr-only" role="status" aria-live="polite">
@@ -254,6 +274,11 @@ export default function HomePage() {
             </Panel>
           ) : recentError ? (
             <EmptyState
+              icon={
+                <span className="feature-tile feat-neutral h-14 w-14">
+                  <AlertTriangle className="h-6 w-6" aria-hidden />
+                </span>
+              }
               title="Couldn't load recent activity"
               description="Something went wrong fetching your latest changes."
               action={
@@ -264,33 +289,63 @@ export default function HomePage() {
             />
           ) : recent.length === 0 ? (
             <EmptyState
+              icon={
+                <span className="feature-tile feat-knowledge h-14 w-14">
+                  <FileClock className="h-6 w-6" aria-hidden />
+                </span>
+              }
               title="Nothing touched yet"
               description="Recent document writes across all your vaults will appear here."
             />
           ) : (
-            <Panel className="mt-3">
-              <ol className="divide-y divide-border stagger">
+            <Panel
+              className="mt-3"
+              inset={false}
+            >
+              {/* inset={false} so a hovered row's lift + shadow aren't clipped;
+                  the end rows are re-rounded to keep the divided-panel look at
+                  rest. */}
+              <ol className="divide-y divide-border stagger [&>li:first-child>a]:rounded-t-[var(--radius-lg)] [&>li:last-child>a]:rounded-b-[var(--radius-lg)]">
                 {recent.map((c, i) => {
                   const Icon = recentIcon(c.type);
+                  const tone = recentTone(c.type);
+                  const fresh = isFresh(c.changed_at);
                   return (
                   <li key={`${c.doc_id}:${c.changed_at ?? ""}:${i}`}>
                     <Link
                       to={`/vault/${c.vault}/doc/${c.doc_id}`}
-                      className="group grid grid-cols-[20px_minmax(0,1fr)_auto_56px] items-baseline gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                      className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto_64px] items-baseline gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
-                      <Icon className="h-4 w-4 self-baseline translate-y-0.5 text-foreground-muted shrink-0" aria-hidden />
+                      <span
+                        className="inline-flex h-5 w-5 self-baseline translate-y-0.5 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+                        style={{
+                          color: tone,
+                          backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
+                        }}
+                        aria-hidden
+                      >
+                        <Icon className="h-3 w-3" aria-hidden />
+                      </span>
                       <div className="min-w-0">
                         <div title={c.title} className="text-sm font-medium tracking-tight truncate text-foreground group-hover:text-primary transition-colors">
                           {c.title}
                         </div>
                         <div title={c.path} className="coord truncate">{c.path}</div>
                       </div>
-                      <Badge variant="secondary" title={c.vault} className="shrink-0 max-w-[140px] truncate self-baseline">
-                        {c.vault}
-                      </Badge>
-                      <span className="coord tabular-nums text-right self-baseline">
-                        {timeAgo(c.changed_at)}
+                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px] self-baseline" title={c.vault}>
+                        <VaultChip name={c.vault} size="sm" />
+                        <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
                       </span>
+                      {fresh ? (
+                        <span className="inline-flex items-center justify-end gap-1 text-right self-baseline text-[11px] font-medium tabular-nums text-accent-strong">
+                          <span className="h-1.5 w-1.5 rounded-full bg-accent-strong" aria-hidden />
+                          {timeAgo(c.changed_at)}
+                        </span>
+                      ) : (
+                        <span className="coord tabular-nums text-right self-baseline">
+                          {timeAgo(c.changed_at)}
+                        </span>
+                      )}
                     </Link>
                   </li>
                   );
@@ -305,7 +360,7 @@ export default function HomePage() {
           <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
             <div className="flex items-baseline gap-3">
               <h2 className="text-xl font-semibold tracking-tight">Your vaults</h2>
-              <span className="coord tabular-nums">{vaults.length}</span>
+              <Badge variant="default" className="tabular-nums">{vaults.length}</Badge>
             </div>
             {vaults.length > VAULT_PREVIEW_LIMIT && (
               <Link
@@ -320,6 +375,11 @@ export default function HomePage() {
 
           {vaults.length === 0 ? (
             <EmptyState
+              icon={
+                <span className="feature-tile feat-memory h-14 w-14">
+                  <FolderPlus className="h-6 w-6" aria-hidden />
+                </span>
+              }
               title="No vaults yet"
               description="Mint a token, then ask your agent to create one — or use the button above."
               action={
@@ -339,11 +399,13 @@ export default function HomePage() {
 
       {/* ── Right rail ───────────────────────────────────────── */}
       <aside className="space-y-8 min-w-0" aria-label="Workspace summary and connection">
-        {/* Summary stats */}
-        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden" aria-labelledby="rail-glance">
+        {/* Summary stats — glass shell so the masthead aurora tints the rail,
+            raised one tier (shadow-md) above the content field. */}
+        <section className="rounded-[var(--radius-lg)] border glass shadow-md overflow-hidden" aria-labelledby="rail-glance">
           <div className="border-b border-border px-4 py-2">
             <h2 id="rail-glance" className="coord-ink">At a glance</h2>
           </div>
+          <ActivitySparkline recent={recent} />
           <dl className="divide-y divide-border">
             <RailStat label="Vaults" value={vaults.length} />
             <RailStat label="Tokens" value={pats.length} />
@@ -356,7 +418,7 @@ export default function HomePage() {
 
         {/* Connect — always open. Mint + snippet tabs kept; prompt examples
             moved to docs-territory since they're one-time guidance. */}
-        <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden" aria-labelledby="rail-connect">
+        <section className="rounded-[var(--radius-lg)] border glass shadow-md overflow-hidden" aria-labelledby="rail-connect">
           <div className="flex items-baseline justify-between gap-2 px-4 py-3">
             <h2 id="rail-connect" className="coord-ink">Connect</h2>
             <div className="flex items-baseline gap-3">
@@ -590,7 +652,7 @@ function RailStat({
   const body = (
     <>
       <dt className="coord group-hover:text-primary transition-colors">{label}</dt>
-      <dd className="text-xl font-semibold tabular-nums text-foreground group-hover:text-primary transition-colors">
+      <dd className="text-xl font-normal tabular-nums text-foreground group-hover:text-primary transition-colors">
         {display}
       </dd>
     </>
@@ -607,5 +669,81 @@ function RailStat({
   }
   return (
     <div className="flex items-baseline justify-between px-4 py-3">{body}</div>
+  );
+}
+
+// How many calendar days the rail sparkline spans.
+const SPARK_DAYS = 14;
+
+/**
+ * The single rail data-viz: thin day-bucketed bars of recent write activity
+ * (teal, with the most recent active day tipped in accent). Built entirely
+ * from the recent[] already in state — no extra fetch. Suppressed when the
+ * signal is too sparse to read as a shape, so the rail never carries a row of
+ * dead zero-height bars on a quiet account. Purely decorative: the bars are
+ * aria-hidden with an sr-only summary.
+ */
+function ActivitySparkline({ recent }: { recent: RecentRow[] }) {
+  const { bars, total, activeDays } = useMemo(() => {
+    const counts = new Array(SPARK_DAYS).fill(0);
+    const now = new Date();
+    const startOfToday = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+    ).getTime();
+    const dayMs = 86_400_000;
+    const seen = new Set<number>();
+    let n = 0;
+    for (const c of recent) {
+      if (!c.changed_at) continue;
+      const t = new Date(c.changed_at).getTime();
+      if (Number.isNaN(t)) continue;
+      const idx = SPARK_DAYS - 1 - Math.floor((startOfToday - t) / dayMs);
+      if (idx < 0 || idx >= SPARK_DAYS) continue;
+      counts[idx] += 1;
+      seen.add(idx);
+      n += 1;
+    }
+    return { bars: counts, total: n, activeDays: seen.size };
+  }, [recent]);
+
+  // Need at least a few changes across more than one day to read as a trend.
+  if (total < 3 || activeDays < 2) return null;
+
+  const max = Math.max(...bars);
+  let tip = -1;
+  for (let i = bars.length - 1; i >= 0; i--) {
+    if (bars[i] > 0) {
+      tip = i;
+      break;
+    }
+  }
+
+  return (
+    <div className="border-b border-border px-4 pt-3 pb-2.5">
+      <div className="flex h-8 items-end gap-[3px]" aria-hidden>
+        {bars.map((n, i) => (
+          <span key={i} className="flex h-full flex-1 items-end">
+            <span
+              className="w-full rounded-t-[2px]"
+              style={{
+                height: n === 0 ? "2px" : `${Math.max(12, Math.round((n / max) * 100))}%`,
+                opacity: n === 0 ? 0.55 : 1,
+                backgroundColor:
+                  n === 0
+                    ? "var(--color-border)"
+                    : i === tip
+                      ? "var(--color-accent)"
+                      : "var(--color-primary)",
+              }}
+            />
+          </span>
+        ))}
+      </div>
+      <span className="sr-only">
+        {total} recent change{total === 1 ? "" : "s"} across the last {SPARK_DAYS} days
+      </span>
+    </div>
   );
 }

@@ -13,6 +13,7 @@
 // Dependency-free. Grouping seam: the forces + color read node.group, which
 // is assigned at data ingest (use-graph-data) from the node's collection.
 import { parseUri } from "@/lib/uri";
+import { hashHue } from "@/lib/utils";
 import type { GraphNode } from "./graph-types";
 
 // ── Tunables (exported so they're easy to find + adjust) ──────────────────
@@ -46,17 +47,6 @@ export function groupOf(uri: string): string | null {
 }
 
 // ── Color ─────────────────────────────────────────────────────────────────
-
-/** Deterministic string → hue in [0,360) (FNV-1a). Same group key always
- *  maps to the same hue regardless of how many groups exist (no flicker). */
-function hashHue(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0) % 360;
-}
 
 /**
  * Stable cluster color for a group key, drawn from the tokenized, CVD-vetted

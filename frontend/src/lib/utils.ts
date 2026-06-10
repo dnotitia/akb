@@ -56,3 +56,30 @@ export function timeAgo(iso: string | null | undefined): string {
   const days = Math.floor(hrs / 24);
   return `${days}d ago`;
 }
+
+/**
+ * Whether a timestamp is "fresh" — changed within the window (default 1h).
+ * Drives the single sanctioned warm accent on a just-touched row; it decays
+ * naturally as the change ages, so there's never a permanent "NEW" badge.
+ */
+export function isFresh(iso: string | null | undefined, withinMs = 3_600_000): boolean {
+  if (!iso) return false;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return false;
+  return Date.now() - t < withinMs;
+}
+
+/**
+ * Deterministic string → hue in [0,360) (FNV-1a). Same key always maps to the
+ * same hue regardless of how many keys exist, so a vault keeps one identity
+ * color across Recent activity, the directory, and the graph clusters (which
+ * bucket this hue into the same categorical ramp via groupColor).
+ */
+export function hashHue(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % 360;
+}
