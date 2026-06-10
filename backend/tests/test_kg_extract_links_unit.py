@@ -45,3 +45,55 @@ def test_strip_code_spans_removes_code_keeps_prose():
     stripped = strip_code_spans("`akb://x/coll/y/doc/z.md` keep-this")
     assert "akb://" not in stripped
     assert "keep-this" in stripped
+
+
+# ── Wikilink extraction ([[target]] / [[target|alias]]) ──────────────
+#
+# Regression: an Obsidian wikilink with an alias used to leak the alias's
+# first word onto the target — `[[akb://…/x.md|PWC Long Title]]` produced
+# the target `akb://…/x.md|PWC` (the greedy bare-URI scan didn't stop at
+# `|`). That target matched no document node, so the graph drew no edge and
+# the relations panel rendered a `…%7CPWC` broken link.
+
+def test_wikilink_akb_uri_with_alias_strips_alias():
+    content = (
+        "## References\n"
+        "- [[akb://v/coll/decisions/doc/x.md|PWC Query Performance Optimization]]"
+    )
+    out = extract_markdown_links(content)
+    assert out == ["akb://v/coll/decisions/doc/x.md"]
+    # The alias (or any fragment of it) must never appear in a target.
+    assert all("|" not in t and "PWC" not in t for t in out)
+
+
+def test_wikilink_path_with_alias_strips_alias():
+    out = extract_markdown_links("see [[decisions/x.md|Some Decision]] here")
+    assert out == ["decisions/x.md"]
+
+
+def test_wikilink_without_alias():
+    out = extract_markdown_links(
+        "[[akb://v/coll/notes/doc/a.md]] and [[guides/b.md]]"
+    )
+    assert "akb://v/coll/notes/doc/a.md" in out
+    assert "guides/b.md" in out
+    assert all("[" not in t and "]" not in t for t in out)
+
+
+def test_wikilink_alias_with_trailing_space_before_close():
+    # The historical failure: matching stopped at the first space, leaving
+    # `…x.md|PWC` (alias's first word glued on). Assert it does NOT happen.
+    out = extract_markdown_links("[[akb://v/coll/d/doc/x.md|PWC Foo]]")
+    assert "akb://v/coll/d/doc/x.md|PWC" not in out
+    assert out == ["akb://v/coll/d/doc/x.md"]
+
+
+def test_wikilink_dedups_with_bare_uri_scan():
+    # The same akb:// inside a wikilink must not be double-counted by the
+    # bare-URI fallback scan (which now also stops at `|`).
+    out = extract_markdown_links("[[akb://v/coll/d/doc/x.md|Label]]")
+    assert out == ["akb://v/coll/d/doc/x.md"]
+
+
+def test_wikilink_inside_code_span_is_not_extracted():
+    assert extract_markdown_links("`[[akb://v/coll/d/doc/x.md|L]]`") == []
