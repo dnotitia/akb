@@ -102,6 +102,11 @@ jwt_expire_hours: 24
 #                                         # Default false = no silent merge (OSS-safe).
 # keycloak_redirect_uri: "https://akb.example.com/api/v1/auth/keycloak/callback"
 # keycloak_post_login_path: "/auth/callback"
+# keycloak_post_login_allowed_origins: []   # companion-app origins allowed to receive the SSO
+#                                           # one-time code, e.g. ["https://reef-acme.example.com"].
+#                                           # Lets a first-party app (reef) ride this akb's Keycloak
+#                                           # client and get the code back on ITS origin. Empty =
+#                                           # akb's own SPA only (open-redirect-safe default).
 # keycloak_exchange_code_ttl_secs: 60
 # keycloak_client_secret lives in secret.yaml (never commit it)
 

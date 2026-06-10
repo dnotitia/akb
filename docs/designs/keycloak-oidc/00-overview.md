@@ -86,6 +86,59 @@ The `/exchange` response intentionally mirrors the existing
 `/auth/login` response (`{token, user:{id,username,email,display_name,is_admin}}`)
 so the SPA reuses `setToken()` and the rest of the Bearer flow verbatim.
 
+## Cross-origin companion apps (post-login origin allowlist)
+
+A single AKB backend can act as the identity owner for a small ecosystem of
+first-party apps on *different* origins (e.g. reef at `reef-<slug>.<domain>`
+alongside akb's own `akb-<slug>.<domain>`), each delegating to the same
+tenant Keycloak client rather than registering its own. The blocker was
+that the post-login redirect was a **single per-instance**
+`keycloak_post_login_path`: the callback always bounced the one-time code to
+that one same-site path, and `_safe_redirect_path()` collapsed any
+cross-origin redirect. So akb's SPA and a companion app could not both
+complete SSO — they fought over one global path.
+
+`keycloak_post_login_allowed_origins` lifts this **per request** without
+weakening the open-redirect guard:
+
+```
+[reef]  GET {AKB}/api/v1/auth/keycloak/login
+              ?redirect=https://reef-acme.example.com/api/auth/akb/sso/callback
+          → redirect's origin ∈ allowlist → carried through flow state
+          → 302 to Keycloak  (same client, same realm — reef owns none of it)
+
+[callback]  _post_login_target() re-checks the origin against the allowlist:
+              ∈ list  → 302 to {that absolute URL}?code=<one_time>   (reef's origin)
+              ∉ list  → 302 to {keycloak_post_login_path}?code=&redirect=<safe path>
+
+[reef server]  POST {AKB}/api/v1/auth/keycloak/exchange { code } → { token, user }
+               → set its own __reef_session cookie
+```
+
+Properties that keep this safe:
+
+- **Empty allowlist ⇒ identical to before.** `_allowed_companion_origin()`
+  returns None for every input, so the code can only ever reach the
+  same-site `keycloak_post_login_path`. No behavioural change for
+  deployments that don't opt in.
+- **The allowlist is the only escape hatch.** Any redirect whose origin is
+  not explicitly listed — including absolute URLs, scheme-relative `//host`,
+  and `https://trusted@evil.com` userinfo spoofs — collapses to the safe
+  same-site path. Origins are matched as `scheme://host[:port]`.
+- **Re-validated at delivery.** The origin is checked at `begin_login` AND
+  again in `_post_login_target` at callback time, so a config change during
+  the ≤10-min flow window can only ever *tighten* where the code goes.
+- **No new trust in the companion.** reef still stores no Keycloak
+  client/secret/realm; identity stays owned by AKB. The one-time code is
+  single-use, ≤60s TTL, and exchanged server-side — same guarantees as the
+  akb-SPA path, now delivered to a vetted origin instead of only the
+  same host.
+
+This is the AKB-side counterpart to reef-test REEF-102 / REEF-112 (reef SSO
+delegation) and supersedes the earlier "just point
+`keycloak_post_login_path` at reef's absolute URL" workaround, which could
+only satisfy one origin per instance.
+
 ## Token validation (ported from seahorse, AKB deps)
 
 - **Local JWKS, no remote introspection.** Fetch JWKS from
@@ -133,6 +186,9 @@ so the SPA reuses `setToken()` and the rest of the Bearer flow verbatim.
   sentinel. `create_jwt()` / `resolve_token()` **unchanged**.
 - `backend/app/config.py` — flat `keycloak_*` settings + derived-endpoint
   properties (see below). `keycloak_enabled` defaults `false`.
+  `keycloak_post_login_allowed_origins` (list, default empty) gates the
+  cross-origin companion-app post-login redirect (see "Cross-origin
+  companion apps" above).
 - `backend/app/services/lifecycle.py` — fail-fast validation when
   enabled; close the Keycloak httpx client on shutdown.
 
