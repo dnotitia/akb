@@ -135,47 +135,57 @@ export function VaultShell() {
                 collapsed={vaultCollapsed}
                 onToggleCollapsed={toggleVaultCollapsed}
               />
-              {!isGraph && (
-                <div
-                  className="overflow-hidden transition-[width] duration-300 ease-out"
-                  style={{ width: visible ? tree.width : 0 }}
-                  aria-hidden={!visible}
-                  // `inert` drops the collapsed tree column from the tab order +
-                  // a11y tree (the rail stays interactive).
-                  inert={!visible}
-                >
-                  <div className="h-full flex flex-col min-h-0" style={{ width: tree.width }}>
-                    {/* Tree header — parallels the vault column's "Vaults"
-                        header, with a matching collapse toggle at the top-right
-                        (the rail's toggle is at the top too, never the foot). */}
-                    <div className="flex items-center justify-between h-9 px-3 shrink-0 border-b border-border">
-                      <span className="coord-ink">Collections</span>
-                      <button
-                        type="button"
-                        onClick={() => setTreeVisible(false)}
-                        title="Collapse tree (⌘\\)"
-                        aria-label="Collapse collection tree"
-                        aria-expanded={true}
-                        className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        <PanelLeftClose className="h-4 w-4" aria-hidden />
-                      </button>
-                    </div>
-                    {name ? (
-                      <div className="flex-1 min-h-0">
-                        <VaultExplorer vault={name} onRefetchReady={onTreeRefetchReady} />
-                      </div>
-                    ) : (
-                      <div className="flex-1 min-h-0 flex items-center justify-center px-6 text-center">
-                        <p className="coord leading-relaxed">
-                          No vault open.
-                          <br />
-                          Select one on the left to see its collections.
-                        </p>
-                      </div>
-                    )}
+              {/* Collection tree column — expanded: a "Collections" header (with
+                  a « collapse toggle that mirrors the vault column's) over the
+                  tree. Collapsed: it doesn't vanish — it leaves a thin strip
+                  with just the » expand toggle at the top, exactly like the
+                  vault rail, so both columns minimize the same way. */}
+              {!isGraph && visible && (
+                <div className="shrink-0 h-full flex flex-col min-h-0" style={{ width: tree.width }}>
+                  <div className="flex items-center justify-between h-9 px-3 shrink-0 border-b border-border">
+                    <span className="coord-ink">Collections</span>
+                    <button
+                      type="button"
+                      onClick={() => setTreeVisible(false)}
+                      title="Collapse tree (⌘\\)"
+                      aria-label="Collapse collection tree"
+                      aria-expanded={true}
+                      className="text-foreground-muted hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                    >
+                      <PanelLeftClose className="h-4 w-4" aria-hidden />
+                    </button>
                   </div>
+                  {name ? (
+                    <div className="flex-1 min-h-0">
+                      <VaultExplorer vault={name} onRefetchReady={onTreeRefetchReady} />
+                    </div>
+                  ) : (
+                    <div className="flex-1 min-h-0 flex items-center justify-center px-6 text-center">
+                      <p className="coord leading-relaxed">
+                        No vault open.
+                        <br />
+                        Select one on the left to see its collections.
+                      </p>
+                    </div>
+                  )}
                 </div>
+              )}
+              {!isGraph && !visible && (
+                <nav
+                  aria-label="Collections (collapsed)"
+                  className="shrink-0 h-full w-10 flex flex-col items-center py-2"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setTreeVisible(true)}
+                    title="Show tree (⌘\\)"
+                    aria-label="Show collection tree"
+                    aria-expanded={false}
+                    className="flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+                  >
+                    <PanelLeftOpen className="h-4 w-4" aria-hidden />
+                  </button>
+                </nav>
               )}
             </div>
           </div>
@@ -202,28 +212,11 @@ export function VaultShell() {
               </ErrorBoundary>
             </div>
           ) : (
-            <div className="flex-1 min-w-0 min-h-0 relative flex flex-col overflow-hidden bg-background">
-              {/* When the tree is collapsed it vanishes (width 0), so its
-                  "show" affordance lives here, at the top-left where the tree
-                  reappears. While the tree is open, its own header « collapses
-                  it — no floating button over the content. */}
-              {!visible && (
-                <button
-                  onClick={() => setTreeVisible(true)}
-                  title="Show tree (⌘\\)"
-                  aria-label="Show collection tree"
-                  aria-expanded={false}
-                  className="absolute top-2 left-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-                >
-                  <PanelLeftOpen className="h-4 w-4" aria-hidden />
-                </button>
-              )}
-              <div className="flex-1 min-h-0 overflow-y-auto">
-                <div className="mx-auto max-w-[1100px] px-6 py-8 lg:px-10 lg:py-10">
-                  <ErrorBoundary resetKeys={[location.pathname]}>
-                    <Outlet />
-                  </ErrorBoundary>
-                </div>
+            <div className="flex-1 min-w-0 min-h-0 overflow-y-auto bg-background">
+              <div className="mx-auto max-w-[1100px] px-6 py-8 lg:px-10 lg:py-10">
+                <ErrorBoundary resetKeys={[location.pathname]}>
+                  <Outlet />
+                </ErrorBoundary>
               </div>
             </div>
           )}
