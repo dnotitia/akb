@@ -270,37 +270,34 @@ body {
   font-feature-settings: "zero", "ss01";
 }
 
-/* signature mono "coordinate" labels — retoned to family palette */
+/* Section/meta micro-labels. Retired the legacy "§ coordinate" terminal face
+   (uppercase + wide tracking + orange) in favor of a calm normal-case Pretendard
+   label — friendly akb-platform, not a terminal margin. Casing now comes from
+   the source text (write labels in Sentence case), and orange is reserved for
+   the marquee CTA, never an eyebrow. tabular-nums is still opt-in per use. */
 .coord {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
+  font-size: 0.6875rem; /* 11px */
+  font-weight: 500;
+  letter-spacing: 0;
   color: var(--color-foreground-muted);
 }
 .coord-ink {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
+  font-size: 0.75rem; /* 12px */
+  font-weight: 600;
+  letter-spacing: 0;
   color: var(--color-foreground);
 }
 .coord-spark {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
-  /* Light: the bright --color-accent (#e55e2c) only clears 3.52:1 on white —
-     AA-fail at this size. Use accent-STRONG (#c44a1e, 4.83:1). Dark keeps the
-     bright accent (override below) since the darker tone regresses on a dark
-     surface. */
-  color: var(--color-accent-strong);
+  font-size: 0.75rem; /* 12px */
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--color-foreground-muted);
 }
 .dark .coord-spark {
-  color: var(--color-accent);
+  color: var(--color-foreground-muted);
 }
 
 /* colored category eyebrow (feature tiles) */

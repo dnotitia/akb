@@ -84,19 +84,19 @@ export function Layout() {
     <div className={rootClass}>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        <div className="mx-auto flex max-w-[1600px] items-center gap-4 px-5 h-16">
+        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1600px] items-center gap-4 px-5 h-16">
           {/* Brand */}
           <Link
             to="/"
             aria-label="AKB home"
-            className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="justify-self-start shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <Logo size={30} subtitle />
           </Link>
 
-          {/* Global search */}
+          {/* Global search — centered in the header, fills the wide center column */}
           <form
-            className="flex-1 max-w-3xl hidden sm:flex h-10"
+            className="hidden sm:flex h-10 w-full justify-self-center"
             onSubmit={(e) => {
               e.preventDefault();
               if (!searchQuery.trim()) return;
@@ -149,7 +149,7 @@ export function Layout() {
           </form>
 
           {/* Nav + actions */}
-          <nav aria-label="Primary" className="flex items-center gap-1 ml-auto">
+          <nav aria-label="Primary" className="flex items-center gap-1 justify-self-end">
             <NavLink to="/" active={location.pathname === "/"} name="Home" />
             <NavLink
               to="/vault"

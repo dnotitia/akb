@@ -254,11 +254,10 @@ export default function HomePage() {
         {/* § 01 Recent — top priority, the jump-back-in list. */}
         <section id="recent" className="scroll-mt-24">
           <header className="flex items-baseline gap-3 pb-3 border-b border-border">
-            <span className="coord-ink">§ 01</span>
             <h2 className="text-xl font-semibold tracking-tight">Recent activity</h2>
             {!recentLoading && !recentError && (
               <span className="coord tabular-nums">
-                [{recent.length}{recentCapped ? "+" : ""}]
+                {recent.length}{recentCapped ? "+" : ""}
               </span>
             )}
           </header>
@@ -326,9 +325,8 @@ export default function HomePage() {
         <section id="vaults" className="scroll-mt-24">
           <header className="flex items-baseline justify-between gap-4 flex-wrap pb-3 border-b border-border">
             <div className="flex items-baseline gap-3">
-              <span className="coord-ink">§ 02</span>
               <h2 className="text-xl font-semibold tracking-tight">Your vaults</h2>
-              <span className="coord tabular-nums">[{vaults.length}]</span>
+              <span className="coord tabular-nums">{vaults.length}</span>
             </div>
             <div className="flex items-center gap-3">
               {vaults.length > 5 && (
@@ -441,17 +439,17 @@ export default function HomePage() {
         {/* Summary stats */}
         <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
           <div className="border-b border-border px-4 py-2">
-            <span className="coord-ink">§ AT A GLANCE</span>
+            <span className="coord-ink">At a glance</span>
           </div>
           <dl className="divide-y divide-border">
-            <RailStat label="VAULTS" value={vaults.length} to="/#vaults" />
+            <RailStat label="Vaults" value={vaults.length} to="/#vaults" />
             <RailStat
-              label="TOKENS"
+              label="Tokens"
               value={pats.length}
               to="/settings?tab=tokens"
             />
             <RailStat
-              label="RECENT"
+              label="Recent"
               value={recentCapped ? `${RECENT_LIMIT}+` : recent.length}
               to="/#recent"
             />
@@ -462,10 +460,10 @@ export default function HomePage() {
             moved to docs-territory since they're one-time guidance. */}
         <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
           <div className="flex items-baseline justify-between gap-2 px-4 py-3">
-            <span className="coord-ink">§ CONNECT</span>
+            <span className="coord-ink">Connect</span>
             <div className="flex items-baseline gap-3">
               {pats.length > 0 ? (
-                <span className="coord tabular-nums">[{pats.length}]</span>
+                <span className="coord tabular-nums">{pats.length}</span>
               ) : (
                 <Badge variant="pending">needs setup</Badge>
               )}
@@ -473,7 +471,7 @@ export default function HomePage() {
                 to="/settings?tab=tokens"
                 className="coord hover:text-primary rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
               >
-                <span aria-hidden>↗ </span>MANAGE
+                Manage
               </Link>
             </div>
           </div>
@@ -481,7 +479,7 @@ export default function HomePage() {
           <div className="border-t border-border">
               {/* Mint */}
               <div className="p-4 border-b border-border">
-                <div className="coord-spark mb-2">MINT TOKEN</div>
+                <div className="coord-spark mb-2">Mint token</div>
                 <form onSubmit={handleCreatePAT} className="space-y-2">
                   <Label htmlFor="pat-name" className="sr-only">Token name</Label>
                   <Input
@@ -515,7 +513,7 @@ export default function HomePage() {
                     role="status"
                     aria-live="polite"
                   >
-                    <div className="coord-spark mb-1">FRESH — COPY NOW</div>
+                    <div className="coord-spark mb-1">New token — copy now</div>
                     <div className="flex items-center gap-1.5">
                       <code className="flex-1 font-mono text-[10px] text-foreground break-all leading-snug">
                         {showPat ? activePat : activePat.slice(0, 10) + "•".repeat(14)}
@@ -547,7 +545,7 @@ export default function HomePage() {
 
               {/* Snippet — compact tabs, one panel. */}
               <div className="p-4 border-b border-border">
-                <div className="coord-spark mb-2">DROP SNIPPET</div>
+                <div className="coord-spark mb-2">Drop snippet</div>
                 <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
                   <TabsList className="flex-wrap gap-0 mb-2">
                     <TabsTrigger value="claude" className="px-2 py-1 text-[10px]">Claude Code</TabsTrigger>
@@ -565,7 +563,7 @@ export default function HomePage() {
               {/* Active tokens — one-line rows; manage link sits in the
                   Connect section header to keep related actions together. */}
               <div className="p-4">
-                <div className="coord-spark mb-2">ACTIVE TOKENS</div>
+                <div className="coord-spark mb-2">Active tokens</div>
                 {pats.length === 0 ? (
                   <div className="coord">— none —</div>
                 ) : (
@@ -696,12 +694,11 @@ function RailStat({
   value: number | string;
   to?: string;
 }) {
-  // Pad raw numbers to 2 digits; pass strings (e.g. "8+") through verbatim.
-  const display = typeof value === "number" ? String(value).padStart(2, "0") : value;
+  const display = String(value);
   const body = (
     <>
       <dt className="coord group-hover:text-primary transition-colors">{label}</dt>
-      <dd className="font-mono text-xl font-semibold tabular-nums text-foreground group-hover:text-primary transition-colors">
+      <dd className="text-xl font-semibold tabular-nums text-foreground group-hover:text-primary transition-colors">
         {display}
       </dd>
     </>

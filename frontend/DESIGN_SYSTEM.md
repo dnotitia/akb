@@ -165,15 +165,21 @@ the darker stop. Light/dark is handled by the token layer, not per-component mat
 | **Pretendard Variable** (bundled npm webfont) | `--font-sans` / `--font-display` | all UI, headings, masthead |
 | **JetBrains Mono Variable** | `--font-mono` | code, vault names, coord labels, tabular columns |
 
-- **Body = `text-sm` (14px).** Headings via `font-display` (Pretendard 700, tight
-  tracking). Weights used: **400 / 500 / 600 / 700** only.
-- **Numbers in tables/lists/stats: `tabular-nums`** (prevents async jitter).
-- **All-caps is reserved for `.coord*` / eyebrow chrome and tab labels** — never
-  `.toUpperCase()` user-facing copy (error/help text stays sentence case).
-- Coord labels: `.coord` (muted), `.coord-ink` (foreground), `.coord-spark`
-  (accent-strong in light / bright accent in dark — the one AA-tuned exception).
-  Minimum label size **10.5px**. Prefer the `<Eyebrow tone="muted|ink|spark">`
-  primitive over hand-writing the class.
+- **Body = `text-sm` (14px).** Headings via `font-display` (Pretendard 600/700,
+  tight tracking, `text-foreground` — not pure black). Weights: **400 / 500 /
+  600 / 700**.
+- **Numbers in tables/lists/stats: `tabular-nums`** (prevents async jitter), in
+  Pretendard — not monospace, and **not zero-padded** (`1`, not `01`).
+- **Retired the legacy "§ coordinate" terminal/newspaper layer.** No `§` glyphs,
+  no all-caps section eyebrows, no wide letter-tracking, no editorial `word.`
+  mastheads (a lone colored period / italic colored last word). Section labels
+  are **normal-case Pretendard** (Sentence case) via `.coord*` / `<Eyebrow>`;
+  page heroes are a calm `PageHeader` (title + friendly subtitle). `.coord`
+  (muted, 11px), `.coord-ink` (foreground, 12px), `.coord-spark` (muted — orange
+  no longer rides the eyebrow). **Casing comes from the source string** — write
+  `At a glance`, not `§ AT A GLANCE`. Keep **monospace strictly for real
+  code/secrets** (wrap in `CodeSnippet`) — not for labels, paths, dates, or
+  counts. `.toUpperCase()` on user/dynamic copy stays banned.
 - *Roadmap:* a paired `--text-*` scale is being introduced to fold the ~140
   arbitrary `text-[Npx]` onto named steps; until then match the nearest existing
   size and avoid new arbitrary pixels.
