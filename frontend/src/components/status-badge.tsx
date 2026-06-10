@@ -6,9 +6,9 @@ import {
   GitBranch,
   Globe,
   Key,
-  Lock,
   Pencil,
   ShieldCheck,
+  Unlock,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
@@ -67,16 +67,20 @@ export function VaultStateBadge({
           external git
         </Badge>
       )}
-      {showPublic && (
-        <Badge variant="info">
-          {publicAccess === "reader" ? (
+      {showPublic &&
+        (publicAccess === "writer" ? (
+          // Most-open state: an OPEN padlock + amber warning — never a closed
+          // Lock, which read as "secured" (the inverse of the truth).
+          <Badge variant="warning">
+            <Unlock className="h-3 w-3" aria-hidden />
+            public:writer
+          </Badge>
+        ) : (
+          <Badge variant="info">
             <Globe className="h-3 w-3" aria-hidden />
-          ) : (
-            <Lock className="h-3 w-3" aria-hidden />
-          )}
-          public:{publicAccess}
-        </Badge>
-      )}
+            public:reader
+          </Badge>
+        ))}
     </div>
   );
 }
