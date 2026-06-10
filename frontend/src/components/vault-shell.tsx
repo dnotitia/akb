@@ -99,7 +99,7 @@ export function VaultShell() {
     <VaultRefreshProvider refetchTree={refetchTree} refetchVaults={refetchVaults}>
       <div className="flex flex-col h-full min-h-0">
         <TitleBar
-          lead={name ? <VaultSwitcher current={name} onRefetchReady={onVaultsRefetchReady} /> : undefined}
+          lead={<VaultSwitcher current={name} onRefetchReady={onVaultsRefetchReady} />}
           crumbs={crumbs}
           right={name ? <VaultActions vault={name} page={page} /> : undefined}
         />
@@ -147,9 +147,17 @@ export function VaultShell() {
                       <ChevronsLeft className="h-4 w-4" aria-hidden />
                     </button>
                   </div>
-                  {name && (
+                  {name ? (
                     <div className="flex-1 min-h-0 overflow-y-auto rail-scroll">
                       <VaultExplorer vault={name} onRefetchReady={onTreeRefetchReady} />
+                    </div>
+                  ) : (
+                    <div className="flex-1 min-h-0 flex items-center justify-center px-6 text-center">
+                      <p className="coord leading-relaxed">
+                        No vault selected.
+                        <br />
+                        Pick one from the switcher above.
+                      </p>
                     </div>
                   )}
                 </aside>

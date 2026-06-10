@@ -74,14 +74,12 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/p/:slug" element={<PublicationPage />} />
         <Route element={<Layout />}>
           <Route path="/" element={<HomePage />} />
-          {/* The vault directory is a top-level page, NOT a vault workspace —
-              it has no single-vault context, so it renders full-width in the
-              normal Layout (no collection-tree sidebar) instead of inside the
-              VaultShell, which would otherwise show a vault list in the sidebar
-              AND in the page body. */}
-          <Route path="/vault" element={<VaultIndexPage />} />
           <Route path="/vault/new" element={<VaultNewPage />} />
           <Route element={<VaultShell />}>
+            {/* /vault is the "no vault selected" state of the workspace shell —
+                it keeps the same chrome (title bar + sidebar) as a vault, with a
+                guidance body, so moving in/out of a vault never shifts layout. */}
+            <Route path="/vault" element={<VaultIndexPage />} />
             <Route path="/vault/:name" element={<VaultPage />} />
             <Route path="/vault/:name/doc/new" element={<DocumentNewPage />} />
             <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />

@@ -22,7 +22,8 @@ export function VaultSwitcher({
   current,
   onRefetchReady,
 }: {
-  current: string;
+  /** The open vault. Absent on /vault (no vault selected) → "Select a vault". */
+  current?: string;
   onRefetchReady?: (refetch: () => void) => void;
 }) {
   const { vaults, loading, refetch } = useVaults();
@@ -41,13 +42,19 @@ export function VaultSwitcher({
       <DropdownMenu.Trigger asChild>
         <button
           type="button"
-          aria-label={`Current vault: ${current}. Switch vault`}
+          aria-label={current ? `Current vault: ${current}. Switch vault` : "Select a vault"}
           className="inline-flex items-center gap-1.5 max-w-[240px] h-7 px-1.5 rounded-[var(--radius-md)] text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface cursor-pointer"
         >
-          <VaultChip name={current} size="sm" />
-          <span className="font-mono text-[13px] font-medium truncate" title={current}>
-            {current}
-          </span>
+          {current ? (
+            <>
+              <VaultChip name={current} size="sm" />
+              <span className="font-mono text-[13px] font-medium truncate" title={current}>
+                {current}
+              </span>
+            </>
+          ) : (
+            <span className="text-[13px] font-medium text-foreground-muted">Select a vault</span>
+          )}
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
         </button>
       </DropdownMenu.Trigger>

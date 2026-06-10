@@ -10,8 +10,7 @@ import { IndexingBadge } from "@/components/status-badge";
 import { ErrorBoundary } from "@/components/error-boundary";
 
 const VAULT_SHELL_PATTERNS = [
-  // NB: bare "/vault" is intentionally NOT here — the vault directory is a
-  // top-level page rendered in the normal Layout, not the vault workspace shell.
+  "/vault",
   "/vault/:name",
   "/vault/:name/doc/:id",
   "/vault/:name/table/:table",
