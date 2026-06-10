@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowRight,
@@ -11,7 +11,6 @@ import {
   FilePlus,
   FileText,
   Plus,
-  Search as SearchIcon,
   Table as TableIcon,
   Trash2,
 } from "lucide-react";
@@ -88,8 +87,6 @@ export default function HomePage() {
   const [quickstartOpen, setQuickstartOpen] = useState(false);
   const quickstartChecked = useRef(false);
   const location = useLocation();
-  const navigate = useNavigate();
-  const [homeSearch, setHomeSearch] = useState("");
   const recentCapped = recent.length >= RECENT_LIMIT;
 
   useEffect(() => {
@@ -225,31 +222,6 @@ export default function HomePage() {
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
       {/* ── Main column ──────────────────────────────────────── */}
       <div className="space-y-10 min-w-0">
-        {/* Search — Home is self-sufficient even when the header search is
-            hidden (narrow widths); routes to the full /search page. */}
-        <form
-          role="search"
-          aria-label="Search knowledge base"
-          onSubmit={(e) => {
-            e.preventDefault();
-            const query = homeSearch.trim();
-            if (query) navigate(`/search?q=${encodeURIComponent(query)}`);
-          }}
-          className="relative"
-        >
-          <SearchIcon
-            className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-foreground-muted"
-            aria-hidden
-          />
-          <Input
-            type="search"
-            value={homeSearch}
-            onChange={(e) => setHomeSearch(e.target.value)}
-            placeholder="Search documents, tables, and notes…"
-            aria-label="Search knowledge base"
-            className="h-11 pl-10"
-          />
-        </form>
         {/* § 01 Recent — top priority, the jump-back-in list. */}
         <section id="recent" className="scroll-mt-24" aria-busy={recentLoading}>
           <header className="flex items-baseline gap-3 pb-3 border-b border-border">
