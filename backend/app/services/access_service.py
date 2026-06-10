@@ -392,6 +392,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         doc_count,
         table_count,
         file_count,
+        coll_count,
         edge_count,
         last_doc,
         is_external_git,
@@ -401,6 +402,9 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         _q("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM vault_files WHERE vault_id = $1", vid),
+        # Authoritative collection total — depth-safe, unlike a client-side
+        # browse(depth=2) count which silently undercounts deeper nesting.
+        _q("SELECT COUNT(*) FROM collections WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM edges WHERE vault_id = $1", vid),
         _r(
             "SELECT updated_at, created_by FROM documents WHERE vault_id = $1 "
@@ -424,6 +428,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         "owner": owner["username"] if owner else None,
         "owner_display_name": owner["display_name"] if owner else None,
         "member_count": member_count + 1,  # +1 for owner
+        "collection_count": coll_count,
         "document_count": doc_count,
         "table_count": table_count,
         "file_count": file_count,
