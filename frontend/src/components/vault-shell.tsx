@@ -2,7 +2,7 @@ import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
 import { VaultExplorer } from "@/components/vault-explorer";
-import { VaultSwitcher } from "@/components/vault-switcher";
+import { VaultNav } from "@/components/vault-nav";
 import { TitleBar, VaultActions, type Crumb, type VaultPageKind } from "@/components/title-bar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
@@ -61,24 +61,26 @@ export function VaultShell() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // The vault switcher (in the title bar) carries the vault identity, so the
-  // breadcrumb holds only the sub-path WITHIN the vault (doc/table/file).
+  // The sidebar vault list carries vault identity; the breadcrumb anchors the
+  // current vault (link to overview) + the sub-path within it.
   const crumbs = useMemo<Crumb[]>(() => {
     if (!name) return [];
+    const base: Crumb[] = [{ label: name, to: `/vault/${name}` }];
     const docMatch = location.pathname.match(/^\/vault\/[^/]+\/doc\/(.+)$/);
     if (docMatch) {
       const raw = decodeURIComponent(docMatch[1]);
       const parts = raw.split("/");
       return [
+        ...base,
         ...parts.slice(0, -1).map((p) => ({ label: p })),
         { label: parts[parts.length - 1] },
       ];
     }
     const tableMatch = location.pathname.match(/^\/vault\/[^/]+\/table\/(.+)$/);
-    if (tableMatch) return [{ label: `table · ${decodeURIComponent(tableMatch[1])}` }];
+    if (tableMatch) return [...base, { label: `table · ${decodeURIComponent(tableMatch[1])}` }];
     const fileMatch = location.pathname.match(/^\/vault\/[^/]+\/file\/(.+)$/);
-    if (fileMatch) return [{ label: `file · ${decodeURIComponent(fileMatch[1]).slice(0, 16)}` }];
-    return [];
+    if (fileMatch) return [...base, { label: `file · ${decodeURIComponent(fileMatch[1]).slice(0, 16)}` }];
+    return base;
   }, [name, location.pathname]);
 
   const isGraph = location.pathname.endsWith("/graph");
@@ -99,7 +101,6 @@ export function VaultShell() {
     <VaultRefreshProvider refetchTree={refetchTree} refetchVaults={refetchVaults}>
       <div className="flex flex-col h-full min-h-0">
         <TitleBar
-          lead={<VaultSwitcher current={name} onRefetchReady={onVaultsRefetchReady} />}
           crumbs={crumbs}
           right={name ? <VaultActions vault={name} page={page} /> : undefined}
         />
@@ -147,6 +148,9 @@ export function VaultShell() {
                       <ChevronsLeft className="h-4 w-4" aria-hidden />
                     </button>
                   </div>
+                  <div className="shrink-0 max-h-[38%] overflow-y-auto border-b border-border rail-scroll">
+                    <VaultNav current={name || ""} onRefetchReady={onVaultsRefetchReady} />
+                  </div>
                   {name ? (
                     <div className="flex-1 min-h-0 overflow-y-auto rail-scroll">
                       <VaultExplorer vault={name} onRefetchReady={onTreeRefetchReady} />
@@ -156,7 +160,7 @@ export function VaultShell() {
                       <p className="coord leading-relaxed">
                         No vault open.
                         <br />
-                        Select one to see its collections here.
+                        Select one above to see its collections.
                       </p>
                     </div>
                   )}

@@ -7,8 +7,6 @@ import {
   FilePlus,
   FileText,
   FolderPlus,
-  Network,
-  RefreshCw,
   Sparkles,
   Table,
   Trash2,
@@ -228,41 +226,10 @@ export function VaultExplorer({
   );
 
   return (
-    <aside className="flex flex-col h-full overflow-hidden border-r border-border text-sm bg-background">
-      <header className="border-b border-border px-3 py-2 flex items-center justify-between gap-2 shrink-0">
-        <Link
-          to={`/vault/${vault}`}
-          title={vault}
-          className="font-mono text-sm font-semibold truncate text-foreground hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
-          {vault}
-        </Link>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={refetch}
-            disabled={loading}
-            title="Refresh tree"
-            aria-label="Refresh vault tree"
-            className="inline-flex items-center coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer disabled:cursor-default disabled:opacity-50"
-          >
-            <RefreshCw
-              className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}
-              aria-hidden
-            />
-          </button>
-          <Link
-            to={`/vault/${vault}/graph`}
-            title="Knowledge graph"
-            aria-label="Knowledge graph"
-            className="inline-flex items-center gap-1 coord hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <Network className="h-3 w-3" aria-hidden />
-            Graph
-          </Link>
-        </div>
-      </header>
-
+    <aside
+      className="flex flex-col h-full overflow-hidden text-sm bg-background"
+      aria-label={`${vault} collections`}
+    >
       <div className="border-b border-border px-2 py-1.5 shrink-0">
         <input
           type="search"

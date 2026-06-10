@@ -12,15 +12,11 @@ export function TitleBar({
   crumbs,
   right,
   left,
-  lead,
   className,
 }: {
   crumbs: Crumb[];
   right?: ReactNode;
   left?: ReactNode;
-  /** Leading element before the breadcrumb (e.g. the vault switcher). When
-   *  present it carries identity, so the breadcrumb holds only the sub-path. */
-  lead?: ReactNode;
   className?: string;
 }) {
   const navigate = useNavigate();
@@ -61,10 +57,9 @@ export function TitleBar({
       >
         <ArrowLeft className="h-3 w-3" aria-hidden />
       </button>
-      {lead}
       {crumbs.map((c, i) => (
         <span key={i} className="flex items-center gap-2.5">
-          <span className="text-foreground-muted">›</span>
+          {i > 0 && <span className="text-foreground-muted">›</span>}
           {c.to ? (
             <Link
               to={c.to}
