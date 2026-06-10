@@ -24,6 +24,7 @@ import {
   type FlatRow,
 } from "@/lib/tree-route";
 import { getVaultInfo } from "@/lib/api";
+import { recentTone } from "@/lib/recent";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
 import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 
@@ -468,7 +469,12 @@ const TreeRow = memo(function TreeRow({
   const href = leafHref(vault, node);
   const isSkill = node.kind === "document" && node.raw?.doc_type === "skill";
   const LeafIcon = isSkill ? Sparkles : node.kind === "document" ? FileText : node.kind === "table" ? Table : File;
-  const leafIconColor = (node.kind === "document" && !isSkill) ? "text-foreground-muted" : "text-accent";
+  // Tint the leaf icon by resource kind from the categorical ramp (the same
+  // doc=cat-1 / table=cat-3 / file=cat-4 mapping the Home + overview rows use),
+  // so a doc vs a table vs a file is a colour at a glance — not just an icon
+  // shape in a flat list. (Was text-accent ORANGE for table/file/skill, which
+  // was off-system + spent the one-marquee-orange budget.) Skill = teal.
+  const leafTone = isSkill ? "var(--color-primary)" : recentTone(node.kind);
 
   return (
     <Link
@@ -484,7 +490,8 @@ const TreeRow = memo(function TreeRow({
       }`}
     >
       <LeafIcon
-        className={`h-3 w-3 shrink-0 ${leafIconColor} group-hover:text-link transition-colors`}
+        className="h-3 w-3 shrink-0"
+        style={{ color: leafTone }}
         aria-hidden
       />
       <span title={node.name} className="truncate min-w-0 text-[13px] group-hover:text-link">{node.name}</span>
