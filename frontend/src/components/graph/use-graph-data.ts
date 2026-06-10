@@ -32,6 +32,7 @@ function normalizeRelation(raw: string | undefined): RelationKind | null {
     case "related_to":
     case "attached_to":
     case "derived_from":
+    case "links_to":
       return raw;
     default:
       return null;
