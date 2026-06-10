@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
@@ -27,6 +27,7 @@ import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
+import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
   getRecent,
@@ -84,6 +85,8 @@ export default function HomePage() {
   const [mintError, setMintError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [tab, setTab] = useState<Tab>("claude");
+  const [quickstartOpen, setQuickstartOpen] = useState(false);
+  const quickstartChecked = useRef(false);
   const location = useLocation();
   const navigate = useNavigate();
   const [homeSearch, setHomeSearch] = useState("");
@@ -140,7 +143,16 @@ export default function HomePage() {
   async function loadPATs() {
     try {
       const d = await listPATs();
-      setPats(d.tokens || []);
+      const toks = d.tokens || [];
+      setPats(toks);
+      // First-run quickstart: proactively surface the connect flow once when a
+      // fresh account has no tokens yet (unless the user opted out).
+      if (!quickstartChecked.current) {
+        quickstartChecked.current = true;
+        if (toks.length === 0 && localStorage.getItem(QUICKSTART_DISMISS_KEY) !== "1") {
+          setQuickstartOpen(true);
+        }
+      }
     } catch {
       /* non-fatal: leave pats empty */
     }
@@ -190,10 +202,6 @@ export default function HomePage() {
     [vaults],
   );
 
-  // First run: no vaults AND no tokens. Lead the main column with the connect
-  // flow (the actual first job) instead of two dead-end empty lists.
-  const firstRun = vaults.length === 0 && pats.length === 0;
-
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
     <div className="fade-up">
@@ -214,86 +222,6 @@ export default function HomePage() {
         }
       />
 
-      {firstRun && (
-        <Panel className="max-w-2xl p-6 sm:p-8">
-          <h2 className="text-lg font-semibold tracking-tight text-foreground">
-            Connect your first agent
-          </h2>
-          <p className="mt-1 text-sm text-foreground-muted leading-relaxed">
-            Mint a personal access token, drop the snippet into your agent, and it can
-            start reading and writing your knowledge base. Vaults and recent activity
-            show up here once you do.
-          </p>
-
-          <div className="mt-5">
-            <div className="coord-spark mb-2">1 · Mint a token</div>
-            <form onSubmit={handleCreatePAT} className="flex gap-2">
-              <Label htmlFor="onboard-pat" className="sr-only">Token name</Label>
-              <Input
-                id="onboard-pat"
-                type="text"
-                placeholder="Token name (e.g. my-laptop)"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                aria-invalid={mintError ? true : undefined}
-                className="flex-1"
-              />
-              <Button type="submit" variant="accent" loading={creating} disabled={!newName.trim()}>
-                {!creating && <Plus className="h-4 w-4" aria-hidden />}
-                {creating ? "Minting…" : "Mint token"}
-              </Button>
-            </form>
-            {mintError && <Alert variant="destructive" className="mt-2 text-xs">{mintError}</Alert>}
-            {activePat && (
-              <div
-                className="mt-3 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-2.5"
-                role="status"
-                aria-live="polite"
-              >
-                <div className="coord-spark mb-1">New token — copy now</div>
-                <div className="flex items-center gap-1.5">
-                  <code className="flex-1 font-mono text-[11px] text-foreground break-all leading-snug">
-                    {showPat ? activePat : activePat.slice(0, 10) + "•".repeat(14)}
-                  </code>
-                  {!showPat && <span className="sr-only">Token value: {activePat}</span>}
-                  <button
-                    onClick={() => setShowPat(!showPat)}
-                    aria-label={showPat ? "Hide token" : "Show token"}
-                    className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {showPat ? <EyeOff className="h-3.5 w-3.5" aria-hidden /> : <Eye className="h-3.5 w-3.5" aria-hidden />}
-                  </button>
-                  <button
-                    onClick={() => copy(activePat, "pat")}
-                    aria-label={copied === "pat" ? "Token copied" : "Copy token"}
-                    className="coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {copied === "pat" ? <span aria-hidden>OK</span> : <Copy className="h-3.5 w-3.5" aria-hidden />}
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="mt-5">
-            <div className="coord-spark mb-2">2 · Drop the snippet</div>
-            <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
-              <TabsList className="flex-wrap">
-                <TabsTrigger value="claude">Claude Code</TabsTrigger>
-                <TabsTrigger value="cursor">Cursor</TabsTrigger>
-                <TabsTrigger value="codex">Codex</TabsTrigger>
-                <TabsTrigger value="vscode">VS Code</TabsTrigger>
-                <TabsTrigger value="openclaw">OpenClaw</TabsTrigger>
-              </TabsList>
-              <TabsContent value={tab}>
-                <CodeSnippet code={snippets[tab]} filename={MCP_AGENT_FILES[tab]} />
-              </TabsContent>
-            </Tabs>
-          </div>
-        </Panel>
-      )}
-
-      {!firstRun && (
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-x-10 gap-y-10">
       {/* ── Main column ──────────────────────────────────────── */}
       <div className="space-y-10 min-w-0">
@@ -602,7 +530,6 @@ export default function HomePage() {
         </section>
       </aside>
       </div>
-      )}
 
       <ConfirmDialog
         open={pendingRevoke !== null}
@@ -618,6 +545,12 @@ export default function HomePage() {
           await revokePAT(pendingRevoke.token_id);
           await loadPATs();
         }}
+      />
+
+      <QuickstartDialog
+        open={quickstartOpen}
+        onOpenChange={setQuickstartOpen}
+        onTokenCreated={loadPATs}
       />
     </div>
   );
