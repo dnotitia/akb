@@ -178,6 +178,40 @@ describe("bfsExpand", () => {
     expect(out.edges.length).toBe(1);
   });
 
+  // Regression: `links_to` (body markdown / wikilink edges) was missing
+  // from normalizeRelation's allowlist, so every body-link edge was
+  // silently dropped — the neighbor node appeared but its edge never did,
+  // leaving floating nodes with no lines in the graph.
+  it("keeps links_to edges (not just the frontmatter relation kinds)", async () => {
+    const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
+      doc_id: docId,
+      uri: `akb://v/doc/${docId}`,
+      relations: [
+        {
+          direction: "outgoing" as const,
+          relation: "links_to",
+          uri: "akb://v/doc/d-2",
+          name: "Linked",
+          resource_type: "document",
+        },
+      ],
+    }));
+    const out = await bfsExpand({ vault: "v", entry: "d-1", hops: 1, fetchRelations });
+    expect(out.edges).toEqual([
+      { source: "akb://v/doc/d-1", target: "akb://v/doc/d-2", relation: "links_to" },
+    ]);
+  });
+
+  it("DEFAULT_VIEW keeps links_to edges through applyFilters", () => {
+    const nodes: GraphNode[] = [
+      { uri: "akb://v/doc/a", name: "A", kind: "document" },
+      { uri: "akb://v/doc/b", name: "B", kind: "document" },
+    ];
+    const edges: GraphEdge[] = [{ source: "akb://v/doc/a", target: "akb://v/doc/b", relation: "links_to" }];
+    const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
+    expect(out.edges).toEqual(edges);
+  });
+
   it("walks depth-2 by following neighbors discovered in hop 1", async () => {
     const calls: string[] = [];
     const fetchRelations = vi.fn(async (_v: string, docId: string) => {
