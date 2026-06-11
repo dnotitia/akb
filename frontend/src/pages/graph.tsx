@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { PanelLeftOpen } from "lucide-react";
+import { PanelLeftOpen, X } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { Alert } from "@/components/ui/alert";
@@ -13,7 +13,6 @@ import {
   useNeighborhood,
   applyFilters,
   mergeGraph,
-  isDegraded,
   docIdFromUri,
 } from "@/components/graph/use-graph-data";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
@@ -42,8 +41,6 @@ export default function GraphPage() {
   const base = view.entry ? neighborQuery.data : fullQuery.data;
   const loading = view.entry ? neighborQuery.isLoading : fullQuery.isLoading;
   const error = view.entry ? neighborQuery.error : fullQuery.error;
-  const rawNodeCount = base?.nodes.length || 0;
-  const degraded = isDegraded(rawNodeCount);
 
   // Click-expand merges into a session-scoped overlay so URL state stays clean.
   const [overlay, setOverlay] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] }>({
@@ -86,6 +83,14 @@ export default function GraphPage() {
   const [pinned, setPinned] = useState<Set<string>>(new Set());
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // One-time orientation hint (persisted dismissed).
+  const [hintOpen, setHintOpen] = useState(
+    () => localStorage.getItem("akb:graph:hint-dismissed") !== "1",
+  );
+  const dismissHint = useCallback(() => {
+    setHintOpen(false);
+    localStorage.setItem("akb:graph:hint-dismissed", "1");
+  }, []);
   const lastClickRef = useRef<{ uri: string; at: number } | null>(null);
 
   // Double-click emulation: two clicks on the same URI within DOUBLECLICK_MS
@@ -131,6 +136,25 @@ export default function GraphPage() {
     return { selectedNode: node, selectedDocId: docId };
   }, [merged, view.selected]);
   const detailOpen = !!selectedNode && !!selectedDocId;
+
+  // Friendly title for the focus-mode banner.
+  const entryTitle =
+    merged.nodes.find((n) => docIdFromUri(n.uri) === view.entry || n.doc_id === view.entry)?.name ??
+    view.entry;
+
+  // Degree-ranked top 50 for the sr-only list — 600 raw buttons is a
+  // screen-reader wall; surface the structurally important nodes first, with
+  // the sidebar search as the path to the long tail.
+  const topNodes = useMemo(() => {
+    const degree = new Map<string, number>();
+    for (const e of merged.edges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    return [...merged.nodes]
+      .sort((a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0))
+      .slice(0, 50);
+  }, [merged]);
 
   // Clicking a relation in the detail panel selects that node in the graph.
   // If it isn't currently rendered (filtered out, or outside the loaded
@@ -198,9 +222,45 @@ export default function GraphPage() {
       )}
 
       <div className="relative bg-background overflow-hidden">
-        {degraded && (
+        {/* Focus mode: a clear "you're zoomed into one node — get out" banner.
+            The whole-graph view (no entry) shows the orientation hint instead. */}
+        {view.entry && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 w-max max-w-[90%]">
-            <Alert variant="warning">{rawNodeCount} nodes — pick an entry point to explore.</Alert>
+            <Alert variant="info">
+              <div className="flex items-center gap-3">
+                <span className="truncate max-w-[40ch]">Focused on {entryTitle}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setView({ ...view, entry: undefined })}
+                >
+                  Show whole graph
+                </Button>
+              </div>
+            </Alert>
+          </div>
+        )}
+
+        {/* Non-blocking orientation hint (whole-graph view only), dismissible
+            + persisted. Replaces the old blocking "pick an entry point" gate. */}
+        {!view.entry && hintOpen && !loading && !error && merged.nodes.length > 0 && (
+          <div className="absolute bottom-3 left-3 z-10 w-max max-w-[90%]">
+            <Alert variant="info">
+              <div className="flex items-center gap-3">
+                <span>
+                  {merged.nodes.length} nodes · {merged.edges.length} links — drag to pan ·
+                  scroll to zoom · click a node to focus
+                </span>
+                <button
+                  type="button"
+                  onClick={dismissHint}
+                  aria-label="Dismiss hint"
+                  className="shrink-0 text-foreground-muted hover:text-foreground transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X className="h-3 w-3" aria-hidden />
+                </button>
+              </div>
+            </Alert>
           </div>
         )}
 
@@ -235,7 +295,6 @@ export default function GraphPage() {
               selected={selectedNode?.uri}
               pinned={pinned}
               hidden={hidden}
-              degraded={degraded}
               onSelect={handleSelect}
               onContextMenu={handleContextMenu}
             />
@@ -245,7 +304,7 @@ export default function GraphPage() {
             <div className="sr-only">
               <h2>Graph nodes ({merged.nodes.length})</h2>
               <ul>
-                {merged.nodes.map((n) => (
+                {topNodes.map((n) => (
                   <li key={n.uri}>
                     <button type="button" onClick={() => handleSelect(n.uri)}>
                       {n.name} — {n.kind}
@@ -253,6 +312,12 @@ export default function GraphPage() {
                     </button>
                   </li>
                 ))}
+                {merged.nodes.length > topNodes.length && (
+                  <li>
+                    {merged.nodes.length - topNodes.length} more — use the sidebar search to
+                    reach them.
+                  </li>
+                )}
               </ul>
             </div>
           </>

@@ -21,7 +21,6 @@ describe("GraphCanvas smoke", () => {
           edges={[]}
           pinned={new Set()}
           hidden={new Set()}
-          degraded={false}
           onSelect={() => {}}
           onContextMenu={() => {}}
         />,

@@ -45,10 +45,9 @@ describe("GraphSidebar · types", () => {
 });
 
 describe("GraphSidebar · hops", () => {
-  it("is disabled when no entry is set", () => {
+  it("is hidden until a focus is set", () => {
     setup();
-    const radio = screen.getByRole("radio", { name: /3 hops/i });
-    expect(radio).toBeDisabled();
+    expect(screen.queryByRole("radio", { name: /3 hops/i })).toBeNull();
   });
 
   it("emits hops change when entry is set", async () => {
@@ -110,7 +109,7 @@ describe("GraphSidebar · entry search", () => {
         onNavigate={() => {}}
       />,
     );
-    const input = screen.getByPlaceholderText(/search documents/i);
+    const input = screen.getByPlaceholderText(/search to focus/i);
     // Use fireEvent to set value directly and avoid userEvent fake-timer conflicts.
     fireEvent.change(input, { target: { value: "road" } });
     await vi.advanceTimersByTimeAsync(300);
@@ -143,7 +142,7 @@ describe("GraphSidebar · entry search", () => {
         onNavigate={() => {}}
       />,
     );
-    const input = screen.getByPlaceholderText(/search documents/i);
+    const input = screen.getByPlaceholderText(/search to focus/i);
     await u.type(input, "road");
     // Wait for debounce (300ms) + microtask flush.
     const hit = await screen.findByText("Roadmap", undefined, { timeout: 1500 });

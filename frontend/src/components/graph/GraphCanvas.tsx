@@ -37,7 +37,6 @@ interface Props {
   selected?: string;
   pinned: Set<string>;
   hidden: Set<string>;
-  degraded: boolean;
   onSelect: (uri: string | undefined) => void;
   onContextMenu: (
     node: GraphNode,
@@ -59,7 +58,24 @@ interface RenderEdge {
 }
 
 const NODE_SIZE = 16;
-const LABEL_ZOOM_THRESHOLD = 0.3;
+/** Above this zoom every node labels; below it only hovered/selected/pinned do,
+ *  so a 600-node graph reads as glyphed squares instead of a smear of names. */
+const LABEL_ALL_ZOOM = 1.2;
+
+/**
+ * Layout effort by node count. `warmup` ticks run SYNCHRONOUSLY off-screen
+ * before the first paint, so node positions ALWAYS exist even when the animated
+ * `cooldown` is short or zero — this is what prevents the old origin-stacking
+ * blank on large graphs. Bigger graphs warm up more (so they're laid out) but
+ * animate less (so the tab stays responsive); `collide` (the only O(n²) force)
+ * is dropped past ~1200 nodes.
+ */
+function layoutTier(n: number) {
+  if (n > 3000) return { warmup: 250, cooldownTicks: 0, collide: false };
+  if (n > 1200) return { warmup: 150, cooldownTicks: 60, collide: false };
+  if (n > 400) return { warmup: 60, cooldownTicks: 120, collide: true };
+  return { warmup: 0, cooldownTicks: 200, collide: true };
+}
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCanvas(
   {
@@ -68,7 +84,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     selected,
     pinned,
     hidden,
-    degraded,
     onSelect,
     onContextMenu,
   },
@@ -82,6 +97,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // Snap (don't animate) the layout when the OS asks for reduced motion.
   const [frozen, setFrozen] = useState(() => prefersReducedMotion());
   const [clustered, setClustered] = useState(true);
+  const [hovered, setHovered] = useState<string>();
   const [size, setSize] = useState({ w: 0, h: 0 });
 
   // react-force-graph-2d defaults to window.innerWidth/Height with no resize
@@ -102,7 +118,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     (): GraphCanvasHandle => ({
       centerOnNode: (uri) => {
         const n = nodes.find((node) => node.uri === uri);
-        if (!n || n.x == null || n.y == null) return;
+        if (!n || n.x == null || n.y == null) {
+          fgRef.current?.zoomToFit(400, 60);
+          return;
+        }
         fgRef.current?.centerAt(n.x, n.y, 400);
         fgRef.current?.zoom(Math.max(fgRef.current?.zoom() || 1, 1.5), 400);
       },
@@ -117,24 +136,23 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    // Pause the sim while frozen/degraded. We intentionally leave the built-in
-    // 'center' force installed — pausing already stops all ticks, and nulling
-    // center permanently would let the layout drift off-centre on a later
-    // resume/reheat.
-    if (degraded || frozen) fg.pauseAnimation();
+    // Pause only for Freeze / reduced-motion — NEVER for node count. Suspending
+    // the sim on a large graph was the old blank bug. The built-in 'center'
+    // force stays installed; pausing already stops all ticks.
+    if (frozen) fg.pauseAnimation();
     else fg.resumeAnimation();
-  }, [degraded, frozen]);
+  }, [frozen]);
 
-  // Auto fit-to-view once when nodes first populate
-  useEffect(() => {
+  // Fit once the layout settles. onEngineStop fires after warmup+cooldown for
+  // every tier (incl. the snap tier, where the synchronous warmup already
+  // placed every node), so zoomToFit always has a real bounding box instead of
+  // racing a fixed timer. fittedRef resets via the page's key={structureKey}
+  // remount on a structural change.
+  const handleEngineStop = useCallback(() => {
     if (fittedRef.current) return;
-    if (nodes.length === 0) return;
-    const t = setTimeout(() => {
-      fgRef.current?.zoomToFit(400, 60);
-      fittedRef.current = true;
-    }, 500);
-    return () => clearTimeout(t);
-  }, [nodes.length]);
+    fgRef.current?.zoomToFit(400, 60);
+    fittedRef.current = true;
+  }, []);
 
   // node.group is assigned at data ingest (use-graph-data.ts), so it travels
   // with the node and this stays a pure filter.
@@ -142,6 +160,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     () => nodes.filter((n) => !hidden.has(n.uri)),
     [nodes, hidden],
   );
+  // Layout effort scales with the rendered node count (see layoutTier).
+  const tier = useMemo(() => layoutTier(visibleNodes.length), [visibleNodes.length]);
   const visibleEdges = useMemo(
     () =>
       edges.filter(
@@ -168,19 +188,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    const on = clustered && !degraded;
+    const on = clustered; // forceCluster (centroid pass, O(n)) — fine at every tier
+    const collideOn = clustered && tier.collide; // forceCollide (O(n²)) only ≤1200
     fg.d3Force("cluster", on ? (forceCluster(CLUSTER_STRENGTH) as never) : null);
-    fg.d3Force("collide", on ? (forceCollide(COLLIDE_RADIUS) as never) : null);
+    fg.d3Force("collide", collideOn ? (forceCollide(COLLIDE_RADIUS) as never) : null);
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
     // Don't reheat on a reduced-motion preference — the freeze effect owns
     // pause/resume; reheating from alpha=1 is the cost Freeze exists to avoid.
-    if (!degraded && !prefersReducedMotion()) fg.d3ReheatSimulation();
+    if (!prefersReducedMotion()) fg.d3ReheatSimulation();
     return () => {
       fgRef.current?.d3Force("cluster", null);
       fgRef.current?.d3Force("collide", null);
     };
-  }, [clustered, degraded]);
+  }, [clustered, tier.collide]);
 
   const paintNode = useCallback(
     (n: RenderNode, ctx: CanvasRenderingContext2D, scale: number) => {
@@ -251,7 +272,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         ctx.fillText(glyph, x, y);
       }
 
-      if (scale > LABEL_ZOOM_THRESHOLD) {
+      // Label every node only when zoomed in past LABEL_ALL_ZOOM; otherwise
+      // (e.g. the fit-to-view overview of a 600-node graph) only the hovered /
+      // selected / pinned node labels, so the canvas reads as glyphed squares
+      // instead of a smear of overlapping names.
+      const labelThis =
+        scale > LABEL_ALL_ZOOM || n.uri === selected || n.uri === hovered || pinned.has(n.uri);
+      if (labelThis) {
         // Render the title as-authored — never .toUpperCase() user copy (it
         // corrupts acronyms/camelCase/non-Latin titles).
         const raw = n.name || "";
@@ -263,7 +290,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         ctx.fillText(label, x, y + NODE_SIZE / 2 + 4);
       }
     },
-    [colors, selected, pinned, clustered],
+    [colors, selected, pinned, clustered, hovered],
   );
 
   const paintLink = useCallback(
@@ -380,7 +407,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
         linkDirectionalArrowColor={colors.foregroundMuted}
-        cooldownTicks={degraded || frozen ? 0 : 200}
+        warmupTicks={tier.warmup}
+        cooldownTicks={frozen ? 0 : tier.cooldownTicks}
+        onEngineStop={handleEngineStop}
+        onNodeHover={(n) => setHovered((n as RenderNode | undefined)?.uri)}
         onNodeClick={handleNodeClick as never}
         onBackgroundClick={handleBackgroundClick}
         onNodeRightClick={handleNodeRightClick as never}

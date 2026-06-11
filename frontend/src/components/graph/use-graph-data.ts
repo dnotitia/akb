@@ -89,12 +89,6 @@ export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
   return { nodes, edges };
 }
 
-export const DEGRADED_NODE_THRESHOLD = 500;
-
-export function isDegraded(rawNodeCount: number): boolean {
-  return rawNodeCount > DEGRADED_NODE_THRESHOLD;
-}
-
 interface BfsExpandArgs {
   vault: string;
   entry: string; // doc path within the vault
@@ -245,10 +239,10 @@ export function useFullGraph(vault: string, enabled: boolean) {
     queryKey: ["graph", vault, "full"],
     enabled,
     queryFn: async (): Promise<GraphPayload> => {
-      // Full mode loads up to 200 nodes; `isDegraded` (>500) is unreachable
-      // today, so 200 is the practical upper bound on full-vault renders.
-      // Truncation is silent — surface "showing first N of M" if it becomes
-      // a real concern.
+      // Loads the whole vault graph. The 200 here is the backend BFS relation
+      // fan-out `limit` (per traversal), NOT a cap on |V| — large vaults return
+      // hundreds/thousands of nodes, which the canvas handles via its layout
+      // perf tiers (GraphCanvas.layoutTier), not a render gate.
       const resp = await getGraph(vault, undefined, 2, 200);
       const nodes: GraphNode[] = resp.nodes.map((n) => ({
         uri: n.uri,

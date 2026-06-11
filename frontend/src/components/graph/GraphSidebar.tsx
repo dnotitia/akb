@@ -136,18 +136,23 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         </div>
       )}
 
-      <Section label="Entry point" className="px-2">
+      <Section label="Focus" className="px-2">
         <div className="relative">
           <SearchIcon className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-foreground-muted pointer-events-none" />
           <input
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search documents"
-            aria-label="Search documents"
+            placeholder="Search to focus on a document"
+            aria-label="Search to focus on a document"
             className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus:border-primary"
           />
         </div>
+        {!view.entry && hits.length === 0 && (
+          <p className="coord text-foreground-muted mt-1.5 leading-relaxed">
+            Showing the whole graph. Search to zoom into one document&rsquo;s neighborhood.
+          </p>
+        )}
         {hits.length > 0 && (
           <ul className="mt-1 flex flex-col gap-px">
             {hits.map((h) => (
@@ -164,14 +169,17 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             ))}
           </ul>
         )}
-        {view.entry && hits.length === 0 && (
-          <div className="mt-1 flex items-center justify-between gap-2 px-2 h-7 text-[11px] bg-surface-muted">
-            <span title={`entry: ${view.entry}`} className="truncate">entry: {view.entry}</span>
+        {view.entry && (
+          <div className="mt-1 flex items-center justify-between gap-2 px-2 h-7 text-[11px] bg-surface-muted rounded-[var(--radius-sm)]">
+            <span title={`focused on ${view.entry}`} className="truncate">
+              Focused on <span className="coord">{view.entry}</span>
+            </span>
             <button
               type="button"
               onClick={() => onChange({ ...view, entry: undefined })}
-              aria-label="Clear entry"
-              className="text-foreground-muted hover:text-foreground"
+              aria-label="Show whole graph"
+              title="Show whole graph"
+              className="shrink-0 text-foreground-muted hover:text-foreground"
             >
               <X className="h-3 w-3" />
             </button>
@@ -179,40 +187,26 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
       </Section>
 
-      <Section label="Hops" className="px-2">
-        <div
-          className={cn(
-            "flex items-center gap-3 text-[11px]",
-            !view.entry && "opacity-50",
-          )}
-          aria-disabled={!view.entry}
-        >
-          {([1, 2, 3] as const).map((d) => (
-            <label
-              key={d}
-              className={cn(
-                "inline-flex items-center gap-1",
-                view.entry ? "cursor-pointer" : "cursor-not-allowed",
-              )}
-            >
-              <input
-                type="radio"
-                name="hops"
-                checked={view.hops === d}
-                disabled={!view.entry}
-                onChange={() => onChange({ ...view, hops: d })}
-                aria-label={`${d} hop${d === 1 ? "" : "s"}`}
-              />
-              {d}
-            </label>
-          ))}
-        </div>
-        {!view.entry && (
-          <p className="coord text-foreground-muted mt-2">
-            Set an entry point to enable
-          </p>
-        )}
-      </Section>
+      {/* Hops only matters inside a focus — hidden in the whole-graph view so
+          the rail isn't half-disabled on first open. */}
+      {view.entry && (
+        <Section label="Hops" className="px-2">
+          <div className="flex items-center gap-3 text-[11px]">
+            {([1, 2, 3] as const).map((d) => (
+              <label key={d} className="inline-flex items-center gap-1 cursor-pointer">
+                <input
+                  type="radio"
+                  name="hops"
+                  checked={view.hops === d}
+                  onChange={() => onChange({ ...view, hops: d })}
+                  aria-label={`${d} hop${d === 1 ? "" : "s"}`}
+                />
+                {d}
+              </label>
+            ))}
+          </div>
+        </Section>
+      )}
 
       <Section label="Types" className="px-2">
         <div className="flex flex-wrap gap-1">
