@@ -38,7 +38,6 @@ const baseProps = {
   edges: [],
   pinned: new Set<string>(),
   hidden: new Set<string>(),
-  degraded: false,
   onSelect: () => {},
   onContextMenu: () => {},
 };

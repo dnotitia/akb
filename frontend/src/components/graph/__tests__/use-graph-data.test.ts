@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mergeGraph, bfsExpand, applyFilters, isDegraded, docIdFromUri } from "../use-graph-data";
+import { mergeGraph, bfsExpand, applyFilters, docIdFromUri } from "../use-graph-data";
 import { docUri } from "@/lib/uri";
 import { DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
 
@@ -90,13 +90,6 @@ describe("applyFilters", () => {
     const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
     expect(out.nodes.length).toBe(3);
     expect(out.edges.length).toBe(2);
-  });
-});
-
-describe("isDegraded", () => {
-  it("flips at > 500 raw nodes (unfiltered count)", () => {
-    expect(isDegraded(500)).toBe(false);
-    expect(isDegraded(501)).toBe(true);
   });
 });
 
