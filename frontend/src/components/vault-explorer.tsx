@@ -3,10 +3,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
-  File,
   FilePlus,
   FileText,
   FolderPlus,
+  Paperclip,
   Sparkles,
   Table,
   Trash2,
@@ -406,7 +406,7 @@ const TreeRow = memo(function TreeRow({
           data-sig={sig}
           onClick={() => onToggle(node.path)}
           style={indent}
-          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
+          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1.5 min-h-9 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
             isActive ? "bg-surface-selected text-surface-selected-foreground" : ""
           }`}
         >
@@ -468,7 +468,7 @@ const TreeRow = memo(function TreeRow({
 
   const href = leafHref(vault, node);
   const isSkill = node.kind === "document" && node.raw?.doc_type === "skill";
-  const LeafIcon = isSkill ? Sparkles : node.kind === "document" ? FileText : node.kind === "table" ? Table : File;
+  const LeafIcon = isSkill ? Sparkles : node.kind === "document" ? FileText : node.kind === "table" ? Table : Paperclip;
   // Tint the leaf icon by resource kind from the categorical ramp (the same
   // doc=cat-1 / table=cat-3 / file=cat-4 mapping the Home + overview rows use),
   // so a doc vs a table vs a file is a colour at a glance — not just an icon
@@ -485,15 +485,34 @@ const TreeRow = memo(function TreeRow({
       aria-current={isActive ? "page" : undefined}
       aria-selected={isActive}
       style={indent}
-      className={`flex items-center gap-1.5 pr-2 py-1 group transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none ${
+      className={`flex items-center gap-1.5 pr-2 py-1.5 min-h-9 group transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none ${
         isActive ? "bg-surface-selected text-surface-selected-foreground border-l-2 border-primary -ml-[2px]" : ""
       }`}
     >
-      <LeafIcon
-        className="h-3 w-3 shrink-0"
-        style={{ color: leafTone }}
+      {/* Tinted icon chip — the same kind-swatch grammar Home + the vault
+          overview use, so a doc vs table vs file is pre-attentive here too
+          (was a bare 12px glyph, the one surface that dropped the chip). */}
+      <span
+        className="inline-flex h-4 w-4 items-center justify-center rounded-[var(--radius-sm)] shrink-0"
+        style={{
+          color: leafTone,
+          backgroundColor: `color-mix(in srgb, ${leafTone} 12%, transparent)`,
+        }}
         aria-hidden
-      />
+      >
+        <LeafIcon className="h-2.5 w-2.5" aria-hidden />
+      </span>
+      {/* The chip is aria-hidden, so name kind to assistive tech in words
+          (otherwise a SR user hears the bare title with no type). */}
+      <span className="sr-only">
+        {node.kind === "document"
+          ? isSkill
+            ? "Skill: "
+            : "Document: "
+          : node.kind === "table"
+            ? "Table: "
+            : "File: "}
+      </span>
       <span title={node.name} className="truncate min-w-0 text-[13px] group-hover:text-link">{node.name}</span>
       {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
     </Link>
