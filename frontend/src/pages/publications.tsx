@@ -14,7 +14,8 @@ import {
 } from "lucide-react";
 import { listPublications, deletePublication, getDocument, type Publication } from "@/lib/api";
 import { parseDocUri, parseFileUri } from "@/lib/uri";
-import { formatDate, timeAgo } from "@/lib/utils";
+import { formatDate } from "@/lib/utils";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -208,9 +209,7 @@ export default function PublicationsPage() {
                         ? `Expires ${formatDate(p.expires_at)}`
                         : "Evergreen"}
                     </span>
-                    <span className="coord tabular-nums">
-                      {timeAgo(p.created_at)}
-                    </span>
+                    <RelativeTime iso={p.created_at} />
                     {/* Benign Copy/Open pair, then a separated destructive Unpub. */}
                     <div className="flex items-center gap-1">
                       <button

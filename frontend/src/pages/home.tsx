@@ -28,6 +28,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
 import { VaultChip } from "@/components/ui/vault-chip";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
@@ -36,7 +37,7 @@ import {
   listPATs,
   revokePAT,
 } from "@/lib/api";
-import { isFresh, timeAgo } from "@/lib/utils";
+import { timeAgo } from "@/lib/utils";
 import { recentIcon, recentTone } from "@/lib/recent";
 import { mcpInstallSnippets, MCP_AGENT_FILES } from "@/lib/mcp-snippets";
 
@@ -288,7 +289,6 @@ export default function HomePage() {
                 {recent.map((c, i) => {
                   const Icon = recentIcon(c.type);
                   const tone = recentTone(c.type);
-                  const fresh = isFresh(c.changed_at);
                   return (
                   <li key={`${c.doc_id}:${c.changed_at ?? ""}:${i}`}>
                     <Link
@@ -315,16 +315,7 @@ export default function HomePage() {
                         <VaultChip name={c.vault} size="sm" />
                         <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
                       </span>
-                      {fresh ? (
-                        <span className="inline-flex items-center justify-end gap-1 text-right text-[11px] font-medium tabular-nums text-spark">
-                          <span className="h-1.5 w-1.5 rounded-full bg-spark" aria-hidden />
-                          {timeAgo(c.changed_at)}
-                        </span>
-                      ) : (
-                        <span className="coord tabular-nums text-right">
-                          {timeAgo(c.changed_at)}
-                        </span>
-                      )}
+                      <RelativeTime iso={c.changed_at} className="justify-end text-right" />
                     </Link>
                   </li>
                   );

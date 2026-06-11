@@ -6,8 +6,8 @@ import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RoleBadge } from "@/components/status-badge";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { recentTone } from "@/lib/recent";
-import { isFresh, timeAgo } from "@/lib/utils";
 
 export interface VaultRow {
   id: string;
@@ -103,18 +103,11 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
                 <div className="flex items-center gap-3 shrink-0">
                   <VaultStatsCell m={m} />
                   {m ? (
-                    lastActivity && isFresh(lastActivity) ? (
-                      // Fresh (<1h) → the same spark treatment the Home Recent
-                      // card uses, so the dashboard's two time columns match.
-                      <span className="inline-flex w-[56px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-spark">
-                        <span className="h-1.5 w-1.5 rounded-full bg-spark" aria-hidden />
-                        {timeAgo(lastActivity)}
-                      </span>
-                    ) : (
-                      <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
-                        {lastActivity ? timeAgo(lastActivity) : "—"}
-                      </span>
-                    )
+                    <RelativeTime
+                      iso={lastActivity}
+                      fallback="—"
+                      className="w-[56px] justify-end text-right whitespace-nowrap"
+                    />
                   ) : (
                     <span
                       className="h-3 w-[56px] rounded bg-surface-muted animate-pulse"
