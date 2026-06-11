@@ -533,6 +533,58 @@ async def test_p2_alter_table_reserved_guard(pool):
     assert has_id == 1, "PK column must still exist after rejected drop"
 
 
+# ── P2: create_table reserved/duplicate/malformed column → 422 ────
+
+
+@pytest.mark.asyncio
+async def test_p2_create_table_bad_columns_are_validation_errors(pool):
+    """Every reserved / duplicate / malformed / missing-name column on create
+    must surface as a clean ValidationError (HTTP 422 / MCP invalid_argument),
+    never a bare ValueError-as-500 or an uncaught asyncpg DuplicateColumnError.
+    Regression: reef's POST /tables with an `id` column returned a 500."""
+    from app.services import table_service
+    from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
+    from app.exceptions import ValidationError
+
+    set_role_sync(RoleSync(pool))
+    vault_repo = VaultRepository(pool)
+    name = f"_p2create_{uuid.uuid4().hex[:8]}"
+    vid = await vault_repo.create(name=name, description="x", git_path=f"/tmp/{name}.git", owner_id=None)
+    await get_role_sync().on_vault_create(vid, None)
+
+    bad_payloads = [
+        [{"name": "id", "type": "text"}],                      # reserved (reef's case)
+        [{"name": "created_at", "type": "text"}],              # reserved
+        [{"name": "title"}, {"name": "title"}],                # duplicate → would be 42701
+        [{"name": "Title", "type": "text"}],                   # malformed (uppercase)
+        [{"type": "text"}],                                    # missing "name"
+    ]
+    for i, cols in enumerate(bad_payloads):
+        with pytest.raises(ValidationError):
+            await table_service.create_table(vid, f"t_{i}", cols, actor_id="t")
+        # IS-A ValueError too, so MCP `except ValueError` handlers still classify it.
+        try:
+            await table_service.create_table(vid, f"t_{i}b", cols, actor_id="t")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"payload {cols!r} should have raised")
+
+    # A clean payload still succeeds and is queryable by its bare name.
+    await table_service.create_table(
+        vid, "reef_issues",
+        [{"name": "reef_id", "type": "text"}, {"name": "title", "type": "text"}],
+        actor_id="t",
+    )
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = $1",
+            table_service.table_data_repo.pg_table_name(name, "reef_issues"),
+        )
+        await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
+    assert exists == 1, "the corrected (no reserved id) create must succeed"
+
+
 # ── P2: archived vault is read-only via akb_sql ───────────────────
 
 

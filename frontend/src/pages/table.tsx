@@ -46,9 +46,14 @@ export default function TablePage() {
         if (found) setInfo(found);
       })
       .catch(() => {});
-    // Quote the identifier so reserved/upper/space-bearing names don't produce
-    // malformed SQL. (PG ACL still bounds visibility via SET LOCAL ROLE.)
-    const ident = `"${(table || "").replace(/"/g, '""')}"`;
+    // Reference the table by its BARE short name so the backend akb_sql
+    // rewriter resolves it to the physical `vt_<vault>__<table>` relation
+    // (PG ACL still bounds visibility via SET LOCAL ROLE). A double-quoted
+    // identifier is intentionally NOT rewritten — the rewriter skips quoted
+    // spans so it can't corrupt string literals — so quoting here silently
+    // bypassed the mapping → "relation <table> does not exist". Table names are
+    // constrained to ^[a-z][a-z0-9_]*$, so a bare reference is always well-formed.
+    const ident = table || "";
     fetch(`/api/v1/tables/${vault}/sql`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },

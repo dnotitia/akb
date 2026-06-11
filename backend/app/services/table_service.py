@@ -65,22 +65,25 @@ _COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _validate_column_name(name) -> None:
-    """Reject reserved + malformed column names (raises ValueError).
+    """Reject reserved + malformed column names (raises ValidationError → 422).
 
     Shared by create_table and alter_table so the two paths stay
     consistent: reserved names collide with the auto-added bookkeeping
     columns (id/created_at/updated_at/created_by), and the shape check
     keeps the registry name identical to its `safe_ident` PG identity.
+
+    Raises ValidationError (which IS-A ValueError) so a bad column name is a
+    clean 422 on REST and invalid_argument on MCP — never an internal 500.
     """
     if not isinstance(name, str) or not name:
-        raise ValueError("Column name must be a non-empty string.")
+        raise ValidationError("Column name must be a non-empty string.")
     if name.lower() in _RESERVED:
-        raise ValueError(
+        raise ValidationError(
             f"Column name '{name}' is reserved (auto-added by AKB). "
             f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
         )
     if not _COLUMN_NAME_RE.fullmatch(name):
-        raise ValueError(
+        raise ValidationError(
             f"Invalid column name {name!r}: must match {_COLUMN_NAME_RE.pattern} "
             f"(lowercase letter then letters/digits/underscores)."
         )
@@ -160,8 +163,22 @@ async def create_table(
             if existing:
                 raise ConflictError(f"Table already exists: {name}")
 
+            seen: set[str] = set()
             for col in columns:
-                _validate_column_name(col["name"])
+                if not isinstance(col, dict) or "name" not in col:
+                    raise ValidationError(
+                        f"Each column must be an object with a 'name' field; got {col!r}."
+                    )
+                cname = col["name"]
+                _validate_column_name(cname)
+                key = cname.lower()
+                if key in seen:
+                    raise ValidationError(
+                        f"Duplicate column name {cname!r}. Column names must be "
+                        f"unique (case-insensitive) and must not collide with "
+                        f"reserved names {sorted(_RESERVED)}."
+                    )
+                seen.add(key)
 
             collection_id = None
             if collection_path:
@@ -192,6 +209,15 @@ async def create_table(
                     created_by=actor_id, now=now,
                     collection_id=collection_id,
                 )
+            except asyncpg.DuplicateColumnError as e:
+                # Belt-and-suspenders: a duplicate/reserved column that reached
+                # DDL despite the input guard above. 42701 is always caller-
+                # fixable input, so surface a clean 422 (not a 500).
+                raise ValidationError(
+                    f"Duplicate or reserved column in table {name!r}: {e}. "
+                    f"Column names (including the reserved id/created_at/"
+                    f"updated_at/created_by) must each appear once."
+                ) from e
             except asyncpg.UniqueViolationError as e:
                 # Concurrent create past the find_by_name check races on
                 # UNIQUE(vault_tables) or pg_type. Surface as 409.
@@ -386,20 +412,24 @@ async def alter_table(
             # those are exactly the _RESERVED set — so a client can no
             # longer drop the PK or shadow a reserved name.
             for col in (add_columns or []):
+                if not isinstance(col, dict) or "name" not in col:
+                    raise ValidationError(
+                        f"Each added column must be an object with a 'name' field; got {col!r}."
+                    )
                 _validate_column_name(col["name"])
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
-                    raise ValueError("Drop column name must be a non-empty string.")
+                    raise ValidationError("Drop column name must be a non-empty string.")
                 if col_name.lower() in _RESERVED:
-                    raise ValueError(
+                    raise ValidationError(
                         f"Column '{col_name}' is a reserved bookkeeping column "
                         f"and cannot be dropped. Reserved: {sorted(_RESERVED)}."
                     )
             for old_name, new_name in (rename_columns or {}).items():
                 if not isinstance(old_name, str) or not old_name:
-                    raise ValueError("Rename source column must be a non-empty string.")
+                    raise ValidationError("Rename source column must be a non-empty string.")
                 if old_name.lower() in _RESERVED:
-                    raise ValueError(
+                    raise ValidationError(
                         f"Column '{old_name}' is a reserved bookkeeping column "
                         f"and cannot be renamed. Reserved: {sorted(_RESERVED)}."
                     )
