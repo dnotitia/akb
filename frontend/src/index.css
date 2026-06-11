@@ -92,6 +92,14 @@
   --color-cat-5: #c44a1e;
   --color-cat-6: #5e6068;
 
+  /* Recency ramp — the relative-time chip cools from vivid warm (just-touched,
+     == --color-spark) through a desaturating warm to the muted gray of old
+     timestamps. It DESATURATES (not lightens), so every tier keeps AA contrast
+     on paper; <1h uses --color-spark, ≥1mo falls back to --color-foreground-muted. */
+  --color-recency-h: #aa5031; /* < 1 day */
+  --color-recency-d: #915543; /* < 1 week */
+  --color-recency-w: #775a56; /* < 1 month */
+
   /* shadcn alias set (existing components inherit) — primary is teal now */
   --color-primary: #004059;
   --color-primary-foreground: #ffffff;
@@ -210,6 +218,10 @@
   --color-cat-4: #e3a13f;
   --color-cat-5: #f0744a;
   --color-cat-6: #9aa4af;
+  /* Recency ramp (dark): lighter warm → light gray, AA on the dark surface. */
+  --color-recency-h: #da8063;
+  --color-recency-d: #c58c7c;
+  --color-recency-w: #af9896;
 
   --color-primary: #0a6f86;
   --color-primary-foreground: #ffffff;

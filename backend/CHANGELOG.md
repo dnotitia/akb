@@ -5,6 +5,14 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.10 — 2026-06-11  *(patch — table create: reserved/duplicate column → clean 422, never 500)*
+
+`POST /api/v1/tables/{vault}` returned a bare **500** when a create payload included a reserved column name (`id`/`created_at`/`updated_at`/`created_by`) or two same-named columns — a client contract violation surfaced as an opaque internal error. Two paths produced it: `_validate_column_name` raised a bare `ValueError` (not an `AKBError`, so the global handler missed it → FastAPI 500), and a duplicate column reached the DDL as an uncaught `asyncpg.DuplicateColumnError`. The reserved-reject gap dates to 0.3.6; it only began firing when a caller (reef) started sending an `id` column.
+
+Now every reserved / duplicate / malformed / missing-`name` column on create (and the symmetric `alter_table` paths) returns a clean **422** with an actionable message, on both REST and MCP. Keystone: `ValidationError` now **IS-A** `ValueError`, so the existing `except ValueError` MCP handlers and `pytest.raises(ValueError)` guards keep classifying validation rejects correctly (`AKBError` stays first in the MRO → status stays 422). Adds `tests/concurrency/test_invariants_unit.py::test_p2_create_table_bad_columns_are_validation_errors` covering every create-422 vector plus the corrected-create-succeeds path. reef must drop the reserved `id` (it already has `reef_id`); AKB does not alias reserved columns by design.
+
+Companion **frontend** fix (separate image): the table viewer referenced a table with a double-quoted identifier (`SELECT * FROM "reef_issues"`), which the akb_sql rewriter intentionally skips, so it was never resolved to the physical `vt_<vault>__<table>` → "relation … does not exist" even though the table + rows existed. The viewer now sends the bare short name (table names are `^[a-z][a-z0-9_]*$`, so a bare reference is always well-formed and gets rewritten).
+
 ## 0.8.9 — 2026-06-10  *(patch — register migration 035 in the runtime applier + guard test)*
 
 Migrations run from an **explicit hardcoded list** in `_apply_migrations` (`app/db/postgres.py`), not by globbing the directory — a deliberate design so a steady-state boot runs zero DDL. 0.8.8 added `035_fix_wikilink_alias_edges.py` but **not** its entry in that list, so the migration shipped as a **no-op**: the file was in the image but never invoked, and the already-corrupted edges stayed corrupted on deploy.

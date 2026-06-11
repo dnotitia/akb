@@ -33,6 +33,14 @@ class ForbiddenError(AKBError):
         super().__init__(message, status_code=403)
 
 
-class ValidationError(AKBError):
+class ValidationError(AKBError, ValueError):
+    """Client-input error → HTTP 422.
+
+    Also IS-A ``ValueError`` so the many ``except ValueError`` sites (MCP tool
+    handlers, the alter-table guard tests) keep catching validation rejects as
+    invalid-argument rather than letting a service-layer reject leak out as an
+    internal 500. AKBError comes first in the MRO, so ``status_code`` stays 422.
+    """
+
     def __init__(self, message: str):
         super().__init__(message, status_code=422)
