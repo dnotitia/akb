@@ -54,7 +54,16 @@ export function timeAgo(iso: string | null | undefined): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
+  // Past a week, collapse the dormant tail to coarse buckets so a directory
+  // of old vaults reads "8mo ago", not a two/three-digit "247d ago" sitting
+  // next to a fresh feed's "3h ago". The recent grammar (just now / m / h / d)
+  // is preserved for the first week — the window that actually matters.
+  // Day-thresholds (not floor-then-compare) so there's no 360–364d gap that
+  // would fall through to "0y ago".
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
 }
 
 /**

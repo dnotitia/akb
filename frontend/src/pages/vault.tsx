@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getDocument, getRecent, getVaultActivity, getVaultInfo } from "@/lib/api";
-import { isFresh, timeAgo } from "@/lib/utils";
+import { RelativeTime } from "@/components/ui/relative-time";
 import { recentIcon, recentTone } from "@/lib/recent";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -316,9 +316,10 @@ export default function VaultPage() {
               <span className="text-foreground">{info.owner_display_name}</span>
             </>,
           );
-        if (info.created_at) segs.push(<>Created {timeAgo(info.created_at)}</>);
+        if (info.created_at)
+          segs.push(<>Created <RelativeTime iso={info.created_at} /></>);
         if (info.last_activity)
-          segs.push(<>Last active {timeAgo(info.last_activity)}</>);
+          segs.push(<>Last active <RelativeTime iso={info.last_activity} /></>);
         if (!segs.length) return null;
         return (
           <div className="coord mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -514,7 +515,6 @@ export default function VaultPage() {
               {recent.map((c, i) => {
                 const Icon = recentIcon(c.type);
                 const tone = recentTone(c.type);
-                const fresh = isFresh(c.changed_at);
                 return (
                   <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
                     <Link
@@ -554,19 +554,10 @@ export default function VaultPage() {
                             {c.commit.slice(0, 7)}
                           </span>
                         )}
-                        {fresh ? (
-                          <span className="inline-flex w-[60px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-spark">
-                            <span
-                              className="h-1.5 w-1.5 rounded-full bg-spark"
-                              aria-hidden
-                            />
-                            {timeAgo(c.changed_at)}
-                          </span>
-                        ) : (
-                          <span className="coord tabular-nums w-[60px] text-right">
-                            {timeAgo(c.changed_at)}
-                          </span>
-                        )}
+                        <RelativeTime
+                          iso={c.changed_at}
+                          className="w-[60px] justify-end text-right"
+                        />
                       </div>
                     </Link>
                   </li>
@@ -660,9 +651,7 @@ export default function VaultPage() {
                           )}
                         </span>
                         <span className="text-center">{changeMark(change)}</span>
-                        <span className="coord tabular-nums text-right">
-                          {timeAgo(c.timestamp)}
-                        </span>
+                        <RelativeTime iso={c.timestamp} className="text-right" />
                       </Link>
                     </li>
                   );

@@ -6,7 +6,7 @@ import { Alert } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { EmptyState } from "@/components/empty-state";
 import { useDebounce } from "@/hooks/use-debounce";
-import { timeAgo } from "@/lib/utils";
+import { RelativeTime } from "@/components/ui/relative-time";
 
 const PAGE_SIZE = 50;
 
@@ -168,12 +168,10 @@ export default function VaultActivityPage() {
                       </div>
                     )}
                   </div>
-                  <span
-                    className="coord tabular-nums w-[64px] text-right shrink-0"
-                    title={e.timestamp}
-                  >
-                    {timeAgo(e.timestamp)}
-                  </span>
+                  <RelativeTime
+                    iso={e.timestamp}
+                    className="w-[64px] text-right shrink-0"
+                  />
                 </Link>
               </li>
             );
