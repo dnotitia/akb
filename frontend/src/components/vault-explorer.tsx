@@ -7,12 +7,11 @@ import {
   FilePlus,
   FileText,
   FolderPlus,
-  Network,
-  RefreshCw,
   Sparkles,
   Table,
   Trash2,
 } from "lucide-react";
+import { Alert } from "@/components/ui/alert";
 import { SkillBadge } from "@/components/ui/skill-badge";
 import { useVaultTree, useExpandedPaths, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
@@ -25,6 +24,7 @@ import {
   type FlatRow,
 } from "@/lib/tree-route";
 import { getVaultInfo } from "@/lib/api";
+import { recentTone } from "@/lib/recent";
 import { CreateCollectionDialog } from "@/components/create-collection-dialog";
 import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 
@@ -227,48 +227,17 @@ export function VaultExplorer({
   );
 
   return (
-    <aside className="flex flex-col h-full overflow-hidden border-r border-border text-sm bg-background">
-      <header className="border-b border-border px-3 py-2 flex items-center justify-between gap-2 shrink-0">
-        <Link
-          to={`/vault/${vault}`}
-          title={vault}
-          className="font-mono text-sm font-semibold truncate text-foreground hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-        >
-          {vault}
-        </Link>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={refetch}
-            disabled={loading}
-            title="Refresh tree"
-            aria-label="Refresh vault tree"
-            className="inline-flex items-center coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer disabled:cursor-default disabled:opacity-60"
-          >
-            <RefreshCw
-              className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}
-              aria-hidden
-            />
-          </button>
-          <Link
-            to={`/vault/${vault}/graph`}
-            title="Knowledge graph"
-            aria-label="Knowledge graph"
-            className="inline-flex items-center gap-1 coord hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <Network className="h-3 w-3" aria-hidden />
-            GRAPH
-          </Link>
-        </div>
-      </header>
-
+    <aside
+      className="flex flex-col h-full overflow-hidden text-sm bg-background"
+      aria-label={`${vault} collections`}
+    >
       <div className="border-b border-border px-2 py-1.5 shrink-0">
         <input
           type="search"
           placeholder="Filter in vault…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="w-full h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-accent focus-visible:ring-0 transition-colors"
+          className="w-full h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
           aria-label="Filter tree"
         />
       </div>
@@ -280,13 +249,13 @@ export function VaultExplorer({
         onKeyDown={onKeyDown}
         className="flex-1 overflow-y-auto"
       >
-        {loading && <div className="coord px-3 py-3">— LOADING —</div>}
-        {error && <div className="coord-spark px-3 py-3">⚠ {error}</div>}
+        {loading && <div className="coord px-3 py-3" role="status" aria-live="polite">— Loading —</div>}
+        {error && <Alert variant="destructive" className="m-2">{error}</Alert>}
         {!loading && !error && total === 0 && (
-          <div className="coord px-3 py-3">— EMPTY —</div>
+          <div className="coord px-3 py-3" role="status">— Empty —</div>
         )}
         {!loading && !error && total > 0 && visibleRows.length === 0 && filter && (
-          <div className="coord px-3 py-1.5 opacity-60">— NO MATCHES —</div>
+          <div className="coord px-3 py-1.5" role="status">— No matches —</div>
         )}
 
         {!loading && !error &&
@@ -334,9 +303,9 @@ export function VaultExplorer({
             <button
               type="button"
               onClick={() => setUncapped(true)}
-              className="w-full coord px-3 py-2 text-left hover:bg-surface-muted hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
+              className="w-full coord px-3 py-2 text-left hover:bg-surface-hover hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
             >
-              ↓ SHOW {fullRows.length - visibleRows.length} MORE
+              ↓ Show {fullRows.length - visibleRows.length} more
             </button>
           )}
 
@@ -347,10 +316,10 @@ export function VaultExplorer({
           <button
             type="button"
             onClick={() => openCreate(null)}
-            className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="w-full inline-flex items-center gap-1.5 px-3 py-1.5 text-left text-foreground-muted hover:bg-surface-hover hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <FolderPlus className="h-3 w-3" aria-hidden />
-            <span className="coord">+ NEW COLLECTION</span>
+            <span className="coord">+ New collection</span>
           </button>
         )}
       </div>
@@ -429,22 +398,24 @@ const TreeRow = memo(function TreeRow({
         role="treeitem"
         aria-expanded={isOpen}
         aria-level={depth + 1}
-        className="group relative flex items-stretch focus-within:bg-surface-muted/40"
+        aria-selected={isActive}
+        aria-current={isActive ? "page" : undefined}
+        className="group relative flex items-stretch focus-within:bg-surface-hover"
       >
         <button
           data-sig={sig}
           onClick={() => onToggle(node.path)}
           style={indent}
-          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1 text-left transition-colors hover:bg-surface-muted focus:bg-surface-muted focus:outline-none cursor-pointer ${
-            isActive ? "bg-accent/10" : ""
+          className={`flex-1 min-w-0 flex items-center gap-1.5 pr-2 py-1 text-left transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer ${
+            isActive ? "bg-surface-selected text-surface-selected-foreground" : ""
           }`}
         >
           <ChevronIcon
-            className="h-3 w-3 shrink-0 text-foreground-muted group-hover:text-accent transition-colors"
+            className="h-3 w-3 shrink-0 text-foreground-muted group-hover:text-link transition-colors"
             aria-hidden
           />
-          <span title={node.name} className="truncate font-medium tracking-tight text-[13px] text-foreground">{node.name}</span>
-          {count > 0 && <span className="coord ml-auto shrink-0">{count}</span>}
+          <span title={node.name} className="truncate font-medium tracking-tight text-[13px]">{node.name}</span>
+          {count > 0 && <span className="coord ml-auto shrink-0 tabular-nums">{count}</span>}
         </button>
         {canWrite && onCreateDoc && (
           <button
@@ -456,7 +427,7 @@ const TreeRow = memo(function TreeRow({
             }}
             title={`New document in ${node.path}`}
             aria-label={`Create document in ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-accent transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-link transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <FilePlus className="h-3 w-3" aria-hidden />
           </button>
@@ -471,7 +442,7 @@ const TreeRow = memo(function TreeRow({
             }}
             title={`New sub-collection in ${node.path}`}
             aria-label={`Create sub-collection in ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-accent transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-link transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <FolderPlus className="h-3 w-3" aria-hidden />
           </button>
@@ -486,7 +457,7 @@ const TreeRow = memo(function TreeRow({
             }}
             title={`Delete ${node.path}`}
             aria-label={`Delete collection ${node.path}`}
-            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-destructive transition-colors cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="shrink-0 px-2 inline-flex items-center justify-center text-foreground-muted hover:text-destructive transition-colors cursor-pointer opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <Trash2 className="h-3 w-3" aria-hidden />
           </button>
@@ -498,7 +469,12 @@ const TreeRow = memo(function TreeRow({
   const href = leafHref(vault, node);
   const isSkill = node.kind === "document" && node.raw?.doc_type === "skill";
   const LeafIcon = isSkill ? Sparkles : node.kind === "document" ? FileText : node.kind === "table" ? Table : File;
-  const leafIconColor = (node.kind === "document" && !isSkill) ? "text-foreground-muted" : "text-accent";
+  // Tint the leaf icon by resource kind from the categorical ramp (the same
+  // doc=cat-1 / table=cat-3 / file=cat-4 mapping the Home + overview rows use),
+  // so a doc vs a table vs a file is a colour at a glance — not just an icon
+  // shape in a flat list. (Was text-accent ORANGE for table/file/skill, which
+  // was off-system + spent the one-marquee-orange budget.) Skill = teal.
+  const leafTone = isSkill ? "var(--color-primary)" : recentTone(node.kind);
 
   return (
     <Link
@@ -507,16 +483,18 @@ const TreeRow = memo(function TreeRow({
       role="treeitem"
       aria-level={depth + 1}
       aria-current={isActive ? "page" : undefined}
+      aria-selected={isActive}
       style={indent}
-      className={`flex items-center gap-1.5 pr-2 py-1 group transition-colors hover:bg-surface-muted focus:bg-surface-muted focus:outline-none ${
-        isActive ? "bg-accent/15 border-l-2 border-accent -ml-[2px]" : ""
+      className={`flex items-center gap-1.5 pr-2 py-1 group transition-colors hover:bg-surface-hover focus:bg-surface-hover focus:outline-none ${
+        isActive ? "bg-surface-selected text-surface-selected-foreground border-l-2 border-primary -ml-[2px]" : ""
       }`}
     >
       <LeafIcon
-        className={`h-3 w-3 shrink-0 ${leafIconColor} group-hover:text-accent transition-colors`}
+        className="h-3 w-3 shrink-0"
+        style={{ color: leafTone }}
         aria-hidden
       />
-      <span title={node.name} className="truncate text-[13px] text-foreground group-hover:text-accent">{node.name}</span>
+      <span title={node.name} className="truncate min-w-0 text-[13px] group-hover:text-link">{node.name}</span>
       {isSkill && <SkillBadge defined className="ml-auto shrink-0" />}
     </Link>
   );

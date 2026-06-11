@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { ArrowUpRight } from "lucide-react";
+import { ArrowLeft, FileQuestion } from "lucide-react";
 import { MarkdownRender } from "@/components/markdown-render";
 import {
   getPublication,
@@ -13,7 +13,10 @@ import { SummaryFold } from "@/components/summary-fold";
 import { TableViewer } from "@/components/table-viewer";
 import { FileViewer } from "@/components/file-viewer";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { Logo } from "@/components/logo";
+import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 export default function PublicationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -51,6 +54,15 @@ export default function PublicationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  // Per-publication document title (WCAG 2.4.2). The password gate sets its
+  // own neutral title (it must not leak a sealed doc's subject), so skip it
+  // here while gated.
+  useEffect(() => {
+    if (needsPassword) return;
+    if (data?.title) document.title = `${data.title} · AKB`;
+    else if (error) document.title = "Unavailable · AKB";
+  }, [data, error, needsPassword]);
+
   if (!slug) return null;
 
   if (needsPassword) {
@@ -64,38 +76,27 @@ export default function PublicationPage() {
   if (!data) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background text-foreground">
-        <div className="coord">— Loading —</div>
+        <div className="text-sm text-foreground-muted" role="status" aria-live="polite">
+          Loading…
+        </div>
       </div>
     );
   }
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      {/* Coordinate strip */}
-      <div className="border-b border-border">
-        <div className="mx-auto max-w-[1200px] px-6 py-1 flex items-center justify-between">
-          <div className="coord">§ AKB · PUBLIC PUBLICATION</div>
-          <div className="coord hidden md:block">SLUG · {slug}</div>
-          <div className="coord">
-            {data.resource_type.replace("_", " ").toUpperCase()}
-          </div>
-        </div>
-      </div>
-
       {/* Masthead */}
       <header className="border-b border-border">
-        <div className="mx-auto max-w-[1200px] px-6 py-4 flex items-center justify-between gap-4">
+        <div className="mx-auto max-w-[1200px] px-6 py-3 flex items-center justify-between gap-4">
           <a
             href="/"
-            className="group flex items-baseline gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label="AKB home"
           >
-            <span className="font-display text-3xl leading-none tracking-tight group-hover:text-accent transition-colors">
-              AKB
-            </span>
-            <span className="coord hidden sm:inline">/ knowledgebase</span>
+            <Logo size={26} subtitle />
           </a>
           <div className="flex items-center gap-3">
-            <Badge variant="spark">PUBLIC</Badge>
+            <Badge variant="secondary">Public</Badge>
             <ThemeToggle />
           </div>
         </div>
@@ -112,16 +113,15 @@ export default function PublicationPage() {
 
       {/* Footer */}
       <footer className="border-t border-border mt-16">
-        <div className="mx-auto max-w-[1200px] px-6 py-4 flex items-center justify-between flex-wrap gap-2">
-          <div className="coord">© Dnotitia / Seahorse</div>
+        <div className="mx-auto max-w-[1200px] px-6 py-5 flex items-center justify-between flex-wrap gap-2">
+          <div className="text-xs text-foreground-muted">© Dnotitia · Seahorse</div>
           <a
             href="/"
-            className="coord inline-flex items-center gap-1 hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="inline-flex items-center gap-1.5 text-xs text-foreground-muted hover:text-link rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            <ArrowUpRight className="h-3 w-3" aria-hidden />
-            AKB.HOME
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden />
+            Back to AKB
           </a>
-          <div className="coord">END OF DOCUMENT</div>
         </div>
       </footer>
     </div>
@@ -131,40 +131,27 @@ export default function PublicationPage() {
 function DocumentBody({ data }: { data: PublicationResponse }) {
   return (
     <article className="grid grid-cols-1 lg:grid-cols-[180px_1fr] gap-8">
-      {/* Left rail — marginalia */}
+      {/* Left rail — metadata */}
       <aside className="lg:sticky lg:top-8 lg:self-start">
         <div className="space-y-5">
-          <div>
-            <div className="coord mb-1">TYPE</div>
-            <div className="text-sm font-medium text-foreground">
-              {data.type || "document"}
-            </div>
-          </div>
-          {data.domain && (
-            <div>
-              <div className="coord mb-1">DOMAIN</div>
-              <div className="text-sm font-medium text-foreground">{data.domain}</div>
-            </div>
-          )}
-          {data.created_by && (
-            <div>
-              <div className="coord mb-1">AUTHOR</div>
-              <div className="text-sm font-medium text-foreground">
-                {data.created_by}
-              </div>
-            </div>
-          )}
+          <MetaField label="Type" value={data.type || "document"} />
+          {data.domain && <MetaField label="Domain" value={data.domain} />}
+          {(() => {
+            // Prefer the resolved author name; never surface a raw user UUID
+            // on the public page. Fall back to a non-UUID created_by string.
+            const isUuid = (s: string) =>
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+            const author =
+              data.created_by_name ||
+              (data.created_by && !isUuid(data.created_by) ? data.created_by : null);
+            return author ? <MetaField label="Author" value={author} /> : null;
+          })()}
           {data.updated_at && (
-            <div>
-              <div className="coord mb-1">UPDATED</div>
-              <div className="text-sm font-medium text-foreground tabular-nums">
-                {formatDate(data.updated_at)}
-              </div>
-            </div>
+            <MetaField label="Updated" value={formatDate(data.updated_at)} tabular />
           )}
           {data.tags && data.tags.length > 0 && (
             <div>
-              <div className="coord mb-2">TAGS</div>
+              <div className="text-xs font-medium text-foreground-muted mb-2">Tags</div>
               <div className="flex flex-wrap gap-1">
                 {data.tags.map((t) => (
                   <Badge key={t} variant="outline">
@@ -176,101 +163,105 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           )}
           {data.section_filter && !data.section_not_found && (
             <div>
-              <div className="coord mb-1">SECTION</div>
-              <div className="text-sm font-medium border-l-2 border-accent pl-2 text-foreground">
-                § {data.section_filter}
+              <div className="text-xs font-medium text-foreground-muted mb-1">Section</div>
+              <div className="text-sm font-medium border-l-2 border-primary pl-2 text-foreground">
+                {data.section_filter}
               </div>
             </div>
           )}
         </div>
       </aside>
 
-      {/* Main column — Fraunces editorial body */}
+      {/* Main column */}
       <div className="min-w-0">
-        <div className="coord-spark mb-4">§ DOCUMENT</div>
-        <h1 className="font-display-tight text-5xl lg:text-7xl text-foreground leading-[0.95] tracking-tight mb-6">
+        <h1 className="font-display text-3xl lg:text-4xl font-semibold text-foreground leading-tight tracking-tight mb-6">
           {data.title}
         </h1>
 
         <SummaryFold summary={data.summary} prominent className="mt-4 mb-10" />
 
         {data.content_unavailable && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
-          >
-            <div className="coord-spark mb-1 text-destructive">⚠ CONTENT UNAVAILABLE</div>
-            <p className="text-sm text-foreground">
-              The underlying document is no longer accessible from the base.
-            </p>
-          </div>
+          <Alert variant="destructive" title="Content unavailable" className="mb-8">
+            The underlying document is no longer accessible from the base.
+          </Alert>
         )}
 
         {data.section_not_found && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-lg)] border border-destructive/40 bg-destructive/5 p-4 mb-8"
-          >
-            <div className="coord-spark mb-1 text-destructive">⚠ SECTION NOT FOUND</div>
-            <p className="text-sm text-foreground">
-              Section{" "}
-              <code className="font-mono">{data.section_filter}</code> wasn't
-              matched. Showing the full document.
-            </p>
-          </div>
+          <Alert variant="warning" title="Section not found" className="mb-8">
+            Section <code className="font-mono">{data.section_filter}</code> wasn't
+            matched. Showing the full document.
+          </Alert>
         )}
 
-        <MarkdownRender markdown={data.content || ""} className="text-[16px] font-display-body" />
+        <MarkdownRender markdown={data.content || ""} className="text-[15px]" />
 
       </div>
     </article>
   );
 }
 
+function MetaField({
+  label,
+  value,
+  tabular,
+}: {
+  label: string;
+  value: string;
+  tabular?: boolean;
+}) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-foreground-muted mb-1">{label}</div>
+      <div className={`text-sm font-medium text-foreground ${tabular ? "tabular-nums" : ""}`}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
 function ErrorPage({ error }: { error: PublicationError }) {
-  let coord = "§ ERROR";
-  let title = "Something broke.";
+  let code = "Error";
+  let title = "Something went wrong";
   let message = error.message;
   if (error.expired) {
-    coord = "§ 410 — EXPIRED";
-    title = "This publication has expired.";
+    code = "410 · Expired";
+    title = "This publication has expired";
     message =
       "The author set an expiry on this link and it has now passed. Ask them for a fresh one.";
   } else if (error.view_limit_reached) {
-    coord = "§ 410 — VIEW LIMIT";
-    title = "View limit reached.";
+    code = "410 · View limit";
+    title = "View limit reached";
     message =
       "This publication had a maximum number of views, and that quota has been spent.";
   } else if (error.not_found) {
-    coord = "§ 404 — NOT FOUND";
-    title = "Nothing here.";
+    code = "404 · Not found";
+    title = "Nothing here";
     message =
       "This publication doesn't exist or has been removed by its author.";
   }
   return (
     <div className="min-h-screen flex items-center justify-center bg-background px-6 text-foreground">
-      <div className="w-full max-w-2xl fade-up">
-        <div className="coord-spark mb-3">{coord}</div>
-        <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-10 relative">
-          <h1 className="font-display-tight text-6xl lg:text-7xl text-foreground leading-none">
-            {title.split(" ").slice(0, -1).join(" ")}
-            <br />
-            <span className="text-accent italic">
-              {title.split(" ").slice(-1)[0]}
-            </span>
+      <div className="w-full max-w-lg fade-up">
+        <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-md p-10 text-center">
+          <span
+            className="inline-flex h-12 w-12 items-center justify-center rounded-[var(--radius-lg)] bg-surface-muted text-foreground-muted mx-auto"
+            aria-hidden
+          >
+            <FileQuestion className="h-5 w-5" />
+          </span>
+          <div className="mt-4 text-xs font-medium text-foreground-muted">{code}</div>
+          <h1 className="mt-1 font-display text-2xl font-semibold tracking-tight text-foreground">
+            {title}
           </h1>
-          <p className="mt-6 text-base text-foreground-muted leading-relaxed max-w-md">
+          <p className="mt-3 text-sm text-foreground-muted leading-relaxed max-w-sm mx-auto">
             {message}
           </p>
-          <a
-            href="/"
-            className="mt-8 inline-flex items-baseline gap-2 border-b-2 border-border hover:border-accent transition-colors pb-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <ArrowUpRight className="h-4 w-4 text-accent" aria-hidden />
-            <span className="font-medium hover:text-accent">Take me to AKB</span>
-          </a>
+          <Button asChild variant="default" className="mt-6">
+            <a href="/">
+              <ArrowLeft className="h-4 w-4" aria-hidden />
+              Back to AKB
+            </a>
+          </Button>
         </div>
       </div>
     </div>

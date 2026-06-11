@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { ExternalLink, File, FileText, Lightbulb, Search as SearchIcon, Sparkles, Table } from "lucide-react";
+import { ExternalLink, File, FileText, Search as SearchIcon, Sparkles, Table } from "lucide-react";
 import { searchDocs, grepDocs, listVaults, type GrepDoc } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { Select } from "@/components/ui/select";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { parseUri } from "@/lib/uri";
@@ -83,7 +85,10 @@ export default function SearchPage() {
   // query param is honored only on the global `/search` route.
   const { name: scopedVault } = useParams<{ name: string }>();
   const q = searchParams.get("q") || "";
-  const mode = (searchParams.get("mode") as Mode) || "dense";
+  // Sanitize instead of a bare cast: an unknown ?mode= must fall back to dense,
+  // not slip through as a truthy non-dense value that routes to grep with
+  // neither toggle highlighted.
+  const mode: Mode = searchParams.get("mode") === "literal" ? "literal" : "dense";
   const queryVault = searchParams.get("v") || "";
   const vault = scopedVault || queryVault;
 
@@ -102,8 +107,11 @@ export default function SearchPage() {
   const [hint, setHint] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [vaults, setVaults] = useState<{ name: string }[]>([]);
   const [activeTypes, setActiveTypes] = useState<Set<DocTypeFilter>>(new Set(ALL_TYPES));
+  // Epoch guard: a superseded (slower) response must not clobber a newer one.
+  const reqId = useRef(0);
 
   function toggleType(t: DocTypeFilter) {
     setActiveTypes((prev) => {
@@ -128,19 +136,25 @@ export default function SearchPage() {
 
   useEffect(() => {
     if (q) doSearch(q, mode, vault);
+    // Bump the epoch on cleanup so an in-flight resolve after a param change
+    // or unmount is ignored (reqId is a request counter, not a DOM ref).
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { reqId.current++; };
   }, [q, mode, vault]);
 
   async function doSearch(s: string, m: Mode, v: string) {
     if (!s.trim()) return;
+    const id = ++reqId.current;
     setLoading(true);
     setSearched(true);
+    setError(null);
     try {
       if (m === "dense") {
         const d = await searchDocs(s, v || undefined);
+        if (id !== reqId.current) return; // superseded
         setDenseResults(d.results);
         setLiteralResults([]);
-        setTotal(d.total);
+        setTotal(d.total ?? d.results.length);
         setTotalMatches(d.total_matches);
         setReturnedDocs(d.returned);
         setReturnedMatches(0);
@@ -148,9 +162,10 @@ export default function SearchPage() {
         setHint(d.hint ?? null);
       } else {
         const d = await grepDocs(s, v || undefined);
+        if (id !== reqId.current) return;
         setLiteralResults(d.results);
         setDenseResults([]);
-        setTotal(d.total_docs);
+        setTotal(d.total_docs ?? d.results.length);
         setTotalMatches(d.total_matches);
         // Older servers (< 0.2.4) don't ship returned_*; fall back to
         // total_* so the header still renders a sensible single count.
@@ -159,7 +174,11 @@ export default function SearchPage() {
         setTruncated(Boolean(d.truncated));
         setHint(d.hint ?? null);
       }
-    } catch {
+    } catch (e) {
+      if (id !== reqId.current) return;
+      // Surface the failure as a distinct error state instead of masking it
+      // as "no results".
+      setError(e instanceof Error ? e.message : "Search failed");
       setDenseResults([]);
       setLiteralResults([]);
       setTotal(0);
@@ -168,8 +187,9 @@ export default function SearchPage() {
       setReturnedMatches(0);
       setTruncated(false);
       setHint(null);
+    } finally {
+      if (id === reqId.current) setLoading(false);
     }
-    setLoading(false);
   }
 
   function buildParams(next: { q?: string; mode?: Mode; v?: string }) {
@@ -202,6 +222,10 @@ export default function SearchPage() {
         (r) => !r.doc_type || activeTypes.has(r.doc_type as DocTypeFilter),
       );
   const groupedDense = groupByType(filteredDense);
+  // Drive render gates off actual array length, not the count field (a falsy
+  // `total` from a legacy response otherwise renders neither list nor empty).
+  const resultCount = mode === "dense" ? filteredDense.length : literalResults.length;
+  const hasResults = resultCount > 0;
 
   // Commit the draft into the URL. Empty queries clear everything.
   // Keep the current mode/scope — the mode toggle handles that separately.
@@ -215,10 +239,21 @@ export default function SearchPage() {
 
   return (
     <div className="fade-up max-w-[1280px] mx-auto">
-      <div className="coord-spark mb-3">§ SEARCH</div>
+      {/* Polite live region — announces searching / results / no-results / error. */}
+      <p role="status" aria-live="polite" className="sr-only">
+        {loading
+          ? "Searching…"
+          : error
+            ? "Search failed"
+            : !searched
+              ? ""
+              : !hasResults
+                ? `No results for ${q}`
+                : `${resultCount} results for ${q}`}
+      </p>
+      <div className="coord-spark mb-3">Search</div>
       <h1 className="font-display text-3xl tracking-tight text-foreground mb-6">
         {scopedVault ? scopedVault : "Query the base"}
-        <span className="text-accent">.</span>
       </h1>
 
       {/* Doc-type filter chips — client-side filter on doc_type field of
@@ -226,13 +261,20 @@ export default function SearchPage() {
           inclusion. Chips are only meaningful in dense (semantic) mode
           where doc_type is present, but we always render them so the
           user's filter survives a mode switch. */}
-      <div className="flex flex-wrap gap-1 mb-4">
+      <div role="group" aria-label="Filter by document type" className="flex flex-wrap gap-1 mb-4">
         <button
           type="button"
+          aria-label="Show all types"
+          aria-pressed={allTypesActive}
           onClick={() => setActiveTypes(new Set(ALL_TYPES))}
-          className="px-2 h-7 rounded-[var(--radius-md)] border border-border font-mono text-[10px] uppercase tracking-[0.12em]"
+          className={cn(
+            "px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            allTypesActive
+              ? "border-transparent bg-surface-selected text-surface-selected-foreground"
+              : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
+          )}
         >
-          ALL
+          All
         </button>
         {ALL_TYPES.map((t) => (
           <button
@@ -242,10 +284,10 @@ export default function SearchPage() {
             aria-pressed={activeTypes.has(t)}
             onClick={() => toggleType(t)}
             className={cn(
-              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border font-mono text-[10px] uppercase tracking-[0.12em]",
+              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
               activeTypes.has(t)
-                ? "border-foreground text-foreground"
-                : "border-border text-foreground-muted opacity-70",
+                ? "border-transparent bg-surface-selected text-surface-selected-foreground"
+                : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
             )}
           >
             {t === "skill" && <Sparkles className="h-3 w-3" aria-hidden />}
@@ -272,10 +314,10 @@ export default function SearchPage() {
             onClick={() => switchMode("dense")}
             aria-pressed={mode === "dense"}
             title="Semantic hybrid search (dense + BM25 + cross-encoder rerank)"
-            className={`px-3 h-full font-medium text-xs transition-colors cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer ${
               mode === "dense"
-                ? "bg-surface-2 text-foreground"
-                : "text-foreground hover:bg-surface-muted"
+                ? "bg-surface-selected text-surface-selected-foreground"
+                : "text-foreground hover:bg-surface-hover"
             }`}
           >
             Semantic
@@ -285,18 +327,18 @@ export default function SearchPage() {
             onClick={() => switchMode("literal")}
             aria-pressed={mode === "literal"}
             title="Literal substring / regex search"
-            className={`px-3 h-full font-medium text-xs transition-colors cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer ${
               mode === "literal"
-                ? "bg-surface-2 text-foreground"
-                : "text-foreground hover:bg-surface-muted"
+                ? "bg-surface-selected text-surface-selected-foreground"
+                : "text-foreground hover:bg-surface-hover"
             }`}
           >
             Literal
           </button>
         </div>
-        <div className="relative flex-1 flex items-center border border-border h-full px-3 focus-within:border-accent transition-colors bg-surface">
+        <div className="relative flex-1 min-w-0 flex items-center border border-border h-full px-3 focus-within:border-primary focus-within:ring-2 focus-within:ring-ring/30 transition-colors bg-surface">
           <SearchIcon
-            className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none"
+            className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none shrink-0"
             aria-hidden
           />
           <label className="sr-only" htmlFor="vault-search">Query</label>
@@ -313,24 +355,26 @@ export default function SearchPage() {
             }
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
+            className="flex-1 min-w-0 bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none"
           />
         </div>
-        <button
+        <Button
           type="submit"
-          className="px-4 h-full rounded-r-[var(--radius-md)] font-medium text-xs bg-accent text-accent-foreground hover:bg-accent/90 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          variant="accent"
+          loading={loading}
+          className="h-full shrink-0 rounded-l-none text-xs"
         >
           Search
-        </button>
+        </Button>
       </form>
 
       {scopedVault && (
         <div className="flex items-center gap-3 text-xs mb-6">
-          <span className="coord">SCOPE</span>
-          <span className="font-mono text-foreground">{scopedVault}</span>
+          <span className="coord">Scope</span>
+          <span className="text-foreground">{scopedVault}</span>
           <Link
             to={`/search${q ? `?q=${encodeURIComponent(q)}${mode !== "dense" ? `&mode=${mode}` : ""}` : ""}`}
-            className="ml-auto inline-flex items-center gap-1 font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="ml-auto inline-flex items-center gap-1 text-foreground-muted hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <ExternalLink className="h-3 w-3" aria-hidden />
             Search all vaults
@@ -341,21 +385,20 @@ export default function SearchPage() {
       {!scopedVault && vaults.length > 0 && (
         <div className="flex items-center gap-3 mb-6">
           <span className="coord shrink-0">Scope</span>
-          <Select
+          <SelectMenu
             value={vault}
-            onChange={(e) => switchVault(e.target.value)}
+            onValueChange={switchVault}
             aria-label="Search scope — limit to a vault"
             className="h-9 w-auto min-w-[220px] max-w-sm"
-          >
-            <option value="">All vaults ({vaults.length})</option>
-            {vaults.map((v) => (
-              <option key={v.name} value={v.name}>{v.name}</option>
-            ))}
-          </Select>
+            options={[
+              { value: "", label: `All vaults (${vaults.length})` },
+              ...vaults.map((v) => ({ value: v.name, label: v.name })),
+            ]}
+          />
           {vault && (
             <button
               onClick={() => switchVault("")}
-              className="coord hover:text-accent transition-colors cursor-pointer"
+              className="coord hover:text-link transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               clear
             </button>
@@ -364,65 +407,79 @@ export default function SearchPage() {
       )}
 
       {showLiteralHint && (
-        <div
-          role="note"
-          className="rounded-[var(--radius-lg)] border border-border px-6 py-3 text-sm flex items-center gap-3 bg-surface-muted mb-4"
-        >
-          <Lightbulb className="h-4 w-4 text-accent shrink-0" aria-hidden />
-          <span className="text-foreground">
-            Short single-token queries often work better in{" "}
-            <button
-              onClick={() => switchMode("literal")}
-              className="underline font-medium hover:text-accent cursor-pointer"
-            >
-              LITERAL
-            </button>{" "}
-            mode.
-          </span>
-        </div>
+        <Alert variant="info" className="mb-4">
+          Short single-token queries often work better in{" "}
+          <button
+            onClick={() => switchMode("literal")}
+            className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Literal
+          </button>{" "}
+          mode.
+        </Alert>
       )}
 
       {loading && (
-        <div className="rounded-[var(--radius-lg)] border border-border p-6 bg-surface shadow-sm space-y-3">
+        <div className="rounded-[var(--radius-lg)] border border-border p-6 bg-surface shadow-sm space-y-3" aria-busy="true">
           <Skeleton className="h-4 w-48" />
           <Skeleton className="h-16" />
           <Skeleton className="h-16" />
           <Skeleton className="h-16" />
-          <div className="coord text-center pt-2">— Reranking…</div>
+          <div className="coord text-center pt-2">Reranking…</div>
         </div>
       )}
 
-      {searched && !loading && total === 0 && (
+      {error && !loading && (
+        <Alert variant="destructive" className="mt-6">
+          Search failed — {error}.{" "}
+          <button
+            onClick={() => doSearch(q, mode, vault)}
+            className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Retry
+          </button>
+        </Alert>
+      )}
+
+      {searched && !loading && !error && !hasResults && total === 0 && (
         <EmptyState
           title="No results"
           description={
             mode === "dense"
-              ? "Try LITERAL mode for exact substring matching."
-              : "Try SEMANTIC mode for meaning-based search."
+              ? "Try Literal mode for exact substring matching."
+              : "Try Semantic mode for meaning-based search."
           }
           action={
             <button
               onClick={() => switchMode(mode === "dense" ? "literal" : "dense")}
-              className="underline text-sm hover:text-accent cursor-pointer"
+              className="underline text-sm hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              Switch to {mode === "dense" ? "LITERAL" : "SEMANTIC"}
+              Switch to {mode === "dense" ? "Literal" : "Semantic"}
             </button>
           }
         />
       )}
 
-      {truncated && hint && total > 0 && !loading && (
-        <div
-          role="note"
-          className="mt-6 rounded-[var(--radius-md)] border border-warning/40 bg-warning/5 px-4 py-2.5 coord text-xs leading-relaxed"
-          aria-label="Result set may be incomplete"
-        >
-          <span className="coord-ink mr-2">▲ TRUNCATED</span>
-          {hint}
-        </div>
+      {/* Type filter narrowed the dense results to zero (but the query did match). */}
+      {!loading && !error && mode === "dense" && total > 0 && filteredDense.length === 0 && (
+        <Alert variant="info" className="mt-6">
+          No results match the active type filters.{" "}
+          <button
+            onClick={() => setActiveTypes(new Set(ALL_TYPES))}
+            className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Reset filters
+          </button>
+        </Alert>
       )}
 
-      {total > 0 && mode === "dense" && (
+      {truncated && hint && hasResults && !loading && (
+        <Alert variant="warning" title="Truncated" className="mt-6">
+          {hint}
+        </Alert>
+      )}
+
+      {mode === "dense" && filteredDense.length > 0 && (
         <Tabs defaultValue="all" className="mt-6">
           <TabsList>
             <TabsTrigger value="all" className="gap-1.5">
@@ -459,10 +516,10 @@ export default function SearchPage() {
         </Tabs>
       )}
 
-      {total > 0 && mode === "literal" && (
+      {mode === "literal" && literalResults.length > 0 && (
         <section className="rounded-[var(--radius-lg)] overflow-hidden border border-border bg-surface shadow-sm mt-6" aria-label="Literal results">
-          <header className="border-b border-border px-4 py-2 flex items-baseline justify-between">
-            <span className="coord-ink">§ RESULTS · LITERAL</span>
+          <header className="border-b border-border px-4 py-2 flex items-baseline justify-between gap-3 flex-wrap">
+            <span className="coord-ink">Results · Literal</span>
             <span className="coord tabular-nums">
               {returnedDocs !== total || returnedMatches !== totalMatches
                 ? `[${returnedDocs} of ${total} docs · ${returnedMatches} of ${totalMatches} matches]`
@@ -474,17 +531,17 @@ export default function SearchPage() {
               <li key={r.uri}>
                 <Link
                   to={`/vault/${r.vault}/doc/${encodeURIComponent(parseUri(r.uri)?.id ?? r.path)}`}
-                  className="block px-5 py-4 group hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  className="block px-5 py-4 group hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   <div className="grid grid-cols-[32px_1fr_60px] gap-4 items-baseline">
                     <span className="coord tabular-nums">
                       {String(i + 1).padStart(2, "0")}
                     </span>
                     <div className="min-w-0">
-                      <div className="text-base font-medium tracking-tight text-foreground group-hover:text-accent">
+                      <div className="text-base font-medium tracking-tight text-foreground group-hover:text-link truncate">
                         {r.title}
                       </div>
-                      <div className="coord mt-0.5">
+                      <div className="coord mt-0.5 truncate">
                         {r.vault} / {r.path}
                       </div>
                       {r.matches.length > 0 && (
@@ -492,7 +549,7 @@ export default function SearchPage() {
                           {r.matches.slice(0, 3).map((m, j) => (
                             <pre
                               key={j}
-                              className="text-xs font-mono whitespace-pre-wrap text-foreground-muted border-l-2 border-accent pl-3 line-clamp-2"
+                              className="text-xs font-mono whitespace-pre-wrap text-foreground-muted border-l-2 border-link pl-3 line-clamp-2"
                             >
                               {m.text}
                             </pre>
@@ -526,7 +583,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
         <li key={r.uri}>
           <Link
             to={resultHref(r)}
-            className="block px-5 py-4 group hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            className="block px-5 py-4 group hover:bg-surface-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
             <div className="grid grid-cols-[32px_1fr_60px] gap-4 items-baseline">
               <span className="coord tabular-nums">
@@ -534,14 +591,14 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
               </span>
               <div className="min-w-0">
                 <div className="flex items-baseline gap-2 flex-wrap">
-                  <span className="text-base font-medium tracking-tight text-foreground group-hover:text-accent">
+                  <span className="text-base font-medium tracking-tight text-foreground group-hover:text-link">
                     {r.title}
                   </span>
                   {r.doc_type && <Badge variant="outline">{r.doc_type}</Badge>}
                 </div>
                 <div className="coord mt-0.5">
                   {r.vault}
-                  {r.collection && <> · <span className="text-accent/80">{r.collection}</span></>}
+                  {r.collection && <> · <span className="text-foreground-muted">{r.collection}</span></>}
                   {" / "}{r.path}
                 </div>
                 {r.summary && (
@@ -550,7 +607,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                   </p>
                 )}
                 {r.matched_section && (
-                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap text-foreground-muted line-clamp-3 border-l-2 border-accent pl-3">
+                  <pre className="mt-2 text-xs font-mono whitespace-pre-wrap text-foreground-muted line-clamp-3 border-l-2 border-link pl-3">
                     {r.matched_section}
                   </pre>
                 )}

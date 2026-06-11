@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { ChevronDown, Loader2 } from "lucide-react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { Check, ChevronDown, Loader2 } from "lucide-react";
 import { badgeVariants } from "@/components/ui/badge";
 import { grantAccess } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -21,8 +22,7 @@ export function RoleSelect({ vault, member, onChanged }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function handleChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    const next = e.target.value;
+  async function changeRole(next: string) {
     const prev = member.role;
     if (next === prev) return;
     setBusy(true);
@@ -39,38 +39,49 @@ export function RoleSelect({ vault, member, onChanged }: Props) {
 
   return (
     <div className="inline-flex flex-col items-end gap-0.5">
-      <div className="relative inline-flex">
-        <select
-          value={member.role}
-          onChange={handleChange}
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger
           disabled={busy}
           aria-label={`Change role for ${member.username}`}
           className={cn(
+            // Reads as the member's role badge; opening reveals the themed list.
             badgeVariants({ variant: member.role }),
-            "appearance-none pr-5 cursor-pointer",
+            "inline-flex items-center gap-1 cursor-pointer transition-token capitalize",
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
-            "hover:brightness-110 transition-[filter] duration-150",
-            "disabled:opacity-60 disabled:cursor-wait",
+            "hover:border-border-strong",
+            "disabled:opacity-50 disabled:cursor-wait",
           )}
         >
-          {OPTIONS.map((r) => (
-            <option key={r} value={r} className="bg-surface text-foreground">
-              {r}
-            </option>
-          ))}
-        </select>
-        {busy ? (
-          <Loader2
-            className="absolute right-1 top-1/2 -translate-y-1/2 h-3 w-3 animate-spin pointer-events-none"
-            aria-hidden
-          />
-        ) : (
-          <ChevronDown
-            className="absolute right-1 top-1/2 -translate-y-1/2 h-3 w-3 pointer-events-none opacity-70"
-            aria-hidden
-          />
-        )}
-      </div>
+          {member.role}
+          {busy ? (
+            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+          ) : (
+            <ChevronDown className="h-3 w-3 opacity-70" aria-hidden />
+          )}
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="end"
+            sideOffset={6}
+            className="z-50 min-w-[8rem] overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+          >
+            <DropdownMenu.RadioGroup value={member.role} onValueChange={changeRole}>
+              {OPTIONS.map((r) => (
+                <DropdownMenu.RadioItem
+                  key={r}
+                  value={r}
+                  className="relative flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] py-1.5 pl-7 pr-3 text-sm capitalize text-foreground outline-none data-[highlighted]:bg-surface-hover data-[state=checked]:text-link"
+                >
+                  <DropdownMenu.ItemIndicator className="absolute left-2 inline-flex">
+                    <Check className="h-3.5 w-3.5" aria-hidden />
+                  </DropdownMenu.ItemIndicator>
+                  {r}
+                </DropdownMenu.RadioItem>
+              ))}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
       {error && (
         <p role="alert" className="coord text-destructive">
           {error}

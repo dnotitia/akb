@@ -20,6 +20,19 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   (globalThis as any).ResizeObserver = ResizeObserverStub;
 }
 
+// jsdom lacks the pointer-capture + scrollIntoView APIs that Radix popovers
+// (DropdownMenu / Select) call when opening — stub them so menu-based controls
+// can open under test instead of throwing on mount/interaction.
+if (!Element.prototype.hasPointerCapture) {
+  Element.prototype.hasPointerCapture = () => false;
+}
+if (!Element.prototype.releasePointerCapture) {
+  Element.prototype.releasePointerCapture = () => {};
+}
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
 // jsdom doesn't implement matchMedia — stub it so theme hooks don't throw.
 if (typeof window.matchMedia === "undefined") {
   Object.defineProperty(window, "matchMedia", {

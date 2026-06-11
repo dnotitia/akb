@@ -24,11 +24,11 @@ export function DocumentOutline({
             <li key={h.slug} style={{ marginLeft: `${indent * 12}px` }}>
               <a
                 href={`#${h.slug}`}
-                aria-current={isActive ? "true" : undefined}
-                className={`block py-1 px-2 rounded-[var(--radius-sm)] leading-snug transition-colors ${
+                aria-current={isActive ? "location" : undefined}
+                className={`block py-1 px-2 rounded-[var(--radius-sm)] leading-snug transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
                   isActive
-                    ? "bg-accent/10 text-accent font-medium"
-                    : "text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+                    ? "bg-surface-selected text-surface-selected-foreground font-medium"
+                    : "text-foreground-muted hover:text-foreground hover:bg-surface-hover"
                 }`}
               >
                 <span title={h.text} className="truncate block text-[12px]">{h.text}</span>

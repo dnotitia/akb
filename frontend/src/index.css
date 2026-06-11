@@ -28,7 +28,7 @@
   --color-surface-muted: #ebeef2;     /* AKB alias == family surface-2 */
   --color-foreground: #1d1d1f;
   --color-foreground-muted: #5e6068;
-  --color-subtle: #94989e;
+  --color-subtle: #767a82;            /* was #94989e (2.90:1, sub-floor) → 4.54:1 (AA) */
   --color-border: #dfe3e8;
   --color-border-strong: #c8ced6;
 
@@ -40,15 +40,57 @@
      sits on it. One token swap re-skins every filled-accent call site. */
   --color-accent-strong: #c44a1e;
   --color-accent-strong-foreground: #ffffff;
-  --color-success: #228b54;
+  /* Fresh-token spark — the sanctioned 2nd-orange highlight (recency dot +
+     relative-time text). A SEPARATE token from accent-strong because the two
+     have opposite dark-mode needs: accent-strong stays dark so white text on a
+     FILLED chip clears AA, while spark is used AS text on a surface and must be
+     LIGHT enough to clear AA on the dark canvas. Light == accent-strong
+     (#c44a1e on white = 4.83:1); dark is brightened (#f0744a on #121821 surface
+     = 6.18:1, on hover #1f2935 = 5.10:1) — both AA at the 11px spark size. */
+  --color-spark: #c44a1e;
+  /* Semantic families — each a full quad: base (text/border), -foreground
+     (text on a filled chip), -soft (tinted banner bg), -soft-foreground
+     (text on the tint). base values darkened to clear WCAG AA as text. */
+  --color-success: #1e7d4b;          /* was #228b54 (4.30:1) → 4.83:1 on white */
   --color-success-foreground: #04200d;
-  --color-warning: #b06000;
+  --color-success-soft: #e7f4ec;
+  --color-success-soft-foreground: #176b3f;
+  --color-warning: #9a5400;          /* was #b06000 → white-on-fill 4.5:1 (AA) */
+  --color-warning-foreground: #ffffff;
+  --color-warning-soft: #fdf1e3;
+  --color-warning-soft-foreground: #8a4b00;
   --color-danger: #c42424;
-  --color-destructive: #c42424;
+  --color-destructive: #c42424;      /* canonical twin of --color-danger */
   --color-destructive-foreground: #ffffff;
-  --color-ring: #004059;
+  --color-danger-soft: #fbeaea;
+  --color-danger-soft-foreground: #a81f1f;
   --color-info: #1d627c;
-  --color-good: #228b54;
+  --color-info-foreground: #ffffff;
+  --color-info-soft: #e6f0f4;
+  --color-info-soft-foreground: #19566c;
+  --color-ring: #004059;
+  --color-good: #1e7d4b;             /* alias of --color-success (migrate text-good→text-success) */
+
+  /* ── Interaction-state tokens (solid — replace /opacity & color-mix hacks) ─
+     INTERACTIVE text = teal (link); HOVER fill = neutral surface-hover;
+     PRESSED = surface-active; SELECTED = teal-tinted surface-selected. */
+  --color-link: #0a6f86;             /* clickable text — 4.74:1 on white (AA) */
+  --color-link-hover: #004059;       /* link hover — 11.18:1 (AAA) */
+  --color-surface-hover: #f0f2f5;    /* row/list/ghost hover fill */
+  --color-surface-active: #e3e7ec;   /* pressed fill (one notch past surface-2) */
+  --color-surface-selected: #e0eef2; /* selected/current — teal-tinted, not gray */
+  --color-surface-selected-foreground: #004059;
+
+  /* ── Categorical / dataviz scale — teal→orange arc + one neutral, CVD-safe
+     (lightness-ramped so categories stay separable under color-vision
+     deficiency). Consumed by graph clusters + .feat-* tiles. cat-5 ==
+     accent-strong, cat-6 == foreground-muted (no off-brand competing hue). */
+  --color-cat-1: #1f5a6e;
+  --color-cat-2: #2f8f94;
+  --color-cat-3: #4f9c7a;
+  --color-cat-4: #b9791b;
+  --color-cat-5: #c44a1e;
+  --color-cat-6: #5e6068;
 
   /* shadcn alias set (existing components inherit) — primary is teal now */
   --color-primary: #004059;
@@ -75,11 +117,29 @@
   --radius-md: 0.75rem;   /* buttons, inputs, chips */
   --radius-lg: 0.875rem;  /* cards, panels, lists */
   --radius-xl: 1rem;      /* dialogs, hero marks */
+  --radius-full: 9999px;  /* pills, avatars, dots */
 
-  /* ── Elevation — soft, cool-tinted shadows ──────────────────────── */
+  /* ── Elevation — soft, cool-tinted shadows. Tier rule: xs=hairline lift,
+     sm=resting cards, md=popover/raised tile, lg=modal/menu, xl=hover peak. */
+  --shadow-xs: 0 1px 1px rgba(16, 24, 40, 0.04);
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
   --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.07), 0 2px 6px rgba(16, 24, 40, 0.05);
   --shadow-lg: 0 16px 40px rgba(16, 24, 40, 0.1), 0 6px 14px rgba(16, 24, 40, 0.06);
+  --shadow-xl: 0 24px 60px rgba(16, 24, 40, 0.14), 0 10px 22px rgba(16, 24, 40, 0.08);
+
+  /* ── Z-index scale — reference via z-[var(--z-*)]; one ladder so overlays,
+     menus, tooltips and toasts never collide. header < overlay < modal <
+     popover < tooltip < toast (a menu/tooltip opened inside a modal sits
+     above it; toasts sit above everything). */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 20;
+  --z-header: 40;
+  --z-overlay: 50;
+  --z-modal: 55;
+  --z-popover: 60;
+  --z-tooltip: 70;
+  --z-toast: 80;
 
   /* ── Glass / translucency ───────────────────────────────────────── */
   --glass-bg: rgba(255, 255, 255, 0.72);
@@ -104,7 +164,7 @@
   --color-surface-muted: #1b2430;
   --color-foreground: #e7eaef;
   --color-foreground-muted: #9aa4af;
-  --color-subtle: #6b7682;
+  --color-subtle: #828c98;            /* was #6b7682 (3.85:1) → 4.52:1 as text */
   --color-border: #26303c;
   --color-border-strong: #36424f;
 
@@ -112,15 +172,44 @@
   --color-accent-foreground: #ffffff;
   --color-accent-strong: #c44a1e;
   --color-accent-strong-foreground: #ffffff;
+  /* Brightened so the fresh-spark text/dot clears WCAG AA on the dark canvas
+     (#f0744a == dark cat-5, keeping the warm ramp consistent). */
+  --color-spark: #f0744a;
   --color-success: #3fb27a;
   --color-success-foreground: #0a1f12;
+  --color-success-soft: #13271c;
+  --color-success-soft-foreground: #7fd4a6;
   --color-warning: #d9912f;
+  --color-warning-foreground: #0b0f14;  /* dark-text on filled warning (white = 2.61:1, fails) */
+  --color-warning-soft: #2a1d0a;
+  --color-warning-soft-foreground: #e8b878;
   --color-danger: #e06464;
   --color-destructive: #e06464;
   --color-destructive-foreground: #0b0f14;
-  --color-ring: #0a6f86;
+  --color-danger-soft: #2a1212;
+  --color-danger-soft-foreground: #f0a0a0;
   --color-info: #4aa3c4;
+  --color-info-foreground: #04222e;
+  --color-info-soft: #0f2730;
+  --color-info-soft-foreground: #9ed1e2;
+  --color-ring: #0a6f86;
   --color-good: #3fb27a;
+
+  /* interaction-state (dark) */
+  --color-link: #4aa3c4;             /* clickable text — 6.22:1 on surface */
+  --color-link-hover: #8fd6ea;
+  --color-surface-hover: #1f2935;
+  --color-surface-active: #26303c;
+  --color-surface-selected: #0f2a33; /* teal-tinted */
+  --color-surface-selected-foreground: #9fd4e6;
+
+  /* categorical / dataviz (dark) */
+  --color-cat-1: #4aa6bd;
+  --color-cat-2: #45c2c6;
+  --color-cat-3: #63d29f;
+  --color-cat-4: #e3a13f;
+  --color-cat-5: #f0744a;
+  --color-cat-6: #9aa4af;
 
   --color-primary: #0a6f86;
   --color-primary-foreground: #ffffff;
@@ -136,9 +225,11 @@
 
   --glass-bg: rgba(18, 24, 33, 0.62);
   --glass-border: rgba(255, 255, 255, 0.08);
+  --shadow-xs: 0 1px 1px rgba(0, 0, 0, 0.4);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
   --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.55);
+  --shadow-xl: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
 
 /* ── Global ──────────────────────────────────────────────────────── */
@@ -190,30 +281,34 @@ body {
   font-feature-settings: "zero", "ss01";
 }
 
-/* signature mono "coordinate" labels — retoned to family palette */
+/* Section/meta micro-labels. Retired the legacy "§ coordinate" terminal face
+   (uppercase + wide tracking + orange) in favor of a calm normal-case Pretendard
+   label — friendly akb-platform, not a terminal margin. Casing now comes from
+   the source text (write labels in Sentence case), and orange is reserved for
+   the marquee CTA, never an eyebrow. tabular-nums is still opt-in per use. */
 .coord {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
+  font-size: 0.6875rem; /* 11px */
+  font-weight: 500;
+  letter-spacing: 0;
   color: var(--color-foreground-muted);
 }
 .coord-ink {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
+  font-size: 0.75rem; /* 12px */
+  font-weight: 600;
+  letter-spacing: 0;
   color: var(--color-foreground);
 }
 .coord-spark {
   font-family: var(--font-sans);
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
-  color: var(--color-accent);
+  font-size: 0.75rem; /* 12px */
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--color-foreground-muted);
+}
+.dark .coord-spark {
+  color: var(--color-foreground-muted);
 }
 
 /* colored category eyebrow (feature tiles) */
@@ -242,14 +337,16 @@ h1, h2, h3, h4, h5, h6 {
   border-color: var(--glass-border);
 }
 
-/* App header: glass + thin teal→orange gradient underline + soft lift */
+/* App header: near-solid surface + a quiet hairline (Swiss). Was a glassy
+   blur with a teal→orange gradient underline + heavy lift — dialed back so
+   the workspace chrome recedes and content leads. A faint blur remains for
+   when content scrolls under it. */
 .app-header {
-  background-color: var(--glass-bg);
-  backdrop-filter: saturate(180%) blur(var(--glass-blur));
-  -webkit-backdrop-filter: saturate(180%) blur(var(--glass-blur));
-  border-bottom: 1px solid transparent;
-  border-image: linear-gradient(90deg, rgba(0, 64, 89, 0.35), rgba(229, 94, 44, 0.35)) 1;
-  box-shadow: 0 1px 0 rgba(16, 24, 40, 0.02), 0 8px 24px -16px rgba(0, 64, 89, 0.25);
+  background-color: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  backdrop-filter: saturate(130%) blur(8px);
+  -webkit-backdrop-filter: saturate(130%) blur(8px);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
 }
 
 /* Gradient brand wordmark */
@@ -271,9 +368,9 @@ body::before {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(45rem 45rem at 8% -12%, rgba(0, 64, 89, 0.1), transparent 60%),
-    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.09), transparent 55%),
-    radial-gradient(50rem 30rem at 50% 120%, rgba(0, 64, 89, 0.06), transparent 60%);
+    radial-gradient(45rem 45rem at 8% -12%, rgba(0, 64, 89, 0.055), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.045), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(0, 64, 89, 0.03), transparent 60%);
 }
 #root {
   position: relative;
@@ -281,9 +378,38 @@ body::before {
 }
 .dark body::before {
   background:
-    radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.22), transparent 60%),
-    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.16), transparent 55%),
-    radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.14), transparent 60%);
+    radial-gradient(45rem 45rem at 8% -12%, rgba(10, 111, 134, 0.1), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, rgba(229, 94, 44, 0.075), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, rgba(10, 111, 134, 0.06), transparent 60%);
+}
+
+/* Header-local aurora wash — the global body::before mesh is anchored
+   off-screen at the corners, so the masthead itself reads flat. This brings
+   one teal bloom up from the lower-left + a faint orange kiss from the
+   upper-right onto the actual header band, fading out within its own box.
+   Static (no motion), pointer-events:none, behind the header content (z-0). */
+.aurora-header {
+  position: relative;
+}
+.aurora-header::before {
+  content: "";
+  position: absolute;
+  inset: -1.5rem -1rem auto -1rem;
+  height: 200%;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(30rem 16rem at 10% 115%, rgba(0, 64, 89, 0.07), transparent 62%),
+    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.06), transparent 60%);
+}
+.dark .aurora-header::before {
+  background:
+    radial-gradient(30rem 16rem at 10% 115%, rgba(10, 111, 134, 0.13), transparent 62%),
+    radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.1), transparent 60%);
+}
+.aurora-header > * {
+  position: relative;
+  z-index: 1;
 }
 
 /* interactive card: lift + shadow on hover */
@@ -409,16 +535,17 @@ body::before {
   line-height: 1.75;
 }
 .prose a {
-  color: var(--color-primary);
+  color: var(--color-link);
   text-decoration: underline;
-  text-decoration-color: color-mix(in srgb, var(--color-primary) 40%, transparent);
+  text-decoration-color: color-mix(in srgb, var(--color-link) 40%, transparent);
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
   transition: color 150ms, text-decoration-color 150ms;
 }
 .prose a:hover {
-  color: var(--color-accent);
-  text-decoration-color: var(--color-accent);
+  /* teal family — hovering a doc link should not spend the marquee orange */
+  color: var(--color-link-hover);
+  text-decoration-color: var(--color-link-hover);
 }
 .prose strong { color: var(--color-foreground); font-weight: 600; }
 .prose h1, .prose h2, .prose h3, .prose h4 {

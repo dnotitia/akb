@@ -13,6 +13,7 @@
 // Dependency-free. Grouping seam: the forces + color read node.group, which
 // is assigned at data ingest (use-graph-data) from the node's collection.
 import { parseUri } from "@/lib/uri";
+import { hashHue } from "@/lib/utils";
 import type { GraphNode } from "./graph-types";
 
 // ── Tunables (exported so they're easy to find + adjust) ──────────────────
@@ -47,49 +48,15 @@ export function groupOf(uri: string): string | null {
 
 // ── Color ─────────────────────────────────────────────────────────────────
 
-/** Deterministic string → hue in [0,360) (FNV-1a). Same group key always
- *  maps to the same hue regardless of how many groups exist (no flicker). */
-function hashHue(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0) % 360;
-}
-
-/** Luminance check on a hex background so colors adapt to the active theme.
- *  Falls back to "dark" for non-hex / unparseable input. */
-export function isDarkBg(bg: string): boolean {
-  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(bg.trim());
-  if (!m) return true;
-  let hex = m[1];
-  if (hex.length === 3) hex = hex.split("").map((c) => c + c).join("");
-  const r = parseInt(hex.slice(0, 2), 16);
-  const g = parseInt(hex.slice(2, 4), 16);
-  const b = parseInt(hex.slice(4, 6), 16);
-  return 0.299 * r + 0.587 * g + 0.114 * b < 128;
-}
-
-const colorCache = new Map<string, string>();
-
-// Curated on-brand hue set for cluster rings — cool teals/sage + warm
-// oranges/amber, anchored on the teal/orange brand. Replaces the former
-// full-spectrum 0-360 rainbow (which surfaced off-brand blues/purples/magenta).
-// hashHue() (0-359) buckets a group into one of these, keeping clusters
-// distinguishable without leaving the brand palette.
-const CLUSTER_HUES = [192, 200, 178, 160, 30, 18, 40];
-
-/** Stable, theme-aware ring color for a group key (memoized — called per
- *  visible node every frame). Darker on a light background so it reads. */
-export function groupColor(group: string, dark = true): string {
-  const key = `${group}|${dark ? 1 : 0}`;
-  const cached = colorCache.get(key);
-  if (cached) return cached;
-  const h = CLUSTER_HUES[hashHue(group) % CLUSTER_HUES.length];
-  const col = dark ? `hsl(${h}, 58%, 60%)` : `hsl(${h}, 52%, 38%)`;
-  colorCache.set(key, col);
-  return col;
+/**
+ * Stable cluster color for a group key, drawn from the tokenized, CVD-vetted
+ * categorical scale (--color-cat-1..6, resolved by readColors() — already
+ * theme-correct, so there is no per-component light/dark fork here). hashHue
+ * buckets the group deterministically into one of the `cat` colors.
+ */
+export function groupColor(group: string, cat: string[]): string {
+  if (!cat.length) return "gray"; // emergency fallback if the token scale didn't resolve
+  return cat[hashHue(group) % cat.length];
 }
 
 // ── Forces ──────────────────────────────────────────────────────────────

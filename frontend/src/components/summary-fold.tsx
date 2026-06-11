@@ -56,7 +56,7 @@ export function SummaryFold({ summary, prominent = false, className = "my-4" }: 
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="mt-1 inline-flex items-center gap-1 coord text-foreground-muted hover:text-foreground transition-colors"
+        className="mt-1 inline-flex items-center gap-1 coord text-foreground-muted hover:text-foreground transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         {open ? <ChevronUp className="h-3 w-3" aria-hidden /> : <ChevronDown className="h-3 w-3" aria-hidden />}
         {open ? "less" : "more"}

@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { PanelLeftOpen } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { GraphCanvas, type GraphCanvasHandle } from "@/components/graph/GraphCanvas";
 import { GraphSidebar } from "@/components/graph/GraphSidebar";
@@ -177,26 +178,29 @@ export default function GraphPage() {
           onCollapse={() => setSidebarOpen(false)}
         />
       ) : (
-        // Collapsed rail: the sole "expand" affordance. The matching
-        // "collapse" control lives in the sidebar header (GraphSidebar
-        // onCollapse) so there is exactly one toggle, always on the left.
-        <div className="flex flex-col items-center">
+        // Collapsed: a thin strip with just the expand toggle at the top —
+        // the same pattern as the workspace tree column's collapsed strip, so
+        // collapsing the graph controls feels identical to collapsing the tree.
+        <nav
+          aria-label="Graph controls (collapsed)"
+          className="h-full w-10 flex flex-col items-center py-2"
+        >
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
-            aria-label="Show sidebar"
-            title="Show sidebar"
-            className="h-9 w-9 m-2 inline-flex items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-muted cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            aria-label="Show graph controls"
+            title="Show graph controls"
+            className="flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
           >
-            <PanelLeftOpen className="h-4 w-4" />
+            <PanelLeftOpen className="h-4 w-4" aria-hidden />
           </button>
-        </div>
+        </nav>
       )}
 
       <div className="relative bg-background overflow-hidden">
         {degraded && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-warning/10 border border-warning text-warning px-3 py-1 font-mono text-[10px] uppercase">
-            {rawNodeCount} nodes — pick an entry point to explore
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 w-max max-w-[90%]">
+            <Alert variant="warning">{rawNodeCount} nodes — pick an entry point to explore.</Alert>
           </div>
         )}
 
@@ -219,17 +223,39 @@ export default function GraphPage() {
         ) : merged.nodes.length === 0 ? (
           <EmptyState title="Empty graph" description="No relations match the current filters." />
         ) : (
-          <GraphCanvas
-            ref={canvasRef}
-            nodes={merged.nodes}
-            edges={merged.edges}
-            selected={selectedNode?.uri}
-            pinned={pinned}
-            hidden={hidden}
-            degraded={degraded}
-            onSelect={handleSelect}
-            onContextMenu={handleContextMenu}
-          />
+          <>
+            <GraphCanvas
+              // Remount on a STRUCTURAL change (entry/hops/filters), not on
+              // selection, so the new graph auto-fits instead of rendering
+              // off-screen. structureKey excludes `selected` by design.
+              key={structureKey}
+              ref={canvasRef}
+              nodes={merged.nodes}
+              edges={merged.edges}
+              selected={selectedNode?.uri}
+              pinned={pinned}
+              hidden={hidden}
+              degraded={degraded}
+              onSelect={handleSelect}
+              onContextMenu={handleContextMenu}
+            />
+            {/* Text alternative + keyboard path: the canvas is opaque to AT, so
+                expose every node as a focusable button that selects it (opening
+                the detail panel — the same handler the canvas click uses). */}
+            <div className="sr-only">
+              <h2>Graph nodes ({merged.nodes.length})</h2>
+              <ul>
+                {merged.nodes.map((n) => (
+                  <li key={n.uri}>
+                    <button type="button" onClick={() => handleSelect(n.uri)}>
+                      {n.name} — {n.kind}
+                      {n.group ? ` — cluster ${n.group}` : ""}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </>
         )}
       </div>
 

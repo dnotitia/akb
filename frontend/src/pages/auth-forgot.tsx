@@ -1,9 +1,17 @@
-import { Link } from "react-router-dom";
+import { useEffect } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
+import { getToken } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
 
 export default function AuthForgotPage() {
+  const navigate = useNavigate();
+  // This route sits outside the Layout auth gate — bounce signed-in users home.
+  useEffect(() => {
+    if (getToken()) navigate("/", { replace: true });
+  }, [navigate]);
+
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
       <div className="absolute right-4 top-4 z-10">
@@ -16,7 +24,6 @@ export default function AuthForgotPage() {
         </div>
 
         <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-          <div className="coord-spark mb-2">§ FORGOT PASSWORD</div>
           <h1 className="font-display text-2xl tracking-tight text-foreground mb-4">
             Forgot your password?
           </h1>
@@ -29,10 +36,10 @@ export default function AuthForgotPage() {
           </p>
           <Link
             to="/auth"
-            className="inline-flex items-center gap-1.5 coord hover:text-accent transition-colors"
+            className="inline-flex items-center gap-1.5 coord hover:text-foreground transition-colors"
           >
             <ArrowLeft className="h-3 w-3" aria-hidden />
-            BACK TO LOGIN
+            Back to login
           </Link>
         </div>
 

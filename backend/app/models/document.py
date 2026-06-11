@@ -109,6 +109,10 @@ class DocumentResponse(BaseModel):
     summary: str | None = None
     domain: str | None = None
     created_by: str | None = None
+    # Human display name resolved from `created_by` (a user UUID) at read time,
+    # so the UI can show an author name instead of a raw id. Null for
+    # external-git imports (non-user author strings) or unknown ids.
+    created_by_name: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     current_commit: str | None = None

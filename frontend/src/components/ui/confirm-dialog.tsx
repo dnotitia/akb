@@ -1,4 +1,5 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -35,13 +36,25 @@ export function ConfirmDialog({
   busy = false,
 }: ConfirmDialogProps) {
   const [internalBusy, setInternalBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const isBusy = busy || internalBusy;
 
+  // Clear any stale error each time the dialog (re)opens so a prior failure
+  // doesn't bleed into the next confirmation.
+  useEffect(() => {
+    if (open) setError(null);
+  }, [open]);
+
   async function handleConfirm() {
+    setError(null);
     setInternalBusy(true);
     try {
       await onConfirm();
       onOpenChange(false);
+    } catch (e) {
+      // Keep the dialog open and surface the failure inline — previously a
+      // rejected onConfirm left the dialog stuck with no feedback.
+      setError(e instanceof Error ? e.message : "Something went wrong. Please try again.");
     } finally {
       setInternalBusy(false);
     }
@@ -58,12 +71,16 @@ export function ConfirmDialog({
             </DialogDescription>
           )}
         </DialogHeader>
+        {error && <Alert variant="destructive">{error}</Alert>}
         <DialogFooter>
           <Button
             type="button"
             variant="outline"
             onClick={() => onOpenChange(false)}
             disabled={isBusy}
+            // Destructive dialogs focus Cancel, not Confirm, so a stray Enter on
+            // open can't fire the irreversible action.
+            autoFocus={variant === "destructive"}
           >
             {cancelLabel}
           </Button>
@@ -72,7 +89,7 @@ export function ConfirmDialog({
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={handleConfirm}
             disabled={isBusy}
-            autoFocus
+            autoFocus={variant !== "destructive"}
           >
             {isBusy ? "Working…" : confirmLabel}
           </Button>

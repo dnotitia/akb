@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { searchUsers, grantAccess } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Segmented } from "@/components/ui/segmented";
 import {
   Dialog,
   DialogContent,
@@ -119,9 +121,10 @@ export function InviteMemberDialog({
     <Dialog open={open} onOpenChange={(o) => !granting && onOpenChange(o)}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Invite to {vault}</DialogTitle>
+          <DialogTitle>Add a member to {vault}</DialogTitle>
           <DialogDescription>
-            Find a user, pick a role, send the invite. The user gains access immediately.
+            Find a person with an AKB account, pick a role, and grant access. They
+            gain access immediately.
           </DialogDescription>
         </DialogHeader>
 
@@ -129,7 +132,7 @@ export function InviteMemberDialog({
           {/* User search */}
           <div className="space-y-1.5">
             <Label htmlFor="invite-search" className="coord-ink">
-              USER
+              User
             </Label>
             <div className="relative">
               <Search
@@ -147,28 +150,32 @@ export function InviteMemberDialog({
               />
             </div>
 
-            <div className="border border-border max-h-56 overflow-y-auto rail-scroll">
+            <div className="border border-border max-h-[min(14rem,30vh)] overflow-y-auto rail-scroll">
               {searching && hits.length === 0 ? (
-                <div className="coord px-3 py-2">— SEARCHING —</div>
+                <div className="coord px-3 py-2" role="status" aria-live="polite">Searching…</div>
               ) : hits.length === 0 ? (
-                <div className="coord px-3 py-2">— NO MATCHES —</div>
+                <div className="coord px-3 py-2" role="status">
+                  {debouncedQuery
+                    ? "No matches — only people with an AKB account appear here."
+                    : "Only people with an AKB account appear here."}
+                </div>
               ) : (
-                <ul className="divide-y divide-border">
+                <ul role="listbox" aria-label="Search results" className="divide-y divide-border">
                   {hits.map((u) => {
                     const active = selected?.username === u.username;
                     return (
-                      <li key={u.username}>
+                      <li key={u.username} role="option" aria-selected={active}>
                         <button
                           type="button"
                           onClick={() => setSelected(u)}
                           className={`w-full text-left px-3 py-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset cursor-pointer ${
                             active
-                              ? "bg-accent/10 text-accent"
-                              : "hover:bg-surface-muted text-foreground"
+                              ? "bg-surface-selected text-surface-selected-foreground"
+                              : "hover:bg-surface-hover text-foreground"
                           }`}
                         >
                           <div className="flex items-baseline gap-2">
-                            <span title={u.username} className="font-mono text-sm font-medium truncate">
+                            <span title={u.username} className="text-sm font-medium truncate">
                               {u.username}
                             </span>
                             {u.display_name && (
@@ -189,37 +196,23 @@ export function InviteMemberDialog({
 
           {/* Role picker */}
           <div className="space-y-1.5">
-            <Label className="coord-ink">ROLE</Label>
-            <div className="grid grid-cols-3 gap-px border border-border bg-border rounded-[var(--radius-md)] overflow-hidden">
-              {(["reader", "writer", "admin"] as Role[]).map((r) => {
-                const active = role === r;
-                return (
-                  <button
-                    key={r}
-                    type="button"
-                    onClick={() => setRole(r)}
-                    aria-pressed={active}
-                    className={`px-3 py-2 text-sm font-medium uppercase tracking-wider transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
-                      active
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-surface text-foreground hover:bg-surface-muted"
-                    }`}
-                  >
-                    {r}
-                  </button>
-                );
-              })}
-            </div>
+            <Label id="invite-role-label" className="coord-ink">Role</Label>
+            <Segmented
+              aria-labelledby="invite-role-label"
+              value={role}
+              onChange={(v) => setRole(v as Role)}
+              className="grid-cols-3"
+              options={(["reader", "writer", "admin"] as Role[]).map((r) => ({
+                value: r,
+                label: r,
+              }))}
+            />
             <p className="text-xs text-foreground-muted leading-relaxed">
               {ROLE_DESCRIPTIONS[role]}
             </p>
           </div>
 
-          {error && (
-            <div role="alert" className="border border-destructive p-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
+          {error && <Alert variant="destructive">{error}</Alert>}
         </div>
 
         <DialogFooter>
@@ -233,18 +226,12 @@ export function InviteMemberDialog({
           </Button>
           <Button
             type="button"
-            variant="accent"
+            variant="default"
             onClick={handleGrant}
-            disabled={!selected || granting}
+            loading={granting}
+            disabled={!selected}
           >
-            {granting ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Granting…
-              </>
-            ) : (
-              `Grant ${role}`
-            )}
+            {granting ? "Granting…" : `Grant ${role}`}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -1,20 +1,24 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, ArrowRight, ChevronRight, Loader2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Eyebrow } from "@/components/ui/eyebrow";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SelectMenu } from "@/components/ui/select-menu";
 import { TagInput } from "@/components/ui/tag-input";
 import { Textarea } from "@/components/ui/textarea";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
 
 /** Flatten every collection path in the tree (depth-first) for the
- *  COLLECTION datalist. The tree nests sub-collections under their
+ *  collection picker chips. The tree nests sub-collections under their
  *  parent, so a recursive walk yields the full `a/b/c` paths. */
 function collectCollectionPaths(nodes: TreeNode[], out: string[] = []): string[] {
   for (const node of nodes) {
@@ -31,9 +35,9 @@ export default function DocumentNewPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { tree } = useVaultTree(name);
-  // Existing collections power the picker datalist; new names are still
-  // accepted (the field stays a free-text input — "created automatically
-  // if new").
+  // Existing collections power the one-tap picker chips; new names are still
+  // accepted (the field stays a free-text input — created automatically when
+  // the typed path doesn't exist yet).
   const collectionOptions = useMemo(
     () => Array.from(new Set(collectCollectionPaths(tree ?? []))).sort(),
     [tree],
@@ -50,26 +54,24 @@ export default function DocumentNewPage() {
   const [tags, setTags] = useState<string[]>([]);
   const [body, setBody] = useState("");
   const [error, setError] = useState("");
+  const [invalidField, setInvalidField] = useState<"title" | "collection" | "body" | null>(null);
   const [creating, setCreating] = useState(false);
+  const [discardOpen, setDiscardOpen] = useState(false);
+  const titleRef = useRef<HTMLInputElement>(null);
+  const collectionRef = useRef<HTMLInputElement>(null);
 
-  function handleCancel() {
-    if (typeof window !== "undefined" && window.history.length > 1) {
-      navigate(-1);
-    } else {
-      navigate(`/vault/${name}`);
-    }
-  }
-
-  // Esc to cancel — mirrors vault-new.tsx, off while saving so we never
-  // discard mid-submit.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape" && !creating) handleCancel();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creating]);
+  // Make "pick existing vs. create new" explicit (instead of a native datalist
+  // that hides the choice): offer existing collections as one-tap chips and
+  // say plainly whether the typed path is existing or about to be created.
+  const collectionTrimmed = collection.trim();
+  const isExistingCollection = collectionOptions.includes(collectionTrimmed);
+  const matchingCollections = collectionOptions
+    .filter(
+      (c) =>
+        c !== collectionTrimmed &&
+        c.toLowerCase().includes(collectionTrimmed.toLowerCase()),
+    )
+    .slice(0, 8);
 
   const isDirty =
     title.trim() !== "" ||
@@ -78,6 +80,30 @@ export default function DocumentNewPage() {
     summary.trim() !== "" ||
     tags.length > 0 ||
     body.trim() !== "";
+
+  function doCancel() {
+    if (typeof window !== "undefined" && window.history.length > 1) {
+      navigate(-1);
+    } else {
+      navigate(`/vault/${name}`);
+    }
+  }
+  function handleCancel() {
+    // Guard a dirty draft behind a ConfirmDialog (design system bans window.confirm).
+    if (isDirty && !creating) setDiscardOpen(true);
+    else doCancel();
+  }
+
+  // Esc to cancel — off while saving and while the discard dialog is open
+  // (Radix owns Esc there) so we never double-handle or discard mid-submit.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !creating && !discardOpen) handleCancel();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creating, discardOpen, isDirty]);
 
   useEffect(() => {
     if (!isDirty || creating) return;
@@ -89,43 +115,38 @@ export default function DocumentNewPage() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, [isDirty, creating]);
 
+  // Fail a field: surface the message, mark the field invalid (aria + red
+  // border), and move focus to it so a keyboard/AT user lands on the problem.
+  function fail(field: "title" | "collection" | "body", message: string) {
+    setError(message);
+    setInvalidField(field);
+    if (field === "title") titleRef.current?.focus();
+    else if (field === "collection") collectionRef.current?.focus();
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!name) return;
+    setError("");
+    setInvalidField(null);
     const t = title.trim();
     const c = collection.trim();
-    if (!t) {
-      setError("Title is required.");
-      return;
-    }
-    if (t.length > 256) {
-      setError("Title is too long (256 chars max).");
-      return;
-    }
-    if (!c) {
-      setError("Collection is required.");
-      return;
-    }
+    if (!t) return fail("title", "Title is required.");
+    if (t.length > 256) return fail("title", "Title is too long (256 chars max).");
+    if (!c) return fail("collection", "Collection is required.");
     // Allowlist: lowercase letters, digits, hyphens, underscores, and `/`
     // as a segment separator. Blocks path traversal (`..`), Windows-style
     // separators, absolute paths, and trailing slashes before the backend
     // ever sees the value. The backend should still validate, but a clear
     // client-side rejection produces a much better error message.
     if (!/^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/.test(c)) {
-      setError(
-        "Collection must use lowercase letters, digits, hyphens, underscores, and `/` only.",
+      return fail(
+        "collection",
+        "Collection must use lowercase letters, digits, hyphens, underscores, and / only.",
       );
-      return;
     }
-    if (!body.trim()) {
-      setError("Body cannot be empty.");
-      return;
-    }
-    if (body.length > 1_000_000) {
-      setError("Body is too large (1 MB max).");
-      return;
-    }
-    setError("");
+    if (!body.trim()) return fail("body", "Body cannot be empty.");
+    if (body.length > 1_000_000) return fail("body", "Body is too large (1 MB max).");
     setCreating(true);
     try {
       const result = await putDocument({
@@ -153,22 +174,30 @@ export default function DocumentNewPage() {
             ? err.message
             : "Failed to create document.";
       setError(message);
+    } finally {
+      // Always clear — a missing-path fallback or no-op navigate must not
+      // leave the button stuck on "Creating…" with the form still mounted.
       setCreating(false);
     }
   }
 
+  const canSubmit = title.trim() !== "" && collection.trim() !== "" && body.trim() !== "";
+
   return (
     <div className="max-w-3xl mx-auto fade-up">
       <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord mb-6">
-        <Link to={`/vault/${name}`} className="hover:text-accent">
-          {(name || "").toUpperCase()}
+        <Link
+          to={`/vault/${name}`}
+          className="hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          {name || ""}
         </Link>
         <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-        <span className="text-foreground">NEW DOCUMENT</span>
+        <span className="text-foreground">New document</span>
       </nav>
 
       <header className="pb-4">
-        <div className="coord-spark mb-2">§ NEW DOCUMENT</div>
+        <Eyebrow tone="spark" className="mb-2 block">New document</Eyebrow>
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           New document.
         </h1>
@@ -189,54 +218,94 @@ export default function DocumentNewPage() {
           </Label>
           <Input
             id="doc-title"
+            ref={titleRef}
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              if (invalidField === "title") setInvalidField(null);
+            }}
             placeholder="A short, descriptive title"
             maxLength={256}
+            required
+            aria-required="true"
+            aria-invalid={invalidField === "title" || undefined}
+            aria-describedby={error ? "doc-form-error" : undefined}
             autoFocus
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="doc-collection">
               Collection <span className="text-destructive normal-case">*</span>
             </Label>
             <Input
               id="doc-collection"
+              ref={collectionRef}
               value={collection}
-              onChange={(e) => setCollection(e.target.value)}
+              onChange={(e) => {
+                setCollection(e.target.value);
+                if (invalidField === "collection") setInvalidField(null);
+              }}
               placeholder="e.g. engineering/specs"
               className="font-mono"
               maxLength={120}
-              list="doc-collection-options"
+              required
+              aria-required="true"
+              aria-invalid={invalidField === "collection" || undefined}
+              aria-describedby="doc-collection-status"
               autoComplete="off"
             />
-            <datalist id="doc-collection-options">
-              {collectionOptions.map((c) => (
-                <option key={c} value={c} />
-              ))}
-            </datalist>
-            <div className="coord">PICK EXISTING · OR TYPE A NEW PATH (CREATED AUTOMATICALLY)</div>
+            {matchingCollections.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {matchingCollections.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => {
+                      setCollection(c);
+                      if (invalidField === "collection") setInvalidField(null);
+                      collectionRef.current?.focus();
+                    }}
+                    className="inline-flex items-center rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 font-mono text-xs text-foreground-muted hover:border-border-strong hover:text-link transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+            )}
+            <p
+              id="doc-collection-status"
+              className="flex items-center gap-1.5 text-xs text-foreground-muted"
+            >
+              {collectionTrimmed === "" ? (
+                "Pick an existing folder, or type a new path to create one."
+              ) : isExistingCollection ? (
+                <>
+                  <Check className="h-3 w-3 text-success" aria-hidden />
+                  Existing collection
+                </>
+              ) : (
+                <>
+                  <FolderPlus className="h-3 w-3 text-foreground" aria-hidden />
+                  <span className="text-foreground">New collection</span> — created on save
+                </>
+              )}
+            </p>
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="doc-type">Type</Label>
-            <select
+            <SelectMenu
               id="doc-type"
+              aria-label="Document type"
               value={type}
-              onChange={(e) => setType(e.target.value as DocType)}
-              className="w-full h-9 px-3 rounded-[var(--radius-md)] bg-surface border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
-            >
-              {DOC_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
+              onValueChange={(v) => setType(v as DocType)}
+              options={DOC_TYPES.map((t) => ({ value: t, label: t }))}
+            />
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="doc-domain">
               Domain{" "}
@@ -280,48 +349,59 @@ export default function DocumentNewPage() {
           />
         </div>
 
-        <div className="space-y-1.5">
-          <Label htmlFor="doc-body">
+        <div
+          className={
+            invalidField === "body"
+              ? "space-y-1.5 rounded-[var(--radius-lg)] ring-2 ring-destructive ring-offset-2 ring-offset-background"
+              : "space-y-1.5"
+          }
+        >
+          <Label htmlFor="doc-body" id="doc-body-label">
             Body <span className="text-destructive normal-case">*</span>
           </Label>
           <Suspense fallback={<MarkdownEditorFallback />}>
             <MarkdownEditor
               value=""
-              onChange={setBody}
+              onChange={(md) => {
+                setBody(md);
+                if (invalidField === "body") setInvalidField(null);
+              }}
               placeholder="Write the document body in markdown."
+              ariaLabelledby="doc-body-label"
+              required
             />
           </Suspense>
         </div>
 
         {error && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
-          >
-            ⚠ {error.toUpperCase()}
-          </div>
+          <Alert variant="destructive" id="doc-form-error">{error}</Alert>
         )}
 
         <div className="flex gap-3 pt-2">
-          <Button type="submit" variant="accent" disabled={creating}>
-            {creating ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Creating…
-              </>
-            ) : (
+          <Button type="submit" variant="accent" loading={creating} disabled={!canSubmit}>
+            {!creating && (
               <>
                 Create document
                 <ArrowRight className="h-4 w-4" aria-hidden />
               </>
             )}
+            {creating && "Creating…"}
           </Button>
           <Button type="button" variant="outline" onClick={handleCancel} disabled={creating}>
             <ArrowLeft className="h-4 w-4" aria-hidden /> Cancel
           </Button>
         </div>
       </form>
+
+      <ConfirmDialog
+        open={discardOpen}
+        onOpenChange={setDiscardOpen}
+        title="Discard this draft?"
+        description="Your unsaved document will be lost."
+        confirmLabel="Discard"
+        variant="destructive"
+        onConfirm={doCancel}
+      />
     </div>
   );
 }

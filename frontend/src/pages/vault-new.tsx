@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ArrowLeft, ArrowRight, ChevronRight, GitBranch, Loader2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronRight, GitBranch } from "lucide-react";
 import { createVault, listVaultTemplates, type VaultTemplateSummary } from "@/lib/api";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SelectMenu } from "@/components/ui/select-menu";
 import {
   Tooltip,
   TooltipContent,
@@ -20,6 +22,8 @@ export default function VaultNewPage() {
   const [creating, setCreating] = useState(false);
   const [templates, setTemplates] = useState<VaultTemplateSummary[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState<string>("");
+  const nameRef = useRef<HTMLInputElement>(null);
+  const nameValid = /^[a-z0-9-]+$/.test(name.trim());
 
   useEffect(() => {
     listVaultTemplates()
@@ -61,11 +65,13 @@ export default function VaultNewPage() {
     e.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) {
-      setError("Vault name is required");
+      setError("Vault name is required.");
+      nameRef.current?.focus();
       return;
     }
     if (!/^[a-z0-9-]+$/.test(trimmed)) {
-      setError("Use lowercase letters, digits, and hyphens only");
+      setError("Use lowercase letters, digits, and hyphens only.");
+      nameRef.current?.focus();
       return;
     }
     setError("");
@@ -86,15 +92,14 @@ export default function VaultNewPage() {
   return (
     <div className="max-w-3xl mx-auto fade-up">
       <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord mb-6">
-        <Link to="/" className="hover:text-accent">HOME</Link>
+        <Link to="/" className="hover:text-link">Home</Link>
         <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-        <span className="text-foreground">NEW VAULT</span>
+        <span className="text-foreground">New vault</span>
       </nav>
 
       <header className="mb-6">
-        <div className="coord-spark mb-2">§ NEW VAULT</div>
         <h1 className="font-display text-3xl tracking-tight text-foreground">
-          Create a vault<span className="text-accent">.</span>
+          Create a vault
         </h1>
         <p className="mt-3 text-sm text-foreground-muted max-w-prose">
           A vault is a Git-backed knowledge root. Documents, tables, and files live
@@ -113,15 +118,22 @@ export default function VaultNewPage() {
           </Label>
           <Input
             id="vault-name"
+            ref={nameRef}
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (error) setError("");
+            }}
             placeholder="e.g. engineering"
+            required
+            aria-required="true"
+            aria-invalid={error ? true : undefined}
             autoFocus
             className="font-mono"
-            aria-describedby="vault-name-hint"
+            aria-describedby={error ? "vault-form-error vault-name-hint" : "vault-name-hint"}
           />
           <div id="vault-name-hint" className="coord">
-            LOWERCASE LETTERS, DIGITS, HYPHENS · BECOMES /vault/&lt;name&gt;
+            Lowercase letters, digits, hyphens · becomes /vault/&lt;name&gt;
           </div>
         </div>
 
@@ -141,17 +153,20 @@ export default function VaultNewPage() {
           <Label htmlFor="vault-template">
             Template <span className="normal-case tracking-normal text-foreground-muted">(optional)</span>
           </Label>
-          <select
+          <SelectMenu
             id="vault-template"
+            aria-label="Vault template"
             value={selectedTemplate}
-            onChange={(e) => setSelectedTemplate(e.target.value)}
-            className="w-full rounded-[var(--radius-md)] bg-surface border border-border px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent transition-colors"
-          >
-            <option value="">None — empty vault</option>
-            {templates.map((t) => (
-              <option key={t.name} value={t.name}>{t.display_name}</option>
-            ))}
-          </select>
+            onValueChange={setSelectedTemplate}
+            options={[
+              { value: "", label: "None — empty vault" },
+              ...templates.map((t) => ({
+                value: t.name,
+                label: t.display_name,
+                hint: `${t.collection_count} collection${t.collection_count === 1 ? "" : "s"}`,
+              })),
+            ]}
+          />
           {selectedSummary && (
             <div className="coord">
               {selectedSummary.description}
@@ -181,29 +196,17 @@ export default function VaultNewPage() {
           </Tooltip>
         </TooltipProvider>
 
-        {error && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs font-mono uppercase tracking-wider text-destructive"
-          >
-            ⚠ {error.toUpperCase()}
-          </div>
-        )}
+        {error && <Alert variant="destructive" id="vault-form-error">{error}</Alert>}
 
         <div className="flex gap-3 pt-2">
-          <Button type="submit" variant="accent" disabled={creating}>
-            {creating ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Creating…
-              </>
-            ) : (
+          <Button type="submit" variant="accent" loading={creating} disabled={!nameValid}>
+            {!creating && (
               <>
                 Create vault
                 <ArrowRight className="h-4 w-4" aria-hidden />
               </>
             )}
+            {creating && "Creating…"}
           </Button>
           <Button type="button" variant="outline" onClick={handleCancel}>
             <ArrowLeft className="h-4 w-4" aria-hidden /> Cancel

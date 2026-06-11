@@ -141,7 +141,7 @@ function RowInner({
       <div
         className={cn(
           baseLayout,
-          active && "bg-accent/10 text-accent",
+          active && "bg-surface-selected text-surface-selected-foreground",
         )}
       >
         <RowContent entry={entry} active={active} />
@@ -159,8 +159,8 @@ function RowInner({
         baseLayout,
         "text-left cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
         active
-          ? "bg-accent/10 text-accent"
-          : "hover:bg-surface-muted",
+          ? "bg-surface-selected text-surface-selected-foreground"
+          : "hover:bg-surface-hover",
       )}
     >
       <RowContent entry={entry} active={active} />
@@ -175,22 +175,24 @@ function RowContent({
   entry: HistoryEntry;
   active?: boolean;
 }) {
+  // When active, the row container carries text-surface-selected-foreground;
+  // inner spans drop their own color so it cascades (no per-span orange).
   return (
     <>
-      <span className={active ? "text-accent" : "text-accent"}>
+      <span className={active ? undefined : "text-link"}>
         {(entry.hash || "").slice(0, 7)}
       </span>
       <span
         title={`${entry.agent || entry.author || "unknown"}${entry.subject ? ` · ${entry.subject}` : ""}`}
-        className={cn("truncate", active ? "text-accent" : "text-foreground-muted")}
+        className="truncate"
       >
-        <span className={active ? "text-accent" : "text-foreground-muted"}>
+        <span className={active ? undefined : "text-foreground-muted"}>
           {entry.agent || entry.author || "unknown"}
         </span>
         {entry.subject && (
           <>
             {" "}
-            <span className={active ? "text-accent" : "text-foreground"}>
+            <span className={active ? undefined : "text-foreground"}>
               · {entry.subject}
             </span>
           </>
@@ -199,7 +201,7 @@ function RowContent({
       <span
         className={cn(
           "tabular-nums text-right shrink-0",
-          active ? "text-accent" : "text-foreground-muted",
+          !active && "text-foreground-muted",
         )}
       >
         {timeAgo(entry.timestamp)}

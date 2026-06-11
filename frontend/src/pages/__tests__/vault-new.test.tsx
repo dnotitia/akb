@@ -1,4 +1,5 @@
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import VaultNewPage from "../vault-new";
@@ -35,6 +36,15 @@ const SAMPLE = [
   },
 ];
 
+// The Template control is now a themed dropdown (Radix DropdownMenu), not a
+// native <select>, so its options live in a popover that we open before
+// asserting / selecting.
+async function openTemplateMenu() {
+  const user = userEvent.setup();
+  await user.click(await screen.findByLabelText(/template/i));
+  return user;
+}
+
 describe("VaultNewPage template selection", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -48,20 +58,21 @@ describe("VaultNewPage template selection", () => {
   it("renders dropdown with 'None' + fetched templates", async () => {
     (api.listVaultTemplates as any).mockResolvedValue(SAMPLE);
     renderPage();
-    const select = await screen.findByLabelText(/template/i);
-    await waitFor(() => expect((select as HTMLSelectElement).options.length).toBe(3));
-    const labels = Array.from((select as HTMLSelectElement).options).map((o) => o.text);
+    await openTemplateMenu();
+    await waitFor(() =>
+      expect(screen.getAllByRole("menuitemradio")).toHaveLength(3),
+    );
+    const labels = screen.getAllByRole("menuitemradio").map((i) => i.textContent || "");
     expect(labels[0]).toMatch(/none/i);
-    expect(labels).toContain("Engineering");
-    expect(labels).toContain("QA");
+    expect(labels.join("|")).toMatch(/Engineering/);
+    expect(labels.join("|")).toMatch(/QA/);
   });
 
   it("shows preview when a template is selected", async () => {
     (api.listVaultTemplates as any).mockResolvedValue(SAMPLE);
     renderPage();
-    const select = (await screen.findByLabelText(/template/i)) as HTMLSelectElement;
-    await waitFor(() => expect(select.options.length).toBe(3));
-    fireEvent.change(select, { target: { value: "engineering" } });
+    const user = await openTemplateMenu();
+    await user.click(await screen.findByRole("menuitemradio", { name: /Engineering/i }));
     expect(await screen.findByText(/software dev/i)).toBeInTheDocument();
     expect(screen.getByText(/specs/)).toBeInTheDocument();
     expect(screen.getByText(/decisions/)).toBeInTheDocument();
@@ -87,9 +98,8 @@ describe("VaultNewPage template selection", () => {
   it("submits with selected template name", async () => {
     (api.listVaultTemplates as any).mockResolvedValue(SAMPLE);
     renderPage();
-    const select = (await screen.findByLabelText(/template/i)) as HTMLSelectElement;
-    await waitFor(() => expect(select.options.length).toBe(3));
-    fireEvent.change(select, { target: { value: "qa" } });
+    const user = await openTemplateMenu();
+    await user.click(await screen.findByRole("menuitemradio", { name: /QA/i }));
     fireEvent.change(screen.getByLabelText(/^name/i), { target: { value: "qvault" } });
     fireEvent.click(screen.getByRole("button", { name: /create vault/i }));
     await waitFor(() =>
@@ -100,8 +110,10 @@ describe("VaultNewPage template selection", () => {
   it("falls back to 'None' only when listVaultTemplates rejects", async () => {
     (api.listVaultTemplates as any).mockRejectedValue(new Error("boom"));
     renderPage();
-    const select = (await screen.findByLabelText(/template/i)) as HTMLSelectElement;
-    await waitFor(() => expect(select.options.length).toBe(1));
-    expect(select.options[0].text).toMatch(/none/i);
+    await openTemplateMenu();
+    await waitFor(() => expect(api.listVaultTemplates).toHaveBeenCalled());
+    const items = screen.getAllByRole("menuitemradio");
+    expect(items).toHaveLength(1);
+    expect(items[0].textContent).toMatch(/none/i);
   });
 });

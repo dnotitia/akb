@@ -15,6 +15,7 @@ import {
 import { listPublications, deletePublication, getDocument, type Publication } from "@/lib/api";
 import { parseDocUri, parseFileUri } from "@/lib/uri";
 import { timeAgo } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
@@ -47,6 +48,9 @@ export default function PublicationsPage() {
   }, [name]);
 
   async function load(vault: string) {
+    // Clear any prior error up-front so a successful Retry / post-unpublish
+    // reload isn't permanently masked by the exclusive error render branch.
+    setError("");
     try {
       const d = await listPublications(vault);
       const pubs: Publication[] = d.publications || [];
@@ -72,8 +76,9 @@ export default function PublicationsPage() {
       );
       setItems(enriched);
     } catch (e: any) {
+      // Keep items null on error so the error branch renders a Retry instead
+      // of the cheerful "No publications yet" empty state masking a fetch fail.
       setError(e?.message || "Failed to load publications");
-      setItems([]);
     }
   }
 
@@ -88,10 +93,16 @@ export default function PublicationsPage() {
     }
   }
 
-  function copyLink(pub: Publication) {
-    navigator.clipboard.writeText(pub.share_url);
-    setCopiedId(pub.slug);
-    setTimeout(() => setCopiedId(null), 1500);
+  async function copyLink(pub: Publication) {
+    // clipboard is undefined on insecure (plain-HTTP) origins — guard with `?.`
+    // so the click never throws an uncaught TypeError before the success state.
+    try {
+      await navigator.clipboard?.writeText(pub.share_url);
+      setCopiedId(pub.slug);
+      setTimeout(() => setCopiedId(null), 1500);
+    } catch {
+      /* clipboard blocked — the link is still reachable via Open */
+    }
   }
 
   // Link back into the app for the underlying resource. The canonical
@@ -114,11 +125,11 @@ export default function PublicationsPage() {
   return (
     <div className="fade-up max-w-[1280px] mx-auto">
       <div className="coord mb-3">
-        VAULT · {name?.toUpperCase()} · PUBLICATIONS
+        Vault · <span className="font-mono">{name}</span> · Publications
       </div>
 
-      <h1 className="font-display text-[44px] leading-[1.0] tracking-tight text-foreground mb-3">
-        published<span className="text-accent">.</span>
+      <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-3">
+        Published
       </h1>
 
       <p className="text-[16px] leading-[1.55] text-foreground-muted mb-8 max-w-2xl">
@@ -128,18 +139,24 @@ export default function PublicationsPage() {
 
       <section aria-labelledby="pubs-heading">
         <div className="flex items-baseline gap-3 pb-3 border-b border-border mb-3">
-          <span id="pubs-heading" className="coord-ink">§ PUBLICATIONS</span>
+          <span id="pubs-heading" className="coord-ink">Publications</span>
           <span className="coord tabular-nums">
             [{items === null ? "…" : items.length}]
           </span>
         </div>
 
-        {error && (
-          <div className="coord-spark mb-4">⚠ {error.toUpperCase()}</div>
-        )}
-
-        {items === null ? (
-          <div className="coord py-6">LOADING…</div>
+        {error ? (
+          <EmptyState
+            title="Couldn't load publications"
+            description={error}
+            action={
+              <Button variant="outline" size="sm" onClick={() => name && load(name)}>
+                Retry
+              </Button>
+            }
+          />
+        ) : items === null ? (
+          <div className="coord py-6" role="status" aria-live="polite">Loading…</div>
         ) : items.length === 0 ? (
           <EmptyState
             title="No publications yet"
@@ -163,7 +180,7 @@ export default function PublicationsPage() {
                       <Link
                         to={resourceHref(p)}
                         title={p.title || p.slug}
-                        className="text-sm font-medium tracking-tight truncate text-foreground hover:text-accent"
+                        className="text-sm font-medium tracking-tight truncate text-foreground hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         {p.title || p.slug}
                       </Link>
@@ -172,7 +189,7 @@ export default function PublicationsPage() {
                       </span>
                       {p.password_protected && (
                         <Lock
-                          className="h-3 w-3 text-warning shrink-0"
+                          className="h-3 w-3 text-foreground-muted shrink-0"
                           aria-label="Password protected"
                         />
                       )}
@@ -183,49 +200,52 @@ export default function PublicationsPage() {
                   </div>
                   <div className="flex items-baseline gap-4 shrink-0">
                     <span className="coord tabular-nums hidden md:inline">
-                      VIEWS {p.view_count ?? 0}
+                      Views {p.view_count ?? 0}
                       {p.max_views ? ` / ${p.max_views}` : ""}
                     </span>
                     <span className="coord tabular-nums hidden sm:inline">
                       {p.expires_at
-                        ? `EXPIRES ${timeAgo(p.expires_at).replace("ago", "").trim().toUpperCase()}`
-                        : "EVERGREEN"}
+                        ? `Expires ${timeAgo(p.expires_at).replace("ago", "").trim()}`
+                        : "Evergreen"}
                     </span>
                     <span className="coord tabular-nums">
-                      {timeAgo(p.created_at).toUpperCase()}
+                      {timeAgo(p.created_at)}
                     </span>
-                    <button
-                      onClick={() => copyLink(p)}
-                      aria-label="Copy public link"
-                      className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                    >
-                      {copiedId === p.slug ? (
-                        <>
-                          <CheckCircle2 className="h-3 w-3 text-accent" aria-hidden />
-                          Copied
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" aria-hidden />
-                          Copy
-                        </>
-                      )}
-                    </button>
-                    <a
-                      href={p.share_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      aria-label="Open public page"
-                      className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                    >
-                      <ExternalLink className="h-3 w-3" aria-hidden />
-                      Open
-                    </a>
+                    {/* Benign Copy/Open pair, then a separated destructive Unpub. */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => copyLink(p)}
+                        aria-label={copiedId === p.slug ? "Public link copied" : "Copy public link"}
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                      >
+                        {copiedId === p.slug ? (
+                          <>
+                            <CheckCircle2 className="h-3 w-3 text-success" aria-hidden />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3" aria-hidden />
+                            Copy
+                          </>
+                        )}
+                      </button>
+                      <a
+                        href={p.share_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label="Open public page"
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                      >
+                        <ExternalLink className="h-3 w-3" aria-hidden />
+                        Open
+                      </a>
+                    </div>
                     <button
                       onClick={() => setPendingRevoke(p)}
                       disabled={revokingId === p.slug}
                       aria-label="Unpublish"
-                      className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-destructive transition-colors cursor-pointer disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                      className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
                       {revokingId === p.slug ? (
                         <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
@@ -245,7 +265,7 @@ export default function PublicationsPage() {
       {items !== null && items.length > 0 && (
         <p className="coord mt-6 flex items-center gap-2">
           <Globe className="h-3 w-3" aria-hidden />
-          PUBLIC · READ-ONLY · NO AUTH REQUIRED
+          Public · Read-only · No auth required
         </p>
       )}
 

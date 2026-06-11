@@ -61,11 +61,12 @@ describe("settings — profile edit", () => {
     expect(screen.getByDisplayValue("alice@example.com")).toBeTruthy();
   });
 
-  it("'Save profile' is blocked when nothing changed", async () => {
+  it("'Save profile' is disabled when nothing changed", async () => {
     renderSettings();
     await screen.findByDisplayValue("Alice Original");
-    fireEvent.click(screen.getByRole("button", { name: /save profile/i }));
-    await screen.findByText(/no changes to save/i);
+    // Save is dirty-gated: with no edits it's disabled (not a no-op click that
+    // surfaces a "nothing to save" notice), so it never submits.
+    expect(screen.getByRole("button", { name: /save profile/i })).toBeDisabled();
     expect(api.updateProfile as any).not.toHaveBeenCalled();
   });
 

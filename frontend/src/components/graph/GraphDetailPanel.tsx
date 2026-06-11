@@ -1,5 +1,5 @@
 // frontend/src/components/graph/GraphDetailPanel.tsx
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Crosshair, ExternalLink, Pin, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
@@ -57,6 +57,12 @@ export function GraphDetailPanel({
 }: Props) {
   const [metaOpen, setMetaOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
+  // Move focus into the panel when a new node is selected so AT users land on
+  // the freshly-revealed detail (the panel appears with no other notification).
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    titleRef.current?.focus();
+  }, [docId]);
 
   const docQuery = useQuery<DocResponse>({
     queryKey: ["document", vault, docId],
@@ -91,7 +97,11 @@ export function GraphDetailPanel({
   }
 
   return (
-    <aside className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface">
+    <aside
+      className="flex flex-col h-full overflow-y-auto border-l border-border bg-surface"
+      role="region"
+      aria-label={`Details for ${kind} ${docId}`}
+    >
       <header className="flex items-center justify-between px-3 py-2 border-b border-border">
         <span className="coord">{kind} · {docId}</span>
         <button onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground">
@@ -125,17 +135,35 @@ export function GraphDetailPanel({
       ) : (
         <>
       <div className="px-3 py-3 border-b border-border">
-        <h2 className="font-semibold tracking-[-0.015em] text-2xl leading-tight mb-1">{doc?.title || "…"}</h2>
+        <h2
+          ref={titleRef}
+          tabIndex={-1}
+          className="font-semibold tracking-[-0.015em] text-2xl leading-tight mb-1 focus:outline-none"
+        >
+          {doc?.title || "…"}
+        </h2>
         <p className="coord text-foreground-muted truncate" title={uri}>{uri}</p>
         <div className="flex flex-wrap gap-1 mt-3">
           <Button size="sm" variant="accent" onClick={openDoc}>
             <ExternalLink className="h-3 w-3" /> Open
           </Button>
-          <Button size="sm" variant="outline" onClick={() => navigator.clipboard.writeText(uri)}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => navigator.clipboard?.writeText(uri).catch(() => {})}
+          >
             Copy URI
           </Button>
           {onTogglePin && (
-            <Button size="sm" variant={pinned ? "accent" : "outline"} onClick={onTogglePin} aria-pressed={!!pinned}>
+            // Pin is a toggle, not a CTA — when pinned it reads as a teal
+            // selected control, not a second filled-orange marquee.
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onTogglePin}
+              aria-pressed={!!pinned}
+              className={pinned ? "bg-surface-selected text-surface-selected-foreground border-primary" : undefined}
+            >
               <Pin className="h-3 w-3" /> {pinned ? "Pinned" : "Pin"}
             </Button>
           )}
@@ -143,13 +171,13 @@ export function GraphDetailPanel({
       </div>
 
       {doc?.summary && (
-        <Section label="SUMMARY" className="px-3">
+        <Section label="Summary" className="px-3">
           <p className="text-[12px] leading-relaxed text-foreground">{doc.summary}</p>
         </Section>
       )}
 
       {kind === "table" && doc?.columns && (
-        <Section label="COLUMNS" className="px-3">
+        <Section label="Columns" className="px-3">
           <ul className="flex flex-wrap gap-1">
             {doc.columns.map((c) => (
               <li key={c}>
@@ -161,7 +189,7 @@ export function GraphDetailPanel({
       )}
 
       {kind === "file" && (
-        <Section label="FILE" className="px-3">
+        <Section label="File" className="px-3">
           <p className="coord">
             {doc?.mime_type || "—"} · {doc?.size_bytes ? `${doc.size_bytes} bytes` : "—"}
           </p>
@@ -169,7 +197,7 @@ export function GraphDetailPanel({
       )}
 
       {doc?.tags && doc.tags.length > 0 && (
-        <Section label="TAGS" className="px-3">
+        <Section label="Tags" className="px-3">
           <div className="flex flex-wrap gap-1">
             {doc.tags.map((t) => (
               <Badge key={t} variant="outline">{t}</Badge>
@@ -178,7 +206,7 @@ export function GraphDetailPanel({
         </Section>
       )}
 
-      <Section label={`RELATIONS [${totalRels}]`} className="px-3">
+      <Section label={`Relations [${totalRels}]`} className="px-3">
         {totalRels === 0 ? (
           <p className="coord text-foreground-muted">none</p>
         ) : (
@@ -208,7 +236,7 @@ export function GraphDetailPanel({
       </Section>
 
       {kind === "document" && (
-        <Section label="PREVIEW" className="px-3">
+        <Section label="Preview" className="px-3">
           <button
             type="button"
             onClick={() => setSectionsOpen((v) => !v)}
@@ -232,7 +260,7 @@ export function GraphDetailPanel({
       )}
 
       <Section
-        label="META"
+        label="Meta"
         className="px-3"
         rightAction={
           <button
@@ -250,16 +278,16 @@ export function GraphDetailPanel({
         {metaOpen && (
           <div className="flex flex-col gap-1 text-[11px]">
             <p>
-              <span className="coord">author</span> · {doc?.author || "—"}
+              <span className="coord">Author</span> · {doc?.author || "—"}
             </p>
             <p>
-              <span className="coord">created</span> · {doc?.created_at || "—"}
+              <span className="coord">Created</span> · {doc?.created_at || "—"}
             </p>
             <p>
-              <span className="coord">updated</span> · {doc?.updated_at || "—"}
+              <span className="coord">Updated</span> · {doc?.updated_at || "—"}
             </p>
             <p className="break-all">
-              <span className="coord">provenance</span> · {JSON.stringify(provQuery.data?.provenance || "—")}
+              <span className="coord">Provenance</span> · {JSON.stringify(provQuery.data?.provenance || "—")}
             </p>
           </div>
         )}
@@ -268,6 +296,12 @@ export function GraphDetailPanel({
       )}
     </aside>
   );
+}
+
+/** Humanize a snake_case relation kind for display: "depends_on" → "Depends on". */
+function humanizeRelation(relation: string): string {
+  const words = relation.replace(/_/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 interface GroupedRel {
@@ -316,7 +350,7 @@ function RelGroup({
   return (
     <div>
       <p className="coord mb-1">
-        {direction === "out" ? "→" : "←"} {relation} ({rows.length})
+        {direction === "out" ? "→" : "←"} {humanizeRelation(relation)} ({rows.length})
       </p>
       <ul className="flex flex-col gap-px pl-2">
         {rows.map((r) => (
@@ -336,8 +370,8 @@ function RelGroup({
                 });
                 onFitToNode(r.other_uri);
               }}
-              title={`${r.other_name} — 그래프에서 선택`}
-              className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              title={`${r.other_name} — select in graph`}
+              className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-link cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <span className="truncate">{r.other_name}</span>
               <Crosshair

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { Alert } from "@/components/ui/alert";
 import { createCollection } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -142,7 +142,7 @@ export function CreateCollectionDialog({
           <DialogTitle>New collection</DialogTitle>
           <DialogDescription>
             Create a new collection in{" "}
-            <span className="font-mono font-semibold text-foreground">{vault}</span>.
+            <span className="font-semibold text-foreground">{vault}</span>.
             Paths may be nested (e.g. <span className="font-mono">specs/api</span>).
           </DialogDescription>
         </DialogHeader>
@@ -179,16 +179,8 @@ export function CreateCollectionDialog({
             />
           </div>
 
-          {error && (
-            <div role="alert" className="border border-destructive p-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
-          {info && (
-            <div className="border border-border p-2 text-xs text-foreground-muted">
-              {info}
-            </div>
-          )}
+          {error && <Alert variant="destructive">{error}</Alert>}
+          {info && <Alert variant="info">{info}</Alert>}
         </div>
 
         <DialogFooter>
@@ -200,15 +192,8 @@ export function CreateCollectionDialog({
           >
             Cancel
           </Button>
-          <Button type="button" onClick={handleSubmit} disabled={working}>
-            {working ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                Creating…
-              </>
-            ) : (
-              "Create"
-            )}
+          <Button type="button" onClick={handleSubmit} loading={working}>
+            {working ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>
       </DialogContent>

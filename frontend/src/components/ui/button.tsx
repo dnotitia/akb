@@ -9,7 +9,9 @@ const buttonVariants = cva(
     "inline-flex items-center justify-center gap-2 whitespace-nowrap font-medium tracking-tight",
     "rounded-[var(--radius-md)] transition-token",
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-    "disabled:pointer-events-none disabled:opacity-50",
+    // Flat, legible disabled state (the :disabled specificity overrides each
+    // variant's fill) — a faded teal/orange slab read as broken, not inactive.
+    "disabled:pointer-events-none disabled:bg-surface-muted disabled:text-foreground-muted disabled:border-border disabled:shadow-none",
     "cursor-pointer",
   ].join(" "),
   {

@@ -30,6 +30,14 @@ function isVaultShellRoute(pathname: string): boolean {
 
 type SearchMode = "dense" | "literal";
 
+// Sanitize the URL `mode` param instead of a bare `as SearchMode` cast: an
+// unknown value (legacy/typo'd ?mode=foo) must fall back to dense, not slip
+// through as truthy-non-dense and silently route to literal/grep search with
+// neither toggle highlighted.
+function asMode(raw: string | null): SearchMode {
+  return raw === "literal" ? "literal" : "dense";
+}
+
 export function Layout() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -39,13 +47,13 @@ export function Layout() {
     onSearchPage ? searchParams.get("q") || "" : "",
   );
   const [searchMode, setSearchMode] = useState<SearchMode>(() =>
-    (onSearchPage && (searchParams.get("mode") as SearchMode)) || "dense",
+    onSearchPage ? asMode(searchParams.get("mode")) : "dense",
   );
 
   useEffect(() => {
     if (onSearchPage) {
       setSearchQuery(searchParams.get("q") || "");
-      setSearchMode((searchParams.get("mode") as SearchMode) || "dense");
+      setSearchMode(asMode(searchParams.get("mode")));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname, searchParams]);
@@ -54,7 +62,11 @@ export function Layout() {
   const { data: health } = useHealth(!!getToken());
 
   if (!getToken()) {
-    return <Navigate to="/auth" replace />;
+    // Preserve where the user was headed so /auth can return them there after
+    // signing in (deep-linked / shared URLs don't dump everyone on home).
+    const dest = location.pathname + location.search;
+    const to = dest && dest !== "/" ? `/auth?next=${encodeURIComponent(dest)}` : "/auth";
+    return <Navigate to={to} replace />;
   }
   const upsert = health?.vector_store?.backfill?.upsert;
   const indexingPending: number | null = upsert
@@ -70,21 +82,29 @@ export function Layout() {
 
   return (
     <div className={rootClass}>
+      {/* Skip link — first focusable element; jumps keyboard/SR users past the
+          header chrome to the page content on every route. */}
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-[100] focus:rounded-[var(--radius-md)] focus:border focus:border-border focus:bg-surface focus:px-3 focus:py-2 focus:text-sm focus:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Skip to content
+      </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        <div className="mx-auto flex max-w-[1600px] items-center gap-4 px-5 h-16">
+        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1600px] items-center gap-4 px-5 h-16">
           {/* Brand */}
           <Link
             to="/"
             aria-label="AKB home"
-            className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="justify-self-start shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
             <Logo size={30} subtitle />
           </Link>
 
-          {/* Global search */}
+          {/* Global search — centered in the header, fills the wide center column */}
           <form
-            className="flex-1 max-w-3xl hidden sm:flex h-10"
+            className="hidden sm:flex h-10 w-full justify-self-center"
             onSubmit={(e) => {
               e.preventDefault();
               if (!searchQuery.trim()) return;
@@ -110,8 +130,8 @@ export function Layout() {
                     aria-pressed={searchMode === mode}
                     className={`px-3 rounded-[var(--radius-sm)] text-xs font-medium transition-token cursor-pointer ${
                       searchMode === mode
-                        ? "bg-primary text-primary-foreground"
-                        : "text-foreground-muted hover:bg-surface-muted"
+                        ? "bg-surface-selected text-surface-selected-foreground"
+                        : "text-foreground-muted hover:bg-surface-hover"
                     }`}
                   >
                     {mode === "dense" ? "Semantic" : "Literal"}
@@ -137,7 +157,7 @@ export function Layout() {
           </form>
 
           {/* Nav + actions */}
-          <nav aria-label="Primary" className="flex items-center gap-1 ml-auto">
+          <nav aria-label="Primary" className="flex items-center gap-1 justify-self-end">
             <NavLink to="/" active={location.pathname === "/"} name="Home" />
             <NavLink
               to="/vault"
@@ -153,14 +173,14 @@ export function Layout() {
       </header>
 
       {/* Content */}
-      <main className={wide ? "flex-1 min-h-0 animate-in" : "flex-1 animate-in"}>
+      <main id="main" tabIndex={-1} className={wide ? "flex-1 min-h-0 animate-in focus:outline-none" : "flex-1 animate-in focus:outline-none"}>
         {wide ? (
-          <ErrorBoundary resetKeys={[location.pathname]}>
+          <ErrorBoundary resetKeys={[location.pathname, location.search]}>
             <Outlet />
           </ErrorBoundary>
         ) : (
           <div className="mx-auto max-w-[1400px] px-6 py-8">
-            <ErrorBoundary resetKeys={[location.pathname]}>
+            <ErrorBoundary resetKeys={[location.pathname, location.search]}>
               <Outlet />
             </ErrorBoundary>
           </div>
@@ -188,8 +208,8 @@ function NavLink({ to, active, name }: { to: string; active: boolean; name: stri
       aria-current={active ? "page" : undefined}
       className={`rounded-[var(--radius-md)] px-3 py-1.5 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
         active
-          ? "bg-surface-muted text-foreground"
-          : "text-foreground-muted hover:text-foreground hover:bg-surface-muted/60"
+          ? "bg-surface-selected text-surface-selected-foreground"
+          : "text-foreground-muted hover:text-foreground hover:bg-surface-hover"
       }`}
     >
       {name}

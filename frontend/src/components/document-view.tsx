@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getDocument, getVaultSkillPreview } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
 import { SkillBanner } from "@/components/skill/skill-banner";
+import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 
 type ViewMode = "rendered" | "raw" | "agent";
@@ -85,7 +86,7 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
 
   if (isLoading) {
     return (
-      <div className="py-8 coord">
+      <div className="py-8 coord" role="status" aria-live="polite">
         <Loader2 className="h-4 w-4 inline animate-spin mr-2" aria-hidden />
         Loading…
       </div>
@@ -93,7 +94,12 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
   }
 
   if (error || !doc) {
-    return null;
+    return (
+      <Alert variant="destructive" className="my-4">
+        Couldn't load this document body.
+        {error instanceof Error ? ` ${error.message}` : ""}
+      </Alert>
+    );
   }
 
   // If the parent passes "agent" but this isn't a skill doc, fall back to "rendered"
@@ -143,14 +149,14 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
           <button
             type="button"
             onClick={copyRaw}
-            aria-label="Copy markdown"
-            className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono uppercase tracking-wider text-foreground-muted hover:text-accent border border-border bg-surface transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label={copiedRaw ? "Markdown copied" : "Copy markdown"}
+            className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-foreground-muted hover:text-link border border-border bg-surface rounded-[var(--radius-sm)] transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            {copiedRaw ? "COPIED" : "COPY"}
+            {copiedRaw ? "Copied" : "Copy"}
           </button>
           <pre
             data-testid="doc-raw"
-            className="font-mono text-[13px] leading-[1.55] whitespace-pre-wrap overflow-x-auto bg-surface-muted p-4 border border-border"
+            className="font-mono text-[13px] leading-[1.55] whitespace-pre-wrap overflow-x-auto bg-surface-muted p-4 border border-border rounded-[var(--radius-lg)]"
           >
             {doc.content || ""}
           </pre>
@@ -170,11 +176,11 @@ interface TabStripProps {
 
 function TabStrip({ view, isSkill, onSelect, extraTab }: TabStripProps) {
   const tabs: Array<{ key: ViewMode | "extra"; label: string; selected: boolean; onActivate: () => void }> = [
-    { key: "rendered", label: "RENDERED", selected: view === "rendered", onActivate: () => onSelect("rendered") },
-    { key: "raw", label: "RAW", selected: view === "raw", onActivate: () => onSelect("raw") },
+    { key: "rendered", label: "Rendered", selected: view === "rendered", onActivate: () => onSelect("rendered") },
+    { key: "raw", label: "Raw", selected: view === "raw", onActivate: () => onSelect("raw") },
   ];
   if (isSkill) {
-    tabs.push({ key: "agent", label: "AGENT", selected: view === "agent", onActivate: () => onSelect("agent") });
+    tabs.push({ key: "agent", label: "Agent", selected: view === "agent", onActivate: () => onSelect("agent") });
   }
   if (extraTab) {
     tabs.push({ key: "extra", label: extraTab.label, selected: false, onActivate: extraTab.onClick });
@@ -236,9 +242,14 @@ function AgentPreview({ vault }: { vault: string }) {
     retry: false,
   });
   if (helpQuery.isLoading) return <div className="p-4"><Skeleton className="h-64 w-full" /></div>;
-  if (helpQuery.isError) return <p className="coord text-destructive p-4">Failed to load agent preview.</p>;
+  if (helpQuery.isError)
+    return (
+      <Alert variant="destructive" className="m-4">
+        Failed to load agent preview.
+      </Alert>
+    );
   return (
-    <pre className="font-mono text-[11px] leading-snug whitespace-pre-wrap bg-background border border-border p-4">
+    <pre className="font-mono text-[11px] leading-snug whitespace-pre-wrap bg-background border border-border rounded-[var(--radius-lg)] p-4">
       {helpQuery.data}
     </pre>
   );

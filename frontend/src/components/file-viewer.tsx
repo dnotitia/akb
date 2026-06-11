@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { JsonTree } from "@/components/json-tree";
+import { Alert } from "@/components/ui/alert";
 import {
   publicationDownloadUrl,
   publicationRawUrl,
   type PublicationResponse,
 } from "@/lib/api";
+
+// Cap inline text/JSON previews so a multi-MB file can't freeze the tab; the
+// full file is always available via the download link.
+const PREVIEW_TEXT_CAP = 512 * 1024;
 
 interface Props {
   slug: string;
@@ -26,11 +31,11 @@ export function FileViewer({ slug, data }: Props) {
       {/* Left rail */}
       <aside className="lg:sticky lg:top-8 lg:self-start space-y-5">
         <div>
-          <div className="coord mb-1">TYPE</div>
+          <div className="coord mb-1">Type</div>
           <div className="text-sm font-medium">file</div>
         </div>
         <div>
-          <div className="coord mb-1">FORMAT</div>
+          <div className="coord mb-1">Format</div>
           <div className="text-sm font-medium font-mono break-all">
             {kind.toUpperCase()}
           </div>
@@ -38,15 +43,15 @@ export function FileViewer({ slug, data }: Props) {
         </div>
         {data.size_bytes !== undefined && (
           <div>
-            <div className="coord mb-1">SIZE</div>
-            <div className="font-display-tight text-2xl text-foreground">
+            <div className="coord mb-1">Size</div>
+            <div className="font-display text-2xl font-semibold tracking-tight text-foreground">
               {formatSize(data.size_bytes)}
             </div>
           </div>
         )}
         {data.collection && (
           <div>
-            <div className="coord mb-1">COLLECTION</div>
+            <div className="coord mb-1">Collection</div>
             <div className="text-sm font-medium font-mono break-all">{data.collection}</div>
           </div>
         )}
@@ -54,17 +59,17 @@ export function FileViewer({ slug, data }: Props) {
           <a
             href={downloadUrl}
             download={data.name}
-            className="block coord-spark hover:underline"
+            className="inline-block coord-spark underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↓ DOWNLOAD ORIGINAL
+            ↓ Download original
           </a>
         </div>
       </aside>
 
       {/* Main column */}
       <div className="min-w-0">
-        <div className="coord-spark mb-4">§ FILE · {kind.toUpperCase()}</div>
-        <h1 className="font-display-tight text-5xl lg:text-6xl text-foreground leading-[0.95] tracking-tight mb-2 break-words">
+        <div className="coord-spark mb-4">File · {kind.toUpperCase()}</div>
+        <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-2 break-words">
           {data.title || data.name}
         </h1>
         {data.title && data.name && data.title !== data.name && (
@@ -74,7 +79,7 @@ export function FileViewer({ slug, data }: Props) {
         <div className="rounded-[var(--radius-lg)] border border-border overflow-hidden shadow-sm mt-8">
           <div className="border-b border-border bg-surface-2 text-foreground px-3 py-1.5 flex items-center justify-between">
             <span className="coord-ink">
-              ⊞ PREVIEW
+              ⊞ Preview
             </span>
             <span className="coord-ink">
               {kind.toUpperCase()}
@@ -103,17 +108,13 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
   if (!directUrl) {
     return (
       <div className="p-8 text-center">
-        <div className="coord">— NO CONTENT AVAILABLE —</div>
+        <div className="coord">— No content available —</div>
       </div>
     );
   }
 
   if (mime.startsWith("image/")) {
-    return (
-      <div className="flex justify-center bg-surface-2 p-6">
-        <img src={directUrl} alt={name} className="max-w-full max-h-[80vh]" />
-      </div>
-    );
+    return <ImageFileBody directUrl={directUrl} name={name} />;
   }
 
   if (mime === "application/pdf") {
@@ -121,9 +122,8 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
       <embed
         src={directUrl}
         type="application/pdf"
-        width="100%"
-        height="800"
-        className="w-full"
+        aria-label={name || "PDF preview"}
+        className="w-full h-[80vh]"
       />
     );
   }
@@ -142,11 +142,37 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
 
   return (
     <div className="p-12 text-center">
-      <div className="coord mb-2">— PREVIEW UNAVAILABLE —</div>
+      <div className="coord mb-2">— Preview unavailable —</div>
       <p className="text-sm text-foreground-muted">
         No inline view for <code className="font-mono">{mime || "this format"}</code>.
         Use the download link in the side rail.
       </p>
+    </div>
+  );
+}
+
+function ImageFileBody({ directUrl, name }: { directUrl: string; name: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <div className="p-12 text-center">
+        <div className="coord mb-2">— Preview failed —</div>
+        <p className="text-sm text-foreground-muted">
+          The image couldn't be loaded (the link may have expired). Use the download link in the side rail.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="flex justify-center bg-surface-2 p-6 min-h-[12rem]">
+      <img
+        src={directUrl}
+        alt={name || "File preview image"}
+        loading="lazy"
+        decoding="async"
+        onError={() => setFailed(true)}
+        className="max-w-full max-h-[80vh] object-contain"
+      />
     </div>
   );
 }
@@ -239,9 +265,16 @@ function HtmlFileBody({ rawUrl, name }: { rawUrl: string; name: string }) {
     <iframe
       ref={iframeRef}
       src={rawUrl}
-      sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
+      // Untrusted user-uploaded HTML. No allow-scripts (content stays inert) and
+      // no allow-top-navigation / allow-popups-to-escape-sandbox (those let the
+      // page hijack the top frame). allow-same-origin is kept only so the parent
+      // can read contentDocument for the fit-to-width scaling below.
+      // NOTE (follow-up): allow-same-origin on same-origin user content is still
+      // a soft risk — the durable fix is serving /raw from a separate sandboxed
+      // origin or with CSP sandbox, backend-side.
+      sandbox="allow-same-origin"
       className="w-full h-[80vh]"
-      title={name}
+      title={name || "HTML file preview"}
       onLoad={onLoad}
     />
   );
@@ -251,13 +284,15 @@ function JsonFileBody({ url }: { url: string }) {
   const [json, setJson] = useState<any>(null);
   const [error, setError] = useState("");
   useEffect(() => {
+    let cancelled = false;
     fetch(url)
       .then((r) => r.json())
-      .then(setJson)
-      .catch((e) => setError(String(e)));
+      .then((d) => !cancelled && setJson(d))
+      .catch((e) => !cancelled && setError(String(e)));
+    return () => { cancelled = true; };
   }, [url]);
-  if (error) return <div className="p-4 coord-spark" style={{ color: "var(--color-destructive)" }}>⚠ {error}</div>;
-  if (json === null) return <div className="p-4 coord">— LOADING —</div>;
+  if (error) return <Alert variant="destructive" className="m-4">{error}</Alert>;
+  if (json === null) return <div className="p-4 coord" role="status" aria-live="polite">Loading…</div>;
   return (
     <div className="font-mono text-sm overflow-auto p-4 max-h-[80vh]">
       <JsonTree data={json} />
@@ -267,19 +302,35 @@ function JsonFileBody({ url }: { url: string }) {
 
 function TextFileBody({ url }: { url: string }) {
   const [text, setText] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
+    let cancelled = false;
     fetch(url)
       .then((r) => r.text())
-      .then(setText)
-      .catch((e) => setError(String(e)));
+      .then((t) => {
+        if (cancelled) return;
+        if (t.length > PREVIEW_TEXT_CAP) {
+          setText(t.slice(0, PREVIEW_TEXT_CAP));
+          setTruncated(true);
+        } else {
+          setText(t);
+        }
+      })
+      .catch((e) => !cancelled && setError(String(e)));
+    return () => { cancelled = true; };
   }, [url]);
-  if (error) return <div className="p-4 coord-spark" style={{ color: "var(--color-destructive)" }}>⚠ {error}</div>;
-  if (text === null) return <div className="p-4 coord">— LOADING —</div>;
+  if (error) return <Alert variant="destructive" className="m-4">{error}</Alert>;
+  if (text === null) return <div className="p-4 coord" role="status" aria-live="polite">Loading…</div>;
   return (
-    <pre className="text-sm whitespace-pre-wrap font-mono p-4 overflow-auto max-h-[80vh] bg-surface">
-      {text}
-    </pre>
+    <>
+      {truncated && (
+        <div className="coord px-4 pt-3">Preview truncated — download the file for the full content.</div>
+      )}
+      <pre className="text-sm whitespace-pre-wrap font-mono p-4 overflow-auto max-h-[80vh] bg-surface">
+        {text}
+      </pre>
+    </>
   );
 }
 

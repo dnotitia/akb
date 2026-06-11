@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { getSkillTemplate, putDocument } from "@/lib/api";
 
@@ -53,13 +54,13 @@ export function SkillCreateButton({ vault, variant = "accent" }: Props) {
         size="sm"
         variant={variant}
         onClick={handleClick}
-        disabled={busy}
+        loading={busy}
       >
-        <Sparkles className="h-3 w-3" aria-hidden />
+        {!busy && <Sparkles className="h-3 w-3" aria-hidden />}
         {busy ? "Creating…" : "Create from template"}
       </Button>
       {error && (
-        <p role="alert" className="coord text-destructive">{error}</p>
+        <Alert variant="destructive" className="text-xs">{error}</Alert>
       )}
     </div>
   );

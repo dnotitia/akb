@@ -44,7 +44,7 @@ describe("Tokens setup guide smart default", () => {
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({ tokens: [] });
     render(wrap());
-    expect(await screen.findByText(/STEP 01/)).toBeVisible();
+    expect(await screen.findByText("Step 01")).toBeVisible();
     expect(screen.getByText(/Mint a token/i)).toBeVisible();
   });
 

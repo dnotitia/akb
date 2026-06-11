@@ -18,12 +18,14 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 
 import AuthPage from "../auth";
-import { authLogin, authRegister, setToken } from "@/lib/api";
+import { authLogin, authRegister, getToken, setToken } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
   authLogin: vi.fn(),
   authRegister: vi.fn(),
   setToken: vi.fn(),
+  // null → not signed in, so AuthPage's authed-guard doesn't redirect on mount.
+  getToken: vi.fn(() => null),
   // Optional Keycloak SSO probe — default disabled so the SSO button stays
   // hidden and AuthPage's mount effect resolves cleanly.
   getAuthConfig: vi.fn().mockResolvedValue({
@@ -91,18 +93,20 @@ describe("AuthPage · register flow", () => {
     await u.click(screen.getByText("Register"));
     await u.type(screen.getByLabelText("Username"), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
-    await u.type(screen.getByLabelText("Password"), "pw-1234");
+    // 8+ chars — register now enforces a client-side minimum (matching the
+    // backend change_password rule) so accounts can't get an unchangeable pw.
+    await u.type(screen.getByLabelText("Password"), "pw-12345");
     await u.click(screen.getByRole("button", { name: /create account/i }));
     await waitFor(() =>
       expect(mockedRegister).toHaveBeenCalledWith(
         "bob",
         "bob@x.test",
-        "pw-1234",
+        "pw-12345",
         undefined,
       ),
     );
     await waitFor(() =>
-      expect(mockedLogin).toHaveBeenCalledWith("bob", "pw-1234"),
+      expect(mockedLogin).toHaveBeenCalledWith("bob", "pw-12345"),
     );
     expect(mockedSetToken).toHaveBeenCalledWith("tok-new");
   });
@@ -135,5 +139,41 @@ describe("AuthPage · error surface", () => {
     // assignment doesn't surface here consistently).
     await u.click(screen.getByText("Register"));
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("AuthPage · guards & validation", () => {
+  it("redirects (no form) when already signed in", async () => {
+    vi.mocked(getToken).mockReturnValueOnce("existing-token");
+    renderAuth();
+    await waitFor(() =>
+      expect(navigate).toHaveBeenCalledWith("/", { replace: true }),
+    );
+  });
+
+  it("rejects a register password under 8 chars without calling the API", async () => {
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(screen.getByText("Register"));
+    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText("Email"), "bob@x.test");
+    await u.type(screen.getByLabelText("Password"), "short");
+    await u.click(screen.getByRole("button", { name: /create account/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/at least 8 characters/i);
+    expect(mockedRegister).not.toHaveBeenCalled();
+  });
+
+  it("treats a token-less 200 login as an error (no token, no navigate)", async () => {
+    mockedLogin.mockResolvedValue({});
+    const u = userEvent.setup();
+    renderAuth();
+    await u.type(screen.getByLabelText("Username"), "alice");
+    await u.type(screen.getByLabelText("Password"), "pw-1234");
+    await u.click(screen.getByRole("button", { name: /sign in/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/no token/i);
+    expect(mockedSetToken).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

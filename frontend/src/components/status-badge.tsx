@@ -6,9 +6,9 @@ import {
   GitBranch,
   Globe,
   Key,
-  Lock,
   Pencil,
   ShieldCheck,
+  Unlock,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
@@ -67,16 +67,20 @@ export function VaultStateBadge({
           external git
         </Badge>
       )}
-      {showPublic && (
-        <Badge variant="info">
-          {publicAccess === "reader" ? (
+      {showPublic &&
+        (publicAccess === "writer" ? (
+          // Most-open state: an OPEN padlock + amber warning — never a closed
+          // Lock, which read as "secured" (the inverse of the truth).
+          <Badge variant="warning">
+            <Unlock className="h-3 w-3" aria-hidden />
+            public:writer
+          </Badge>
+        ) : (
+          <Badge variant="info">
             <Globe className="h-3 w-3" aria-hidden />
-          ) : (
-            <Lock className="h-3 w-3" aria-hidden />
-          )}
-          public:{publicAccess}
-        </Badge>
-      )}
+            public:reader
+          </Badge>
+        ))}
     </div>
   );
 }
@@ -102,8 +106,7 @@ export function IndexingBadge({
 }) {
   const abandonedChip = abandoned > 0 ? (
     <Badge
-      variant="outline"
-      className="border-destructive/40 text-destructive"
+      variant="error"
       title={`${abandoned.toLocaleString()} chunk(s) failed indexing and are awaiting auto-reap`}
     >
       <AlertTriangle className="h-3 w-3" aria-hidden />
@@ -116,7 +119,7 @@ export function IndexingBadge({
       <>
         <Badge
           variant="outline"
-          className="opacity-40 animate-pulse"
+          className="opacity-50 animate-pulse"
           title="Checking indexing status…"
           aria-busy="true"
         >
@@ -136,6 +139,7 @@ export function IndexingBadge({
         variant="pending"
         className="fade-in"
         title={`${pending.toLocaleString()} items pending`}
+        aria-busy="true"
       >
         <CircleDashed className="h-3 w-3 animate-spin" aria-hidden />
         indexing {pending.toLocaleString()}

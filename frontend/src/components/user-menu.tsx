@@ -55,7 +55,7 @@ export function UserMenu() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Account menu — ${label}`}
-        className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
+        className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
       >
         <span
           className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-[var(--color-teal)] to-[var(--color-teal-2)] text-white font-mono text-[10px] font-semibold"
@@ -63,7 +63,7 @@ export function UserMenu() {
         >
           {initial}
         </span>
-        <span className="hidden sm:inline font-mono text-[11px] uppercase tracking-wider">
+        <span className="hidden sm:inline text-[13px] font-medium">
           {label}
         </span>
       </DropdownMenu.Trigger>
@@ -75,7 +75,7 @@ export function UserMenu() {
         >
           {/* Identity header */}
           <div className="px-3 py-2 border-b border-border mb-1">
-            <div className="coord">ACCOUNT</div>
+            <div className="coord">Account</div>
             <div title={label} className="text-sm font-medium text-foreground truncate mt-0.5">
               {label}
             </div>
@@ -85,7 +85,7 @@ export function UserMenu() {
               </div>
             )}
             {user?.is_admin && (
-              <div className="coord-spark mt-1">⊛ ADMIN</div>
+              <div className="coord-spark mt-1">Admin</div>
             )}
           </div>
 
@@ -104,8 +104,8 @@ export function UserMenu() {
                   aria-pressed={active}
                   className={`flex-1 inline-flex items-center justify-center gap-1 h-7 text-xs font-medium rounded-[var(--radius-md)] border transition-colors cursor-pointer ${
                     active
-                      ? "border-accent text-accent bg-accent/5"
-                      : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+                      ? "border-primary bg-surface-selected text-surface-selected-foreground"
+                      : "border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover"
                   }`}
                 >
                   <Icon className="h-3 w-3" aria-hidden />
@@ -119,7 +119,7 @@ export function UserMenu() {
 
           <DropdownMenu.Item
             onSelect={() => navigate("/settings")}
-            className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-muted"
+            className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
           >
             <SettingsIcon className="h-4 w-4 text-foreground-muted" aria-hidden />
             <span>Settings</span>

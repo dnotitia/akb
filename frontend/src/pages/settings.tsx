@@ -2,15 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
-  ArrowUpRight,
   ChevronRight,
   Copy,
   Eye,
   EyeOff,
   Key,
   Loader2,
+  Monitor,
+  Moon,
   Plus,
   RotateCw,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -28,14 +30,18 @@ import {
 } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
 import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
-import { formatDate } from "@/lib/utils";
+import { formatDate, timeAgo } from "@/lib/utils";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
+import { SelectMenu } from "@/components/ui/select-menu";
+import { Segmented } from "@/components/ui/segmented";
+import { RoleBadge } from "@/components/status-badge";
+import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { useTheme } from "@/hooks/use-theme";
+import { useTheme, type Theme } from "@/hooks/use-theme";
 import { useFlashStatus } from "@/hooks/use-flash-status";
 import {
   Tabs,
@@ -43,8 +49,12 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
-
-const MCP_URL = `${window.location.origin}/mcp/`;
+import {
+  mcpInstallSnippets,
+  MCP_AGENT_FILES,
+  MCP_AGENT_LABELS,
+  type McpAgent,
+} from "@/lib/mcp-snippets";
 
 interface User {
   user_id: string;
@@ -63,7 +73,7 @@ interface PAT {
 }
 
 type TabId = "profile" | "tokens" | "preferences" | "admin";
-type ClientTab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
+type ClientTab = McpAgent;
 type AdminSort = "recent" | "oldest" | "username" | "vaults";
 
 export default function SettingsPage() {
@@ -74,7 +84,17 @@ export default function SettingsPage() {
   const [showPat, setShowPat] = useState<boolean>(true);
   const [copied, setCopied] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [mintError, setMintError] = useState<string | null>(null);
+  // Reissue = revoke-then-mint. Routed through a ConfirmDialog (the old token
+  // dies immediately) with a per-row pending guard so a double-click can't
+  // fire two revoke/mint pairs, and an error channel for the dangerous
+  // half-failure where revoke lands but the replacement mint rejects.
+  const [pendingReissue, setPendingReissue] = useState<PAT | null>(null);
+  const [reissuingId, setReissuingId] = useState<string | null>(null);
+  const [reissueError, setReissueError] = useState<string | null>(null);
+  const [patsError, setPatsError] = useState(false);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
+  const [usersError, setUsersError] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [adminQuery, setAdminQuery] = useState("");
   const [adminSort, setAdminSort] = useState<AdminSort>("recent");
@@ -106,10 +126,13 @@ export default function SettingsPage() {
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileError, setProfileError] = useState("");
+  // Benign "nothing to save" message — kept off the red error channel so a
+  // no-op submit doesn't read as a failure.
+  const [profileNotice, setProfileNotice] = useState("");
   const [profileBusy, setProfileBusy] = useState(false);
   const profileFlash = useFlashStatus(3000);
   const passwordFlash = useFlashStatus(3000);
-  const { theme } = useTheme();
+  const { theme, setTheme } = useTheme();
 
   // Sync local edit state when user payload arrives.
   useEffect(() => {
@@ -118,6 +141,21 @@ export default function SettingsPage() {
       setProfileEmail(user.email ?? "");
     }
   }, [user]);
+
+  // Guard unsaved profile edits behind the browser's unload prompt (refresh /
+  // close / external nav). In-app SPA nav has the Save/notice as its net.
+  useEffect(() => {
+    if (!user) return;
+    const dirty =
+      (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
+    if (!dirty || profileBusy) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [user, profileDisplayName, profileEmail, profileBusy]);
 
   // Smart default: open setup guide when user has no PATs, closed otherwise.
   // Only applies when localStorage has no saved preference (setupOpen === null).
@@ -137,11 +175,12 @@ export default function SettingsPage() {
     e.preventDefault();
     if (!user) return;
     setProfileError("");
+    setProfileNotice("");
     const patch: { display_name?: string; email?: string } = {};
     if ((user.display_name ?? "") !== profileDisplayName) patch.display_name = profileDisplayName;
     if (user.email !== profileEmail) patch.email = profileEmail;
     if (!Object.keys(patch).length) {
-      setProfileError("No changes to save");
+      setProfileNotice("No changes to save");
       return;
     }
     setProfileBusy(true);
@@ -185,6 +224,19 @@ export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
 
+  // Name the tab/history entry (tab switching + SR route-change orientation).
+  // Keyed on the raw `?tab=` (the derived activeTab lives past an early return,
+  // so it can't drive a hook).
+  useEffect(() => {
+    const tab = searchParams.get("tab") || "profile";
+    const cap = tab.charAt(0).toUpperCase() + tab.slice(1);
+    const prev = document.title;
+    document.title = `Settings · ${cap} · AKB`;
+    return () => {
+      document.title = prev;
+    };
+  }, [searchParams]);
+
   // Walk back if there's history (user entered Settings from somewhere
   // meaningful — a vault, a doc, etc.), otherwise fall through to Home.
   // Browser history length hits 1 on a fresh tab / direct deep-link.
@@ -201,7 +253,6 @@ export default function SettingsPage() {
     getMe()
       .then((u) => {
         setUser(u);
-        if (u?.is_admin) loadUsers();
       })
       .catch(() => {
         location.href = "/auth";
@@ -210,14 +261,41 @@ export default function SettingsPage() {
   }, []);
 
   async function loadPATs() {
-    const d = await listPATs();
-    setPats(d.tokens || []);
+    setPatsError(false);
+    try {
+      const d = await listPATs();
+      setPats(d.tokens || []);
+    } catch {
+      // Leave pats null and flag — the Tokens tab shows a retry instead of a
+      // deceptive "no tokens yet" empty state masking a fetch failure.
+      setPatsError(true);
+    }
   }
 
   async function loadUsers() {
-    const d = await adminListUsers();
-    setUsers(d.users || []);
+    setUsersError(false);
+    try {
+      const d = await adminListUsers();
+      setUsers(d.users || []);
+    } catch {
+      // Leave users null and flag — the Admin tab shows a retry instead of a
+      // permanently-stuck "LOADING…".
+      setUsersError(true);
+    }
   }
+
+  // Lazy-load the admin roster only when the Admin tab is actually viewed — an
+  // admin landing on Profile/Tokens shouldn't pay the (potentially large)
+  // /admin/users round-trip. Re-runs if a prior load errored and the user
+  // returns to the tab.
+  useEffect(() => {
+    if (!user?.is_admin) return;
+    if (searchParams.get("tab") !== "admin") return;
+    // usersError intentionally omitted from deps: an auto-load that errors
+    // must NOT immediately re-fire (storm); recovery is the manual Retry.
+    if (users === null && !usersError) loadUsers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, searchParams, users]);
 
   async function confirmDeleteUser() {
     if (!pendingDeleteUser) return;
@@ -237,88 +315,72 @@ export default function SettingsPage() {
     await loadPATs();
   }
 
-  function copy(text: string, label: string) {
-    navigator.clipboard.writeText(text);
-    setCopied(label);
-    setTimeout(() => setCopied(null), 2000);
+  async function copy(text: string, label: string) {
+    // clipboard is undefined on insecure (plain-HTTP) origins — and AKB ships
+    // an `--insecure` snippet, so that deploy shape is real. Guard with `?.` so
+    // copying a show-once secret never throws an uncaught TypeError with no
+    // feedback; the value stays on screen to copy manually.
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopied(label);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      /* clipboard blocked — value remains visible for manual copy */
+    }
   }
 
   async function handleCreatePAT(e: React.FormEvent) {
     e.preventDefault();
     if (!newName.trim()) return;
+    setMintError(null);
     setCreating(true);
     try {
       const r = await createPAT(newName);
       setNewPat(r.token);
       setShowPat(true);
       setNewName("");
-      loadPATs();
+      await loadPATs();
+    } catch (err) {
+      // No app-wide toast — surface inline or the button settles with no token
+      // and no explanation on a secret the user is waiting for.
+      setMintError(
+        err instanceof Error ? err.message : "Couldn't mint a token. Please try again.",
+      );
     } finally {
       setCreating(false);
     }
   }
 
-  const stdioConfig = (pat: string) =>
-    JSON.stringify(
-      {
-        mcpServers: {
-          akb: {
-            command: "npx",
-            args: ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"],
-          },
-        },
-      },
-      null,
-      2,
-    );
+  // Reissue = revoke the live token, then mint a replacement. Confirmed first
+  // (the old token stops working the instant revoke lands). If the mint half
+  // rejects after revoke succeeded, the deployed token is already gone — we
+  // surface that explicitly instead of swallowing it.
+  async function handleReissue(p: PAT) {
+    setReissuingId(p.token_id);
+    setReissueError(null);
+    try {
+      await revokePAT(p.token_id);
+      const r = await createPAT(p.name);
+      setNewPat(r.token);
+      setShowPat(true);
+      await loadPATs();
+    } catch {
+      setReissueError(
+        `"${p.name}" was revoked but a replacement could not be minted — mint a new token now to restore access.`,
+      );
+      await loadPATs();
+    } finally {
+      setReissuingId(null);
+    }
+  }
 
-  // Pat used in snippets: prefer fresh mint, else first active, else placeholder
-  const snippetPat = newPat || pats?.[0]?.prefix + "…" || "<YOUR_PAT>";
-  const snippets = useMemo<Record<ClientTab, string>>(
-    () => ({
-      claude: `claude mcp add --scope user akb -- npx akb-mcp --url ${MCP_URL} --pat ${snippetPat} --insecure`,
-      cursor: JSON.stringify(
-        {
-          mcpServers: {
-            akb: {
-              command: "npx",
-              args: ["akb-mcp", "--url", MCP_URL, "--pat", snippetPat, "--insecure"],
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      codex: `codex mcp add akb -- npx akb-mcp --url ${MCP_URL} --pat ${snippetPat} --insecure`,
-      vscode: JSON.stringify(
-        {
-          servers: {
-            akb: {
-              type: "stdio",
-              command: "npx",
-              args: ["akb-mcp", "--url", MCP_URL, "--pat", snippetPat, "--insecure"],
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      openclaw: JSON.stringify(
-        {
-          mcp: {
-            servers: {
-              akb: {
-                command: "npx",
-                args: ["akb-mcp", "--url", MCP_URL, "--pat", snippetPat, "--insecure"],
-              },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-    }),
-    [snippetPat],
+  // Pat used in snippets: prefer fresh mint, else first active, else placeholder.
+  const snippetPat = newPat || (pats?.[0] ? pats[0].prefix + "…" : "<YOUR_PAT>");
+  const snippets = useMemo(() => mcpInstallSnippets(snippetPat), [snippetPat]);
+  // Fresh-token banner embeds the real, un-masked token in its config block.
+  const freshSnippet = useMemo(
+    () => (newPat ? mcpInstallSnippets(newPat).cursor : ""),
+    [newPat],
   );
 
   const filteredUsers = useMemo(() => {
@@ -370,28 +432,27 @@ export default function SettingsPage() {
     setSearchParams(next, { replace: true });
   };
 
+  const profileDirty =
+    (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
+
   return (
-    <div className="max-w-[1280px] mx-auto fade-up">
-      <div className="flex items-center justify-between mb-6">
+    <div className="max-w-4xl mx-auto fade-up">
+      {/* One upward affordance — a history-aware Back. The breadcrumb's
+          location (Settings › {tab}) was redundant with the H1 + the tab bar
+          right below, and its middle crumb self-linked to this page. */}
+      <div className="mb-6">
         <button
           type="button"
           onClick={goBack}
-          className="inline-flex items-center gap-1.5 coord hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
-          BACK
+          Back
         </button>
-        <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord">
-          <Link to="/" className="hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">HOME</Link>
-          <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-          <Link to="/settings" className="hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">SETTINGS</Link>
-          <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-          <span className="text-foreground">{activeTab.toUpperCase()}</span>
-        </nav>
       </div>
 
       <header className="mb-6">
-        <div className="coord-spark mb-2">§ SETTINGS</div>
+        <div className="coord-spark mb-2">Account · {user.username}</div>
         <h1 className="font-display text-3xl text-foreground">
           Settings
         </h1>
@@ -401,11 +462,13 @@ export default function SettingsPage() {
       </header>
 
       <Tabs value={activeTab} onValueChange={setTab}>
-        <TabsList>
+        {/* Scroll the pill track on narrow screens so the admin 4-tab row never
+            clips at 375px (the raised pills break if wrapped). */}
+        <TabsList className="max-w-full overflow-x-auto">
           <TabsTrigger value="profile">Profile</TabsTrigger>
           <TabsTrigger value="tokens" className="gap-1.5">
             Tokens
-            <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
+            <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
           </TabsTrigger>
           <TabsTrigger value="preferences">Preferences</TabsTrigger>
           {user.is_admin && (
@@ -419,24 +482,23 @@ export default function SettingsPage() {
         </TabsList>
 
         {/* Profile — read-only account info */}
-        <TabsContent value="profile" className="pt-6 max-w-4xl space-y-6">
+        <TabsContent value="profile" className="pt-6 space-y-6">
           {/* Account card */}
           <form
             onSubmit={handleSaveProfile}
             className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden"
           >
             <header className="border-b border-border px-6 py-3">
-              <span className="coord-ink">§ ACCOUNT</span>
+              <span className="coord-ink">Account</span>
             </header>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4 p-6">
-              <ReadOnlyField label="USERNAME" value={user.username} />
-              <ReadOnlyField
-                label="ROLE"
-                value={user.is_admin ? "ADMIN" : "USER"}
-                accent={user.is_admin}
-              />
+              <ReadOnlyField label="Username" value={user.username} />
               <div>
-                <Label htmlFor="profile-display-name">DISPLAY NAME</Label>
+                <div className="coord mb-1">Role</div>
+                <RoleBadge role={user.is_admin ? "admin" : "user"} />
+              </div>
+              <div>
+                <Label htmlFor="profile-display-name">Display name</Label>
                 <Input
                   id="profile-display-name"
                   value={profileDisplayName}
@@ -445,7 +507,7 @@ export default function SettingsPage() {
                 />
               </div>
               <div>
-                <Label htmlFor="profile-email">EMAIL</Label>
+                <Label htmlFor="profile-email">Email</Label>
                 <Input
                   id="profile-email"
                   type="email"
@@ -455,13 +517,18 @@ export default function SettingsPage() {
                 />
               </div>
             </div>
-            <div className="flex items-center gap-3 px-6 pb-6">
-              <Button type="submit" disabled={profileBusy}>
-                {profileBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save profile"}
+            <div className="flex items-center gap-3 px-6 pb-6 flex-wrap">
+              <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
+                Save profile
               </Button>
               {profileFlash.message && (
                 <span role="status" aria-live="polite" className="text-sm text-success">
                   {profileFlash.message}
+                </span>
+              )}
+              {profileNotice && (
+                <span role="status" aria-live="polite" className="text-sm text-foreground-muted">
+                  {profileNotice}
                 </span>
               )}
               {profileError && (
@@ -478,11 +545,11 @@ export default function SettingsPage() {
             aria-labelledby="change-pw-heading"
           >
             <header className="border-b border-border px-6 py-3">
-              <span id="change-pw-heading" className="coord-ink">§ CHANGE PASSWORD</span>
+              <span id="change-pw-heading" className="coord-ink">Change password</span>
             </header>
             <form onSubmit={handleChangePassword} className="space-y-3 p-6 max-w-md">
               <div>
-                <Label htmlFor="pw-current">CURRENT PASSWORD</Label>
+                <Label htmlFor="pw-current">Current password</Label>
                 <Input
                   id="pw-current"
                   type="password"
@@ -493,7 +560,7 @@ export default function SettingsPage() {
                 />
               </div>
               <div>
-                <Label htmlFor="pw-new">NEW PASSWORD</Label>
+                <Label htmlFor="pw-new">New password</Label>
                 <Input
                   id="pw-new"
                   type="password"
@@ -506,13 +573,13 @@ export default function SettingsPage() {
                   required
                 />
                 {pwTooShort && (
-                  <p id="pw-new-help" className="text-destructive text-xs font-mono mt-1">
+                  <p id="pw-new-help" className="text-destructive text-xs mt-1">
                     Use at least 8 characters.
                   </p>
                 )}
               </div>
               <div>
-                <Label htmlFor="pw-confirm">CONFIRM NEW PASSWORD</Label>
+                <Label htmlFor="pw-confirm">Confirm new password</Label>
                 <Input
                   id="pw-confirm"
                   type="password"
@@ -525,23 +592,22 @@ export default function SettingsPage() {
                   required
                 />
                 {pwMismatch && (
-                  <p id="pw-confirm-help" className="text-destructive text-xs font-mono mt-1">
+                  <p id="pw-confirm-help" className="text-destructive text-xs mt-1">
                     Doesn&apos;t match new password.
                   </p>
                 )}
               </div>
               {pwError && (
-                <p role="alert" className="text-destructive text-xs font-mono">
+                <p role="alert" className="text-destructive text-xs">
                   {pwError}
                 </p>
               )}
               {passwordFlash.message && (
-                <p role="status" aria-live="polite" className="text-success text-xs font-mono">
+                <p role="status" aria-live="polite" className="text-success text-xs">
                   {passwordFlash.message}
                 </p>
               )}
-              <Button type="submit" disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
-                {pwBusy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
+              <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
                 Change password
               </Button>
             </form>
@@ -549,31 +615,37 @@ export default function SettingsPage() {
         </TabsContent>
 
         {/* Tokens — PATs + fresh token banner when minted */}
-        <TabsContent value="tokens" className="pt-6 space-y-4 max-w-4xl">
+        <TabsContent value="tokens" className="pt-6 space-y-6">
           {newPat && (
-            <section className="rounded-[var(--radius-lg)] border border-destructive bg-destructive/5 shadow-sm overflow-hidden">
-              <div className="border-b border-destructive px-4 py-2 flex items-baseline justify-between">
+            <section
+              className="rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm overflow-hidden"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="border-b border-accent/40 px-4 py-2 flex items-baseline justify-between gap-2 flex-wrap">
                 <div>
-                  <span className="coord-spark text-destructive">⊛ FRESH TOKEN — COPY NOW</span>
+                  <span className="coord-spark">Fresh token — copy now</span>
                   <span className="coord ml-2">Shown once. If you dismiss without copying, you'll need to reissue.</span>
                 </div>
                 <button
                   onClick={() => setNewPat(null)}
                   aria-label="Dismiss fresh token"
-                  className="inline-flex items-center justify-center h-7 w-7 coord hover:text-destructive cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="inline-flex items-center justify-center min-h-[36px] min-w-[36px] coord hover:text-primary cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <X className="h-3 w-3" aria-hidden />
                 </button>
               </div>
               <div className="p-6 space-y-4">
-                <div className="flex items-center gap-3">
+                <div className="flex items-start gap-3">
                   <code className="flex-1 font-mono text-xs text-foreground break-all rounded-[var(--radius-md)] border border-border px-3 py-2 bg-surface">
                     {showPat ? newPat : newPat.slice(0, 12) + "•".repeat(20)}
                   </code>
+                  {/* Full token stays reachable to a screen reader even masked. */}
+                  {!showPat && <span className="sr-only">Token value: {newPat}</span>}
                   <button
                     onClick={() => setShowPat(!showPat)}
                     aria-label={showPat ? "Hide token" : "Show token"}
-                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    className="inline-flex items-center justify-center min-h-[36px] px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
                     {showPat ? (
                       <EyeOff className="h-3 w-3" aria-hidden />
@@ -583,32 +655,14 @@ export default function SettingsPage() {
                   </button>
                   <button
                     onClick={() => copy(newPat, "pat")}
-                    aria-label="Copy token"
-                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-accent cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    aria-label={copied === "pat" ? "Token copied" : "Copy token"}
+                    className="inline-flex items-center justify-center min-h-[36px] px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
-                    {copied === "pat" ? "✓ COPIED" : <Copy className="h-3 w-3" aria-hidden />}
+                    {copied === "pat" ? <span aria-hidden>Copied</span> : <Copy className="h-3 w-3" aria-hidden />}
                   </button>
                 </div>
 
-                <div className="rounded-[var(--radius-md)] border border-border overflow-hidden">
-                  <div className="border-b border-border bg-surface-2 text-foreground px-3 py-1.5 flex items-center justify-between">
-                    <span className="font-mono text-[10px] uppercase tracking-wider">
-                      CURSOR / WINDSURF — settings.json
-                    </span>
-                    <button
-                      onClick={() => copy(stdioConfig(newPat), "stdio")}
-                      aria-label="Copy config"
-                      className={`inline-flex items-center justify-center h-7 px-2 font-mono text-[10px] uppercase tracking-wider cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-                        copied === "stdio" ? "text-accent" : "hover:text-accent"
-                      }`}
-                    >
-                      {copied === "stdio" ? "✓ COPIED" : "COPY"}
-                    </button>
-                  </div>
-                  <pre className="text-[11px] font-mono p-3 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-all">
-                    {stdioConfig(newPat)}
-                  </pre>
-                </div>
+                <CodeSnippet code={freshSnippet} filename={MCP_AGENT_FILES.cursor} />
               </div>
             </section>
           )}
@@ -616,12 +670,54 @@ export default function SettingsPage() {
           {/* Active tokens — primary content on this tab (management). */}
           <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
-              <span className="coord-ink">§ ACTIVE TOKENS</span>
-              <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
+              <span className="coord-ink">Active tokens</span>
+              <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
             </header>
-            <div className="p-6">
-              {!pats || pats.length === 0 ? (
-                <EmptyState title="No tokens yet — mint one below." />
+            <div className="p-6 space-y-4">
+              {reissueError && <Alert variant="destructive">{reissueError}</Alert>}
+              {patsError ? (
+                <EmptyState
+                  title="Couldn't load tokens"
+                  description="Something went wrong fetching your tokens."
+                  action={
+                    <Button variant="outline" size="sm" onClick={() => loadPATs()}>
+                      Retry
+                    </Button>
+                  }
+                />
+              ) : !pats ? (
+                <>
+                  <span className="sr-only" role="status" aria-live="polite">
+                    Loading tokens
+                  </span>
+                  <div
+                    className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                    aria-hidden
+                  >
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <div key={i} className="px-4 py-3 space-y-2">
+                        <div className="flex items-center gap-3">
+                          <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-4 w-32 rounded bg-surface-muted animate-pulse" />
+                        </div>
+                        <div className="h-3 w-40 rounded bg-surface-muted animate-pulse ml-7" />
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : pats.length === 0 ? (
+                <EmptyState
+                  title="No tokens yet"
+                  description="Mint your first token to connect an agent."
+                  action={
+                    !setupOpen ? (
+                      <Button variant="outline" size="sm" onClick={() => setSetupOpen(true)}>
+                        Set up a token
+                      </Button>
+                    ) : undefined
+                  }
+                />
+
               ) : (
                 <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
                   {(pats ?? []).map((p, i) => (
@@ -641,34 +737,36 @@ export default function SettingsPage() {
                       {/* Line 2 — meta + actions */}
                       <div className="flex items-center justify-between gap-3 flex-wrap pl-7">
                         <div className="flex items-center gap-3 text-foreground-muted">
-                          <span className="coord tabular-nums">
-                            CREATED {formatDate(p.created_at).toUpperCase()}
-                          </span>
-                          {p.last_used_at && (
-                            <span className="coord tabular-nums">
-                              USED {formatDate(p.last_used_at).toUpperCase()}
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <button
-                            onClick={async () => {
-                              await revokePAT(p.token_id);
-                              const r = await createPAT(p.name);
-                              setNewPat(r.token);
-                              setShowPat(true);
-                              loadPATs();
-                            }}
-                            aria-label={`Reissue token ${p.name}`}
-                            className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                          <span
+                            className="coord tabular-nums"
+                            title={`Created ${formatDate(p.created_at)}`}
                           >
-                            <RotateCw className="h-3 w-3" aria-hidden />
-                            Reissue
+                            Created {timeAgo(p.created_at)}
+                          </span>
+                          <span
+                            className="coord tabular-nums"
+                            title={p.last_used_at ? `Last used ${formatDate(p.last_used_at)}` : undefined}
+                          >
+                            {p.last_used_at ? `Used ${timeAgo(p.last_used_at)}` : "Never used"}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1 ml-auto">
+                          <button
+                            onClick={() => setPendingReissue(p)}
+                            disabled={reissuingId === p.token_id}
+                            aria-label={`Reissue token ${p.name}`}
+                            className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                          >
+                            <RotateCw
+                              className={`h-3 w-3 ${reissuingId === p.token_id ? "animate-spin" : ""}`}
+                              aria-hidden
+                            />
+                            {reissuingId === p.token_id ? "Reissuing" : "Reissue"}
                           </button>
                           <button
                             onClick={() => setPendingRevokePat(p)}
                             aria-label={`Revoke token ${p.name}`}
-                            className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-destructive hover:text-destructive/80 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                            className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                           >
                             <Trash2 className="h-3 w-3" aria-hidden />
                             Revoke
@@ -689,9 +787,9 @@ export default function SettingsPage() {
               onClick={toggleSetup}
               aria-expanded={!!setupOpen}
               aria-controls="setup-guide-body"
-              className="w-full flex items-center justify-between px-6 py-3 border-b border-border hover:bg-surface-muted cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="w-full flex items-center justify-between px-6 py-3 border-b border-border hover:bg-surface-hover cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
-              <span className="coord-ink">§ SETUP GUIDE — 3 STEPS</span>
+              <span className="coord-ink">Setup guide — 3 steps</span>
               <ChevronRight
                 className={`h-4 w-4 transition-transform ${setupOpen ? "rotate-90" : ""}`}
                 aria-hidden
@@ -704,7 +802,7 @@ export default function SettingsPage() {
                 <div>
                   <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
                     <div className="flex items-baseline gap-3">
-                      <span className="coord-spark">STEP 01</span>
+                      <span className="coord-spark">Step 01</span>
                       <h2 className="text-base font-semibold tracking-tight text-foreground">
                         Mint a token
                       </h2>
@@ -714,7 +812,7 @@ export default function SettingsPage() {
                   <div className="space-y-3">
                     <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
                       A Personal Access Token authorizes your agent against the base.
-                      You can rotate or revoke it any time.
+                      You can reissue or revoke it any time.
                     </p>
                     <form onSubmit={handleCreatePAT} className="flex gap-2">
                       <Label htmlFor="new-pat-name" className="sr-only">
@@ -725,26 +823,22 @@ export default function SettingsPage() {
                         placeholder="Token name (e.g. claude-code-macbook)"
                         value={newName}
                         onChange={(e) => setNewName(e.target.value)}
+                        aria-invalid={mintError ? true : undefined}
                         className="flex-1"
                       />
                       <Button
                         type="submit"
                         variant="accent"
-                        disabled={creating || !newName.trim()}
+                        loading={creating}
+                        disabled={!newName.trim()}
                       >
-                        {creating ? (
-                          <>
-                            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                            Minting
-                          </>
-                        ) : (
-                          <>
-                            <Plus className="h-4 w-4" aria-hidden />
-                            Mint
-                          </>
-                        )}
+                        {!creating && <Plus className="h-4 w-4" aria-hidden />}
+                        {creating ? "Minting" : "Mint"}
                       </Button>
                     </form>
+                    {mintError && (
+                      <Alert variant="destructive">{mintError}</Alert>
+                    )}
                   </div>
                 </div>
 
@@ -754,7 +848,7 @@ export default function SettingsPage() {
                 <div>
                   <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
                     <div className="flex items-baseline gap-3">
-                      <span className="coord-spark">STEP 02</span>
+                      <span className="coord-spark">Step 02</span>
                       <h2 className="text-base font-semibold tracking-tight text-foreground">
                         Drop the snippet
                       </h2>
@@ -767,74 +861,40 @@ export default function SettingsPage() {
                       next launch.
                     </p>
 
-                    {/* Client tabs */}
-                    <div className="flex flex-wrap rounded-[var(--radius-md)] border border-border overflow-hidden">
-                      {(
-                        [
-                          ["claude", "Claude Code"],
-                          ["cursor", "Cursor / Windsurf / Gemini / Claude Desktop"],
-                          ["codex", "Codex CLI"],
-                          ["vscode", "VS Code"],
-                          ["openclaw", "OpenClaw"],
-                        ] as [ClientTab, string][]
-                      ).map(([id, label]) => (
-                        <button
-                          key={id}
-                          type="button"
-                          onClick={() => setClientTab(id)}
-                          className={`flex-1 min-w-[140px] text-left px-3 py-2 transition-colors ${
-                            clientTab === id
-                              ? "bg-surface-2 text-foreground"
-                              : "hover:bg-surface-muted cursor-pointer"
-                          }`}
-                        >
-                          <div className="text-xs font-medium tracking-tight">
-                            {label}
+                    {/* Client picker + snippet — Tabs gives roving tabindex,
+                        role=tab/aria-selected, arrow-key nav, and the teal
+                        raised-pill active state for free. CodeSnippet supplies
+                        the insecure-origin-guarded copy + teal hover. */}
+                    <Tabs value={clientTab} onValueChange={(v) => setClientTab(v as ClientTab)}>
+                      <TabsList className="flex-wrap">
+                        {(Object.keys(MCP_AGENT_LABELS) as ClientTab[]).map((id) => (
+                          <TabsTrigger key={id} value={id}>
+                            {MCP_AGENT_LABELS[id]}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                      <TabsContent value={clientTab} className="space-y-2">
+                        <CodeSnippet
+                          code={snippets[clientTab]}
+                          filename={MCP_AGENT_FILES[clientTab]}
+                        />
+                        {clientTab === "cursor" && (
+                          <div className="rounded-[var(--radius-md)] border border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
+                            <div><span className="coord mr-2">Cursor</span>~/.cursor/mcp.json</div>
+                            <div><span className="coord mr-2">Windsurf</span>~/.codeium/windsurf/mcp_config.json</div>
+                            <div><span className="coord mr-2">Gemini</span>~/.gemini/settings.json</div>
+                            <div>
+                              <span className="coord mr-2">Claude Desktop</span>
+                              ~/Library/Application Support/Claude/claude_desktop_config.json{" "}
+                              <span className="text-subtle">(macOS)</span>
+                            </div>
                           </div>
-                        </button>
-                      ))}
-                    </div>
-
-                    {/* Snippet */}
-                    <div className="rounded-[var(--radius-md)] border border-border overflow-hidden">
-                      <div className="flex items-center justify-between border-b border-border bg-surface-2 text-foreground px-3 py-1.5">
-                        <span className="font-mono text-[10px] uppercase tracking-wider truncate">
-                          {clientTab === "claude" && "TERMINAL"}
-                          {clientTab === "cursor" && "mcpServers schema — per-client path below"}
-                          {clientTab === "codex" && "TERMINAL"}
-                          {clientTab === "vscode" && ".vscode/mcp.json"}
-                          {clientTab === "openclaw" && "~/.openclaw/openclaw.json"}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => copy(snippets[clientTab], clientTab)}
-                          aria-label="Copy snippet"
-                          className={`inline-flex items-center justify-center h-7 px-2 font-mono text-[10px] uppercase tracking-wider cursor-pointer shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
-                            copied === clientTab ? "text-accent" : "hover:text-accent"
-                          }`}
-                        >
-                          {copied === clientTab ? "✓ COPIED" : "COPY"}
-                        </button>
-                      </div>
-                      <pre className="font-mono text-[11px] leading-relaxed p-4 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-all">
-                        {snippets[clientTab]}
-                      </pre>
-                      {clientTab === "cursor" && (
-                        <div className="border-t border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
-                          <div><span className="coord mr-2">CURSOR</span>~/.cursor/mcp.json</div>
-                          <div><span className="coord mr-2">WINDSURF</span>~/.codeium/windsurf/mcp_config.json</div>
-                          <div><span className="coord mr-2">GEMINI</span>~/.gemini/settings.json</div>
-                          <div>
-                            <span className="coord mr-2">CLAUDE DESKTOP</span>
-                            ~/Library/Application Support/Claude/claude_desktop_config.json{" "}
-                            <span className="text-foreground-muted/60">(macOS)</span>
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                        )}
+                      </TabsContent>
+                    </Tabs>
                     {snippetPat === "<YOUR_PAT>" && (
                       <p className="coord text-foreground-muted">
-                        ↑ Replace <span className="text-accent">&lt;YOUR_PAT&gt;</span> with the
+                        ↑ Replace <span className="text-accent-strong">&lt;YOUR_PAT&gt;</span> with the
                         token string shown after Step 01.
                       </p>
                     )}
@@ -847,16 +907,16 @@ export default function SettingsPage() {
                 <div>
                   <header className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
                     <div className="flex items-baseline gap-3">
-                      <span className="coord-spark">STEP 03</span>
+                      <span className="coord-spark">Step 03</span>
                       <h2 className="text-base font-semibold tracking-tight text-foreground">
                         Talk to your agent
                       </h2>
                     </div>
                     <Link
                       to="/search?q=AKB+usage+guide"
-                      className="coord hover:text-accent"
+                      className="coord hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
-                      ↗ FULL GUIDE
+                      Full guide
                     </Link>
                   </header>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
@@ -885,40 +945,29 @@ export default function SettingsPage() {
 
         </TabsContent>
 
-        {/* Preferences — status display only; real control lives in header UserMenu */}
-        <TabsContent value="preferences" className="pt-6 max-w-4xl space-y-6">
-          {/* Theme — status only. Real control lives in the header UserMenu. */}
+        {/* Preferences — theme control inline (synced with the header menu via
+            useTheme), not a read-only status pointing off-page. */}
+        <TabsContent value="preferences" className="pt-6 space-y-6">
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3">
-              <span className="coord-ink">§ THEME</span>
+              <span id="theme-label" className="coord-ink">Theme</span>
             </header>
-            <div className="p-6 flex items-start justify-between gap-4">
-              <div>
-                <div className="text-sm font-medium text-foreground">
-                  Current: <span className="font-mono uppercase">{theme}</span>
-                  {theme === "system" && (
-                    <span className="text-foreground-muted"> (follows OS)</span>
-                  )}
-                </div>
-                <p className="text-xs text-foreground-muted mt-1.5 leading-relaxed">
-                  Active mode follows your selection in the header menu.
-                </p>
-              </div>
-              <div className="inline-flex items-center gap-1 text-foreground-muted text-xs font-mono uppercase tracking-wider">
-                <ArrowUpRight className="h-3 w-3" aria-hidden />
-                Change in header menu
-              </div>
-            </div>
-          </div>
-
-          {/* Future placeholder card */}
-          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden opacity-60">
-            <header className="border-b border-border px-6 py-3">
-              <span className="coord-ink">§ MORE PREFERENCES</span>
-            </header>
-            <div className="p-6">
-              <p className="text-sm text-foreground-muted">
-                Language, density, notifications — coming soon.
+            <div className="p-6 max-w-sm">
+              <Segmented
+                aria-labelledby="theme-label"
+                value={theme}
+                onChange={(v) => setTheme(v as Theme)}
+                className="grid-cols-3"
+                options={[
+                  { value: "light", label: "Light", icon: <Sun className="h-3 w-3" aria-hidden /> },
+                  { value: "dark", label: "Dark", icon: <Moon className="h-3 w-3" aria-hidden /> },
+                  { value: "system", label: "System", icon: <Monitor className="h-3 w-3" aria-hidden /> },
+                ]}
+              />
+              <p className="text-xs text-foreground-muted mt-2 leading-relaxed">
+                {theme === "system"
+                  ? "Follows your operating system's appearance."
+                  : `Always ${theme}.`}
               </p>
             </div>
           </div>
@@ -930,7 +979,7 @@ export default function SettingsPage() {
 
         {/* Admin — user management. Only rendered when user.is_admin. */}
         {user.is_admin && (
-          <TabsContent value="admin" className="pt-6 max-w-5xl space-y-4">
+          <TabsContent value="admin" className="pt-6 space-y-6">
             {/* Search + sort bar */}
             <div className="flex flex-wrap items-center gap-3">
               <Input
@@ -941,29 +990,59 @@ export default function SettingsPage() {
                 aria-label="Search users"
               />
               <Label htmlFor="admin-sort" className="sr-only">Sort</Label>
-              <select
+              <SelectMenu
                 id="admin-sort"
                 aria-label="Sort users"
                 value={adminSort}
-                onChange={(e) => setAdminSort(e.target.value as AdminSort)}
-                className="h-9 px-3 bg-surface rounded-[var(--radius-md)] border border-border text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background cursor-pointer"
-              >
-                <option value="recent">Recent first</option>
-                <option value="oldest">Oldest first</option>
-                <option value="username">Username A-Z</option>
-                <option value="vaults">Most vaults</option>
-              </select>
-            </div>
-
-            {/* Match count */}
-            <div className="coord">
-              [{filteredUsers.length} matching of {users?.length ?? 0}]
+                onValueChange={(v) => setAdminSort(v as AdminSort)}
+                className="w-auto min-w-[160px]"
+                options={[
+                  { value: "recent", label: "Recent first" },
+                  { value: "oldest", label: "Oldest first" },
+                  { value: "username", label: "Username A-Z" },
+                  { value: "vaults", label: "Most vaults" },
+                ]}
+              />
             </div>
 
             <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
+              {/* Count lives in the card header (parity with the Tokens card),
+                  not an orphan line floating above the card. */}
+              <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
+                <span className="coord-ink">Users</span>
+                <span className="coord tabular-nums">
+                  [{users ? `${filteredUsers.length} of ${users.length}` : "··"}]
+                </span>
+              </header>
               <div className="p-6">
-                {!users ? (
-                  <div className="coord">LOADING…</div>
+                {usersError ? (
+                  <EmptyState
+                    title="Couldn't load users"
+                    description="Something went wrong fetching the user list."
+                    action={
+                      <Button variant="outline" size="sm" onClick={() => loadUsers()}>
+                        Retry
+                      </Button>
+                    }
+                  />
+                ) : !users ? (
+                  <>
+                    <span className="sr-only" role="status" aria-live="polite">
+                      Loading users
+                    </span>
+                    <div
+                      className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                      aria-hidden
+                    >
+                      {Array.from({ length: 5 }).map((_, i) => (
+                        <div key={i} className="flex items-center gap-3 px-4 py-3">
+                          <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-4 flex-1 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-3 w-16 rounded bg-surface-muted animate-pulse" />
+                        </div>
+                      ))}
+                    </div>
+                  </>
                 ) : filteredUsers.length === 0 ? (
                   <EmptyState
                     title={
@@ -996,25 +1075,25 @@ export default function SettingsPage() {
                               {u.display_name}
                             </span>
                           )}
-                          <code title={u.email} className="font-mono text-[11px] text-foreground-muted truncate hidden md:inline">
+                          <span title={u.email} className="text-[11px] text-foreground-muted truncate hidden md:inline">
                             {u.email}
-                          </code>
+                          </span>
                           {u.is_admin && (
-                            <Badge variant="owner" className="shrink-0">
-                              ADMIN
-                            </Badge>
+                            <span className="shrink-0">
+                              <RoleBadge role="admin" />
+                            </span>
                           )}
                         </div>
                         <div className="flex items-center gap-3 shrink-0">
                           <span className="coord tabular-nums hidden sm:inline">
-                            VAULTS {u.owned_vaults}
+                            Vaults {u.owned_vaults}
                           </span>
                           <span className="coord tabular-nums hidden md:inline">
-                            JOINED {formatDate(u.created_at).toUpperCase()}
+                            Joined {formatDate(u.created_at)}
                           </span>
                           {u.id === user.user_id ? (
                             <span className="coord text-foreground-muted">
-                              — SELF —
+                              Self
                             </span>
                           ) : (
                             <>
@@ -1023,7 +1102,7 @@ export default function SettingsPage() {
                                 onClick={() => setResetTarget(u)}
                                 title={`Reset password for ${u.username}`}
                                 aria-label={`Reset password for ${u.username}`}
-                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-foreground-muted hover:text-accent transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                                className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                               >
                                 <Key className="h-3 w-3" aria-hidden />
                                 Reset
@@ -1032,7 +1111,7 @@ export default function SettingsPage() {
                                 onClick={() => setPendingDeleteUser(u)}
                                 disabled={deletingId === u.id}
                                 aria-label={`Delete user ${u.username}`}
-                                className="inline-flex items-center gap-1 text-xs font-mono uppercase tracking-wider text-destructive hover:text-destructive/80 disabled:opacity-40 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                                className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                               >
                                 {deletingId === u.id ? (
                                   <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
@@ -1067,6 +1146,20 @@ export default function SettingsPage() {
       />
 
       <ConfirmDialog
+        open={pendingReissue !== null}
+        onOpenChange={(o) => !o && setPendingReissue(null)}
+        title={pendingReissue ? `Reissue "${pendingReissue.name}"?` : ""}
+        description={
+          "The current token stops working the instant this runs — a fresh token is minted to replace it. Any agent still using the old value will lose access until you paste the new one."
+        }
+        confirmLabel="Reissue token"
+        variant="destructive"
+        onConfirm={() => {
+          if (pendingReissue) return handleReissue(pendingReissue);
+        }}
+      />
+
+      <ConfirmDialog
         open={pendingDeleteUser !== null}
         onOpenChange={(o) => !o && setPendingDeleteUser(null)}
         title={pendingDeleteUser ? `Delete user "${pendingDeleteUser.username}"?` : ""}
@@ -1096,30 +1189,18 @@ function PromptExample({ text, label }: { text: string; label: string }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="coord">{label}</div>
-      <code className="font-mono text-[13px] text-foreground leading-relaxed">
-        {text}
-      </code>
+      {/* Conversational example prompts — sans, not code (they are sentences to
+          say to an agent, not a snippet to paste). */}
+      <span className="text-[13px] text-foreground leading-relaxed">{text}</span>
     </div>
   );
 }
 
-function ReadOnlyField({
-  label,
-  value,
-  accent,
-}: {
-  label: string;
-  value: string;
-  accent?: boolean;
-}) {
+function ReadOnlyField({ label, value }: { label: string; value: string }) {
   return (
     <div>
       <div className="coord mb-1">{label}</div>
-      <div
-        className={`text-sm font-medium ${accent ? "text-accent" : "text-foreground"}`}
-      >
-        {value}
-      </div>
+      <div className="text-sm font-medium text-foreground">{value}</div>
     </div>
   );
 }

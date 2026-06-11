@@ -33,7 +33,10 @@ const DialogContent = forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4",
+        "fixed left-1/2 top-1/2 z-50 grid w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4",
+        // Cap height + scroll so a tall dialog never pushes its footer (Cancel /
+        // destructive Confirm) off-screen on short viewports.
+        "max-h-[calc(100dvh-2rem)] overflow-y-auto",
         "rounded-[var(--radius-xl)] border border-border bg-surface p-6 text-foreground shadow-lg",
         "focus:outline-none",
         className,

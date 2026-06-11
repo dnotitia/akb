@@ -15,12 +15,17 @@ import {
   groupColor,
   forceCluster,
   forceCollide,
-  isDarkBg,
   CLUSTER_STRENGTH,
   COLLIDE_RADIUS,
   CHARGE_STRENGTH,
   DEFAULT_CHARGE,
 } from "./cluster";
+
+/** True when the OS asks for reduced motion — used to snap the force layout
+ *  instead of animating it (the canvas rAF sim is unreachable by CSS). */
+function prefersReducedMotion(): boolean {
+  return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+}
 
 export interface GraphCanvasHandle {
   centerOnNode: (uri: string) => void;
@@ -71,10 +76,26 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 ) {
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const fittedRef = useRef(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
-  const [frozen, setFrozen] = useState(false);
+  // Snap (don't animate) the layout when the OS asks for reduced motion.
+  const [frozen, setFrozen] = useState(() => prefersReducedMotion());
   const [clustered, setClustered] = useState(true);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+
+  // react-force-graph-2d defaults to window.innerWidth/Height with no resize
+  // handling — measure the actual wrapper so the canvas fills its grid cell and
+  // reflows when the sidebar/detail panel toggles.
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([e]) =>
+      setSize({ w: e.contentRect.width, h: e.contentRect.height }),
+    );
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useImperativeHandle(
     ref,
@@ -134,10 +155,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [visibleNodes, visibleEdges],
   );
 
-  // Group colors adapt to the active theme (lighter on dark bg, darker on
-  // light bg) so cluster rings/hulls never wash out.
-  const dark = useMemo(() => isDarkBg(colors.background), [colors]);
-
   // Install/remove the clustering forces on the three STATE inputs only — not
   // on graphData. force-graph already re-feeds nodes + reheats to alpha(1) on
   // every data change, so depending on graphData here would double-reheat and
@@ -151,17 +168,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    const on = clustered && !degraded && !frozen;
+    const on = clustered && !degraded;
     fg.d3Force("cluster", on ? (forceCluster(CLUSTER_STRENGTH) as never) : null);
     fg.d3Force("collide", on ? (forceCollide(COLLIDE_RADIUS) as never) : null);
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
-    if (!degraded && !frozen) fg.d3ReheatSimulation();
+    // Don't reheat on a reduced-motion preference — the freeze effect owns
+    // pause/resume; reheating from alpha=1 is the cost Freeze exists to avoid.
+    if (!degraded && !prefersReducedMotion()) fg.d3ReheatSimulation();
     return () => {
       fgRef.current?.d3Force("cluster", null);
       fgRef.current?.d3Force("collide", null);
     };
-  }, [clustered, degraded, frozen]);
+  }, [clustered, degraded]);
 
   const paintNode = useCallback(
     (n: RenderNode, ctx: CanvasRenderingContext2D, scale: number) => {
@@ -172,7 +191,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // Cluster membership re-tints the node ring (keeping the kind-based
       // fill + glyph so document/table/file stay distinguishable). Selection
       // always wins; ungrouped nodes keep their kind stroke.
-      const groupStroke = clustered && n.group ? groupColor(n.group, dark) : null;
+      const groupStroke = clustered && n.group ? groupColor(n.group, colors.cat) : null;
 
       ctx.beginPath();
       ctx.rect(x - NODE_SIZE / 2, y - NODE_SIZE / 2, NODE_SIZE, NODE_SIZE);
@@ -233,7 +252,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       }
 
       if (scale > LABEL_ZOOM_THRESHOLD) {
-        const label = (n.name || "").slice(0, 16).toUpperCase();
+        // Render the title as-authored — never .toUpperCase() user copy (it
+        // corrupts acronyms/camelCase/non-Latin titles).
+        const raw = n.name || "";
+        const label = raw.length > 18 ? raw.slice(0, 18) + "…" : raw;
         ctx.font = `10px ui-monospace, SFMono-Regular, monospace`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
@@ -241,7 +263,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         ctx.fillText(label, x, y + NODE_SIZE / 2 + 4);
       }
     },
-    [colors, selected, pinned, clustered, dark],
+    [colors, selected, pinned, clustered],
   );
 
   const paintLink = useCallback(
@@ -311,6 +333,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   return (
     <div
+      ref={wrapRef}
       className="absolute inset-0"
       role="img"
       aria-label={`Knowledge graph: ${nodes.length} nodes, ${edges.length} edges`}
@@ -346,6 +369,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       <ForceGraph2D
         ref={fgRef as never}
         graphData={graphData as never}
+        width={size.w || undefined}
+        height={size.h || undefined}
         backgroundColor={colors.background}
         nodeId="uri"
         linkSource="source"
@@ -355,7 +380,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
         linkDirectionalArrowColor={colors.foregroundMuted}
-        cooldownTicks={degraded ? 0 : 200}
+        cooldownTicks={degraded || frozen ? 0 : 200}
         onNodeClick={handleNodeClick as never}
         onBackgroundClick={handleBackgroundClick}
         onNodeRightClick={handleNodeRightClick as never}
@@ -392,8 +417,8 @@ function CanvasButton({
       aria-pressed={active}
       className={`inline-flex items-center justify-center h-8 w-8 rounded-[var(--radius-md)] border shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-colors cursor-pointer ${
         active
-          ? "bg-accent/10 border-accent text-accent"
-          : "bg-surface border-border text-foreground-muted hover:text-foreground hover:bg-surface-muted"
+          ? "bg-surface-selected border-primary text-surface-selected-foreground"
+          : "bg-surface border-border text-foreground-muted hover:text-foreground hover:bg-surface-hover"
       }`}
     >
       <Icon className="h-3 w-3" aria-hidden />

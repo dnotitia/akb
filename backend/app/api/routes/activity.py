@@ -7,6 +7,7 @@ management. The file was renamed accordingly.
 """
 
 import json
+import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -21,6 +22,47 @@ router = APIRouter()
 git = GitService()
 
 
+def _is_uuid(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        _uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+async def _resolve_activity_authors(entries: list[dict]) -> list[dict]:
+    """Add a human `author_name` to each commit-log entry.
+
+    App commits set the git author to the actor's user UUID, so the raw log
+    shows raw ids. Batch-resolve the UUID author/agent values to display names
+    (display_name → username) so the UI can show a name instead. Non-UUID
+    authors (external-git imports) are left for the UI to show as-is.
+    """
+    ids = {
+        v
+        for e in entries
+        for v in (e.get("agent"), e.get("author"))
+        if _is_uuid(v)
+    }
+    if not ids:
+        return entries
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, COALESCE(display_name, username) AS name "
+            "FROM users WHERE id::text = ANY($1)",
+            list(ids),
+        )
+    name_by_id = {r["id"]: r["name"] for r in rows}
+    for e in entries:
+        raw = e.get("agent") or e.get("author")
+        if raw in name_by_id:
+            e["author_name"] = name_by_id[raw]
+    return entries
+
+
 @router.get("/activity/{vault}", summary="Get vault activity history (Git-based)")
 async def vault_activity(
     vault: str,
@@ -32,11 +74,15 @@ async def vault_activity(
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
     entries = git.vault_log(vault, max_count=limit, since=since, path=collection)
+    entries = await _resolve_activity_authors(entries)
 
     if author:
+        needle = author.lower()
         entries = [
             e for e in entries
-            if author.lower() in e.get("agent", "").lower() or author.lower() in e.get("author", "").lower()
+            if needle in e.get("agent", "").lower()
+            or needle in e.get("author", "").lower()
+            or needle in (e.get("author_name") or "").lower()
         ]
 
     return {"vault": vault, "total": len(entries), "activity": entries}

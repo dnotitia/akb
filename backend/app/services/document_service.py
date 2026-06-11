@@ -212,6 +212,30 @@ class DocumentService:
         pool = await get_pool()
         return VaultRepository(pool), DocumentRepository(pool), CollectionRepository(pool)
 
+    async def _resolve_author_name(self, created_by: str | None) -> str | None:
+        """Resolve a `created_by` user id to a human display name for the UI.
+
+        App-authored docs store a user UUID; external-git imports store a
+        non-UUID author string (left for the caller to show as-is). Returns the
+        user's display_name (falling back to username), or None when the id
+        isn't a UUID or doesn't match a user.
+        """
+        if not created_by:
+            return None
+        try:
+            uuid.UUID(str(created_by))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT display_name, username FROM users WHERE id::text = $1",
+                str(created_by),
+            )
+        if not row:
+            return None
+        return row["display_name"] or row["username"]
+
     async def _ensure_document_hash(
         self,
         doc_repo,
@@ -437,6 +461,7 @@ class DocumentService:
             vault=row["vault_name"], path=row["path"],
             title=row["title"], type=row["doc_type"] or "note", status=row["status"],
             summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
+            created_by_name=await self._resolve_author_name(row["created_by"]),
             created_at=row["created_at"], updated_at=row["updated_at"],
             current_commit=row["current_commit"],
             content_hash=content_hash, hash_algorithm=hash_algorithm,
@@ -496,6 +521,7 @@ class DocumentService:
             vault=row["vault_name"], path=row["path"],
             title=row["title"], type=row["doc_type"] or "note", status=row["status"],
             summary=row["summary"], domain=row["domain"], created_by=row["created_by"],
+            created_by_name=await self._resolve_author_name(row["created_by"]),
             created_at=row["created_at"], updated_at=row["updated_at"],
             current_commit=version,    # report the requested version, not HEAD
             content_hash=content_hash, hash_algorithm=HASH_ALGORITHM,
