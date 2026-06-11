@@ -1,0 +1,24 @@
+{
+  "name": "akb-skillpack",
+  "owner": {
+    "name": "jylkim",
+    "email": ""
+  },
+  "plugins": [
+    {
+      "name": "akb-claude-code",
+      "source": "./plugins/claude/akb-claude-code",
+      "description": "Bridge Claude Code's session lifecycle into AKB's agent-memory vault."
+    },
+    {
+      "name": "akb-sessions",
+      "source": "./plugins/claude/akb-sessions",
+      "description": "Ingest coding sessions into an AKB vault as structured notes."
+    },
+    {
+      "name": "akb-wiki",
+      "source": "./plugins/claude/akb-wiki",
+      "description": "LLM-wiki layer for AKB vaults — unified document ingest (any source) and hybrid search."
+    }
+  ]
+}

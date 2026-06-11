@@ -1,0 +1,40 @@
+{
+  "name": "akb-wiki",
+  "version": "0.21.1",
+  "description": "LLM-wiki layer for AKB vaults — unified document ingest (any source) and hybrid search.",
+  "author": {
+    "name": "jylkim",
+    "url": "https://github.com/jylkim"
+  },
+  "homepage": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "repository": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "license": "MIT",
+  "keywords": [
+    "akb",
+    "llm-wiki",
+    "ingest",
+    "search",
+    "git",
+    "atlassian"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "AKB Wiki",
+    "shortDescription": "LLM-wiki ingest and search layer for AKB vaults.",
+    "longDescription": "Runs any AKB vault as an LLM-wiki. Combines a read-only question-answering\nsurface (`/akb-query`: multi-strategy search, cited synthesis, a time-axis\nfreshness check) and a single unified ingest entry point:\n`/akb-ingest` takes whatever you point at — a local file, a web URL, a GitHub\nPR / release / commit, a Confluence page, or a Jira issue — classifies the\nsource type, and dispatches to a specialized ingest subagent. Document-style\nsources become five-section LLM-wiki summary pages (optionally preserving the\noriginal bytes); decision-record sources (PRs, releases, commits, issues)\nbecome faithful mechanical episodic records. The router fetches nothing\nitself; each subagent owns exactly one fetch path. Cross-source consolidation,\nlint, and dream-cycle maintenance are handled by an external maintenance layer\nthat runs over the same AKB vault, not by this skillpack.\n",
+    "developerName": "jylkim",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+    "defaultPrompt": [
+      "Ingest this PDF into my vault.",
+      "Ingest this GitHub PR into my vault.",
+      "Ask my vault about this topic."
+    ],
+    "brandColor": "#2F4858"
+  }
+}

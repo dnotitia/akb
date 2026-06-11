@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "akb": {
+      "command": "npx",
+      "args": [
+        "akb-mcp",
+        "--insecure"
+      ],
+      "env_vars": [
+        "AKB_MCP_URL",
+        "AKB_PAT"
+      ],
+      "default_tools_approval_mode": "approve"
+    }
+  }
+}

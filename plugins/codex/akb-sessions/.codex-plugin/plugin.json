@@ -1,0 +1,38 @@
+{
+  "name": "akb-sessions",
+  "version": "0.26.1",
+  "description": "Ingest coding sessions into an AKB vault as structured notes.",
+  "author": {
+    "name": "jylkim",
+    "url": "https://github.com/jylkim"
+  },
+  "homepage": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "repository": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+  "license": "MIT",
+  "keywords": [
+    "akb",
+    "ingest",
+    "sessions",
+    "knowledge-management",
+    "multi-agent"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AKB Sessions",
+    "shortDescription": "Turn coding sessions into structured AKB knowledge documents.",
+    "longDescription": "Capture session reports, learnings, follow-up tasks, ideas, and long-lived decisions from your coding sessions as structured documents in your AKB knowledge base vault.",
+    "developerName": "jylkim",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/younglo-kim_dnotitia/akb-skillpack",
+    "defaultPrompt": [
+      "Save this session to my AKB vault.",
+      "Capture the decisions and learnings from this session.",
+      "Ingest my current coding session into AKB."
+    ],
+    "brandColor": "#3A6B9F"
+  }
+}
