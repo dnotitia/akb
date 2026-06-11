@@ -6,7 +6,8 @@ import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RoleBadge } from "@/components/status-badge";
-import { timeAgo } from "@/lib/utils";
+import { recentTone } from "@/lib/recent";
+import { isFresh, timeAgo } from "@/lib/utils";
 
 export interface VaultRow {
   id: string;
@@ -102,9 +103,18 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
                 <div className="flex items-center gap-3 shrink-0">
                   <VaultStatsCell m={m} />
                   {m ? (
-                    <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
-                      {lastActivity ? timeAgo(lastActivity) : "—"}
-                    </span>
+                    lastActivity && isFresh(lastActivity) ? (
+                      // Fresh (<1h) → the same spark treatment the Home Recent
+                      // card uses, so the dashboard's two time columns match.
+                      <span className="inline-flex w-[56px] items-center justify-end gap-1 text-[11px] font-medium tabular-nums text-spark">
+                        <span className="h-1.5 w-1.5 rounded-full bg-spark" aria-hidden />
+                        {timeAgo(lastActivity)}
+                      </span>
+                    ) : (
+                      <span className="coord tabular-nums whitespace-nowrap w-[56px] text-right">
+                        {lastActivity ? timeAgo(lastActivity) : "—"}
+                      </span>
+                    )
                   ) : (
                     <span
                       className="h-3 w-[56px] rounded bg-surface-muted animate-pulse"
@@ -146,9 +156,9 @@ function CompositionBar({ d, t, f }: { d: number; t: number; f: number }) {
       className="inline-flex h-1 w-10 shrink-0 overflow-hidden rounded-full bg-surface-muted"
       aria-hidden
     >
-      {seg(d, "var(--color-cat-1)")}
-      {seg(t, "var(--color-cat-3)")}
-      {seg(f, "var(--color-cat-4)")}
+      {seg(d, recentTone("document"))}
+      {seg(t, recentTone("table"))}
+      {seg(f, recentTone("file"))}
     </span>
   );
 }
@@ -173,6 +183,8 @@ function VaultStatsCell({ m }: { m?: VaultMetrics }) {
     <span
       className="coord tabular-nums whitespace-nowrap inline-flex items-center gap-2"
       title={title}
+      role="img"
+      aria-label={title}
     >
       <CompositionBar d={d} t={t} f={f} />
       {d + t + f === 0 ? (
@@ -181,19 +193,19 @@ function VaultStatsCell({ m }: { m?: VaultMetrics }) {
         <>
           {d > 0 && (
             <span className="inline-flex items-center gap-1">
-              <FileText className="h-3 w-3" aria-hidden />
+              <FileText className="h-3 w-3" style={{ color: recentTone("document") }} aria-hidden />
               {d}
             </span>
           )}
           {t > 0 && (
             <span className="inline-flex items-center gap-1">
-              <TableIcon className="h-3 w-3" aria-hidden />
+              <TableIcon className="h-3 w-3" style={{ color: recentTone("table") }} aria-hidden />
               {t}
             </span>
           )}
           {f > 0 && (
             <span className="inline-flex items-center gap-1">
-              <FileIcon className="h-3 w-3" aria-hidden />
+              <FileIcon className="h-3 w-3" style={{ color: recentTone("file") }} aria-hidden />
               {f}
             </span>
           )}

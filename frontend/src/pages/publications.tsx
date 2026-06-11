@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { listPublications, deletePublication, getDocument, type Publication } from "@/lib/api";
 import { parseDocUri, parseFileUri } from "@/lib/uri";
-import { timeAgo } from "@/lib/utils";
+import { formatDate, timeAgo } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -205,7 +205,7 @@ export default function PublicationsPage() {
                     </span>
                     <span className="coord tabular-nums hidden sm:inline">
                       {p.expires_at
-                        ? `Expires ${timeAgo(p.expires_at).replace("ago", "").trim()}`
+                        ? `Expires ${formatDate(p.expires_at)}`
                         : "Evergreen"}
                     </span>
                     <span className="coord tabular-nums">
