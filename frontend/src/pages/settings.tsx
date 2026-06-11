@@ -2,15 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
-  ArrowUpRight,
   ChevronRight,
   Copy,
   Eye,
   EyeOff,
   Key,
   Loader2,
+  Monitor,
+  Moon,
   Plus,
   RotateCw,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -28,17 +30,18 @@ import {
 } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
 import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
-import { formatDate } from "@/lib/utils";
+import { formatDate, timeAgo } from "@/lib/utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
-import { Badge } from "@/components/ui/badge";
+import { Segmented } from "@/components/ui/segmented";
+import { RoleBadge } from "@/components/status-badge";
 import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { useTheme } from "@/hooks/use-theme";
+import { useTheme, type Theme } from "@/hooks/use-theme";
 import { useFlashStatus } from "@/hooks/use-flash-status";
 import {
   Tabs,
@@ -129,7 +132,7 @@ export default function SettingsPage() {
   const [profileBusy, setProfileBusy] = useState(false);
   const profileFlash = useFlashStatus(3000);
   const passwordFlash = useFlashStatus(3000);
-  const { theme } = useTheme();
+  const { theme, setTheme } = useTheme();
 
   // Sync local edit state when user payload arrives.
   useEffect(() => {
@@ -138,6 +141,21 @@ export default function SettingsPage() {
       setProfileEmail(user.email ?? "");
     }
   }, [user]);
+
+  // Guard unsaved profile edits behind the browser's unload prompt (refresh /
+  // close / external nav). In-app SPA nav has the Save/notice as its net.
+  useEffect(() => {
+    if (!user) return;
+    const dirty =
+      (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
+    if (!dirty || profileBusy) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [user, profileDisplayName, profileEmail, profileBusy]);
 
   // Smart default: open setup guide when user has no PATs, closed otherwise.
   // Only applies when localStorage has no saved preference (setupOpen === null).
@@ -205,6 +223,19 @@ export default function SettingsPage() {
 
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+
+  // Name the tab/history entry (tab switching + SR route-change orientation).
+  // Keyed on the raw `?tab=` (the derived activeTab lives past an early return,
+  // so it can't drive a hook).
+  useEffect(() => {
+    const tab = searchParams.get("tab") || "profile";
+    const cap = tab.charAt(0).toUpperCase() + tab.slice(1);
+    const prev = document.title;
+    document.title = `Settings · ${cap} · AKB`;
+    return () => {
+      document.title = prev;
+    };
+  }, [searchParams]);
 
   // Walk back if there's history (user entered Settings from somewhere
   // meaningful — a vault, a doc, etc.), otherwise fall through to Home.
@@ -401,6 +432,9 @@ export default function SettingsPage() {
     setSearchParams(next, { replace: true });
   };
 
+  const profileDirty =
+    (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
+
   return (
     <div className="max-w-[1280px] mx-auto fade-up">
       <div className="flex items-center justify-between mb-6">
@@ -436,7 +470,7 @@ export default function SettingsPage() {
           <TabsTrigger value="profile">Profile</TabsTrigger>
           <TabsTrigger value="tokens" className="gap-1.5">
             Tokens
-            <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
+            <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
           </TabsTrigger>
           <TabsTrigger value="preferences">Preferences</TabsTrigger>
           {user.is_admin && (
@@ -463,11 +497,7 @@ export default function SettingsPage() {
               <ReadOnlyField label="Username" value={user.username} />
               <div>
                 <div className="coord mb-1">Role</div>
-                {user.is_admin ? (
-                  <Badge variant="owner">ADMIN</Badge>
-                ) : (
-                  <div className="text-sm font-medium text-foreground">User</div>
-                )}
+                <RoleBadge role={user.is_admin ? "admin" : "user"} />
               </div>
               <div>
                 <Label htmlFor="profile-display-name">Display name</Label>
@@ -490,7 +520,7 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="flex items-center gap-3 px-6 pb-6 flex-wrap">
-              <Button type="submit" loading={profileBusy}>
+              <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
                 Save profile
               </Button>
               {profileFlash.message && (
@@ -545,7 +575,7 @@ export default function SettingsPage() {
                   required
                 />
                 {pwTooShort && (
-                  <p id="pw-new-help" className="text-destructive text-xs font-mono mt-1">
+                  <p id="pw-new-help" className="text-destructive text-xs mt-1">
                     Use at least 8 characters.
                   </p>
                 )}
@@ -564,18 +594,18 @@ export default function SettingsPage() {
                   required
                 />
                 {pwMismatch && (
-                  <p id="pw-confirm-help" className="text-destructive text-xs font-mono mt-1">
+                  <p id="pw-confirm-help" className="text-destructive text-xs mt-1">
                     Doesn&apos;t match new password.
                   </p>
                 )}
               </div>
               {pwError && (
-                <p role="alert" className="text-destructive text-xs font-mono">
+                <p role="alert" className="text-destructive text-xs">
                   {pwError}
                 </p>
               )}
               {passwordFlash.message && (
-                <p role="status" aria-live="polite" className="text-success text-xs font-mono">
+                <p role="status" aria-live="polite" className="text-success text-xs">
                   {passwordFlash.message}
                 </p>
               )}
@@ -602,7 +632,7 @@ export default function SettingsPage() {
                 <button
                   onClick={() => setNewPat(null)}
                   aria-label="Dismiss fresh token"
-                  className="inline-flex items-center justify-center h-7 w-7 coord hover:text-primary cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  className="inline-flex items-center justify-center min-h-[36px] min-w-[36px] coord hover:text-primary cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <X className="h-3 w-3" aria-hidden />
                 </button>
@@ -617,7 +647,7 @@ export default function SettingsPage() {
                   <button
                     onClick={() => setShowPat(!showPat)}
                     aria-label={showPat ? "Hide token" : "Show token"}
-                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    className="inline-flex items-center justify-center min-h-[36px] px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
                     {showPat ? (
                       <EyeOff className="h-3 w-3" aria-hidden />
@@ -628,7 +658,7 @@ export default function SettingsPage() {
                   <button
                     onClick={() => copy(newPat, "pat")}
                     aria-label={copied === "pat" ? "Token copied" : "Copy token"}
-                    className="inline-flex items-center justify-center h-7 px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    className="inline-flex items-center justify-center min-h-[36px] px-2 coord hover:text-primary cursor-pointer shrink-0 rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                   >
                     {copied === "pat" ? <span aria-hidden>Copied</span> : <Copy className="h-3 w-3" aria-hidden />}
                   </button>
@@ -643,7 +673,7 @@ export default function SettingsPage() {
           <section className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
               <span className="coord-ink">Active tokens</span>
-              <span className="coord tabular-nums">[{pats?.length ?? 0}]</span>
+              <span className="coord tabular-nums">[{pats ? pats.length : "··"}]</span>
             </header>
             <div className="p-6 space-y-4">
               {reissueError && <Alert variant="destructive">{reissueError}</Alert>}
@@ -658,7 +688,25 @@ export default function SettingsPage() {
                   }
                 />
               ) : !pats ? (
-                <div className="coord" role="status" aria-live="polite">Loading</div>
+                <>
+                  <span className="sr-only" role="status" aria-live="polite">
+                    Loading tokens
+                  </span>
+                  <div
+                    className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                    aria-hidden
+                  >
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <div key={i} className="px-4 py-3 space-y-2">
+                        <div className="flex items-center gap-3">
+                          <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-4 w-32 rounded bg-surface-muted animate-pulse" />
+                        </div>
+                        <div className="h-3 w-40 rounded bg-surface-muted animate-pulse ml-7" />
+                      </div>
+                    ))}
+                  </div>
+                </>
               ) : pats.length === 0 ? (
                 <EmptyState title="No tokens yet — mint one below." />
               ) : (
@@ -680,21 +728,25 @@ export default function SettingsPage() {
                       {/* Line 2 — meta + actions */}
                       <div className="flex items-center justify-between gap-3 flex-wrap pl-7">
                         <div className="flex items-center gap-3 text-foreground-muted">
-                          <span className="coord tabular-nums">
-                            Created {formatDate(p.created_at)}
+                          <span
+                            className="coord tabular-nums"
+                            title={`Created ${formatDate(p.created_at)}`}
+                          >
+                            Created {timeAgo(p.created_at)}
                           </span>
-                          {p.last_used_at && (
-                            <span className="coord tabular-nums">
-                              Used {formatDate(p.last_used_at)}
-                            </span>
-                          )}
+                          <span
+                            className="coord tabular-nums"
+                            title={p.last_used_at ? `Last used ${formatDate(p.last_used_at)}` : undefined}
+                          >
+                            {p.last_used_at ? `Used ${timeAgo(p.last_used_at)}` : "Never used"}
+                          </span>
                         </div>
                         <div className="flex items-center gap-1 ml-auto">
                           <button
                             onClick={() => setPendingReissue(p)}
                             disabled={reissuingId === p.token_id}
                             aria-label={`Reissue token ${p.name}`}
-                            className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                            className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                           >
                             <RotateCw
                               className={`h-3 w-3 ${reissuingId === p.token_id ? "animate-spin" : ""}`}
@@ -705,7 +757,7 @@ export default function SettingsPage() {
                           <button
                             onClick={() => setPendingRevokePat(p)}
                             aria-label={`Revoke token ${p.name}`}
-                            className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                            className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                           >
                             <Trash2 className="h-3 w-3" aria-hidden />
                             Revoke
@@ -751,7 +803,7 @@ export default function SettingsPage() {
                   <div className="space-y-3">
                     <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
                       A Personal Access Token authorizes your agent against the base.
-                      You can rotate or revoke it any time.
+                      You can reissue or revoke it any time.
                     </p>
                     <form onSubmit={handleCreatePAT} className="flex gap-2">
                       <Label htmlFor="new-pat-name" className="sr-only">
@@ -884,40 +936,29 @@ export default function SettingsPage() {
 
         </TabsContent>
 
-        {/* Preferences — status display only; real control lives in header UserMenu */}
+        {/* Preferences — theme control inline (synced with the header menu via
+            useTheme), not a read-only status pointing off-page. */}
         <TabsContent value="preferences" className="pt-6 max-w-4xl space-y-6">
-          {/* Theme — status only. Real control lives in the header UserMenu. */}
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3">
-              <span className="coord-ink">Theme</span>
+              <span id="theme-label" className="coord-ink">Theme</span>
             </header>
-            <div className="p-6 flex items-start justify-between gap-4">
-              <div>
-                <div className="text-sm font-medium text-foreground">
-                  Current: <span className="capitalize">{theme}</span>
-                  {theme === "system" && (
-                    <span className="text-foreground-muted"> (follows OS)</span>
-                  )}
-                </div>
-                <p className="text-xs text-foreground-muted mt-1.5 leading-relaxed">
-                  Active mode follows your selection in the header menu.
-                </p>
-              </div>
-              <div className="inline-flex items-center gap-1 text-foreground-muted text-xs">
-                <ArrowUpRight className="h-3 w-3" aria-hidden />
-                Change in header menu
-              </div>
-            </div>
-          </div>
-
-          {/* Future placeholder card */}
-          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden opacity-50">
-            <header className="border-b border-border px-6 py-3">
-              <span className="coord-ink">More preferences</span>
-            </header>
-            <div className="p-6">
-              <p className="text-sm text-foreground-muted">
-                Language, density, notifications — coming soon.
+            <div className="p-6 max-w-sm">
+              <Segmented
+                aria-labelledby="theme-label"
+                value={theme}
+                onChange={(v) => setTheme(v as Theme)}
+                className="grid-cols-3"
+                options={[
+                  { value: "light", label: "Light", icon: <Sun className="h-3 w-3" aria-hidden /> },
+                  { value: "dark", label: "Dark", icon: <Moon className="h-3 w-3" aria-hidden /> },
+                  { value: "system", label: "System", icon: <Monitor className="h-3 w-3" aria-hidden /> },
+                ]}
+              />
+              <p className="text-xs text-foreground-muted mt-2 leading-relaxed">
+                {theme === "system"
+                  ? "Follows your operating system's appearance."
+                  : `Always ${theme}.`}
               </p>
             </div>
           </div>
@@ -973,7 +1014,23 @@ export default function SettingsPage() {
                     }
                   />
                 ) : !users ? (
-                  <div className="coord" role="status" aria-live="polite">Loading</div>
+                  <>
+                    <span className="sr-only" role="status" aria-live="polite">
+                      Loading users
+                    </span>
+                    <div
+                      className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden"
+                      aria-hidden
+                    >
+                      {Array.from({ length: 5 }).map((_, i) => (
+                        <div key={i} className="flex items-center gap-3 px-4 py-3">
+                          <span className="h-3 w-5 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-4 flex-1 rounded bg-surface-muted animate-pulse" />
+                          <span className="h-3 w-16 rounded bg-surface-muted animate-pulse" />
+                        </div>
+                      ))}
+                    </div>
+                  </>
                 ) : filteredUsers.length === 0 ? (
                   <EmptyState
                     title={
@@ -1006,13 +1063,13 @@ export default function SettingsPage() {
                               {u.display_name}
                             </span>
                           )}
-                          <code title={u.email} className="font-mono text-[11px] text-foreground-muted truncate hidden md:inline">
+                          <span title={u.email} className="text-[11px] text-foreground-muted truncate hidden md:inline">
                             {u.email}
-                          </code>
+                          </span>
                           {u.is_admin && (
-                            <Badge variant="owner" className="shrink-0">
-                              ADMIN
-                            </Badge>
+                            <span className="shrink-0">
+                              <RoleBadge role="admin" />
+                            </span>
                           )}
                         </div>
                         <div className="flex items-center gap-3 shrink-0">
@@ -1033,7 +1090,7 @@ export default function SettingsPage() {
                                 onClick={() => setResetTarget(u)}
                                 title={`Reset password for ${u.username}`}
                                 aria-label={`Reset password for ${u.username}`}
-                                className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                                className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                               >
                                 <Key className="h-3 w-3" aria-hidden />
                                 Reset
@@ -1042,7 +1099,7 @@ export default function SettingsPage() {
                                 onClick={() => setPendingDeleteUser(u)}
                                 disabled={deletingId === u.id}
                                 aria-label={`Delete user ${u.username}`}
-                                className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                                className="inline-flex items-center gap-1 px-2 min-h-[36px] rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover disabled:opacity-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                               >
                                 {deletingId === u.id ? (
                                   <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
@@ -1120,9 +1177,9 @@ function PromptExample({ text, label }: { text: string; label: string }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="coord">{label}</div>
-      <code className="font-mono text-[13px] text-foreground leading-relaxed">
-        {text}
-      </code>
+      {/* Conversational example prompts — sans, not code (they are sentences to
+          say to an agent, not a snippet to paste). */}
+      <span className="text-[13px] text-foreground leading-relaxed">{text}</span>
     </div>
   );
 }
