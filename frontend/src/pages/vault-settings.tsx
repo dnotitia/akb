@@ -1,9 +1,11 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AlertTriangle,
   Archive,
   ArrowLeft,
+  CheckCircle2,
+  CircleDashed,
   Globe,
   Lock,
   RotateCcw,
@@ -23,9 +25,11 @@ import {
 import { timeAgo } from "@/lib/utils";
 import { SkillSettingsLink } from "@/components/skill/skill-settings-link";
 import { Alert } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { StatTile } from "@/components/ui/stat-tile";
 import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Segmented } from "@/components/ui/segmented";
@@ -44,6 +48,7 @@ interface VaultInfo {
   name: string;
   description?: string;
   role?: "owner" | "admin" | "writer" | "reader";
+  role_source?: "member" | "public";
   status?: string;
   is_archived?: boolean;
   is_external_git?: boolean;
@@ -53,10 +58,13 @@ interface VaultInfo {
   owner?: string;
   owner_display_name?: string;
   created_at?: string;
+  last_activity?: string;
   member_count?: number;
+  collection_count?: number;
   document_count?: number;
   table_count?: number;
   file_count?: number;
+  edge_count?: number;
   tables?: TableMeta[];
 }
 
@@ -96,6 +104,7 @@ export default function VaultSettingsPage() {
   const [pendingPublicWrite, setPendingPublicWrite] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const vaultHealth = useVaultHealth(name);
+  const saveStatusRef = useRef<HTMLSpanElement>(null);
 
   const skillQuery = useQuery({
     queryKey: ["document", name, "overview/vault-skill.md"],
@@ -125,6 +134,7 @@ export default function VaultSettingsPage() {
     setDescription("");
     setPublicAccess("none");
     setSaveError("");
+    setSavedAt(null);
     loadInfo(name);
   }, [name]);
 
@@ -139,10 +149,9 @@ export default function VaultSettingsPage() {
   }, [name]);
 
   const canEdit = info?.role === "owner";
+  const savedPublic = (info?.public_access as PublicAccess) || "none";
   const dirty = Boolean(
-    info &&
-      (description !== (info.description || "") ||
-        publicAccess !== ((info.public_access as PublicAccess) || "none")),
+    info && (description !== (info.description || "") || publicAccess !== savedPublic),
   );
 
   // Guard a dirty config behind the browser's unload prompt (refresh / close /
@@ -163,8 +172,7 @@ export default function VaultSettingsPage() {
   // Save commits it. Lowering access or toggling read stays frictionless.
   function requestSave() {
     if (!info) return;
-    const enablingPublicWrite =
-      publicAccess === "writer" && (info.public_access || "none") !== "writer";
+    const enablingPublicWrite = publicAccess === "writer" && savedPublic !== "writer";
     if (enablingPublicWrite) {
       setPendingPublicWrite(true);
       return;
@@ -180,7 +188,10 @@ export default function VaultSettingsPage() {
       await updateVault(name, { description, public_access: publicAccess });
       setInfo({ ...info, description, public_access: publicAccess });
       setSavedAt(Date.now());
-      setTimeout(() => setSavedAt(null), 2000);
+      // Move focus to a stable status node so a keyboard Save doesn't drop focus
+      // to <body> when the (now-clean) Save disables + the Discard button
+      // unmounts. "Saved" persists until the next edit (dirty hides it).
+      requestAnimationFrame(() => saveStatusRef.current?.focus());
     } catch (e: any) {
       setSaveError(e?.message || "Save failed");
     } finally {
@@ -191,8 +202,10 @@ export default function VaultSettingsPage() {
   function handleDiscard() {
     if (!info) return;
     setDescription(info.description || "");
-    setPublicAccess((info.public_access as PublicAccess) || "none");
+    setPublicAccess(savedPublic);
     setSaveError("");
+    // Discarding is not a save — don't leave the "Saved" chip up.
+    setSavedAt(null);
   }
 
   async function confirmArchive() {
@@ -209,6 +222,7 @@ export default function VaultSettingsPage() {
   if (!name) return null;
 
   const loading = info === null && !loadError;
+  const tables = info?.tables ?? [];
   const deleteScale = info
     ? ([
         [info.document_count, "document"],
@@ -254,7 +268,7 @@ export default function VaultSettingsPage() {
         Vault metadata, public access, and lifecycle controls.
       </p>
 
-      {/* Identity line — who owns it, how old, how big. From get_vault_info,
+      {/* Identity line — who owns it, how old, how alive. From get_vault_info,
           already fetched. Owner is a display name (sans, not mono). */}
       {info &&
         (() => {
@@ -267,6 +281,8 @@ export default function VaultSettingsPage() {
               </>,
             );
           if (info.created_at) segs.push(<>Created {timeAgo(info.created_at)}</>);
+          if (info.last_activity)
+            segs.push(<>Last active {timeAgo(info.last_activity)}</>);
           if (info.member_count != null)
             segs.push(
               <>
@@ -276,7 +292,7 @@ export default function VaultSettingsPage() {
             );
           if (!segs.length) return null;
           return (
-            <div className="coord mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="coord mt-1.5 mb-6 flex flex-wrap items-center gap-x-2 gap-y-1">
               {segs.map((s, i) => (
                 <span key={i} className="flex items-center gap-x-2">
                   {i > 0 && <span aria-hidden>·</span>}
@@ -287,7 +303,8 @@ export default function VaultSettingsPage() {
           );
         })()}
 
-      <div className="mb-10 min-h-[1.5rem]" aria-busy={loading || undefined}>
+      {/* State badges */}
+      <div className="mb-4 min-h-[1.5rem]" aria-busy={loading || undefined}>
         {loading ? (
           <span
             className="inline-block h-5 w-40 rounded bg-surface-muted animate-pulse"
@@ -305,22 +322,69 @@ export default function VaultSettingsPage() {
         {loading ? "Loading vault settings" : loadError ? "Could not load settings" : ""}
       </span>
 
-      {!canEdit && info && (
-        <div
-          role="status"
-          className="rounded-[var(--radius-md)] border border-border bg-surface-muted px-4 py-2 mb-8 text-xs"
-        >
-          Read-only view — only the owner can change these settings. Your role: {info.role}.
+      {/* At a glance — the scale this vault carries, from the same /info payload,
+          so the masthead is substantive instead of a thin line over empty space. */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {info ? (
+          (
+            [
+              ["Collections", info.collection_count],
+              ["Documents", info.document_count],
+              ["Tables", info.table_count],
+              ["Files", info.file_count],
+            ] as Array<[string, number | undefined]>
+          ).map(([label, value]) => (
+            <StatTile key={label} label={label} value={(value ?? 0).toLocaleString()} dimZero />
+          ))
+        ) : loadError ? null : (
+          Array.from({ length: 4 }).map((_, i) => <SettingsStatSkeleton key={i} />)
+        )}
+      </div>
+      {info && (
+        <div className="coord mt-2 mb-10 flex flex-wrap items-center gap-x-3 gap-y-1">
+          {info.edge_count != null && (
+            <span className="tabular-nums">
+              {info.edge_count.toLocaleString()} graph link
+              {info.edge_count === 1 ? "" : "s"}
+            </span>
+          )}
+          {info.edge_count != null && <span aria-hidden>·</span>}
+          <Link
+            to={`/vault/${name}`}
+            className="inline-flex items-center gap-1 hover:text-link transition-colors rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          >
+            ↗ Open overview
+          </Link>
         </div>
       )}
 
-      {/* § METADATA — the form column is capped for a readable measure; the wide
-          content area is for the cards below. */}
+      {!canEdit && info && (
+        <div
+          role="status"
+          className="rounded-[var(--radius-md)] border border-border bg-surface-muted px-4 py-2 mb-8 text-xs flex flex-wrap items-center gap-2"
+        >
+          <span>
+            Read-only view — only the owner can change these settings. Your role: {info.role}.
+          </span>
+          {info.role_source === "public" && (
+            <Badge
+              variant="info-outline"
+              title="This role comes from the vault's public-access setting, not a direct invite."
+            >
+              <Globe className="h-3 w-3" aria-hidden />
+              via public access
+            </Badge>
+          )}
+        </div>
+      )}
+
+      {/* § METADATA — the form column is capped for a readable measure. */}
       <section className="mb-12" aria-labelledby="meta-h">
         <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
           <h2 id="meta-h" className="coord-ink">
             Metadata
           </h2>
+          <span className="coord">name · description · access</span>
         </header>
 
         <div className="space-y-5 max-w-2xl">
@@ -346,6 +410,11 @@ export default function VaultSettingsPage() {
               rows={2}
               className="resize-y"
             />
+            {!canEdit && (
+              <p className="text-xs text-foreground-muted mt-1.5">
+                Read-only — only the owner can edit the description.
+              </p>
+            )}
           </div>
 
           {!skillQuery.isLoading && (
@@ -382,6 +451,17 @@ export default function VaultSettingsPage() {
               )}
               {PUBLIC_DESCRIPTIONS[publicAccess]}
             </p>
+            {info && (
+              <p className="coord mt-1">
+                Currently {PUBLIC_LABELS[savedPublic]}
+                {dirty && publicAccess !== savedPublic && (
+                  <>
+                    {" "}→ changing to{" "}
+                    <span className="text-foreground">{PUBLIC_LABELS[publicAccess]}</span>
+                  </>
+                )}
+              </p>
+            )}
           </div>
 
           {saveError && <Alert variant="destructive">{saveError}</Alert>}
@@ -397,31 +477,46 @@ export default function VaultSettingsPage() {
                   Discard
                 </Button>
               )}
-              <span role="status" aria-live="polite">
-                {savedAt && <span className="coord-spark fade-in">Saved</span>}
+              <span
+                ref={saveStatusRef}
+                tabIndex={-1}
+                role="status"
+                aria-live="polite"
+                className="min-w-[8rem] inline-flex items-center outline-none"
+              >
+                {saving ? null : !dirty && savedAt ? (
+                  <span className="coord-spark">Saved</span>
+                ) : dirty ? (
+                  <span className="coord">Unsaved changes</span>
+                ) : null}
               </span>
-              {dirty && !savedAt && !saving && (
-                <span className="coord">Unsaved changes</span>
-              )}
             </div>
           )}
         </div>
       </section>
 
-      {/* § LIFECYCLE */}
+      {/* § LIFECYCLE — the two non-destructive lifecycle controls grouped into
+          one card so the tinted Danger zone below reads as the deliberate
+          outlier. */}
       {canEdit && (
         <section aria-labelledby="lifecycle-h" className="mb-12">
           <header className="flex items-baseline gap-3 pb-3 border-b border-border mb-4">
             <h2 id="lifecycle-h" className="coord-ink">
               Lifecycle
             </h2>
+            <span className="coord">archive · transfer</span>
           </header>
 
-          <div className="space-y-5">
-            <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-4">
+          <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm divide-y divide-border">
+            <div className="p-4">
               <div className="flex items-baseline justify-between flex-wrap gap-y-3">
                 <div className="min-w-0 pr-4">
-                  <h3 className="text-base font-semibold tracking-tight mb-1">
+                  <h3 className="text-base font-semibold tracking-tight mb-1 inline-flex items-center gap-1.5">
+                    {info?.is_archived ? (
+                      <Archive className="h-4 w-4 text-foreground-muted" aria-hidden />
+                    ) : (
+                      <CheckCircle2 className="h-4 w-4 text-success" aria-hidden />
+                    )}
                     {info?.is_archived ? "Archived" : "Active"}
                   </h3>
                   <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
@@ -444,7 +539,7 @@ export default function VaultSettingsPage() {
               </div>
             </div>
 
-            <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm p-4">
+            <div className="p-4">
               <h3 className="text-base font-semibold tracking-tight mb-1">
                 Transfer ownership
               </h3>
@@ -473,7 +568,8 @@ export default function VaultSettingsPage() {
           <div className="rounded-[var(--radius-lg)] border border-destructive/50 bg-destructive/5 p-4">
             <div className="flex items-baseline justify-between flex-wrap gap-y-3">
               <div className="min-w-0 pr-4">
-                <h3 className="text-base font-semibold tracking-tight mb-1 text-destructive">
+                <h3 className="text-base font-semibold tracking-tight mb-1 inline-flex items-center gap-1.5 text-destructive">
+                  <AlertTriangle className="h-4 w-4" aria-hidden />
                   Delete vault permanently
                 </h3>
                 <p className="text-sm text-foreground-muted leading-relaxed max-w-prose">
@@ -484,6 +580,20 @@ export default function VaultSettingsPage() {
                   cannot be undone — prefer Archive if you only need to freeze the
                   vault.
                 </p>
+                {tables.length > 0 && (
+                  <p className="text-xs text-foreground-muted leading-relaxed max-w-prose mt-2">
+                    Tables destroyed:{" "}
+                    {tables.slice(0, 6).map((t, i) => (
+                      <span key={t.name}>
+                        {i > 0 && ", "}
+                        <span className="text-foreground">{t.name}</span> (
+                        {(t.row_count ?? 0).toLocaleString()} row
+                        {t.row_count === 1 ? "" : "s"})
+                      </span>
+                    ))}
+                    {tables.length > 6 && <>, +{tables.length - 6} more</>}.
+                  </p>
+                )}
               </div>
               <Button variant="destructive" onClick={() => setDeleteOpen(true)}>
                 <Trash2 className="h-4 w-4" aria-hidden />
@@ -569,23 +679,54 @@ export default function VaultSettingsPage() {
   );
 }
 
+function SettingsStatSkeleton() {
+  return (
+    <div
+      className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm px-4 py-3.5"
+      aria-hidden
+    >
+      <div className="h-3 w-16 rounded bg-surface-muted animate-pulse mb-2" />
+      <div className="h-7 w-10 rounded bg-surface-muted animate-pulse" />
+    </div>
+  );
+}
+
 interface DiagStats {
   pending?: number;
   retrying?: number;
   abandoned?: number;
 }
 
+/** A glanceable verdict so a healthy pipeline reads "Caught up" instead of a
+ *  wall of 0/0/0 — color always paired with an icon + word. */
+function diagVerdict(stats?: DiagStats): { label: string; cls: string; Icon: LucideIcon } {
+  const a = stats?.abandoned ?? 0;
+  const inFlight = (stats?.pending ?? 0) + (stats?.retrying ?? 0);
+  if (a > 0) return { label: `${a.toLocaleString()} abandoned`, cls: "text-destructive", Icon: AlertTriangle };
+  if (inFlight > 0)
+    return { label: `${inFlight.toLocaleString()} in progress`, cls: "text-warning", Icon: CircleDashed };
+  return { label: "Caught up", cls: "text-success", Icon: CheckCircle2 };
+}
+
 function DiagCell({ title, stats }: { title: string; stats?: DiagStats }) {
+  const v = diagVerdict(stats);
+  const VIcon = v.Icon;
   return (
     <div className="bg-surface p-3">
-      <div className="coord-ink mb-2">{title}</div>
-      <dl className="text-xs space-y-1 font-mono tabular-nums">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="coord-ink">{title}</div>
+        <span className={`inline-flex items-center gap-1 text-xs ${v.cls}`}>
+          <VIcon className="h-3 w-3" aria-hidden />
+          {v.label}
+        </span>
+      </div>
+      <dl className="text-xs space-y-1 tabular-nums">
         <div className="flex justify-between">
-          <dt>pending</dt>
+          <dt className="text-foreground-muted">pending</dt>
           <dd>{stats?.pending ?? "—"}</dd>
         </div>
         <div className="flex justify-between">
-          <dt>retrying</dt>
+          <dt className="text-foreground-muted">retrying</dt>
           <dd>{stats?.retrying ?? "—"}</dd>
         </div>
         <div className="flex justify-between text-destructive">
