@@ -436,7 +436,7 @@ export default function SettingsPage() {
     (user.display_name ?? "") !== profileDisplayName || user.email !== profileEmail;
 
   return (
-    <div className="max-w-[1280px] mx-auto fade-up">
+    <div className="max-w-4xl mx-auto fade-up">
       {/* One upward affordance — a history-aware Back. The breadcrumb's
           location (Settings › {tab}) was redundant with the H1 + the tab bar
           right below, and its middle crumb self-linked to this page. */}
@@ -482,7 +482,7 @@ export default function SettingsPage() {
         </TabsList>
 
         {/* Profile — read-only account info */}
-        <TabsContent value="profile" className="pt-6 max-w-4xl space-y-6">
+        <TabsContent value="profile" className="pt-6 space-y-6">
           {/* Account card */}
           <form
             onSubmit={handleSaveProfile}
@@ -615,7 +615,7 @@ export default function SettingsPage() {
         </TabsContent>
 
         {/* Tokens — PATs + fresh token banner when minted */}
-        <TabsContent value="tokens" className="pt-6 space-y-6 max-w-4xl">
+        <TabsContent value="tokens" className="pt-6 space-y-6">
           {newPat && (
             <section
               className="rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm overflow-hidden"
@@ -947,7 +947,7 @@ export default function SettingsPage() {
 
         {/* Preferences — theme control inline (synced with the header menu via
             useTheme), not a read-only status pointing off-page. */}
-        <TabsContent value="preferences" className="pt-6 max-w-4xl space-y-6">
+        <TabsContent value="preferences" className="pt-6 space-y-6">
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
             <header className="border-b border-border px-6 py-3">
               <span id="theme-label" className="coord-ink">Theme</span>
@@ -979,7 +979,7 @@ export default function SettingsPage() {
 
         {/* Admin — user management. Only rendered when user.is_admin. */}
         {user.is_admin && (
-          <TabsContent value="admin" className="pt-6 max-w-4xl space-y-6">
+          <TabsContent value="admin" className="pt-6 space-y-6">
             {/* Search + sort bar */}
             <div className="flex flex-wrap items-center gap-3">
               <Input
