@@ -1,5 +1,5 @@
 import { matchPath } from "react-router-dom";
-import type { TreeNode } from "@/hooks/use-vault-tree";
+import type { NodeKind, TreeNode } from "@/hooks/use-vault-tree";
 
 /**
  * Resolve which tree node (if any) the current URL refers to. Returns a
@@ -93,6 +93,11 @@ export interface FlatRow {
   sig: string;
   /** True iff this collection is currently expanded. `false` for leaves. */
   isOpen: boolean;
+  /** When set, render a kind-group label ("Documents"/"Tables"/"Files") just
+   *  above this row. Populated only on the first row of each leaf-kind group,
+   *  and only inside a parent that actually mixes ≥2 leaf kinds — a doc-only
+   *  collection stays unlabeled. Purely visual; not a focusable tree row. */
+  kindHeader?: NodeKind;
 }
 
 /**
@@ -111,9 +116,22 @@ export function flattenVisible(
 ): FlatRow[] {
   const out: FlatRow[] = [];
   const visit = (list: TreeNode[], depth: number) => {
+    // Label kind groups only when this sibling list mixes ≥2 leaf kinds
+    // (sub-collections don't count) — a doc-only collection stays unlabeled so
+    // the common case carries no extra chrome. The list is already sorted
+    // collection→document→table→file, so each kind arrives in one contiguous run.
+    const leafKinds = new Set<NodeKind>();
+    for (const n of list) if (n.kind !== "collection") leafKinds.add(n.kind);
+    const grouped = leafKinds.size >= 2;
+    let prevLeafKind: NodeKind | null = null;
     for (const n of list) {
       const isOpen = n.kind === "collection" && (forceOpen || expanded.has(n.path));
-      out.push({ node: n, depth, sig: signatureOf(n), isOpen });
+      let kindHeader: NodeKind | undefined;
+      if (grouped && n.kind !== "collection" && n.kind !== prevLeafKind) {
+        kindHeader = n.kind;
+      }
+      if (n.kind !== "collection") prevLeafKind = n.kind;
+      out.push({ node: n, depth, sig: signatureOf(n), isOpen, kindHeader });
       if (isOpen && n.children) visit(n.children, depth + 1);
     }
   };

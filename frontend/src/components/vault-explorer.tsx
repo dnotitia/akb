@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { SkillBadge } from "@/components/ui/skill-badge";
-import { useVaultTree, useExpandedPaths, type TreeNode } from "@/hooks/use-vault-tree";
+import { useVaultTree, useExpandedPaths, type NodeKind, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import {
   activePathFromRoute,
@@ -260,8 +260,9 @@ export function VaultExplorer({
 
         {!loading && !error &&
           visibleRows.map((r) => (
-            <TreeRow
-              key={r.sig}
+            <Fragment key={r.sig}>
+              {r.kindHeader && <KindGroupLabel kind={r.kindHeader} depth={r.depth} />}
+              <TreeRow
               node={r.node}
               depth={r.depth}
               sig={r.sig}
@@ -295,7 +296,8 @@ export function VaultExplorer({
                   subCollectionCount: countSubCollections(node),
                 })
               }
-            />
+              />
+            </Fragment>
           ))}
 
         {!loading && !error && !filter && !uncapped &&
@@ -518,6 +520,34 @@ const TreeRow = memo(function TreeRow({
     </Link>
   );
 });
+
+/* ── Kind-group label (Documents / Tables / Files) ────────────────────────── */
+
+const KIND_LABEL: Partial<Record<NodeKind, string>> = {
+  document: "Documents",
+  table: "Tables",
+  file: "Files",
+};
+
+/**
+ * A muted, non-interactive group heading rendered above the first row of each
+ * leaf-kind run when a collection mixes kinds (Sentence case per the design
+ * system). `role="presentation"` + no `data-sig` keeps it out of the tree's
+ * roving keyboard nav and the aria-tree row set — it's purely a visual divider.
+ */
+function KindGroupLabel({ kind, depth }: { kind: NodeKind; depth: number }) {
+  const label = KIND_LABEL[kind];
+  if (!label) return null;
+  return (
+    <div
+      role="presentation"
+      style={{ paddingLeft: `${depth * 12 + 12}px` }}
+      className="coord px-2 pt-2 pb-0.5 select-none"
+    >
+      {label}
+    </div>
+  );
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
