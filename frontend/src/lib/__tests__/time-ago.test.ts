@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isFresh, timeAgo } from "@/lib/utils";
+import { isFresh, recencyTone, timeAgo } from "@/lib/utils";
 
 // timeAgo / isFresh are time-relative, so pin "now" to a fixed instant and
 // build each input as an offset back from it. Locks the bucket boundaries
@@ -57,5 +57,19 @@ describe("isFresh", () => {
     expect(isFresh(ago(2 * HOUR))).toBe(false);
     expect(isFresh(null)).toBe(false);
     expect(isFresh("not-a-date")).toBe(false);
+  });
+});
+
+describe("recencyTone", () => {
+  it("cools from spark through the warm ramp to muted with age", () => {
+    expect(recencyTone(ago(30 * MIN))).toBe("var(--color-spark)"); // <1h
+    expect(recencyTone(ago(5 * HOUR))).toBe("var(--color-recency-h)"); // <1d
+    expect(recencyTone(ago(3 * DAY))).toBe("var(--color-recency-d)"); // <1w
+    expect(recencyTone(ago(20 * DAY))).toBe("var(--color-recency-w)"); // <1mo
+    expect(recencyTone(ago(90 * DAY))).toBe("var(--color-foreground-muted)"); // ≥1mo
+  });
+  it("falls back to muted for missing/invalid input", () => {
+    expect(recencyTone(null)).toBe("var(--color-foreground-muted)");
+    expect(recencyTone("not-a-date")).toBe("var(--color-foreground-muted)");
   });
 });

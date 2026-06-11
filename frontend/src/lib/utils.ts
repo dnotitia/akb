@@ -79,6 +79,27 @@ export function isFresh(iso: string | null | undefined, withinMs = 3_600_000): b
 }
 
 /**
+ * Color for a relative timestamp on the recency ramp — vivid warm when
+ * just-touched (== --color-spark), desaturating warm as it ages, muted gray
+ * once old. Buckets mirror timeAgo(): <1h spark / <1d / <1w / <1mo / ≥1mo. The
+ * time TEXT carries the meaning; this is a secondary "how recent" tint (the dot
+ * in <RelativeTime> shows only for the fresh tier). Returns a CSS var token.
+ */
+export function recencyTone(iso: string | null | undefined): string {
+  if (!iso) return "var(--color-foreground-muted)";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "var(--color-foreground-muted)";
+  const mins = (Date.now() - t) / 60000;
+  if (mins < 60) return "var(--color-spark)"; // < 1h (fresh)
+  const hrs = mins / 60;
+  if (hrs < 24) return "var(--color-recency-h)"; // < 1d
+  const days = hrs / 24;
+  if (days < 7) return "var(--color-recency-d)"; // < 1w
+  if (days < 30) return "var(--color-recency-w)"; // < 1mo
+  return "var(--color-foreground-muted)"; // ≥ 1mo
+}
+
+/**
  * Deterministic string → hue in [0,360) (FNV-1a). Same key always maps to the
  * same hue regardless of how many keys exist, so a vault keeps one identity
  * color across Recent activity, the directory, and the graph clusters (which

@@ -1,4 +1,4 @@
-import { cn, formatDate, isFresh, timeAgo } from "@/lib/utils";
+import { cn, formatDate, isFresh, recencyTone, timeAgo } from "@/lib/utils";
 
 interface RelativeTimeProps {
   /** ISO timestamp to render relatively (e.g. "3h ago", "8mo ago"). */
@@ -24,25 +24,27 @@ export function RelativeTime({ iso, className, fallback }: RelativeTimeProps) {
   if (!iso) {
     return <span className={cn("coord tabular-nums", className)}>{fallback ?? "-"}</span>;
   }
-  // Exact date on hover, everywhere — the relative grain is the glance, the
-  // tooltip is the precise answer.
+  // Exact date on hover; the relative grain is the glance, the tooltip the
+  // precise answer.
   const title = formatDate(iso);
-  if (isFresh(iso)) {
-    return (
-      <span
-        title={title}
-        className={cn(
-          "inline-flex items-center gap-1 text-[11px] font-medium tabular-nums text-spark",
-          className,
-        )}
-      >
-        <span className="h-1.5 w-1.5 rounded-full bg-spark" aria-hidden />
-        {timeAgo(iso)}
-      </span>
-    );
-  }
+  // Every tier is tinted on the recency ramp (recencyTone): vivid warm when
+  // just-touched, cooling to muted gray as it ages — so "how recent" reads at a
+  // glance, not just from the number. Only the fresh (<1h) tier keeps the spark
+  // dot, an "active now" marker that's odd on an old timestamp.
+  const tone = recencyTone(iso);
+  const fresh = isFresh(iso);
   return (
-    <span title={title} className={cn("coord tabular-nums", className)}>
+    <span
+      title={title}
+      style={{ color: tone }}
+      className={cn(
+        "inline-flex items-center gap-1 text-[11px] font-medium tabular-nums",
+        className,
+      )}
+    >
+      {fresh && (
+        <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: tone }} aria-hidden />
+      )}
       {timeAgo(iso)}
     </span>
   );
