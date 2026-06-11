@@ -1,0 +1,83 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(sed -n *)",
+      "Bash(nl *)",
+      "Bash(python3 .claude/hooks/akb_pm_hook.py *)",
+      "Bash(bash scripts/check.sh)",
+      "Bash(cd backend && pytest *)",
+      "Bash(cd frontend && npx --no-install *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./config/secret.yaml)",
+      "Read(./deploy/k8s/internal/**)",
+      "Read(./deploy/k8s/aws-internal/**)",
+      "Read(./deploy/k8s/aws-demo-internal/**)",
+      "Bash(rm -rf *)",
+      "Bash(git reset --hard *)",
+      "Bash(git checkout -- *)",
+      "Bash(git clean -*)",
+      "Bash(git push --force *)"
+    ]
+  },
+  "enabledPlugins": {
+    "claude-md-management@claude-plugins-official": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/akb_pm_hook.py\" session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/akb_pm_hook.py\" user-prompt",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Write|Edit|MultiEdit|mcp__akb__.*|mcp__akb_test__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/akb_pm_hook.py\" pre-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/akb_pm_hook.py\" stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

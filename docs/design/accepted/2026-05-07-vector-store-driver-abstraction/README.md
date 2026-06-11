@@ -1,3 +1,10 @@
+---
+status: accepted
+stage: applied
+created: 2026-05-07
+updated: 2026-06-11
+---
+
 # Vector store driver abstraction + pgvector path to OSS
 
 **Status**: Approved 2026-05-07 — implementation in progress
