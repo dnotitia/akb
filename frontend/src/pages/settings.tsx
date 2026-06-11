@@ -437,26 +437,22 @@ export default function SettingsPage() {
 
   return (
     <div className="max-w-[1280px] mx-auto fade-up">
-      <div className="flex items-center justify-between mb-6">
+      {/* One upward affordance — a history-aware Back. The breadcrumb's
+          location (Settings › {tab}) was redundant with the H1 + the tab bar
+          right below, and its middle crumb self-linked to this page. */}
+      <div className="mb-6">
         <button
           type="button"
           onClick={goBack}
-          className="inline-flex items-center gap-1.5 coord hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex items-center gap-1.5 min-h-[36px] coord hover:text-link transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-[var(--radius-sm)]"
         >
           <ArrowLeft className="h-3 w-3" aria-hidden />
           Back
         </button>
-        <nav aria-label="Breadcrumb" className="flex items-center gap-2 coord">
-          <Link to="/" className="hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">Home</Link>
-          <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-          <Link to="/settings" className="hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">Settings</Link>
-          <ChevronRight className="h-3 w-3 text-foreground-muted" aria-hidden />
-          <span className="text-foreground capitalize">{activeTab}</span>
-        </nav>
       </div>
 
       <header className="mb-6">
-        <div className="coord-spark mb-2">Settings</div>
+        <div className="coord-spark mb-2">Account · {user.username}</div>
         <h1 className="font-display text-3xl text-foreground">
           Settings
         </h1>
@@ -466,7 +462,9 @@ export default function SettingsPage() {
       </header>
 
       <Tabs value={activeTab} onValueChange={setTab}>
-        <TabsList>
+        {/* Scroll the pill track on narrow screens so the admin 4-tab row never
+            clips at 375px (the raised pills break if wrapped). */}
+        <TabsList className="max-w-full overflow-x-auto">
           <TabsTrigger value="profile">Profile</TabsTrigger>
           <TabsTrigger value="tokens" className="gap-1.5">
             Tokens
@@ -617,7 +615,7 @@ export default function SettingsPage() {
         </TabsContent>
 
         {/* Tokens — PATs + fresh token banner when minted */}
-        <TabsContent value="tokens" className="pt-6 space-y-4 max-w-4xl">
+        <TabsContent value="tokens" className="pt-6 space-y-6 max-w-4xl">
           {newPat && (
             <section
               className="rounded-[var(--radius-lg)] border border-accent/40 bg-accent/5 shadow-sm overflow-hidden"
@@ -708,7 +706,18 @@ export default function SettingsPage() {
                   </div>
                 </>
               ) : pats.length === 0 ? (
-                <EmptyState title="No tokens yet — mint one below." />
+                <EmptyState
+                  title="No tokens yet"
+                  description="Mint your first token to connect an agent."
+                  action={
+                    !setupOpen ? (
+                      <Button variant="outline" size="sm" onClick={() => setSetupOpen(true)}>
+                        Set up a token
+                      </Button>
+                    ) : undefined
+                  }
+                />
+
               ) : (
                 <div className="rounded-[var(--radius-md)] border border-border divide-y divide-border overflow-hidden">
                   {(pats ?? []).map((p, i) => (
@@ -970,7 +979,7 @@ export default function SettingsPage() {
 
         {/* Admin — user management. Only rendered when user.is_admin. */}
         {user.is_admin && (
-          <TabsContent value="admin" className="pt-6 max-w-5xl space-y-4">
+          <TabsContent value="admin" className="pt-6 max-w-4xl space-y-6">
             {/* Search + sort bar */}
             <div className="flex flex-wrap items-center gap-3">
               <Input
@@ -996,12 +1005,15 @@ export default function SettingsPage() {
               />
             </div>
 
-            {/* Match count */}
-            <div className="coord">
-              [{filteredUsers.length} matching of {users?.length ?? 0}]
-            </div>
-
             <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm overflow-hidden">
+              {/* Count lives in the card header (parity with the Tokens card),
+                  not an orphan line floating above the card. */}
+              <header className="border-b border-border px-6 py-3 flex items-baseline gap-3">
+                <span className="coord-ink">Users</span>
+                <span className="coord tabular-nums">
+                  [{users ? `${filteredUsers.length} of ${users.length}` : "··"}]
+                </span>
+              </header>
               <div className="p-6">
                 {usersError ? (
                   <EmptyState
