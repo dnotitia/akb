@@ -202,6 +202,28 @@ class Settings(BaseModel):
     # Relative → resolves against the request origin (same host the user
     # is already on), so it works for both :3000 dev proxy and prod ingress.
     keycloak_post_login_path: str = "/auth/callback"
+    # Companion-app post-login origins for cross-origin SSO delegation.
+    #
+    # Empty (default) → the post-login one-time code is ALWAYS delivered to
+    # the same-site keycloak_post_login_path (AKB's own SPA). Behaviour is
+    # then 100% identical to before this option existed; no other origin can
+    # ever receive the code.
+    #
+    # When set, a first-party companion app served on a listed origin (e.g.
+    # reef at https://reef-<slug>.<domain>) can ride THIS akb's Keycloak
+    # client without owning its own client/realm/secret. It starts SSO via
+    #   GET /auth/keycloak/login?redirect=<absolute-callback-URL-on-that-origin>
+    # and akb delivers the one-time code to that URL (which the companion
+    # then exchanges server-side via POST /auth/keycloak/exchange). This is
+    # what makes a single per-instance keycloak_post_login_path stop being a
+    # bottleneck: akb's own SPA and the companion can both complete SSO,
+    # selected per request by the redirect target rather than one global path.
+    #
+    # Open-redirect protection is preserved: a redirect whose origin is NOT
+    # in this list collapses to the safe same-site path. Each entry must be a
+    # full origin matched as scheme://host[:port], e.g.
+    #   ["https://reef-acme.example.com"]
+    keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
     # One-time exchange-code TTL (seconds). The callback hands the SPA a
     # short-lived opaque code; the SPA trades it for the AKB JWT over a
     # POST so the token never rides in a URL. Keep this small.

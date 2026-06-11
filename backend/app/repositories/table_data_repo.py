@@ -205,6 +205,42 @@ def _scan_dollar_quote(sql: str, start: int) -> int | None:
     return end + len(tag)
 
 
+def count_statement_separators(sql: str) -> int:
+    """Count the ``;`` characters in ``sql`` that act as statement
+    separators — i.e. appear OUTSIDE string literals, quoted
+    identifiers, comments, and dollar-quoted blocks.
+
+    Shares the tokenizer (``_SQL_TOKEN_RE`` + ``_scan_dollar_quote``)
+    with ``rewrite_table_names`` so the multi-statement guard in
+    ``table_service.execute_sql`` classifies semicolons with exactly
+    the same scope-awareness as the rewriter. The previous guard was a
+    literal-blind ``";" in sql`` membership test, which rejected single
+    statements like ``VALUES ('Fix bug; refactor')`` (issue #180).
+
+    Tolerance for trailing semicolons is the caller's policy: this
+    helper reports every separator it sees.
+    """
+    count = 0
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        # Same walk order as `rewrite_table_names`: manual dollar-quote
+        # scan first, then the token regex.
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            # Should not happen — `sym` catches any character. Safety net.
+            pos += 1
+            continue
+        if m.lastgroup == "sym" and m.group() == ";":
+            count += 1
+        pos = m.end()
+    return count
+
+
 def rewrite_table_names(sql: str, table_map: dict[str, str]) -> str:
     """Replace short table names in ``sql`` with their pg-qualified
     names, but ONLY for bare identifiers — never inside string literals,

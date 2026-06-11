@@ -46,7 +46,7 @@ import {
 } from "lucide-react";
 import "katex/dist/katex.min.css";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
-import { parseHeadings, slugify } from "@/lib/markdown";
+import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
 
 /* ── LaTeX delimiter normalization ────────────────────────────────
    GPT-family models emit \[..\] / \(..\); remark-math only groks the
@@ -695,13 +695,18 @@ export interface MarkdownRenderProps {
  * (see src/index.css).
  */
 export function MarkdownRender({ markdown, className }: MarkdownRenderProps) {
+  // Drop any leading embedded frontmatter block before rendering so its
+  // closing `---` isn't parsed as a setext heading (see stripFrontmatter).
+  // Sharing the stripped body keeps the rendered headings and the slug
+  // queue built inside buildComponents in lock-step.
+  const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
   const normalized = useMemo(
-    () => normalizeLatexDelimiters(markdown || ""),
-    [markdown],
+    () => normalizeLatexDelimiters(body),
+    [body],
   );
   const components = useMemo(
-    () => buildComponents(markdown || ""),
-    [markdown],
+    () => buildComponents(body),
+    [body],
   );
 
   return (

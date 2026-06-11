@@ -7,11 +7,16 @@ export type RelationKind =
   | "references"
   | "related_to"
   | "attached_to"
-  | "derived_from";
+  | "derived_from"
+  // Body markdown / wikilink references (`[[…]]`, `[..](..)`) extracted by
+  // the backend as implicit edges. Omitting it here silently dropped every
+  // body-link edge from the graph even when the backend returned it.
+  | "links_to";
 
 export const ALL_NODE_KINDS: ReadonlyArray<NodeKind> = ["document", "table", "file"];
 export const ALL_RELATIONS: ReadonlyArray<RelationKind> = [
   "depends_on", "implements", "references", "related_to", "attached_to", "derived_from",
+  "links_to",
 ];
 
 export interface GraphNode {
@@ -104,4 +109,5 @@ export const RELATION_DASH: Record<RelationKind, number[]> = {
   related_to: [2, 2],
   attached_to: [],
   derived_from: [6, 2],
+  links_to: [1, 3],
 };

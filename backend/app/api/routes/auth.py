@@ -109,11 +109,98 @@ def _safe_redirect_path(raw: str | None) -> str:
     return raw
 
 
+def _normalize_origin(value: str | None) -> str | None:
+    """Canonical ``scheme://host[:port]`` for an absolute http(s) URL, else None.
+
+    Rejects anything that is not a plain absolute http/https URL: relative
+    paths, scheme-relative ``//host``, non-web schemes, and — crucially —
+    URLs carrying embedded credentials (``https://trusted@evil.com``, whose
+    real host is ``evil.com``), a classic origin-spoofing trick. The host is
+    lowercased so the comparison is case-insensitive.
+    """
+    if not value:
+        return None
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    if "@" in parsed.netloc:  # embedded userinfo — spoof guard
+        return None
+    origin = f"{parsed.scheme}://{parsed.hostname.lower()}"
+    if parsed.port is not None:
+        origin += f":{parsed.port}"
+    return origin
+
+
+def _allowed_companion_origin(raw: str | None) -> str | None:
+    """Origin of ``raw`` iff it is an absolute URL on a configured companion
+    origin (``keycloak_post_login_allowed_origins``); otherwise None.
+
+    This allowlist is the ONLY gate that lets the post-login one-time code
+    leave akb's own origin. An empty list ⇒ always None ⇒ the same-site
+    behaviour that predates the option.
+    """
+    origin = _normalize_origin(raw)
+    if origin is None:
+        return None
+    allowed = {
+        _normalize_origin(o) for o in settings.keycloak_post_login_allowed_origins
+    }
+    return origin if origin in allowed else None
+
+
+def _with_query_param(url: str, key: str, value: str) -> str:
+    """Append ``key=value`` to ``url``'s query, preserving existing query
+    and fragment."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    query.append((key, value))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path,
+         urllib.parse.urlencode(query), parts.fragment)
+    )
+
+
+def _post_login_target(redirect: str | None, one_time_code: str) -> str:
+    """Build the URL the SSO callback bounces the browser to, carrying the
+    one-time code. Two shapes, chosen per request:
+
+    - **Companion app** (cross-origin SSO delegation): ``redirect`` is an
+      absolute URL on an allowlisted origin → deliver the code straight to
+      that URL (origin + path + its own query preserved). This is how a
+      first-party app like reef, riding akb's Keycloak client, gets the code
+      back on *its* origin instead of akb's SPA.
+    - **Default / akb's own SPA**: append the code to the same-site
+      ``keycloak_post_login_path`` and carry the safe in-app path as
+      ``redirect``. Any non-allowlisted absolute / scheme-relative value
+      collapses here (open-redirect protection).
+
+    The allowlist is re-checked here (not just at login time) so the
+    delivery decision always reflects current config, never a value frozen
+    into flow state minutes earlier.
+    """
+    if _allowed_companion_origin(redirect) is not None:
+        return _with_query_param(redirect, "code", one_time_code)  # type: ignore[arg-type]
+    safe = _safe_redirect_path(redirect)
+    return (
+        f"{settings.keycloak_post_login_path}"
+        f"?code={urllib.parse.quote(one_time_code)}"
+        f"&redirect={urllib.parse.quote(safe, safe='')}"
+    )
+
+
 @router.get("/auth/keycloak/login", summary="Begin Keycloak SSO login")
 async def keycloak_login(redirect: str = "/"):
     _require_keycloak()
     from app.services.keycloak_oidc import get_keycloak_oidc
-    url = await get_keycloak_oidc().begin_login(_safe_redirect_path(redirect))
+    # An allowlisted companion-app absolute URL rides through verbatim
+    # (re-validated at callback time); everything else is reduced to a safe
+    # same-site path before it ever enters the flow state.
+    dest = (
+        redirect
+        if _allowed_companion_origin(redirect) is not None
+        else _safe_redirect_path(redirect)
+    )
+    url = await get_keycloak_oidc().begin_login(dest)
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
@@ -153,12 +240,7 @@ async def keycloak_callback(request: Request):
     # Stash the Keycloak id_token too so the SPA can pass it back as
     # id_token_hint on logout (seamless RP-initiated logout, no KC prompt).
     one_time = await issue_exchange_code({**login_response, "kc_id_token": id_token})
-    dest = _safe_redirect_path(flow.get("redirect_path", "/"))
-    target = (
-        f"{settings.keycloak_post_login_path}"
-        f"?code={urllib.parse.quote(one_time)}"
-        f"&redirect={urllib.parse.quote(dest, safe='')}"
-    )
+    target = _post_login_target(flow.get("redirect_path", "/"), one_time)
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 

@@ -5,6 +5,48 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.9 — 2026-06-10  *(patch — register migration 035 in the runtime applier + guard test)*
+
+Migrations run from an **explicit hardcoded list** in `_apply_migrations` (`app/db/postgres.py`), not by globbing the directory — a deliberate design so a steady-state boot runs zero DDL. 0.8.8 added `035_fix_wikilink_alias_edges.py` but **not** its entry in that list, so the migration shipped as a **no-op**: the file was in the image but never invoked, and the already-corrupted edges stayed corrupted on deploy.
+
+This registers `035_fix_wikilink_alias_edges.py` so it actually runs, and adds `tests/test_migrations_registered_unit.py` — a guard that fails if any `0NN_*.py` migration file on disk is missing from the applier list (with a tiny documented allowlist for the two applied via init.sql). That guard would have caught the 0.8.8 omission in CI.
+
+## 0.8.8 — 2026-06-10  *(patch — knowledge graph: wikilink-alias edge corruption + implicit-edge existence validation)*
+
+Body-link extraction had **no handling for Obsidian wikilinks** `[[target|alias]]`. The greedy bare-`akb://` scan (`_AKB_URI_RE`) then swallowed the alias's first word onto the target — a References line like `[[akb://v/coll/decisions/doc/x.md|PWC Query Performance Optimization]]` produced the edge target `akb://v/coll/decisions/doc/x.md|PWC` (matching stopped at the first space). One bug, two symptoms:
+
+- **Relations panel / `akb_relations`** returned the malformed URI, so "related to" navigation built a broken `…/x.md%7CPWC` link to a non-existent doc.
+- **Graph drew no edges** — the corrupted target matched no document node, so every body-derived edge was silently un-drawable. A vault whose only relations were wikilinks showed all nodes, zero edges.
+
+Three-part fix:
+
+1. **Parser** (`extract_markdown_links`): added a wikilink matcher `[[target|alias]]` that keeps only the target (alias is display text), and tightened `_AKB_URI_RE` to stop at `|`, `[`, `]` so the bare-URI fallback can no longer absorb an alias or a closing `]]`.
+2. **Existence validation** (`_store_edge`): the implicit extraction path now validates the target **exists** before storing — via the *same* `_resource_exists` primitive the explicit `akb_link` path uses (the two paths differ only in policy: `akb_link` returns `NOT_FOUND`, extraction silently skips). An implicit edge to a non-existent resource can never be drawn and only pollutes the graph; previously the URI branch skipped this check, which is how the malformed targets persisted. *Note:* a frontmatter `depends_on` / `related_to` (or body link) whose target does not yet exist is now dropped rather than stored as a dangling edge — a deliberate forward-reference is re-materialized on the next index after the target is created.
+3. **Migration 035** (`035_fix_wikilink_alias_edges.py`): repairs rows already persisted — for each edge whose `target_uri` contains `|`, strips to the real target and, if that target resolves, re-inserts the corrected edge (ON CONFLICT DO NOTHING) and drops the corrupted row; orphans whose cleaned target doesn't resolve are dropped. Idempotent.
+
+### Tests
+`tests/test_kg_extract_links_unit.py` gains wikilink coverage: akb:// + alias strips to the clean URI (and asserts no alias fragment leaks), path + alias, alias-less `[[…]]`, the exact historical "stopped at the space" failure shape, bare-scan dedup, and a wikilink inside a code span staying ignored.
+
+## 0.8.7 — 2026-06-10  *(minor — Keycloak SSO: cross-origin companion-app post-login redirect allowlist)*
+
+A single AKB backend can act as the identity owner for a small family of first-party apps on **different origins** (e.g. reef at `reef-<slug>.<domain>` alongside akb's own `akb-<slug>.<domain>`), each delegating to the *same* tenant Keycloak client instead of registering its own. The blocker was that the SSO post-login redirect was a **single per-instance** `keycloak_post_login_path`: the callback always bounced the one-time code to that one same-site path, and `_safe_redirect_path()` collapsed any cross-origin redirect (open-redirect guard). So akb's own SPA and a companion app could not both complete SSO — they fought over one global path, and pointing `keycloak_post_login_path` at the companion's absolute URL (the earlier workaround) just broke akb's own SPA instead.
+
+New optional setting **`keycloak_post_login_allowed_origins`** (list, default empty) lifts this **per request** without weakening the open-redirect guard:
+
+- A companion app starts SSO via `GET /auth/keycloak/login?redirect=<absolute-URL-on-an-allowlisted-origin>`; the callback delivers the one-time `code` straight to that URL (origin + path + its own query preserved). It then exchanges the code server-side via the existing `POST /auth/keycloak/exchange` — same single-use, ≤60s-TTL guarantees as the akb-SPA path, now delivered to a vetted origin.
+- akb's own SPA (a same-site `redirect` path) is unchanged: code goes to `keycloak_post_login_path?code=&redirect=<safe path>`.
+- **Empty list ⇒ identical to before.** No origin can ever receive the code; behaviour is 100% the pre-existing same-site flow.
+- **Open-redirect protection preserved.** Any redirect whose origin is not explicitly listed — absolute URLs, scheme-relative `//host`, and `https://trusted@evil.com` userinfo spoofs — collapses to the safe same-site path. Origins match as `scheme://host[:port]`.
+- **Re-validated at delivery.** The origin is checked at `begin_login` *and* again in the callback, so a config change during the ≤10-min flow window can only ever tighten where the code goes; flow-state values are never trusted blindly.
+- No new trust in the companion: it still stores no Keycloak client/secret/realm — identity stays owned by AKB.
+
+This is the AKB-side counterpart to the reef SSO-delegation work (reef-test REEF-102 / REEF-112) and supersedes the "point `keycloak_post_login_path` at the companion's absolute URL" workaround, which could satisfy only one origin per instance.
+
+`backend/app/api/routes/auth.py` gains `_normalize_origin` / `_allowed_companion_origin` / `_with_query_param` / `_post_login_target`; `keycloak_login` and `keycloak_callback` route through them. `backend/app/config.py` adds the setting (default empty). `config/app.yaml.example` and `docs/designs/keycloak-oidc/00-overview.md` document it.
+
+### Tests
+`tests/test_keycloak_redirect_unit.py` (new, 21 cases, no DB) pins the allowlist gate and the open-redirect guard: origin normalization (host lowercasing, port retention, non-http rejection), the userinfo-spoof rejection even when the trusted origin is listed, empty-list ⇒ same-site for every input, listed-origin code delivery with existing query preserved, and unlisted/absolute/scheme-relative collapse to the safe path.
+
 ## 0.8.6 — 2026-06-08  *(patch — GET document: read body at the row's current_commit, not floating HEAD (E03 read-side race))*
 
 `GET /documents/{vault}/{id}` (`akb_get`) assembled its response from **two unsynchronized reads**: the body via `git.read_file(vault, path)` — which reads the *floating vault HEAD* — and `current_commit` from the DB row. Under concurrent updates to the **same** document, a writer could advance git HEAD and the DB row between those two reads, so a single response carried a `content` and a `current_commit` belonging to **different writers** (the "E03" symptom: body ↔ current_commit disagree).

@@ -167,6 +167,7 @@ async def _apply_migrations() -> None:
         "032_drop_supersedes.py",               # drop never-used documents.supersedes column (status leaned to draft/active/archived)
         "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
         "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
+        "035_fix_wikilink_alias_edges.py",      # repair edges whose target_uri carries a wikilink alias ([[…|label]] → …|label); strip alias, re-validate existence, drop orphans
     ):
         if filename in applied:
             continue

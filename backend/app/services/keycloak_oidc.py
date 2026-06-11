@@ -132,7 +132,13 @@ class KeycloakOIDC:
     # ── Authorization request ────────────────────────────────────────
     async def begin_login(self, redirect_path: str = "/") -> str:
         """Create CSRF state (+PKCE for public clients) and return the
-        Keycloak authorization URL to redirect the browser to."""
+        Keycloak authorization URL to redirect the browser to.
+
+        ``redirect_path`` is the caller-vetted post-login destination carried
+        opaquely through flow state. It is normally a same-site path, but may
+        be an allowlisted companion-app absolute URL (cross-origin SSO); the
+        callback (`_post_login_target`) re-validates it before delivering the
+        one-time code, so this layer just stores it verbatim."""
         state = secrets.token_urlsafe(32)
         payload: dict[str, str] = {"redirect_path": redirect_path}
         params: dict[str, str] = {
