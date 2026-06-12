@@ -6,9 +6,9 @@ import { UserMenu } from "../user-menu";
 
 vi.mock("@/lib/api", () => ({
   getMe: vi.fn().mockResolvedValue({
-    username: "gnu",
-    email: "kwoo24@dnotitia.com",
-    display_name: "gnu",
+    username: "alice",
+    email: "alice@example.com",
+    display_name: "alice",
     is_admin: false,
   }),
   setToken: vi.fn(),

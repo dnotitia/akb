@@ -3,6 +3,7 @@ name = "akb"
 version = "0.8.10"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.14"
+license = "BUSL-1.1"
 # Runtime deps are exact-pinned for the same reproducibility reason
 # the [dev] tools below are: a silent resolver upgrade should not be
 # able to swap our backend image's behavior on a re-deploy. Bumps are

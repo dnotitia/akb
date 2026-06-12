@@ -15,7 +15,10 @@ cd "$(dirname "$0")/.."
 : "${RUNS_DIR:=runs_v4}"
 
 ARMS=(A1_search_only A2_grep_only A3_tree A4_all)
-PY=/Users/byongjohn_han/git-repository/akb/backend/.venv/bin/python
+# Default to the repo-relative backend venv; override with PY=... if your
+# venv lives elsewhere or you're running outside the repo tree.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="${PY:-${SCRIPT_DIR}/../../../backend/.venv/bin/python}"
 
 mkdir -p "$RUNS_DIR"
 
