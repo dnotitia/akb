@@ -62,13 +62,15 @@ jobs:
           pip install -e '.[dev]'
 
       - name: Write CI config files
-        run: |
+        # pragma: allowlist secret
+        run: |  # pragma: allowlist secret
           mkdir -p config /tmp/akb-vaults
           cat > config/app.yaml <<'YAML'
           db_host: localhost
           db_port: 15432
           db_name: akb
           db_user: akb
+          public_base_url: http://localhost:8000
           git_storage_path: /tmp/akb-vaults
           embed_base_url: http://localhost:8888/v1
           embed_model: ci-embed-stub
@@ -81,7 +83,7 @@ jobs:
           cat > config/secret.yaml <<'YAML'
           db_password: akb  # pragma: allowlist secret
           jwt_secret: ci-only-jwt-secret-not-for-prod-use  # pragma: allowlist secret
-          embed_api_key: ci-stub-no-auth
+          embed_api_key: ci-stub-no-auth  # pragma: allowlist secret
           YAML
 
       - name: Start embedding stub (background)
