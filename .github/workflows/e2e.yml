@@ -1,0 +1,173 @@
+name: e2e
+
+# Runs the canonical shell e2e suite against a live backend stack
+# (Postgres + backend) so PRs that break the MCP surface, RBAC
+# enforcement, or auth flow can't merge green. Lives in its own
+# workflow so the heavier bring-up doesn't slow down the lint/type
+# gate (`check.yml`) or the unit-test gate (`backend-pytest.yml`).
+#
+# Scope: HTTP-only suites — the npm stdio proxy isn't installed so
+# file-tool suites (test_stdio_files_e2e.sh, test_put_file_param_e2e.sh)
+# stay out for now. S3 (MinIO) is intentionally NOT brought up either;
+# none of the suites picked here exercise the file backend. Add a
+# MinIO service container when wiring those tests in.
+#
+# Embedding: stubbed by `backend/scripts/ci/embed_stub.py`. Suites
+# picked for CI either skip search assertions or tolerate "0 results"
+# under meaningless-vector search, so the stub is safe.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-e2e:
+    name: shell e2e (live stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: akb
+          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
+          POSTGRES_DB: akb
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U akb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install backend (runtime + dev)
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Write CI config files
+        run: |
+          mkdir -p config /tmp/akb-vaults
+          cat > config/app.yaml <<'YAML'
+          db_host: localhost
+          db_port: 15432
+          db_name: akb
+          db_user: akb
+          git_storage_path: /tmp/akb-vaults
+          embed_base_url: http://localhost:8888/v1
+          embed_model: ci-embed-stub
+          embed_dimensions: 1536
+          llm_base_url: ""
+          llm_model: ""
+          rerank_enabled: false
+          s3_endpoint_url: ""
+          YAML
+          cat > config/secret.yaml <<'YAML'
+          db_password: akb  # pragma: allowlist secret
+          jwt_secret: ci-only-jwt-secret-not-for-prod-use  # pragma: allowlist secret
+          embed_api_key: ci-stub-no-auth
+          YAML
+
+      - name: Start embedding stub (background)
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn scripts.ci.embed_stub:app \
+            --host 127.0.0.1 --port 8888 \
+            > /tmp/embed-stub.log 2>&1 &
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8888/healthz >/dev/null 2>&1; then
+              echo "embed stub ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start backend (background)
+        run: |
+          # Run uvicorn from repo root so the ./config/ candidate hits.
+          nohup python -m uvicorn app.main:app \
+            --app-dir backend \
+            --host 127.0.0.1 --port 8000 \
+            > /tmp/backend.log 2>&1 &
+          # Wait for /readyz — cold start typically settles in ~20s;
+          # 90s ceiling is a safety net for slow CI runners.
+          for i in $(seq 1 45); do
+            if curl -fsS http://localhost:8000/readyz 2>/dev/null | grep -q '"status"'; then
+              echo "backend ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/readyz || (echo "backend never came up"; tail -50 /tmp/backend.log; exit 1)
+
+      - name: Run canonical shell e2e suite
+        env:
+          AKB_URL: http://localhost:8000
+        run: |
+          # Curated subset of CLAUDE.md's canonical list — every suite
+          # here exercises the HTTP/MCP surface end-to-end without
+          # needing the npm proxy or a real embedding provider.
+          SUITES=(
+            test_probes_e2e.sh
+            test_mcp_e2e.sh
+            test_edit_e2e.sh
+            test_security_edge_e2e.sh
+            test_pg_rbac_e2e.sh
+            test_graph_replace_e2e.sh
+            test_defensive_e2e.sh
+            test_concurrency_repro_e2e.sh
+            test_jwt_revocation_e2e.sh
+          )
+          TOTAL_PASS=0
+          TOTAL_FAIL=0
+          FAILED=()
+          for s in "${SUITES[@]}"; do
+            echo "::group::$s"
+            OUT=$(bash "backend/tests/$s" 2>&1) && RC=0 || RC=$?
+            echo "$OUT" | tail -80
+            SUMMARY=$(echo "$OUT" | grep -E '^║.*Results:|^Results:' | tail -1)
+            P=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)
+            F=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '^[0-9]+' || echo 0)
+            TOTAL_PASS=$((TOTAL_PASS + ${P:-0}))
+            TOTAL_FAIL=$((TOTAL_FAIL + ${F:-0}))
+            echo "::endgroup::"
+            echo "▸ $s: ${P:-0} passed, ${F:-0} failed (rc=$RC)"
+            if [ "$RC" != "0" ] || [ "${F:-0}" != "0" ]; then
+              FAILED+=("$s")
+            fi
+          done
+          echo ""
+          echo "═════════════════════════════════════════"
+          echo "TOTAL: $TOTAL_PASS passed, $TOTAL_FAIL failed"
+          echo "═════════════════════════════════════════"
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "FAILED SUITES:"
+            for s in "${FAILED[@]}"; do echo "  - $s"; done
+            exit 1
+          fi
+
+      - name: Upload backend logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-log
+          path: |
+            /tmp/backend.log
+            /tmp/embed-stub.log
+          if-no-files-found: ignore
