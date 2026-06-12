@@ -9,12 +9,15 @@ Run:  python -m app.db.migrations.001_relations_to_edges
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from app.db.postgres import get_pool, init_db, close_pool
+
+logger = logging.getLogger("akb.migrations")
 
 
 async def migrate():
@@ -27,13 +30,13 @@ async def migrate():
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'edges')"
         )
         if not exists:
-            print("edges table does not exist. Run init.sql first.")
+            logger.warning("edges table does not exist. Run init.sql first.")
             return
 
         # Check if migration already ran
         edge_count = await conn.fetchval("SELECT COUNT(*) FROM edges")
         if edge_count > 0:
-            print(f"edges table already has {edge_count} rows — skipping migration.")
+            logger.info("edges table already has %d rows — skipping migration.", edge_count)
             return
 
         rows = await conn.fetch("""
@@ -58,7 +61,7 @@ async def migrate():
             """, r["vault_id"], source_uri, target_uri, r["relation_type"], r["created_at"])
             migrated += 1
 
-        print(f"Migrated {migrated} relations → edges")
+        logger.info("Migrated %d relations → edges", migrated)
 
     await close_pool()
 

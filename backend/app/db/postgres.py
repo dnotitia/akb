@@ -1,8 +1,11 @@
 import asyncio
+import logging
 import asyncpg
 from pathlib import Path
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
@@ -63,7 +66,10 @@ async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
             return
         except (ConnectionRefusedError, asyncpg.CannotConnectNowError, OSError):
             if attempt < max_retries - 1:
-                print(f"DB not ready (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                logger.warning(
+                    "DB not ready (attempt %d/%d), retrying in %.1fs...",
+                    attempt + 1, max_retries, delay,
+                )
                 await asyncio.sleep(delay)
             else:
                 raise
