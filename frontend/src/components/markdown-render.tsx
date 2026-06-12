@@ -28,8 +28,8 @@
  *     as a soft rounded card. `\[..\]` / `\(..\)` pre-normalized to
  *     `$$` / `$`.
  */
-import React, { useCallback, useMemo, useState } from "react";
-import Markdown from "react-markdown";
+import React, { useCallback, useMemo, useState, type ComponentProps } from "react";
+import Markdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -129,14 +129,13 @@ function labelFor(lang: string | undefined): string {
 }
 
 /** Detect the language hint on `<pre><code class="language-xxx">`. */
-function getPreNodeLanguage(node: any): string | null {
+function getPreNodeLanguage(node: ExtraProps["node"]): string | null {
   const firstChild = node?.children?.[0];
-  if (firstChild?.tagName !== "code") return null;
-  const className =
-    firstChild.properties?.className?.[0] ||
-    firstChild.properties?.className ||
-    "";
-  if (typeof className !== "string") return null;
+  if (!firstChild || firstChild.type !== "element" || firstChild.tagName !== "code") {
+    return null;
+  }
+  const raw = firstChild.properties?.className;
+  const className = Array.isArray(raw) ? String(raw[0] ?? "") : typeof raw === "string" ? raw : "";
   const match = className.match(/language-([\w+-]+)/);
   return match ? match[1] : null;
 }
@@ -387,11 +386,11 @@ function MarkdownAlert({
 function TaskListItem({ children }: { children: React.ReactNode }) {
   const arr = React.Children.toArray(children);
   const checkbox = arr.find(
-    (c: any) =>
-      React.isValidElement(c) &&
-      (c.type === "input" || (c as any).props?.type === "checkbox"),
+    (c): c is React.ReactElement<{ type?: string; checked?: boolean }> =>
+      React.isValidElement<{ type?: string; checked?: boolean }>(c) &&
+      (c.type === "input" || c.props?.type === "checkbox"),
   );
-  const checked = (checkbox as any)?.props?.checked === true;
+  const checked = checkbox?.props?.checked === true;
   const rest = arr.filter((c) => c !== checkbox);
   return (
     <li className="list-none -ml-6 my-1 leading-[1.7] flex items-start gap-2 [&>p]:my-0 [&>input]:hidden">
@@ -426,31 +425,35 @@ function TaskListItem({ children }: { children: React.ReactNode }) {
 }
 
 /* ── Heading factory with stable, outline-matched ids ────────────── */
-function flattenText(children: any): string {
+function flattenText(children: React.ReactNode): string {
   if (typeof children === "string") return children;
   if (Array.isArray(children)) return children.map(flattenText).join("");
-  if (children?.props?.children) return flattenText(children.props.children);
+  if (React.isValidElement<{ children?: React.ReactNode }>(children)) {
+    return flattenText(children.props.children);
+  }
   return "";
 }
 
 /* ── Build the full components map ───────────────────────────────── */
-function buildComponents(markdown: string) {
+type HeadingProps = ComponentProps<"h1"> & ExtraProps;
+
+function buildComponents(markdown: string): Components {
   // Heading slugs in document order — matches parseHeadings() so the
   // outline's `#slug` anchors line up with the rendered `id`s. The
   // cursor advances once per heading element react-markdown renders,
   // mirroring the source order parseHeadings walks.
   const slugQueue = parseHeadings(markdown).map((h) => h.slug);
   let cursor = 0;
-  const nextId = (children: any, level: number) =>
+  const nextId = (children: React.ReactNode, level: number) =>
     slugQueue[cursor++] ?? slugify(flattenText(children)) ?? `heading-${level}`;
 
   const heading =
     (level: 1 | 2 | 3 | 4 | 5 | 6, cls: string) =>
-    ({ node: _node, children, ...props }: any) => {
+    ({ node: _node, children, ...props }: HeadingProps) => {
       // Demote one semantic level: the page already owns the single <h1>, so a
       // body that starts with `# ` must not emit a second top-level heading.
       // Tag is demoted; the visual class + slug/id are unchanged.
-      const Tag = `h${Math.min(level + 1, 6)}` as any;
+      const Tag = `h${Math.min(level + 1, 6)}` as React.ElementType;
       return (
         <Tag id={nextId(children, level)} className={cls} {...props}>
           {children}
@@ -460,13 +463,13 @@ function buildComponents(markdown: string) {
 
   return {
     /* ── Block prose ──────────────────────────────────────────── */
-    p: ({ node: _node, children, ...props }: any) => (
+    p: ({ node: _node, children, ...props }) => (
       <p className={cn(PROSE_LEADING, "my-3 wrap-break-word")} {...props}>
         {children}
       </p>
     ),
 
-    hr: ({ node: _node, ...props }: any) => (
+    hr: ({ node: _node, ...props }) => (
       <hr
         className="my-7 border-0 h-px bg-gradient-to-r from-transparent via-border-strong to-transparent"
         {...props}
@@ -491,29 +494,29 @@ function buildComponents(markdown: string) {
       cn(HEADING_BASE, "mt-5 mb-2 text-[1.08em] text-foreground tracking-[-0.006em]"),
     ),
     h5: heading(5, cn(HEADING_BASE, "mt-4 mb-1.5 text-[0.95em] text-foreground-muted")),
-    h6: ({ node: _node, children, level: _l, ...props }: any) => (
+    h6: ({ node: _node, children, ...props }) => (
       <h6 id={nextId(children, 6)} className={EYEBROW} {...props}>
         {children}
       </h6>
     ),
 
     /* ── Inline phrase elements ───────────────────────────────── */
-    strong: ({ node: _node, children, ...props }: any) => (
+    strong: ({ node: _node, children, ...props }) => (
       <strong className="font-semibold text-foreground tracking-[-0.005em]" {...props}>
         {children}
       </strong>
     ),
-    em: ({ node: _node, children, ...props }: any) => (
+    em: ({ node: _node, children, ...props }) => (
       <em className="italic text-foreground-muted" {...props}>
         {children}
       </em>
     ),
-    del: ({ node: _node, children, ...props }: any) => (
+    del: ({ node: _node, children, ...props }) => (
       <del className="text-subtle" {...props}>
         {children}
       </del>
     ),
-    kbd: ({ node: _node, children, ...props }: any) => (
+    kbd: ({ node: _node, children, ...props }) => (
       <kbd
         className="font-mono text-[0.825em] px-1.5 min-w-[1.5em] inline-flex items-center justify-center rounded-[var(--radius-sm)] bg-surface text-foreground border border-border align-baseline mx-[1px]"
         {...props}
@@ -521,19 +524,19 @@ function buildComponents(markdown: string) {
         {children}
       </kbd>
     ),
-    sup: ({ node: _node, children, ...props }: any) => (
+    sup: ({ node: _node, children, ...props }) => (
       <sup className="text-[0.7em] text-accent [&_a]:no-underline" {...props}>
         {children}
       </sup>
     ),
-    sub: ({ node: _node, children, ...props }: any) => (
+    sub: ({ node: _node, children, ...props }) => (
       <sub className="text-[0.7em] text-foreground-muted" {...props}>
         {children}
       </sub>
     ),
 
     /* ── Lists ────────────────────────────────────────────────── */
-    ul: ({ node: _node, children, ...props }: any) => (
+    ul: ({ node: _node, children, ...props }) => (
       <ul
         className={cn("pl-6 my-3 list-disc marker:text-subtle", PROSE_LEADING)}
         {...props}
@@ -541,7 +544,7 @@ function buildComponents(markdown: string) {
         {children}
       </ul>
     ),
-    ol: ({ node: _node, children, ...props }: any) => (
+    ol: ({ node: _node, children, ...props }) => (
       <ol
         className={cn(
           "pl-6 my-3 list-decimal marker:text-accent marker:font-semibold",
@@ -552,10 +555,12 @@ function buildComponents(markdown: string) {
         {children}
       </ol>
     ),
-    li: ({ node, children, ...props }: any) => {
+    li: ({ node, children, ...props }) => {
+      const className = typeof props.className === "string" ? props.className : "";
+      const nodeClass = node?.properties?.className;
+      const nodeClasses = Array.isArray(nodeClass) ? nodeClass.map(String) : [];
       const isTask =
-        props?.className?.includes?.("task-list-item") ||
-        node?.properties?.className?.includes?.("task-list-item");
+        className.includes("task-list-item") || nodeClasses.includes("task-list-item");
       if (isTask) return <TaskListItem>{children}</TaskListItem>;
       return (
         <li
@@ -568,7 +573,7 @@ function buildComponents(markdown: string) {
     },
 
     /* ── Links + media ────────────────────────────────────────── */
-    a: ({ node: _node, href, children, ...props }: any) => {
+    a: ({ node: _node, href, children, ...props }) => {
       const safe = sanitizeLinkUrl(href);
       const external = /^https?:\/\//i.test(safe);
       return (
@@ -582,7 +587,7 @@ function buildComponents(markdown: string) {
         </a>
       );
     },
-    img: ({ node: _node, src, alt, ...props }: any) => (
+    img: ({ node: _node, src, alt, ...props }) => (
       <img
         src={src}
         alt={alt}
@@ -593,31 +598,39 @@ function buildComponents(markdown: string) {
     ),
 
     /* ── Code (inline + fenced) ───────────────────────────────── */
-    code: ({ node: _node, inline, className, children, ...props }: any) => {
+    // react-markdown v8 used to pass `inline: boolean`; v9+ dropped
+    // it. We accept the prop via a defensive intersection in case a
+    // custom rehype/remark path still sets it, and fall back to
+    // className inspection (fenced blocks carry `language-xxx`).
+    code: ({ node: _node, className, children, ...props }: ComponentProps<"code"> & ExtraProps & { inline?: boolean }) => {
+      const inline =
+        props.inline ?? !(typeof className === "string" && className.startsWith("language-"));
+      // Strip the local `inline` switch off `props` before spreading onto a DOM node.
+      const { inline: _inline, ...domProps } = props;
       if (inline) {
         return (
           <code
             className="font-mono text-[0.875em] px-1.5 py-0.5 mx-[1px] rounded-[var(--radius-sm)] bg-surface-2 text-primary border border-border wrap-anywhere"
-            {...props}
+            {...domProps}
           >
             {children}
           </code>
         );
       }
       return (
-        <code className={className} {...props}>
+        <code className={className} {...domProps}>
           {children}
         </code>
       );
     },
-    pre: ({ node, children }: any) => {
+    pre: ({ node, children }) => {
       const lang = getPreNodeLanguage(node);
       const code = extractCodeText(children).replace(/\n+$/, "");
       return <CodeBlock language={lang ?? undefined} code={code} />;
     },
 
     /* ── Blockquote → callout or quiet quote ──────────────────── */
-    blockquote: ({ node: _node, children, ...props }: any) => {
+    blockquote: ({ node: _node, children, ...props }) => {
       const alert = detectAlert(children);
       if (alert) return <MarkdownAlert kind={alert.kind}>{alert.rest}</MarkdownAlert>;
       return (
@@ -636,19 +649,19 @@ function buildComponents(markdown: string) {
     },
 
     /* ── Tables ───────────────────────────────────────────────── */
-    table: ({ node: _node, children, ...props }: any) => (
+    table: ({ node: _node, children, ...props }) => (
       <div className="my-5 overflow-x-auto max-w-full rounded-[var(--radius-lg)] border border-border">
         <table className="min-w-full border-collapse text-[0.92em]" {...props}>
           {children}
         </table>
       </div>
     ),
-    thead: ({ node: _node, children, ...props }: any) => (
+    thead: ({ node: _node, children, ...props }) => (
       <thead className="bg-surface-2" {...props}>
         {children}
       </thead>
     ),
-    tbody: ({ node: _node, children, ...props }: any) => (
+    tbody: ({ node: _node, children, ...props }) => (
       <tbody
         className="[&>tr:nth-child(even)]:bg-surface-2/30 [&>tr:hover]:bg-surface-2/60"
         {...props}
@@ -656,12 +669,12 @@ function buildComponents(markdown: string) {
         {children}
       </tbody>
     ),
-    tr: ({ node: _node, children, ...props }: any) => (
+    tr: ({ node: _node, children, ...props }) => (
       <tr className="transition-token" {...props}>
         {children}
       </tr>
     ),
-    th: ({ node: _node, children, ...props }: any) => (
+    th: ({ node: _node, children, ...props }) => (
       <th
         className="px-4 py-2.5 text-left font-semibold text-foreground-muted border-b border-border whitespace-nowrap text-[0.86em]"
         {...props}
@@ -669,7 +682,7 @@ function buildComponents(markdown: string) {
         {children}
       </th>
     ),
-    td: ({ node: _node, children, ...props }: any) => (
+    td: ({ node: _node, children, ...props }) => (
       <td
         className="px-4 py-2.5 text-foreground border-b border-border/60 align-top"
         {...props}
