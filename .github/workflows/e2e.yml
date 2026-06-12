@@ -72,6 +72,7 @@ jobs:
           db_user: akb
           public_base_url: http://localhost:8000
           git_storage_path: /tmp/akb-vaults
+          vector_store_driver: pgvector
           embed_base_url: http://localhost:8888/v1
           embed_model: ci-embed-stub
           embed_dimensions: 1536
