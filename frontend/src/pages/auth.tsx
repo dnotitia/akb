@@ -4,6 +4,7 @@ import { ArrowRight, Database, Boxes, GitBranch } from "lucide-react";
 import { authLogin, authRegister, clearSsoSession, getAuthConfig, getToken, setToken } from "@/lib/api";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { Alert } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
@@ -144,7 +145,7 @@ export default function AuthPage() {
             ].map(([Icon, eyebrow, text], i) => (
               <li key={i} className="flex items-center gap-3">
                 <span className={cn("feature-tile", `feat-${eyebrow as string}`)} style={{ width: 34, height: 34 }}>
-                  <Icon size={17} strokeWidth={1.75} />
+                  <Icon size={17} strokeWidth={1.75} aria-hidden />
                 </span>
                 <span className="text-sm text-foreground-muted">{text as string}</span>
               </li>
@@ -248,9 +249,9 @@ function AuthForm({
       <Field label="Password" id="auth-password" type="password" value={password} onChange={setPassword} autoComplete={mode === "login" ? "current-password" : "new-password"} name="password" required minLength={mode === "register" ? 8 : undefined} invalid={!!error} describedBy={error ? "auth-error" : undefined} />
 
       {error && (
-        <div id="auth-error" role="alert" className="rounded-[var(--radius-md)] border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+        <Alert variant="destructive" id="auth-error">
           {error}
-        </div>
+        </Alert>
       )}
 
       <Button type="submit" loading={loading} size="lg" className="w-full mt-1">
@@ -263,7 +264,7 @@ function AuthForm({
 
       {mode === "login" && (
         <div className="text-center pt-1">
-          <Link to="/auth/forgot" className="coord hover:text-foreground hover:underline transition-colors">Forgot password?</Link>
+          <Link to="/auth/forgot" className="text-sm text-link hover:text-link-hover hover:underline transition-token">Forgot password?</Link>
         </div>
       )}
     </form>

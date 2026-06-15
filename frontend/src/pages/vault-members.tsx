@@ -275,7 +275,7 @@ export default function VaultMembersPage() {
           <button
             type="button"
             onClick={handleUndo}
-            className="inline-flex min-h-[36px] items-center text-xs text-link hover:text-link-hover hover:underline cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex min-h-[36px] items-center text-xs text-link hover:text-link-hover hover:underline cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-muted"
           >
             Undo
           </button>
@@ -283,7 +283,7 @@ export default function VaultMembersPage() {
             type="button"
             onClick={() => setUndoTarget(null)}
             aria-label="Dismiss"
-            className="ml-auto inline-flex h-9 w-9 items-center justify-center text-foreground-muted hover:text-foreground cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="ml-auto inline-flex h-9 w-9 items-center justify-center text-foreground-muted hover:text-foreground cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-muted"
           >
             <X className="h-3.5 w-3.5" aria-hidden />
           </button>

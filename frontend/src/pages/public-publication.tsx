@@ -151,7 +151,7 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           )}
           {data.tags && data.tags.length > 0 && (
             <div>
-              <div className="text-xs font-medium text-foreground-muted mb-2">Tags</div>
+              <div className="coord mb-2">Tags</div>
               <div className="flex flex-wrap gap-1">
                 {data.tags.map((t) => (
                   <Badge key={t} variant="outline">
@@ -211,7 +211,7 @@ function MetaField({
 }) {
   return (
     <div>
-      <div className="text-xs font-medium text-foreground-muted mb-1">{label}</div>
+      <div className="coord mb-1">{label}</div>
       <div className={`text-sm font-medium text-foreground ${tabular ? "tabular-nums" : ""}`}>
         {value}
       </div>

@@ -530,7 +530,7 @@ function buildComponents(markdown: string): Components {
       </kbd>
     ),
     sup: ({ node: _node, children, ...props }) => (
-      <sup className="text-[0.7em] text-accent [&_a]:no-underline" {...props}>
+      <sup className="text-[0.7em] text-link [&_a]:no-underline" {...props}>
         {children}
       </sup>
     ),
@@ -552,7 +552,7 @@ function buildComponents(markdown: string): Components {
     ol: ({ node: _node, children, ...props }) => (
       <ol
         className={cn(
-          "pl-6 my-3 list-decimal marker:text-accent marker:font-semibold",
+          "pl-6 my-3 list-decimal marker:text-subtle marker:font-semibold",
           PROSE_LEADING,
           PROSE_MEASURE,
         )}

@@ -192,24 +192,26 @@ export default function SearchPage() {
     }
   }
 
-  function buildParams(next: { q?: string; mode?: Mode; v?: string }) {
-    const p = new URLSearchParams();
-    p.set("q", next.q ?? q);
-    const m = next.mode ?? mode;
-    if (m !== "dense") p.set("mode", m);
-    const v = next.v ?? vault;
-    if (v) p.set("v", v);
-    return p;
-  }
-
+  // The mode/vault toggles must work even before a query is committed: persist
+  // the choice (so a later submit uses it) and, if the input already has text,
+  // commit that draft too so results update immediately. Mirrors submitDraft's
+  // param handling (preserve siblings; omit mode when dense, q when empty).
   function switchMode(m: Mode) {
-    if (!q) return;
-    setSearchParams(buildParams({ mode: m }));
+    const next = new URLSearchParams(searchParams);
+    const trimmed = draft.trim();
+    if (trimmed) next.set("q", trimmed);
+    if (m === "dense") next.delete("mode");
+    else next.set("mode", m);
+    setSearchParams(next, { replace: true });
   }
 
   function switchVault(v: string) {
-    if (!q) return;
-    setSearchParams(buildParams({ v }));
+    const next = new URLSearchParams(searchParams);
+    const trimmed = draft.trim();
+    if (trimmed) next.set("q", trimmed);
+    if (v) next.set("v", v);
+    else next.delete("v");
+    setSearchParams(next, { replace: true });
   }
 
   const isShortQuery = q.trim().length > 0 && q.trim().length <= 6 && !/\s/.test(q.trim());
@@ -268,7 +270,7 @@ export default function SearchPage() {
           aria-pressed={allTypesActive}
           onClick={() => setActiveTypes(new Set(ALL_TYPES))}
           className={cn(
-            "px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
             allTypesActive
               ? "border-transparent bg-surface-selected text-surface-selected-foreground"
               : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
@@ -284,7 +286,7 @@ export default function SearchPage() {
             aria-pressed={activeTypes.has(t)}
             onClick={() => toggleType(t)}
             className={cn(
-              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              "inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-md)] border text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
               activeTypes.has(t)
                 ? "border-transparent bg-surface-selected text-surface-selected-foreground"
                 : "border-border bg-surface text-foreground-muted hover:bg-surface-hover",
@@ -314,7 +316,7 @@ export default function SearchPage() {
             onClick={() => switchMode("dense")}
             aria-pressed={mode === "dense"}
             title="Semantic hybrid search (dense + BM25 + cross-encoder rerank)"
-            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
               mode === "dense"
                 ? "bg-surface-selected text-surface-selected-foreground"
                 : "text-foreground hover:bg-surface-hover"
@@ -327,7 +329,7 @@ export default function SearchPage() {
             onClick={() => switchMode("literal")}
             aria-pressed={mode === "literal"}
             title="Literal substring / regex search"
-            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer ${
+            className={`px-3 h-full font-medium text-xs transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${
               mode === "literal"
                 ? "bg-surface-selected text-surface-selected-foreground"
                 : "text-foreground hover:bg-surface-hover"
@@ -336,7 +338,7 @@ export default function SearchPage() {
             Literal
           </button>
         </div>
-        <div className="relative flex-1 min-w-0 flex items-center border border-border h-full px-3 focus-within:border-primary focus-within:ring-2 focus-within:ring-ring/30 transition-colors bg-surface">
+        <div className="relative flex-1 min-w-0 flex items-center border border-border h-full px-3 focus-within:border-primary focus-within:ring-2 focus-within:ring-ring transition-token bg-surface">
           <SearchIcon
             className="h-4 w-4 text-foreground-muted mr-2 pointer-events-none shrink-0"
             aria-hidden
@@ -398,7 +400,7 @@ export default function SearchPage() {
           {vault && (
             <button
               onClick={() => switchVault("")}
-              className="coord hover:text-link transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="coord hover:text-link transition-token cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               clear
             </button>

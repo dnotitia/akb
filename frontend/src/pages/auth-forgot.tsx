@@ -36,7 +36,7 @@ export default function AuthForgotPage() {
           </p>
           <Link
             to="/auth"
-            className="inline-flex items-center gap-1.5 coord hover:text-foreground transition-colors"
+            className="inline-flex items-center gap-1.5 text-sm text-link hover:text-link-hover transition-token"
           >
             <ArrowLeft className="h-3 w-3" aria-hidden />
             Back to login

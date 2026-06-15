@@ -28,9 +28,10 @@ const TabsTrigger = forwardRef<
     className={cn(
       "inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-[var(--radius-sm)] text-sm font-medium whitespace-nowrap",
       "text-foreground-muted hover:text-foreground",
-      // Active tab — soft raised pill (segmented control), accent coord numerals
+      // Active tab — soft raised pill (segmented control); count numerals lift to
+      // foreground (orange no longer rides the eyebrow/coord, §8; text-accent also fails AA at 3.52:1)
       "data-[state=active]:bg-surface data-[state=active]:text-foreground data-[state=active]:shadow-sm",
-      "data-[state=active]:[&_.coord]:text-accent",
+      "data-[state=active]:[&_.coord]:text-foreground",
       "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-2",
       "transition-token cursor-pointer",
       className,

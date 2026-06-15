@@ -84,7 +84,7 @@ export default function FilePage() {
       </div>
 
       <header className="flex items-baseline justify-between flex-wrap gap-x-4 gap-y-2 pb-3 border-b border-border">
-        <h1 className="font-mono text-[28px] font-semibold tracking-tight text-foreground break-all min-w-0">
+        <h1 className="font-display text-[28px] font-semibold tracking-tight text-foreground break-all min-w-0">
           {info?.name || fileId}
         </h1>
         <div className="flex items-center gap-4 coord tabular-nums shrink-0">

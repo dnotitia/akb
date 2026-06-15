@@ -60,7 +60,7 @@ export function TagInput({
                 type="button"
                 onClick={() => remove(t)}
                 aria-label={`Remove tag ${t}`}
-                className="text-foreground-muted hover:text-destructive cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="text-foreground-muted hover:text-destructive cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-muted"
               >
                 <X className="h-3 w-3" aria-hidden />
               </button>

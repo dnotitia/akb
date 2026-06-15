@@ -368,7 +368,7 @@ export default function DocumentPage() {
                 p.delete("commit");
                 setSearchParams(p, { replace: false });
               }}
-              className="inline-flex items-center gap-1 px-2 h-7 text-xs rounded-[var(--radius-sm)] border border-accent-strong text-accent-strong hover:bg-accent-strong hover:text-accent-strong-foreground transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              className="inline-flex items-center gap-1 px-2 h-7 text-xs rounded-[var(--radius-sm)] border border-primary text-link hover:bg-primary hover:text-primary-foreground transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               ← Back to latest
             </button>
@@ -401,12 +401,12 @@ export default function DocumentPage() {
           const authorName =
             doc.created_by_name ||
             (doc.created_by && !isUuid(doc.created_by) ? doc.created_by : null);
-          const initial = (authorName?.trim()[0] || "?").toUpperCase();
+          const initial = authorName?.trim()[0] || "?"; // CSS uppercases the glyph (§8)
           return (
-            <div className="flex items-center gap-2 text-[14px] text-foreground-muted mb-7">
+            <div className="flex items-center gap-2 text-sm text-foreground-muted mb-7">
               {doc.created_by && (
                 <span
-                  className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-surface-selected text-primary text-[11px] font-semibold"
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-surface-selected text-primary text-[11px] font-semibold uppercase"
                   title={doc.created_by}
                   aria-hidden
                 >
@@ -622,7 +622,7 @@ export default function DocumentPage() {
                 </button>
               )}
               {canWrite && (
-                <button onClick={() => setDeleteOpen(true)} className={`${rowCls} text-foreground-muted hover:bg-destructive/5 hover:text-destructive`}>
+                <button onClick={() => setDeleteOpen(true)} className={`${rowCls} text-foreground-muted hover:bg-destructive-soft hover:text-destructive-soft-foreground`}>
                   <Trash2 className="h-3.5 w-3.5" aria-hidden />
                   Delete document
                 </button>

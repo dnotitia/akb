@@ -16,7 +16,7 @@ type AlertVariant = "destructive" | "warning" | "info" | "success";
 
 const VARIANTS: Record<AlertVariant, { box: string; Icon: LucideIcon }> = {
   destructive: {
-    box: "border-destructive/30 bg-danger-soft text-danger-soft-foreground",
+    box: "border-destructive/30 bg-destructive-soft text-destructive-soft-foreground",
     Icon: AlertCircle,
   },
   warning: {

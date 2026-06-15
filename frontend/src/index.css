@@ -28,7 +28,7 @@
   --color-surface-muted: #ebeef2;     /* AKB alias == family surface-2 */
   --color-foreground: #1d1d1f;
   --color-foreground-muted: #5e6068;
-  --color-subtle: #767a82;            /* was #94989e (2.90:1, sub-floor) → 4.54:1 (AA) */
+  --color-subtle: #6b6f77;            /* AA on canvas: 4.70:1 on background, 5.04:1 on surface (was #767a82 = 4.02:1 on background, sub-floor) */
   --color-border: #dfe3e8;
   --color-border-strong: #c8ced6;
 
@@ -52,7 +52,7 @@
      (text on a filled chip), -soft (tinted banner bg), -soft-foreground
      (text on the tint). base values darkened to clear WCAG AA as text. */
   --color-success: #1e7d4b;          /* was #228b54 (4.30:1) → 4.83:1 on white */
-  --color-success-foreground: #04200d;
+  --color-success-foreground: #ffffff; /* white-on-fill 5.13:1 (AA); was #04200d = 3.36:1 (fail) — matches warning/info/destructive foregrounds */
   --color-success-soft: #e7f4ec;
   --color-success-soft-foreground: #176b3f;
   --color-warning: #9a5400;          /* was #b06000 → white-on-fill 4.5:1 (AA) */
@@ -64,6 +64,8 @@
   --color-destructive-foreground: #ffffff;
   --color-danger-soft: #fbeaea;
   --color-danger-soft-foreground: #a81f1f;
+  --color-destructive-soft: #fbeaea;            /* canonical twin of --color-danger-soft */
+  --color-destructive-soft-foreground: #a81f1f;
   --color-info: #1d627c;
   --color-info-foreground: #ffffff;
   --color-info-soft: #e6f0f4;
@@ -196,6 +198,8 @@
   --color-destructive-foreground: #0b0f14;
   --color-danger-soft: #2a1212;
   --color-danger-soft-foreground: #f0a0a0;
+  --color-destructive-soft: #2a1212;
+  --color-destructive-soft-foreground: #f0a0a0;
   --color-info: #4aa3c4;
   --color-info-foreground: #04222e;
   --color-info-soft: #0f2730;

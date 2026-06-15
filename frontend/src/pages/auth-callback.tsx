@@ -71,7 +71,7 @@ export default function AuthCallbackPage() {
       <div className="hero-glow w-full max-w-md mx-auto fade-up flex flex-col items-center gap-8">
         <h1 className="sr-only">Completing sign-in</h1>
         <Logo size={40} subtitle />
-        <div className="flex flex-col items-center gap-4 coord" role="status" aria-live="polite">
+        <div className="flex flex-col items-center gap-4 text-sm text-foreground-muted" role="status" aria-live="polite">
           <Loader2 className="h-6 w-6 animate-spin text-primary" aria-hidden />
           <span>Completing sign-in…</span>
         </div>

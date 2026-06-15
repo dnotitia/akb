@@ -589,7 +589,7 @@ function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
         <DropdownMenu.Content
           align="end"
           sideOffset={6}
-          className="z-50 max-h-[60vh] overflow-y-auto min-w-[220px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+          className="z-[var(--z-popover)] max-h-[60vh] overflow-y-auto min-w-[220px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           <div className="px-3 py-1.5 coord">Choose a vault</div>
           {vaults.map((v) => (

@@ -565,7 +565,7 @@ export default function VaultSettingsPage() {
             </h2>
           </header>
 
-          <div className="rounded-[var(--radius-lg)] border border-destructive/50 bg-destructive/5 p-4">
+          <div className="rounded-[var(--radius-lg)] border border-destructive bg-destructive-soft p-4">
             <div className="flex items-baseline justify-between flex-wrap gap-y-3">
               <div className="min-w-0 pr-4">
                 <h3 className="text-base font-semibold tracking-tight mb-1 inline-flex items-center gap-1.5 text-destructive">

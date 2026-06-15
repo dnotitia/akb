@@ -291,7 +291,7 @@ export default function VaultPage() {
       </h1>
 
       {info?.description ? (
-        <p className="text-[16px] leading-[1.55] text-foreground-muted mb-1 max-w-2xl">
+        <p className="text-base leading-[1.55] text-foreground-muted mb-1 max-w-2xl">
           {info.description}
         </p>
       ) : info === null && !infoError ? (

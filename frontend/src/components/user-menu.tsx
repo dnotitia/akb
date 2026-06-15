@@ -49,7 +49,9 @@ export function UserMenu() {
   }, []);
 
   const label = user?.display_name || user?.username || "Account";
-  const initial = (label[0] || "?").toUpperCase();
+  // Glyph casing is CSS-only (`uppercase` on the avatar), not a JS transform of
+  // the user-supplied display name (§8).
+  const initial = label[0] || "?";
 
   return (
     <DropdownMenu.Root>
@@ -58,7 +60,7 @@ export function UserMenu() {
         className="inline-flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 pr-3 text-foreground hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-token cursor-pointer"
       >
         <span
-          className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-[var(--color-teal)] to-[var(--color-teal-2)] text-white font-mono text-[10px] font-semibold"
+          className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-[var(--color-teal)] to-[var(--color-teal-2)] text-white font-mono text-[10px] font-semibold uppercase"
           aria-hidden
         >
           {initial}

@@ -15,7 +15,7 @@ const DialogOverlay = forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-50 bg-black/50",
+      "fixed inset-0 z-[var(--z-overlay)] bg-black/50",
       "data-[state=open]:animate-in data-[state=closed]:animate-out",
       className,
     )}
@@ -33,7 +33,7 @@ const DialogContent = forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-1/2 top-1/2 z-50 grid w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4",
+        "fixed left-1/2 top-1/2 z-[var(--z-modal)] grid w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4",
         // Cap height + scroll so a tall dialog never pushes its footer (Cancel /
         // destructive Confirm) off-screen on short viewports.
         "max-h-[calc(100dvh-2rem)] overflow-y-auto",

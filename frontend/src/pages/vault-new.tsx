@@ -7,12 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 
 export default function VaultNewPage() {
   const navigate = useNavigate();
@@ -114,7 +108,7 @@ export default function VaultNewPage() {
       >
         <div className="space-y-1.5">
           <Label htmlFor="vault-name">
-            Name <span className="text-destructive normal-case">*</span>
+            Name <span className="text-foreground-muted normal-case">*</span>
           </Label>
           <Input
             id="vault-name"
@@ -177,24 +171,21 @@ export default function VaultNewPage() {
           )}
         </div>
 
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div>
-                <Label className="pointer-events-none">
-                  Connect external Git <span className="normal-case tracking-normal text-foreground-muted">(coming soon)</span>
-                </Label>
-                <div className="mt-1.5 flex items-center gap-2 rounded-[var(--radius-md)] border border-border border-dashed px-3 py-2 text-sm text-foreground-muted cursor-not-allowed opacity-60">
-                  <GitBranch className="h-4 w-4 shrink-0" aria-hidden />
-                  <span>Upstream repo URL · read-only mirror</span>
-                </div>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent>
-              Available via MCP (akb_create_vault); REST extension pending
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+        {/* "Coming soon" placeholder. The explanatory note is rendered as an
+            always-visible hint (not a tooltip on a non-focusable <div>, which
+            keyboard + screen-reader users could never reach). */}
+        <div>
+          <Label className="pointer-events-none">
+            Connect external Git <span className="normal-case tracking-normal text-foreground-muted">(coming soon)</span>
+          </Label>
+          <div className="mt-1.5 flex items-center gap-2 rounded-[var(--radius-md)] border border-border border-dashed px-3 py-2 text-sm text-foreground-muted opacity-60">
+            <GitBranch className="h-4 w-4 shrink-0" aria-hidden />
+            <span>Upstream repo URL · read-only mirror</span>
+          </div>
+          <p className="coord mt-1.5">
+            Available via MCP (akb_create_vault); REST extension pending.
+          </p>
+        </div>
 
         {error && <Alert variant="destructive" id="vault-form-error">{error}</Alert>}
 

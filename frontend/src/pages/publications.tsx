@@ -133,7 +133,7 @@ export default function PublicationsPage() {
         Published
       </h1>
 
-      <p className="text-[16px] leading-[1.55] text-foreground-muted mb-8 max-w-2xl">
+      <p className="text-base leading-[1.55] text-foreground-muted mb-8 max-w-2xl">
         Public-read links for this vault. Unpublish any time — the /p/ URL stops
         resolving immediately.
       </p>
@@ -215,7 +215,7 @@ export default function PublicationsPage() {
                       <button
                         onClick={() => copyLink(p)}
                         aria-label={copiedId === p.slug ? "Public link copied" : "Copy public link"}
-                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         {copiedId === p.slug ? (
                           <>
@@ -234,7 +234,7 @@ export default function PublicationsPage() {
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label="Open public page"
-                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-foreground-muted hover:text-primary hover:bg-surface-hover transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                       >
                         <ExternalLink className="h-3 w-3" aria-hidden />
                         Open
@@ -244,7 +244,7 @@ export default function PublicationsPage() {
                       onClick={() => setPendingRevoke(p)}
                       disabled={revokingId === p.slug}
                       aria-label="Unpublish"
-                      className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-colors cursor-pointer disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                      className="inline-flex items-center gap-1 px-2 h-7 rounded-[var(--radius-sm)] text-xs text-destructive hover:bg-surface-hover transition-token cursor-pointer disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                     >
                       {revokingId === p.slug ? (
                         <Loader2 className="h-3 w-3 animate-spin" aria-hidden />

@@ -183,12 +183,12 @@ export default function TablePage() {
                 {rows.map((row, i) => (
                   <tr key={i} className="hover:bg-surface-hover transition-colors">
                     <td className="coord px-3 py-1.5 border-r border-border tabular-nums">
-                      {String(i + 1).padStart(2, "0")}
+                      {i + 1}
                     </td>
                     {cols.map((c) => (
                       <td
                         key={c}
-                        className={`px-3 py-1.5 font-mono text-[12px] text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
+                        className={`px-3 py-1.5 font-mono text-xs text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
                         title={formatCell(row[c])}
                       >
                         {formatCell(row[c])}

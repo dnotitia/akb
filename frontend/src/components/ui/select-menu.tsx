@@ -79,7 +79,7 @@ export function SelectMenu({
         <DropdownMenu.Content
           align="start"
           sideOffset={6}
-          className="z-50 max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+          className="z-[var(--z-popover)] max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           <DropdownMenu.RadioGroup value={value} onValueChange={onValueChange}>
             {options.map((o) => (

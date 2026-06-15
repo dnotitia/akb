@@ -104,8 +104,8 @@ export function GraphDetailPanel({
     >
       <header className="flex items-center justify-between px-3 py-2 border-b border-border">
         <span className="coord">{kind} · {docId}</span>
-        <button onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground">
-          <X className="h-3 w-3" />
+        <button type="button" onClick={onClose} aria-label="Close detail" className="text-foreground-muted hover:text-foreground transition-token cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
+          <X className="h-3 w-3" aria-hidden />
         </button>
       </header>
 

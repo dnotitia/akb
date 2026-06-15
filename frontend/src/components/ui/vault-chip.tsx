@@ -21,12 +21,14 @@ function catVar(name: string): string {
 // 1–2 letters: initials across word/separator boundaries (akb-platform → "AP"),
 // otherwise the first two characters. A presentational mark only — the readable
 // vault name always sits beside it, so the chip itself is aria-hidden.
+// Casing is presentation-only — the glyph is uppercased via CSS (`uppercase` on
+// the tile), never by transforming the underlying user-supplied name in JS (§8).
 function initials(name: string): string {
   const cleaned = name.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-  if (!cleaned) return name.slice(0, 2).toUpperCase();
+  if (!cleaned) return name.slice(0, 2);
   const parts = cleaned.split(/\s+/);
-  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-  return cleaned.slice(0, 2).toUpperCase();
+  if (parts.length >= 2) return parts[0][0] + parts[1][0];
+  return cleaned.slice(0, 2);
 }
 
 /**
@@ -49,7 +51,7 @@ export function VaultChip({
     <span
       aria-hidden
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[var(--radius-sm)] font-semibold leading-none",
+        "inline-flex shrink-0 items-center justify-center rounded-[var(--radius-sm)] font-semibold leading-none uppercase",
         dim,
         className,
       )}

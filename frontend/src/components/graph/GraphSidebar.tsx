@@ -145,7 +145,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search to focus on a document"
             aria-label="Search to focus on a document"
-            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus:border-primary"
+            className="w-full h-9 pl-6 pr-2 rounded-[var(--radius-md)] bg-background border border-border text-[11px] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           />
         </div>
         {!view.entry && hits.length === 0 && (

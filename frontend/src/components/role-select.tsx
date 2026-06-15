@@ -63,14 +63,14 @@ export function RoleSelect({ vault, member, onChanged }: Props) {
           <DropdownMenu.Content
             align="end"
             sideOffset={6}
-            className="z-50 min-w-[8rem] overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+            className="z-[var(--z-popover)] min-w-[8rem] overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
           >
             <DropdownMenu.RadioGroup value={member.role} onValueChange={changeRole}>
               {OPTIONS.map((r) => (
                 <DropdownMenu.RadioItem
                   key={r}
                   value={r}
-                  className="relative flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] py-1.5 pl-7 pr-3 text-sm capitalize text-foreground outline-none data-[highlighted]:bg-surface-hover data-[state=checked]:text-link"
+                  className="relative flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] py-1.5 pl-7 pr-3 text-sm capitalize text-foreground outline-none data-[highlighted]:bg-surface-hover data-[state=checked]:bg-surface-selected data-[state=checked]:text-surface-selected-foreground"
                 >
                   <DropdownMenu.ItemIndicator className="absolute left-2 inline-flex">
                     <Check className="h-3.5 w-3.5" aria-hidden />
