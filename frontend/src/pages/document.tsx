@@ -336,16 +336,16 @@ export default function DocumentPage() {
 
   return (
     <div
-      className={`grid grid-cols-1 gap-x-10 gap-y-6 fade-up ${
-        inEditMode ? "" : "lg:grid-cols-[minmax(0,1fr)_280px]"
+      className={`grid grid-cols-1 gap-x-8 lg:gap-x-10 gap-y-6 fade-up ${
+        inEditMode
+          ? ""
+          : "lg:grid-cols-[minmax(0,1fr)_280px] xl:grid-cols-[minmax(0,1fr)_320px] 2xl:grid-cols-[minmax(0,1fr)_360px]"
       }`}
     >
       <article
         ref={setArticleEl}
         aria-labelledby="doc-title"
-        className={`min-w-0 w-full ${
-          inEditMode ? "max-w-none" : "max-w-[880px]"
-        }`}
+        className="min-w-0 w-full max-w-none"
       >
         {commitHash && (
           <div

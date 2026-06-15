@@ -78,6 +78,11 @@ function convertDelimiters(text: string): string {
 
 /* ── shared utility tokens ───────────────────────────────────────── */
 const PROSE_LEADING = "leading-[1.7]";
+// Readable line-length for text flow (matches the Plate editor's `.prose`
+// measure in index.css). Applied to paragraphs/lists/headings only so that
+// code blocks, tables, and images stay free to break out to the full column
+// width on wide screens.
+const PROSE_MEASURE = "max-w-[72ch]";
 const HEADING_BASE = "font-semibold scroll-mt-24";
 const EYEBROW =
   "mt-4 mb-1 font-semibold text-[11px] uppercase tracking-[0.06em] text-subtle";
@@ -464,7 +469,7 @@ function buildComponents(markdown: string): Components {
   return {
     /* ── Block prose ──────────────────────────────────────────── */
     p: ({ node: _node, children, ...props }) => (
-      <p className={cn(PROSE_LEADING, "my-3 wrap-break-word")} {...props}>
+      <p className={cn(PROSE_LEADING, "my-3 wrap-break-word", PROSE_MEASURE)} {...props}>
         {children}
       </p>
     ),
@@ -479,19 +484,19 @@ function buildComponents(markdown: string): Components {
     /* ── Headings — tuned cascade + negative tracking ─────────── */
     h1: heading(
       1,
-      cn(HEADING_BASE, "mt-8 mb-3.5 text-[1.9em] text-foreground tracking-[-0.02em] leading-tight"),
+      cn(HEADING_BASE, PROSE_MEASURE, "mt-8 mb-3.5 text-[1.9em] text-foreground tracking-[-0.02em] leading-tight"),
     ),
     h2: heading(
       2,
-      cn(HEADING_BASE, "mt-7 mb-3 text-[1.5em] text-foreground tracking-[-0.015em] leading-snug"),
+      cn(HEADING_BASE, PROSE_MEASURE, "mt-7 mb-3 text-[1.5em] text-foreground tracking-[-0.015em] leading-snug"),
     ),
     h3: heading(
       3,
-      cn(HEADING_BASE, "mt-6 mb-2.5 text-[1.25em] text-foreground tracking-[-0.01em]"),
+      cn(HEADING_BASE, PROSE_MEASURE, "mt-6 mb-2.5 text-[1.25em] text-foreground tracking-[-0.01em]"),
     ),
     h4: heading(
       4,
-      cn(HEADING_BASE, "mt-5 mb-2 text-[1.08em] text-foreground tracking-[-0.006em]"),
+      cn(HEADING_BASE, PROSE_MEASURE, "mt-5 mb-2 text-[1.08em] text-foreground tracking-[-0.006em]"),
     ),
     h5: heading(5, cn(HEADING_BASE, "mt-4 mb-1.5 text-[0.95em] text-foreground-muted")),
     h6: ({ node: _node, children, ...props }) => (
@@ -538,7 +543,7 @@ function buildComponents(markdown: string): Components {
     /* ── Lists ────────────────────────────────────────────────── */
     ul: ({ node: _node, children, ...props }) => (
       <ul
-        className={cn("pl-6 my-3 list-disc marker:text-subtle", PROSE_LEADING)}
+        className={cn("pl-6 my-3 list-disc marker:text-subtle", PROSE_LEADING, PROSE_MEASURE)}
         {...props}
       >
         {children}
@@ -549,6 +554,7 @@ function buildComponents(markdown: string): Components {
         className={cn(
           "pl-6 my-3 list-decimal marker:text-accent marker:font-semibold",
           PROSE_LEADING,
+          PROSE_MEASURE,
         )}
         {...props}
       >
@@ -638,6 +644,7 @@ function buildComponents(markdown: string): Components {
           className={cn(
             "my-4 pl-4 pr-3 py-2 italic",
             PROSE_LEADING,
+            PROSE_MEASURE,
             "border-l-2 border-border-strong bg-surface-2/50 text-foreground-muted rounded-r-[var(--radius-md)]",
             "[&>p:first-child]:mt-0 [&>p:last-child]:mb-0",
           )}

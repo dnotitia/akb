@@ -233,7 +233,7 @@ export function VaultShell() {
             </div>
           ) : (
             <div className="flex-1 min-w-0 min-h-0 overflow-y-auto bg-background">
-              <div className="mx-auto max-w-[1100px] px-6 py-8 lg:px-10 lg:py-10">
+              <div className="mx-auto max-w-[1100px] xl:max-w-[1320px] 2xl:max-w-[1600px] px-6 py-8 lg:px-10 lg:py-10">
                 <ErrorBoundary resetKeys={[location.pathname]}>
                   <Outlet />
                 </ErrorBoundary>
