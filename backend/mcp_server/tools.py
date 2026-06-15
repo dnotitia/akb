@@ -237,6 +237,32 @@ TOOLS = [
         },
     ),
     Tool(
+        name="akb_move",
+        description=(
+            "Move or rename a document — change its collection and/or slug while "
+            "keeping its identity and full git history. The old akb:// URI keeps "
+            "resolving (a redirect is recorded), and graph links/publications are "
+            "rewritten. Provide collection and/or slug (at least one must change). "
+            "The title is unchanged; use akb_update to change the displayed title."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "Document URI to move"},
+                "collection": {
+                    "type": "string",
+                    "description": "New collection path (omit to keep the current collection)",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "New slug / filename base, e.g. 'final-spec' (omit to keep the current slug)",
+                },
+                "message": {"type": "string", "description": "Commit message describing the move"},
+            },
+            "required": ["uri"],
+        },
+    ),
+    Tool(
         name="akb_delete",
         description="Delete a document. Removes from Git, search index, and knowledge graph.",
         inputSchema={

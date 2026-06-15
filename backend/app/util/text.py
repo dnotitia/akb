@@ -17,6 +17,7 @@ idempotent) and catches anything caller-side normalization missed.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from difflib import get_close_matches
 from typing import Any
@@ -162,6 +163,33 @@ def fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
     truncated = candidates[:_FUZZY_HINT_LIST_LIMIT]
     suffix = " …" if len(candidates) > _FUZZY_HINT_LIST_LIMIT else ""
     return f"Available {label}: {', '.join(truncated)}{suffix}"
+
+
+# ── Document slug / path identity ────────────────────────────────
+#
+# A document's identity is its path = "{collection}/{slug}.md". The slug is
+# derived from the human title, but the title is mutable and need not be unique.
+# The service writes the clean slug when free and appends a `-{shortid}` only on
+# collision (see document_service.put / _put_locked) — the standard pattern for
+# identity-bearing paths. This module owns just the (pure, testable) slug
+# normalization. See docs/designs/doc-identity-slug/00-overview.md.
+
+_SLUG_MAX = 80
+
+
+def slugify(text: str) -> str:
+    """Title → URL/path-safe slug.
+
+    Hardened over the original: trims leading/trailing hyphens (so a path
+    never starts with ``-`` or, after truncation, dangles one), and falls
+    back to ``"untitled"`` for empty / symbol-only input so the derived
+    path is never a bare ``".md"`` dotfile.
+    """
+    slug = text.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[-\s]+", "-", slug).strip("-")
+    slug = slug[:_SLUG_MAX].rstrip("-")
+    return slug or "untitled"
 
 
 def like_escape(s: str) -> str:

@@ -584,6 +584,62 @@ class GitService:
                 parent_required=True,
             )
 
+    def move_file(
+        self,
+        vault_name: str,
+        old_path: str,
+        new_path: str,
+        message: str,
+        author_name: str = "AKB System",
+        author_email: str = "akb@system",
+    ) -> str:
+        """Rename/move a tracked file via ``git mv`` and commit. Returns the
+        commit hash.
+
+        ``git mv`` records the rename so ``git log --follow <new_path>`` traces
+        the file's history across the move (blame/log continuity). Mirrors
+        ``commit_file``/``delete_file``'s lock + worktree-prep + commit shape.
+        """
+        if old_path == new_path:
+            raise ValueError("move_file: old_path and new_path are identical")
+        with _vault_lock(vault_name):
+            wt = self._ensure_worktree(vault_name)
+            if wt is None:
+                raise FileNotFoundError(f"File not found in vault: {old_path}")
+
+            work_repo = Repo(str(wt))
+            work_repo.git.reset("--hard", "HEAD")
+
+            src = wt / old_path
+            if not src.exists():
+                raise FileNotFoundError(f"File not found in vault: {old_path}")
+            dst = wt / new_path
+            # A case-only rename ("File.md" -> "file.md") on a case-INSENSITIVE
+            # filesystem (macOS APFS/HFS+) makes dst.exists() report True even
+            # though src and dst are the SAME inode. Allow that; only a genuine
+            # different file at the destination is a conflict.
+            if dst.exists() and not src.samefile(dst):
+                raise FileExistsError(f"Destination already exists in vault: {new_path}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            work_repo.git.mv("--", old_path, new_path)
+            return self._stage_and_commit(
+                work_repo,
+                message,
+                author_name,
+                author_email,
+                parent_required=True,
+            )
+
+    def current_commit(self, vault_name: str) -> str | None:
+        """Return the vault's current HEAD commit hash, or None if the bare repo
+        has no commits yet. Used to reconcile DB state after a crash-recovery
+        move where the git mv already committed."""
+        try:
+            return self._get_repo(vault_name).head.commit.hexsha
+        except Exception:  # noqa: BLE001 — repo missing or no HEAD yet (empty repo)
+            return None
+
     def delete_paths_bulk(
         self,
         *,
