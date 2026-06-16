@@ -5,6 +5,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { GraphCanvas, type GraphCanvasHandle } from "@/components/graph/GraphCanvas";
 import { GraphSidebar } from "@/components/graph/GraphSidebar";
 import { GraphDetailPanel } from "@/components/graph/GraphDetailPanel";
@@ -228,7 +229,7 @@ export default function GraphPage() {
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 w-max max-w-[90%]">
             <Alert variant="info">
               <div className="flex items-center gap-3">
-                <span className="truncate max-w-[40ch]">Focused on {entryTitle}</span>
+                <TooltipText className="truncate max-w-[40ch]" tip={entryTitle}>Focused on {entryTitle}</TooltipText>
                 <Button
                   variant="outline"
                   size="sm"

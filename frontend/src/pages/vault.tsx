@@ -26,6 +26,8 @@ import { IndexingBadge, RoleBadge, VaultStateBadge } from "@/components/status-b
 import { useVaultHealth } from "@/hooks/use-vault-health";
 import { SkillStatusChip } from "@/components/skill/skill-status-chip";
 import { StatTile } from "@/components/ui/stat-tile";
+import { TooltipText } from "@/components/ui/tooltip-text";
+import { CopyButton } from "@/components/ui/copy-button";
 
 interface TableMeta {
   name: string;
@@ -281,8 +283,9 @@ export default function VaultPage() {
       {/* Meta line — one identity only (the H1 below states the name; the
           breadcrumb says "where am I"), so don't print the name a third time:
           just the label + the canonical mono URI. */}
-      <div className="coord mb-3">
+      <div className="coord mb-3 inline-flex items-center gap-1.5">
         Vault · <span className="font-mono">akb://{name}</span>
+        <CopyButton value={`akb://${name}`} label="Copy vault URI" />
       </div>
 
       {/* Display title */}
@@ -638,18 +641,18 @@ export default function VaultPage() {
                         <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
                           {(c.hash || "").slice(0, 7)}
                         </span>
-                        <span title={author} className="text-foreground truncate">
+                        <TooltipText className="text-foreground truncate">
                           {author}
-                        </span>
-                        <span
-                          title={c.subject || filePath}
+                        </TooltipText>
+                        <TooltipText
+                          tip={c.subject || filePath}
                           className="text-foreground truncate"
                         >
                           {c.subject || filePath}
                           {filesCount > 1 && (
                             <span className="text-foreground-muted"> · +{filesCount - 1}</span>
                           )}
-                        </span>
+                        </TooltipText>
                         <span className="text-center">{changeMark(change)}</span>
                         <RelativeTime iso={c.timestamp} className="text-right" />
                       </Link>

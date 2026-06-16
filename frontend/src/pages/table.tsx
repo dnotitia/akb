@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import { EmptyState } from "@/components/empty-state";
 import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 interface Column {
   name: string;
@@ -186,13 +187,13 @@ export default function TablePage() {
                       {i + 1}
                     </td>
                     {cols.map((c) => (
-                      <td
-                        key={c}
-                        className={`px-3 py-1.5 font-mono text-xs text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
-                        title={formatCell(row[c])}
-                      >
-                        {formatCell(row[c])}
-                      </td>
+                      <TooltipText key={c} asChild tip={formatCell(row[c])}>
+                        <td
+                          className={`px-3 py-1.5 font-mono text-xs text-foreground border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
+                        >
+                          {formatCell(row[c])}
+                        </td>
+                      </TooltipText>
                     ))}
                   </tr>
                 ))}

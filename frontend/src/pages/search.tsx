@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { SelectMenu } from "@/components/ui/select-menu";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { parseUri } from "@/lib/uri";
@@ -540,12 +541,12 @@ export default function SearchPage() {
                       {String(i + 1).padStart(2, "0")}
                     </span>
                     <div className="min-w-0">
-                      <div className="text-base font-medium tracking-tight text-foreground group-hover:text-link truncate">
+                      <TooltipText as="div" className="text-base font-medium tracking-tight text-foreground group-hover:text-link truncate">
                         {r.title}
-                      </div>
-                      <div className="coord mt-0.5 truncate">
+                      </TooltipText>
+                      <TooltipText as="div" className="coord mt-0.5 truncate" tip={`${r.vault} / ${r.path}`}>
                         {r.vault} / {r.path}
-                      </div>
+                      </TooltipText>
                       {r.matches.length > 0 && (
                         <div className="mt-2 space-y-1">
                           {r.matches.slice(0, 3).map((m, j) => (

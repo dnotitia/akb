@@ -2,6 +2,7 @@ import { useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/utils";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 export interface HistoryEntry {
   hash?: string;
@@ -182,8 +183,8 @@ function RowContent({
       <span className={active ? undefined : "text-link"}>
         {(entry.hash || "").slice(0, 7)}
       </span>
-      <span
-        title={`${entry.agent || entry.author || "unknown"}${entry.subject ? ` · ${entry.subject}` : ""}`}
+      <TooltipText
+        tip={`${entry.agent || entry.author || "unknown"}${entry.subject ? ` · ${entry.subject}` : ""}`}
         className="truncate"
       >
         <span className={active ? undefined : "text-foreground-muted"}>
@@ -197,7 +198,7 @@ function RowContent({
             </span>
           </>
         )}
-      </span>
+      </TooltipText>
       <span
         className={cn(
           "tabular-nums text-right shrink-0",

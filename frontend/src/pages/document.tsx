@@ -38,6 +38,7 @@ import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
@@ -649,9 +650,9 @@ export default function DocumentPage() {
                       </button>
                     </div>
                   </div>
-                  <div title={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground-muted truncate">
+                  <TooltipText as="div" tip={`/p/${doc.public_slug}`} className="font-mono text-[11px] text-foreground-muted truncate">
                     /p/{doc.public_slug}
-                  </div>
+                  </TooltipText>
                 </div>
               ) : (
                 <button
@@ -728,9 +729,9 @@ export default function DocumentPage() {
                           className="grid grid-cols-[minmax(64px,88px)_1fr] gap-1.5 py-0.5 group hover:bg-surface-hover -mx-1 px-1 rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                         >
                           <span className={relColor}>{r.relation || "relates"}</span>
-                          <span title={label} className="text-foreground truncate group-hover:text-link">
+                          <TooltipText tip={label} className="text-foreground truncate group-hover:text-link">
                             → {label}
-                          </span>
+                          </TooltipText>
                         </Link>
                       </li>
                     );

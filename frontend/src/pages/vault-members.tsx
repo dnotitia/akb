@@ -18,6 +18,7 @@ import { InviteMemberDialog } from "@/components/invite-member-dialog";
 import { RoleBadge } from "@/components/status-badge";
 import { RoleSelect } from "@/components/role-select";
 import { EmptyState } from "@/components/empty-state";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { timeAgo } from "@/lib/utils";
 
 interface Member {
@@ -342,7 +343,7 @@ export default function VaultMembersPage() {
                       </span>
                     )}
                   </div>
-                  <div title={m.email} className="coord truncate">{m.email}</div>
+                  <TooltipText as="div" className="coord truncate">{m.email}</TooltipText>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
                   {canManage && m.role !== "owner" && currentUser && m.username !== currentUser.username ? (

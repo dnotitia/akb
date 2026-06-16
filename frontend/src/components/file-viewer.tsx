@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { JsonTree } from "@/components/json-tree";
 import { Alert } from "@/components/ui/alert";
+import { CopyButton } from "@/components/ui/copy-button";
 import {
   publicationDownloadUrl,
   publicationRawUrl,
@@ -52,7 +53,10 @@ export function FileViewer({ slug, data }: Props) {
         {data.collection && (
           <div>
             <div className="coord mb-1">Collection</div>
-            <div className="text-sm font-medium font-mono break-all">{data.collection}</div>
+            <div className="inline-flex items-center gap-1.5">
+              <div className="text-sm font-medium font-mono break-all">{data.collection}</div>
+              <CopyButton value={data.collection} label="Copy collection" />
+            </div>
           </div>
         )}
         <div className="pt-3 border-t border-border">

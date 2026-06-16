@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { getMe, setToken, isSsoSession, clearSsoSession, keycloakLogoutUrl } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 interface User {
   username?: string;
@@ -78,13 +79,13 @@ export function UserMenu() {
           {/* Identity header */}
           <div className="px-3 py-2 border-b border-border mb-1">
             <div className="coord">Account</div>
-            <div title={label} className="text-sm font-medium text-foreground truncate mt-0.5">
+            <TooltipText as="div" className="text-sm font-medium text-foreground truncate mt-0.5">
               {label}
-            </div>
+            </TooltipText>
             {user?.email && (
-              <div title={user.email} className="font-mono text-[11px] text-foreground-muted truncate">
+              <TooltipText as="div" className="font-mono text-[11px] text-foreground-muted truncate">
                 {user.email}
-              </div>
+              </TooltipText>
             )}
             {user?.is_admin && (
               <div className="coord-spark mt-1">Admin</div>

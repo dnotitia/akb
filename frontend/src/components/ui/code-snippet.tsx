@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 /**
  * Design-system primitive: a copyable code block with a soft header bar.
@@ -32,9 +33,9 @@ export function CodeSnippet({
   return (
     <div className={cn("rounded-[var(--radius-md)] border border-border overflow-hidden", className)}>
       <div className="flex items-center justify-between gap-2 border-b border-border bg-surface-2 px-2 py-1">
-        <span className="font-mono text-[11px] text-foreground-muted truncate">
+        <TooltipText tip={filename || "snippet"} className="font-mono text-[11px] text-foreground-muted truncate">
           {filename || "snippet"}
-        </span>
+        </TooltipText>
         <button
           onClick={copy}
           aria-label={copied ? "Snippet copied" : "Copy snippet"}
