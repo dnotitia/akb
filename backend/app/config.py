@@ -139,12 +139,15 @@ class Settings(BaseModel):
     # #189 Phase 2). When True AND the driver is pgvector AND a search has no
     # doc-level filter (collection/doc_type/tags/source_uris), search filters by
     # the user's accessible vault ids (a small set) instead of materializing
-    # every accessible source id (O(corpus)). OFF by default: flip to True only
-    # AFTER the vector index's `vault_id` column is fully backfilled
-    # (scripts/backfill_vault_id.py) — until then the column is partly NULL and
-    # the filter would miss un-backfilled points. While False the behavior is
-    # byte-identical to before (the source_ids path).
-    vault_filter_enabled: bool = False
+    # every accessible source id (O(corpus)). Correctness-equivalent to the
+    # source-id path (AKB's ACL is purely per-vault).
+    #
+    # Safe to leave ON: search self-gates on `vault_backfill.is_ready()`, so the
+    # vault path only activates once every pre-upgrade point has its `vault_id`
+    # (the auto-backfill worker fills them on startup). Until then search
+    # transparently uses the source-id path — no under-fetch. Set False to opt
+    # out of the optimization entirely (byte-identical legacy behavior).
+    vault_filter_enabled: bool = True
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""       # Internal endpoint (server → S3)

@@ -5,6 +5,32 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.13 — 2026-06-16  *(patch — search: zero-touch Phase 2 + retrieval fixes)*
+
+Follow-ups that make the 0.8.12 search work correct and operator-free at scale.
+
+**Zero-touch vault filter (#189 Phase 2 follow-up, #214):** the
+`vault_filter_enabled` optimization no longer needs a manual
+`scripts/backfill_vault_id.py` run or a hand-flipped flag. A `vault_backfill`
+worker started in `lifespan` backfills `vault_id` onto pre-upgrade pgvector
+points on startup (idempotent batches; same-instance via a server-side join),
+and search self-activates the vault path only once it reports ready — until then
+it transparently uses the source-id path (no under-fetch). The flag now defaults
+**on**; the readiness gate makes that safe, and an explicit `false` still opts
+out. Separate-instance pgvector gates readiness on the driver's NULL count
+(== the script's "0 before flip" contract) instead of auto-filling. `/health`
+gains `vector_store.vault_backfill {ready, applicable, null_remaining}`.
+
+**HNSW under-fetch fix (#212):** filtered dense search now sets
+`hnsw.iterative_scan = relaxed_order` + a larger `ef_search` inside the query
+transaction, so a selective vault/source filter no longer post-filters a fixed
+global top-`ef_search` down to a handful of rows (a selective query that
+returned 1 hit now returns the full set).
+
+**Web search UX (#213):** the results page requests a higher limit (25) and
+replaces the alarming "Truncated" warning with a calm informational note —
+semantic search returns the top matches, not an exhaustive count.
+
 ## 0.8.12 — 2026-06-16  *(minor — search: scale + safety (issue #189))*
 
 Make `akb_search` scale and fail honestly at corpus scale.
