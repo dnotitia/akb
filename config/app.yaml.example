@@ -66,6 +66,11 @@ rerank_timeout_seconds: 3.0
 # 0 keeps legacy behavior: only rerank-enabled searches use rerank_prefetch.
 # Set >limit to give rerank-off searches more dedup headroom.
 search_prefetch: 0
+# Hard server-side ceiling on a search/grep `limit`. The MCP tool schema
+# advertises max 50, but that is client-side only — a direct REST call or a
+# non-validating client could otherwise pass an arbitrary limit that propagates
+# into the vector-store prefetch (issue #189). Clamped at the service entry.
+search_limit_max: 50
 
 # === S3-compatible object storage (for vault file uploads) ===
 # Leave endpoints blank to disable file storage features.

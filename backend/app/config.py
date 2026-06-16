@@ -128,6 +128,13 @@ class Settings(BaseModel):
     # lets rerank-off searches dedup over a wider dense+BM25 candidate set.
     search_prefetch: int = Field(default=0, ge=0)
 
+    # Hard server-side ceiling on a search/grep `limit`. The MCP tool schema
+    # advertises max 50 but that is client-side only — a direct REST call or a
+    # non-validating client can pass an arbitrary limit that propagates into the
+    # vector-store prefetch (issue #189). Clamped at the service entry so every
+    # caller (MCP, REST, internal) is bounded uniformly.
+    search_limit_max: int = Field(default=50, ge=1)
+
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""       # Internal endpoint (server → S3)
     s3_public_url: str = ""         # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.

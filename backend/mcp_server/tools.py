@@ -363,7 +363,11 @@ TOOLS = [
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
             "more hits than reported — switch to akb_grep with count_only=true for an exact "
-            "literal-substring count, or refine the query."
+            "literal-substring count, or refine the query. "
+            "When `degraded=true` the retrieval index hit a transient failure (vector-store "
+            "outage or a degraded leg), so results may be incomplete or empty — this is NOT a "
+            "genuine zero-match; `degradation_reason` names the cause. Retry shortly, or fall "
+            "back to akb_grep for a literal search."
         ),
         inputSchema={
             "type": "object",
