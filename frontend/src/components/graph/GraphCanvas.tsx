@@ -525,6 +525,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         width={size.w || undefined}
         height={size.h || undefined}
         backgroundColor={colors.background}
+        // Clamp the zoom range. Without an upper bound, zooming in keeps
+        // scaling the graph-unit decorations (selection halo, arrowheads, edge
+        // spacing) until the view falls apart; the lower bound stops zooming out
+        // into an unusable speck.
+        minZoom={0.2}
+        maxZoom={4}
         nodeId="uri"
         linkSource="source"
         linkTarget="target"
