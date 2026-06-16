@@ -41,6 +41,10 @@ class ChunkUpsert:
     sparse_values: list[float]
     source_type: str
     source_id: str
+    # Owning vault, denormalized onto every point so a driver can filter by
+    # accessible vaults (small set) instead of an enumerated source_id list
+    # (issue #189 Phase 2). Always available at index time (main `chunks` row).
+    vault_id: str
 
 
 @dataclass
@@ -103,6 +107,7 @@ async def loop_upsert_batch(
             sparse_values=c.sparse_values,
             source_type=c.source_type,
             source_id=c.source_id,
+            vault_id=c.vault_id,
         )
 
 
@@ -186,6 +191,7 @@ class VectorStore(Protocol):
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         """Upsert one chunk into the driver. `dense` and `sparse_*` are
         pre-computed by the caller (`embed_worker` for indexing).
@@ -244,6 +250,7 @@ class VectorStore(Protocol):
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         """Dense + sparse search, RRF-fused.
 
@@ -252,9 +259,15 @@ class VectorStore(Protocol):
           falls back to sparse-only.
         - Empty `query_sparse_indices` means OOV query — driver falls
           back to dense-only.
-        - `source_ids` is the post-filter (resolved at the caller from
-          vault/collection/doc_type/tags/ACL); drivers translate to
+        - `source_ids` is the per-resource post-filter (resolved at the caller
+          from collection/doc_type/tags/source_uris); drivers translate to
           their own filter primitive.
+        - `vault_ids` is the per-VAULT ACL filter (issue #189 Phase 2): a small
+          set of accessible vault ids the caller passes INSTEAD of enumerating
+          every accessible source_id. Drivers that store `vault_id` on each
+          point (pgvector) filter on it natively; others ignore it for now and
+          keep filtering by `source_ids`. The caller sends one or the other,
+          never both at once.
         - `prefetch_per_leg` caps each leg's candidate pool before
           fusion. Caller decides — typically `max(limit * 3, 50)`.
         """

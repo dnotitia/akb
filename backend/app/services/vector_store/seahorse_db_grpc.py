@@ -278,6 +278,7 @@ class SeahorseDbGrpcStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         """Single-record insert. JSONL bytes carried over
         ``IngestService.InsertJsonl`` — identical to the REST
@@ -361,6 +362,7 @@ class SeahorseDbGrpcStore:
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         """Server-streaming search. Each ``ResultStreamEvent`` carries
         one of ``header`` / ``chunk`` / ``result_set_boundary`` /

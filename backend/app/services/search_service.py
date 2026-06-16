@@ -86,6 +86,25 @@ def fuse_original_and_reranked_hits(
     return [hits[idx] for idx in ordered]
 
 
+def vault_path_eligible(
+    *,
+    collection: str | None,
+    doc_type: str | None,
+    tags: list[str] | None,
+    source_uris: list[str] | None,
+) -> bool:
+    """Whether a search should use the VAULT-granularity ACL path (issue #189
+    Phase 2) instead of enumerating source ids. Requires: the flag on, the
+    pgvector driver (only it stores vault_id), and NO doc-level narrowing filter
+    (those still need per-resource source_ids). When False, the existing
+    source_ids path runs unchanged."""
+    return (
+        settings.vault_filter_enabled
+        and settings.vector_store_driver == "pgvector"
+        and not (collection or doc_type or tags or source_uris)
+    )
+
+
 def clamp_search_limit(limit: int) -> int:
     """Clamp a user-supplied search/grep ``limit`` to ``[1, search_limit_max]``.
 
@@ -177,8 +196,36 @@ class SearchService:
         # documents from vaults the user can't read.
         has_filters = any([vault, collection, doc_type, tags, user_id, source_uris])
         candidate_source_ids: list[str] | None = None
+        candidate_vault_ids: list[str] | None = None
 
-        if has_filters:
+        # VAULT path (issue #189 Phase 2): when there's no doc-level narrowing
+        # filter, the flag is on, and the driver is pgvector, filter the vector
+        # search by the user's accessible VAULT ids (a small set) instead of
+        # enumerating every accessible source id (O(accessible corpus)). ACL in
+        # AKB is purely per-vault, so this is correctness-equivalent. Otherwise
+        # the existing SOURCE_IDS path runs UNCHANGED (flag off / other driver /
+        # any doc-level filter present).
+        use_vault_path = vault_path_eligible(
+            collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
+        )
+
+        if use_vault_path:
+            async with pool.acquire() as conn:
+                user_uuid = uuid.UUID(user_id) if user_id else None
+                is_admin = bool(await conn.fetchval(
+                    "SELECT is_admin FROM users WHERE id = $1", user_uuid,
+                )) if user_uuid is not None else False
+                candidate_vault_ids = await self._accessible_vault_ids(
+                    conn, user_uuid=user_uuid, is_admin=is_admin, vault=vault,
+                )
+            # None  → admin / anon-with-named-vault → unscoped (mirrors the
+            #         source path's no-ACL admin behavior; admin sees all).
+            # []    → the user can read no matching vault → no results.
+            if candidate_vault_ids is not None and not candidate_vault_ids:
+                return SearchResponse(
+                    query=query, total=0, returned=0, total_matches=0, results=[],
+                )
+        elif has_filters:
             async with pool.acquire() as conn:
                 # Resolve user access once — used in all three candidate
                 # queries below. Previously this repeated the lookup per
@@ -325,6 +372,7 @@ class SearchService:
             query_text=query,
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
+            candidate_vault_ids=candidate_vault_ids,
             limit=target_unique * 3,
         )
 
@@ -385,6 +433,40 @@ class SearchService:
             degradation_reason=degraded_reason,
             results=results,
         )
+
+    async def _accessible_vault_ids(
+        self, conn, *, user_uuid: uuid.UUID | None, is_admin: bool, vault: str | None,
+    ) -> list[str] | None:
+        """The vault ids the user may read — the VAULT-path ACL (issue #189
+        Phase 2). Mirrors the per-vault `_vault_acl` predicate exactly so the
+        flag is a pure performance change, never a security change.
+
+        Returns:
+          - ``None``  → no ACL filter needed (admin, or an anon caller scoped by
+            an explicit vault name) → an unscoped vector search, same as the
+            source path's no-ACL admin behavior.
+          - ``[]``    → the user can read no matching vault → caller returns [].
+          - ``[id…]`` → the accessible vault id(s) to filter on.
+        """
+        # admin / anon mirror `_vault_acl` returning (None, []): no predicate.
+        if user_uuid is None or is_admin:
+            if vault:
+                vid = await conn.fetchval("SELECT id FROM vaults WHERE name = $1", vault)
+                return [str(vid)] if vid is not None else []
+            return None  # admin, no named vault → unscoped
+        # Authenticated non-admin: owner / explicit grant / public.
+        acl = (
+            "v.id IN (SELECT vault_id FROM vault_access WHERE user_id = $1) "
+            "OR v.owner_id = $1 OR v.public_access IN ('reader', 'writer')"
+        )
+        if vault:
+            vid = await conn.fetchval(
+                f"SELECT v.id FROM vaults v WHERE v.name = $2 AND ({acl})",
+                user_uuid, vault,
+            )
+            return [str(vid)] if vid is not None else []
+        rows = await conn.fetch(f"SELECT v.id FROM vaults v WHERE {acl}", user_uuid)
+        return [str(r["id"]) for r in rows]
 
     async def _resolve_source_uris(
         self, conn, source_uris: list[str]
@@ -595,6 +677,7 @@ class SearchService:
         query_text: str,
         query_embedding: list[float] | None,
         candidate_source_ids: list[str] | None,
+        candidate_vault_ids: list[str] | None = None,
         limit: int,
     ) -> tuple[list, str | None]:
         """Hybrid search over the vector store.
@@ -645,6 +728,7 @@ class SearchService:
                 query_sparse_indices=sparse_idx,
                 query_sparse_values=sparse_vals,
                 source_ids=candidate_source_ids,
+                vault_ids=candidate_vault_ids,
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )

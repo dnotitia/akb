@@ -128,6 +128,7 @@ async def _iter_chunks(
                c.chunk_index    AS chunk_index,
                c.source_type    AS source_type,
                c.source_id::text AS source_id,
+               c.vault_id::text  AS vault_id,
                vi.dense         AS dense
           FROM chunks c
           JOIN vaults v ON v.id = c.vault_id
@@ -297,6 +298,7 @@ async def migrate(
                 sparse_values=sparse_values,
                 source_type=row["source_type"] or "document",
                 source_id=row["source_id"],
+                vault_id=row["vault_id"],
             ))
 
         if not batch_payload:
@@ -351,6 +353,7 @@ async def migrate(
                         sparse_values=c.sparse_values,
                         source_type=c.source_type,
                         source_id=c.source_id,
+                        vault_id=c.vault_id,
                     )
                     per_row_ok += 1
                 except Exception as ee:  # noqa: BLE001

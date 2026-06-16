@@ -295,6 +295,7 @@ class PgvectorStore:
                     chunk_id        UUID PRIMARY KEY,
                     source_type     TEXT NOT NULL,
                     source_id       UUID NOT NULL,
+                    vault_id        UUID,
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
@@ -312,6 +313,7 @@ class PgvectorStore:
                     chunk_id        UUID PRIMARY KEY,
                     source_type     TEXT NOT NULL,
                     source_id       UUID NOT NULL,
+                    vault_id        UUID,
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
@@ -350,11 +352,27 @@ class PgvectorStore:
             f'ALTER TABLE "{self._schema}".chunks ALTER COLUMN dense DROP NOT NULL'
         )
 
+        # vault_id (issue #189 Phase 2): denormalized owning-vault on each point
+        # so the ACL filter can be by accessible vault (small set) instead of an
+        # enumerated source_id list. Idempotent ADD COLUMN for tables created
+        # before this column existed; nullable because the column is backfilled
+        # out-of-band (UPDATE from source) and the vault filter stays gated off
+        # (`vault_filter_enabled`) until the backfill completes.
+        await conn.execute(
+            f'ALTER TABLE "{self._schema}".chunks ADD COLUMN IF NOT EXISTS vault_id UUID'
+        )
+
         # Common indexes (both shapes).
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_source_id
                 ON "{self._schema}".chunks (source_id)
+            """
+        )
+        await conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_vi_chunks_vault_id
+                ON "{self._schema}".chunks (vault_id)
             """
         )
         # HNSW for dense KNN, partial on `WHERE dense IS NOT NULL` so
@@ -434,6 +452,17 @@ class PgvectorStore:
         except Exception:  # noqa: BLE001
             return False
 
+    async def vault_backfill_pending(self) -> int:
+        """How many points still have NULL `vault_id` (issue #189 Phase 2). The
+        vault filter (`vault_filter_enabled`) is only safe to enable once this is
+        0 — surfaced in /health so operators can tell when the backfill is done.
+        Cheap (indexed `vault_id` btree). Driver-specific (pgvector only)."""
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            return int(await conn.fetchval(
+                f'SELECT count(*) FROM "{self._schema}".chunks WHERE vault_id IS NULL'
+            ))
+
     # ── Upsert ────────────────────────────────────────────────────
 
     async def upsert_one(
@@ -449,10 +478,12 @@ class PgvectorStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         await self.ensure_collection()
         cid = uuid.UUID(str(chunk_id))
         sid = uuid.UUID(str(source_id))
+        vid = uuid.UUID(str(vault_id))
         # `dense` goes through pgvector's binary codec — list[float]
         # straight into asyncpg's bind. No text literal, no `::vector`
         # cast needed. `None` (sparse-only fallback when the embed API
@@ -467,13 +498,14 @@ class PgvectorStore:
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
-                            (chunk_id, source_type, source_id, section_path,
+                            (chunk_id, source_type, source_id, vault_id, section_path,
                              content, chunk_index, dense,
                              sparse_terms, sparse_weights, indexed_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             source_type    = EXCLUDED.source_type,
                             source_id      = EXCLUDED.source_id,
+                            vault_id       = EXCLUDED.vault_id,
                             section_path   = EXCLUDED.section_path,
                             content        = EXCLUDED.content,
                             chunk_index    = EXCLUDED.chunk_index,
@@ -482,7 +514,7 @@ class PgvectorStore:
                             sparse_weights = EXCLUDED.sparse_weights,
                             indexed_at     = NOW()
                         """,
-                        cid, source_type, sid, section_path or "",
+                        cid, source_type, sid, vid, section_path or "",
                         content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
@@ -490,19 +522,20 @@ class PgvectorStore:
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
-                            (chunk_id, source_type, source_id, section_path,
+                            (chunk_id, source_type, source_id, vault_id, section_path,
                              content, chunk_index, dense, indexed_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             source_type  = EXCLUDED.source_type,
                             source_id    = EXCLUDED.source_id,
+                            vault_id     = EXCLUDED.vault_id,
                             section_path = EXCLUDED.section_path,
                             content      = EXCLUDED.content,
                             chunk_index  = EXCLUDED.chunk_index,
                             dense        = EXCLUDED.dense,
                             indexed_at   = NOW()
                         """,
-                        cid, source_type, sid, section_path or "",
+                        cid, source_type, sid, vid, section_path or "",
                         content, int(chunk_index), dense_param,
                     )
                     # Replace posting rows for this chunk.
@@ -563,6 +596,7 @@ class PgvectorStore:
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         del query_text  # debug-only on this driver; keep signature parity
         await self.ensure_collection()
@@ -572,8 +606,27 @@ class PgvectorStore:
         if not has_dense and not has_sparse:
             return []
 
-        src_uuids = [uuid.UUID(str(s)) for s in (source_ids or [])]
-        src_filter = src_uuids if src_uuids else None
+        # vault_ids (issue #189 Phase 2) vs source_ids: the caller sends EITHER
+        # the vault-granularity ACL filter OR the per-resource filter, never
+        # both. Both reduce to `<col> = ANY($N::uuid[])`, so we resolve a single
+        # (uuids, column) pair and pass the column name down — keeping each leg
+        # query single-branch (filter vs none) instead of duplicating it per
+        # column. `filter_col` is a fixed literal, never user input, so the
+        # f-string interpolation is as safe as the existing `self._schema` one.
+        # Defensive: the two filters are mutually exclusive by contract; if both
+        # ever arrive, vault_ids wins below — assert so a future caller bug is
+        # caught loudly instead of silently dropping the source filter.
+        assert not (vault_ids and source_ids), \
+            "hybrid_search got both vault_ids and source_ids; expected exactly one"
+        if vault_ids:
+            filter_uuids: list[uuid.UUID] | None = [uuid.UUID(str(s)) for s in vault_ids]
+            filter_col = "vault_id"
+        elif source_ids:
+            filter_uuids = [uuid.UUID(str(s)) for s in source_ids]
+            filter_col = "source_id"
+        else:
+            filter_uuids = None
+            filter_col = "source_id"  # unused when filter_uuids is None
         pool = await self._pool()
 
         async def _dense_leg() -> list[str]:
@@ -582,7 +635,8 @@ class PgvectorStore:
                 await self._ensure_codec(c)
                 return await self._search_dense(
                     c, query_dense=query_dense,
-                    src_uuids=src_filter, limit=prefetch_per_leg,
+                    filter_uuids=filter_uuids, filter_col=filter_col,
+                    limit=prefetch_per_leg,
                 )
 
         async def _sparse_leg() -> list[str]:
@@ -591,7 +645,8 @@ class PgvectorStore:
                 return await self._search_sparse(
                     c, terms=list(query_sparse_indices),
                     weights=list(query_sparse_values),
-                    src_uuids=src_filter, limit=prefetch_per_leg,
+                    filter_uuids=filter_uuids, filter_col=filter_col,
+                    limit=prefetch_per_leg,
                 )
 
         try:
@@ -639,23 +694,25 @@ class PgvectorStore:
         conn: asyncpg.Connection,
         *,
         query_dense: list[float],
-        src_uuids: list[uuid.UUID] | None,
+        filter_uuids: list[uuid.UUID] | None,
+        filter_col: str,
         limit: int,
     ) -> list[str]:
         # Binary codec → list[float] passes through directly.
         # `WHERE dense IS NOT NULL` mirrors the partial HNSW index above —
         # sparse-only points (embed API was down when they were indexed)
         # contribute only to the sparse leg, never to the dense KNN.
-        if src_uuids:
+        # `filter_col` is "source_id" or "vault_id" (literal — see hybrid_search).
+        if filter_uuids:
             rows = await conn.fetch(
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
-                WHERE source_id = ANY($2::uuid[]) AND dense IS NOT NULL
+                WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL
                 ORDER BY dense <=> $1
                 LIMIT $3
                 """,
-                list(query_dense), src_uuids, int(limit),
+                list(query_dense), filter_uuids, int(limit),
             )
         else:
             rows = await conn.fetch(
@@ -676,17 +733,19 @@ class PgvectorStore:
         *,
         terms: list[int],
         weights: list[float],
-        src_uuids: list[uuid.UUID] | None,
+        filter_uuids: list[uuid.UUID] | None,
+        filter_col: str,
         limit: int,
     ) -> list[str]:
         if not terms:
             return []
 
         if self._sparse_shape == "arrays":
-            # Two query branches (with/without source filter) keep the
-            # planner honest — a single SQL with `WHERE $3 IS NULL OR
-            # source_id = ANY($3)` confuses ANY-cardinality estimation.
-            if src_uuids:
+            # Two query branches (with/without filter) keep the planner honest —
+            # a single SQL with `WHERE $3 IS NULL OR <col> = ANY($3)` confuses
+            # ANY-cardinality estimation. `filter_col` is "source_id"/"vault_id"
+            # (literal — see hybrid_search), so the interpolation is safe.
+            if filter_uuids:
                 sql = f"""
                     WITH q AS (
                       SELECT unnest($1::bigint[]) AS tid,
@@ -695,7 +754,7 @@ class PgvectorStore:
                     cand AS (
                       SELECT chunk_id, sparse_terms, sparse_weights
                       FROM "{self._schema}".chunks
-                      WHERE source_id = ANY($3::uuid[])
+                      WHERE {filter_col} = ANY($3::uuid[])
                     )
                     SELECT c.chunk_id::text AS chunk_id,
                            SUM(q.w * t.weight) AS score
@@ -709,7 +768,7 @@ class PgvectorStore:
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights],
-                    src_uuids, int(limit),
+                    filter_uuids, int(limit),
                 )
             else:
                 sql = f"""
@@ -731,7 +790,7 @@ class PgvectorStore:
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
         else:  # posting
-            if src_uuids:
+            if filter_uuids:
                 sql = f"""
                     WITH q AS (
                       SELECT unnest($1::bigint[]) AS tid,
@@ -742,14 +801,14 @@ class PgvectorStore:
                     FROM "{self._schema}".posting p
                     JOIN q ON q.tid = p.term_id
                     JOIN "{self._schema}".chunks c ON c.chunk_id = p.chunk_id
-                    WHERE c.source_id = ANY($3::uuid[])
+                    WHERE c.{filter_col} = ANY($3::uuid[])
                     GROUP BY p.chunk_id
                     ORDER BY score DESC
                     LIMIT $4
                 """
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights],
-                    src_uuids, int(limit),
+                    filter_uuids, int(limit),
                 )
             else:
                 sql = f"""

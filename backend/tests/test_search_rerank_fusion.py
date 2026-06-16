@@ -9,6 +9,7 @@ from app.services.search_service import (
     clamp_search_limit,
     fuse_original_and_reranked_hits,
     resolve_first_stage_unique_limit,
+    vault_path_eligible,
 )
 
 FUSION_K = 60
@@ -119,6 +120,65 @@ def test_search_response_degraded_defaults_false():
     r = SearchResponse(query="x", total=0, returned=0, total_matches=0, results=[])
     assert r.degraded is False
     assert r.degradation_reason is None
+
+
+def test_vault_path_eligible(monkeypatch):
+    """The VAULT path (issue #189 Phase 2) is taken ONLY with the flag on, the
+    pgvector driver, and NO doc-level filter; otherwise the source_ids path
+    (flag-off parity = byte-identical to before)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "vector_store_driver", "pgvector", raising=False)
+
+    def call(**kw):
+        base = {"collection": None, "doc_type": None, "tags": None, "source_uris": None}
+        base.update(kw)
+        return vault_path_eligible(**base)
+
+    assert call() is True  # flag + pgvector + no filters → vault path
+    assert call(collection="specs") is False  # any doc-level filter → source path
+    assert call(doc_type="note") is False
+    assert call(tags=["x"]) is False
+    assert call(source_uris=["akb://v/doc/x"]) is False
+
+    # flag off → never (parity with pre-Phase-2 behavior)
+    monkeypatch.setattr(settings, "vault_filter_enabled", False, raising=False)
+    assert call() is False
+
+    # other driver → never (only pgvector stores vault_id)
+    monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "vector_store_driver", "qdrant", raising=False)
+    assert call() is False
+
+
+@pytest.mark.asyncio
+async def test_run_vector_search_forwards_vault_ids_to_driver(monkeypatch):
+    """The VAULT path threads candidate_vault_ids into the driver's hybrid_search
+    (and leaves source_ids None), so pgvector can filter by vault instead of an
+    enumerated source-id list."""
+    import app.services.search_service as ss
+
+    svc = ss.SearchService()
+    captured = {}
+
+    async def encode_ok(_q):
+        return [1], [1.0]
+
+    class _Store:
+        async def hybrid_search(self, **kw):
+            captured.update(kw)
+            return []
+
+    monkeypatch.setattr(ss.sparse_encoder, "encode_query", encode_ok)
+    monkeypatch.setattr(ss, "get_vector_store", lambda: _Store())
+
+    await svc._run_vector_search(
+        query_text="q", query_embedding=[0.1, 0.2],
+        candidate_source_ids=None, candidate_vault_ids=["v1", "v2"], limit=10,
+    )
+    assert captured["vault_ids"] == ["v1", "v2"]
+    assert captured["source_ids"] is None
 
 
 @pytest.mark.asyncio
