@@ -7,6 +7,7 @@ import {
   FileText,
   FolderPlus,
   Paperclip,
+  RotateCw,
   Sparkles,
   Table,
   Trash2,
@@ -231,15 +232,24 @@ export function VaultExplorer({
       className="flex flex-col h-full overflow-hidden text-sm bg-background"
       aria-label={`${vault} collections`}
     >
-      <div className="border-b border-border px-2 py-1.5 shrink-0">
+      <div className="border-b border-border px-2 py-1.5 shrink-0 flex items-center gap-1.5">
         <input
           type="search"
           placeholder="Filter in vault…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="w-full h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
+          className="flex-1 min-w-0 h-9 px-2.5 rounded-[var(--radius-md)] bg-surface border border-border text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-ring transition-colors"
           aria-label="Filter tree"
         />
+        <button
+          type="button"
+          onClick={() => refetch()}
+          aria-label="Refresh"
+          title="Refresh"
+          className="shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <RotateCw className="h-3.5 w-3.5" aria-hidden />
+        </button>
       </div>
 
       <div
@@ -416,7 +426,12 @@ const TreeRow = memo(function TreeRow({
             className="h-3 w-3 shrink-0 text-foreground-muted group-hover:text-link transition-colors"
             aria-hidden
           />
-          <span title={node.name} className="truncate font-medium tracking-tight text-[13px]">{node.name}</span>
+          <span
+            title={node.raw?.summary ? `${node.name} — ${node.raw.summary}` : node.name}
+            className="truncate font-medium tracking-tight text-[13px]"
+          >
+            {node.name}
+          </span>
           {count > 0 && <span className="coord ml-auto shrink-0 tabular-nums">{count}</span>}
         </button>
         {canWrite && onCreateDoc && (
