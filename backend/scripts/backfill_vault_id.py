@@ -91,23 +91,40 @@ async def _apply_batch(vpool, schema: str, batch: list[tuple[str, str]]) -> int:
 
 async def _backfill_same_instance(schema: str) -> int:
     """Server-side join UPDATE — the vector index is in the main DB, so no rows
-    cross into Python. Single transaction; idempotent on `vault_id IS NULL`."""
+    cross into Python. Done in bounded BATCHES (each its own transaction) so a
+    large corpus can't blow the per-statement timeout (one UPDATE over hundreds
+    of thousands of rows does). Idempotent on `vault_id IS NULL`; loops until no
+    NULL row still has a source match (orphans, if any, are left for the caller
+    to report)."""
     pool = await get_pool()
-    async with pool.acquire() as c:
-        async with c.transaction():
-            res = await c.execute(
-                f"""
-                UPDATE "{schema}".chunks vi
-                SET vault_id = src.vault_id
-                FROM (
-                  SELECT id, vault_id FROM documents
-                  UNION ALL SELECT id, vault_id FROM vault_tables
-                  UNION ALL SELECT id, vault_id FROM vault_files
-                ) src
-                WHERE vi.source_id = src.id AND vi.vault_id IS NULL
-                """
-            )
-    return int(res.split()[-1]) if res.startswith("UPDATE") else 0
+    total = 0
+    while True:
+        async with pool.acquire() as c:
+            async with c.transaction():
+                res = await c.execute(
+                    f"""
+                    WITH batch AS (
+                      SELECT vi.chunk_id, src.vault_id AS vid
+                      FROM "{schema}".chunks vi
+                      JOIN (
+                        SELECT id, vault_id FROM documents
+                        UNION ALL SELECT id, vault_id FROM vault_tables
+                        UNION ALL SELECT id, vault_id FROM vault_files
+                      ) src ON src.id = vi.source_id
+                      WHERE vi.vault_id IS NULL
+                      LIMIT {_BATCH}
+                    )
+                    UPDATE "{schema}".chunks vi
+                    SET vault_id = batch.vid
+                    FROM batch
+                    WHERE vi.chunk_id = batch.chunk_id
+                    """
+                )
+        n = int(res.split()[-1]) if res.startswith("UPDATE") else 0
+        total += n
+        if n == 0:
+            break
+    return total
 
 
 async def _backfill_separate(schema: str) -> int:
