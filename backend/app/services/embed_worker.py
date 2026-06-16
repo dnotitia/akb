@@ -238,6 +238,7 @@ async def _process_once() -> int:
                         sparse_values=sparse_vals,
                         source_type=row["source_type"] or "document",
                         source_id=str(row["source_id"]),
+                        vault_id=str(row["vault_id"]),
                     )
                     await _mark_success(conn, row["id"])
         except VectorStoreUnavailable as e:

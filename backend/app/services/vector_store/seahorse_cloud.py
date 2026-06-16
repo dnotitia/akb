@@ -286,6 +286,7 @@ class SeahorseCloudStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         del conn
         await self.ensure_collection()
@@ -366,6 +367,7 @@ class SeahorseCloudStore:
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         # Seahorse runs its own RRF prefetch internally; the caller's
         # prefetch_per_leg hint isn't surfaced as an API knob.

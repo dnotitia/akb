@@ -216,6 +216,7 @@ class SeahorseDbStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         """Insert a single record into the AKB-shaped Coral table.
 
@@ -428,6 +429,7 @@ class SeahorseDbStore:
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         """Coral's hybrid search takes:
 
