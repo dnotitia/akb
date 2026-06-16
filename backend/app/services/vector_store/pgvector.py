@@ -704,16 +704,32 @@ class PgvectorStore:
         # contribute only to the sparse leg, never to the dense KNN.
         # `filter_col` is "source_id" or "vault_id" (literal — see hybrid_search).
         if filter_uuids:
-            rows = await conn.fetch(
-                f"""
-                SELECT chunk_id::text AS chunk_id
-                FROM "{self._schema}".chunks
-                WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL
-                ORDER BY dense <=> $1
-                LIMIT $3
-                """,
-                list(query_dense), filter_uuids, int(limit),
-            )
+            # HNSW post-filters: it walks the graph for ~`ef_search` GLOBAL
+            # nearest, THEN drops the ones failing the WHERE. With a selective
+            # filter (one user's vaults/docs out of the whole corpus) most of
+            # the global top-ef live in OTHER vaults, so a plain query returns
+            # only the handful that survive — severe under-retrieval (a query
+            # whose global-nearest sit in other vaults came back with ~1 hit
+            # while the corpus held dozens). `hnsw.iterative_scan` (pgvector
+            # >= 0.8) makes the index keep scanning until `limit` filtered rows
+            # are found, bounded by `hnsw.max_scan_tuples`. relaxed_order is
+            # fine — the dense leg is re-ranked by RRF + cross-encoder anyway.
+            # SET LOCAL scopes it to this transaction so the pooled conn resets.
+            async with conn.transaction():
+                await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+                # ef_search bumped from the default 40 so iterative scan has a
+                # wider beam before it starts re-scanning (fewer scan rounds).
+                await conn.execute("SET LOCAL hnsw.ef_search = 200")
+                rows = await conn.fetch(
+                    f"""
+                    SELECT chunk_id::text AS chunk_id
+                    FROM "{self._schema}".chunks
+                    WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL
+                    ORDER BY dense <=> $1
+                    LIMIT $3
+                    """,
+                    list(query_dense), filter_uuids, int(limit),
+                )
         else:
             rows = await conn.fetch(
                 f"""
