@@ -105,7 +105,6 @@ export default function SearchPage() {
   const [returnedDocs, setReturnedDocs] = useState(0);
   const [returnedMatches, setReturnedMatches] = useState(0);
   const [truncated, setTruncated] = useState(false);
-  const [hint, setHint] = useState<string | null>(null);
   const [degraded, setDegraded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
@@ -152,7 +151,9 @@ export default function SearchPage() {
     setError(null);
     try {
       if (m === "dense") {
-        const d = await searchDocs(s, v || undefined);
+        // Web shows a fuller page than the agent default (10). 25 stays under
+        // the server-side ceiling (search_limit_max, 50).
+        const d = await searchDocs(s, v || undefined, 25);
         if (id !== reqId.current) return; // superseded
         setDenseResults(d.results);
         setLiteralResults([]);
@@ -161,7 +162,6 @@ export default function SearchPage() {
         setReturnedDocs(d.returned);
         setReturnedMatches(0);
         setTruncated(Boolean(d.truncated));
-        setHint(d.hint ?? null);
         setDegraded(Boolean(d.degraded));
       } else {
         const d = await grepDocs(s, v || undefined);
@@ -175,7 +175,6 @@ export default function SearchPage() {
         setReturnedDocs(d.returned_docs ?? d.total_docs);
         setReturnedMatches(d.returned_matches ?? d.total_matches);
         setTruncated(Boolean(d.truncated));
-        setHint(d.hint ?? null);
         setDegraded(false); // literal/grep uses SQL, not the vector store
       }
     } catch (e) {
@@ -190,7 +189,6 @@ export default function SearchPage() {
       setReturnedDocs(0);
       setReturnedMatches(0);
       setTruncated(false);
-      setHint(null);
       setDegraded(false);
     } finally {
       if (id === reqId.current) setLoading(false);
@@ -495,9 +493,21 @@ export default function SearchPage() {
         </Alert>
       )}
 
-      {truncated && hint && hasResults && !loading && (
-        <Alert variant="warning" title="Truncated" className="mt-6">
-          {hint}
+      {/* Truncated = the prefetch pool was capped (semantic search is top-K,
+          not an exhaustive scan). The backend `hint` is written for agents
+          (suggests akb_grep count_only); on the web a short, calm note reads
+          better than the full tooling sentence. */}
+      {truncated && hasResults && !loading && (
+        <Alert variant="info" title="Showing the most relevant matches" className="mt-6">
+          Semantic search returns the top matches, not an exhaustive list — there
+          may be more. Refine your query, or use{" "}
+          <button
+            onClick={() => switchMode("literal")}
+            className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Literal
+          </button>{" "}
+          search for an exact count.
         </Alert>
       )}
 
