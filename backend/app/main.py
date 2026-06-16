@@ -179,11 +179,20 @@ async def health():
     reporting the same `chunks.vector_indexed_at IS NULL` count.
     """
     from app.services import sparse_encoder
-    vs_info: dict = {"reachable": await get_vector_store().health()}
+    store = get_vector_store()
+    vs_info: dict = {"reachable": await store.health()}
     try:
         vs_info["backfill"] = await embed_worker.pending_stats()
     except Exception as e:  # noqa: BLE001
         vs_info["backfill_error"] = str(e)
+    # vault_id backfill progress (issue #189 Phase 2): operators must see this
+    # reach 0 before flipping `vault_filter_enabled`. pgvector-only.
+    vault_backfill = getattr(store, "vault_backfill_pending", None)
+    if vault_backfill is not None:
+        try:
+            vs_info["vault_id_null_count"] = await vault_backfill()
+        except Exception as e:  # noqa: BLE001
+            vs_info["vault_id_null_count_error"] = str(e)
     try:
         vs_info["bm25"] = await sparse_encoder.stats_snapshot()
     except Exception as e:  # noqa: BLE001

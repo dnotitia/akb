@@ -71,6 +71,15 @@ search_prefetch: 0
 # non-validating client could otherwise pass an arbitrary limit that propagates
 # into the vector-store prefetch (issue #189). Clamped at the service entry.
 search_limit_max: 50
+# Push the ACL filter down to VAULT granularity in the vector store (issue #189
+# Phase 2). When true AND the driver is pgvector AND a search has no doc-level
+# filter, search filters by the user's accessible vault ids (small set) instead
+# of every accessible source id (O(corpus)). KEEP false until the vector index's
+# vault_id column is fully backfilled — run, to completion:
+#     python -m scripts.backfill_vault_id            # then --check reports 0
+# Until then the column is partly NULL and the filter would silently drop those
+# points. While false the behavior is identical to before.
+vault_filter_enabled: false
 
 # === S3-compatible object storage (for vault file uploads) ===
 # Leave endpoints blank to disable file storage features.
