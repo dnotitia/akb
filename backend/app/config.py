@@ -135,6 +135,17 @@ class Settings(BaseModel):
     # caller (MCP, REST, internal) is bounded uniformly.
     search_limit_max: int = Field(default=50, ge=1)
 
+    # Push the ACL filter down to VAULT granularity in the vector store (issue
+    # #189 Phase 2). When True AND the driver is pgvector AND a search has no
+    # doc-level filter (collection/doc_type/tags/source_uris), search filters by
+    # the user's accessible vault ids (a small set) instead of materializing
+    # every accessible source id (O(corpus)). OFF by default: flip to True only
+    # AFTER the vector index's `vault_id` column is fully backfilled
+    # (scripts/backfill_vault_id.py) — until then the column is partly NULL and
+    # the filter would miss un-backfilled points. While False the behavior is
+    # byte-identical to before (the source_ids path).
+    vault_filter_enabled: bool = False
+
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""       # Internal endpoint (server → S3)
     s3_public_url: str = ""         # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
