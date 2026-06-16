@@ -22,6 +22,8 @@ describe("GraphCanvas smoke", () => {
           pinned={new Set()}
           hidden={new Set()}
           onSelect={() => {}}
+          onExpand={() => {}}
+          onPinNode={() => {}}
           onContextMenu={() => {}}
         />,
       );
