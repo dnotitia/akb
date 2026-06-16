@@ -295,6 +295,7 @@ class PgvectorStore:
                     chunk_id        UUID PRIMARY KEY,
                     source_type     TEXT NOT NULL,
                     source_id       UUID NOT NULL,
+                    vault_id        UUID,
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
@@ -312,6 +313,7 @@ class PgvectorStore:
                     chunk_id        UUID PRIMARY KEY,
                     source_type     TEXT NOT NULL,
                     source_id       UUID NOT NULL,
+                    vault_id        UUID,
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
@@ -350,11 +352,27 @@ class PgvectorStore:
             f'ALTER TABLE "{self._schema}".chunks ALTER COLUMN dense DROP NOT NULL'
         )
 
+        # vault_id (issue #189 Phase 2): denormalized owning-vault on each point
+        # so the ACL filter can be by accessible vault (small set) instead of an
+        # enumerated source_id list. Idempotent ADD COLUMN for tables created
+        # before this column existed; nullable because the column is backfilled
+        # out-of-band (UPDATE from source) and the vault filter stays gated off
+        # (`vault_filter_enabled`) until the backfill completes.
+        await conn.execute(
+            f'ALTER TABLE "{self._schema}".chunks ADD COLUMN IF NOT EXISTS vault_id UUID'
+        )
+
         # Common indexes (both shapes).
         await conn.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_vi_chunks_source_id
                 ON "{self._schema}".chunks (source_id)
+            """
+        )
+        await conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_vi_chunks_vault_id
+                ON "{self._schema}".chunks (vault_id)
             """
         )
         # HNSW for dense KNN, partial on `WHERE dense IS NOT NULL` so
@@ -449,10 +467,12 @@ class PgvectorStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> None:
         await self.ensure_collection()
         cid = uuid.UUID(str(chunk_id))
         sid = uuid.UUID(str(source_id))
+        vid = uuid.UUID(str(vault_id))
         # `dense` goes through pgvector's binary codec — list[float]
         # straight into asyncpg's bind. No text literal, no `::vector`
         # cast needed. `None` (sparse-only fallback when the embed API
@@ -467,13 +487,14 @@ class PgvectorStore:
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
-                            (chunk_id, source_type, source_id, section_path,
+                            (chunk_id, source_type, source_id, vault_id, section_path,
                              content, chunk_index, dense,
                              sparse_terms, sparse_weights, indexed_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             source_type    = EXCLUDED.source_type,
                             source_id      = EXCLUDED.source_id,
+                            vault_id       = EXCLUDED.vault_id,
                             section_path   = EXCLUDED.section_path,
                             content        = EXCLUDED.content,
                             chunk_index    = EXCLUDED.chunk_index,
@@ -482,7 +503,7 @@ class PgvectorStore:
                             sparse_weights = EXCLUDED.sparse_weights,
                             indexed_at     = NOW()
                         """,
-                        cid, source_type, sid, section_path or "",
+                        cid, source_type, sid, vid, section_path or "",
                         content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
@@ -490,19 +511,20 @@ class PgvectorStore:
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
-                            (chunk_id, source_type, source_id, section_path,
+                            (chunk_id, source_type, source_id, vault_id, section_path,
                              content, chunk_index, dense, indexed_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             source_type  = EXCLUDED.source_type,
                             source_id    = EXCLUDED.source_id,
+                            vault_id     = EXCLUDED.vault_id,
                             section_path = EXCLUDED.section_path,
                             content      = EXCLUDED.content,
                             chunk_index  = EXCLUDED.chunk_index,
                             dense        = EXCLUDED.dense,
                             indexed_at   = NOW()
                         """,
-                        cid, source_type, sid, section_path or "",
+                        cid, source_type, sid, vid, section_path or "",
                         content, int(chunk_index), dense_param,
                     )
                     # Replace posting rows for this chunk.
@@ -563,8 +585,13 @@ class PgvectorStore:
         source_ids: list[str] | None,
         limit: int,
         prefetch_per_leg: int,
+        vault_ids: list[str] | None = None,
     ) -> list[VectorHit]:
         del query_text  # debug-only on this driver; keep signature parity
+        # vault_ids filtering is wired in Phase 2 increment B (vault-granularity
+        # ACL). Accepted now for contract parity; until then the caller still
+        # passes source_ids and this driver filters on that.
+        del vault_ids
         await self.ensure_collection()
 
         has_dense = query_dense is not None and len(query_dense) > 0

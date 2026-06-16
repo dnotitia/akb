@@ -131,7 +131,7 @@ R=$(run_test "    cid = uuid.uuid4()
         chunk_id=str(cid), content='hello world', section_path='',
         chunk_index=0, dense=[0.1]*8,
         sparse_indices=[10, 20, 30], sparse_values=[1.0, 0.5, 0.25],
-        source_type='document', source_id=str(sid),
+        source_type='document', source_id=str(sid), vault_id=str(sid),
     )
     pool = await s._pool()
     async with pool.acquire() as c:
@@ -154,14 +154,14 @@ R=$(run_test "    sid = uuid.uuid4()
             chunk_id=str(c), content=f'doc {i}', section_path='', chunk_index=i,
             dense=[1.0 - i*0.1] * 8,
             sparse_indices=[100 + i], sparse_values=[float(i+1)],
-            source_type='document', source_id=str(sid),
+            source_type='document', source_id=str(sid), vault_id=str(sid),
         )
     # Distractor in another source.
     distractor = uuid.uuid4()
     await s.upsert_one(
         chunk_id=str(distractor), content='wrong vault', section_path='', chunk_index=0,
         dense=[0.9]*8, sparse_indices=[100], sparse_values=[5.0],
-        source_type='document', source_id=str(sid_other),
+        source_type='document', source_id=str(sid_other), vault_id=str(sid_other),
     )
     # Dense-only
     dense_hits = await s.hybrid_search(
@@ -206,7 +206,7 @@ R=$(run_test "    cid = uuid.uuid4()
     await s.upsert_one(
         chunk_id=str(cid), content='to-delete', section_path='', chunk_index=0,
         dense=[0.1]*8, sparse_indices=[1, 2], sparse_values=[0.5, 0.5],
-        source_type='document', source_id=str(sid),
+        source_type='document', source_id=str(sid), vault_id=str(sid),
     )
     await s.delete_point(str(cid))
     pool = await s._pool()
@@ -227,7 +227,7 @@ R=$(run_test "    cid = uuid.uuid4()
     await s.upsert_one(
         chunk_id=str(cid), content='codec', section_path='', chunk_index=0,
         dense=src_dense, sparse_indices=[], sparse_values=[],
-        source_type='document', source_id=str(sid),
+        source_type='document', source_id=str(sid), vault_id=str(sid),
     )
     pool = await s._pool()
     async with pool.acquire() as c:

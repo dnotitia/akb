@@ -414,6 +414,7 @@ async def test_upsert_one_jsonl_record_shape(
         sparse_values=[1.0, 0.5, 0.25],
         source_type="document",
         source_id="11111111-2222-3333-4444-555555555555",
+        vault_id="99999999-8888-7777-6666-555555555555",
     )
 
     args = stub.InsertJsonl.await_args.args[0]
