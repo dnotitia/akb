@@ -65,7 +65,7 @@ describe("SearchPage · semantic (dense) mode", () => {
       ],
     });
     renderAt("/search?q=postgres");
-    await waitFor(() => expect(mockedSearch).toHaveBeenCalledWith("postgres", undefined));
+    await waitFor(() => expect(mockedSearch).toHaveBeenCalledWith("postgres", undefined, 25));
     expect(await screen.findByText("PostgreSQL tuning")).toBeTruthy();
     expect(mockedGrep).not.toHaveBeenCalled();
   });
