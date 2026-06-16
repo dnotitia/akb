@@ -39,6 +39,8 @@ const baseProps = {
   pinned: new Set<string>(),
   hidden: new Set<string>(),
   onSelect: () => {},
+  onExpand: () => {},
+  onPinNode: () => {},
   onContextMenu: () => {},
 };
 

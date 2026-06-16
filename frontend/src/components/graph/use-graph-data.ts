@@ -1,6 +1,12 @@
 // frontend/src/components/graph/use-graph-data.ts
 import { useQuery } from "@tanstack/react-query";
-import { getGraph, getRelations, type RelationRow } from "@/lib/api";
+import {
+  getGraph,
+  getRelations,
+  type GraphApiNode,
+  type GraphApiEdge,
+  type RelationRow,
+} from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import { groupOf } from "./cluster";
 import {
@@ -37,6 +43,25 @@ function normalizeRelation(raw: string | undefined): RelationKind | null {
     default:
       return null;
   }
+}
+
+/** Convert a backend /graph response into the renderer's payload shape.
+ *  Shared by the full-graph load and on-demand node expansion so both map
+ *  kinds/relations/groups identically. */
+export function apiToPayload(resp: { nodes: GraphApiNode[]; edges: GraphApiEdge[] }): GraphPayload {
+  const nodes: GraphNode[] = resp.nodes.map((n) => ({
+    uri: n.uri,
+    name: n.name || n.uri,
+    kind: normalizeKind(n.resource_type),
+    group: groupOf(n.uri),
+  }));
+  const edges: GraphEdge[] = resp.edges
+    .map((e) => {
+      const rel = normalizeRelation(e.relation);
+      return rel ? { source: e.source, target: e.target, relation: rel } : null;
+    })
+    .filter((e): e is GraphEdge => e !== null);
+  return { nodes, edges };
 }
 
 export function mergeGraph(a: GraphPayload, b: GraphPayload): GraphPayload {
@@ -244,21 +269,21 @@ export function useFullGraph(vault: string, enabled: boolean) {
       // hundreds/thousands of nodes, which the canvas handles via its layout
       // perf tiers (GraphCanvas.layoutTier), not a render gate.
       const resp = await getGraph(vault, undefined, 2, 200);
-      const nodes: GraphNode[] = resp.nodes.map((n) => ({
-        uri: n.uri,
-        name: n.name || n.uri,
-        kind: normalizeKind(n.resource_type),
-        group: groupOf(n.uri),
-      }));
-      const edges: GraphEdge[] = resp.edges
-        .map((e) => {
-          const rel = normalizeRelation(e.relation);
-          return rel ? { source: e.source, target: e.target, relation: rel } : null;
-        })
-        .filter((e): e is GraphEdge => e !== null);
-      return { nodes, edges };
+      return apiToPayload(resp);
     },
   });
+}
+
+/** Fetch one node's immediate neighborhood via the backend graph BFS (single
+ *  round trip), for on-demand expand. Returns a payload to merge into the
+ *  session overlay. */
+export async function fetchNeighbors(
+  vault: string,
+  id: string,
+  hops: 1 | 2 = 1,
+): Promise<GraphPayload> {
+  const resp = await getGraph(vault, id, hops, 100);
+  return apiToPayload(resp);
 }
 
 export function useNeighborhood(

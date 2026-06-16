@@ -14,13 +14,13 @@ import {
   useNeighborhood,
   applyFilters,
   mergeGraph,
+  fetchNeighbors,
   docIdFromUri,
 } from "@/components/graph/use-graph-data";
+import { GraphContextMenu, type GraphMenuState } from "@/components/graph/GraphContextMenu";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
 import { kindToSegment, type GraphEdge, type GraphNode, type GraphView, type RelatedRef } from "@/components/graph/graph-types";
 import { groupOf } from "@/components/graph/cluster";
-
-const DOUBLECLICK_MS = 250;
 
 export default function GraphPage() {
   const { name: vault } = useParams<{ name: string }>();
@@ -92,34 +92,63 @@ export default function GraphPage() {
     setHintOpen(false);
     localStorage.setItem("akb:graph:hint-dismissed", "1");
   }, []);
-  const lastClickRef = useRef<{ uri: string; at: number } | null>(null);
+  // Floating context-menu state (right-click on a node).
+  const [menu, setMenu] = useState<GraphMenuState | null>(null);
 
-  // Double-click emulation: two clicks on the same URI within DOUBLECLICK_MS
-  // navigate to the doc; otherwise the first click is treated as select.
+  // Single click selects (highlight-only — never relayouts). Double-click
+  // (expand) and navigation are handled separately: the canvas calls onExpand
+  // on double-click; navigation lives in the context menu / detail panel.
   function handleSelect(uri: string | undefined) {
-    if (uri && lastClickRef.current && lastClickRef.current.uri === uri && Date.now() - lastClickRef.current.at < DOUBLECLICK_MS) {
-      const node = merged.nodes.find((n) => n.uri === uri);
-      if (node) handleDoubleClick(node);
-      lastClickRef.current = null;
-      return;
-    }
-    lastClickRef.current = uri ? { uri, at: Date.now() } : null;
     const sel = uri ? (docIdFromUri(uri) ?? uri) : undefined;
     if (sel === view.selected) return;
     setView({ ...view, selected: sel });
   }
 
-  function handleDoubleClick(node: GraphNode) {
+  function openNode(node: GraphNode, newTab = false) {
     const id = node.doc_id || docIdFromUri(node.uri);
     if (!id) return;
-    const segment = kindToSegment(node.kind);
-    navigate(`/vault/${vault}/${segment}/${encodeURIComponent(id)}`);
+    const url = `/vault/${vault}/${kindToSegment(node.kind)}/${encodeURIComponent(id)}`;
+    if (newTab) window.open(url, "_blank", "noopener");
+    else navigate(url);
   }
 
-  function handleContextMenu(_n: GraphNode, _x: number, _y: number) {
-    // Context menu wiring deferred — fall back to plain select for now.
-    // TODO(graph-context-menu): floating menu with Pin/Unpin/Hide/Copy/Open-new-tab.
+  // Expand a node's immediate neighborhood via the backend graph BFS (one round
+  // trip) and merge it into the session overlay, so new neighbors appear
+  // without changing the URL/base view.
+  async function expandNode(node: GraphNode) {
+    const id = node.doc_id || docIdFromUri(node.uri);
+    if (!id) return;
+    try {
+      const payload = await fetchNeighbors(vault!, id, 1);
+      // Seed each genuinely-new node next to the node being expanded, so it
+      // tucks in beside its neighbor instead of spawning at the origin and
+      // flying across the canvas (existing nodes stay pinned from pin-on-settle,
+      // so only these new free nodes move).
+      const present = new Set(merged.nodes.map((n) => n.uri));
+      const cx = node.x ?? 0;
+      const cy = node.y ?? 0;
+      for (const n of payload.nodes) {
+        if (!present.has(n.uri)) {
+          n.x = cx + (Math.random() - 0.5) * 40;
+          n.y = cy + (Math.random() - 0.5) * 40;
+        }
+      }
+      setOverlay((prev) => mergeGraph(prev, payload));
+    } catch {
+      /* node simply doesn't expand — leave the graph unchanged */
+    }
   }
+
+  const pinNode = (uri: string) =>
+    setPinned((prev) => (prev.has(uri) ? prev : new Set(prev).add(uri)));
+  const togglePin = (uri: string) =>
+    setPinned((prev) => {
+      const next = new Set(prev);
+      if (next.has(uri)) next.delete(uri);
+      else next.add(uri);
+      return next;
+    });
+  const hideNode = (uri: string) => setHidden((prev) => new Set(prev).add(uri));
 
   // Resolve the selected node + its lookup id once per (graph, selection)
   // change rather than on every render — the find scans up to ~200 nodes and
@@ -297,7 +326,9 @@ export default function GraphPage() {
               pinned={pinned}
               hidden={hidden}
               onSelect={handleSelect}
-              onContextMenu={handleContextMenu}
+              onExpand={expandNode}
+              onPinNode={pinNode}
+              onContextMenu={(node, x, y) => setMenu({ node, x, y })}
             />
             {/* Text alternative + keyboard path: the canvas is opaque to AT, so
                 expose every node as a focusable button that selects it (opening
@@ -345,6 +376,26 @@ export default function GraphPage() {
           pinned={pinned.has(selectedNode.uri)}
         />
       ) : null}
+
+      {menu && (
+        <GraphContextMenu
+          state={menu}
+          pinned={pinned.has(menu.node.uri)}
+          onClose={() => setMenu(null)}
+          onOpen={(newTab) => openNode(menu.node, newTab)}
+          onExpand={() => expandNode(menu.node)}
+          onTogglePin={() => togglePin(menu.node.uri)}
+          onHide={() => hideNode(menu.node.uri)}
+          onFocus={() =>
+            setView({
+              ...view,
+              entry: docIdFromUri(menu.node.uri) ?? menu.node.uri,
+              selected: undefined,
+            })
+          }
+          onCopyUri={() => navigator.clipboard?.writeText(menu.node.uri)}
+        />
+      )}
     </div>
   );
 }

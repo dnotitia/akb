@@ -38,6 +38,12 @@ interface Props {
   pinned: Set<string>;
   hidden: Set<string>;
   onSelect: (uri: string | undefined) => void;
+  /** Double-click / Enter on a node — expand its neighborhood (NOT navigate;
+   *  navigation lives in the context menu + detail panel). */
+  onExpand: (node: GraphNode) => void;
+  /** Drag-release pins the node in place (Obsidian-style); the page adds it to
+   *  the `pinned` set so the marker shows and it survives relayout. */
+  onPinNode: (uri: string) => void;
   onContextMenu: (
     node: GraphNode,
     screenX: number,
@@ -57,10 +63,25 @@ interface RenderEdge {
   relation: GraphEdge["relation"];
 }
 
+// react-force-graph-2d's typed ForceGraphMethods omits graphData(); the live
+// node array (with simulation-mutated x/y/fx/fy) is reachable through it at
+// runtime. Narrow cast so we can pin / read positions without `any`.
+type FgData = { graphData: () => { nodes: RenderNode[]; links: RenderEdge[] } };
+const liveNodes = (fg: ForceGraphMethods | undefined): RenderNode[] => {
+  const gd = (fg as unknown as Partial<FgData> | undefined)?.graphData;
+  return typeof gd === "function" ? gd().nodes : [];
+};
+
 const NODE_SIZE = 16;
 /** Above this zoom every node labels; below it only hovered/selected/pinned do,
  *  so a 600-node graph reads as glyphed squares instead of a smear of names. */
 const LABEL_ALL_ZOOM = 1.2;
+/** Node draw size is CLAMPED to a screen-pixel range so it neither balloons
+ *  when a small graph fits-to-view (zoomed way in) nor vanishes on a big graph
+ *  (zoomed out). Drawn at `clamp(baseSize·zoom, MIN, MAX) / zoom` graph units →
+ *  a constant-ish on-screen size that still grows a little with degree. */
+const NODE_MIN_PX = 7;
+const NODE_MAX_PX = 26;
 
 /**
  * Layout effort by node count. `warmup` ticks run SYNCHRONOUSLY off-screen
@@ -85,6 +106,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     pinned,
     hidden,
     onSelect,
+    onExpand,
+    onPinNode,
     onContextMenu,
   },
   ref,
@@ -92,6 +115,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const fittedRef = useRef(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  // Latest user-pin set, read inside effects without making them depend on it
+  // (so a pin/unpin never reheats the simulation).
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
   // Snap (don't animate) the layout when the OS asks for reduced motion.
@@ -143,15 +170,27 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     else fg.resumeAnimation();
   }, [frozen]);
 
-  // Fit once the layout settles. onEngineStop fires after warmup+cooldown for
-  // every tier (incl. the snap tier, where the synchronous warmup already
-  // placed every node), so zoomToFit always has a real bounding box instead of
-  // racing a fixed timer. fittedRef resets via the page's key={structureKey}
-  // remount on a structural change.
+  // On settle: PIN every node where it landed (fx/fy = x/y), then fit once.
+  //
+  // Pinning is the cure for the "click makes nodes drift apart" bug: d3-drag
+  // reheats the simulation on every click (a click is a zero-distance drag),
+  // and the cluster/collide forces have no stable equilibrium, so each reheat
+  // nudges nodes farther out — ratcheting. A pinned node has x=fx every tick,
+  // so no reheat (click, hover, expand) can move it. This runs on EVERY settle,
+  // so a deliberate re-layout (cluster toggle / expand) re-pins afterward.
+  // User pins (drag/context-menu) and auto-pins are both fx/fy here; they're
+  // told apart by the `pinned` Set, which the cluster re-layout consults.
   const handleEngineStop = useCallback(() => {
-    if (fittedRef.current) return;
-    fgRef.current?.zoomToFit(400, 60);
-    fittedRef.current = true;
+    const fg = fgRef.current;
+    if (!fg) return;
+    for (const n of liveNodes(fg)) {
+      n.fx = n.x;
+      n.fy = n.y;
+    }
+    if (!fittedRef.current) {
+      fg.zoomToFit(400, 60);
+      fittedRef.current = true;
+    }
   }, []);
 
   // node.group is assigned at data ingest (use-graph-data.ts), so it travels
@@ -175,6 +214,57 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [visibleNodes, visibleEdges],
   );
 
+  // Adjacency (uri → neighbor uris) for hover/selection neighbor-highlighting.
+  // Cheap O(E) rebuild only when the visible edge set changes.
+  const adjacency = useMemo(() => {
+    const adj = new Map<string, Set<string>>();
+    const link = (a: string, b: string) => {
+      let s = adj.get(a);
+      if (!s) adj.set(a, (s = new Set()));
+      s.add(b);
+    };
+    for (const e of visibleEdges) {
+      const s = endpointUri(e.source);
+      const t = endpointUri(e.target);
+      link(s, t);
+      link(t, s);
+    }
+    return adj;
+  }, [visibleEdges]);
+
+  // Node degree (visible edges) — drives both node sizing and which labels
+  // surface first at overview zoom (hubs before leaves).
+  const degree = useMemo(() => {
+    const d = new Map<string, number>();
+    for (const e of visibleEdges) {
+      const s = endpointUri(e.source);
+      const t = endpointUri(e.target);
+      d.set(s, (d.get(s) ?? 0) + 1);
+      d.set(t, (d.get(t) ?? 0) + 1);
+    }
+    return d;
+  }, [visibleEdges]);
+
+  // Hover takes precedence over selection for the highlight focus, so moving the
+  // pointer previews a node's neighborhood without committing a selection. When
+  // neither is active, nothing dims (the plain overview).
+  const focusUri = hovered ?? selected;
+  const isRelated = useCallback(
+    (uri: string) => !focusUri || uri === focusUri || (adjacency.get(focusUri)?.has(uri) ?? false),
+    [focusUri, adjacency],
+  );
+
+  // Accepted-label boxes for the greedy collision cull in paintNode's label
+  // step (reset each frame in onRenderFramePre). A non-forced label whose box
+  // overlaps one already drawn this frame is skipped — so labels never overlap.
+  const labelBoxes = useRef<Array<{ x: number; y: number; w: number; h: number }>>([]);
+  const overlaps = useCallback((b: { x: number; y: number; w: number; h: number }) => {
+    for (const o of labelBoxes.current) {
+      if (b.x < o.x + o.w && b.x + b.w > o.x && b.y < o.y + o.h && b.y + b.h > o.y) return true;
+    }
+    return false;
+  }, []);
+
   // Install/remove the clustering forces on the three STATE inputs only — not
   // on graphData. force-graph already re-feeds nodes + reheats to alpha(1) on
   // every data change, so depending on graphData here would double-reheat and
@@ -194,6 +284,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     fg.d3Force("collide", collideOn ? (forceCollide(COLLIDE_RADIUS) as never) : null);
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
+    // Release auto-pinned positions so the changed force can actually re-lay
+    // the graph out — without this, a cluster toggle does nothing visible
+    // because pin-on-settle has fixed every node. User pins (drag / context
+    // menu) stay put. Then reheat so the new force takes effect.
+    for (const n of liveNodes(fg)) {
+      if (!pinnedRef.current.has(n.uri)) {
+        n.fx = undefined;
+        n.fy = undefined;
+      }
+    }
     // Don't reheat on a reduced-motion preference — the freeze effect owns
     // pause/resume; reheating from alpha=1 is the cost Freeze exists to avoid.
     if (!prefersReducedMotion()) fg.d3ReheatSimulation();
@@ -209,13 +309,26 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const y = n.y || 0;
       const isSelected = n.uri === selected;
       const isPinned = pinned.has(n.uri);
+      const related = isRelated(n.uri);
+      const deg = degree.get(n.uri) ?? 0;
+      // Degree sizing (hubs read larger) clamped to a screen-pixel range, then
+      // converted back to graph units, so the node is a constant-ish on-screen
+      // size at any zoom — never ballooning on a small fit-to-view graph nor
+      // shrinking to nothing on a big one.
+      const baseSz = NODE_SIZE + Math.min(8, deg);
+      const sz = Math.max(NODE_MIN_PX, Math.min(NODE_MAX_PX, baseSz * scale)) / scale;
       // Cluster membership re-tints the node ring (keeping the kind-based
       // fill + glyph so document/table/file stay distinguishable). Selection
       // always wins; ungrouped nodes keep their kind stroke.
       const groupStroke = clustered && n.group ? groupColor(n.group, colors.cat) : null;
 
+      ctx.save();
+      // Hover/selection neighbor-highlight: dim everything not adjacent to the
+      // focused node so its neighborhood pops out of a dense graph.
+      if (focusUri && !related) ctx.globalAlpha = 0.18;
+
       ctx.beginPath();
-      ctx.rect(x - NODE_SIZE / 2, y - NODE_SIZE / 2, NODE_SIZE, NODE_SIZE);
+      ctx.rect(x - sz / 2, y - sz / 2, sz, sz);
       switch (n.kind) {
         case "document":
           ctx.fillStyle = colors.surfaceMuted;
@@ -249,48 +362,62 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         ctx.shadowBlur = 12;
         ctx.strokeStyle = colors.accent;
         ctx.lineWidth = 2;
-        ctx.strokeRect(
-          x - NODE_SIZE / 2 - pad,
-          y - NODE_SIZE / 2 - pad,
-          NODE_SIZE + pad * 2,
-          NODE_SIZE + pad * 2,
-        );
+        ctx.strokeRect(x - sz / 2 - pad, y - sz / 2 - pad, sz + pad * 2, sz + pad * 2);
         ctx.restore();
       }
 
       if (isPinned) {
         ctx.fillStyle = colors.accent;
-        ctx.fillRect(x + NODE_SIZE / 2 - 3, y - NODE_SIZE / 2, 3, 3);
+        ctx.fillRect(x + sz / 2 - 3, y - sz / 2, 3, 3);
       }
 
       if (scale > 0.6) {
         const glyph = n.kind === "document" ? "D" : n.kind === "table" ? "T" : "F";
-        ctx.font = `bold 8px ui-monospace, SFMono-Regular, monospace`;
+        // Glyph scales with the (clamped) node size so it always fits the box.
+        ctx.font = `bold ${sz * 0.5}px ui-monospace, SFMono-Regular, monospace`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillStyle = colors.foregroundMuted;
         ctx.fillText(glyph, x, y);
       }
 
-      // Label every node only when zoomed in past LABEL_ALL_ZOOM; otherwise
-      // (e.g. the fit-to-view overview of a 600-node graph) only the hovered /
-      // selected / pinned node labels, so the canvas reads as glyphed squares
-      // instead of a smear of overlapping names.
-      const labelThis =
-        scale > LABEL_ALL_ZOOM || n.uri === selected || n.uri === hovered || pinned.has(n.uri);
-      if (labelThis) {
-        // Render the title as-authored — never .toUpperCase() user copy (it
-        // corrupts acronyms/camelCase/non-Latin titles).
-        const raw = n.name || "";
-        const label = raw.length > 18 ? raw.slice(0, 18) + "…" : raw;
-        ctx.font = `10px ui-monospace, SFMono-Regular, monospace`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "top";
-        ctx.fillStyle = colors.foregroundMuted;
-        ctx.fillText(label, x, y + NODE_SIZE / 2 + 4);
+      // Label — readability rules synthesized from Obsidian (zoom restraint),
+      // sigma/Cytoscape (declutter + rendered-size gate), Gephi (degree
+      // priority), G6/yFiles (pill background):
+      //  • constant ON-SCREEN size: divide the graph-space font by the zoom, so
+      //    labels don't balloon when a small graph fits-to-view zoomed-in;
+      //  • restraint: forced (selected/hovered/pinned/focus-neighbor) always;
+      //    otherwise only when zoomed in past LABEL_ALL_ZOOM or for hubs
+      //    (degree ≥ 4); in focus mode only the focused neighborhood labels;
+      //  • collision culling: a non-forced label that would overlap one already
+      //    drawn this frame is skipped (labelBoxes resets in onRenderFramePre);
+      //  • translucent pill behind the text for legibility over edges/nodes.
+      const forced = isSelected || n.uri === hovered || isPinned || (focusUri != null && related);
+      const wantLabel = forced || (focusUri == null && (scale > LABEL_ALL_ZOOM || deg >= 4));
+      if (wantLabel && n.name) {
+        const fontSize = 12 / scale;
+        const lp = 3 / scale;
+        ctx.font = `${fontSize}px ui-monospace, SFMono-Regular, monospace`;
+        // Title as-authored — never .toUpperCase() (corrupts acronyms/non-Latin).
+        const label = n.name.length > 24 ? n.name.slice(0, 24) + "…" : n.name;
+        const w = ctx.measureText(label).width;
+        const ly = y + sz / 2 + lp;
+        const box = { x: x - w / 2 - lp, y: ly, w: w + lp * 2, h: fontSize + lp * 2 };
+        if (forced || !overlaps(box)) {
+          labelBoxes.current.push(box);
+          ctx.globalAlpha = 0.82;
+          ctx.fillStyle = colors.background;
+          ctx.fillRect(box.x, box.y, box.w, box.h);
+          ctx.globalAlpha = 1;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "top";
+          ctx.fillStyle = isSelected ? colors.accent : colors.foreground;
+          ctx.fillText(label, x, ly + lp);
+        }
       }
+      ctx.restore();
     },
-    [colors, selected, pinned, clustered, hovered],
+    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps],
   );
 
   const paintLink = useCallback(
@@ -300,9 +427,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       if (!src || !tgt) return;
       const dash = RELATION_DASH[l.relation];
       const isAccent = l.relation === "implements" || l.relation === "derived_from";
-      // Edges touching the selected node light up (accent + thicker + glow);
-      // the rest dim so the selected node's connections stand out.
-      const incident = selected != null && (src.uri === selected || tgt.uri === selected);
+      // Edges touching the focused node (hovered, else selected) light up
+      // (accent + thicker + glow); the rest dim so the focused node's
+      // connections stand out of a dense graph.
+      const incident = focusUri != null && (src.uri === focusUri || tgt.uri === focusUri);
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(src.x || 0, src.y || 0);
@@ -315,20 +443,32 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       } else {
         ctx.strokeStyle = isAccent ? colors.accent : colors.foregroundMuted;
         ctx.lineWidth = l.relation === "attached_to" ? 1 : 1.5;
-        if (selected != null) ctx.globalAlpha = 0.3;
+        if (focusUri != null) ctx.globalAlpha = 0.15;
       }
       ctx.setLineDash(dash);
       ctx.stroke();
       ctx.restore();
     },
-    [colors, selected],
+    [colors, focusUri],
   );
 
+  // Single click selects; a second click on the same node within 250 ms
+  // expands its neighborhood (the standard graph gesture). Navigation moved to
+  // the context menu / detail panel so double-click no longer yanks you off the
+  // canvas. Emulated here because react-force-graph-2d has no onNodeDoubleClick.
+  const lastClick = useRef<{ uri: string; at: number } | null>(null);
   const handleNodeClick = useCallback(
     (n: RenderNode) => {
+      const prev = lastClick.current;
+      if (prev && prev.uri === n.uri && Date.now() - prev.at < 250) {
+        lastClick.current = null;
+        onExpand(n);
+        return;
+      }
+      lastClick.current = { uri: n.uri, at: Date.now() };
       onSelect(n.uri);
     },
-    [onSelect],
+    [onSelect, onExpand],
   );
 
   const handleBackgroundClick = useCallback(() => {
@@ -337,26 +477,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   const handleNodeRightClick = useCallback(
     (n: RenderNode, ev: MouseEvent) => {
-      // Native context menu remains available until the custom menu lands.
-      // TODO(graph-context-menu): preventDefault here once the floating
-      // menu (Pin/Unpin/Hide/Copy/Open-new-tab) is wired in the page shell.
+      ev.preventDefault(); // the floating menu is wired in the page shell
       onContextMenu(n, ev.clientX, ev.clientY);
     },
     [onContextMenu],
   );
-
-  const handleNodeDrag = useCallback((_n: RenderNode, _t: { x: number; y: number }) => {
-    // TODO(task-6): shift+drag pinning.
-    //
-    // react-force-graph-2d's `onNodeDrag` does NOT pass a MouseEvent, so we
-    // cannot read ev.shiftKey here. The page shell (Task 6) must:
-    //   1. Track shift-key state via window.addEventListener('keydown'|'keyup').
-    //   2. When a drag begins while shift is held, add the node's URI to the
-    //      `pinned` set passed in via props. Pinning then takes effect through
-    //      the existing `onNodeDragEnd` branch that preserves fx/fy for pinned
-    //      nodes (line below).
-    // This canvas component intentionally stays stateless about keyboard.
-  }, []);
 
   return (
     <div
@@ -393,12 +518,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           icon={Plus}
         />
       </div>
+      <GraphLegend />
       <ForceGraph2D
         ref={fgRef as never}
         graphData={graphData as never}
         width={size.w || undefined}
         height={size.h || undefined}
         backgroundColor={colors.background}
+        // Clamp the zoom range. Without an upper bound, zooming in keeps
+        // scaling the graph-unit decorations (selection halo, arrowheads, edge
+        // spacing) until the view falls apart; the lower bound stops zooming out
+        // into an unusable speck.
+        minZoom={0.2}
+        maxZoom={4}
         nodeId="uri"
         linkSource="source"
         linkTarget="target"
@@ -409,22 +541,90 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkDirectionalArrowColor={colors.foregroundMuted}
         warmupTicks={tier.warmup}
         cooldownTicks={frozen ? 0 : tier.cooldownTicks}
+        // Steadier, quicker settle: more friction + faster cooling so the
+        // layout reaches equilibrium in fewer ticks and overshoots less
+        // (less jiggle on a small/medium graph).
+        d3VelocityDecay={0.5}
+        d3AlphaDecay={0.04}
+        onRenderFramePre={() => {
+          // Reset the per-frame label-collision accumulator before nodes paint.
+          labelBoxes.current = [];
+        }}
         onEngineStop={handleEngineStop}
         onNodeHover={(n) => setHovered((n as RenderNode | undefined)?.uri)}
         onNodeClick={handleNodeClick as never}
         onBackgroundClick={handleBackgroundClick}
         onNodeRightClick={handleNodeRightClick as never}
-        onNodeDrag={handleNodeDrag as never}
         onNodeDragEnd={(n) => {
-          if (!pinned.has((n as unknown as RenderNode).uri)) {
-            (n as unknown as RenderNode).fx = undefined;
-            (n as unknown as RenderNode).fy = undefined;
-          }
+          // Drag-release pins the node where the user dropped it (fx/fy fix the
+          // position); the page records it in `pinned` so the marker shows and
+          // it survives relayout.
+          const node = n as unknown as RenderNode;
+          node.fx = node.x;
+          node.fy = node.y;
+          onPinNode(node.uri);
         }}
       />
     </div>
   );
 });
+
+/** Static legend: node kinds + the structural-vs-associative edge encoding.
+ *  Collapsible so it never competes with the graph; tokens only (no hex). */
+function GraphLegend() {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="absolute bottom-3 right-3 z-10">
+      {open ? (
+        <div className="rounded-[var(--radius-md)] border border-border bg-surface/90 backdrop-blur px-3 py-2 shadow-sm text-[11px] text-foreground-muted">
+          <div className="flex items-center justify-between gap-4 mb-1.5">
+            <span className="font-medium text-foreground">Legend</span>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Hide legend"
+              className="text-foreground-muted hover:text-foreground cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Minus className="h-3 w-3" aria-hidden />
+            </button>
+          </div>
+          <ul className="space-y-1">
+            <li className="flex items-center gap-2">
+              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-foreground rounded-[2px] bg-surface-muted font-mono text-[7px] text-foreground-muted">D</span>
+              Document
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-accent rounded-[2px] bg-surface font-mono text-[7px] text-foreground-muted">T</span>
+              Table
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-dashed border-foreground-muted rounded-[2px] font-mono text-[7px] text-foreground-muted">F</span>
+              File
+            </li>
+            <li className="flex items-center gap-2 pt-1">
+              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.5" /></svg>
+              Structural
+            </li>
+            <li className="flex items-center gap-2">
+              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.5" strokeDasharray="3 3" /></svg>
+              Associative
+            </li>
+          </ul>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          aria-label="Show legend"
+          title="Legend"
+          className="inline-flex items-center justify-center h-8 w-8 rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <Boxes className="h-3 w-3" aria-hidden />
+        </button>
+      )}
+    </div>
+  );
+}
 
 function CanvasButton({
   onClick,
