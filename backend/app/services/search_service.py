@@ -166,6 +166,12 @@ class SearchService:
             logger.warning("query embedding failed: %s", e)
             embeddings = []
         query_embedding = embeddings[0] if embeddings else None
+        # A None embedding here is intentionally NOT surfaced as `degraded`:
+        # sparse-only is a legitimate by-design mode (a deployment may leave
+        # `embed_base_url` unset), and we can't cheaply tell "configured but
+        # transiently down" from "intentionally absent" at this point. The
+        # symmetric sparse-leg failure IS flagged degraded in _run_vector_search
+        # because the BM25 vocab is always present when the feature is on.
 
         # Always pre-filter when user_id is provided so we never leak
         # documents from vaults the user can't read.
@@ -600,20 +606,32 @@ class SearchService:
         a derived view, so a failure never raises to the caller; PG truth is
         untouched. Previously every failure was swallowed into a silent ``[]``
         with no signal (issue #189)."""
+        sparse_failed = False
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
         except Exception as e:  # noqa: BLE001
             logger.warning("sparse encode_query failed (%s); dense-only path", e)
             sparse_idx, sparse_vals = [], []
+            sparse_failed = True
 
-        # Hybrid requires a sparse signal. If encode_query succeeded but
-        # returned no vocab terms (OOV / nonsense query) AND the embedding
-        # API succeeded (query_embedding not None), the right answer is [].
-        # Dense-only is a degraded mode for embedding-API outage, not for
-        # OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
-        # text and would return plausible-looking distractor neighbours.
-        if not sparse_idx and query_embedding is not None:
+        # OOV guard — fires ONLY when encode_query SUCCEEDED but produced no
+        # vocab terms (nonsense query) AND the embedding API succeeded: the
+        # right answer is []. Dense-only is a degraded mode for an outage, not
+        # for OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
+        # text and would return plausible-looking distractor neighbours. This
+        # must NOT fire on a sparse-encoder FAILURE (that's degraded, not OOV).
+        if not sparse_failed and not sparse_idx and query_embedding is not None:
             return [], None
+
+        # Sparse encoder DOWN with no dense leg either → we can't search at all.
+        # Surface it as degraded (issue #189) instead of a silent zero-match.
+        if sparse_failed and query_embedding is None:
+            return [], "sparse_encoder_failed"
+
+        # If the sparse leg failed but a dense leg is available, we proceed
+        # dense-only — but the result is degraded (one retrieval leg missing),
+        # so we flag it rather than passing it off as a complete result.
+        sparse_reason = "sparse_encoder_degraded" if sparse_failed else None
 
         # max(limit*3, 50): same heuristic the legacy native-fusion path used.
         # Driver-agnostic now, but the value transfers cleanly — RRF
@@ -630,7 +648,9 @@ class SearchService:
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )
-            return hits, None
+            # `sparse_reason` is None on the normal path; set when the sparse leg
+            # was down and we ran dense-only (degraded-but-has-results).
+            return hits, sparse_reason
         except VectorStoreUnavailable as e:
             # Transient/expected: store outage. Search degrades to empty but the
             # caller is told WHY instead of seeing a silent zero-match.

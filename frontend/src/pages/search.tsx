@@ -106,6 +106,7 @@ export default function SearchPage() {
   const [returnedMatches, setReturnedMatches] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -161,6 +162,7 @@ export default function SearchPage() {
         setReturnedMatches(0);
         setTruncated(Boolean(d.truncated));
         setHint(d.hint ?? null);
+        setDegraded(Boolean(d.degraded));
       } else {
         const d = await grepDocs(s, v || undefined);
         if (id !== reqId.current) return;
@@ -174,6 +176,7 @@ export default function SearchPage() {
         setReturnedMatches(d.returned_matches ?? d.total_matches);
         setTruncated(Boolean(d.truncated));
         setHint(d.hint ?? null);
+        setDegraded(false); // literal/grep uses SQL, not the vector store
       }
     } catch (e) {
       if (id !== reqId.current) return;
@@ -188,6 +191,7 @@ export default function SearchPage() {
       setReturnedMatches(0);
       setTruncated(false);
       setHint(null);
+      setDegraded(false);
     } finally {
       if (id === reqId.current) setLoading(false);
     }
@@ -407,6 +411,21 @@ export default function SearchPage() {
             </button>
           )}
         </div>
+      )}
+
+      {degraded && (
+        <Alert variant="warning" className="mb-4">
+          Search is degraded — the retrieval index hit a transient issue, so these
+          results may be incomplete. This isn't a "no matches" result; try again
+          shortly, or switch to{" "}
+          <button
+            onClick={() => switchMode("literal")}
+            className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Literal
+          </button>{" "}
+          search.
+        </Alert>
       )}
 
       {showLiteralHint && (

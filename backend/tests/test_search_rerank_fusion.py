@@ -121,6 +121,73 @@ def test_search_response_degraded_defaults_false():
     assert r.degradation_reason is None
 
 
+@pytest.mark.asyncio
+async def test_run_vector_search_surfaces_store_and_sparse_failures(monkeypatch):
+    """_run_vector_search returns (hits, degradation_reason) and must classify
+    failures instead of swallowing them into a silent [] (issue #189):
+      - store raises VectorStoreUnavailable → 'vector_store_unavailable'
+      - store raises any other Exception     → 'vector_store_error'
+      - sparse encoder fails + no dense leg  → 'sparse_encoder_failed' (can't search)
+      - sparse encoder fails + dense leg ok  → dense-only hits, 'sparse_encoder_degraded'
+      - all healthy                          → hits, None
+    """
+    import app.services.search_service as ss
+
+    svc = ss.SearchService()
+
+    async def encode_ok(_q):
+        return [1, 2], [0.5, 0.5]
+
+    async def encode_fail(_q):
+        raise RuntimeError("sparse encoder down")
+
+    class _Store:
+        def __init__(self, behavior):
+            self.behavior = behavior
+
+        async def hybrid_search(self, **_kw):
+            if self.behavior == "unavailable":
+                raise ss.VectorStoreUnavailable("store down")
+            if self.behavior == "boom":
+                raise RuntimeError("filter-size overflow")
+            return [SimpleNamespace(source_type="document", source_id="d1", score=1.0)]
+
+    def use_store(behavior):
+        monkeypatch.setattr(ss, "get_vector_store", lambda: _Store(behavior))
+
+    async def run(*, embedding):
+        return await svc._run_vector_search(
+            query_text="q", query_embedding=embedding,
+            candidate_source_ids=["s1"], limit=10,
+        )
+
+    # store outage (transient) → vector_store_unavailable
+    monkeypatch.setattr(ss.sparse_encoder, "encode_query", encode_ok)
+    use_store("unavailable")
+    hits, reason = await run(embedding=[0.1, 0.2])
+    assert hits == [] and reason == "vector_store_unavailable"
+
+    # unexpected store error (e.g. seahorse IN overflow) → vector_store_error
+    use_store("boom")
+    hits, reason = await run(embedding=[0.1, 0.2])
+    assert hits == [] and reason == "vector_store_error"
+
+    # all healthy → hits, no degradation
+    use_store("ok")
+    hits, reason = await run(embedding=[0.1, 0.2])
+    assert len(hits) == 1 and reason is None
+
+    # sparse encoder down + a dense leg → dense-only, flagged degraded
+    monkeypatch.setattr(ss.sparse_encoder, "encode_query", encode_fail)
+    use_store("ok")
+    hits, reason = await run(embedding=[0.1, 0.2])
+    assert len(hits) == 1 and reason == "sparse_encoder_degraded"
+
+    # sparse encoder down + NO dense leg → can't search → degraded empty (not OOV)
+    hits, reason = await run(embedding=None)
+    assert hits == [] and reason == "sparse_encoder_failed"
+
+
 def test_search_response_carries_degraded_signal():
     """When the vector store fails (outage / seahorse filter-size overflow),
     the empty result is flagged degraded with a cause — no longer a silent []

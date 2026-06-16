@@ -308,6 +308,11 @@ export interface SearchResponse {
   total_matches: number;
   truncated?: boolean;
   hint?: string | null;
+  // Set when the retrieval index hit a transient failure (vector-store outage
+  // or a degraded leg): results may be incomplete/empty — NOT a genuine
+  // zero-match (backend issue #189). `degradation_reason` names the cause.
+  degraded?: boolean;
+  degradation_reason?: string | null;
   results: any[];
 }
 export const searchDocs = (query: string, vault?: string, limit = 10) => {
