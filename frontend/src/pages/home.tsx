@@ -208,7 +208,11 @@ export default function HomePage() {
           subtitle="Your knowledge base for AI agents — browse vaults, see recent changes, and manage agent connections."
           actions={
             <div className="flex items-center gap-2">
-              {vaults.length > 0 && <NewDocAction vaults={vaults} />}
+              {/* Only offer vaults the user can actually write to — a reader
+                  vault in the picker just leads to a 403 on create. */}
+              {vaults.some((v) => v.role !== "reader") && (
+                <NewDocAction vaults={vaults.filter((v) => v.role !== "reader")} />
+              )}
               <Button asChild variant={vaults.length > 0 ? "outline" : "accent"} size="md">
                 <Link to="/vault/new">
                   <Plus className="h-4 w-4" aria-hidden />

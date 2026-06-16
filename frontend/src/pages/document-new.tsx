@@ -4,6 +4,7 @@ import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-r
 import { ApiError, putDocument } from "@/lib/api";
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
 import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
+import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,9 @@ export default function DocumentNewPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { tree } = useVaultTree(name);
+  // Invalidate the shared vault tree/list after a create so the new doc shows
+  // up in the explorer + home recent without a manual refresh.
+  const { refetchTree, refetchVaults } = useVaultRefresh();
   // Existing collections power the one-tap picker chips; new names are still
   // accepted (the field stays a free-text input — created automatically when
   // the typed path doesn't exist yet).
@@ -159,6 +163,10 @@ export default function DocumentNewPage() {
         domain: domain.trim() || undefined,
         summary: summary.trim() || undefined,
       });
+      // Refresh the shared tree + vault list so the new doc appears without a
+      // manual reload (the explorer/home stay mounted across this navigation).
+      refetchTree();
+      refetchVaults();
       const path = result?.path;
       if (path) {
         navigate(`/vault/${name}/doc/${encodeURIComponent(path)}`);
