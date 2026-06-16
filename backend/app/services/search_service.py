@@ -22,6 +22,7 @@ from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import VectorHit, get_vector_store
+from app.services.vector_store.base import VectorStoreUnavailable
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
@@ -85,6 +86,17 @@ def fuse_original_and_reranked_hits(
     return [hits[idx] for idx in ordered]
 
 
+def clamp_search_limit(limit: int) -> int:
+    """Clamp a user-supplied search/grep ``limit`` to ``[1, search_limit_max]``.
+
+    The MCP tool schema advertises ``maximum: 50`` but that is client-side only;
+    a direct REST call or a non-validating client can pass any value, which
+    propagates into the vector-store prefetch (issue #189). Applied at the
+    service entry so every caller (MCP, REST, internal) is bounded uniformly.
+    """
+    return max(1, min(limit, settings.search_limit_max))
+
+
 def resolve_first_stage_unique_limit(
     *,
     limit: int,
@@ -133,6 +145,13 @@ class SearchService:
         # this self-defends against any future caller that forgets.
         if vault is None and user_id is None:
             raise ValidationError("vault or user_id required")
+
+        # Server-side limit clamp (issue #189): the MCP schema caps `limit` at
+        # 50 but that is client-side only — a direct REST call or non-validating
+        # client could pass an arbitrary value that propagates into the vector
+        # store prefetch (target_unique * 3, prefetch_per_leg). Clamp here, the
+        # single entry point for every caller.
+        limit = clamp_search_limit(limit)
 
         pool = await get_pool()
 
@@ -296,7 +315,7 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
-        hits = await self._run_vector_search(
+        hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
@@ -304,7 +323,11 @@ class SearchService:
         )
 
         if not hits:
-            return SearchResponse(query=query, total=0, results=[])
+            return SearchResponse(
+                query=query, total=0, returned=0, total_matches=0, results=[],
+                degraded=degraded_reason is not None,
+                degradation_reason=degraded_reason,
+            )
 
         # Dedup at the source level — one hit per (source_type, source_id).
         # Previously dedup was by document_id only; generalizing keeps
@@ -352,6 +375,8 @@ class SearchService:
             total_matches=total_matches,
             truncated=prefetch_capped,
             hint=hint,
+            degraded=degraded_reason is not None,
+            degradation_reason=degraded_reason,
             results=results,
         )
 
@@ -565,10 +590,16 @@ class SearchService:
         query_embedding: list[float] | None,
         candidate_source_ids: list[str] | None,
         limit: int,
-    ):
-        """Hybrid search over the vector store. Returns [] on any failure —
-        the store is a derived view; outages surface as 'no results' while
-        PG truth is untouched."""
+    ) -> tuple[list, str | None]:
+        """Hybrid search over the vector store.
+
+        Returns ``(hits, degradation_reason)``. ``reason`` is None on success
+        OR on a genuine OOV-empty; a non-None reason means the store FAILED
+        (outage, or a filter-size overflow on the seahorse drivers) so the
+        empty/partial result is degraded — not a true zero-match. The store is
+        a derived view, so a failure never raises to the caller; PG truth is
+        untouched. Previously every failure was swallowed into a silent ``[]``
+        with no signal (issue #189)."""
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
         except Exception as e:  # noqa: BLE001
@@ -582,7 +613,7 @@ class SearchService:
         # OOV — Qwen3-style embeddings sit at ~0.4-0.5 cosine for unrelated
         # text and would return plausible-looking distractor neighbours.
         if not sparse_idx and query_embedding is not None:
-            return []
+            return [], None
 
         # max(limit*3, 50): same heuristic the legacy native-fusion path used.
         # Driver-agnostic now, but the value transfers cleanly — RRF
@@ -590,7 +621,7 @@ class SearchService:
         prefetch_per_leg = max(limit * 3, 50)
 
         try:
-            return await get_vector_store().hybrid_search(
+            hits = await get_vector_store().hybrid_search(
                 query_text=query_text,
                 query_dense=query_embedding,
                 query_sparse_indices=sparse_idx,
@@ -599,9 +630,17 @@ class SearchService:
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )
+            return hits, None
+        except VectorStoreUnavailable as e:
+            # Transient/expected: store outage. Search degrades to empty but the
+            # caller is told WHY instead of seeing a silent zero-match.
+            logger.warning("vector store unavailable (%s); degraded empty result", e)
+            return [], "vector_store_unavailable"
         except Exception as e:  # noqa: BLE001
-            logger.warning("vector hybrid_search failed (%s); returning empty", e)
-            return []
+            # Unexpected (e.g. seahorse filter-size overflow from a giant IN list
+            # — the #189 silent-failure mode). Log loudly + surface the signal.
+            logger.error("vector hybrid_search failed (%s); degraded empty result", e)
+            return [], "vector_store_error"
 
     async def grep(
         self,
@@ -664,6 +703,9 @@ class SearchService:
         # in that branch would silently produce a cross-vault scan.
         if vault is None and user_id is None:
             raise ValidationError("vault or user_id required")
+
+        # Server-side limit clamp (issue #189) — same ceiling as search().
+        limit = clamp_search_limit(limit)
 
         pool = await get_pool()
         async with pool.acquire() as conn:

@@ -6,6 +6,7 @@ from app.exceptions import ValidationError
 from app.models.document import SearchResponse
 from app.services.search_service import (
     SearchService,
+    clamp_search_limit,
     fuse_original_and_reranked_hits,
     resolve_first_stage_unique_limit,
 )
@@ -93,6 +94,48 @@ def test_search_response_carries_truncated_signal():
     )
     assert r.truncated is True
     assert r.hint and "Prefetch pool" in r.hint
+
+
+def test_clamp_search_limit(monkeypatch):
+    """Server-side limit clamp (issue #189): an over-large limit is capped to
+    search_limit_max, and a zero/negative limit floors at 1, so a direct REST
+    call or non-validating client can't blow up the vector-store prefetch."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "search_limit_max", 50, raising=False)
+    assert clamp_search_limit(1000) == 50  # over the ceiling → clamped
+    assert clamp_search_limit(50) == 50  # at the ceiling → unchanged
+    assert clamp_search_limit(10) == 10  # under → unchanged
+    assert clamp_search_limit(0) == 1  # zero → floored to 1
+    assert clamp_search_limit(-5) == 1  # negative → floored to 1
+    # Honors a per-deployment override.
+    monkeypatch.setattr(settings, "search_limit_max", 200, raising=False)
+    assert clamp_search_limit(1000) == 200
+
+
+def test_search_response_degraded_defaults_false():
+    """A response built without explicit degraded fields must default to
+    'not degraded' — a genuine zero-match, NOT a swallowed store failure."""
+    r = SearchResponse(query="x", total=0, returned=0, total_matches=0, results=[])
+    assert r.degraded is False
+    assert r.degradation_reason is None
+
+
+def test_search_response_carries_degraded_signal():
+    """When the vector store fails (outage / seahorse filter-size overflow),
+    the empty result is flagged degraded with a cause — no longer a silent []
+    (issue #189)."""
+    r = SearchResponse(
+        query="x",
+        total=0,
+        returned=0,
+        total_matches=0,
+        degraded=True,
+        degradation_reason="vector_store_error",
+        results=[],
+    )
+    assert r.degraded is True
+    assert r.degradation_reason == "vector_store_error"
 
 
 @pytest.mark.asyncio

@@ -249,4 +249,10 @@ class SearchResponse(BaseModel):
     total_matches: int = 0
     truncated: bool = False
     hint: str | None = None
+    # `degraded` is true when the vector store raised (outage, or a filter-size
+    # overflow on the seahorse drivers) so the result set is incomplete/empty —
+    # distinct from a genuine zero-match. Previously such failures were swallowed
+    # into a silent `[]` (issue #189). `degradation_reason` is a short cause.
+    degraded: bool = False
+    degradation_reason: str | None = None
     results: list[SearchResult]
