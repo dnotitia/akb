@@ -205,9 +205,13 @@ class SearchService:
         # AKB is purely per-vault, so this is correctness-equivalent. Otherwise
         # the existing SOURCE_IDS path runs UNCHANGED (flag off / other driver /
         # any doc-level filter present).
+        # `is_ready()` additionally gates on the auto-backfill: until every
+        # pre-upgrade pgvector point carries its vault_id, fall back to the
+        # source-id path so a user can't miss their own un-backfilled docs.
+        from app.services import vault_backfill
         use_vault_path = vault_path_eligible(
             collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
-        )
+        ) and vault_backfill.is_ready()
 
         if use_vault_path:
             async with pool.acquire() as conn:

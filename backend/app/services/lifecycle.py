@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder
+from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder, vault_backfill
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -104,13 +104,18 @@ def start_workers() -> None:
     embed_worker.start()
     delete_worker.start()
     external_git_poller.start()
+    # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
+    # Phase 2). Non-blocking; search self-activates the vault path once it
+    # reports ready (until then the source-id path runs unchanged). No-op for
+    # other drivers / separate-instance / fully-backfilled corpora.
+    vault_backfill.start()
     # BM25 corpus stats (total_docs, avgdl, per-term df) only become
     # non-degenerate after `recompute_stats()` runs. The refresher fires
     # once at startup and then on a configurable cadence so the sparse
     # leg of hybrid search isn't silently degraded on fresh installs or
     # after long periods without manual init.
     sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
-    started = ["embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher"]
+    started = ["embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -169,6 +174,7 @@ async def stop_workers() -> None:
     await s3_delete_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()
+    await vault_backfill.stop()
     await sparse_encoder.stop_stats_refresher()
 
 
