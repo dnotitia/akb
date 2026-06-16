@@ -5,6 +5,30 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.12 — 2026-06-16  *(minor — search: scale + safety (issue #189))*
+
+Make `akb_search` scale and fail honestly at corpus scale.
+
+**Phase 1 (safe, no migration):** the JSON-schema `limit` ceiling (50) is now
+enforced server-side at the `search`/`grep` entry points (`clamp_search_limit`),
+so a direct REST call or non-validating client can no longer pass an arbitrary
+limit into the vector-store prefetch. Vector-store failures are no longer
+swallowed into a silent empty result — `_run_vector_search` classifies them and
+`SearchResponse` gains `degraded` / `degradation_reason` (vector-store outage,
+seahorse filter-size overflow, or a downed sparse-encoder leg), surfaced through
+REST + MCP and rendered in the web search UI.
+
+**Phase 2 (vault-granularity ACL, pgvector, gated):** the candidate prefilter no
+longer materializes every accessible `source_id` (O(corpus)) on each query. Each
+vector point now carries its owning `vault_id`, and when `vault_filter_enabled`
+is on (pgvector, no doc-level filter) search filters by the user's accessible
+*vault* ids (a small set) instead — O(vaults). ACL in AKB is purely per-vault, so
+this is correctness-equivalent (verified: flag-on == flag-off result parity).
+Off by default; safe rollout is deploy → `scripts/backfill_vault_id.py`
+(metadata-only, not a re-embed) → `/health vault_id_null_count` reaches 0 → flip
+the flag. The `vault_id` column is added idempotently; new points populate it
+automatically.
+
 ## 0.8.11 — 2026-06-16  *(minor — document identity: conditional `{slug}-{shortid}` + move/rename)*
 
 Redesign document identity so duplicate-title creates and renames stop being
