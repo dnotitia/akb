@@ -407,6 +407,31 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     return result.model_dump()
 
 
+@_h("akb_move")
+async def _handle_move(args: dict, uid: str, user: _MCPUser) -> dict:
+    try:
+        vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    except ValueError as e:
+        return err(str(e), code=INVALID_URI)
+    doc_path = to_nfc(doc_path)
+    await check_vault_access(uid, vault, required_role="writer")
+    collection = args.get("collection")
+    slug = args.get("slug")
+    if collection is None and slug is None:
+        return err(
+            "Provide `collection` and/or `slug` to move the document.",
+            code=INVALID_ARGUMENT,
+        )
+    result = await doc_service.move(
+        vault, doc_path,
+        collection=to_nfc(collection) if collection is not None else None,
+        slug=to_nfc(slug) if slug is not None else None,
+        message=args.get("message"),
+        agent_id=user.username,
+    )
+    return result.model_dump()
+
+
 @_h("akb_edit")
 async def _handle_edit(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")

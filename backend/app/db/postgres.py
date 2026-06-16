@@ -174,6 +174,7 @@ async def _apply_migrations() -> None:
         "033_users_auth_provider.py",           # users.auth_provider ('local' default | 'keycloak' for JIT-provisioned SSO accounts)
         "034_oidc_transients.py",               # oidc_transients: short-lived OIDC state + one-time exchange codes (HA-safe; empty when Keycloak off)
         "035_fix_wikilink_alias_edges.py",      # repair edges whose target_uri carries a wikilink alias ([[…|label]] → …|label); strip alias, re-validate existence, drop orphans
+        "036_resource_aliases.py",              # rename/move redirect table (old path/name → current resource id); old akb:// URIs keep resolving after a move
     ):
         if filename in applied:
             continue

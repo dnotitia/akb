@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -149,13 +148,10 @@ class EditError(AKBError):
 
 
 from app.util.text import normalize_collection_path as _normalize_collection
-
-
-def _slugify(title: str) -> str:
-    slug = title.lower().strip()
-    slug = re.sub(r"[^\w\s-]", "", slug)
-    slug = re.sub(r"[-\s]+", "-", slug)
-    return slug[:80]
+from app.util.text import slugify
+from app.util.text import doc_path as _doc_path
+from app.util.text import split_doc_path as _split_doc_path
+from app.util.text import strip_own_suffix as _strip_own_suffix
 
 
 def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
@@ -288,6 +284,75 @@ class DocumentService:
                 await acquire_path_lock(lock_conn, vault_id, file_path)
                 yield lock_conn
 
+    @asynccontextmanager
+    async def _move_lock(self, vault_id: uuid.UUID, path_a: str, path_b: str):
+        """Lock BOTH the source and destination paths for a move, in a stable
+        (sorted) order so two concurrent moves can't deadlock on each other."""
+        pool = await get_pool()
+        async with pool.acquire() as lock_conn:
+            async with lock_conn.transaction():
+                for p in sorted({path_a, path_b}):
+                    await acquire_path_lock(lock_conn, vault_id, p)
+                yield lock_conn
+
+    async def _resolve_free_path(
+        self, doc_repo, vault_id: uuid.UUID, base_path: str,
+        doc_id: uuid.UUID, conn, *, self_id: uuid.UUID | None = None,
+    ) -> str:
+        """Return ``base_path`` if it is free, else disambiguate with
+        progressively longer slices of the doc's OWN uuid hex (8→12→16→full).
+
+        The clean path is preferred (predictable). On collision the doc's uuid
+        is the disambiguator: distinct docs have distinct uuids, and the full
+        hex is globally unique, so this always terminates on a free path. This
+        covers the deep cases — a same-title doc already at the target (move
+        into a colliding collection), AND the (adversarial/astronomical) case
+        where the 8-hex suffix is itself taken. ``self_id`` (move) treats a row
+        that IS this doc as free, so re-running a move is a clean no-op rather
+        than a self-collision. The advisory lock on the base path + the final
+        UNIQUE(vault_id, path) constraint guard the residual concurrent race.
+        """
+        def _is_free(row) -> bool:
+            return row is None or (self_id is not None and row["id"] == self_id)
+
+        if _is_free(await doc_repo.find_by_path(vault_id, base_path, conn=conn)):
+            return base_path
+        stem = base_path[:-3] if base_path.endswith(".md") else base_path
+        hexs = doc_id.hex
+        for n in (8, 12, 16, len(hexs)):
+            cand = f"{stem}-{hexs[:n]}.md"
+            if _is_free(await doc_repo.find_by_path(vault_id, cand, conn=conn)):
+                return cand
+        # Unreachable in practice (full uuid is unique); fall through to the
+        # full-hex form and let the UNIQUE constraint surface any true clash.
+        return f"{stem}-{hexs}.md"
+
+    @staticmethod
+    async def _relink_edges(conn, vault_id, column: str, old_uri: str, new_uri: str) -> None:
+        """Repoint edges referencing ``old_uri`` to ``new_uri`` on ``column``
+        ('source_uri' or 'target_uri') during a move. Rows that would duplicate
+        an edge already present at ``new_uri`` are skipped by the UPDATE (the
+        UNIQUE(source_uri, target_uri, relation_type) guard) and then dropped,
+        since they ARE such duplicates. ``column`` comes from a fixed internal
+        set, so the f-string interpolation is not an injection surface."""
+        other = "target_uri" if column == "source_uri" else "source_uri"
+        await conn.execute(
+            f"""
+            UPDATE edges e SET {column} = $1
+             WHERE e.vault_id = $2 AND e.{column} = $3
+               AND NOT EXISTS (
+                 SELECT 1 FROM edges x
+                  WHERE x.vault_id = $2 AND x.{column} = $1
+                    AND x.{other} = e.{other}
+                    AND x.relation_type = e.relation_type)
+            """,
+            new_uri, vault_id, old_uri,
+        )
+        await conn.execute(
+            f"DELETE FROM edges WHERE vault_id = $1 AND {column} = $2",
+            vault_id, old_uri,
+        )
+
     # ── Put ───────────────────────────────────────────────────
 
     async def put(self, req: DocumentPutRequest, agent_id: str | None = None) -> DocumentPutResponse:
@@ -302,34 +367,58 @@ class DocumentService:
             raise NotFoundError("Vault", req.vault)
 
         now = datetime.now(timezone.utc)
-        # Caller may pin an explicit slug (e.g. the vault-guide seed needs
-        # `vault-skill` so its path stays stable across title edits).
-        slug = (req.slug and _slugify(req.slug)) or _slugify(req.title)
+        # Generate the doc id up front so a collision can disambiguate the path
+        # with the doc's short form. The clean path is used when the slug is
+        # free; a `-{shortid}` suffix is appended ONLY on collision — the
+        # industry-standard pattern for identity-bearing paths (WordPress /
+        # Drupal / Rails / Ghost all suffix only on collision, never always).
+        # A caller-pinned `req.slug` (e.g. the vault-skill seed) must land at
+        # its exact path, so a collision there is a real conflict (no suffix).
+        # See docs/designs/doc-identity-slug/00-overview.md.
+        doc_id = uuid.uuid4()
+        base_slug = slugify(req.slug) if req.slug else slugify(req.title)
         normalized_collection = _normalize_collection(req.collection)
-        file_path = f"{normalized_collection}/{slug}.md" if normalized_collection else f"{slug}.md"
+        base_path = _doc_path(normalized_collection, base_slug)
 
-        async with self._path_lock(vault_id, file_path) as conn:
+        async with self._path_lock(vault_id, base_path) as conn:
             return await self._put_locked(
-                req=req, agent_id=agent_id, vault_id=vault_id,
-                file_path=file_path, slug=slug, now=now,
+                req=req, agent_id=agent_id, vault_id=vault_id, doc_id=doc_id,
+                base_path=base_path, base_slug=base_slug,
+                explicit_slug=bool(req.slug), now=now,
                 normalized_collection=normalized_collection,
                 doc_repo=doc_repo, coll_repo=coll_repo, conn=conn,
             )
 
     async def _put_locked(
-        self, *, req, agent_id, vault_id, file_path, slug, now,
-        normalized_collection, doc_repo, coll_repo, conn,
+        self, *, req, agent_id, vault_id, doc_id, base_path, base_slug,
+        explicit_slug, now, normalized_collection, doc_repo, coll_repo, conn,
     ) -> DocumentPutResponse:
-        # Conflict pre-check — now safe under (vault_id, path) advisory lock.
-        # The earlier comment about "concurrent puts can still race past
-        # this gate" no longer applies: the lock serializes writers on
-        # this exact (vault_id, path), so a second caller observes the
-        # first caller's row here and 409s before any git mutation.
-        # Every DB call below reuses `conn` (the lock connection, already in
-        # a transaction) so the whole put holds exactly one pool connection.
-        if await doc_repo.find_by_path(vault_id, file_path, conn=conn):
-            from app.exceptions import ConflictError
-            raise ConflictError(f"Document already exists at path: {file_path}")
+        # Resolve the final path under the (vault, base_path) advisory lock,
+        # which serializes writers racing on the same base slug. If the clean
+        # path is free, use it (predictable, human-readable). If taken: a
+        # caller-pinned slug is a true conflict (409), but a title-derived slug
+        # disambiguates with the doc's short id so two distinct titles that
+        # normalize to the same slug both persist. The short id makes the
+        # suffixed path unique by construction; create()'s UNIQUE(vault_id,
+        # path) is the final guard against the astronomically rare hex clash.
+        # Every DB call below reuses `conn` (the lock connection, already in a
+        # transaction) so the whole put holds exactly one pool connection.
+        from app.exceptions import ConflictError
+        from app.repositories.document_repo import drop_resource_alias
+        if await doc_repo.find_by_path(vault_id, base_path, conn=conn):
+            if explicit_slug:
+                # A caller-pinned slug must land at its exact path.
+                raise ConflictError(f"Document already exists at path: {base_path}")
+            # Title-derived: disambiguate with this doc's own uuid (robust even
+            # if the 8-hex form is itself taken).
+            file_path = await self._resolve_free_path(
+                doc_repo, vault_id, base_path, doc_id, conn
+            )
+        else:
+            file_path = base_path
+        # A real doc now owns this path → clear any stale rename redirect that
+        # pointed elsewhere (a reused path's history resets to the live doc).
+        await drop_resource_alias(conn, vault_id, "document", file_path)
 
         fm_dict = _build_frontmatter(req, now)
         if agent_id:
@@ -370,6 +459,7 @@ class DocumentService:
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
             now=now, commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={}, conn=conn,
+            doc_id=doc_id,
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -709,6 +799,200 @@ class DocumentService:
             action="updated", chunks_indexed=chunks_indexed, entities_found=0,
         )
 
+    # ── Move / rename ─────────────────────────────────────────
+
+    async def move(
+        self, vault: str, doc_ref: str, *,
+        collection: str | None = None, slug: str | None = None,
+        message: str | None = None, agent_id: str | None = None,
+    ) -> DocumentPutResponse:
+        """Move/rename a document: change its collection and/or slug while
+        keeping its identity (id). The move is a ``git mv``, so ``git log
+        --follow`` traces the file's history across it later. The old path is
+        recorded in ``resource_aliases`` so old akb:// URIs keep resolving;
+        graph edges + publications referencing the old URI are rewritten. At
+        least one of ``collection``/``slug`` must be provided, and the resulting
+        path must differ from the current one (else it is rejected as a no-op).
+        """
+        from app.repositories.document_repo import (
+            add_resource_alias,
+            drop_resource_alias,
+        )
+
+        vault_repo, doc_repo, coll_repo = await self._repos()
+        vault_id = await vault_repo.get_id_by_name(vault)
+        if not vault_id:
+            raise NotFoundError("Vault", vault)
+
+        if collection is None and slug is None:
+            raise ValidationError("move requires at least one of collection or slug")
+        # An explicitly-requested slug is a precise rename target — like create,
+        # a collision on it rejects rather than silently suffixing.
+        explicit_slug = bool(slug)
+
+        row = await doc_repo.find_by_ref(vault_id, doc_ref)
+        if not row:
+            raise NotFoundError("Document", doc_ref)
+        old_path = row["path"]
+
+        # Best-effort target estimate, used only to pick the lock. The
+        # AUTHORITATIVE target is recomputed from the fresh row after the lock,
+        # since a concurrent move could change this doc's path between this read
+        # and lock acquisition (the recompute + UNIQUE(vault_id, path) make the
+        # stale-read race safe). When the slug is kept (not re-specified), strip
+        # any collision suffix THIS doc added before so a move doesn't nest them.
+        def _target(base_path: str, doc_id: uuid.UUID) -> tuple[str, str, str]:
+            cur_coll, cur_base = _split_doc_path(base_path)
+            nc = _normalize_collection(collection) if collection is not None else cur_coll
+            ns = slugify(slug) if slug else _strip_own_suffix(cur_base, doc_id)
+            return nc, ns, _doc_path(nc, ns)
+
+        _, _, est_new_path = _target(old_path, row["id"])
+
+        async with self._move_lock(vault_id, old_path, est_new_path) as conn:
+            # Re-read under the lock and recompute the target from fresh state.
+            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+            if not row:
+                raise NotFoundError("Document", doc_ref)
+            old_path = row["path"]
+            pg_doc_id = row["id"]
+            old_collection_id = row["collection_id"]
+
+            new_coll, new_base_slug, base_new_path = _target(old_path, pg_doc_id)
+            if base_new_path == old_path:
+                raise ValidationError(
+                    "move is a no-op: the target path equals the current path"
+                )
+
+            # On-collision suffix (same robust rule as create): if the clean
+            # target is taken by a DIFFERENT doc, disambiguate with this doc's
+            # own uuid. self_id lets a target already held by THIS doc count as
+            # free, so a redundant re-move collapses to the no-op check below.
+            new_path = await self._resolve_free_path(
+                doc_repo, vault_id, base_new_path, pg_doc_id, conn, self_id=pg_doc_id
+            )
+            if new_path == old_path:
+                raise ValidationError("move is a no-op: the target path equals the current path")
+            # A suffix was forced (collision) but the caller pinned this slug →
+            # reject instead of silently renaming to something they didn't ask for.
+            if explicit_slug and new_path != base_new_path:
+                raise ConflictError(f"Document already exists at path: {base_new_path}")
+
+            new_collection_id = (
+                await coll_repo.get_or_create(vault_id, new_coll, conn=conn)
+                if new_coll else None
+            )
+            now = datetime.now(timezone.utc)
+            summary = message or f"{old_path} -> {new_path}"
+            commit_msg = (
+                f"[move] {old_path} -> {new_path}\n\n"
+                f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
+            )
+            try:
+                commit_hash = await asyncio.to_thread(
+                    self.git.move_file,
+                    vault_name=vault, old_path=old_path, new_path=new_path,
+                    message=commit_msg, author_name=agent_id or "AKB System",
+                )
+            except FileNotFoundError:
+                # Crash-recovery idempotence: a prior move committed the git mv
+                # but its DB tx didn't commit, so on retry the source is already
+                # gone. If the file now lives at new_path, adopt the current HEAD
+                # and finish the DB side; otherwise it's a genuine missing file.
+                head = await asyncio.to_thread(self.git.current_commit, vault)
+                if head is None or await asyncio.to_thread(self.git.read_file, vault, new_path) is None:
+                    raise
+                logger.warning(
+                    "Move recovery: %s already at %s in git — reconciling DB to HEAD %s",
+                    old_path, new_path, head[:8],
+                )
+                commit_hash = head
+            logger.info("Document moved: %s -> %s (commit: %s)", old_path, new_path, commit_hash[:8])
+
+            await doc_repo.update_path(
+                pg_doc_id, new_path, collection_id=new_collection_id,
+                now=now, commit_hash=commit_hash, conn=conn,
+            )
+
+            # Keep collection doc counts honest when the folder changed.
+            if old_collection_id != new_collection_id:
+                if old_collection_id:
+                    await coll_repo.decrement_count(old_collection_id, now, conn=conn)
+                if new_collection_id:
+                    await coll_repo.increment_count(new_collection_id, now, conn=conn)
+
+            # Redirect old_path -> this id; clear any stale redirect now shadowed
+            # by a real doc landing on new_path.
+            await add_resource_alias(conn, vault_id, "document", old_path, pg_doc_id)
+            await drop_resource_alias(conn, vault_id, "document", new_path)
+
+            # Rewrite graph edges + publications that referenced the old URI so
+            # the live graph stays correct (old links also resolve via alias).
+            # Guard edges' UNIQUE(source_uri, target_uri, relation_type): move
+            # only rows that won't duplicate an edge already present at the new
+            # URI, then drop the leftovers (they ARE such duplicates). Without
+            # this, a move onto a path that previously held an equivalent edge
+            # would throw a UniqueViolation and abort the whole move.
+            old_uri = doc_uri(vault, old_path)
+            new_uri = doc_uri(vault, new_path)
+            await self._relink_edges(conn, vault_id, "source_uri", old_uri, new_uri)
+            await self._relink_edges(conn, vault_id, "target_uri", old_uri, new_uri)
+            await conn.execute(
+                "UPDATE publications SET resource_uri = $1 WHERE vault_id = $2 AND resource_uri = $3",
+                new_uri, vault_id, old_uri,
+            )
+
+            # Re-chunk so the doc-metadata header carries the new path.
+            chunks_indexed = 0
+            content = await asyncio.to_thread(self.git.read_file, vault, new_path)
+            if content is not None:
+                _, body = _parse_markdown(content)
+                meta_header = build_doc_metadata_header(
+                    vault_name=vault, path=new_path, title=row["title"],
+                    summary=row["summary"],
+                    tags=list(row["tags"]) if row["tags"] else [],
+                    doc_type=row["doc_type"],
+                )
+                chunks = chunk_markdown(body, metadata_header=meta_header)
+                chunks_indexed = await write_source_chunks(
+                    conn, "document", str(pg_doc_id), vault_id=vault_id, chunks=chunks,
+                )
+            else:
+                # Invariant violation: the file we just `git mv`-ed is unreadable.
+                # Don't abort (that would diverge git from DB — the path move is
+                # already committed). But DROP the now-orphaned chunks: the
+                # re-chunk above (skipped here) would have *replaced* them, so
+                # leaving them serves a stale, wrong-path embedding under the new
+                # path. Dropping makes the doc honestly UNSEARCHABLE until its
+                # next edit/reindex — the correct failure mode here.
+                await delete_document_chunks(conn, str(pg_doc_id))
+                logger.error(
+                    "Move re-index FAILED: %s unreadable right after git mv "
+                    "(doc_id=%s, commit=%s) — dropped stale chunks; doc is "
+                    "UNSEARCHABLE until next reindex",
+                    new_path, pg_doc_id, commit_hash[:8],
+                )
+
+            await emit_event(
+                conn, "document.move",
+                vault_id=vault_id,
+                resource_uri=new_uri,
+                actor_id=agent_id,
+                payload={
+                    "vault": vault, "path": new_path, "old_path": old_path,
+                    "old_uri": old_uri, "commit_hash": commit_hash,
+                },
+            )
+
+            return DocumentPutResponse(
+                uri=new_uri, vault=vault, path=new_path,
+                commit_hash=commit_hash, current_commit=commit_hash,
+                previous_commit=row.get("current_commit"),
+                content_hash=row.get("content_hash"),
+                hash_algorithm=row.get("hash_algorithm"),
+                action="moved", chunks_indexed=chunks_indexed, entities_found=0,
+            )
+
     # ── Edit ──────────────────────────────────────────────────
 
     async def edit(
@@ -945,6 +1229,11 @@ class DocumentService:
             "DELETE FROM publications WHERE resource_uri = $1",
             doc_uri(vault, file_path),
         )
+        # Drop any rename/move redirects that pointed at this doc so no alias
+        # outlives the row it targets (a later doc reusing the old path then
+        # resolves to itself, not a tombstone).
+        from app.repositories.document_repo import drop_aliases_for_resource
+        await drop_aliases_for_resource(conn, vault_id, "document", pg_doc_id)
         await emit_event(
             conn, "document.delete",
             vault_id=vault_id,

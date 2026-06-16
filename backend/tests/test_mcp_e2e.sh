@@ -181,16 +181,21 @@ R=$(mcp_call akb_get "{\"uri\":\"${DOC_URI}/\"}" | mcp_result)
 GOT_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('path','MISSING'))" 2>/dev/null)
 [ "$GOT_PATH" = "specs/mcp-created-spec.md" ] && pass "akb_get tolerates trailing slash on URI" || fail "trailing slash" "got path: $GOT_PATH"
 
-# Put conflict atomicity — putting twice at the same path must error
-# out cleanly without mutating the existing doc. Earlier git.commit
-# fired before the DB pre-check, so the second put's body landed on
-# disk even though the response was a conflict error.
-mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"conflict probe\",\"content\":\"BODY_FIRST\"}" >/dev/null
-SECOND=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"conflict probe\",\"content\":\"BODY_SECOND\"}" | mcp_result)
-IS_ERR=$(echo "$SECOND" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d)" 2>/dev/null)
-GOT=$(mcp_call akb_get "{\"uri\":\"akb://$VAULT/doc/specs/conflict-probe.md\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
-KEPT=$(echo "$GOT" | grep -q "BODY_FIRST" && ! echo "$GOT" | grep -q "BODY_SECOND" && echo yes || echo no)
-[ "$IS_ERR" = "True" ] && [ "$KEPT" = "yes" ] && pass "akb_put conflict atomicity (no partial overwrite)" || fail "put conflict" "got err=$IS_ERR kept=$KEPT"
+# Slug-collision resolution — two docs whose titles slugify to the same base
+# must BOTH persist: the first takes the clean path, the second gets a distinct
+# `-{shortid}` suffixed path (collision is resolved, not rejected). Each keeps
+# its own body (no overwrite). Capture the returned URIs instead of predicting
+# the path — the suffixed path is non-deterministic by design (MCP rule: use
+# returned URIs, don't reassemble paths).
+C1=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"collision probe\",\"content\":\"BODY_FIRST\"}" | mcp_result)
+URI1=$(echo "$C1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+C2=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"collision probe\",\"content\":\"BODY_SECOND\"}" | mcp_result)
+URI2=$(echo "$C2" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+B1=$(mcp_call akb_get "{\"uri\":\"$URI1\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
+B2=$(mcp_call akb_get "{\"uri\":\"$URI2\"}" | mcp_result | python3 -c "import sys,json; print(json.load(sys.stdin).get('content',''))" 2>/dev/null)
+ISO1=$(echo "$B1" | grep -q "BODY_FIRST" && ! echo "$B1" | grep -q "BODY_SECOND" && echo yes || echo no)
+ISO2=$(echo "$B2" | grep -q "BODY_SECOND" && ! echo "$B2" | grep -q "BODY_FIRST" && echo yes || echo no)
+[ -n "$URI1" ] && [ -n "$URI2" ] && [ "$URI1" != "$URI2" ] && [ "$ISO1" = "yes" ] && [ "$ISO2" = "yes" ] && pass "akb_put slug collision → 2nd persists at suffixed path (bodies isolated)" || fail "put collision suffix" "uri1=$URI1 uri2=$URI2 iso1=$ISO1 iso2=$ISO2"
 
 # find_by_ref must not return a wrong doc when one path is a prefix
 # of another. Create two docs whose paths differ only by suffix and
@@ -211,6 +216,91 @@ if [ -n "$COMMIT" ]; then
   CLEAN=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print(not c.lstrip().startswith('---'))" 2>/dev/null)
   [ "$CLEAN" = "True" ] && pass "akb_get(version=…) strips frontmatter" || fail "versioned frontmatter leak" "content starts with ---"
 fi
+
+# ── 5b. Document Move / Rename (Phase 2) ─────────────────────
+echo ""
+echo "▸ 5b. Document Move / Rename"
+
+# Create a doc, then rename its slug. action=moved, URIs distinct.
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"movetest\",\"title\":\"Move Me\",\"content\":\"MOVE_BODY_TAG\"}" | mcp_result)
+MV_OLD=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+R=$(mcp_call akb_move "{\"uri\":\"$MV_OLD\",\"slug\":\"moved-final\"}" | mcp_result)
+MV_NEW=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+MV_ACTION=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
+[ -n "$MV_NEW" ] && [ "$MV_NEW" != "$MV_OLD" ] && [ "$MV_ACTION" = "moved" ] && pass "akb_move renamed slug ($MV_ACTION)" || fail "akb_move" "new=$MV_NEW action=$MV_ACTION"
+
+# New URI resolves with the original body.
+NB=$(mcp_call akb_get "{\"uri\":\"$MV_NEW\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+[ "$NB" = "True" ] && pass "akb_move: new URI resolves with content" || fail "move new resolve" "body missing at new uri"
+
+# OLD URI still resolves via the alias redirect → same doc.
+OB=$(mcp_call akb_get "{\"uri\":\"$MV_OLD\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+[ "$OB" = "True" ] && pass "akb_move: OLD URI still resolves (alias redirect)" || fail "move alias resolve" "old uri 404 after move"
+
+# Move across collections; the path lands under the new collection.
+R=$(mcp_call akb_move "{\"uri\":\"$MV_NEW\",\"collection\":\"archive\"}" | mcp_result)
+MV_NEW2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+echo "$MV_NEW2" | grep -q "archive" && pass "akb_move across collections ($MV_NEW2)" || fail "move collection" "uri=$MV_NEW2"
+
+# Every prior URI resolves to the doc — aliases point at the id, never chain.
+O1=$(mcp_call akb_get "{\"uri\":\"$MV_OLD\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+O2=$(mcp_call akb_get "{\"uri\":\"$MV_NEW\"}" | mcp_result | python3 -c "import sys,json; print('MOVE_BODY_TAG' in json.load(sys.stdin).get('content',''))" 2>/dev/null)
+[ "$O1" = "True" ] && [ "$O2" = "True" ] && pass "akb_move: all prior URIs resolve (no redirect chain)" || fail "move chain" "o1=$O1 o2=$O2"
+
+# No-op move (neither collection nor slug) is rejected.
+R=$(mcp_call akb_move "{\"uri\":\"$MV_NEW2\"}" | mcp_result)
+ISERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$ISERR" = "True" ] && pass "akb_move: no-op (no collection/slug) rejected" || fail "move no-op" "expected error"
+
+# Collision on move — move a SAME-TITLE doc into a collection that already has
+# one. Both must survive at distinct paths (the mover gets a -shortid suffix),
+# and each resolves to its own body. This is the case the user flagged.
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"dups\",\"title\":\"Twin\",\"content\":\"TWIN_A\"}" | mcp_result)
+TWIN_A=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"dupsrc\",\"title\":\"Twin\",\"content\":\"TWIN_B\"}" | mcp_result)
+TWIN_B=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+# Move B (dupsrc/twin.md) into 'dups' where A (dups/twin.md) already lives.
+R=$(mcp_call akb_move "{\"uri\":\"$TWIN_B\",\"collection\":\"dups\"}" | mcp_result)
+TWIN_B2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+DISTINCT=$([ -n "$TWIN_B2" ] && [ "$TWIN_B2" != "$TWIN_A" ] && echo yes || echo no)
+AB=$(mcp_call akb_get "{\"uri\":\"$TWIN_A\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('TWIN_A' in d.get('content','') and 'TWIN_B' not in d.get('content',''))" 2>/dev/null)
+BB=$(mcp_call akb_get "{\"uri\":\"$TWIN_B2\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('TWIN_B' in d.get('content','') and 'TWIN_A' not in d.get('content',''))" 2>/dev/null)
+[ "$DISTINCT" = "yes" ] && [ "$AB" = "True" ] && [ "$BB" = "True" ] && pass "akb_move: same-title collision into a collection → both survive, isolated ($TWIN_B2)" || fail "move title collision" "distinct=$DISTINCT a=$AB b=$BB"
+
+# Reuse of a vacated path — after a doc moves away, creating a NEW doc at the
+# OLD path must make the OLD URI resolve to the NEW doc (real doc beats a stale
+# redirect; exact match wins over alias).
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"reuse\",\"title\":\"Recycle\",\"content\":\"ORIG_DOC\"}" | mcp_result)
+RC_OLD=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+mcp_call akb_move "{\"uri\":\"$RC_OLD\",\"slug\":\"recycled\"}" >/dev/null
+mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"reuse\",\"title\":\"Recycle\",\"content\":\"NEW_DOC\"}" >/dev/null
+RC=$(mcp_call akb_get "{\"uri\":\"$RC_OLD\"}" | mcp_result | python3 -c "import sys,json; d=json.load(sys.stdin); print('NEW_DOC' in d.get('content','') and 'ORIG_DOC' not in d.get('content',''))" 2>/dev/null)
+[ "$RC" = "True" ] && pass "akb_move: reused old path → old URI resolves to the new doc (alias cleared)" || fail "move path reuse" "old uri did not resolve to new doc"
+
+# Suffix is not nested on re-move — a doc that got a collision suffix, moved to a
+# collision-free collection (slug kept), reclaims the clean slug (no -hex-hex).
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"sfxa\",\"title\":\"Sfx\",\"content\":\"S1\"}" | mcp_result)
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"sfxa\",\"title\":\"Sfx\",\"content\":\"S2\"}" | mcp_result)
+SFX2=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+echo "$SFX2" | grep -q "sfx-" && SUFFIXED=yes || SUFFIXED=no   # 2nd got a -hex suffix
+R=$(mcp_call akb_move "{\"uri\":\"$SFX2\",\"collection\":\"sfxb\"}" | mcp_result)
+MOVED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
+CLEAN=$(echo "$MOVED" | python3 -c "import sys; u=sys.stdin.read().strip(); print(u.endswith('/sfx.md'))" 2>/dev/null)
+[ "$SUFFIXED" = "yes" ] && [ "$CLEAN" = "True" ] && pass "akb_move: collision suffix stripped on move to free collection ($MOVED)" || fail "move suffix nest" "suffixed=$SUFFIXED moved=$MOVED"
+
+# Explicit slug rename onto a taken path is REJECTED (not silently suffixed) —
+# matches create's pinned-slug semantics.
+mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rej\",\"title\":\"Taken\",\"content\":\"T1\"}" >/dev/null
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rej\",\"title\":\"Mover\",\"content\":\"T2\"}" | mcp_result)
+REJ_SRC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+R=$(mcp_call akb_move "{\"uri\":\"$REJ_SRC\",\"slug\":\"taken\"}" | mcp_result)
+REJERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$REJERR" = "True" ] && pass "akb_move: explicit slug onto taken path rejected (no silent suffix)" || fail "move explicit reject" "expected error, got $R"
+
+# Bad URI to akb_move returns a clean error (not an internal 500 envelope).
+R=$(mcp_call akb_move "{\"uri\":\"not-a-valid-uri\",\"slug\":\"x\"}" | mcp_result)
+BADERR=$(echo "$R" | python3 -c "import sys,json; print('error' in json.load(sys.stdin))" 2>/dev/null)
+[ "$BADERR" = "True" ] && pass "akb_move: malformed URI rejected cleanly" || fail "move bad uri" "expected error"
 
 # ── 6. Relations & Graph ─────────────────────────────────────
 echo ""

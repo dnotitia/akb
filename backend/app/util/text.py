@@ -17,7 +17,9 @@ idempotent) and catches anything caller-side normalization missed.
 
 from __future__ import annotations
 
+import re
 import unicodedata
+import uuid
 from difflib import get_close_matches
 from typing import Any
 
@@ -162,6 +164,62 @@ def fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
     truncated = candidates[:_FUZZY_HINT_LIST_LIMIT]
     suffix = " …" if len(candidates) > _FUZZY_HINT_LIST_LIMIT else ""
     return f"Available {label}: {', '.join(truncated)}{suffix}"
+
+
+# ── Document slug / path identity ────────────────────────────────
+#
+# A document's identity is its path = "{collection}/{slug}.md". The slug is
+# derived from the human title, but the title is mutable and need not be unique.
+# The service writes the clean slug when free and appends a `-{shortid}` only on
+# collision (see document_service.put / _put_locked) — the standard pattern for
+# identity-bearing paths. This module owns just the (pure, testable) slug
+# normalization. See docs/designs/doc-identity-slug/00-overview.md.
+
+_SLUG_MAX = 80
+
+
+def slugify(text: str) -> str:
+    """Title → URL/path-safe slug.
+
+    Hardened over the original: trims leading/trailing hyphens (so a path
+    never starts with ``-`` or, after truncation, dangles one), and falls
+    back to ``"untitled"`` for empty / symbol-only input so the derived
+    path is never a bare ``".md"`` dotfile.
+    """
+    slug = text.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[-\s]+", "-", slug).strip("-")
+    slug = slug[:_SLUG_MAX].rstrip("-")
+    return slug or "untitled"
+
+
+def split_doc_path(path: str) -> tuple[str, str]:
+    """Split a document path into (collection, base-slug). The base-slug is the
+    filename without its ``.md`` suffix. Root docs return ("", base)."""
+    stem = path[:-3] if path.endswith(".md") else path
+    if "/" in stem:
+        coll, base = stem.rsplit("/", 1)
+        return coll, base
+    return "", stem
+
+
+def doc_path(collection: str, slug: str) -> str:
+    """Compose a document path from a (possibly empty) collection + slug. Inverse
+    of `split_doc_path`; a root doc (empty collection) is just ``{slug}.md``."""
+    return f"{collection}/{slug}.md" if collection else f"{slug}.md"
+
+
+def strip_own_suffix(base_slug: str, doc_id: uuid.UUID) -> str:
+    """Strip a collision suffix THIS doc previously added to its own slug, so a
+    re-derive on move doesn't nest suffixes (`title-abc123` -> `title`). Matches
+    only this doc's own uuid-hex prefixes (longest first), never an unrelated
+    trailing `-hex` that happens to be part of a real title."""
+    hexs = doc_id.hex
+    for n in (len(hexs), 16, 12, 8):
+        suffix = f"-{hexs[:n]}"
+        if base_slug.endswith(suffix):
+            return base_slug[: -len(suffix)]
+    return base_slug
 
 
 def like_escape(s: str) -> str:

@@ -5,6 +5,34 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.11 — 2026-06-16  *(minor — document identity: conditional `{slug}-{shortid}` + move/rename)*
+
+Redesign document identity so duplicate-title creates and renames stop being
+hostile, without giving up readable git paths. The `path` stays the identity
+(`UNIQUE(vault_id, path)`); the `title` is a free, non-unique label.
+
+**Create (Phase 1):** distinct human titles that normalize to the same slug no
+longer collide — the clean `{slug}.md` is used when free, and a `-{shortid}`
+(the doc's own uuid prefix) is appended **only on collision**. Empty/symbol-only
+titles fall back to `untitled` instead of producing a bare `.md` dotfile, and
+slug truncation no longer collides. No migration; existing paths and akb:// URIs
+are unchanged.
+
+**Move/rename (Phase 2):** new `akb_move` MCP tool changes a document's
+collection and/or slug while keeping its identity and git history (`git mv`, so
+`git log --follow` traces it). A new `resource_aliases` table (migration 036,
+auto-applied) maps `old_ref → resource_id` (UUID, never path→path, so renames
+never chain), and `find_by_ref` consults it so old akb:// URIs keep resolving;
+graph edges and publications referencing the old URI are rewritten, and the doc
+is re-chunked at the new path. `delete` cleans up the doc's aliases.
+
+Validated by external best-practice research + adversarial multi-agent review +
+an exhaustive 181-case audit + a multi-agent PR review (correctness, silent
+failures, comments, test coverage). Coverage: unit 12, scenario e2e 34, the
+existing e2e suites (mcp 88 / edit 37 / graph 29 / defensive 33 / security 63 /
+pg_rbac 50 / probes 13), plus a 600-concurrent-create + concurrent-move
+(300 / same-doc 60 / collision-merge 120 / race) stress — all 0 failed.
+
 ## 0.8.10 — 2026-06-11  *(patch — table create: reserved/duplicate column → clean 422, never 500)*
 
 `POST /api/v1/tables/{vault}` returned a bare **500** when a create payload included a reserved column name (`id`/`created_at`/`updated_at`/`created_by`) or two same-named columns — a client contract violation surfaced as an opaque internal error. Two paths produced it: `_validate_column_name` raised a bare `ValueError` (not an `AKBError`, so the global handler missed it → FastAPI 500), and a duplicate column reached the DDL as an uncaught `asyncpg.DuplicateColumnError`. The reserved-reject gap dates to 0.3.6; it only began firing when a caller (reef) started sending an `id` column.

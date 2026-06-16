@@ -275,6 +275,31 @@ CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source_type);
 CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target_type);
 
 -- ============================================================
+-- Resource aliases (rename/move redirects)
+-- A former reference (old path/name) → the CURRENT resource id. Keying on the
+-- durable id (never on a new path) means N renames collapse to one hop — no
+-- redirect chains (cf. MediaWiki). find_by_ref consults this so old akb:// URIs
+-- keep resolving after a move. See docs/designs/doc-identity-slug/00-overview.md.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS resource_aliases (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    resource_type TEXT NOT NULL CHECK(resource_type IN ('document', 'table', 'file')),
+    old_ref TEXT NOT NULL,              -- former path (doc/file) or name (table)
+    resource_id UUID NOT NULL,          -- current resource id — NEVER a path (no chains)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- One alias per (vault, type, old_ref). If the old_ref is later reused by a
+    -- NEW resource, the writer drops the stale alias first (a real resource at a
+    -- path always wins over a redirect).
+    UNIQUE(vault_id, resource_type, old_ref)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_aliases_lookup
+    ON resource_aliases(vault_id, resource_type, old_ref);
+CREATE INDEX IF NOT EXISTS idx_resource_aliases_resource
+    ON resource_aliases(resource_id);
+
+-- ============================================================
 -- Vault Files (S3-backed binary/large file storage)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS vault_files (

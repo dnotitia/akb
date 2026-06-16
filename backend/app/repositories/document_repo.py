@@ -36,6 +36,49 @@ async def acquire_path_lock(conn, vault_id: uuid.UUID, path: str) -> None:
     )
 
 
+# ── Resource aliases (rename/move redirects) ─────────────────────
+# Polymorphic across document/table/file, so these are module-level helpers
+# rather than methods on the document repo. The invariant is old_ref →
+# resource_id (a UUID), never old_ref → new path (that would chain).
+
+async def add_resource_alias(
+    conn, vault_id: uuid.UUID, resource_type: str, old_ref: str, resource_id: uuid.UUID
+) -> None:
+    """Record that ``old_ref`` used to name this resource. Upserts so a path
+    that has been the old name more than once re-points to the latest id."""
+    await conn.execute(
+        """
+        INSERT INTO resource_aliases (vault_id, resource_type, old_ref, resource_id)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (vault_id, resource_type, old_ref)
+        DO UPDATE SET resource_id = EXCLUDED.resource_id, created_at = NOW()
+        """,
+        vault_id, resource_type, old_ref, resource_id,
+    )
+
+
+async def drop_resource_alias(
+    conn, vault_id: uuid.UUID, resource_type: str, old_ref: str
+) -> None:
+    """Remove any redirect sitting on ``old_ref`` — called when a real resource
+    is (re)created at that path, so the live resource wins over a stale alias."""
+    await conn.execute(
+        "DELETE FROM resource_aliases WHERE vault_id = $1 AND resource_type = $2 AND old_ref = $3",
+        vault_id, resource_type, old_ref,
+    )
+
+
+async def drop_aliases_for_resource(
+    conn, vault_id: uuid.UUID, resource_type: str, resource_id: uuid.UUID
+) -> None:
+    """Remove every redirect pointing at a resource — called on its deletion so
+    no alias outlives the row it targets."""
+    await conn.execute(
+        "DELETE FROM resource_aliases WHERE vault_id = $1 AND resource_type = $2 AND resource_id = $3",
+        vault_id, resource_type, resource_id,
+    )
+
+
 class DocumentRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -59,8 +102,10 @@ class DocumentRepository:
         metadata: dict,
         *,
         conn=None,
+        doc_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
-        doc_id = uuid.uuid4()
+        # Caller may supply the id so a path can embed its short form; else mint one.
+        doc_id = doc_id or uuid.uuid4()
 
         async def _insert(c):
             try:
@@ -134,7 +179,13 @@ class DocumentRepository:
             return await self.find_by_ref_with_conn(conn, vault_id, ref)
 
     async def find_by_ref_with_conn(self, conn, vault_id: uuid.UUID, ref: str) -> dict | None:
-        """Find document using an existing connection (no pool acquire)."""
+        """Find document using an existing connection (no pool acquire).
+
+        Resolution order: an exact id/path match wins; only on a miss do we
+        consult ``resource_aliases`` so an OLD path (from a prior move/rename)
+        still resolves to the current document. Exact-first means a real
+        document that now occupies a reused path always beats a stale redirect.
+        """
         row = await conn.fetchrow(
             f"""
             SELECT d.*, v.name as vault_name
@@ -142,6 +193,21 @@ class DocumentRepository:
             JOIN vaults v ON d.vault_id = v.id
             WHERE d.vault_id = $1
               AND {self._MATCH_WHERE}
+            """,
+            vault_id, ref,
+        )
+        if row:
+            return dict(row)
+        # Alias fallback — old_ref → current resource_id (never path→path).
+        row = await conn.fetchrow(
+            """
+            SELECT d.*, v.name as vault_name
+            FROM resource_aliases a
+            JOIN documents d ON d.id = a.resource_id
+            JOIN vaults v ON d.vault_id = v.id
+            WHERE a.vault_id = $1 AND a.resource_type = 'document' AND a.old_ref = $2
+              AND d.vault_id = $1
+            LIMIT 1
             """,
             vault_id, ref,
         )
@@ -160,6 +226,31 @@ class DocumentRepository:
         async with self.pool.acquire() as c:
             row = await c.fetchrow(sql, vault_id, path)
             return dict(row) if row else None
+
+    async def update_path(
+        self, doc_id: uuid.UUID, new_path: str, *, collection_id: uuid.UUID | None,
+        now: datetime, commit_hash: str, conn,
+    ) -> None:
+        """Move a document to ``new_path`` (rename/move). Identity (id) is
+        unchanged; only the path/collection/commit move. Surfaces a path
+        collision as a 409 like create() does."""
+        try:
+            await conn.execute(
+                """
+                UPDATE documents
+                   SET path = $2, collection_id = $3, updated_at = $4, current_commit = $5
+                 WHERE id = $1
+                """,
+                doc_id, new_path, collection_id, now, commit_hash,
+            )
+        except asyncpg.UniqueViolationError as e:
+            # The target was free when move() resolved it under the lock, so this
+            # only fires when a concurrent writer claimed it in the meantime — a
+            # retry re-resolves to a fresh free path.
+            raise ConflictError(
+                f"Document already exists at path: {new_path} "
+                "(a concurrent write claimed it — retry the move)"
+            ) from e
 
     async def update(
         self,
