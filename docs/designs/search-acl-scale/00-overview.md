@@ -72,8 +72,22 @@ the limit and makes the seahorse overflow *visible*. The structural fix is Phase
 Push ACL down to **vault granularity** (the canonical multi-tenant pattern):
 
 1. Add `vault_id` to the vector-store point payload (pgvector column + index;
-   qdrant payload + idempotent index; seahorse_cloud/db column). Backfill via the
-   existing reindex pipeline (already knows `vault_id`).
+   qdrant payload + idempotent index; seahorse_cloud/db column).
+   **Backfill is metadata-only — NOT a re-embed** — because `vault_id` is
+   derivable from the already-stored `source_id` and the embeddings don't change:
+   - **pgvector** (the production driver): `ALTER TABLE vector_index.chunks ADD
+     COLUMN vault_id` → one `UPDATE … SET vault_id = src.vault_id FROM (source
+     JOIN) WHERE source_id = src.id` → `CREATE INDEX`. Seconds–minutes, zero
+     embedding-API calls.
+   - **qdrant**: batch `set_payload` from a `source_id → vault_id` map (vectors
+     untouched). No re-embed.
+   - **seahorse_cloud**: `ALTER` + `UPDATE` if the column can be added in place;
+     otherwise re-upsert.
+   - **seahorse_db / Coral** is the ONLY full-re-embed case (immutable schema →
+     drop + recreate → `scripts/reindex_all.py`). Production does not use it.
+   During the backfill window, gate the vault filter (fall back to the
+   `source_ids` path) until `vault_id` is fully populated, so no points are
+   missed.
 2. Extend `VectorStore.hybrid_search` with `vault_ids: list[str] | None`
    (keep `source_ids` for the doc-filter / `source_uris` path).
 3. Two codepaths in `SearchService.search`:
