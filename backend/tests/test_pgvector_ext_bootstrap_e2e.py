@@ -174,6 +174,7 @@ async def test_ensure_collection_bootstraps_extension_own_pool(fresh_db_dsn):
         sparse_values=[1.0, 0.5],
         source_type="document",
         source_id=source_id,
+        vault_id=str(uuid.uuid4()),
     )
     hits = await store.hybrid_search(
         query_text="cpu spike",

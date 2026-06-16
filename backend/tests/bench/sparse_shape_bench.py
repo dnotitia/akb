@@ -156,6 +156,7 @@ async def populate_store(store: PgvectorStore, corpus: list[dict]) -> None:
             sparse_values=row["sparse_values"],
             source_type=row["source_type"],
             source_id=row["source_id"],
+            vault_id=row.get("vault_id", row["source_id"]),
         )
     dt = time.perf_counter() - t0
     print(

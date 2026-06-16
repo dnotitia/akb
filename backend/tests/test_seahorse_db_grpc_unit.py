@@ -455,6 +455,7 @@ async def test_upsert_one_dense_none_raises(
             sparse_indices=[], sparse_values=[],
             source_type="document",
             source_id="11111111-2222-3333-4444-555555555555",
+            vault_id="99999999-8888-7777-6666-555555555555",
         )
     stub.InsertJsonl.assert_not_called()
 
