@@ -120,6 +120,19 @@ export default function GraphPage() {
     if (!id) return;
     try {
       const payload = await fetchNeighbors(vault!, id, 1);
+      // Seed each genuinely-new node next to the node being expanded, so it
+      // tucks in beside its neighbor instead of spawning at the origin and
+      // flying across the canvas (existing nodes stay pinned from pin-on-settle,
+      // so only these new free nodes move).
+      const present = new Set(merged.nodes.map((n) => n.uri));
+      const cx = node.x ?? 0;
+      const cy = node.y ?? 0;
+      for (const n of payload.nodes) {
+        if (!present.has(n.uri)) {
+          n.x = cx + (Math.random() - 0.5) * 40;
+          n.y = cy + (Math.random() - 0.5) * 40;
+        }
+      }
       setOverlay((prev) => mergeGraph(prev, payload));
     } catch {
       /* node simply doesn't expand — leave the graph unchanged */

@@ -63,10 +63,25 @@ interface RenderEdge {
   relation: GraphEdge["relation"];
 }
 
+// react-force-graph-2d's typed ForceGraphMethods omits graphData(); the live
+// node array (with simulation-mutated x/y/fx/fy) is reachable through it at
+// runtime. Narrow cast so we can pin / read positions without `any`.
+type FgData = { graphData: () => { nodes: RenderNode[]; links: RenderEdge[] } };
+const liveNodes = (fg: ForceGraphMethods | undefined): RenderNode[] => {
+  const gd = (fg as unknown as Partial<FgData> | undefined)?.graphData;
+  return typeof gd === "function" ? gd().nodes : [];
+};
+
 const NODE_SIZE = 16;
 /** Above this zoom every node labels; below it only hovered/selected/pinned do,
  *  so a 600-node graph reads as glyphed squares instead of a smear of names. */
 const LABEL_ALL_ZOOM = 1.2;
+/** Node draw size is CLAMPED to a screen-pixel range so it neither balloons
+ *  when a small graph fits-to-view (zoomed way in) nor vanishes on a big graph
+ *  (zoomed out). Drawn at `clamp(baseSize·zoom, MIN, MAX) / zoom` graph units →
+ *  a constant-ish on-screen size that still grows a little with degree. */
+const NODE_MIN_PX = 7;
+const NODE_MAX_PX = 26;
 
 /**
  * Layout effort by node count. `warmup` ticks run SYNCHRONOUSLY off-screen
@@ -100,6 +115,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const fittedRef = useRef(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  // Latest user-pin set, read inside effects without making them depend on it
+  // (so a pin/unpin never reheats the simulation).
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
   // Snap (don't animate) the layout when the OS asks for reduced motion.
@@ -151,15 +170,27 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     else fg.resumeAnimation();
   }, [frozen]);
 
-  // Fit once the layout settles. onEngineStop fires after warmup+cooldown for
-  // every tier (incl. the snap tier, where the synchronous warmup already
-  // placed every node), so zoomToFit always has a real bounding box instead of
-  // racing a fixed timer. fittedRef resets via the page's key={structureKey}
-  // remount on a structural change.
+  // On settle: PIN every node where it landed (fx/fy = x/y), then fit once.
+  //
+  // Pinning is the cure for the "click makes nodes drift apart" bug: d3-drag
+  // reheats the simulation on every click (a click is a zero-distance drag),
+  // and the cluster/collide forces have no stable equilibrium, so each reheat
+  // nudges nodes farther out — ratcheting. A pinned node has x=fx every tick,
+  // so no reheat (click, hover, expand) can move it. This runs on EVERY settle,
+  // so a deliberate re-layout (cluster toggle / expand) re-pins afterward.
+  // User pins (drag/context-menu) and auto-pins are both fx/fy here; they're
+  // told apart by the `pinned` Set, which the cluster re-layout consults.
   const handleEngineStop = useCallback(() => {
-    if (fittedRef.current) return;
-    fgRef.current?.zoomToFit(400, 60);
-    fittedRef.current = true;
+    const fg = fgRef.current;
+    if (!fg) return;
+    for (const n of liveNodes(fg)) {
+      n.fx = n.x;
+      n.fy = n.y;
+    }
+    if (!fittedRef.current) {
+      fg.zoomToFit(400, 60);
+      fittedRef.current = true;
+    }
   }, []);
 
   // node.group is assigned at data ingest (use-graph-data.ts), so it travels
@@ -223,12 +254,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [focusUri, adjacency],
   );
 
-  // Per-frame label-collision accumulator. react-force-graph repaints every
-  // node each frame; resetting this in onRenderFramePre lets paintNode skip a
-  // label that would overlap one already drawn this frame — real collision
-  // avoidance instead of the old all-or-nothing zoom gate. "Forced" labels
-  // (selected / hovered / pinned / focus-neighbor) draw regardless and still
-  // reserve their box so leaf labels yield to them.
+  // Accepted-label boxes for the greedy collision cull in paintNode's label
+  // step (reset each frame in onRenderFramePre). A non-forced label whose box
+  // overlaps one already drawn this frame is skipped — so labels never overlap.
   const labelBoxes = useRef<Array<{ x: number; y: number; w: number; h: number }>>([]);
   const overlaps = useCallback((b: { x: number; y: number; w: number; h: number }) => {
     for (const o of labelBoxes.current) {
@@ -256,6 +284,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     fg.d3Force("collide", collideOn ? (forceCollide(COLLIDE_RADIUS) as never) : null);
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
+    // Release auto-pinned positions so the changed force can actually re-lay
+    // the graph out — without this, a cluster toggle does nothing visible
+    // because pin-on-settle has fixed every node. User pins (drag / context
+    // menu) stay put. Then reheat so the new force takes effect.
+    for (const n of liveNodes(fg)) {
+      if (!pinnedRef.current.has(n.uri)) {
+        n.fx = undefined;
+        n.fy = undefined;
+      }
+    }
     // Don't reheat on a reduced-motion preference — the freeze effect owns
     // pause/resume; reheating from alpha=1 is the cost Freeze exists to avoid.
     if (!prefersReducedMotion()) fg.d3ReheatSimulation();
@@ -273,9 +311,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const isPinned = pinned.has(n.uri);
       const related = isRelated(n.uri);
       const deg = degree.get(n.uri) ?? 0;
-      // Degree sizing: hubs read larger (16 → up to 24). Visual hierarchy only —
-      // small range so it doesn't disturb layout/collision feel.
-      const sz = NODE_SIZE + Math.min(8, deg);
+      // Degree sizing (hubs read larger) clamped to a screen-pixel range, then
+      // converted back to graph units, so the node is a constant-ish on-screen
+      // size at any zoom — never ballooning on a small fit-to-view graph nor
+      // shrinking to nothing on a big one.
+      const baseSz = NODE_SIZE + Math.min(8, deg);
+      const sz = Math.max(NODE_MIN_PX, Math.min(NODE_MAX_PX, baseSz * scale)) / scale;
       // Cluster membership re-tints the node ring (keeping the kind-based
       // fill + glyph so document/table/file stay distinguishable). Selection
       // always wins; ungrouped nodes keep their kind stroke.
@@ -332,37 +373,46 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
       if (scale > 0.6) {
         const glyph = n.kind === "document" ? "D" : n.kind === "table" ? "T" : "F";
-        ctx.font = `bold 8px ui-monospace, SFMono-Regular, monospace`;
+        // Glyph scales with the (clamped) node size so it always fits the box.
+        ctx.font = `bold ${sz * 0.5}px ui-monospace, SFMono-Regular, monospace`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillStyle = colors.foregroundMuted;
         ctx.fillText(glyph, x, y);
       }
 
-      // LOD labels with collision avoidance (replaces the old all-or-nothing
-      // zoom gate that smeared 600 names together). A label is FORCED when the
-      // node is selected/hovered/pinned or a neighbor of the focused node —
-      // those always draw and reserve their box. Otherwise a label only appears
-      // when zoomed in past LABEL_ALL_ZOOM, or earlier for hubs (deg ≥ 4), and
-      // only if it doesn't overlap a label already drawn this frame.
-      const forced =
-        isSelected || n.uri === hovered || isPinned || (focusUri != null && related);
-      const wantLabel = forced || scale > LABEL_ALL_ZOOM || (scale > 0.5 && deg >= 4);
+      // Label — readability rules synthesized from Obsidian (zoom restraint),
+      // sigma/Cytoscape (declutter + rendered-size gate), Gephi (degree
+      // priority), G6/yFiles (pill background):
+      //  • constant ON-SCREEN size: divide the graph-space font by the zoom, so
+      //    labels don't balloon when a small graph fits-to-view zoomed-in;
+      //  • restraint: forced (selected/hovered/pinned/focus-neighbor) always;
+      //    otherwise only when zoomed in past LABEL_ALL_ZOOM or for hubs
+      //    (degree ≥ 4); in focus mode only the focused neighborhood labels;
+      //  • collision culling: a non-forced label that would overlap one already
+      //    drawn this frame is skipped (labelBoxes resets in onRenderFramePre);
+      //  • translucent pill behind the text for legibility over edges/nodes.
+      const forced = isSelected || n.uri === hovered || isPinned || (focusUri != null && related);
+      const wantLabel = forced || (focusUri == null && (scale > LABEL_ALL_ZOOM || deg >= 4));
       if (wantLabel && n.name) {
-        // Render the title as-authored — never .toUpperCase() user copy (it
-        // corrupts acronyms/camelCase/non-Latin titles).
-        const raw = n.name;
-        const label = raw.length > 18 ? raw.slice(0, 18) + "…" : raw;
-        ctx.font = `10px ui-monospace, SFMono-Regular, monospace`;
+        const fontSize = 12 / scale;
+        const lp = 3 / scale;
+        ctx.font = `${fontSize}px ui-monospace, SFMono-Regular, monospace`;
+        // Title as-authored — never .toUpperCase() (corrupts acronyms/non-Latin).
+        const label = n.name.length > 24 ? n.name.slice(0, 24) + "…" : n.name;
         const w = ctx.measureText(label).width;
-        const ly = y + sz / 2 + 4;
-        const box = { x: x - w / 2, y: ly, w, h: 11 };
+        const ly = y + sz / 2 + lp;
+        const box = { x: x - w / 2 - lp, y: ly, w: w + lp * 2, h: fontSize + lp * 2 };
         if (forced || !overlaps(box)) {
           labelBoxes.current.push(box);
+          ctx.globalAlpha = 0.82;
+          ctx.fillStyle = colors.background;
+          ctx.fillRect(box.x, box.y, box.w, box.h);
+          ctx.globalAlpha = 1;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillStyle = colors.foregroundMuted;
-          ctx.fillText(label, x, ly);
+          ctx.fillStyle = isSelected ? colors.accent : colors.foreground;
+          ctx.fillText(label, x, ly + lp);
         }
       }
       ctx.restore();
@@ -485,6 +535,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkDirectionalArrowColor={colors.foregroundMuted}
         warmupTicks={tier.warmup}
         cooldownTicks={frozen ? 0 : tier.cooldownTicks}
+        // Steadier, quicker settle: more friction + faster cooling so the
+        // layout reaches equilibrium in fewer ticks and overshoots less
+        // (less jiggle on a small/medium graph).
+        d3VelocityDecay={0.5}
+        d3AlphaDecay={0.04}
         onRenderFramePre={() => {
           // Reset the per-frame label-collision accumulator before nodes paint.
           labelBoxes.current = [];
