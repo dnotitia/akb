@@ -185,6 +185,28 @@ mcp akb_move "{\"uri\":\"$CV\",\"slug\":\"cross-moved\"}" >/dev/null
 CVP=$(echo "$CV" | sed "s#/$VAULT/#/$VAULT2/#")
 [ "$(iserr "$(mcp akb_get "{\"uri\":\"$CVP\"}")")" = True ] && pass "alias is vault-scoped (no cross-vault leak)" || fail "cross-vault" "$CVP"
 
+echo ""; echo "▸ S8. Collection doc_count adjusts on move"
+# Maintained collections.doc_count, read from the collection row in a full browse
+# (content_type=all so collection rows are present). Empty → 0.
+ccount() {
+  local n
+  n=$(mcp akb_browse "{\"vault\":\"$VAULT\",\"depth\":-1}" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((it.get('doc_count') or 0 for it in d.get('items',[]) if it.get('type')=='collection' and it.get('path')=='$1'),0))" 2>/dev/null)
+  echo "${n:-0}"
+}
+put "$VAULT" "cc-src" "Count Keeper A" "KA" >/dev/null
+CC=$(put "$VAULT" "cc-src" "Count Keeper B" "KB" | field uri)
+SRC0=$(ccount cc-src); DST0=$(ccount cc-dst)
+mcp akb_move "{\"uri\":\"$CC\",\"collection\":\"cc-dst\"}" >/dev/null
+SRC1=$(ccount cc-src); DST1=$(ccount cc-dst)
+[ "$(( SRC0 - SRC1 ))" -eq 1 ] && [ "$(( DST1 - DST0 ))" -eq 1 ] && pass "doc_count: src -1 / dst +1 on cross-collection move (src $SRC0->$SRC1, dst $DST0->$DST1)" || fail "doc_count cross" "src $SRC0->$SRC1 dst $DST0->$DST1"
+# move-to-root: source decrements, no NULL-collection increment crash
+RM=$(put "$VAULT" "cc-src" "To Root" "TR" | field uri)
+SRC2=$(ccount cc-src)
+mcp akb_move "{\"uri\":\"$RM\",\"collection\":\"\"}" >/dev/null
+SRC3=$(ccount cc-src)
+[ "$(( SRC2 - SRC3 ))" -eq 1 ] && pass "doc_count: move-to-root decrements source ($SRC2->$SRC3)" || fail "doc_count root" "src $SRC2->$SRC3"
+
 # ── Cleanup ──────────────────────────────────────────────────
 mcp akb_delete_vault "{\"name\":\"$VAULT\",\"confirm\":\"$VAULT\"}" >/dev/null 2>&1
 mcp akb_delete_vault "{\"name\":\"$VAULT2\",\"confirm\":\"$VAULT2\"}" >/dev/null 2>&1

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import uuid
 from difflib import get_close_matches
 from typing import Any
 
@@ -190,6 +191,35 @@ def slugify(text: str) -> str:
     slug = re.sub(r"[-\s]+", "-", slug).strip("-")
     slug = slug[:_SLUG_MAX].rstrip("-")
     return slug or "untitled"
+
+
+def split_doc_path(path: str) -> tuple[str, str]:
+    """Split a document path into (collection, base-slug). The base-slug is the
+    filename without its ``.md`` suffix. Root docs return ("", base)."""
+    stem = path[:-3] if path.endswith(".md") else path
+    if "/" in stem:
+        coll, base = stem.rsplit("/", 1)
+        return coll, base
+    return "", stem
+
+
+def doc_path(collection: str, slug: str) -> str:
+    """Compose a document path from a (possibly empty) collection + slug. Inverse
+    of `split_doc_path`; a root doc (empty collection) is just ``{slug}.md``."""
+    return f"{collection}/{slug}.md" if collection else f"{slug}.md"
+
+
+def strip_own_suffix(base_slug: str, doc_id: uuid.UUID) -> str:
+    """Strip a collision suffix THIS doc previously added to its own slug, so a
+    re-derive on move doesn't nest suffixes (`title-abc123` -> `title`). Matches
+    only this doc's own uuid-hex prefixes (longest first), never an unrelated
+    trailing `-hex` that happens to be part of a real title."""
+    hexs = doc_id.hex
+    for n in (len(hexs), 16, 12, 8):
+        suffix = f"-{hexs[:n]}"
+        if base_slug.endswith(suffix):
+            return base_slug[: -len(suffix)]
+    return base_slug
 
 
 def like_escape(s: str) -> str:

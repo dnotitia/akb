@@ -149,6 +149,9 @@ class EditError(AKBError):
 
 from app.util.text import normalize_collection_path as _normalize_collection
 from app.util.text import slugify
+from app.util.text import doc_path as _doc_path
+from app.util.text import split_doc_path as _split_doc_path
+from app.util.text import strip_own_suffix as _strip_own_suffix
 
 
 def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
@@ -195,35 +198,6 @@ def _parse_markdown(content: str) -> tuple[dict, str]:
 
 def _body_content_hash(body: str) -> str:
     return compute_text_content_hash(body)
-
-
-def _split_doc_path(path: str) -> tuple[str, str]:
-    """Split a document path into (collection, base-slug). The base-slug is the
-    filename without its ``.md`` suffix. Root docs return ("", base)."""
-    stem = path[:-3] if path.endswith(".md") else path
-    if "/" in stem:
-        coll, base = stem.rsplit("/", 1)
-        return coll, base
-    return "", stem
-
-
-def _doc_path(collection: str, slug: str) -> str:
-    """Compose a document path from a (possibly empty) collection + slug. Inverse
-    of `_split_doc_path`; a root doc (empty collection) is just ``{slug}.md``."""
-    return f"{collection}/{slug}.md" if collection else f"{slug}.md"
-
-
-def _strip_own_suffix(base_slug: str, doc_id: uuid.UUID) -> str:
-    """Strip a collision suffix THIS doc previously added to its own slug, so a
-    re-derive on move doesn't nest suffixes (`title-abc123` -> `title`). Matches
-    only this doc's own uuid-hex prefixes (longest first), never an unrelated
-    trailing `-hex` that happens to be part of a real title."""
-    hexs = doc_id.hex
-    for n in (len(hexs), 16, 12, 8):
-        suffix = f"-{hexs[:n]}"
-        if base_slug.endswith(suffix):
-            return base_slug[: -len(suffix)]
-    return base_slug
 
 
 class DocumentService:
@@ -830,13 +804,15 @@ class DocumentService:
     async def move(
         self, vault: str, doc_ref: str, *,
         collection: str | None = None, slug: str | None = None,
-        agent_id: str | None = None,
+        message: str | None = None, agent_id: str | None = None,
     ) -> DocumentPutResponse:
         """Move/rename a document: change its collection and/or slug while
-        keeping its identity (id) and git history (``git mv`` + ``--follow``).
-        The old path is recorded in ``resource_aliases`` so old akb:// URIs keep
-        resolving; graph edges + publications referencing the old URI are
-        rewritten. At least one of ``collection``/``slug`` must change.
+        keeping its identity (id). The move is a ``git mv``, so ``git log
+        --follow`` traces the file's history across it later. The old path is
+        recorded in ``resource_aliases`` so old akb:// URIs keep resolving;
+        graph edges + publications referencing the old URI are rewritten. At
+        least one of ``collection``/``slug`` must be provided, and the resulting
+        path must differ from the current one (else it is rejected as a no-op).
         """
         from app.repositories.document_repo import (
             add_resource_alias,
@@ -907,9 +883,10 @@ class DocumentService:
                 if new_coll else None
             )
             now = datetime.now(timezone.utc)
+            summary = message or f"{old_path} -> {new_path}"
             commit_msg = (
                 f"[move] {old_path} -> {new_path}\n\n"
-                f"agent: {agent_id or 'unknown'}\naction: move"
+                f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
             )
             try:
                 commit_hash = await asyncio.to_thread(
@@ -982,11 +959,18 @@ class DocumentService:
                 )
             else:
                 # Invariant violation: the file we just `git mv`-ed is unreadable.
-                # Don't abort (that would diverge git from DB) — the path move is
-                # committed; surface it so search-index staleness is noticed.
+                # Don't abort (that would diverge git from DB — the path move is
+                # already committed). But DROP the now-orphaned chunks: the
+                # re-chunk above (skipped here) would have *replaced* them, so
+                # leaving them serves a stale, wrong-path embedding under the new
+                # path. Dropping makes the doc honestly UNSEARCHABLE until its
+                # next edit/reindex — the correct failure mode here.
+                await delete_document_chunks(conn, str(pg_doc_id))
                 logger.error(
-                    "Move re-index skipped: %s unreadable right after git mv (chunks now stale)",
-                    new_path,
+                    "Move re-index FAILED: %s unreadable right after git mv "
+                    "(doc_id=%s, commit=%s) — dropped stale chunks; doc is "
+                    "UNSEARCHABLE until next reindex",
+                    new_path, pg_doc_id, commit_hash[:8],
                 )
 
             await emit_event(

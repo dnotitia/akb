@@ -244,7 +244,13 @@ class DocumentRepository:
                 doc_id, new_path, collection_id, now, commit_hash,
             )
         except asyncpg.UniqueViolationError as e:
-            raise ConflictError(f"Document already exists at path: {new_path}") from e
+            # The target was free when move() resolved it under the lock, so this
+            # only fires when a concurrent writer claimed it in the meantime — a
+            # retry re-resolves to a fresh free path.
+            raise ConflictError(
+                f"Document already exists at path: {new_path} "
+                "(a concurrent write claimed it — retry the move)"
+            ) from e
 
     async def update(
         self,

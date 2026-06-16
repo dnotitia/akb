@@ -11,7 +11,9 @@ Imports from `app.util.text` only — no DB / heavy deps, runs as a pure unit te
 """
 from __future__ import annotations
 
-from app.util.text import slugify
+import uuid
+
+from app.util.text import doc_path, slugify, split_doc_path, strip_own_suffix
 
 
 class TestSlugify:
@@ -53,3 +55,36 @@ class TestSlugify:
         base = slugify("Meeting Notes")
         assert base == "meeting-notes"
         assert f"{base}-3f9a2c1b" == "meeting-notes-3f9a2c1b"
+
+
+class TestDocPath:
+    def test_compose_and_split_round_trip(self):
+        assert doc_path("specs", "api") == "specs/api.md"
+        assert doc_path("", "api") == "api.md"  # root doc
+        assert split_doc_path("specs/api.md") == ("specs", "api")
+        assert split_doc_path("api.md") == ("", "api")
+        assert split_doc_path("a/b/c/api.md") == ("a/b/c", "api")
+
+
+class TestStripOwnSuffix:
+    UID = uuid.UUID("3f9a2c1b-0000-4000-8000-000000000000")  # hex starts 3f9a2c1b...
+
+    def test_strips_this_docs_own_8hex_suffix(self):
+        assert strip_own_suffix("title-3f9a2c1b", self.UID) == "title"
+
+    def test_strips_longer_rungs(self):
+        # 12/16/full-hex suffixes the doc itself could have produced are stripped.
+        assert strip_own_suffix(f"t-{self.UID.hex[:12]}", self.UID) == "t"
+        assert strip_own_suffix(f"t-{self.UID.hex[:16]}", self.UID) == "t"
+        assert strip_own_suffix(f"t-{self.UID.hex}", self.UID) == "t"
+
+    def test_preserves_unrelated_trailing_hex(self):
+        # A real title ending in 8 hex chars that are NOT this doc's uuid prefix
+        # must survive untouched — the safety claim in the docstring.
+        assert strip_own_suffix("release-abcdef12", self.UID) == "release-abcdef12"
+        # ...even another valid-looking uuid prefix that isn't ours.
+        other = uuid.UUID("deadbeef-0000-4000-8000-000000000000")
+        assert strip_own_suffix(f"x-{other.hex[:8]}", self.UID) == f"x-{other.hex[:8]}"
+
+    def test_no_suffix_unchanged(self):
+        assert strip_own_suffix("plain-title", self.UID) == "plain-title"

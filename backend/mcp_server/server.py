@@ -426,6 +426,7 @@ async def _handle_move(args: dict, uid: str, user: _MCPUser) -> dict:
         vault, doc_path,
         collection=to_nfc(collection) if collection is not None else None,
         slug=to_nfc(slug) if slug is not None else None,
+        message=args.get("message"),
         agent_id=user.username,
     )
     return result.model_dump()
