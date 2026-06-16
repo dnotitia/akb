@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Segmented } from "@/components/ui/segmented";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import {
   Dialog,
   DialogContent,
@@ -175,9 +176,9 @@ export function InviteMemberDialog({
                           }`}
                         >
                           <div className="flex items-baseline gap-2">
-                            <span title={u.username} className="text-sm font-medium truncate">
+                            <TooltipText className="text-sm font-medium truncate">
                               {u.username}
-                            </span>
+                            </TooltipText>
                             {u.display_name && (
                               <span title={u.display_name} className="text-xs text-foreground-muted truncate">
                                 {u.display_name}

@@ -9,6 +9,8 @@ import { EmptyState } from "@/components/empty-state";
 import { getDocument, getRelations, getProvenance, drillDown } from "@/lib/api";
 import { ALL_NODE_KINDS, ALL_RELATIONS, type NodeKind, type RelationKind, type RelatedRef, kindToSegment } from "./graph-types";
 import { Section } from "./Section";
+import { TooltipText } from "@/components/ui/tooltip-text";
+import { CopyButton } from "@/components/ui/copy-button";
 
 interface Props {
   vault: string;
@@ -147,13 +149,7 @@ export function GraphDetailPanel({
           <Button size="sm" variant="accent" onClick={openDoc}>
             <ExternalLink className="h-3 w-3" /> Open
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => navigator.clipboard?.writeText(uri).catch(() => {})}
-          >
-            Copy URI
-          </Button>
+          <CopyButton value={uri} label="Copy URI" />
           {onTogglePin && (
             // Pin is a toggle, not a CTA — when pinned it reads as a teal
             // selected control, not a second filled-orange marquee.
@@ -249,7 +245,9 @@ export function GraphDetailPanel({
           {sectionsOpen && (
             <ul className="mb-2 flex flex-col gap-px">
               {(secQuery.data?.sections || []).map((s: any, i: number) => (
-                <li key={i} title={s.heading || s.title || `section ${i}`} className="coord truncate">‣ {s.heading || s.title || `section ${i}`}</li>
+                <li key={i} className="coord">
+                  <TooltipText className="truncate" tip={s.heading || s.title || `section ${i}`}>‣ {s.heading || s.title || `section ${i}`}</TooltipText>
+                </li>
               ))}
             </ul>
           )}
@@ -373,7 +371,7 @@ function RelGroup({
               title={`${r.other_name} — select in graph`}
               className="flex-1 inline-flex items-center gap-1 min-w-0 text-left text-[11px] text-foreground hover:text-link cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <span className="truncate">{r.other_name}</span>
+              <TooltipText className="truncate">{r.other_name}</TooltipText>
               <Crosshair
                 className="h-2.5 w-2.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
                 aria-hidden

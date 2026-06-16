@@ -3,6 +3,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import {
   getPublication,
   publicationCsvUrl,
@@ -196,13 +197,13 @@ export function TableViewer({ slug, initialData }: Props) {
                     {String(i + 1).padStart(2, "0")}
                   </td>
                   {cols.map((c) => (
-                    <td
-                      key={c}
-                      className={`px-3 py-2 font-mono text-[12px] border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
-                      title={formatCellFull(row[c])}
-                    >
-                      {formatCell(row[c])}
-                    </td>
+                    <TooltipText key={c} asChild tip={formatCellFull(row[c])}>
+                      <td
+                        className={`px-3 py-2 font-mono text-[12px] border-r border-border last:border-r-0 whitespace-nowrap max-w-xs truncate ${typeof row[c] === "number" ? "tabular-nums" : ""}`}
+                      >
+                        {formatCell(row[c])}
+                      </td>
+                    </TooltipText>
                   ))}
                 </tr>
               ))}

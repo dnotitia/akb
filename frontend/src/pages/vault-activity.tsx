@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { EmptyState } from "@/components/empty-state";
 import { useDebounce } from "@/hooks/use-debounce";
 import { RelativeTime } from "@/components/ui/relative-time";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 const PAGE_SIZE = 50;
 
@@ -145,13 +146,16 @@ export default function VaultActivityPage() {
                   <span className="font-mono text-[11px] text-foreground-muted tabular-nums">
                     {(e.hash || "").slice(0, 7)}
                   </span>
-                  <span title={e.author_name || e.agent || e.author || "unknown"} className="text-xs text-foreground truncate">
+                  <TooltipText
+                    tip={e.author_name || e.agent || e.author || "unknown"}
+                    className="text-xs text-foreground truncate"
+                  >
                     <GitCommit
                       className="inline-block h-3 w-3 mr-1 text-info -translate-y-px"
                       aria-hidden
                     />
                     {e.author_name || e.agent || e.author || "unknown"}
-                  </span>
+                  </TooltipText>
                   <div className="min-w-0">
                     <div title={e.subject || primary?.path || "(no subject)"} className="text-sm tracking-tight truncate text-foreground group-hover:text-link">
                       {e.subject || primary?.path || "(no subject)"}

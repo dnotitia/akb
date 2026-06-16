@@ -29,6 +29,7 @@ import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
@@ -311,9 +312,9 @@ export default function HomePage() {
                         </div>
                         <div title={c.path} className="coord truncate">{c.path}</div>
                       </div>
-                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px]" title={c.vault}>
+                      <span className="flex items-center gap-1.5 shrink-0 max-w-[150px]">
                         <VaultChip name={c.vault} size="sm" />
-                        <span className="truncate text-xs text-foreground-muted">{c.vault}</span>
+                        <TooltipText className="truncate text-xs text-foreground-muted">{c.vault}</TooltipText>
                       </span>
                       <RelativeTime iso={c.changed_at} className="justify-end text-right" />
                     </Link>
@@ -599,7 +600,7 @@ function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
                 className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none rounded-[var(--radius-sm)] data-[highlighted]:bg-surface-hover"
               >
                 <FileText className="h-4 w-4 text-foreground-muted" aria-hidden />
-                <span className="truncate">{v.name}</span>
+                <TooltipText className="truncate">{v.name}</TooltipText>
               </Link>
             </DropdownMenu.Item>
           ))}

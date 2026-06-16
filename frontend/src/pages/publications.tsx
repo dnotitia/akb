@@ -12,6 +12,7 @@ import {
   Table as TableIcon,
   Trash2,
 } from "lucide-react";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { listPublications, deletePublication, getDocument, type Publication } from "@/lib/api";
 import { parseDocUri, parseFileUri } from "@/lib/uri";
 import { formatDate } from "@/lib/utils";
@@ -178,13 +179,14 @@ export default function PublicationsPage() {
                   <div className="min-w-0">
                     <div className="flex items-baseline gap-2 min-w-0">
                       <Icon className="h-3.5 w-3.5 shrink-0 translate-y-0.5 text-foreground-muted" aria-hidden />
-                      <Link
-                        to={resourceHref(p)}
-                        title={p.title || p.slug}
-                        className="text-sm font-medium tracking-tight truncate text-foreground hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                      >
-                        {p.title || p.slug}
-                      </Link>
+                      <TooltipText asChild tip={p.title || p.slug}>
+                        <Link
+                          to={resourceHref(p)}
+                          className="text-sm font-medium tracking-tight truncate text-foreground hover:text-link rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                        >
+                          {p.title || p.slug}
+                        </Link>
+                      </TooltipText>
                       <span className="coord shrink-0">
                         {RESOURCE_LABEL[p.resource_type]}
                       </span>

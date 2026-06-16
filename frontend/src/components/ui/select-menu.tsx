@@ -1,6 +1,7 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 export interface SelectOption {
   value: string;
@@ -64,15 +65,16 @@ export function SelectMenu({
           className,
         )}
       >
-        <span
+        <TooltipText
           className={cn(
             "truncate",
             mono && "font-mono",
             !current && "text-foreground-muted",
           )}
+          tip={current?.label}
         >
           {current ? current.label : placeholder}
-        </span>
+        </TooltipText>
         <ChevronDown className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
@@ -97,13 +99,19 @@ export function SelectMenu({
                   <Check className="h-3.5 w-3.5" aria-hidden />
                 </DropdownMenu.ItemIndicator>
                 <span className="min-w-0">
-                  <span className={cn("block truncate", mono && "font-mono")}>
+                  <TooltipText
+                    className={cn("block truncate", mono && "font-mono")}
+                    tip={o.label}
+                  >
                     {o.label}
-                  </span>
+                  </TooltipText>
                   {o.hint && (
-                    <span className="block truncate text-xs text-foreground-muted">
+                    <TooltipText
+                      className="block truncate text-xs text-foreground-muted"
+                      tip={o.hint}
+                    >
                       {o.hint}
-                    </span>
+                    </TooltipText>
                   )}
                 </span>
               </DropdownMenu.RadioItem>

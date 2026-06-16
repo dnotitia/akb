@@ -1,4 +1,5 @@
 import { useDocOutline } from "@/hooks/use-doc-outline";
+import { TooltipText } from "@/components/ui/tooltip-text";
 
 export function DocumentOutline({
   markdown,
@@ -31,7 +32,7 @@ export function DocumentOutline({
                     : "text-foreground-muted hover:text-foreground hover:bg-surface-hover"
                 }`}
               >
-                <span title={h.text} className="truncate block text-[12px]">{h.text}</span>
+                <TooltipText className="truncate block text-[12px]">{h.text}</TooltipText>
               </a>
             </li>
           );

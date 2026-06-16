@@ -11,6 +11,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { RoleBadge } from "@/components/status-badge";
 import { EmptyState } from "@/components/empty-state";
 import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dialog";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import type { User } from "./profile-section";
 
 type AdminSort = "recent" | "oldest" | "username" | "vaults";
@@ -157,17 +158,16 @@ export function AdminSection({ user, users, usersError, onReloadUsers }: Props) 
                     <span className="coord tabular-nums shrink-0">
                       {String(i + 1).padStart(2, "0")}
                     </span>
-                    <span
+                    <TooltipText
                       data-testid="admin-user-name"
-                      title={u.username}
                       className="text-sm font-medium truncate text-foreground"
                     >
                       {u.username}
-                    </span>
+                    </TooltipText>
                     {u.display_name && u.display_name !== u.username && (
-                      <span title={u.display_name} className="text-sm text-foreground-muted truncate hidden sm:inline">
+                      <TooltipText className="text-sm text-foreground-muted truncate hidden sm:inline">
                         {u.display_name}
-                      </span>
+                      </TooltipText>
                     )}
                     <span title={u.email} className="text-[11px] text-foreground-muted truncate hidden md:inline">
                       {u.email}

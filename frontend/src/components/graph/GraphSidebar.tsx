@@ -13,6 +13,7 @@ import {
 } from "./graph-types";
 import { viewToQuery } from "./graph-state";
 import { Section } from "./Section";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -162,7 +163,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                   onClick={() => commitEntry(h)}
                   className="w-full flex items-center justify-between gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-hover"
                 >
-                  <span title={h.title} className="truncate">{h.title}</span>
+                  <TooltipText className="truncate">{h.title}</TooltipText>
                   <span className="coord">{h.type}</span>
                 </button>
               </li>
@@ -171,9 +172,9 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
         {view.entry && (
           <div className="mt-1 flex items-center justify-between gap-2 px-2 h-7 text-[11px] bg-surface-muted rounded-[var(--radius-sm)]">
-            <span title={`focused on ${view.entry}`} className="truncate">
+            <TooltipText className="truncate" tip={`focused on ${view.entry}`}>
               Focused on <span className="coord">{view.entry}</span>
-            </span>
+            </TooltipText>
             <button
               type="button"
               onClick={() => onChange({ ...view, entry: undefined })}
@@ -272,10 +273,9 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => onChange({ ...view, entry: r.doc_id })}
-                  title={r.title}
                   className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:bg-surface-active truncate"
                 >
-                  {r.title}
+                  <TooltipText className="truncate">{r.title}</TooltipText>
                 </button>
               </li>
             ))}
@@ -328,10 +328,9 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => onNavigate(s.url)}
-                  title={s.name}
                   className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:opacity-60 transition-opacity duration-150 truncate"
                 >
-                  {s.name}
+                  <TooltipText className="truncate">{s.name}</TooltipText>
                 </button>
                 <button
                   type="button"
