@@ -2,28 +2,13 @@ import {
   AlertTriangle,
   Archive,
   CircleDashed,
-  Eye,
   GitBranch,
   Globe,
-  Key,
-  Pencil,
-  ShieldCheck,
   Unlock,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { ROLE_ICONS, type Role } from "@/lib/roles";
 
-type Role = "owner" | "admin" | "writer" | "reader";
-
-const ROLE_ICONS: Record<Role, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>> = {
-  owner: Key,            // holds the key — filled accent
-  admin: ShieldCheck,    // admin — filled foreground
-  writer: Pencil,        // can write — outlined
-  reader: Eye,           // read-only — muted outlined
-};
-
-// Accept any string at runtime — backend can introduce new role levels ahead
-// of the frontend enum, and an unknown key used to render <undefined /> and
-// crash the whole view with React #130.
 export function RoleBadge({ role }: { role: string }) {
   const Icon = ROLE_ICONS[role as Role];
   const known = Icon !== undefined;
