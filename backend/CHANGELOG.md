@@ -5,6 +5,21 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.15 — 2026-06-17  *(fix — qdrant driver converts client errors to VectorStoreUnavailable, #207)*
+
+The qdrant driver now wraps its client calls so a transient failure (network
+drop, 5xx, `UnexpectedResponse`, gRPC error) surfaces as `VectorStoreUnavailable`
+— matching pgvector/seahorse, so `SearchService._run_vector_search` labels a
+qdrant outage `vector_store_unavailable` rather than a generic
+`vector_store_error`, and the write path no longer leaks raw client exceptions to
+the indexing worker. Applied to `ensure_collection`, `upsert_one`, `delete_point`,
+and all three `hybrid_search` legs via a shared `_qdrant_errors` async context
+manager. A `TypeError`/`ValueError` (a programming bug — e.g. a bad `qm.*`
+argument) is re-raised unmasked rather than mislabelled as an outage; the
+previously over-broad `ensure_collection` catch is narrowed the same way.
+qdrant-only and pre-existing (production runs pgvector). New driver unit tests +
+a live connection-failure check confirm the conversion.
+
 ## 0.8.14 — 2026-06-17  *(feature — vault filter extended to qdrant + seahorse)*
 
 **#189 Phase 2 vault filter, now driver-agnostic.** The per-vault ACL search

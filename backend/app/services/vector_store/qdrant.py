@@ -12,6 +12,7 @@ the legacy `vector_store.py`.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any
 
@@ -77,48 +78,55 @@ class QdrantStore:
         if self._ensured_collection:
             return
         client = self._get_client()
-        try:
+        async with _qdrant_errors("ensure_collection"):
             exists = await client.collection_exists(self._collection)
-        except Exception as e:  # noqa: BLE001
-            raise VectorStoreUnavailable(f"ping failed: {e}") from e
-
-        if not exists:
-            await client.create_collection(
-                collection_name=self._collection,
-                vectors_config={
-                    DENSE_VECTOR_NAME: qm.VectorParams(
-                        size=self._dense_dim,
-                        distance=qm.Distance.COSINE,
-                    ),
-                },
-                sparse_vectors_config={
-                    SPARSE_VECTOR_NAME: qm.SparseVectorParams(),
-                },
-            )
-            logger.info(
-                "Vector collection %r created (dense_dim=%d)",
-                self._collection, self._dense_dim,
-            )
-            # source_id is the primary filter key on every search.
-            # Without this payload index the store falls back to a
-            # full scan per query — measurable latency regression.
-            await client.create_payload_index(
-                collection_name=self._collection,
-                field_name=PAYLOAD_SOURCE_ID,
-                field_schema=qm.PayloadSchemaType.KEYWORD,
-            )
+            if not exists:
+                await client.create_collection(
+                    collection_name=self._collection,
+                    vectors_config={
+                        DENSE_VECTOR_NAME: qm.VectorParams(
+                            size=self._dense_dim,
+                            distance=qm.Distance.COSINE,
+                        ),
+                    },
+                    sparse_vectors_config={
+                        SPARSE_VECTOR_NAME: qm.SparseVectorParams(),
+                    },
+                )
+                logger.info(
+                    "Vector collection %r created (dense_dim=%d)",
+                    self._collection, self._dense_dim,
+                )
+                # source_id is the primary filter key on every search.
+                # Without this payload index the store falls back to a
+                # full scan per query — measurable latency regression.
+                await client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name=PAYLOAD_SOURCE_ID,
+                    field_schema=qm.PayloadSchemaType.KEYWORD,
+                )
         # vault_id is the per-vault ACL filter key (issue #189 Phase 2). Indexed
         # for the same reason as source_id. Created OUTSIDE the `if not exists`
         # block (idempotent server-side) so an ALREADY-deployed collection
         # — created before vault_id existed — also gets the index on first ensure.
+        # Best-effort (non-fatal) — but a TypeError/ValueError is a programming
+        # bug, not a transient index hiccup, so let it surface.
         try:
             await client.create_payload_index(
                 collection_name=self._collection,
                 field_name=PAYLOAD_VAULT_ID,
                 field_schema=qm.PayloadSchemaType.KEYWORD,
             )
+        except (TypeError, ValueError):
+            raise
         except Exception as e:  # noqa: BLE001
-            logger.warning("vault_id payload index ensure failed (non-fatal): %s", e)
+            # Non-fatal: a missing index doesn't break correctness (the readiness
+            # gate keys off the NULL-vault_id count, not the index), but every
+            # vault-filtered search then does a full payload scan. Log at ERROR,
+            # not WARNING, so a PERSISTENT failure (e.g. a managed cluster
+            # rejecting the schema) leaves a standing, greppable signal — this
+            # fires once per process since `_ensured_collection` latches below.
+            logger.error("qdrant vault_id payload index ensure failed (non-fatal, search falls back to full scan): %s", e)
         self._ensured_collection = True
 
     async def health(self) -> bool:
@@ -201,7 +209,8 @@ class QdrantStore:
                 PAYLOAD_VAULT_ID: str(vault_id),
             },
         )
-        await client.upsert(collection_name=self._collection, points=[point])
+        async with _qdrant_errors("upsert"):
+            await client.upsert(collection_name=self._collection, points=[point])
 
     # ── Delete ───────────────────────────────────────────────────
 
@@ -221,10 +230,11 @@ class QdrantStore:
         del conn  # external service; can't share PG transaction
         await self.ensure_collection()
         client = self._get_client()
-        await client.delete(
-            collection_name=self._collection,
-            points_selector=[str(chunk_id)],
-        )
+        async with _qdrant_errors("delete"):
+            await client.delete(
+                collection_name=self._collection,
+                points_selector=[str(chunk_id)],
+            )
 
     # ── Search ───────────────────────────────────────────────────
 
@@ -273,41 +283,60 @@ class QdrantStore:
                     filter=flt,
                 ),
             ]
-            result = await client.query_points(
-                collection_name=self._collection,
-                prefetch=prefetch,
-                query=qm.FusionQuery(fusion=qm.Fusion.RRF),
-                limit=limit,
-                with_payload=True,
-            )
+            async with _qdrant_errors("hybrid_search"):
+                result = await client.query_points(
+                    collection_name=self._collection,
+                    prefetch=prefetch,
+                    query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+                    limit=limit,
+                    with_payload=True,
+                )
             return [_to_hit(p) for p in result.points]
 
         if has_dense:
             # Dense-only: query has no known vocab term. Cross-encoder
             # rerank downstream filters semantically-weak matches.
+            async with _qdrant_errors("hybrid_search"):
+                result = await client.query_points(
+                    collection_name=self._collection,
+                    query=query_dense,
+                    using=DENSE_VECTOR_NAME,
+                    limit=limit,
+                    query_filter=flt,
+                    with_payload=True,
+                )
+            return [_to_hit(p) for p in result.points]
+
+        # Sparse-only: embedding API unavailable.
+        async with _qdrant_errors("hybrid_search"):
             result = await client.query_points(
                 collection_name=self._collection,
-                query=query_dense,
-                using=DENSE_VECTOR_NAME,
+                query=qm.SparseVector(
+                    indices=query_sparse_indices,
+                    values=query_sparse_values,
+                ),
+                using=SPARSE_VECTOR_NAME,
                 limit=limit,
                 query_filter=flt,
                 with_payload=True,
             )
-            return [_to_hit(p) for p in result.points]
-
-        # Sparse-only: embedding API unavailable.
-        result = await client.query_points(
-            collection_name=self._collection,
-            query=qm.SparseVector(
-                indices=query_sparse_indices,
-                values=query_sparse_values,
-            ),
-            using=SPARSE_VECTOR_NAME,
-            limit=limit,
-            query_filter=flt,
-            with_payload=True,
-        )
         return [_to_hit(p) for p in result.points]
+
+
+@contextlib.asynccontextmanager
+async def _qdrant_errors(op: str):
+    """Convert a qdrant-client call's transient failures (network drop, 5xx,
+    UnexpectedResponse, gRPC errors) into ``VectorStoreUnavailable`` so the
+    search/index paths label a qdrant outage `vector_store_unavailable` (not a
+    generic `vector_store_error`) — matching the pgvector/seahorse drivers
+    (#207). A ``TypeError``/``ValueError`` is a programming bug (e.g. a bad
+    ``qm.*`` argument), NOT an outage, so it propagates unmasked."""
+    try:
+        yield
+    except (TypeError, ValueError):
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise VectorStoreUnavailable(f"qdrant {op}: {e}") from e
 
 
 def _acl_filter(*, vault_ids: list[str] | None, source_ids: list[str] | None):
