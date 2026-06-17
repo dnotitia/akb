@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
-from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, tables
+from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, knowledge_io, tables
 from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -74,6 +74,7 @@ app.include_router(knowledge.router, prefix="/api/v1", tags=["knowledge"])
 app.include_router(activity.router, prefix="/api/v1", tags=["activity"])
 app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-sessions"])
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
+app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
 app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])

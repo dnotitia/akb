@@ -1127,4 +1127,63 @@ TOOLS = [
             },
         },
     ),
+    Tool(
+        name="akb_export",
+        description=(
+            "Export an entire vault as a portable knowledge bundle. Returns the "
+            "bundle inline as a {path: content} map. The `format` parameter selects "
+            "the on-disk format — currently 'okf' (Open Knowledge Format: markdown + "
+            "YAML frontmatter, the only required field being `type`). Documents export "
+            "1:1; tables and files become OKF concept documents (schema / metadata + a "
+            "`resource` pointer — the rows/bytes stay in AKB). Reader role required. "
+            "For a downloadable zip, use the REST endpoint GET /api/v1/vaults/{vault}/export."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Vault to export"},
+                "format": {
+                    "type": "string",
+                    "enum": ["okf"],
+                    "default": "okf",
+                    "description": "Bundle format. Currently only 'okf'.",
+                },
+            },
+            "required": ["vault"],
+        },
+    ),
+    Tool(
+        name="akb_import",
+        description=(
+            "Import a knowledge bundle into a vault. Pass `files` as a {path: content} "
+            "map (the shape akb_export returns). `format` selects the bundle format — "
+            "currently 'okf'. Concept documents are imported as AKB documents; a "
+            "`type: table`/`file` concept doc (which carries only schema/metadata, not "
+            "rows/bytes) imports as a regular document describing that asset. Existing "
+            "paths are skipped, not overwritten. Writer role required."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Target vault"},
+                "format": {
+                    "type": "string",
+                    "enum": ["okf"],
+                    "default": "okf",
+                    "description": "Bundle format. Currently only 'okf'.",
+                },
+                "files": {
+                    "type": "object",
+                    "description": "Bundle as a {bundle-relative-path: markdown-content} map.",
+                    "additionalProperties": {"type": "string"},
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["draft", "active", "archived"],
+                    "description": "Optional: override status for every imported document.",
+                },
+            },
+            "required": ["vault", "files"],
+        },
+    ),
 ]

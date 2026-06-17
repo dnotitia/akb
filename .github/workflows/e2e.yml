@@ -159,6 +159,7 @@ jobs:
             test_jwt_revocation_e2e.sh
             test_table_constraints_e2e.sh
             test_forbidden_permission_code_e2e.sh
+            test_okf_export_import_e2e.sh
           )
           TOTAL_PASS=0
           TOTAL_FAIL=0

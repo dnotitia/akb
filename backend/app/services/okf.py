@@ -418,6 +418,76 @@ def records_from_git_tree(worktree: Path, vault: str) -> list[dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Import: OKF concept documents → AKB document records
+# ─────────────────────────────────────────────────────────────────────────────
+# AKB's document `type` is a closed enum; OKF's `type` is open. On import we
+# clamp unknown OKF types to "reference" (and remember the original as a tag) so
+# an arbitrary OKF bundle never fails AKB's validation.
+AKB_DOC_TYPES = frozenset(
+    {"note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"}
+)
+AKB_DOC_STATUSES = frozenset({"draft", "active", "archived"})
+
+
+def _clamp_type(okf_type: Any) -> tuple[str, str | None]:
+    """Map an OKF `type` to (akb_type, original_if_clamped)."""
+    value = str(okf_type or "").strip()
+    if value in AKB_DOC_TYPES:
+        return value, None
+    return "reference", value or None
+
+
+def okf_doc_to_record(rel_path: str, meta: Mapping[str, Any], body: str) -> dict[str, Any]:
+    """One OKF concept doc → an AKB-shaped document record (for import).
+
+    Reverses the export field mapping: ``description`` → ``summary``. AKB sets
+    its own ``created_at``/``updated_at`` on write, so OKF ``timestamp`` is
+    informational only. Unknown ``type`` values are clamped (see ``_clamp_type``)
+    and the original preserved as an ``okf-type:<value>`` tag.
+    """
+    coll, _, fname = rel_path.replace("\\", "/").rpartition("/")
+    slug = fname[:-3] if fname.endswith(".md") else fname
+    akb_type, original_type = _clamp_type(meta.get("type"))
+    tags = list(meta.get("tags") or [])
+    if original_type:
+        tags.append(f"okf-type:{original_type}")
+    status = str(meta.get("status") or "draft")
+    if status not in AKB_DOC_STATUSES:
+        status = "draft"
+    return {
+        "path": _normalise_path(rel_path),
+        "collection": coll,
+        "slug": slug,
+        "title": str(meta.get("title") or slug),
+        "type": akb_type,
+        "status": status,
+        "summary": meta.get("description") or meta.get("summary"),
+        "domain": meta.get("domain"),
+        "tags": tags,
+        "content": body.strip(),
+    }
+
+
+def parse_okf_bundle(files: Mapping[str, str]) -> list[dict[str, Any]]:
+    """An OKF bundle (path → content) → AKB document records.
+
+    Permissive consumer (per OKF spec): reserved files are skipped, and a
+    concept file with no/unparseable frontmatter is still imported (as a
+    ``reference`` note) rather than rejected.
+    """
+    records: list[dict[str, Any]] = []
+    for rel, text in sorted(files.items()):
+        if not rel.endswith(".md"):
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        if name in RESERVED_FILENAMES:
+            continue
+        meta, body, _ = split_frontmatter(text)
+        records.append(okf_doc_to_record(rel, meta or {}, body if meta is not None else text))
+    return records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Conformance: validate a bundle against OKF v0.1 MUST rules
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass

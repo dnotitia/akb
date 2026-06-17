@@ -1235,6 +1235,44 @@ async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     return {"uri": doc_uri(vault, doc["path"]), "history": history}
 
 
+@_h("akb_export")
+async def _handle_export(args: dict, uid: str, user: _MCPUser) -> dict:
+    """Export a vault as a knowledge bundle (currently OKF). Returns the bundle
+    inline as a {path: content} map."""
+    vault = args.get("vault")
+    if not vault:
+        return err("`vault` is required", code=INVALID_ARGUMENT)
+    fmt = args.get("format", "okf")
+    await check_vault_access(uid, vault, required_role="reader")
+    from app.services import knowledge_io
+    try:
+        files = await knowledge_io.export_vault(vault, fmt=fmt, doc_service=doc_service)
+    except ValueError as e:
+        return err(str(e), code=INVALID_ARGUMENT)
+    return {"format": fmt, "vault": vault, "file_count": len(files), "files": files}
+
+
+@_h("akb_import")
+async def _handle_import(args: dict, uid: str, user: _MCPUser) -> dict:
+    """Import a knowledge bundle ({path: content} map) into a vault."""
+    vault = args.get("vault")
+    if not vault:
+        return err("`vault` is required", code=INVALID_ARGUMENT)
+    files = args.get("files")
+    if not isinstance(files, dict) or not files:
+        return err("`files` must be a non-empty {path: content} object", code=INVALID_ARGUMENT)
+    fmt = args.get("format", "okf")
+    await check_vault_access(uid, vault, required_role="writer")
+    from app.services import knowledge_io
+    try:
+        return await knowledge_io.import_bundle(
+            vault, files, fmt=fmt, actor_id=user.username,
+            doc_service=doc_service, status=args.get("status"),
+        )
+    except ValueError as e:
+        return err(str(e), code=INVALID_ARGUMENT)
+
+
 @_h("akb_set_public")
 async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
     """Set `vaults.public_access`. Owner-only.
