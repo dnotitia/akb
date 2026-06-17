@@ -1113,7 +1113,7 @@ class DocumentService:
         current_fm["updated_at"] = now.isoformat()
         new_md = _compose_markdown(current_fm, new_body)
         previous_hash = row.get("content_hash") or _body_content_hash(current_body)
-        content_hash = _body_content_hash(new_body)
+        content_hash = _certified_content_hash(new_md)
 
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
