@@ -157,6 +157,7 @@ jobs:
             test_pg_rbac_e2e.sh
             test_graph_replace_e2e.sh
             test_jwt_revocation_e2e.sh
+            test_table_constraints_e2e.sh
           )
           TOTAL_PASS=0
           TOTAL_FAIL=0

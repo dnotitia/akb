@@ -135,6 +135,10 @@ async def test_unique_key_duplicates_query_shape():
     assert "COUNT(*)" in select_clause.upper()
     assert "ACTOR" in sql and "TS" in sql
     assert "LIMIT 5" in sql
+    # NULLS DISTINCT parity: rows with any NULL key value are excluded so the
+    # preflight is not STRICTER than the UNIQUE constraint it guards (#220 review).
+    assert "WHERE" in sql
+    assert sql.count("IS NOT NULL") == 2  # one per key column (actor, ts)
 
 
 @pytest.mark.asyncio
@@ -228,10 +232,39 @@ def test_resolve_unique_keys_rejects_unknown_column():
 
 
 def test_resolve_unique_keys_column_match_is_case_insensitive():
+    # A mixed-case reference matches the declared column case-insensitively AND
+    # is normalised to the CANONICAL declared name — so the stored metadata and
+    # the duplicate-preflight sample (row[safe_ident(name)]) use the real PG
+    # identifier, never the caller's casing (which would KeyError). (#220 review)
     resolved = table_service._resolve_unique_keys(
         [{"columns": ["ACTOR"]}], _DECLARED, "vt_demo__events",
     )
-    assert resolved[0]["columns"] == ["ACTOR"]
+    assert resolved[0]["columns"] == ["actor"]
+
+
+def test_resolve_rejects_duplicate_column_within_one_key():
+    # columns:["actor","actor"] must be a clean 422, not a DDL 500 (42701/42P16).
+    with pytest.raises(ValidationError):
+        table_service._resolve_unique_keys(
+            [{"columns": ["actor", "actor"]}], _DECLARED, "vt_demo__events",
+        )
+    # case-insensitive duplicate too
+    with pytest.raises(ValidationError):
+        table_service._resolve_unique_keys(
+            [{"columns": ["actor", "ACTOR"]}], _DECLARED, "vt_demo__events",
+        )
+    with pytest.raises(ValidationError):
+        table_service._resolve_indexes(
+            [{"columns": ["ts", "ts"]}], _DECLARED, "vt_demo__events",
+        )
+
+
+def test_resolve_indexes_canonicalises_column_case():
+    resolved = table_service._resolve_indexes(
+        [{"columns": [{"name": "TS", "order": "desc"}]}], _DECLARED, "vt_demo__events",
+    )
+    assert resolved[0]["columns"][0]["name"] == "ts"
+    assert resolved[0]["columns"][0]["order"] == "desc"
 
 
 def test_resolve_unique_keys_rejects_reserved_column():

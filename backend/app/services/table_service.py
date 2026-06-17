@@ -107,9 +107,16 @@ def _declared_column_lookup(columns: list[dict]) -> dict[str, str]:
     return {c["name"].lower(): c["name"] for c in columns if isinstance(c, dict) and "name" in c}
 
 
-def _check_key_column(col, lookup: dict[str, str], *, ctx: str) -> None:
-    """Validate one referenced column: non-empty string, not reserved,
-    and present in the table's declared columns (case-insensitive)."""
+def _check_key_column(col, lookup: dict[str, str], *, ctx: str) -> str:
+    """Validate one referenced column and return its CANONICAL declared name.
+
+    Non-empty string, not reserved, and present in the table's declared
+    columns (case-insensitive). Returning the canonical name means a
+    mixed-case reference (e.g. ``"ACTOR"`` for declared ``"actor"``) is stored
+    as the real PG identifier — so the duplicate-preflight sample
+    (``row[safe_ident(name)]``) can't KeyError on a casing mismatch, and the
+    registry never records a divergent casing.
+    """
     if not isinstance(col, str) or not col:
         raise ValidationError(f"{ctx}: each column must be a non-empty string; got {col!r}.")
     if col.lower() in _RESERVED:
@@ -122,6 +129,7 @@ def _check_key_column(col, lookup: dict[str, str], *, ctx: str) -> None:
             f"{ctx}: column {col!r} does not exist on this table. "
             f"Declared columns: {sorted(lookup.values())}."
         )
+    return lookup[col.lower()]
 
 
 def _resolve_unique_keys(
@@ -154,8 +162,17 @@ def _resolve_unique_keys(
             raise ValidationError(
                 f"unique_keys.columns must be a non-empty list; got {cols!r}."
             )
+        canon_cols: list[str] = []
+        seen_cols: set[str] = set()
         for col in cols:
-            _check_key_column(col, lookup, ctx="unique_keys")
+            cname = _check_key_column(col, lookup, ctx="unique_keys")
+            if cname.lower() in seen_cols:
+                raise ValidationError(
+                    f"unique_keys: column {col!r} appears more than once in a single "
+                    f"key; a unique key's columns must be distinct."
+                )
+            seen_cols.add(cname.lower())
+            canon_cols.append(cname)
         name = item.get("name")
         if name is not None:
             if not isinstance(name, str) or not name:
@@ -167,14 +184,14 @@ def _resolve_unique_keys(
                     f"{table_data_repo.PG_IDENT_MAX_LEN}-char PostgreSQL identifier limit."
                 )
         else:
-            name = table_data_repo.generate_constraint_name(pg_name, cols, kind="uk")
+            name = table_data_repo.generate_constraint_name(pg_name, canon_cols, kind="uk")
         if name in seen_names:
             raise ValidationError(
                 f"Duplicate unique-key name {name!r}. Names (generated or supplied) "
                 f"must be unique within a table."
             )
         seen_names.add(name)
-        resolved.append({"name": name, "columns": list(cols)})
+        resolved.append({"name": name, "columns": canon_cols})
     return resolved
 
 
@@ -207,6 +224,7 @@ def _resolve_indexes(
             )
         norm_cols: list[dict] = []
         col_names: list[str] = []
+        seen_cols: set[str] = set()
         for col in cols:
             if isinstance(col, str):
                 col_name, order = col, "asc"
@@ -222,9 +240,15 @@ def _resolve_indexes(
                 raise ValidationError(
                     f"indexes: each column must be a string or {{name, order?}}; got {col!r}."
                 )
-            _check_key_column(col_name, lookup, ctx="indexes")
-            norm_cols.append({"name": col_name, "order": order})
-            col_names.append(col_name)
+            cname = _check_key_column(col_name, lookup, ctx="indexes")
+            if cname.lower() in seen_cols:
+                raise ValidationError(
+                    f"indexes: column {col_name!r} appears more than once in a single "
+                    f"index; an index's columns must be distinct."
+                )
+            seen_cols.add(cname.lower())
+            norm_cols.append({"name": cname, "order": order})
+            col_names.append(cname)
         name = item.get("name")
         if name is not None:
             if not isinstance(name, str) or not name:
@@ -676,6 +700,37 @@ async def alter_table(
             existing_idxs = table_registry_repo.parse_json_list(table.get("indexes"))
             uk_changed = False
             idx_changed = False
+
+            # Keep declarative metadata consistent with column rename/drop done
+            # in THIS alter, else the registry drifts from the physical schema:
+            # a PG column rename leaves the constraint/index under the old
+            # column name, and DROP COLUMN auto-drops any constraint/index the
+            # column was part of. Mirror both in the registry. (#220 review.)
+            if renamed:
+                ren = {old.lower(): new for old, new in renamed.items()}
+                for uk in existing_uks:
+                    new_cols = [ren.get(str(c).lower(), c) for c in uk.get("columns", [])]
+                    if new_cols != uk.get("columns"):
+                        uk["columns"] = new_cols
+                        uk_changed = True
+                for idx in existing_idxs:
+                    for c in idx.get("columns", []):
+                        if isinstance(c, dict) and str(c.get("name", "")).lower() in ren:
+                            c["name"] = ren[str(c["name"]).lower()]
+                            idx_changed = True
+            if dropped:
+                dset = {d.lower() for d in dropped}
+                kept_uks = [uk for uk in existing_uks
+                            if not any(str(c).lower() in dset for c in uk.get("columns", []))]
+                if len(kept_uks) != len(existing_uks):
+                    existing_uks = kept_uks
+                    uk_changed = True
+                kept_idxs = [idx for idx in existing_idxs
+                             if not any(isinstance(c, dict) and str(c.get("name", "")).lower() in dset
+                                        for c in idx.get("columns", []))]
+                if len(kept_idxs) != len(existing_idxs):
+                    existing_idxs = kept_idxs
+                    idx_changed = True
 
             # Drops first so a drop+re-add of the same name in one alter
             # works, and so adds validate against the post-drop set.

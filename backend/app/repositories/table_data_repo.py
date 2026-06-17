@@ -237,14 +237,23 @@ async def unique_key_duplicates(
     would violate the constraint. An empty list means the key can be
     added safely.
 
-    ``SELECT {cols}, COUNT(*) FROM {pg} GROUP BY {cols} HAVING COUNT(*) > 1 LIMIT {n}``
-    — identifiers via ``safe_ident``; ``limit`` is coerced to ``int``."""
+    PostgreSQL ``UNIQUE`` defaults to ``NULLS DISTINCT`` — a row whose key has
+    ANY NULL value never conflicts. The preflight mirrors that (``WHERE <each
+    col> IS NOT NULL``) so it is not STRICTER than the constraint it guards:
+    otherwise multiple legitimately-NULL rows would group together and falsely
+    block a valid ``ADD CONSTRAINT``.
+
+    ``SELECT {cols}, COUNT(*) FROM {pg} WHERE {cols all NOT NULL}
+    GROUP BY {cols} HAVING COUNT(*) > 1 LIMIT {n}`` — identifiers via
+    ``safe_ident``; ``limit`` is coerced to ``int``."""
     safe_cols = [safe_ident(c) for c in columns]
     col_list = ", ".join(safe_cols)
+    not_null = " AND ".join(f"{c} IS NOT NULL" for c in safe_cols)
     lim = int(limit)
     rows = await conn.fetch(
         f"SELECT {col_list}, COUNT(*) AS dup_count "
         f"FROM {pg_name} "
+        f"WHERE {not_null} "
         f"GROUP BY {col_list} "
         f"HAVING COUNT(*) > 1 "
         f"LIMIT {lim}"
