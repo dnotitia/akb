@@ -650,6 +650,7 @@ akb_help(topic="link-resources")    # Workflow guide
 | vault | ✓ | Target vault name |
 | collection | ✓ | Directory path (e.g. "api-specs", "meeting-notes") |
 | title | ✓ | Document title |
+| slug | | Optional filename slug. When omitted, the path is derived from `title`; pass this to pin a stable URI filename independently of the display title. |
 | content | ✓ | Markdown body |
 | type | | note, report, decision, spec, plan, session, task, reference |
 | tags | | ["auth", "api"] |
@@ -664,6 +665,14 @@ akb_help(topic="link-resources")    # Workflow guide
 ```
 akb_put(vault="eng", collection="notes", title="Meeting Notes 2026-04-03",
   content="## Attendees\\n- Kim, Lee\\n\\n## Discussion\\n...")
+```
+
+**Stable path, friendly title:**
+```
+akb_put(vault="eng", collection="issues", title="Fix login redirect loop",
+  slug="github-issue-123",
+  content="## Context\\n...")
+# uri: akb://eng/coll/issues/doc/github-issue-123.md
 ```
 
 **Decision record with links:**

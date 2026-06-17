@@ -130,6 +130,7 @@ TOOLS = [
                 },
                 "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
                 "collection": {"type": "string", "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'. Ignored when `parent` is given."},
+                "slug": {"type": "string", "description": "Optional explicit slug for the document filename. When stored under a collection the URI is `akb://{vault}/coll/{collection}/doc/{slug}.md`; at the vault root it is `akb://{vault}/doc/{slug}.md`. When omitted, the slug is derived from the title. Pass it to keep the path stable and meaningful when the title is friendly, changeable text (e.g. slug `github-issue-123` with a human-readable title)."},
                 "title": {"type": "string", "description": "Document title"},
                 "content": {"type": "string", "description": "Document body in Markdown"},
                 "type": {

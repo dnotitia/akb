@@ -275,6 +275,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     req = DocumentPutRequest(
         vault=vault,
         collection=collection,
+        slug=args.get("slug"),
         title=args["title"],
         content=args["content"],
         type=args.get("type", "note"),
