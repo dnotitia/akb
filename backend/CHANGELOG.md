@@ -19,7 +19,9 @@ works on **qdrant** and the three **seahorse** drivers too.
   unknown driver is fail-safe (source-id path, never a wrong vault path).
 - **qdrant:** writes `vault_id` on each point's payload, indexes it (KEYWORD),
   filters on it in `hybrid_search` under the exactly-one(vault_ids, source_ids)
-  contract, and counts un-backfilled points via `count(IsNullCondition, exact=True)`.
+  contract, and counts un-backfilled points via `count(IsEmptyCondition, exact=True)`
+  — IsEmpty matches missing-OR-null; IsNull would miss pre-upgrade points that
+  never carried the key (under-count → gate flips ready early).
 - **seahorse (Coral REST / gRPC / Cloud):** `vault_id` column on the table schema
   + written on every upsert; filtered via a shared `vault_filter_sql` helper
   (`vault_id IN (…)`). The REST driver gates readiness on a `/data/scan` null
@@ -37,9 +39,9 @@ works on **qdrant** and the three **seahorse** drivers too.
   pgvector and is unaffected.
 - Tests: new qdrant + seahorse(REST/Cloud) vault-filter unit suites; gRPC unit
   test extended (CI-only). NOTE: the seahorse drivers are unit-tested but not
-  live-verified against Coral here — the `/data/scan` count shape and qdrant's
-  `IsNullCondition` absent-key semantics should be confirmed against a live
-  server before relying on auto-activation.
+  live-verified against Coral here — the `/data/scan` count shape should be
+  confirmed against a live server before relying on seahorse auto-activation.
+  (qdrant's `IsEmptyCondition` absent-key count IS live-verified against 1.18.2.)
 
 ## 0.8.13 — 2026-06-16  *(patch — search: zero-touch Phase 2 + retrieval fixes)*
 

@@ -97,6 +97,32 @@ async def test_db_upsert_one_inline_record_carries_vault_id():
 
 
 @pytest.mark.asyncio
+async def test_db_hybrid_search_filter_wires_vault_then_source(monkeypatch):
+    """The per-driver seam: vault_ids must reach the request `filter` as
+    `vault_id IN (…)`, source_ids as `source_id IN (…)`. A column mix-up here is
+    a cross-vault leak. (hybrid_search calls sparse_encoder.load_stats
+    unconditionally — mock it so no real PG/coordinator connection is made.)"""
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr("app.services.sparse_encoder.load_stats", AsyncMock(return_value={}))
+
+    s = SeahorseDbStore(coordinator_url="http://x", table_name="chunks", dense_dim=4)
+    s._ensured_collection = True
+    s._client = _FakeHttp(_Resp(200, {"data": {"data": [[]]}}))
+    await s.hybrid_search(
+        query_text="q", query_dense=_DENSE, query_sparse_indices=[], query_sparse_values=[],
+        source_ids=None, vault_ids=[_UUID], limit=5, prefetch_per_leg=10,
+    )
+    assert s._client.calls[-1]["json"]["filter"] == f"vault_id IN ('{_UUID}')"
+
+    s._client = _FakeHttp(_Resp(200, {"data": {"data": [[]]}}))
+    await s.hybrid_search(
+        query_text="q", query_dense=_DENSE, query_sparse_indices=[], query_sparse_values=[],
+        source_ids=[_UUID], vault_ids=None, limit=5, prefetch_per_leg=10,
+    )
+    assert s._client.calls[-1]["json"]["filter"] == f"source_id IN ('{_UUID}')"
+
+
+@pytest.mark.asyncio
 async def test_db_vault_backfill_pending_counts_and_fails_closed():
     s = SeahorseDbStore(coordinator_url="http://x", table_name="chunks", dense_dim=4)
     # empty scan → 0 pending (fresh/recreated table → vault path can activate)
@@ -138,3 +164,22 @@ async def test_cloud_upsert_one_row_carries_vault_id():
     )
     sent = json.loads(fake.calls[-1]["content"].decode("utf-8"))
     assert sent[COL_VAULT_ID] == "vault-9"
+
+
+@pytest.mark.asyncio
+async def test_cloud_hybrid_search_filter_uses_vault_col_override():
+    """seahorse_cloud is the ONLY driver passing non-default vault_col/source_col
+    to vault_filter_sql — a typo there filters the wrong column (cross-vault
+    leak), and it was otherwise untested. Assert vault_ids → `vault_id IN (…)`."""
+    s = SeahorseCloudStore(
+        management_url="http://x", token="t", tenant_uuid="ten", table_name="chunks",
+        dense_dim=4,
+    )
+    s._ensured = True
+    s._table_host = "http://host"
+    s._client = _FakeHttp(_Resp(200, {"data": {"data": [[]]}}))
+    await s.hybrid_search(
+        query_text="q", query_dense=_DENSE, query_sparse_indices=[], query_sparse_values=[],
+        source_ids=None, vault_ids=[_UUID], limit=5, prefetch_per_leg=10,
+    )
+    assert s._client.calls[-1]["json"]["filter"] == f"{COL_VAULT_ID} IN ('{_UUID}')"

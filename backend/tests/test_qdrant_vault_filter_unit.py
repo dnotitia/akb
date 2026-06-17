@@ -99,6 +99,24 @@ async def test_hybrid_search_filters_by_vault_then_source_and_rejects_both():
 
 
 @pytest.mark.asyncio
+async def test_hybrid_search_dual_prefetch_filters_both_legs():
+    """The production-common path (dense AND sparse present) builds two Prefetch
+    legs and must attach the vault filter to BOTH — a leg missing the filter
+    would retrieve cross-vault candidates before RRF fusion."""
+    fake = _FakeClient()
+    store = _store_with(fake)
+    await store.hybrid_search(
+        query_text="q", query_dense=[0.1, 0.2, 0.3, 0.4],
+        query_sparse_indices=[1, 2], query_sparse_values=[0.5, 0.5],
+        source_ids=None, vault_ids=["v1"], limit=10, prefetch_per_leg=50,
+    )
+    prefetch = store._client.last_query["prefetch"]
+    assert len(prefetch) == 2
+    for leg in prefetch:
+        assert leg.filter.must[0].key == PAYLOAD_VAULT_ID
+
+
+@pytest.mark.asyncio
 async def test_vault_backfill_pending_counts_null_exactly():
     fake = _FakeClient()
     store = _store_with(fake)

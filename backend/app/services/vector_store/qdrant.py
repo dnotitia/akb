@@ -135,13 +135,13 @@ class QdrantStore:
         side join to the main DB, so the operator backfills by reindexing). The
         qdrant analogue of pgvector's `WHERE vault_id IS NULL`.
 
-        Uses `IsEmptyCondition`, NOT `IsNullCondition`: verified against qdrant
-        1.18.2, IsNull matches only an EXPLICIT null and MISSES a point that
-        never had the key — which is exactly the pre-upgrade point set we must
+        Uses `IsEmptyCondition`, NOT `IsNullCondition`: verified against a live
+        qdrant 1.18.x server, IsNull matches only an EXPLICIT null and MISSES a
+        point that never had the key — exactly the pre-upgrade point set we must
         count. IsEmpty matches missing OR null. (A wrong choice here under-counts
         → the gate flips ready early → users miss their un-backfilled docs.)
-        `exact=True` is mandatory: the default approximate count could read 0
-        prematurely for the same reason."""
+        We pin `exact=True` because an APPROXIMATE count (`exact=False`) could
+        read 0 prematurely for the same reason — don't rely on the client default."""
         await self.ensure_collection()
         client = self._get_client()
         try:

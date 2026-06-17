@@ -126,11 +126,14 @@ class VectorStore(Protocol):
     (idempotent by chunk_id).
     """
 
-    # Capability flag (issue #189 Phase 2). True only on drivers that (1) write
-    # `vault_id` on every point in upsert_one, (2) filter on it in hybrid_search
-    # under the exactly-one(vault_ids, source_ids) contract, AND (3) expose
-    # `vault_backfill_pending()`. The three ship together — this flag IS that
-    # contract. Drivers DUCK-TYPE this Protocol (they don't inherit), so this
+    # Capability flag (issue #189 Phase 2). True on drivers that (1) write
+    # `vault_id` on every point in upsert_one and (2) filter on it in
+    # hybrid_search under the exactly-one(vault_ids, source_ids) contract. A
+    # capable driver SHOULD also (3) expose `vault_backfill_pending()` so the
+    # readiness worker can auto-activate it; one that doesn't (seahorse gRPC /
+    # Cloud — no count primitive yet) stays permanently gated on the safe
+    # source-id path (correct, just not the O(vaults) speedup) until a count is
+    # wired. Drivers DUCK-TYPE this Protocol (they don't inherit), so this
     # default does NOT propagate; every capable driver sets it on its own class,
     # and every reader uses `getattr(store, "vault_filter_supported", False)` so
     # an unknown driver is fail-safe (source-id path, never a wrong vault path).
