@@ -202,6 +202,26 @@ related_to: ["akb://eng/coll/meetings/doc/2026-05-01-payments.md"]
 ...
 ```
 
+### Open Knowledge Format (OKF) compatible
+
+A vault is stored as a git tree of `.md` + YAML-frontmatter files whose
+identity is the path — the same model as Google Cloud's
+[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog)
+(OKF v0.1), which AKB independently arrived at before the spec existed.
+AKB-authored bundles satisfy all three OKF MUST rules, and AKB can export any
+vault as a conformant OKF bundle (documents, plus tables/files as concept docs)
+and validate any bundle:
+
+```bash
+python -m app.cli okf-export --from-git /data/vaults/_worktrees/<vault> \
+    --vault <vault> --out ./okf-out/
+python -m app.cli okf-validate ./okf-out/
+```
+
+OKF and AKB are complementary — OKF standardizes *how knowledge is written
+down*; AKB stores, versions, searches, governs, and serves it to agents. See
+[`okf/`](okf/) for the mapping and a sample bundle.
+
 ## Quick Start
 
 AKB ships as a **3-container stack** (PostgreSQL with pgvector + backend +
@@ -360,6 +380,7 @@ akb/
 ├── agents/                   # Reference Python agent runtime (think/act loop over MCP)
 ├── plugins/                  # Claude Code / Codex agent plugins (ingest, query, session capture, lifecycle)
 ├── templates/                # Doc templates (ADR, PRD, runbook, …) and vault profiles
+├── okf/                      # Open Knowledge Format interop: positioning + sample bundle
 ├── design-system/            # Frontend design system docs
 ├── config/
 │   ├── app.yaml.example      # Non-secret runtime settings
