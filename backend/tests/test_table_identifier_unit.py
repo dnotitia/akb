@@ -86,6 +86,125 @@ def test_rewriter_leaves_quoted_identifier_alone():
     assert rewrite_table_names(sql, table_map) == sql
 
 
+# ── rewriter skips PG reserved keywords (issue #180-family, #182) ──
+#
+# The table map is vault-wide, so a single table named like a SQL
+# keyword used to clobber that keyword in EVERY statement in the vault
+# (`INSERT ... VALUES (...)` → `INSERT ... vt_<vault>__values (...)`).
+# Because the rewriter is tokenizer-based rather than grammar-based, every
+# PostgreSQL keyword is unsafe as a bare table alias. Keyword-shaped tables
+# remain reachable through their vault-prefixed alias.
+
+
+def test_rewriter_keyword_decoy_does_not_break_values():
+    """Issue #182's motivating case: a vault containing a table named
+    ``values`` must not break unrelated INSERTs."""
+    table_map = {
+        "source_github_issues": "vt_demo__source_github_issues",
+        "values": "vt_demo__values",
+        "demo__values": "vt_demo__values",
+    }
+    rewritten = rewrite_table_names(
+        "INSERT INTO source_github_issues (title) VALUES ('x')", table_map,
+    )
+    assert rewritten == (
+        "INSERT INTO vt_demo__source_github_issues (title) VALUES ('x')"
+    )
+
+
+def test_rewriter_keyword_decoys_leave_select_order_group_alone():
+    """Same hazard for the other common keyword-shaped names; the skip
+    is case-insensitive like the rest of the rewriter."""
+    table_map = {
+        "pipeline": "vt_demo__pipeline",
+        "select": "vt_demo__select",
+        "order": "vt_demo__order",
+        "group": "vt_demo__group",
+    }
+    rewritten = rewrite_table_names(
+        "SELECT id FROM pipeline GROUP BY id ORDER BY id", table_map,
+    )
+    assert rewritten == (
+        "SELECT id FROM vt_demo__pipeline GROUP BY id ORDER BY id"
+    )
+
+
+def test_rewriter_keyword_decoys_leave_between_exists_over_alone():
+    """Expression/window keywords are not reserved table-name keywords, but
+    rewriting them still corrupts valid SQL when the vault also has tables
+    named ``between``, ``exists``, or ``over``."""
+    table_map = {
+        "scores": "vt_demo__scores",
+        "between": "vt_demo__between",
+        "exists": "vt_demo__exists",
+        "over": "vt_demo__over",
+    }
+    rewritten = rewrite_table_names(
+        "SELECT avg(score) OVER () FROM scores "
+        "WHERE score BETWEEN 1 AND 10 "
+        "AND EXISTS (SELECT 1)",
+        table_map,
+    )
+    assert rewritten == (
+        "SELECT avg(score) OVER () FROM vt_demo__scores "
+        "WHERE score BETWEEN 1 AND 10 "
+        "AND EXISTS (SELECT 1)"
+    )
+
+
+def test_rewriter_keyword_named_table_is_unreachable_via_bare_ident():
+    """DOCUMENTED TRADE-OFF: a table literally named ``values`` can no
+    longer be referenced as a bare ``FROM values`` — the rewriter leaves
+    the keyword alone and PG rejects it with a syntax error (VALUES is
+    fully reserved). That is the acceptable cost: before this fix the
+    same map entry silently corrupted every OTHER statement in the
+    vault, so keyword-named tables were already breaking the vault. The
+    supported route remains the vault-prefixed alias (next test), which
+    is never a keyword."""
+    table_map = {"values": "vt_demo__values"}
+    sql = "SELECT * FROM values"
+    assert rewrite_table_names(sql, table_map) == sql
+
+
+def test_rewriter_prefixed_alias_still_reaches_keyword_named_tables():
+    """The ``<vault>__<table>`` alias is not a keyword, so a
+    keyword-named table stays reachable through it."""
+    table_map = {
+        "demo__between": "vt_demo__between",
+        "demo__exists": "vt_demo__exists",
+        "demo__over": "vt_demo__over",
+        "demo__values": "vt_demo__values",
+    }
+    rewritten = rewrite_table_names(
+        "SELECT * FROM demo__values "
+        "JOIN demo__between ON true "
+        "JOIN demo__exists ON true "
+        "JOIN demo__over ON true",
+        table_map,
+    )
+    assert rewritten == (
+        "SELECT * FROM vt_demo__values "
+        "JOIN vt_demo__between ON true "
+        "JOIN vt_demo__exists ON true "
+        "JOIN vt_demo__over ON true"
+    )
+
+
+def test_rewriter_non_reserved_pg_keyword_named_table_needs_prefixed_alias():
+    """Even a non-reserved PG keyword is context-sensitive SQL syntax, so
+    the bare form is left alone and the prefixed alias is the supported
+    route."""
+    table_map = {
+        "comment": "vt_demo__comment",
+        "demo__comment": "vt_demo__comment",
+    }
+    rewritten = rewrite_table_names("SELECT * FROM comment", table_map)
+    assert rewritten == "SELECT * FROM comment"
+
+    rewritten = rewrite_table_names("SELECT * FROM demo__comment", table_map)
+    assert rewritten == "SELECT * FROM vt_demo__comment"
+
+
 # ── identifier length boundary (E08) ───────────────────────────
 
 
