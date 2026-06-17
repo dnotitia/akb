@@ -92,11 +92,85 @@ async def _repair_resource_hashes(args: list[str]) -> int:
     return 1 if report.get("errors") else 0
 
 
+def _okf_validate(args: list[str]) -> int:
+    """`okf-validate <bundle-dir>` — check a directory against OKF v0.1."""
+    from pathlib import Path
+
+    from app.services.okf import check_dir
+
+    if len(args) != 1:
+        print("Usage: python -m app.cli okf-validate <bundle-dir>", file=sys.stderr)
+        return 2
+    root = Path(args[0])
+    if not root.is_dir():
+        print(f"Not a directory: {root}", file=sys.stderr)
+        return 2
+    report = check_dir(root)
+    for finding in report.findings:
+        print(finding, file=sys.stderr)
+    print(report.summary())
+    return 0 if report.ok else 1
+
+
+def _okf_export(args: list[str]) -> int:
+    """`okf-export --from-git <worktree> --vault <name> --out <dir>`.
+
+    Exports an AKB vault git worktree as an OKF bundle and validates it.
+    """
+    from pathlib import Path
+
+    from app.services.okf import build_bundle, check_bundle, records_from_git_tree, write_bundle
+
+    usage = (
+        "Usage: python -m app.cli okf-export --from-git <worktree> "
+        "--vault <name> --out <dir>"
+    )
+    from_git = vault = out = None
+    index = 0
+    while index < len(args):
+        flag = args[index]
+        if flag in ("--from-git", "--vault", "--out"):
+            index += 1
+            if index >= len(args):
+                print(usage, file=sys.stderr)
+                return 2
+            if flag == "--from-git":
+                from_git = args[index]
+            elif flag == "--vault":
+                vault = args[index]
+            else:
+                out = args[index]
+        else:
+            print(f"Unknown okf-export option: {flag}", file=sys.stderr)
+            return 2
+        index += 1
+    if not (from_git and vault and out):
+        print(usage, file=sys.stderr)
+        return 2
+    worktree = Path(from_git)
+    if not worktree.is_dir():
+        print(f"Not a directory: {worktree}", file=sys.stderr)
+        return 2
+    records = records_from_git_tree(worktree, vault)
+    bundle = build_bundle(documents=records)
+    write_bundle(Path(out), bundle)
+    report = check_bundle(bundle)
+    for finding in report.findings:
+        print(finding, file=sys.stderr)
+    print(f"Wrote {len(bundle)} file(s) to {out}")
+    print(report.summary())
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
         print("Usage: python -m app.cli <subcommand> [args]", file=sys.stderr)
-        print("Subcommands: reset-password <username>, repair-resource-hashes", file=sys.stderr)
+        print(
+            "Subcommands: reset-password <username>, repair-resource-hashes, "
+            "okf-validate <dir>, okf-export --from-git <worktree> --vault <name> --out <dir>",
+            file=sys.stderr,
+        )
         return 2
     cmd = argv[0]
     if cmd == "reset-password":
@@ -106,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_reset_password(argv[1]))
     if cmd == "repair-resource-hashes":
         return asyncio.run(_repair_resource_hashes(argv[1:]))
+    if cmd == "okf-validate":
+        return _okf_validate(argv[1:])
+    if cmd == "okf-export":
+        return _okf_export(argv[1:])
     print(f"Unknown subcommand: {cmd}", file=sys.stderr)
     return 2
 
