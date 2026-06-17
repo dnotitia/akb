@@ -120,7 +120,13 @@ class QdrantStore:
         except (TypeError, ValueError):
             raise
         except Exception as e:  # noqa: BLE001
-            logger.warning("vault_id payload index ensure failed (non-fatal): %s", e)
+            # Non-fatal: a missing index doesn't break correctness (the readiness
+            # gate keys off the NULL-vault_id count, not the index), but every
+            # vault-filtered search then does a full payload scan. Log at ERROR,
+            # not WARNING, so a PERSISTENT failure (e.g. a managed cluster
+            # rejecting the schema) leaves a standing, greppable signal — this
+            # fires once per process since `_ensured_collection` latches below.
+            logger.error("qdrant vault_id payload index ensure failed (non-fatal, search falls back to full scan): %s", e)
         self._ensured_collection = True
 
     async def health(self) -> bool:

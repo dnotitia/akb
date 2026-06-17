@@ -176,7 +176,18 @@ async def _do_upsert(store):
     )
 
 
-async def _do_search(store):
+# hybrid_search has three independent legs, each with its own `async with
+# _qdrant_errors` — cover ALL three (dual-prefetch is the production-common path)
+# so a refactor dropping the wrap from one leg can't pass silently.
+async def _do_search_hybrid(store):  # dense + sparse → dual-prefetch leg
+    await store.hybrid_search(
+        query_text="q", query_dense=[0.1, 0.2, 0.3, 0.4],
+        query_sparse_indices=[1, 2], query_sparse_values=[0.5, 0.5],
+        source_ids=None, vault_ids=["v1"], limit=10, prefetch_per_leg=50,
+    )
+
+
+async def _do_search_dense(store):  # dense only
     await store.hybrid_search(
         query_text="q", query_dense=[0.1, 0.2, 0.3, 0.4],
         query_sparse_indices=[], query_sparse_values=[],
@@ -184,12 +195,23 @@ async def _do_search(store):
     )
 
 
+async def _do_search_sparse(store):  # sparse only (embed API down)
+    await store.hybrid_search(
+        query_text="q", query_dense=None,
+        query_sparse_indices=[1, 2], query_sparse_values=[0.5, 0.5],
+        source_ids=None, vault_ids=["v1"], limit=10, prefetch_per_leg=50,
+    )
+
+
+_ALL_ACTIONS = [_do_upsert, _do_search_hybrid, _do_search_dense, _do_search_sparse]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", [_do_upsert, _do_search])
+@pytest.mark.parametrize("action", _ALL_ACTIONS)
 async def test_transient_client_error_becomes_unavailable(action):
     """A transient qdrant-client failure on the write/search path surfaces as
     VectorStoreUnavailable (so _run_vector_search labels it correctly), not a
-    raw client exception."""
+    raw client exception. Covers all three hybrid_search legs."""
     store = _store_with(_BoomClient(RuntimeError("connection refused")))
     with pytest.raises(VectorStoreUnavailable):
         await action(store)
@@ -211,10 +233,46 @@ async def test_ensure_collection_error_becomes_unavailable():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", [_do_upsert, _do_search])
-async def test_programming_error_is_not_masked(action):
-    """A TypeError/ValueError is a programming bug (bad qm.* arg), NOT an outage —
-    it must propagate unmasked rather than become VectorStoreUnavailable."""
-    store = _store_with(_BoomClient(TypeError("bad arg")))
-    with pytest.raises(TypeError):
+@pytest.mark.parametrize("action", _ALL_ACTIONS)
+@pytest.mark.parametrize("exc", [TypeError("bad arg"), ValueError("bad value")])
+async def test_programming_error_is_not_masked(action, exc):
+    """TypeError AND ValueError are programming bugs (bad qm.* arg), NOT outages —
+    both must propagate unmasked rather than become VectorStoreUnavailable. Both
+    are named in the catch tuples, so both are guarded against a future trim."""
+    store = _store_with(_BoomClient(exc))
+    with pytest.raises(type(exc)):
         await action(store)
+
+
+# The vault_id payload index is best-effort (issue #189 P2) but its catch still
+# re-raises programming errors — assert both halves: a transient failure is
+# swallowed (ensure completes) while a TypeError/ValueError surfaces.
+class _VaultIndexBoom(_FakeClient):
+    """collection_exists → True (skip create); create_payload_index raises."""
+
+    def __init__(self, exc: BaseException):
+        super().__init__()
+        self._exc = exc
+
+    async def collection_exists(self, name):
+        return True
+
+    async def create_payload_index(self, **kw):
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_vault_index_transient_is_non_fatal():
+    store = QdrantStore(url="http://x", api_key=None, collection="chunks", dense_dim=4)
+    store._client = _VaultIndexBoom(RuntimeError("index 5xx"))
+    await store.ensure_collection()  # best-effort: must NOT raise
+    assert store._ensured_collection is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [TypeError("bad"), ValueError("bad")])
+async def test_ensure_collection_vault_index_programming_error_propagates(exc):
+    store = QdrantStore(url="http://x", api_key=None, collection="chunks", dense_dim=4)
+    store._client = _VaultIndexBoom(exc)
+    with pytest.raises(type(exc)):
+        await store.ensure_collection()
