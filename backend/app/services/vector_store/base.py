@@ -85,6 +85,17 @@ def has_dense(dense: list[float] | None) -> TypeGuard[list[float]]:
     return dense is not None and len(dense) > 0
 
 
+def supports_vault_filter(store) -> bool:
+    """Single source of truth for "this driver implements the vault filter"
+    (issue #189 Phase 2). Reads the `vault_filter_supported` capability via
+    `getattr(..., False)` because drivers DUCK-TYPE the Protocol (they don't
+    inherit, so the Protocol default doesn't propagate) — an unknown/future
+    driver therefore reads False and is fail-safe to the source-id path. Used by
+    `search_service.vault_path_eligible` and the `vault_backfill` worker so the
+    capability-read semantics live in one place, not three `getattr` literals."""
+    return getattr(store, "vault_filter_supported", False)
+
+
 async def loop_upsert_batch(
     store: "VectorStore",
     chunks: list[ChunkUpsert],

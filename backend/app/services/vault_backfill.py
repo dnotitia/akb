@@ -32,6 +32,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner
 from app.services.vector_store import get_vector_store
+from app.services.vector_store.base import supports_vault_filter
 
 logger = logging.getLogger("akb.vault_backfill")
 
@@ -58,9 +59,13 @@ def _same_instance() -> bool:
 
 
 def _applicable() -> bool:
-    # True only where this worker can AUTO-backfill (same-instance pgvector). A
-    # separate vector instance is still gated for readiness below — it just isn't
-    # auto-filled here (the operator runs scripts/backfill_vault_id.py).
+    # True only where this worker can AUTO-backfill via the server-side
+    # `UPDATE … JOIN documents/vault_tables/vault_files` (see _process_once).
+    # That needs BOTH: the index shares the main DB (_same_instance) AND the
+    # driver's points are joinable to the main catalog by source_id — which
+    # `_is_pgvector` stands in for (it's the only such driver; qdrant/seahorse
+    # store points out-of-band). A capable driver that isn't applicable is still
+    # gated for readiness below, just not auto-filled (operator backfills).
     return _is_pgvector() and _same_instance()
 
 
@@ -76,7 +81,7 @@ async def _process_once() -> int:
     # A driver without the vault filter never takes the vault path
     # (`vault_path_eligible` is False for it), so readiness is moot. Latch ready
     # so the worker stops looping instead of spinning forever.
-    if not getattr(store, "vault_filter_supported", False):
+    if not supports_vault_filter(store):
         _ready = True
         return 0
 
@@ -163,7 +168,7 @@ async def pending_stats() -> dict:
     out: dict = {
         "ready": is_ready(),
         "applicable": _applicable(),
-        "vault_filter_supported": getattr(store, "vault_filter_supported", False),
+        "vault_filter_supported": supports_vault_filter(store),
     }
     fn = getattr(store, "vault_backfill_pending", None)
     if fn is not None:

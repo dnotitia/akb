@@ -22,7 +22,7 @@ from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import VectorHit, get_vector_store
-from app.services.vector_store.base import VectorStoreUnavailable
+from app.services.vector_store.base import VectorStoreUnavailable, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
@@ -100,7 +100,7 @@ def vault_path_eligible(
     When False, the existing source_ids path runs unchanged."""
     return (
         settings.vault_filter_enabled
-        and getattr(get_vector_store(), "vault_filter_supported", False)
+        and supports_vault_filter(get_vector_store())
         and not (collection or doc_type or tags or source_uris)
     )
 

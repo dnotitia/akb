@@ -240,13 +240,13 @@ class SeahorseDbStore:
         except Exception as e:  # noqa: BLE001
             raise VectorStoreUnavailable(f"Coral scan returned non-JSON: {e}") from e
         # Coral scan returns the matching rows under `data`/`rows` (shape varies
-        # by version). Check key PRESENCE, not truthiness — an empty list (`[]`,
-        # the 0-null-rows / ready case) must not fall through to the error branch.
-        if "data" in body:
-            rows = body["data"]
-        elif "rows" in body:
-            rows = body["rows"]
-        else:
+        # by version). Test with `is None`, not truthiness — an empty list (`[]`,
+        # the 0-null-rows / ready case) is not None, so it returns 0 rather than
+        # falling into the error branch; only a genuinely-missing key raises.
+        rows = body.get("data")
+        if rows is None:
+            rows = body.get("rows")
+        if rows is None:
             raise VectorStoreUnavailable(
                 f"Coral scan response missing data/rows: {str(body)[:200]}"
             )
