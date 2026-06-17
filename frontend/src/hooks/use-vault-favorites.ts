@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 
-// Per-browser favorited vault IDs. Mirrors the readJson/writeJson idiom from
-// use-graph-history.ts (quota/disabled-storage safe). Keyed by vault.id (the
-// stable PK on every /my/vaults row) — NEVER name, which is user-renamable and
-// would silently drop a favorite after a rename. The `is_pinned?` field on
-// VaultSummary is the documented seam for a future server-synced upgrade; this
-// hook ignores it for now.
+// Per-browser favorited vault IDs. Uses the same quota/disabled-storage-safe
+// localStorage idiom as use-graph-history.ts. Keyed by vault.id (the stable PK
+// on every /my/vaults row) — NEVER name, which is user-renamable and would
+// silently drop a favorite after a rename. (VaultSummary has an unused
+// `is_pinned?` field reserved for a future server-synced upgrade; nothing
+// populates it today and this hook ignores it.)
 
 const KEY = "akb-vault-favorites";
 const MAX = 100; // defensive cap so a runaway list can't bloat localStorage

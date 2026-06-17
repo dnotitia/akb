@@ -1,6 +1,7 @@
 import { Link, useLocation } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 import {
+  Box,
   ChevronsLeft,
   ChevronsRight,
   Filter,
@@ -12,7 +13,9 @@ import {
 import { useVaults, type VaultSummary } from "@/hooks/use-vaults";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { VaultChip } from "@/components/ui/vault-chip";
+import { TooltipText } from "@/components/ui/tooltip-text";
 import { roleIcon } from "@/lib/roles";
+import { SCOPES, type RoleScope, inScope, readScope, writeScope } from "@/lib/vault-scope";
 import {
   Tooltip,
   TooltipContent,
@@ -34,37 +37,6 @@ import { cn } from "@/lib/utils";
  * Favorites persist per-browser (localStorage, keyed by vault id); the role
  * scope persists too. Both modes read the same partition so they never disagree.
  */
-
-type RoleScope = "all" | "owned" | "editable";
-const SCOPE_KEY = "akb-vault-role-scope";
-const SCOPES: { key: RoleScope; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "owned", label: "Owned" },
-  { key: "editable", label: "Can edit" },
-];
-
-function readScope(): RoleScope {
-  try {
-    const v = localStorage.getItem(SCOPE_KEY);
-    return v === "owned" || v === "editable" ? v : "all";
-  } catch {
-    return "all";
-  }
-}
-function writeScope(s: RoleScope) {
-  try {
-    localStorage.setItem(SCOPE_KEY, s);
-  } catch {
-    // storage disabled — keep the in-memory scope, never throw.
-  }
-}
-
-// `editable` = anyone who can write (owner/admin/writer); `owned` = owner only.
-function inScope(role: string | undefined, scope: RoleScope): boolean {
-  if (scope === "all") return true;
-  if (scope === "owned") return role === "owner";
-  return role === "owner" || role === "admin" || role === "writer";
-}
 
 export function VaultRail({
   current,
@@ -244,10 +216,10 @@ export function VaultRail({
             active ? "text-surface-selected-foreground" : "text-foreground",
           )}
         >
-          <VaultChip name={v.name} size="sm" />
-          <span title={v.name} className="truncate">
+          <Box className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <TooltipText tip={v.name} side="right" className="truncate">
             {v.name}
-          </span>
+          </TooltipText>
         </Link>
         <button
           type="button"
@@ -365,7 +337,20 @@ export function VaultRail({
             {loading ? "Loading…" : "No vaults yet"}
           </p>
         ) : filtered.length === 0 ? (
-          <p className="px-3 py-2 coord">No matches</p>
+          <div className="px-3 py-2">
+            <p className="coord">
+              {scope !== "all" ? "No vaults match this role filter" : "No matches"}
+            </p>
+            {scope !== "all" && (
+              <button
+                type="button"
+                onClick={() => changeScope("all")}
+                className="mt-1 rounded-[var(--radius-sm)] text-xs text-link hover:text-link-hover hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Show all roles
+              </button>
+            )}
+          </div>
         ) : (
           <>
             {favs.length > 0 && (
