@@ -39,20 +39,13 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
-    existing = await conn.fetchval(
-        """
-        SELECT 1
-          FROM information_schema.columns
-         WHERE table_name = 'vault_tables'
-           AND column_name = 'unique_keys'
-        """
-    )
-    if existing:
-        logger.info(
-            "Migration 037: vault_tables.unique_keys already exists; skipping"
-        )
-        return
-
+    # No early-return skip-guard: the `ADD COLUMN IF NOT EXISTS` pair below is
+    # already fully idempotent and — unlike a guard keyed on a SINGLE column —
+    # it self-heals a partial state where only ONE of the two columns is
+    # present (e.g. `indexes` dropped/missing while `unique_keys` exists). A
+    # guard checking only `unique_keys` would short-circuit and never re-add
+    # `indexes`, after which every read of vault_tables (which SELECTs both)
+    # would 500.
     async with conn.transaction():
         await conn.execute(
             """

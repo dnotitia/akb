@@ -29,8 +29,8 @@ specifically; the proxy has its own log in
 - A duplicate `INSERT` via `akb_sql` now returns a stable `unique_violation` code
   plus `pg_sqlstate=23505` (was the generic `sql_error` catch-all).
 - Declared metadata is persisted on `vault_tables` (migration `037`, idempotent)
-  and exposed via `list_tables`, the `akb_vault_info` introspection surface, and
-  the create/alter return dicts. REST `CreateTableRequest` threads
+  and exposed via `list_tables`, `akb_vault_info`, the create/alter return dicts,
+  and the hybrid-search metadata chunk. REST `CreateTableRequest` threads
   `unique_keys`/`indexes` (previously silently dropped).
 - Tests: a DB-free unit suite (`test_table_constraints_unit.py`) plus a live e2e
   suite (`test_table_constraints_e2e.sh`, now in the CI shell-e2e gate) covering

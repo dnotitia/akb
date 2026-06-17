@@ -53,6 +53,15 @@ mcp() {  # $1=PAT $2=SID $3=tool $4=args-json → echoes result text (content[0]
     | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null
 }
 field() { python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d$1)" 2>/dev/null; }
+# Strict success assertion: response must be valid JSON object with NO error/code
+# envelope (catches malformed/empty/error responses that "no code = success"
+# greps would silently pass). #220 review hardening.
+assert_ok() { # $1=response $2=label
+  echo "$1" | python3 -c "import sys,json
+d=json.loads(sys.stdin.read())
+assert isinstance(d, dict) and 'code' not in d and 'error' not in d, d" >/dev/null 2>&1 \
+    && pass "$2" || fail "$2" "not a clean success: $1"
+}
 
 # ── 0. setup ─────────────────────────────────────────────────────
 PAT=$(register_pat "$USER")
@@ -80,7 +89,7 @@ echo "$R" | field "['tables'][0]['indexes'][0]['name']" | grep -q "idx" && pass 
 
 # ── AC#2: duplicate INSERT through akb_sql fails with a STABLE code
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO events (principal_id, session_id, seq) VALUES ('p1','s1',1)\"}")
-echo "$R" | field "['error']" | grep -qi "." && fail "AC#2 first insert" "unexpected error: $R" || pass "AC#2 first insert ok"
+assert_ok "$R" "AC#2 first insert ok"
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO events (principal_id, session_id, seq) VALUES ('p1','s1',1)\"}")
 CODE=$(echo "$R" | field "['code']")
 SQLSTATE=$(echo "$R" | field "['details']['pg_sqlstate']")
@@ -113,7 +122,7 @@ DUPS_UK=$(echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);t=[x fo
 [ "$DUPS_UK" = "0" ] && pass "AC#10 failed alter left registry unchanged (dups.unique_keys empty)" || fail "AC#10 registry unchanged" "dups unique_keys=$DUPS_UK"
 # constraint not physically created → a 3rd duplicate insert still succeeds (no UK enforced)
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO dups (email) VALUES ('a@x.dev')\"}")
-echo "$R" | field "['code']" | grep -qi "violation" && fail "AC#10 schema unchanged" "constraint leaked: $R" || pass "AC#10 failed alter left physical schema unchanged"
+assert_ok "$R" "AC#10 failed alter left physical schema unchanged (dup INSERT still succeeds)"
 
 # ── DML-only boundary: DDL via akb_sql is rejected
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"CREATE UNIQUE INDEX hack ON events (principal_id)\"}")
@@ -147,7 +156,7 @@ mcp "$PAT" "$SID" akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"nul\",\"col
 mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES (NULL)\"}" >/dev/null
 mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES (NULL)\"}" >/dev/null
 R=$(mcp "$PAT" "$SID" akb_alter_table "{\"uri\":\"akb://$VAULT/table/nul\",\"add_unique_keys\":[{\"name\":\"nul_email_key\",\"columns\":[\"email\"]}]}")
-echo "$R" | field "['code']" | grep -q . && fail "F3 nullable UK blocked" "$R" || pass "F3 multiple-NULL rows don't block ADD UNIQUE (NULLS DISTINCT)"
+assert_ok "$R" "F3 multiple-NULL rows don't block ADD UNIQUE (NULLS DISTINCT)"
 mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES ('a@b')\"}" >/dev/null
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES ('a@b')\"}")
 [ "$(echo "$R" | field "['code']")" = "unique_violation" ] && pass "F3 non-null duplicate still enforced" || fail "F3 enforcement" "$R"
@@ -188,7 +197,15 @@ ATBOTH="$(tbl_meta atom indexes)$(tbl_meta atom unique_keys)"
 # strengthen drop AC: after drop_unique_keys, a previously-rejected dup INSERT now succeeds (physical-removal proof)
 mcp "$PAT" "$SID" akb_alter_table "{\"uri\":\"akb://$VAULT/table/nul\",\"drop_unique_keys\":[\"nul_email_key\"]}" >/dev/null
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES ('a@b')\"}")
-echo "$R" | field "['code']" | grep -qi "violation" && fail "drop UK physical proof" "still enforced: $R" || pass "AC#3 dropped UK physically gone (dup INSERT now succeeds)"
+assert_ok "$R" "AC#3 dropped UK physically gone (dup INSERT now succeeds)"
+
+# ── cleanup: drop the ephemeral vault + ALL its tables ────────────
+# Required for idempotent re-runs: several tests use caller-supplied
+# constraint/index names, and a UNIQUE constraint's implicit index name is
+# SCHEMA-GLOBAL in PostgreSQL — leaving them behind makes a second run collide
+# (and matches the AKB convention that tests clean up after themselves).
+R=$(mcp "$PAT" "$SID" akb_delete_vault "{\"vault\":\"$VAULT\"}")
+assert_ok "$R" "cleanup: ephemeral vault + tables deleted"
 
 echo ""
 echo "── #215 e2e: $PASS passed, $FAIL failed ──"

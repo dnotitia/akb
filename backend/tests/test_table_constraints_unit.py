@@ -493,3 +493,37 @@ def test_rest_create_table_request_accepts_unique_keys_and_indexes():
     # Defaults stay None (omitted) so create_table's own defaults apply.
     req2 = CreateTableRequest(name="t", columns=[{"name": "a", "type": "text"}])
     assert req2.unique_keys is None and req2.indexes is None
+
+
+# ── AC#11 discovery surface: declared guarantees reach the search chunk ──
+
+
+def test_table_chunk_exposes_unique_keys_and_indexes():
+    """The hybrid-search metadata chunk must carry the declared unique_keys
+    + indexes (names AND columns) so an agent can DISCOVER a table's
+    guarantees by searching — AC#11's discovery surface (#220 review)."""
+    from app.services.index_service import build_table_chunk
+    c = build_table_chunk(
+        vault_name="v", name="customers", description="Customer records",
+        columns=[{"name": "email", "type": "text"}, {"name": "tenant", "type": "text"}],
+        unique_keys=[{"name": "uk_customers_email", "columns": ["email"]}],
+        indexes=[{"name": "idx_customers_tenant",
+                  "columns": [{"name": "tenant", "order": "desc"}]}],
+    )
+    assert "uk_customers_email" in c.content
+    assert "idx_customers_tenant" in c.content
+    assert "email" in c.content and "tenant" in c.content
+    # the index's non-default order is surfaced too
+    assert "desc" in c.content
+
+
+def test_table_chunk_backcompat_no_constraints():
+    """Omitting unique_keys/indexes must not crash and must not emit the
+    sections (older callers / tables without declared guarantees)."""
+    from app.services.index_service import build_table_chunk
+    c = build_table_chunk(
+        vault_name="v", name="t", description=None,
+        columns=[{"name": "a", "type": "text"}],
+    )
+    assert "UNIQUE_KEYS" not in c.content
+    assert "INDEXES" not in c.content

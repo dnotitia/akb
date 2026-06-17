@@ -281,13 +281,17 @@ async def index_table_metadata(
     name: str,
     description: str | None,
     columns: list[dict],
+    unique_keys: list[dict] | None = None,
+    indexes: list[dict] | None = None,
 ) -> None:
     """Build + upsert the metadata chunk for a table so hybrid search can
     surface it. Safe to call repeatedly — write_source_chunks replaces
-    all prior chunks for this table first."""
+    all prior chunks for this table first. Declared unique_keys/indexes
+    are forwarded so the table's guarantees are searchable (AC #11)."""
     chunk = build_table_chunk(
         vault_name=vault_name, name=name,
         description=description, columns=columns,
+        unique_keys=unique_keys, indexes=indexes,
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -462,6 +466,8 @@ async def create_table(
             name=name,
             description=description,
             columns=columns,
+            unique_keys=resolved_uks,
+            indexes=resolved_idxs,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
@@ -875,6 +881,8 @@ async def alter_table(
             name=table_name,
             description=table["description"] or "",
             columns=columns,
+            unique_keys=existing_uks,
+            indexes=existing_idxs,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("alter_table chunk reindex failed for %s: %s", table_name, e)
