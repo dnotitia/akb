@@ -30,6 +30,7 @@ from typing import Any
 import httpx
 
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
+from ._seahorse_common import vault_filter_sql as _vault_filter_sql
 
 logger = logging.getLogger("akb.vector_store.seahorse")
 
@@ -52,6 +53,7 @@ COL_ID = "id"                       # PK == AKB chunk UUID
 COL_EXTERNAL_CHUNK_ID = "external_chunk_id"
 COL_SOURCE_TYPE = "source_type"
 COL_SOURCE_ID = "source_id"
+COL_VAULT_ID = "vault_id"           # per-vault ACL filter key (issue #189 P2)
 COL_SECTION_PATH = "section_path"
 COL_CONTENT = "content"
 COL_CHUNK_INDEX = "chunk_index"
@@ -86,6 +88,14 @@ def _sparse_to_str(indices: list[int], values: list[float]) -> str:
 
 class SeahorseCloudStore:
     """VectorStore impl over Seahorse Cloud's TABLE_V2 + BFF API."""
+
+    # Stores vault_id and filters on it in hybrid_search (issue #189 Phase 2).
+    # Like the gRPC driver, exposes no vault_backfill_pending(): the managed BFF
+    # host API has no documented count/scan primitive here, so the readiness
+    # worker keeps this driver on the safe source-id path until a count is wired
+    # (recreate+reindex, then it auto-activates). Storage + filtering are correct
+    # meanwhile.
+    vault_filter_supported = True
 
     def __init__(
         self,
@@ -207,6 +217,9 @@ class SeahorseCloudStore:
                 {"name": COL_EXTERNAL_CHUNK_ID, "nullable": False, "type": "STRING"},
                 {"name": COL_SOURCE_TYPE, "nullable": False, "type": "STRING"},
                 {"name": COL_SOURCE_ID, "nullable": False, "type": "STRING"},
+                # vault_id (issue #189 Phase 2). nullable=True so a recreate-and-
+                # reindex upgrade lands the column before rows carry their value.
+                {"name": COL_VAULT_ID, "nullable": True, "type": "STRING"},
                 {"name": COL_SECTION_PATH, "nullable": True, "type": "STRING"},
                 {"name": COL_CONTENT, "nullable": False, "type": "STRING"},
                 {"name": COL_CHUNK_INDEX, "nullable": False, "type": "INT64"},
@@ -295,6 +308,7 @@ class SeahorseCloudStore:
             COL_EXTERNAL_CHUNK_ID: str(chunk_id),
             COL_SOURCE_TYPE: source_type,
             COL_SOURCE_ID: str(source_id),
+            COL_VAULT_ID: str(vault_id),
             COL_SECTION_PATH: section_path or "",
             COL_CONTENT: content,
             COL_CHUNK_INDEX: int(chunk_index),
@@ -417,9 +431,13 @@ class SeahorseCloudStore:
             }
         if has_dense and has_sparse:
             body["fusion"] = {"type": "rrf", "parameters": {"k": RRF_K}}
-        if source_ids:
-            quoted = ",".join(f"'{_sql_quote(str(s))}'" for s in source_ids)
-            body["filter"] = f"{COL_SOURCE_ID} IN ({quoted})"
+        # ACL pre-filter (issue #189 Phase 2): exactly one of vault_ids /
+        # source_ids; vault_filter_sql asserts that + UUID-validates each id.
+        acl = _vault_filter_sql(
+            vault_ids, source_ids, vault_col=COL_VAULT_ID, source_col=COL_SOURCE_ID,
+        )
+        if acl is not None:
+            body["filter"] = acl
 
         try:
             client = await self._http()

@@ -80,7 +80,7 @@ logger = logging.getLogger("akb.vector_store.seahorse_db")
 from ._seahorse_common import (
     chunk_id_to_label as _chunk_id_to_label,
     encode_sparse_string as _encode_sparse_string,
-    validate_uuid_for_sql as _validate_uuid_for_sql,
+    vault_filter_sql as _vault_filter_sql,
 )
 
 
@@ -92,6 +92,10 @@ class SeahorseDbStore:
     ``ensure_collection`` does the catalog setup on first use (and
     is called from lifespan startup so the cost lands at boot, not
     on the first search request)."""
+
+    # Stores vault_id, filters on it in hybrid_search, exposes
+    # vault_backfill_pending() — vault filter capable (issue #189 Phase 2).
+    vault_filter_supported = True
 
     def __init__(
         self,
@@ -203,6 +207,51 @@ class SeahorseDbStore:
         except Exception:  # noqa: BLE001
             return False
 
+    async def vault_backfill_pending(self) -> int:
+        """Rows whose `vault_id` is NULL (issue #189 Phase 2) — the backfill-
+        readiness signal the worker gates on. Coral has no in-place UPDATE, so
+        the supported seahorse upgrade is recreate + reindex: a fresh table has
+        the column and every re-upserted row carries vault_id (this returns 0 and
+        the vault path activates); a pre-upgrade table lacks the column entirely
+        and this scan errors (kept gated → operator must recreate).
+
+        FAIL-CLOSED: returns 0 ONLY on a clear empty scan; ANY error or
+        unexpected shape raises VectorStoreUnavailable so the worker stays gated
+        and search keeps the safe source-id path — never activating the vault
+        path on an uncertain count. NOTE: the `/data/scan` request/response shape
+        is modeled on Coral's REST conventions but is NOT exercised by the e2e
+        suite — confirm against a live Coral before trusting the gate to flip."""
+        http = await self._http()
+        try:
+            resp = await http.post(
+                f"/v2/tables/{self._table}/data/scan",
+                json={"filter": "vault_id IS NULL", "limit": 1},
+            )
+        except httpx.HTTPError as e:
+            raise VectorStoreUnavailable(
+                f"Coral POST /v2/tables/{self._table}/data/scan: {e}"
+            ) from e
+        if resp.status_code != 200:
+            raise VectorStoreUnavailable(
+                f"Coral scan for null vault_id → {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            body = resp.json()
+        except Exception as e:  # noqa: BLE001
+            raise VectorStoreUnavailable(f"Coral scan returned non-JSON: {e}") from e
+        # Coral scan returns the matching rows under `data`/`rows` (shape varies
+        # by version). Test with `is None`, not truthiness — an empty list (`[]`,
+        # the 0-null-rows / ready case) is not None, so it returns 0 rather than
+        # falling into the error branch; only a genuinely-missing key raises.
+        rows = body.get("data")
+        if rows is None:
+            rows = body.get("rows")
+        if rows is None:
+            raise VectorStoreUnavailable(
+                f"Coral scan response missing data/rows: {str(body)[:200]}"
+            )
+        return len(rows)
+
     async def upsert_one(
         self,
         *,
@@ -242,6 +291,7 @@ class SeahorseDbStore:
             "chunk_index": chunk_index,
             "source_type": source_type,
             "source_id": source_id,
+            "vault_id": vault_id,
             "sparse": _encode_sparse_string(sparse_indices, sparse_values),
         }
         if has_dense(dense):
@@ -299,6 +349,7 @@ class SeahorseDbStore:
         sparse_values: list[float],
         source_type: str,
         source_id: str,
+        vault_id: str,
     ) -> dict[str, Any]:
         """Build the canonical Coral record dict for a single chunk.
         Shared by ``upsert_one`` and ``upsert_batch`` so the two paths
@@ -317,6 +368,7 @@ class SeahorseDbStore:
             "chunk_index": chunk_index,
             "source_type": source_type,
             "source_id": source_id,
+            "vault_id": vault_id,
             "sparse": _encode_sparse_string(sparse_indices, sparse_values),
             "embedding": dense,
         }
@@ -354,6 +406,7 @@ class SeahorseDbStore:
                 sparse_values=c.sparse_values,
                 source_type=c.source_type,
                 source_id=c.source_id,
+                vault_id=c.vault_id,
             )
             for c in chunks
         ]
@@ -529,12 +582,12 @@ class SeahorseDbStore:
         }
         if sparse_metadata is not None:
             payload["sparse"]["metadata"] = sparse_metadata
-        if source_ids:
-            # SQL WHERE clause — Coral parses this directly. Each
-            # `source_id` is a UUID, so the IN list is safe to
-            # build by interpolation. Defensive check + quote.
-            quoted = ", ".join(f"'{_validate_uuid_for_sql(s)}'" for s in source_ids)
-            payload["filter"] = f"source_id IN ({quoted})"
+        # ACL pre-filter as a Coral SQL WHERE clause (issue #189 Phase 2): the
+        # caller sends EXACTLY ONE of vault_ids (per-vault) / source_ids (per-
+        # resource). vault_filter_sql asserts that and UUID-validates each id.
+        acl = _vault_filter_sql(vault_ids, source_ids)
+        if acl is not None:
+            payload["filter"] = acl
 
         http = await self._http()
         try:
@@ -630,6 +683,10 @@ class SeahorseDbStore:
                 {"name": "chunk_index", "type": "INT64", "nullable": True},
                 {"name": "source_type", "type": "STRING", "nullable": False},
                 {"name": "source_id", "type": "STRING", "nullable": False},
+                # vault_id (issue #189 Phase 2): the per-vault ACL filter key.
+                # nullable=True so a recreate-and-reindex upgrade can land the
+                # column before every row is re-upserted with its value.
+                {"name": "vault_id", "type": "STRING", "nullable": True},
             ],
             "segmentation": {
                 "strategy": "hash",

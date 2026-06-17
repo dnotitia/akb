@@ -123,20 +123,27 @@ def test_search_response_degraded_defaults_false():
 
 
 def test_vault_path_eligible(monkeypatch):
-    """The VAULT path (issue #189 Phase 2) is taken ONLY with the flag on, the
-    pgvector driver, and NO doc-level filter; otherwise the source_ids path
-    (flag-off parity = byte-identical to before)."""
+    """The VAULT path (issue #189 Phase 2) is taken ONLY with the flag on, a
+    vault-filter-CAPABLE driver (vault_filter_supported True), and NO doc-level
+    filter; otherwise the source_ids path (flag-off parity = byte-identical)."""
     from app.config import settings
+    from app.services import search_service
+
+    class _Capable:
+        vault_filter_supported = True
+
+    class _Plain:
+        vault_filter_supported = False
 
     monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "vector_store_driver", "pgvector", raising=False)
+    monkeypatch.setattr(search_service, "get_vector_store", lambda: _Capable())
 
     def call(**kw):
         base = {"collection": None, "doc_type": None, "tags": None, "source_uris": None}
         base.update(kw)
         return vault_path_eligible(**base)
 
-    assert call() is True  # flag + pgvector + no filters → vault path
+    assert call() is True  # flag + capable driver + no filters → vault path
     assert call(collection="specs") is False  # any doc-level filter → source path
     assert call(doc_type="note") is False
     assert call(tags=["x"]) is False
@@ -146,9 +153,9 @@ def test_vault_path_eligible(monkeypatch):
     monkeypatch.setattr(settings, "vault_filter_enabled", False, raising=False)
     assert call() is False
 
-    # other driver → never (only pgvector stores vault_id)
+    # non-capable driver → never (fail-safe: unknown driver → source-id path)
     monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "vector_store_driver", "qdrant", raising=False)
+    monkeypatch.setattr(search_service, "get_vector_store", lambda: _Plain())
     assert call() is False
 
 

@@ -21,17 +21,24 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import grpc
-import pyarrow as pa
 import pytest
 
+# Skip cleanly (not a collection ERROR) where the gRPC stack is unavailable:
+# grpc/pyarrow missing, OR the generated protobuf stubs reject the installed
+# protobuf runtime (the local `runtime_version` ImportError — see
+# [[feedback_local_skip_ci_driver_tests]]). CI installs the pinned deps and runs
+# this in full.
+grpc = pytest.importorskip("grpc")
+pa = pytest.importorskip("pyarrow")
 
-# Stub-loading side-effect: importing the driver inserts the proto root
-# onto sys.path inside a try/finally. We exercise that side-effect once
-# at module import — every test below relies on the stubs being
-# importable, so a regression there would surface as a collection
-# error and we'd hear about it immediately.
-from app.services.vector_store import seahorse_db_grpc as sdgrpc
+# Stub-loading side-effect: importing the driver inserts the proto root onto
+# sys.path inside a try/finally. Guard it so a protobuf-version mismatch skips
+# the module instead of erroring at collection.
+try:
+    from app.services.vector_store import seahorse_db_grpc as sdgrpc
+except ImportError as _e:  # pragma: no cover - env-dependent
+    pytest.skip(f"coral gRPC stubs unimportable: {_e}", allow_module_level=True)
+
 from app.services.vector_store.base import VectorHit
 
 
@@ -110,6 +117,12 @@ def test_endpoint_url_parsing(url: str, expected: str) -> None:
 # ── CreateTable schema parity with REST driver ─────────────────
 
 
+def test_vault_filter_capability_flag() -> None:
+    # Stores vault_id + filters on it (issue #189 Phase 2); no count primitive
+    # here (no SqlService stub), so the readiness worker keeps it gated.
+    assert sdgrpc.SeahorseDbGrpcStore.vault_filter_supported is True
+
+
 def test_create_table_request_shape() -> None:
     s = sdgrpc.SeahorseDbGrpcStore(
         coordinator_url="localhost:53286",
@@ -127,7 +140,7 @@ def test_create_table_request_shape() -> None:
     assert set(cols) == {
         "id", "chunk_id", "embedding", "sparse",
         "content", "section_path", "chunk_index",
-        "source_type", "source_id",
+        "source_type", "source_id", "vault_id",
     }
     # Nullability matches the REST driver's payload.
     assert cols["id"].nullable is False
@@ -139,6 +152,8 @@ def test_create_table_request_shape() -> None:
     assert cols["chunk_index"].nullable is True
     assert cols["source_type"].nullable is False
     assert cols["source_id"].nullable is False
+    # vault_id (issue #189 Phase 2): nullable so recreate+reindex can land it.
+    assert cols["vault_id"].nullable is True
     # Dense vector dim flows through from constructor.
     assert cols["embedding"].column_type.dense_vector.dim == 1024
 
@@ -427,6 +442,8 @@ async def test_upsert_one_jsonl_record_shape(
     assert record["content"] == "hello world"
     assert record["section_path"] == "intro"
     assert record["chunk_index"] == 3
+    # vault_id (issue #189 Phase 2) is stored on every row for the vault filter.
+    assert record["vault_id"] == "99999999-8888-7777-6666-555555555555"
     assert record["embedding"] == [0.1, 0.2, 0.3, 0.4]
     # Sparse is the "term_id:weight ..." compact form.
     assert record["sparse"] == "5:1 7:0.5 9:0.25"
@@ -639,6 +656,73 @@ async def test_hybrid_search_source_ids_filter(
         "'aaaaaaaa-bbbb-cccc-dddd-000000000010')"
     )
     assert req.filter == expected_filter
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_vault_ids_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    store: sdgrpc.SeahorseDbGrpcStore,
+    mock_channel: MagicMock,
+) -> None:
+    """The vault path (issue #189 Phase 2): vault_ids must filter on the
+    `vault_id` column, NOT source_id — a column mix-up here is a cross-vault
+    leak. Symmetric to test_hybrid_search_source_ids_filter."""
+    async def fake_stream(_request: query_pb2.HybridSearchRequest,
+                          timeout: float) -> object:
+        fake_stream.captured = _request  # type: ignore[attr-defined]
+        yield query_pb2.ResultStreamEvent(
+            header=query_pb2.ResultStreamHeader(num_result_sets=1),
+        )
+        yield query_pb2.ResultStreamEvent(footer=query_pb2.ResultStreamFooter())
+
+    stub = MagicMock()
+    stub.HybridSearch = fake_stream
+    monkeypatch.setattr(sdgrpc.query_pb2_grpc, "QueryServiceStub",
+                        lambda _ch: stub)
+    monkeypatch.setattr(
+        "app.services.sparse_encoder.load_stats",
+        AsyncMock(return_value={"total_docs": 10, "avgdl": 5.0, "k1": 1.5, "b": 0.75}),
+    )
+    monkeypatch.setattr(
+        "app.services.sparse_encoder.load_df_for_terms",
+        AsyncMock(return_value={5: 1}),
+    )
+
+    await store.hybrid_search(
+        query_text="x",
+        query_dense=[0.0, 0.0, 0.0, 0.1],
+        query_sparse_indices=[5], query_sparse_values=[0.1],
+        source_ids=None,
+        vault_ids=["11111111-2222-3333-4444-555555555555"],
+        limit=2, prefetch_per_leg=8,
+    )
+    req = fake_stream.captured  # type: ignore[attr-defined]
+    assert req.filter == "vault_id IN ('11111111-2222-3333-4444-555555555555')"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_rejects_both_vault_and_source(
+    monkeypatch: pytest.MonkeyPatch,
+    store: sdgrpc.SeahorseDbGrpcStore,
+    mock_channel: MagicMock,
+) -> None:
+    """Both filters at once is a caller bug → AssertionError (exactly-one)."""
+    monkeypatch.setattr(
+        "app.services.sparse_encoder.load_stats",
+        AsyncMock(return_value={"total_docs": 10, "avgdl": 5.0, "k1": 1.5, "b": 0.75}),
+    )
+    monkeypatch.setattr(
+        "app.services.sparse_encoder.load_df_for_terms",
+        AsyncMock(return_value={5: 1}),
+    )
+    with pytest.raises(AssertionError):
+        await store.hybrid_search(
+            query_text="x", query_dense=[0.0, 0.0, 0.0, 0.1],
+            query_sparse_indices=[5], query_sparse_values=[0.1],
+            source_ids=["11111111-2222-3333-4444-555555555555"],
+            vault_ids=["22222222-3333-4444-5555-666666666666"],
+            limit=2, prefetch_per_leg=8,
+        )
 
 
 @pytest.mark.asyncio

@@ -44,13 +44,17 @@ def test_applicable_only_for_pgvector_same_instance(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_once_non_pgvector_latches_ready_without_db(monkeypatch):
-    """Other drivers have no vault_id column and the vault path is never eligible
-    for them, so readiness is moot — latch ready (stop looping), never touch DB."""
-    monkeypatch.setattr(vault_backfill, "_is_pgvector", lambda: False)
+async def test_process_once_non_capable_latches_ready_without_db(monkeypatch):
+    """A driver without the vault filter (vault_filter_supported absent/False)
+    never takes the vault path, so readiness is moot — latch ready (stop looping),
+    never touch DB."""
+    class _Plain:  # no vault_filter_supported attribute
+        pass
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Plain())
 
     async def _boom():
-        raise AssertionError("get_pool called for a non-pgvector driver")
+        raise AssertionError("get_pool called for a non-capable driver")
 
     monkeypatch.setattr(vault_backfill, "get_pool", _boom)
     assert await vault_backfill._process_once() == 0
@@ -58,35 +62,53 @@ async def test_process_once_non_pgvector_latches_ready_without_db(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_once_separate_instance_gates_on_driver_count(monkeypatch):
-    """Separate pgvector instance: never auto-backfills (no server-side join) and
-    never touches the main pool — readiness follows the driver's NULL count, so
-    the manual-script escape hatch still activates the vault path (and only once
-    the backfill is actually done)."""
+async def test_process_once_capable_non_autofill_gates_on_count(monkeypatch):
+    """A capable driver this worker can't auto-fill (qdrant, seahorse, or a
+    separate pgvector instance): never touches the main pool — readiness follows
+    the driver's NULL count, so the manual-backfill escape hatch still activates
+    the vault path (and only once the backfill is actually done)."""
+    # Not same-instance pgvector → _applicable() is False → the count-gate branch.
     monkeypatch.setattr(vault_backfill, "_is_pgvector", lambda: True)
     monkeypatch.setattr(vault_backfill, "_same_instance", lambda: False)
 
     async def _boom():
-        raise AssertionError("get_pool (main DB) called for a separate instance")
+        raise AssertionError("get_pool (auto-join) called for a gate-only driver")
 
     monkeypatch.setattr(vault_backfill, "get_pool", _boom)
 
     pending = {"n": 5}
 
     class _Store:
+        vault_filter_supported = True
+
         async def vault_backfill_pending(self):
             return pending["n"]
 
     monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Store())
 
-    # Backfill not yet run on the separate instance → stays gated.
+    # Backfill not yet run → stays gated.
     assert await vault_backfill._process_once() == 0
     assert vault_backfill.is_ready() is False
 
-    # Operator ran the manual script → count hits 0 → readiness latches.
+    # Operator ran the manual backfill → count hits 0 → readiness latches.
     pending["n"] = 0
     assert await vault_backfill._process_once() == 0
     assert vault_backfill.is_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_process_once_capable_without_counter_stays_gated(monkeypatch):
+    """A capable driver (e.g. seahorse gRPC/cloud) that exposes no
+    vault_backfill_pending() can't prove its existing points carry vault_id, so
+    the worker keeps it gated forever — never activate the vault path blind."""
+    monkeypatch.setattr(vault_backfill, "_is_pgvector", lambda: False)
+
+    class _Store:
+        vault_filter_supported = True  # capable, but NO vault_backfill_pending
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Store())
+    assert await vault_backfill._process_once() == 0
+    assert vault_backfill.is_ready() is False
 
 
 @pytest.mark.asyncio
@@ -127,4 +149,4 @@ async def test_pending_stats_omits_count_for_drivers_without_counter(monkeypatch
     monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Store())
     stats = await vault_backfill.pending_stats()
     assert "null_remaining" not in stats
-    assert set(stats) == {"ready", "applicable"}
+    assert set(stats) == {"ready", "applicable", "vault_filter_supported"}

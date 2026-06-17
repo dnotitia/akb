@@ -97,7 +97,7 @@ finally:
 from ._seahorse_common import (
     chunk_id_to_label as _chunk_id_to_label,
     encode_sparse_string as _encode_sparse_string,
-    validate_uuid_for_sql as _validate_uuid_for_sql,
+    vault_filter_sql as _vault_filter_sql,
 )
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
@@ -159,6 +159,14 @@ class SeahorseDbGrpcStore:
     GetTable + CreateTable round-trip on first use; subsequent calls
     cheap-cache.
     """
+
+    # Stores vault_id and filters on it in hybrid_search (issue #189 Phase 2).
+    # Capable, but does NOT expose vault_backfill_pending(): the generated gRPC
+    # stubs here have no SqlService (no count primitive) and Coral has no scan
+    # RPC, so the readiness worker keeps this driver gated on the safe source-id
+    # path until a count is wired (recreate+reindex + a SQL/scan count, then it
+    # auto-activates). vault_id storage + filtering are still correct meanwhile.
+    vault_filter_supported = True
 
     def __init__(
         self,
@@ -302,6 +310,7 @@ class SeahorseDbGrpcStore:
             "chunk_index": chunk_index,
             "source_type": source_type,
             "source_id": source_id,
+            "vault_id": vault_id,
         }
         jsonl = (
             json.dumps(record, separators=(",", ":")) + "\n"
@@ -437,11 +446,11 @@ class SeahorseDbGrpcStore:
                 "chunk_id, source_type, source_id, section_path, content"
             ),
         )
-        if source_ids:
-            quoted = ", ".join(
-                f"'{_validate_uuid_for_sql(s)}'" for s in source_ids
-            )
-            request.filter = f"source_id IN ({quoted})"
+        # ACL pre-filter (issue #189 Phase 2): exactly one of vault_ids /
+        # source_ids; vault_filter_sql asserts that + UUID-validates each id.
+        acl = _vault_filter_sql(vault_ids, source_ids)
+        if acl is not None:
+            request.filter = acl
 
         ch = await self._ch()
         stub = query_pb2_grpc.QueryServiceStub(ch)
@@ -481,6 +490,8 @@ class SeahorseDbGrpcStore:
                 _column_scalar("chunk_index", "INT64", nullable=True),
                 _column_scalar("source_type", "STRING", nullable=False),
                 _column_scalar("source_id", "STRING", nullable=False),
+                # vault_id (issue #189 Phase 2): per-vault ACL filter key.
+                _column_scalar("vault_id", "STRING", nullable=True),
             ],
             segmentation=catalog_pb2.ExternalSegmentation(
                 strategy=catalog_pb2.SegmentationStrategy.Value(

@@ -85,6 +85,17 @@ def has_dense(dense: list[float] | None) -> TypeGuard[list[float]]:
     return dense is not None and len(dense) > 0
 
 
+def supports_vault_filter(store) -> bool:
+    """Single source of truth for "this driver implements the vault filter"
+    (issue #189 Phase 2). Reads the `vault_filter_supported` capability via
+    `getattr(..., False)` because drivers DUCK-TYPE the Protocol (they don't
+    inherit, so the Protocol default doesn't propagate) — an unknown/future
+    driver therefore reads False and is fail-safe to the source-id path. Used by
+    `search_service.vault_path_eligible` and the `vault_backfill` worker so the
+    capability-read semantics live in one place, not three `getattr` literals."""
+    return getattr(store, "vault_filter_supported", False)
+
+
 async def loop_upsert_batch(
     store: "VectorStore",
     chunks: list[ChunkUpsert],
@@ -125,6 +136,19 @@ class VectorStore(Protocol):
     view, and recovery is via re-upsert on the next worker cycle
     (idempotent by chunk_id).
     """
+
+    # Capability flag (issue #189 Phase 2). True on drivers that (1) write
+    # `vault_id` on every point in upsert_one and (2) filter on it in
+    # hybrid_search under the exactly-one(vault_ids, source_ids) contract. A
+    # capable driver SHOULD also (3) expose `vault_backfill_pending()` so the
+    # readiness worker can auto-activate it; one that doesn't (seahorse gRPC /
+    # Cloud — no count primitive yet) stays permanently gated on the safe
+    # source-id path (correct, just not the O(vaults) speedup) until a count is
+    # wired. Drivers DUCK-TYPE this Protocol (they don't inherit), so this
+    # default does NOT propagate; every capable driver sets it on its own class,
+    # and every reader uses `getattr(store, "vault_filter_supported", False)` so
+    # an unknown driver is fail-safe (source-id path, never a wrong vault path).
+    vault_filter_supported: bool = False
 
     async def ensure_collection(self, *, conn=None) -> None:
         """Idempotent: create the underlying storage (Qdrant collection,
@@ -264,10 +288,12 @@ class VectorStore(Protocol):
           their own filter primitive.
         - `vault_ids` is the per-VAULT ACL filter (issue #189 Phase 2): a small
           set of accessible vault ids the caller passes INSTEAD of enumerating
-          every accessible source_id. Drivers that store `vault_id` on each
-          point (pgvector) filter on it natively; others ignore it for now and
-          keep filtering by `source_ids`. The caller sends one or the other,
-          never both at once.
+          every accessible source_id. Drivers with `vault_filter_supported=True`
+          store `vault_id` on each point and filter on it natively (pgvector,
+          qdrant, seahorse); drivers without it never receive `vault_ids` (the
+          caller's `vault_path_eligible` gate is False for them) and keep
+          filtering by `source_ids`. The caller sends EXACTLY ONE of the two,
+          never both — capable drivers assert this.
         - `prefetch_per_leg` caps each leg's candidate pool before
           fusion. Caller decides — typically `max(limit * 3, 50)`.
         """

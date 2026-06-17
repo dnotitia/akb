@@ -96,6 +96,10 @@ class PgvectorStore:
     pending (recoverable, but visible as a counter mismatch).
     """
 
+    # Stores vault_id, filters on it in hybrid_search, exposes
+    # vault_backfill_pending() — the reference vault-filter driver (issue #189).
+    vault_filter_supported = True
+
     def __init__(
         self,
         *,
