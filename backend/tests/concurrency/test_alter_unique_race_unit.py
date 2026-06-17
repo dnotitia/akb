@@ -44,13 +44,21 @@ async def _can_connect(dsn: str) -> bool:
 async def seeded():
     if not await _can_connect(_DSN):
         pytest.skip(f"Postgres not reachable at {_DSN}")
+    from pathlib import Path
     from app.repositories.vault_repo import VaultRepository
     pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=6)
+    # Self-bootstrap the schema (idempotent) so this runs against a bare CI
+    # Postgres too — mirrors tests/concurrency/test_invariants_unit.py.
+    init_sql = (
+        Path(__file__).resolve().parents[2] / "app" / "db" / "init.sql"
+    ).read_text()
+    async with pool.acquire() as conn:
+        await conn.execute(init_sql)
     vname = f"race_{uuid.uuid4().hex[:8]}"
     tname = "people"
     pg_name = table_data_repo.pg_table_name(vname, tname)
     cols = [{"name": "email", "type": "text"}]
-    # Real vaults/vault_tables schema (from init.sql, already present in the DB).
+    # Real vaults/vault_tables schema (from init.sql).
     vid = await VaultRepository(pool).create(
         name=vname, description="ephemeral race-test vault",
         git_path=f"/tmp/{vname}.git", owner_id=None,
