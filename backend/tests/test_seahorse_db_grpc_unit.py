@@ -110,6 +110,12 @@ def test_endpoint_url_parsing(url: str, expected: str) -> None:
 # ── CreateTable schema parity with REST driver ─────────────────
 
 
+def test_vault_filter_capability_flag() -> None:
+    # Stores vault_id + filters on it (issue #189 Phase 2); no count primitive
+    # here (no SqlService stub), so the readiness worker keeps it gated.
+    assert sdgrpc.SeahorseDbGrpcStore.vault_filter_supported is True
+
+
 def test_create_table_request_shape() -> None:
     s = sdgrpc.SeahorseDbGrpcStore(
         coordinator_url="localhost:53286",
@@ -127,7 +133,7 @@ def test_create_table_request_shape() -> None:
     assert set(cols) == {
         "id", "chunk_id", "embedding", "sparse",
         "content", "section_path", "chunk_index",
-        "source_type", "source_id",
+        "source_type", "source_id", "vault_id",
     }
     # Nullability matches the REST driver's payload.
     assert cols["id"].nullable is False
@@ -139,6 +145,8 @@ def test_create_table_request_shape() -> None:
     assert cols["chunk_index"].nullable is True
     assert cols["source_type"].nullable is False
     assert cols["source_id"].nullable is False
+    # vault_id (issue #189 Phase 2): nullable so recreate+reindex can land it.
+    assert cols["vault_id"].nullable is True
     # Dense vector dim flows through from constructor.
     assert cols["embedding"].column_type.dense_vector.dim == 1024
 
@@ -427,6 +435,8 @@ async def test_upsert_one_jsonl_record_shape(
     assert record["content"] == "hello world"
     assert record["section_path"] == "intro"
     assert record["chunk_index"] == 3
+    # vault_id (issue #189 Phase 2) is stored on every row for the vault filter.
+    assert record["vault_id"] == "99999999-8888-7777-6666-555555555555"
     assert record["embedding"] == [0.1, 0.2, 0.3, 0.4]
     # Sparse is the "term_id:weight ..." compact form.
     assert record["sparse"] == "5:1 7:0.5 9:0.25"

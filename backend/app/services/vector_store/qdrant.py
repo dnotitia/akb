@@ -33,10 +33,15 @@ PAYLOAD_SECTION_PATH = "section_path"
 PAYLOAD_CONTENT = "content"
 PAYLOAD_SOURCE_TYPE = "source_type"
 PAYLOAD_SOURCE_ID = "source_id"
+PAYLOAD_VAULT_ID = "vault_id"
 
 
 class QdrantStore:
     """VectorStore impl over Qdrant. Uses native RRF fusion."""
+
+    # Stores vault_id on each point's payload, filters on it in hybrid_search,
+    # exposes vault_backfill_pending() — vault filter capable (issue #189 P2).
+    vault_filter_supported = True
 
     def __init__(
         self,
@@ -102,6 +107,18 @@ class QdrantStore:
                 field_name=PAYLOAD_SOURCE_ID,
                 field_schema=qm.PayloadSchemaType.KEYWORD,
             )
+        # vault_id is the per-vault ACL filter key (issue #189 Phase 2). Indexed
+        # for the same reason as source_id. Created OUTSIDE the `if not exists`
+        # block (idempotent server-side) so an ALREADY-deployed collection
+        # — created before vault_id existed — also gets the index on first ensure.
+        try:
+            await client.create_payload_index(
+                collection_name=self._collection,
+                field_name=PAYLOAD_VAULT_ID,
+                field_schema=qm.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vault_id payload index ensure failed (non-fatal): %s", e)
         self._ensured_collection = True
 
     async def health(self) -> bool:
@@ -111,6 +128,33 @@ class QdrantStore:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    async def vault_backfill_pending(self) -> int:
+        """Points whose `vault_id` payload is missing/null (issue #189 Phase 2) —
+        the backfill-readiness signal the worker gates on (qdrant has no server-
+        side join to the main DB, so the operator backfills by reindexing). The
+        qdrant analogue of pgvector's `WHERE vault_id IS NULL`.
+
+        Uses `IsEmptyCondition`, NOT `IsNullCondition`: verified against qdrant
+        1.18.2, IsNull matches only an EXPLICIT null and MISSES a point that
+        never had the key — which is exactly the pre-upgrade point set we must
+        count. IsEmpty matches missing OR null. (A wrong choice here under-counts
+        → the gate flips ready early → users miss their un-backfilled docs.)
+        `exact=True` is mandatory: the default approximate count could read 0
+        prematurely for the same reason."""
+        await self.ensure_collection()
+        client = self._get_client()
+        try:
+            res = await client.count(
+                collection_name=self._collection,
+                count_filter=qm.Filter(
+                    must=[qm.IsEmptyCondition(is_empty=qm.PayloadField(key=PAYLOAD_VAULT_ID))],
+                ),
+                exact=True,
+            )
+            return int(res.count)
+        except Exception as e:  # noqa: BLE001
+            raise VectorStoreUnavailable(f"vault_backfill_pending failed: {e}") from e
 
     # ── Upsert ───────────────────────────────────────────────────
 
@@ -154,6 +198,7 @@ class QdrantStore:
                 PAYLOAD_CONTENT: content,
                 PAYLOAD_SOURCE_TYPE: source_type,
                 PAYLOAD_SOURCE_ID: str(source_id),
+                PAYLOAD_VAULT_ID: str(vault_id),
             },
         )
         await client.upsert(collection_name=self._collection, points=[point])
@@ -198,12 +243,17 @@ class QdrantStore:
         await self.ensure_collection()
         client = self._get_client()
 
+        # Exactly one ACL filter (issue #189 Phase 2): the caller sends vault_ids
+        # (vault path) OR source_ids (resource path), never both. Mirrors pgvector.
+        assert not (vault_ids and source_ids), \
+            "hybrid_search got both vault_ids and source_ids; expected exactly one"
+
         has_dense = query_dense is not None and len(query_dense) > 0
         has_sparse = len(query_sparse_indices) > 0
         if not has_dense and not has_sparse:
             return []
 
-        flt = _source_filter(source_ids)
+        flt = _acl_filter(vault_ids=vault_ids, source_ids=source_ids)
 
         if has_dense and has_sparse:
             prefetch = [
@@ -260,16 +310,19 @@ class QdrantStore:
         return [_to_hit(p) for p in result.points]
 
 
-def _source_filter(source_ids: list[str] | None):
-    if not source_ids:
+def _acl_filter(*, vault_ids: list[str] | None, source_ids: list[str] | None):
+    """The ACL pre-filter: vault_ids (per-vault, issue #189 Phase 2) wins when
+    present, else source_ids (per-resource), else no filter. The qdrant analogue
+    of pgvector's `WHERE {vault_id|source_id} = ANY(...)`. vault_id is stored as
+    UUID text (like source_id), so MatchAny over the keyword index is exact."""
+    if vault_ids:
+        key, vals = PAYLOAD_VAULT_ID, vault_ids
+    elif source_ids:
+        key, vals = PAYLOAD_SOURCE_ID, source_ids
+    else:
         return None
     return qm.Filter(
-        must=[
-            qm.FieldCondition(
-                key=PAYLOAD_SOURCE_ID,
-                match=qm.MatchAny(any=[str(d) for d in source_ids]),
-            ),
-        ],
+        must=[qm.FieldCondition(key=key, match=qm.MatchAny(any=[str(v) for v in vals]))],
     )
 
 

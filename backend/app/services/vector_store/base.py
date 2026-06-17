@@ -126,6 +126,16 @@ class VectorStore(Protocol):
     (idempotent by chunk_id).
     """
 
+    # Capability flag (issue #189 Phase 2). True only on drivers that (1) write
+    # `vault_id` on every point in upsert_one, (2) filter on it in hybrid_search
+    # under the exactly-one(vault_ids, source_ids) contract, AND (3) expose
+    # `vault_backfill_pending()`. The three ship together — this flag IS that
+    # contract. Drivers DUCK-TYPE this Protocol (they don't inherit), so this
+    # default does NOT propagate; every capable driver sets it on its own class,
+    # and every reader uses `getattr(store, "vault_filter_supported", False)` so
+    # an unknown driver is fail-safe (source-id path, never a wrong vault path).
+    vault_filter_supported: bool = False
+
     async def ensure_collection(self, *, conn=None) -> None:
         """Idempotent: create the underlying storage (Qdrant collection,
         PG schema/tables, etc.) if it doesn't exist. May reuse `conn`
@@ -264,10 +274,12 @@ class VectorStore(Protocol):
           their own filter primitive.
         - `vault_ids` is the per-VAULT ACL filter (issue #189 Phase 2): a small
           set of accessible vault ids the caller passes INSTEAD of enumerating
-          every accessible source_id. Drivers that store `vault_id` on each
-          point (pgvector) filter on it natively; others ignore it for now and
-          keep filtering by `source_ids`. The caller sends one or the other,
-          never both at once.
+          every accessible source_id. Drivers with `vault_filter_supported=True`
+          store `vault_id` on each point and filter on it natively (pgvector,
+          qdrant, seahorse); drivers without it never receive `vault_ids` (the
+          caller's `vault_path_eligible` gate is False for them) and keep
+          filtering by `source_ids`. The caller sends EXACTLY ONE of the two,
+          never both — capable drivers assert this.
         - `prefetch_per_leg` caps each leg's candidate pool before
           fusion. Caller decides — typically `max(limit * 3, 50)`.
         """

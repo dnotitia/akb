@@ -67,3 +67,27 @@ def validate_uuid_for_sql(s: str) -> str:
     defense in depth against any caller mistake."""
     uuid.UUID(s)
     return s
+
+
+def vault_filter_sql(
+    vault_ids: list[str] | None,
+    source_ids: list[str] | None,
+    *,
+    vault_col: str = "vault_id",
+    source_col: str = "source_id",
+) -> str | None:
+    """The ACL pre-filter as a Coral SQL WHERE clause (issue #189 Phase 2):
+    vault_ids (per-VAULT) wins when present, else source_ids (per-resource),
+    else None (no filter). Mirrors the pgvector/qdrant exactly-one contract — the
+    caller sends one or the other, never both. Both id kinds are UUIDs, validated
+    before interpolation (defense in depth; the IN list is otherwise trusted)."""
+    assert not (vault_ids and source_ids), \
+        "vault_filter_sql got both vault_ids and source_ids; expected exactly one"
+    if vault_ids:
+        col, ids = vault_col, vault_ids
+    elif source_ids:
+        col, ids = source_col, source_ids
+    else:
+        return None
+    quoted = ", ".join(f"'{validate_uuid_for_sql(str(s))}'" for s in ids)
+    return f"{col} IN ({quoted})"

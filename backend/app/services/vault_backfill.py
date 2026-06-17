@@ -11,10 +11,14 @@ startup (non-blocking, in bounded batches), and search self-activates the vault
 path only once it reports ready — until then it transparently uses the existing
 source-id path (no behavior change, no under-fetch). Zero-touch upgrade.
 
-Scope: pgvector in same-instance mode (the vector index lives in the main DB, so
-the backfill is a server-side join). For a SEPARATE vector instance or any other
-driver this worker is a no-op — those run `scripts/backfill_vault_id.py` by hand
-(rare; only pgvector implements the vault filter today).
+Auto-fill scope: pgvector in same-instance mode (the vector index lives in the
+main DB, so the backfill is a server-side join). Every OTHER vault-filter-capable
+driver (qdrant, seahorse, separate-instance pgvector) can't be reached by that
+join, so this worker doesn't auto-fill them — it only GATES readiness on the
+driver's own `vault_backfill_pending()` reaching 0 (the operator backfills:
+qdrant via `scripts/backfill_vault_id.py`, seahorse via recreate + reindex). A
+driver whose `vault_filter_supported` is False never takes the vault path, so the
+worker latches ready immediately for it.
 
 Readiness = "no LIVE-source point is missing vault_id". Orphan points (whose
 source row was deleted) keep `vault_id` NULL forever but are excluded by BOTH the
@@ -67,25 +71,33 @@ async def _process_once() -> int:
     if _ready:
         return 0
 
-    # Non-pgvector drivers have no vault_id column and `vault_path_eligible` is
-    # already False for them — the vault path is never taken, so readiness is
-    # moot. Latch ready so the worker stops looping instead of spinning forever.
-    if not _is_pgvector():
+    store = get_vector_store()
+
+    # A driver without the vault filter never takes the vault path
+    # (`vault_path_eligible` is False for it), so readiness is moot. Latch ready
+    # so the worker stops looping instead of spinning forever.
+    if not getattr(store, "vault_filter_supported", False):
         _ready = True
         return 0
 
-    # Separate pgvector instance: we can't run the server-side join (the index
-    # lives in another DB), so we DON'T auto-backfill — the operator runs
-    # scripts/backfill_vault_id.py. But we still gate: readiness = the vector
-    # instance reports 0 NULL vault_id (exactly the manual script's
-    # "0 before flip" contract, orphans included). Until then the source-id path
-    # runs. This preserves the pre-auto-backfill escape hatch without the old
-    # under-fetch foot-gun (activating the flag before the backfill finished).
-    if not _same_instance():
-        fn = getattr(get_vector_store(), "vault_backfill_pending", None)
-        if fn is not None and await fn() == 0:
+    # Capable driver this worker CANNOT auto-backfill — qdrant, seahorse, or a
+    # SEPARATE-instance pgvector: none is reachable by the same-DB server-side
+    # join below. We DON'T auto-fill; the operator backfills (qdrant: the script;
+    # seahorse: recreate + reindex; separate pgvector: scripts/backfill_vault_id).
+    # We still gate: readiness = the driver reports 0 NULL vault_id (the manual
+    # script's "0 before flip" contract). Until then search keeps the source-id
+    # path — no under-fetch. A capable driver MUST expose vault_backfill_pending();
+    # if one somehow doesn't, stay gated forever rather than activate blind.
+    if not _applicable():
+        fn = getattr(store, "vault_backfill_pending", None)
+        if fn is None:
+            return 0
+        if await fn() == 0:
             _ready = True
-            logger.info("vault_id backfill complete (separate instance) — vault filter path is now active")
+            logger.info(
+                "vault_id backfill complete (%s) — vault filter path is now active",
+                settings.vector_store_driver,
+            )
         return 0
 
     schema = settings.vector_store_schema
@@ -143,9 +155,17 @@ stop = _runner.stop
 
 async def pending_stats() -> dict:
     """For /health: readiness + remaining NULL count (the safe-to-activate
-    signal). null_remaining includes orphans; readiness ignores them."""
-    out: dict = {"ready": is_ready(), "applicable": _applicable()}
-    fn = getattr(get_vector_store(), "vault_backfill_pending", None)
+    signal). null_remaining includes orphans; readiness ignores them.
+    `applicable` = this worker auto-fills here (pgvector same-instance);
+    `vault_filter_supported` = the driver is capable at all (so an operator on
+    qdrant/seahorse, where applicable=False, still sees the gate is live)."""
+    store = get_vector_store()
+    out: dict = {
+        "ready": is_ready(),
+        "applicable": _applicable(),
+        "vault_filter_supported": getattr(store, "vault_filter_supported", False),
+    }
+    fn = getattr(store, "vault_backfill_pending", None)
     if fn is not None:
         try:
             out["null_remaining"] = await fn()

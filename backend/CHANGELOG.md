@@ -5,6 +5,42 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.14 — 2026-06-17  *(feature — vault filter extended to qdrant + seahorse)*
+
+**#189 Phase 2 vault filter, now driver-agnostic.** The per-vault ACL search
+path (filter the vector search by the user's accessible vault ids instead of
+enumerating every accessible source id) previously only ran on pgvector. It now
+works on **qdrant** and the three **seahorse** drivers too.
+
+- **Capability flag, not a driver-name check.** `VectorStore.vault_filter_supported`
+  (default False; each capable driver sets it True on its own class) replaces the
+  hardcoded `driver == "pgvector"` in `search_service.vault_path_eligible`, the
+  `vault_backfill` worker, and `/health`. Read via `getattr(..., False)` so an
+  unknown driver is fail-safe (source-id path, never a wrong vault path).
+- **qdrant:** writes `vault_id` on each point's payload, indexes it (KEYWORD),
+  filters on it in `hybrid_search` under the exactly-one(vault_ids, source_ids)
+  contract, and counts un-backfilled points via `count(IsNullCondition, exact=True)`.
+- **seahorse (Coral REST / gRPC / Cloud):** `vault_id` column on the table schema
+  + written on every upsert; filtered via a shared `vault_filter_sql` helper
+  (`vault_id IN (…)`). The REST driver gates readiness on a `/data/scan` null
+  count (fail-closed); gRPC/Cloud store + filter but stay gated (no count
+  primitive) until a count is wired.
+- **Backfill-worker fix:** a capable non-pgvector driver now gates `is_ready()`
+  on its `vault_backfill_pending()==0` instead of latching ready immediately (the
+  prior latch would have activated the vault path before existing points carried
+  `vault_id`, under-fetching). pgvector same-instance keeps its server-side
+  auto-join backfill.
+- **Upgrade path for existing non-pgvector deployments:** reindex
+  (`UPDATE chunks SET vector_indexed_at = NULL`) so the worker re-upserts every
+  point *with* `vault_id`; until the null count hits 0 search stays on the safe
+  source-id path (correct, just not the O(vaults) speedup). Production runs
+  pgvector and is unaffected.
+- Tests: new qdrant + seahorse(REST/Cloud) vault-filter unit suites; gRPC unit
+  test extended (CI-only). NOTE: the seahorse drivers are unit-tested but not
+  live-verified against Coral here — the `/data/scan` count shape and qdrant's
+  `IsNullCondition` absent-key semantics should be confirmed against a live
+  server before relying on auto-activation.
+
 ## 0.8.13 — 2026-06-16  *(patch — search: zero-touch Phase 2 + retrieval fixes)*
 
 Follow-ups that make the 0.8.12 search work correct and operator-free at scale.
