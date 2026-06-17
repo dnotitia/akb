@@ -220,6 +220,8 @@ CREATE TABLE IF NOT EXISTS vault_tables (
     name TEXT NOT NULL,
     description TEXT,
     columns JSONB NOT NULL DEFAULT '[]',
+    unique_keys JSONB NOT NULL DEFAULT '[]',
+    indexes JSONB NOT NULL DEFAULT '[]',
     created_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

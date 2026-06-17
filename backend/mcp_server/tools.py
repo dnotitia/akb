@@ -640,6 +640,61 @@ TOOLS = [
                         "required": ["name", "type"],
                     },
                 },
+                "unique_keys": {
+                    "type": "array",
+                    "description": (
+                        "Declarative UNIQUE keys. Each item is {name?, columns}. "
+                        "`columns` is a list of existing column names (single or "
+                        "composite). `name` is optional — when omitted AKB generates "
+                        "a deterministic, stable name. Use this (not `indexes`) for "
+                        "unique indexes."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                            },
+                        },
+                        "required": ["columns"],
+                    },
+                },
+                "indexes": {
+                    "type": "array",
+                    "description": (
+                        "Declarative lookup (btree) indexes. Each item is "
+                        "{name?, columns}. A column is a bare string or "
+                        "{name, order} where order is 'asc' (default) or 'desc'. "
+                        "Unique indexes are expressed via `unique_keys`, not here."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "oneOf": [
+                                        {"type": "string"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": {"type": "string"},
+                                                "order": {"type": "string", "enum": ["asc", "desc"]},
+                                            },
+                                            "required": ["name"],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                        "required": ["columns"],
+                    },
+                },
             },
             "required": ["name", "columns"],
         },
@@ -705,6 +760,67 @@ TOOLS = [
                 "rename_columns": {
                     "type": "object",
                     "description": "Rename columns: {old_name: new_name}",
+                },
+                "add_unique_keys": {
+                    "type": "array",
+                    "description": (
+                        "UNIQUE keys to add: [{name?, columns}]. Adding a key on a "
+                        "table with existing data preflights for duplicate rows and "
+                        "fails before any DDL if any are found."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                            },
+                        },
+                        "required": ["columns"],
+                    },
+                },
+                "drop_unique_keys": {
+                    "type": "array",
+                    "description": "UNIQUE-key names to drop (as shown in unique_keys metadata).",
+                    "items": {"type": "string"},
+                },
+                "add_indexes": {
+                    "type": "array",
+                    "description": (
+                        "Lookup indexes to add: [{name?, columns}]. A column is a "
+                        "bare string or {name, order} (order 'asc'|'desc')."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "oneOf": [
+                                        {"type": "string"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": {"type": "string"},
+                                                "order": {"type": "string", "enum": ["asc", "desc"]},
+                                            },
+                                            "required": ["name"],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                        "required": ["columns"],
+                    },
+                },
+                "drop_indexes": {
+                    "type": "array",
+                    "description": "Index names to drop (as shown in indexes metadata).",
+                    "items": {"type": "string"},
                 },
             },
             "required": ["uri"],

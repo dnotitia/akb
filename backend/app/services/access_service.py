@@ -451,7 +451,8 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         registry = await conn.fetch(
-            "SELECT id, name FROM vault_tables WHERE vault_id = $1 ORDER BY name",
+            "SELECT id, name, unique_keys, indexes FROM vault_tables "
+            "WHERE vault_id = $1 ORDER BY name",
             vault_id,
         )
         if not registry:
@@ -461,6 +462,7 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
         # canonical sanitizer so hyphenated vault names map to the actual
         # `vt_<sanitised>__<sanitised>` PG identifiers.
         from app.repositories.table_data_repo import pg_table_name
+        from app.repositories import table_registry_repo
         pg_names = [pg_table_name(vault_name, r["name"]) for r in registry]
         col_rows = await conn.fetch(
             """
@@ -502,6 +504,11 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
                 "name": r["name"],
                 "row_count": row_count,
                 "columns": columns,
+                # Declared guarantees (AKB #215) so an agent inspecting a
+                # vault sees uniqueness/index metadata without a mid-flow
+                # information_schema lookup — the point of this surface.
+                "unique_keys": table_registry_repo.parse_json_list(r["unique_keys"]),
+                "indexes": table_registry_repo.parse_json_list(r["indexes"]),
             })
         return out
 

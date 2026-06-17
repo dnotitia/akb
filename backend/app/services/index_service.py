@@ -65,6 +65,8 @@ CHUNK_HEADER_KEYS: tuple[str, ...] = (
     "MIME",
     "SIZE",
     "DESCRIPTION",
+    "UNIQUE_KEYS",
+    "INDEXES",
 )
 
 
@@ -99,10 +101,17 @@ def build_table_chunk(
     name: str,
     description: str | None,
     columns: list[dict],
+    unique_keys: list[dict] | None = None,
+    indexes: list[dict] | None = None,
 ) -> "Chunk":
     """Single chunk representing a table's metadata + column schema.
     Tables are not markdown; we emit one metadata chunk so hybrid search
-    can find them alongside documents."""
+    can find them alongside documents.
+
+    Declared `unique_keys` / `indexes` (AKB #215) are surfaced too so the
+    table's guarantees are discoverable via hybrid search — otherwise an
+    agent searching for a uniqueness/index guarantee by name finds nothing
+    (AC #11 discovery surface)."""
     col_lines = []
     for col in columns or []:
         line = f"  - {col.get('name')}: {col.get('type', 'text')}"
@@ -119,6 +128,24 @@ def build_table_chunk(
     if col_lines:
         parts.append("COLUMNS:")
         parts.extend(col_lines)
+    if unique_keys:
+        parts.append("UNIQUE_KEYS:")
+        for uk in unique_keys:
+            cols = ", ".join(uk.get("columns", []))
+            parts.append(f"  - {uk.get('name')} ({cols})")
+    if indexes:
+        parts.append("INDEXES:")
+        for idx in indexes:
+            cparts = []
+            for c in idx.get("columns", []):
+                # index columns are normally {name, order} dicts, but tolerate a
+                # bare-string column (the resolver's own input shape) so a
+                # legacy/hand-edited row can never raise here.
+                if isinstance(c, dict):
+                    cparts.append(f"{c.get('name')} {c.get('order', 'asc')}")
+                else:
+                    cparts.append(f"{c} asc")
+            parts.append(f"  - {idx.get('name')} ({', '.join(cparts)})")
     content = "\n".join(parts)
     return Chunk(
         section_path="",

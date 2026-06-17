@@ -853,6 +853,8 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             actor_id=user.username,
             description=args.get("description", ""),
             collection=collection or None,
+            unique_keys=args.get("unique_keys"),
+            indexes=args.get("indexes"),
         )
     except (ValidationError, ValueError) as e:
         # ValidationError: bad table name / over-long PG identifier (422).
@@ -911,6 +913,10 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
             add_columns=args.get("add_columns"),
             drop_columns=args.get("drop_columns"),
             rename_columns=args.get("rename_columns"),
+            add_unique_keys=args.get("add_unique_keys"),
+            drop_unique_keys=args.get("drop_unique_keys"),
+            add_indexes=args.get("add_indexes"),
+            drop_indexes=args.get("drop_indexes"),
         )
     except NotFoundError as e:
         return err(str(e), code=NOT_FOUND)

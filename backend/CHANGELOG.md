@@ -5,6 +5,38 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.16 — 2026-06-17  *(feat — declarative unique keys + indexes on the table DDL tools, #215)*
+
+`akb_create_table` accepts optional declarative `unique_keys` and `indexes`;
+`akb_alter_table` gains `add_unique_keys` / `drop_unique_keys` / `add_indexes` /
+`drop_indexes`. Declarative JSON only — `akb_sql` stays DML-only.
+`check_constraints` (the rest of #215) ship in a follow-up PR.
+
+- DDL primitives + a deterministic, schema-global-namespaced, `sha1`-disambiguated
+  name generator (distinct column lists can never alias, e.g. `["a","b"]` vs
+  `["a_b"]`); every identifier flows through `safe_ident` and index order is a
+  closed `asc`/`desc` enum, so no raw caller input reaches a DDL string.
+- Adding a unique key preflights existing rows for duplicates BEFORE the
+  `ADD CONSTRAINT`; preflight + DDL + registry write share one transaction, so a
+  violation rolls back **both** physical schema and registry. The preflight mirrors
+  PostgreSQL `NULLS DISTINCT` (a row with any NULL key value never conflicts) so it
+  is not stricter than the constraint it guards. Post-preflight races and
+  schema-global name clashes surface as `invalid_argument` (422), not 500s.
+- A duplicate column within one key/index, or a mixed-case column reference, are
+  clean `invalid_argument` rejects rather than DDL 500s; referenced columns are
+  stored under their canonical declared name, and a column rename/drop keeps the
+  unique_key/index registry metadata consistent with the physical schema.
+- A duplicate `INSERT` via `akb_sql` now returns a stable `unique_violation` code
+  plus `pg_sqlstate=23505` (was the generic `sql_error` catch-all).
+- Declared metadata is persisted on `vault_tables` (migration `037`, idempotent)
+  and exposed via `list_tables`, `akb_vault_info`, the create/alter return dicts,
+  and the hybrid-search metadata chunk. REST `CreateTableRequest` threads
+  `unique_keys`/`indexes` (previously silently dropped).
+- Tests: a DB-free unit suite (`test_table_constraints_unit.py`) plus a live e2e
+  suite (`test_table_constraints_e2e.sh`, now in the CI shell-e2e gate) covering
+  AC #1–#6/#10/#11, the `akb_sql` DDL boundary, NULLS-DISTINCT, single-TX
+  atomicity, and the admin permission gate.
+
 ## 0.8.15 — 2026-06-17  *(fix — qdrant driver converts client errors to VectorStoreUnavailable, #207)*
 
 The qdrant driver now wraps its client calls so a transient failure (network

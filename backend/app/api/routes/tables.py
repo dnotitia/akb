@@ -16,6 +16,12 @@ class CreateTableRequest(NFCModel):
     description: str = ""
     columns: list[dict]
     collection: str | None = None
+    # Declarative unique keys / indexes (#215). Optional; mirror the MCP
+    # akb_create_table surface so REST/web clients can WRITE them, not
+    # just READ them back via list_tables. ValidationError/ConflictError
+    # from the service map to 422/409 via the global AKBError handler.
+    unique_keys: list[dict] | None = None
+    indexes: list[dict] | None = None
 
 
 class SqlRequest(NFCModel):
@@ -30,6 +36,7 @@ async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedU
         access["vault_id"], req.name, req.columns,
         actor_id=user.username, description=req.description,
         collection=req.collection,
+        unique_keys=req.unique_keys, indexes=req.indexes,
     )
 
 

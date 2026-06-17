@@ -89,4 +89,14 @@ jobs:
         env:
           # Matches the fixture default + the dev compose override.
           AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
-        run: pytest tests/test_pgvector_ext_bootstrap_e2e.py -v --tb=short
+        # #215 declarative-DDL integration tests need a live PG too (index
+        # ASC/DESC physical order, migration 037 upgrade path, add-unique-key
+        # concurrency race). They skip in the DB-free unit job above, so gate
+        # them here where AKB_TEST_DSN is reachable.
+        run: >
+          pytest
+          tests/test_pgvector_ext_bootstrap_e2e.py
+          tests/test_migration_037_upgrade_unit.py
+          tests/test_index_order_unit.py
+          tests/concurrency/test_alter_unique_race_unit.py
+          -v --tb=short
