@@ -138,3 +138,83 @@ async def test_ensure_collection_indexes_vault_id():
     store._client = fake
     await store.ensure_collection()
     assert PAYLOAD_VAULT_ID in fake.indexes
+
+
+# ── #207: client errors → VectorStoreUnavailable (write + search paths) ──
+
+from app.services.vector_store.base import VectorStoreUnavailable
+
+
+class _BoomClient(_FakeClient):
+    """A client whose network calls raise a chosen exception."""
+
+    def __init__(self, exc: BaseException):
+        super().__init__()
+        self._exc = exc
+
+    async def collection_exists(self, name):
+        raise self._exc
+
+    async def create_payload_index(self, **kw):
+        raise self._exc
+
+    async def upsert(self, *, collection_name, points):
+        raise self._exc
+
+    async def delete(self, *, collection_name, points_selector):
+        raise self._exc
+
+    async def query_points(self, **kw):
+        raise self._exc
+
+
+async def _do_upsert(store):
+    await store.upsert_one(
+        chunk_id="c1", content="x", section_path=None, chunk_index=0,
+        dense=[0.1, 0.2, 0.3, 0.4], sparse_indices=[1], sparse_values=[0.5],
+        source_type="document", source_id="s1", vault_id="v1",
+    )
+
+
+async def _do_search(store):
+    await store.hybrid_search(
+        query_text="q", query_dense=[0.1, 0.2, 0.3, 0.4],
+        query_sparse_indices=[], query_sparse_values=[],
+        source_ids=None, vault_ids=["v1"], limit=10, prefetch_per_leg=50,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [_do_upsert, _do_search])
+async def test_transient_client_error_becomes_unavailable(action):
+    """A transient qdrant-client failure on the write/search path surfaces as
+    VectorStoreUnavailable (so _run_vector_search labels it correctly), not a
+    raw client exception."""
+    store = _store_with(_BoomClient(RuntimeError("connection refused")))
+    with pytest.raises(VectorStoreUnavailable):
+        await action(store)
+
+
+@pytest.mark.asyncio
+async def test_delete_point_error_becomes_unavailable():
+    store = _store_with(_BoomClient(RuntimeError("5xx")))
+    with pytest.raises(VectorStoreUnavailable):
+        await store.delete_point("c1")
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_error_becomes_unavailable():
+    store = QdrantStore(url="http://x", api_key=None, collection="chunks", dense_dim=4)
+    store._client = _BoomClient(RuntimeError("ping failed"))
+    with pytest.raises(VectorStoreUnavailable):
+        await store.ensure_collection()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [_do_upsert, _do_search])
+async def test_programming_error_is_not_masked(action):
+    """A TypeError/ValueError is a programming bug (bad qm.* arg), NOT an outage —
+    it must propagate unmasked rather than become VectorStoreUnavailable."""
+    store = _store_with(_BoomClient(TypeError("bad arg")))
+    with pytest.raises(TypeError):
+        await action(store)
