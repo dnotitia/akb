@@ -145,8 +145,11 @@ echo "$DOC_URI2" | grep -q "/title-derived-path\.md$" \
 # ── Cleanup vault ─────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"name\":\"$VAULT\"}}" >/dev/null 2>&1
-pass "Vault deleted"
+DELETE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT\"}}")
+DELETE_OK=$(tool_result "$DELETE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted") is True)' 2>/dev/null)
+[ "$DELETE_OK" = "True" ] \
+  && pass "Vault deleted" \
+  || fail "Cleanup" "akb_delete_vault did not confirm deletion"
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""

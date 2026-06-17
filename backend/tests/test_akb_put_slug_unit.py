@@ -69,6 +69,22 @@ def _akb_put_schema_property_names() -> set[str]:
     return {k.value for k in props.keys if isinstance(k, ast.Constant)}
 
 
+def _help_topic_text(topic: str) -> str:
+    tree = ast.parse((_MCP / "help.py").read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == topic
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            ):
+                return value.value
+    raise AssertionError(f"help topic {topic!r} not found")
+
+
 def _handle_put_put_request_call() -> ast.Call:
     tree = ast.parse((_MCP / "server.py").read_text())
     fn = next(
@@ -90,6 +106,15 @@ def test_akb_put_schema_exposes_slug() -> None:
         "akb_put inputSchema must advertise `slug` so a caller can set it AND so "
         "the schema-derived arg-validator (_TOOL_ARG_NAMES) accepts it."
     )
+
+
+def test_akb_put_help_documents_slug() -> None:
+    text = _help_topic_text("akb_put")
+    assert "| slug |" in text, (
+        "akb_help(topic='akb_put') must document `slug`; schema-only exposure "
+        "is hard for agents/users to discover."
+    )
+    assert "github-issue-123" in text
 
 
 def test_handle_put_forwards_slug_from_args() -> None:
