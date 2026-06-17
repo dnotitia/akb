@@ -276,6 +276,308 @@ async def test_document_get_reads_body_at_current_commit_not_head(monkeypatch) -
     assert result.current_commit == commit
 
 
+# ── write-response / get hash parity (issue #181) ─────────────────
+#
+# put/update used to hash the RAW request body, while get parses the
+# stored markdown (frontmatter.loads strips surrounding whitespace) and
+# hashes the parsed body. Any body with leading/trailing whitespace got
+# a write-response hash no later read would ever confirm. The write
+# path must certify the canonical parsed body — the same value get
+# serves — by construction.
+
+
+class _FakePutDocRepo:
+    """find_by_path/create/update/update_hash fakes for the put and
+    update critical sections; records what would hit the DB."""
+
+    def __init__(self, row: dict | None = None):
+        self.row = row
+        self.created: dict | None = None
+        self.updated: dict | None = None
+        self.hash_update: dict | None = None
+
+    async def find_by_path(self, vault_id: uuid.UUID, path: str, conn=None):
+        return None
+
+    async def find_by_ref(self, vault_id: uuid.UUID, ref: str) -> dict:
+        return dict(self.row or {})
+
+    async def create(self, **kwargs) -> uuid.UUID:
+        self.created = kwargs
+        return uuid.uuid4()
+
+    async def update(self, doc_id: uuid.UUID, **kwargs) -> None:
+        self.updated = {"doc_id": doc_id, **kwargs}
+
+    async def update_hash(self, doc_id: uuid.UUID, *, content_hash, hash_algorithm, content_hash_commit, conn=None) -> None:
+        self.hash_update = {
+            "doc_id": doc_id,
+            "content_hash": content_hash,
+            "hash_algorithm": hash_algorithm,
+            "content_hash_commit": content_hash_commit,
+        }
+
+
+class _FakeCollRepo:
+    async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
+        return uuid.uuid4()
+
+    async def increment_count(self, collection_id, now, conn=None) -> None:
+        return None
+
+
+class _CommittingGit:
+    """Records the markdown handed to commit_file and serves it back on
+    read_file — i.e. behaves like the real git round-trip."""
+
+    def __init__(self, commit: str, initial_raw: str | None = None):
+        self.commit = commit
+        self.initial_raw = initial_raw
+        self.committed_md: str | None = None
+
+    def commit_file(self, *, vault_name, file_path, content, message, author_name) -> str:
+        self.committed_md = content
+        return self.commit
+
+    def read_file(self, vault: str, path: str, commit: str | None = None) -> str:
+        if self.committed_md is not None:
+            return self.committed_md
+        assert self.initial_raw is not None, "read before any commit"
+        return self.initial_raw
+
+
+def _patch_index_side_effects(monkeypatch) -> None:
+    """Neutralize the chunk/relations/event writes that need a live DB."""
+    import app.repositories.document_repo as document_repo
+    import app.services.document_service as ds
+
+    async def fake_write_source_chunks(conn, kind, doc_id, *, vault_id, chunks):
+        return len(chunks)
+
+    async def fake_drop_resource_alias(*args, **kwargs):
+        return None
+
+    async def fake_store_document_relations(*args, **kwargs):
+        return None
+
+    async def fake_emit_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(document_repo, "drop_resource_alias", fake_drop_resource_alias)
+    monkeypatch.setattr(ds, "write_source_chunks", fake_write_source_chunks)
+    monkeypatch.setattr(ds, "store_document_relations", fake_store_document_relations)
+    monkeypatch.setattr(ds, "emit_event", fake_emit_event)
+
+
+@pytest.mark.asyncio
+async def test_put_certifies_the_canonical_parsed_body_hash(monkeypatch) -> None:
+    """A body with trailing newlines (Jira-style sync payloads produce
+    them routinely): the put-response hash must equal the hash of the
+    frontmatter round-tripped body — what a later get will serve — not
+    the raw request body."""
+    import frontmatter
+
+    from app.models.document import DocumentPutRequest
+
+    _patch_index_side_effects(monkeypatch)
+    commit = "e" * 40
+    git = _CommittingGit(commit)
+    doc_repo = _FakePutDocRepo()
+    service = DocumentService(git=git)
+    req = DocumentPutRequest(
+        vault="hash-vault", collection="specs", title="Trailing",
+        content="Body line one.\n\nBody line two.\n\n",
+    )
+
+    resp = await service._put_locked(
+        req=req, agent_id="tester", vault_id=uuid.uuid4(), doc_id=uuid.uuid4(),
+        base_path="specs/trailing.md", base_slug="trailing", explicit_slug=True,
+        now=datetime.now(timezone.utc), normalized_collection="specs",
+        doc_repo=doc_repo, coll_repo=_FakeCollRepo(), conn=None,
+    )
+
+    # Canonical body = what frontmatter parses back out of the committed
+    # markdown; this is exactly what get() hashes.
+    canonical_body = frontmatter.loads(git.committed_md).content
+    expected_hash = sha256(canonical_body.encode("utf-8")).hexdigest()
+    assert canonical_body != req.content, "fixture must exercise the strip"
+    assert resp.content_hash == expected_hash, (
+        "put response certified the raw request body, not the canonical "
+        "parsed body — no later akb_get will ever confirm this hash"
+    )
+    # The DB row gets the same canonical hash (no read-order-dependent flip).
+    assert doc_repo.created is not None
+    assert doc_repo.created["content_hash"] == expected_hash
+
+
+@pytest.mark.asyncio
+async def test_get_after_put_confirms_hash_and_self_heal_is_noop(monkeypatch) -> None:
+    """End-to-end parity: get() over the row a fresh put persisted must
+    return the same content_hash and never rewrite the row (the
+    _ensure_document_hash self-heal is a no-op for fresh writes)."""
+    from app.models.document import DocumentPutRequest
+
+    _patch_index_side_effects(monkeypatch)
+    commit = "f" * 40
+    git = _CommittingGit(commit)
+    put_repo = _FakePutDocRepo()
+    service = DocumentService(git=git)
+    req = DocumentPutRequest(
+        vault="hash-vault", collection="specs", title="Trailing",
+        content="# Heading\n\nBody.\n\n",
+    )
+    resp = await service._put_locked(
+        req=req, agent_id="tester", vault_id=uuid.uuid4(), doc_id=uuid.uuid4(),
+        base_path="specs/trailing.md", base_slug="trailing", explicit_slug=True,
+        now=datetime.now(timezone.utc), normalized_collection="specs",
+        doc_repo=put_repo, coll_repo=_FakeCollRepo(), conn=None,
+    )
+
+    # Project the row exactly as the put persisted it.
+    row = {
+        "id": uuid.uuid4(),
+        "vault_name": "hash-vault",
+        "path": "specs/trailing.md",
+        "title": "Trailing",
+        "doc_type": "note",
+        "status": "draft",
+        "summary": None,
+        "domain": None,
+        "created_by": "tester",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+        "current_commit": commit,
+        "content_hash": put_repo.created["content_hash"],
+        "hash_algorithm": "sha256",
+        "content_hash_commit": commit,
+        "tags": [],
+    }
+    get_repo = _FakeDocRepo(row)
+
+    async def fake_repos():
+        return _FakeVaultRepo(uuid.uuid4()), get_repo, object()
+
+    async def fake_public_slug(vault: str, path: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_repos", fake_repos)
+    monkeypatch.setattr(service, "_get_public_slug", fake_public_slug)
+
+    result = await service.get("hash-vault", "specs/trailing.md")
+
+    assert result.content_hash == resp.content_hash, (
+        "get() returned a different hash than the put response certified"
+    )
+    assert get_repo.hash_update is None, (
+        "get() rewrote the row hash on first read — the write certified "
+        "a non-canonical value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_certifies_the_canonical_parsed_body_hash(monkeypatch) -> None:
+    """Same parity contract on the update path: req.content with trailing
+    newlines must yield a response/DB hash over the canonical parsed body."""
+    import frontmatter
+
+    _patch_index_side_effects(monkeypatch)
+    current_body = "Old body."
+    current_hash = sha256(current_body.encode("utf-8")).hexdigest()
+    commit = "9" * 40
+    doc_id = uuid.uuid4()
+    row = {
+        "id": doc_id,
+        "path": "specs/trailing.md",
+        "title": "Trailing",
+        "doc_type": "note",
+        "status": "draft",
+        "summary": None,
+        "current_commit": "8" * 40,
+        "content_hash": current_hash,
+        "hash_algorithm": "sha256",
+        "content_hash_commit": "8" * 40,
+        "tags": [],
+    }
+    git = _CommittingGit(commit)
+    git.committed_md = f"---\ntitle: Trailing\n---\n{current_body}"
+    doc_repo = _FakePutDocRepo(row)
+    service = DocumentService(git=git)
+    req = DocumentUpdateRequest(content="New body.\n\n")
+
+    resp = await service._update_locked(
+        req=req, agent_id="tester", vault="hash-vault",
+        vault_id=uuid.uuid4(), doc_repo=doc_repo, row=row, conn=None,
+    )
+
+    canonical_body = frontmatter.loads(git.committed_md).content
+    expected_hash = sha256(canonical_body.encode("utf-8")).hexdigest()
+    assert canonical_body == "New body."
+    assert resp.content_hash == expected_hash, (
+        "update response certified the raw request body, not the "
+        "canonical parsed body"
+    )
+    assert doc_repo.updated is not None
+    assert doc_repo.updated["content_hash"] == expected_hash
+    assert resp.previous_content_hash == current_hash
+
+
+@pytest.mark.asyncio
+async def test_edit_certifies_the_canonical_parsed_body_hash(monkeypatch) -> None:
+    """akb_edit must use the same canonical write hash as put/update.
+
+    Replacing with a string that ends in blank lines exercises the exact
+    frontmatter round-trip that strips body edges before akb_get hashes it.
+    """
+    import frontmatter
+
+    _patch_index_side_effects(monkeypatch)
+    current_body = "Old body."
+    current_hash = sha256(current_body.encode("utf-8")).hexdigest()
+    commit = "7" * 40
+    doc_id = uuid.uuid4()
+    row = {
+        "id": doc_id,
+        "path": "specs/edit.md",
+        "title": "Edit Hash",
+        "doc_type": "note",
+        "summary": None,
+        "current_commit": "6" * 40,
+        "content_hash": current_hash,
+        "hash_algorithm": "sha256",
+        "content_hash_commit": "6" * 40,
+        "tags": [],
+    }
+    git = _CommittingGit(
+        commit,
+        initial_raw=f"---\ntitle: Edit Hash\ntype: note\n---\n{current_body}",
+    )
+    doc_repo = _FakePutDocRepo(row)
+    service = DocumentService(git=git)
+
+    resp = await service._edit_locked(
+        vault="hash-vault",
+        vault_id=uuid.uuid4(),
+        row=row,
+        doc_repo=doc_repo,
+        old_string=current_body,
+        new_string="New body.\n\n",
+        replace_all=False,
+        message="edit hash",
+        agent_id="tester",
+        conn=None,
+    )
+
+    canonical_body = frontmatter.loads(git.committed_md).content
+    expected_hash = sha256(canonical_body.encode("utf-8")).hexdigest()
+    assert canonical_body == "New body."
+    assert resp.content_hash == expected_hash, (
+        "edit response certified the raw edited body, not the canonical parsed body"
+    )
+    assert doc_repo.updated is not None
+    assert doc_repo.updated["content_hash"] == expected_hash
+    assert resp.previous_content_hash == current_hash
+
+
 # ── akb_put status option ──────────────────────────────────────────
 
 
