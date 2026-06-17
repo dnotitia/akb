@@ -30,6 +30,7 @@ import { VaultList, type VaultRow } from "@/components/vault-list";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { MenuFilter } from "@/components/ui/menu-filter";
 import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
@@ -571,6 +572,7 @@ export default function HomePage() {
  * One vault → straight to its new-doc form; several → a small vault picker.
  */
 function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
+  const [filter, setFilter] = useState("");
   if (vaults.length === 1) {
     return (
       <Button asChild variant="accent" size="md">
@@ -581,8 +583,12 @@ function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
       </Button>
     );
   }
+  // A filter only earns its keep once the list is long enough to scan.
+  const showFilter = vaults.length > 7;
+  const q = filter.trim().toLowerCase();
+  const filtered = q ? vaults.filter((v) => v.name.toLowerCase().includes(q)) : vaults;
   return (
-    <DropdownMenu.Root>
+    <DropdownMenu.Root onOpenChange={(open) => !open && setFilter("")}>
       <DropdownMenu.Trigger asChild>
         <Button variant="accent" size="md">
           <FilePlus className="h-4 w-4" aria-hidden />
@@ -596,18 +602,28 @@ function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
           sideOffset={6}
           className="z-[var(--z-popover)] max-h-[60vh] overflow-y-auto min-w-[220px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
-          <div className="px-3 py-1.5 coord">Choose a vault</div>
-          {vaults.map((v) => (
-            <DropdownMenu.Item key={v.id} asChild>
-              <Link
-                to={`/vault/${v.name}/doc/new`}
-                className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none rounded-[var(--radius-sm)] data-[highlighted]:bg-surface-hover"
-              >
-                <FileText className="h-4 w-4 text-foreground-muted" aria-hidden />
-                <TooltipText className="truncate">{v.name}</TooltipText>
-              </Link>
-            </DropdownMenu.Item>
-          ))}
+          {showFilter ? (
+            <div className="sticky -top-1 z-10 -mx-1 -mt-1 mb-0.5 border-b border-border bg-surface px-1 pt-1">
+              <MenuFilter value={filter} onChange={setFilter} placeholder="Filter vaults" />
+            </div>
+          ) : (
+            <div className="px-3 py-1.5 coord">Choose a vault</div>
+          )}
+          {filtered.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-foreground-muted">No matches</div>
+          ) : (
+            filtered.map((v) => (
+              <DropdownMenu.Item key={v.id} asChild>
+                <Link
+                  to={`/vault/${v.name}/doc/new`}
+                  className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none rounded-[var(--radius-sm)] data-[highlighted]:bg-surface-hover"
+                >
+                  <FileText className="h-4 w-4 text-foreground-muted" aria-hidden />
+                  <TooltipText className="truncate">{v.name}</TooltipText>
+                </Link>
+              </DropdownMenu.Item>
+            ))
+          )}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>

@@ -1,7 +1,9 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown } from "lucide-react";
+import { useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { MenuFilter } from "@/components/ui/menu-filter";
 
 export interface SelectOption {
   value: string;
@@ -24,6 +26,13 @@ interface SelectMenuProps {
   "aria-describedby"?: string;
   /** Mono-format the trigger value (for identifier-shaped values). */
   mono?: boolean;
+  /**
+   * Show a live filter box atop the open list once the option count crosses
+   * `searchThreshold` (default 8). Filters options by their label.
+   */
+  searchable?: boolean;
+  searchThreshold?: number;
+  searchPlaceholder?: string;
 }
 
 /**
@@ -42,11 +51,21 @@ export function SelectMenu({
   className,
   disabled,
   mono,
+  searchable = false,
+  searchThreshold = 8,
+  searchPlaceholder = "Filter…",
   "aria-label": ariaLabel,
   "aria-invalid": ariaInvalid,
   "aria-describedby": ariaDescribedby,
 }: SelectMenuProps) {
   const current = options.find((o) => o.value === value);
+  const [filter, setFilter] = useState("");
+  const showFilter = searchable && options.length > searchThreshold;
+  const q = filter.trim().toLowerCase();
+  const filtered = useMemo(
+    () => (showFilter && q ? options.filter((o) => o.label.toLowerCase().includes(q)) : options),
+    [options, q, showFilter],
+  );
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
@@ -81,10 +100,23 @@ export function SelectMenu({
         <DropdownMenu.Content
           align="start"
           sideOffset={6}
+          onCloseAutoFocus={showFilter ? () => setFilter("") : undefined}
           className="z-[var(--z-popover)] max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
+          {showFilter && (
+            <div className="sticky -top-1 z-10 -mx-1 -mt-1 mb-0.5 border-b border-border bg-surface px-1 pt-1">
+              <MenuFilter
+                value={filter}
+                onChange={setFilter}
+                placeholder={searchPlaceholder}
+              />
+            </div>
+          )}
+          {showFilter && filtered.length === 0 && (
+            <div className="px-3 py-2 text-xs text-foreground-muted">No matches</div>
+          )}
           <DropdownMenu.RadioGroup value={value} onValueChange={onValueChange}>
-            {options.map((o) => (
+            {filtered.map((o) => (
               <DropdownMenu.RadioItem
                 key={o.value}
                 value={o.value}
