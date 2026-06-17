@@ -403,6 +403,44 @@ export const getRelations = (vault: string, docPath: string) => {
   return api<{ uri: string; relations: RelationRow[] }>(`/relations?${p}`);
 };
 
+// User-settable link vocabulary (mirrors backend LinkRelationType). `links_to`
+// is auto-extracted from markdown and is NOT settable here.
+export const RELATION_TYPES = [
+  "references",
+  "related_to",
+  "depends_on",
+  "implements",
+  "derived_from",
+  "attached_to",
+] as const;
+export type RelationType = (typeof RELATION_TYPES)[number];
+
+// Create a typed relation edge. `source`/`target` are full akb:// URIs and must
+// live in the same vault (backend rejects cross-vault links). Needs writer role.
+export const createRelation = (
+  source: string,
+  target: string,
+  relation: RelationType,
+  metadata?: Record<string, unknown>,
+) =>
+  api<{ linked: boolean; source: string; target: string; relation: string }>(`/relations`, {
+    method: "POST",
+    body: JSON.stringify({ source, target, relation, metadata }),
+  });
+
+// Remove a relation edge. `relation` is widened to `string` (vs createRelation's
+// `RelationType`) on purpose: unlink must also be able to name the read-only
+// `links_to` edge, and omitting it drops ALL edges between the two. Returns
+// `{ unlinked: <count> }`; a 0 count (nothing matched) is still a 200 success,
+// not an error — the UI only deletes edges it already shows, so count ≥ 1.
+export const deleteRelation = (source: string, target: string, relation?: string) => {
+  const p = new URLSearchParams({ source, target });
+  if (relation) p.set("relation", relation);
+  return api<{ unlinked: number; source: string; target: string }>(`/relations?${p}`, {
+    method: "DELETE",
+  });
+};
+
 // ── Recent ──
 export const getRecent = (vault?: string, limit = 20) => {
   const p = new URLSearchParams({ limit: String(limit) });

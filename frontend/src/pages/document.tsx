@@ -6,7 +6,6 @@ import {
   ArrowLeft,
   CheckCircle2,
   ExternalLink,
-  GitGraph,
   Loader2,
   Lock,
   Pencil,
@@ -19,11 +18,12 @@ import {
   getDocument,
   getRelations,
   getVaultInfo,
+  type RelationRow,
   unpublishDoc,
   updateDocument,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { docUri, parseUri } from "@/lib/uri";
+import { docUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
@@ -40,19 +40,11 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { RelationsPanel } from "@/components/relations/relations-panel";
 
 // Plate is heavy (~hundreds of KB gzipped); lazy-load so the read-only path
 // (Rendered / Raw / Agent) stays cheap.
 const MarkdownEditor = lazy(() => import("@/components/markdown-editor"));
-
-const RELATION_COLOR: Record<string, string> = {
-  implements: "text-success",
-  depends_on: "text-info",
-  references: "text-info",
-  related_to: "text-foreground-muted",
-  attached_to: "text-success",
-  derived_from: "text-warning",
-};
 
 type DocView = "rendered" | "raw" | "agent" | "edit";
 
@@ -71,7 +63,7 @@ export default function DocumentPage() {
         : rawView === "agent"
           ? "agent"
           : "rendered";
-  const [relations, setRelations] = useState<any[]>([]);
+  const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [provenance, setProvenance] = useState<any[]>([]);
   const [historyError, setHistoryError] = useState(false);
@@ -138,6 +130,16 @@ export default function DocumentPage() {
   // Parse headings once for the outline-tab count (the outline + renderer each
   // re-scan internally; this removes the third pass that ran on every render).
   const headingSlugs = useMemo(() => parseHeadings(doc?.content || ""), [doc?.content]);
+
+  // Re-pull relations after an add/remove from the Relations panel. Keyed off
+  // the doc *path* (the GET response has no internal id — see the load effect).
+  const reloadRelations = () => {
+    const p = doc?.path;
+    if (!p) return;
+    getRelations(name!, p)
+      .then((r) => setRelations(r.relations || []))
+      .catch(() => setRelationsError(true));
+  };
 
   useEffect(() => {
     const d = docQuery.data;
@@ -699,54 +701,14 @@ export default function DocumentPage() {
             value="relations"
             className="flex-1 min-h-0 overflow-y-auto rail-scroll pr-1 pt-3"
           >
-            {relationsError ? (
-              <Alert variant="destructive">Failed to load relations.</Alert>
-            ) : relations.length > 0 ? (
-              <>
-                <ol className="font-mono text-[11px] leading-[1.9] space-y-0.5">
-                  {relations.map((r) => {
-                    // Use the canonical URI parser (handles the `/coll/.../doc/`
-                    // form) — a flat regex missed collection docs and produced
-                    // an empty ref → `/vault/x/doc/` → blank screen.
-                    const p = parseUri(r.uri);
-                    const targetVault = p?.vault ?? name;
-                    const targetType = p?.kind ?? r.resource_type;
-                    const targetRef = p?.id ?? "";
-                    let href = "#";
-                    if (targetRef && targetType === "doc") {
-                      href = `/vault/${targetVault}/doc/${encodeURIComponent(targetRef)}`;
-                    } else if (targetRef && targetType === "table") {
-                      href = `/vault/${targetVault}/table/${encodeURIComponent(targetRef)}`;
-                    } else if (targetRef && targetType === "file") {
-                      href = `/vault/${targetVault}/file/${encodeURIComponent(targetRef)}`;
-                    }
-                    const label = r.name || targetRef || r.uri;
-                    const relColor = RELATION_COLOR[r.relation] || "text-foreground-muted";
-                    return (
-                      <li key={`${r.relation}:${r.uri}`}>
-                        <Link
-                          to={href}
-                          className="grid grid-cols-[minmax(64px,88px)_1fr] gap-1.5 py-0.5 group hover:bg-surface-hover -mx-1 px-1 rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                        >
-                          <span className={relColor}>{r.relation || "relates"}</span>
-                          <TooltipText tip={label} className="text-foreground truncate group-hover:text-link">
-                            → {label}
-                          </TooltipText>
-                        </Link>
-                      </li>
-                    );
-                  })}
-                </ol>
-                <Link
-                  to={`/vault/${name}/graph?focus=${encodeURIComponent(doc.path ? docUri(name!, doc.path) : "")}`}
-                  className="mt-3 inline-flex items-center gap-1 text-xs text-link hover:text-link-hover hover:underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                >
-                  <GitGraph className="h-3 w-3" aria-hidden /> Open in graph →
-                </Link>
-              </>
-            ) : (
-              <div className="coord">No relations yet.</div>
-            )}
+            <RelationsPanel
+              vault={name!}
+              sourceUri={doc.path ? docUri(name!, doc.path) : ""}
+              relations={relations}
+              relationsError={relationsError}
+              graphHref={`/vault/${name}/graph?focus=${encodeURIComponent(doc.path ? docUri(name!, doc.path) : "")}`}
+              onReload={reloadRelations}
+            />
           </TabsContent>
 
           <TabsContent

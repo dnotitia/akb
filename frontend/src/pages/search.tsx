@@ -395,6 +395,8 @@ export default function SearchPage() {
             onValueChange={switchVault}
             aria-label="Search scope — limit to a vault"
             className="h-9 w-auto min-w-[220px] max-w-sm"
+            searchable
+            searchPlaceholder="Filter vaults"
             options={[
               { value: "", label: `All vaults (${vaults.length})` },
               ...vaults.map((v) => ({ value: v.name, label: v.name })),
