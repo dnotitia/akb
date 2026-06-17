@@ -20,6 +20,7 @@ from app.services.okf import (
     concept_from_file,
     concept_from_table,
     okf_frontmatter,
+    parse_okf_bundle,
     split_frontmatter,
 )
 
@@ -170,6 +171,60 @@ class TestConformance:
     def test_permissive_no_index_ok(self):
         report = check_bundle({"a.md": "---\ntype: note\n---\nbody\n"})
         assert report.ok  # missing index.md is never a failure
+
+
+class TestImport:
+    def test_okf_keys_mapped_back_to_akb(self):
+        bundle = {
+            "specs/api-v2.md": (
+                "---\ntype: spec\ntitle: API v2\ndescription: The surface.\n"
+                "tags:\n- api\ntimestamp: '2026-06-13T09:00:00+00:00'\n---\n# API v2\nBody.\n"
+            ),
+        }
+        recs = parse_okf_bundle(bundle)
+        assert len(recs) == 1
+        r = recs[0]
+        assert r["collection"] == "specs"
+        assert r["slug"] == "api-v2"
+        assert r["title"] == "API v2"
+        assert r["type"] == "spec"
+        assert r["summary"] == "The surface."  # OKF `description` → AKB `summary`
+        assert r["tags"] == ["api"]
+        assert r["content"] == "# API v2\nBody."
+
+    def test_unknown_type_clamped_and_preserved_as_tag(self):
+        bundle = {"r.md": "---\ntype: runbook\ntitle: R\n---\nbody\n"}
+        r = parse_okf_bundle(bundle)[0]
+        assert r["type"] == "reference"  # 'runbook' not in AKB enum → clamped
+        assert "okf-type:runbook" in r["tags"]
+
+    def test_reserved_files_skipped(self):
+        bundle = {
+            "index.md": "---\nokf_version: '0.1'\n---\n# x\n",
+            "log.md": "# Log\n",
+            "a.md": "---\ntype: note\n---\nbody\n",
+        }
+        recs = parse_okf_bundle(bundle)
+        assert [r["slug"] for r in recs] == ["a"]
+
+    def test_frontmatterless_file_still_imported(self):
+        # Permissive consumer: no frontmatter → imported as a note, not rejected.
+        recs = parse_okf_bundle({"a.md": "# Just a heading\n\ntext"})
+        assert len(recs) == 1
+        assert recs[0]["type"] == "reference"
+        assert "Just a heading" in recs[0]["content"]
+
+    def test_round_trip_document_preserves_core_fields(self):
+        # export → import returns the same path / title / type / summary / tags.
+        bundle = build_bundle(documents=[DOC])
+        recs = parse_okf_bundle(bundle)
+        assert len(recs) == 1
+        r = recs[0]
+        assert r["path"] == DOC["path"]
+        assert r["title"] == DOC["title"]
+        assert r["type"] == DOC["type"]
+        assert r["summary"] == DOC["summary"]
+        assert set(DOC["tags"]).issubset(set(r["tags"]))
 
 
 class TestLogGrouping:
