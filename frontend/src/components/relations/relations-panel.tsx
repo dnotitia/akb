@@ -4,10 +4,12 @@ import { GitGraph, Link2, Loader2, Plus, Unlink } from "lucide-react";
 import {
   RELATION_TYPES,
   type RelationType,
+  type RelationRow,
   createRelation,
   deleteRelation,
 } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
+import { edgeFor, hrefFor } from "@/components/relations/relation-row-utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { SelectMenu } from "@/components/ui/select-menu";
@@ -41,14 +43,6 @@ const RELATION_LABEL: Record<RelationType, string> = {
   attached_to: "Attached to",
 };
 
-interface RelationRow {
-  direction?: "outgoing" | "incoming";
-  relation: string;
-  uri: string;
-  resource_type?: string;
-  name?: string;
-}
-
 interface RelationsPanelProps {
   vault: string;
   /** The current document's canonical akb:// URI (the link source). */
@@ -69,25 +63,6 @@ export function RelationsPanel({
 }: RelationsPanelProps) {
   const [addOpen, setAddOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<RelationRow | null>(null);
-
-  // A relation row stores only the "other side" + a direction; rebuild the
-  // (source, target) pair the unlink endpoint wants from this doc's vantage.
-  function edgeFor(r: RelationRow): { source: string; target: string } {
-    return r.direction === "incoming"
-      ? { source: r.uri, target: sourceUri }
-      : { source: sourceUri, target: r.uri };
-  }
-
-  function hrefFor(r: RelationRow): string {
-    const p = parseUri(r.uri);
-    const v = p?.vault ?? vault;
-    const ref = p?.id ?? "";
-    const kind = p?.kind ?? r.resource_type;
-    if (!ref) return "#";
-    if (kind === "table") return `/vault/${v}/table/${encodeURIComponent(ref)}`;
-    if (kind === "file") return `/vault/${v}/file/${encodeURIComponent(ref)}`;
-    return `/vault/${v}/doc/${encodeURIComponent(ref)}`;
-  }
 
   return (
     <div className="flex h-full flex-col">
@@ -112,9 +87,9 @@ export function RelationsPanel({
             // unlinking it is meaningless. Hide its delete affordance.
             const deletable = r.relation !== "links_to";
             return (
-              <li key={`${r.direction ?? "out"}:${r.relation}:${r.uri}`} className="group flex items-center gap-1">
+              <li key={`${r.direction}:${r.relation}:${r.uri}`} className="group flex items-center gap-1">
                 <Link
-                  to={hrefFor(r)}
+                  to={hrefFor(r, vault)}
                   className="grid min-w-0 flex-1 grid-cols-[minmax(64px,88px)_1fr] gap-1.5 rounded-[var(--radius-sm)] px-1 py-0.5 transition-colors hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >
                   <span className={relColor}>{r.relation || "relates"}</span>
@@ -169,7 +144,7 @@ export function RelationsPanel({
         variant="destructive"
         onConfirm={async () => {
           if (!pendingDelete) return;
-          const { source, target } = edgeFor(pendingDelete);
+          const { source, target } = edgeFor(pendingDelete, sourceUri);
           await deleteRelation(source, target, pendingDelete.relation);
           setPendingDelete(null);
           onReload();

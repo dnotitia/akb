@@ -428,8 +428,11 @@ export const createRelation = (
     body: JSON.stringify({ source, target, relation, metadata }),
   });
 
-// Remove a relation edge. Omit `relation` to drop all edges between the two.
-// Backend bridges a 0-count unlink to an error, so success means ≥1 removed.
+// Remove a relation edge. `relation` is widened to `string` (vs createRelation's
+// `RelationType`) on purpose: unlink must also be able to name the read-only
+// `links_to` edge, and omitting it drops ALL edges between the two. Returns
+// `{ unlinked: <count> }`; a 0 count (nothing matched) is still a 200 success,
+// not an error — the UI only deletes edges it already shows, so count ≥ 1.
 export const deleteRelation = (source: string, target: string, relation?: string) => {
   const p = new URLSearchParams({ source, target });
   if (relation) p.set("relation", relation);

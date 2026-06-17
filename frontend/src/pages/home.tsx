@@ -31,6 +31,7 @@ import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { MenuFilter } from "@/components/ui/menu-filter";
+import { MENU_FILTER_THRESHOLD, filterByText } from "@/components/ui/menu-filter-utils";
 import { QuickstartDialog, QUICKSTART_DISMISS_KEY } from "@/components/quickstart-dialog";
 import {
   listVaults,
@@ -583,10 +584,8 @@ function NewDocAction({ vaults }: { vaults: VaultRow[] }) {
       </Button>
     );
   }
-  // A filter only earns its keep once the list is long enough to scan.
-  const showFilter = vaults.length > 7;
-  const q = filter.trim().toLowerCase();
-  const filtered = q ? vaults.filter((v) => v.name.toLowerCase().includes(q)) : vaults;
+  const showFilter = vaults.length > MENU_FILTER_THRESHOLD;
+  const filtered = filterByText(vaults, filter, (v) => v.name);
   return (
     <DropdownMenu.Root onOpenChange={(open) => !open && setFilter("")}>
       <DropdownMenu.Trigger asChild>

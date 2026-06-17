@@ -18,6 +18,7 @@ import {
   getDocument,
   getRelations,
   getVaultInfo,
+  type RelationRow,
   unpublishDoc,
   updateDocument,
 } from "@/lib/api";
@@ -62,7 +63,7 @@ export default function DocumentPage() {
         : rawView === "agent"
           ? "agent"
           : "rendered";
-  const [relations, setRelations] = useState<any[]>([]);
+  const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [provenance, setProvenance] = useState<any[]>([]);
   const [historyError, setHistoryError] = useState(false);

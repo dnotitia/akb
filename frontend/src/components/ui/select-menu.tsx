@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { MenuFilter } from "@/components/ui/menu-filter";
+import { MENU_FILTER_THRESHOLD, filterByText } from "@/components/ui/menu-filter-utils";
 
 export interface SelectOption {
   value: string;
@@ -52,7 +53,7 @@ export function SelectMenu({
   disabled,
   mono,
   searchable = false,
-  searchThreshold = 8,
+  searchThreshold = MENU_FILTER_THRESHOLD,
   searchPlaceholder = "Filter…",
   "aria-label": ariaLabel,
   "aria-invalid": ariaInvalid,
@@ -61,10 +62,9 @@ export function SelectMenu({
   const current = options.find((o) => o.value === value);
   const [filter, setFilter] = useState("");
   const showFilter = searchable && options.length > searchThreshold;
-  const q = filter.trim().toLowerCase();
   const filtered = useMemo(
-    () => (showFilter && q ? options.filter((o) => o.label.toLowerCase().includes(q)) : options),
-    [options, q, showFilter],
+    () => (showFilter ? filterByText(options, filter, (o) => o.label) : options),
+    [options, filter, showFilter],
   );
   return (
     <DropdownMenu.Root>

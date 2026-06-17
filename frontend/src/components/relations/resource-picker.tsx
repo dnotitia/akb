@@ -28,39 +28,54 @@ export function ResourcePicker({ vault, excludeUri, value, onChange }: ResourceP
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<PickedResource[]>([]);
   const [loading, setLoading] = useState(false);
+  const [searchError, setSearchError] = useState(false);
   const [open, setOpen] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
 
   // Debounced search. A blank query clears results rather than listing the corpus.
+  // `cancelled` lives at effect scope (not inside setTimeout) so the cleanup
+  // actually flips it — an in-flight request that resolves after the user types
+  // again, clears the box, or unmounts must not clobber newer state.
   useEffect(() => {
     const q = query.trim();
     if (!q) {
       setResults([]);
       setLoading(false);
+      setSearchError(false);
       return;
     }
+    let cancelled = false;
     setLoading(true);
     const t = setTimeout(() => {
-      let cancelled = false;
       searchDocs(q, vault, 8)
         .then((r) => {
           if (cancelled) return;
+          setSearchError(false);
           const rows: PickedResource[] = (r.results || [])
-            .map((d: any) => ({
-              uri: d.uri as string,
-              title: (d.title as string) || (d.path as string) || d.uri,
-              path: (d.path as string) || parseUri(d.uri)?.id || "",
+            .map((d: { uri?: string; title?: string; path?: string }) => ({
+              uri: d.uri ?? "",
+              title: d.title || d.path || d.uri || "",
+              path: d.path || parseUri(d.uri)?.id || "",
             }))
-            .filter((d: PickedResource) => d.uri && d.uri !== excludeUri);
+            .filter((d) => d.uri && d.uri !== excludeUri);
           setResults(rows);
         })
-        .catch(() => !cancelled && setResults([]))
-        .finally(() => !cancelled && setLoading(false));
-      return () => {
-        cancelled = true;
-      };
+        .catch((e) => {
+          if (cancelled) return;
+          // Surface as a distinct state — a backend/network failure must not
+          // masquerade as a genuine "no matching documents" empty result.
+          console.error("ResourcePicker: target search failed", e);
+          setSearchError(true);
+          setResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
     }, 250);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
   }, [query, vault, excludeUri]);
 
   // Dismiss the popdown on an outside click.
@@ -118,7 +133,11 @@ export function ResourcePicker({ vault, excludeUri, value, onChange }: ResourceP
         <div className="absolute z-[var(--z-popover)] mt-1 max-h-60 w-full overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md">
           {results.length === 0 ? (
             <div className="px-3 py-2 text-xs text-foreground-muted">
-              {loading ? "Searching…" : "No matching documents"}
+              {loading
+                ? "Searching…"
+                : searchError
+                  ? "Search is unavailable — try again."
+                  : "No matching documents"}
             </div>
           ) : (
             results.map((r) => (
