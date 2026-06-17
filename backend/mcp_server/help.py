@@ -930,9 +930,22 @@ akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections c
 | name | ✓ | Table name |
 | description | | What this table is for |
 | columns | ✓ | Column definitions |
+| unique_keys | | Declarative UNIQUE keys: `[{name?, columns}]` |
+| indexes | | Declarative lookup indexes: `[{name?, columns}]` |
 
 ## Column Types
 `text`, `number`, `boolean`, `date`, `json`
+
+## Unique keys & indexes
+- `unique_keys` — single or composite UNIQUE constraints. Each item is
+  `{name?, columns}`; `columns` is a list of existing column names.
+  Omit `name` and AKB generates a deterministic, stable name. Use this
+  (NOT `indexes`) when you want uniqueness enforced.
+- `indexes` — plain lookup (btree) indexes. Each item is `{name?, columns}`;
+  a column is a bare string or `{name, order}` with order `asc` (default)
+  or `desc`.
+- Declarative only — no raw SQL. Reserved bookkeeping columns
+  (id/created_at/updated_at/created_by) cannot be referenced.
 
 ## Example
 ```
@@ -944,7 +957,9 @@ akb_create_table(vault="finance", name="invoices",
     {"name": "status", "type": "text"},
     {"name": "due_date", "type": "date"},
     {"name": "metadata", "type": "json"}
-  ])
+  ],
+  unique_keys=[{"columns": ["client", "due_date"]}],
+  indexes=[{"columns": ["status", {"name": "due_date", "order": "desc"}]}])
 ```""",
 
     "akb_list_vaults": """# akb_list_vaults — List Accessible Vaults
@@ -1331,13 +1346,29 @@ The `confirm` parameter must match the vault name. Owner only.""",
 | add_columns | | Columns to add: [{"name": "col", "type": "text"}] |
 | drop_columns | | Column names to remove: ["old_col"] |
 | rename_columns | | Rename map: {"old_name": "new_name"} |
+| add_unique_keys | | UNIQUE keys to add: [{name?, columns}] |
+| drop_unique_keys | | UNIQUE-key names to drop: ["uk_name"] |
+| add_indexes | | Lookup indexes to add: [{name?, columns}] |
+| drop_indexes | | Index names to drop: ["idx_name"] |
+
+## Unique keys & indexes
+- `add_unique_keys` / `add_indexes` mirror the `akb_create_table` shape.
+- Adding a UNIQUE key on a table that already has data PREFLIGHTS for
+  duplicate rows; if any are found the whole alter fails BEFORE any DDL
+  (schema + metadata unchanged) and the error names the duplicate key
+  columns.
+- Drop by the resolved name shown in the table's `unique_keys` /
+  `indexes` metadata.
 
 ## Example
 ```
 akb_alter_table(uri="akb://eng/table/tasks",
   add_columns=[{"name": "priority", "type": "number"}],
   drop_columns=["old_field"],
-  rename_columns={"desc": "description"})
+  rename_columns={"desc": "description"},
+  add_unique_keys=[{"name": "uq_slug", "columns": ["slug"]}],
+  add_indexes=[{"columns": [{"name": "priority", "order": "desc"}]}],
+  drop_indexes=["vt_eng__tasks__old_field__idx"])
 ```
 
 Requires admin role.""",

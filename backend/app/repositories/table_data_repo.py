@@ -17,7 +17,10 @@ row-CRUD API is added later it will live in this module.
 
 from __future__ import annotations
 
+import hashlib
 import re
+
+from app.exceptions import ValidationError
 
 
 TYPE_MAP = {
@@ -127,6 +130,126 @@ async def rename_column(conn, pg_name: str, old_name: str, new_name: str) -> Non
     await conn.execute(
         f"ALTER TABLE {pg_name} RENAME COLUMN {old_name} TO {new_name}"
     )
+
+
+# ── Constraint / index DDL (AKB #215) ────────────────────────────
+
+
+# Closed enum for index column ordering. Never interpolate a raw user
+# value into DDL — map through this dict so only ASC/DESC can ever
+# reach the SQL string.
+_ORDER_SQL = {"asc": "ASC", "desc": "DESC"}
+
+
+def generate_constraint_name(pg_name: str, columns: list[str], *, kind: str) -> str:
+    """Deterministic, schema-global-safe name for a generated UNIQUE
+    constraint (``kind='uk'``) or index (``kind='idx'``).
+
+    Index names — and a UNIQUE constraint's implicit index name — are
+    SCHEMA-GLOBAL in PostgreSQL, so the generated name is namespaced by
+    the physical table (``pg_name``) to avoid cross-table collisions.
+
+    Shape: ``{pg_name}__{cols joined by _}_{digest}__{kind}``. ``digest``
+    is the first 8 hex chars of a ``hashlib.sha1`` over the NUL-joined
+    ``(pg_name, kind, *columns)`` tuple — pure ``hashlib`` (no randomness,
+    stable across calls/processes). It is ALWAYS present, for two reasons:
+    (1) it disambiguates column lists whose underscore-flattened forms
+    collide (``["a","b"]`` and ``["a_b"]`` both flatten to ``a_b``) — NUL
+    can never occur in a column name, so distinct lists always hash
+    differently; (2) when the readable part would exceed
+    ``PG_IDENT_MAX_LEN`` bytes it is truncated and the digest tail keeps
+    the result collision-safe.
+    """
+    suffix = f"__{kind}"
+    cols_part = "_".join(safe_ident(c) for c in columns)
+    # usedforsecurity=False: this digest is a collision-avoidance tag for a
+    # PG identifier, not a security primitive — SHA-1 is fine and the flag
+    # keeps static analysis (bandit B324) from flagging it as weak crypto.
+    digest = hashlib.sha1(
+        "\x00".join([pg_name, kind, *columns]).encode(), usedforsecurity=False
+    ).hexdigest()[:8]
+    logical = f"{pg_name}__{cols_part}_{digest}{suffix}"
+    if len(logical.encode()) <= PG_IDENT_MAX_LEN:
+        return logical
+    tail = f"_{digest}{suffix}"
+    # Keep the leading readable bytes; reserve room for the digest tail.
+    budget = PG_IDENT_MAX_LEN - len(tail.encode())
+    readable = f"{pg_name}__{cols_part}".encode()[:budget].decode(errors="ignore")
+    return f"{readable}{tail}"
+
+
+async def create_unique_constraint(
+    conn, pg_name: str, name: str, columns: list[str],
+) -> None:
+    """``ALTER TABLE {pg} ADD CONSTRAINT {name} UNIQUE ({cols})``.
+
+    Every identifier flows through ``safe_ident``; caller is expected to
+    have validated/resolved ``name`` already (see service layer)."""
+    safe_name = safe_ident(name)
+    cols = ", ".join(safe_ident(c) for c in columns)
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD CONSTRAINT {safe_name} UNIQUE ({cols})"
+    )
+
+
+async def drop_constraint(conn, pg_name: str, name: str) -> None:
+    safe_name = safe_ident(name)
+    await conn.execute(
+        f"ALTER TABLE {pg_name} DROP CONSTRAINT IF EXISTS {safe_name}"
+    )
+
+
+async def create_index(
+    conn, pg_name: str, name: str, cols_with_order: list[tuple[str, str]],
+) -> None:
+    """``CREATE INDEX {name} ON {pg} ({col [ASC|DESC], ...})``.
+
+    ``cols_with_order`` is a list of ``(column, order)`` where order is
+    ``'asc'`` / ``'desc'`` (the closed enum). Identifiers via
+    ``safe_ident``; order via the ``_ORDER_SQL`` map — an unknown order
+    raises ``ValidationError`` rather than reaching the DDL string."""
+    safe_name = safe_ident(name)
+    parts = []
+    for col, order in cols_with_order:
+        order_sql = _ORDER_SQL.get((order or "asc").lower())
+        if order_sql is None:
+            raise ValidationError(
+                f"Invalid index order {order!r}: must be 'asc' or 'desc'."
+            )
+        parts.append(f"{safe_ident(col)} {order_sql}")
+    await conn.execute(
+        f"CREATE INDEX {safe_name} ON {pg_name} ({', '.join(parts)})"
+    )
+
+
+async def drop_index(conn, name: str) -> None:
+    safe_name = safe_ident(name)
+    await conn.execute(f"DROP INDEX IF EXISTS {safe_name}")
+
+
+async def unique_key_duplicates(
+    conn, pg_name: str, columns: list[str], limit: int = 5,
+) -> list[dict]:
+    """Preflight a candidate UNIQUE key against EXISTING data.
+
+    Returns up to ``limit`` groups of the *key columns only* (no other
+    columns leaked) that already have COUNT(*) > 1 — i.e. rows that
+    would violate the constraint. An empty list means the key can be
+    added safely.
+
+    ``SELECT {cols}, COUNT(*) FROM {pg} GROUP BY {cols} HAVING COUNT(*) > 1 LIMIT {n}``
+    — identifiers via ``safe_ident``; ``limit`` is coerced to ``int``."""
+    safe_cols = [safe_ident(c) for c in columns]
+    col_list = ", ".join(safe_cols)
+    lim = int(limit)
+    rows = await conn.fetch(
+        f"SELECT {col_list}, COUNT(*) AS dup_count "
+        f"FROM {pg_name} "
+        f"GROUP BY {col_list} "
+        f"HAVING COUNT(*) > 1 "
+        f"LIMIT {lim}"
+    )
+    return [dict(r) for r in rows]
 
 
 # ── SQL rewriting (for execute_sql + table_query share path) ─────

@@ -32,7 +32,8 @@ async def find_by_name(conn, vault_id: uuid.UUID, name: str) -> dict | None:
     row = await conn.fetchrow(
         """
         SELECT vt.id, vt.vault_id, vt.collection_id, c.path AS collection,
-               vt.name, vt.description, vt.columns, vt.created_by,
+               vt.name, vt.description, vt.columns,
+               vt.unique_keys, vt.indexes, vt.created_by,
                vt.created_at, vt.updated_at
           FROM vault_tables vt
           LEFT JOIN collections c ON c.id = vt.collection_id
@@ -76,7 +77,8 @@ async def list_for_vault(
             rows = await conn.fetch(
                 """
                 SELECT vt.id, vt.collection_id, c.path AS collection,
-                       vt.name, vt.description, vt.columns, vt.created_at
+                       vt.name, vt.description, vt.columns,
+                       vt.unique_keys, vt.indexes, vt.created_at
                   FROM vault_tables vt
                   LEFT JOIN collections c ON c.id = vt.collection_id
                  WHERE vt.vault_id = $1 AND vt.collection_id IS NULL
@@ -88,7 +90,8 @@ async def list_for_vault(
             rows = await conn.fetch(
                 """
                 SELECT vt.id, vt.collection_id, c.path AS collection,
-                       vt.name, vt.description, vt.columns, vt.created_at
+                       vt.name, vt.description, vt.columns,
+                       vt.unique_keys, vt.indexes, vt.created_at
                   FROM vault_tables vt
                   LEFT JOIN collections c ON c.id = vt.collection_id
                  WHERE vt.vault_id = $1 AND vt.collection_id = $2
@@ -131,7 +134,8 @@ async def list_for_vault(
         # the desired scoping behaviour.
         sql = (
             "SELECT vt.id, vt.collection_id, c.path AS collection, "
-            "       vt.name, vt.description, vt.columns, vt.created_at "
+            "       vt.name, vt.description, vt.columns, "
+            "       vt.unique_keys, vt.indexes, vt.created_at "
             "  FROM vault_tables vt "
             "  LEFT JOIN collections c ON c.id = vt.collection_id "
             " WHERE vt.vault_id = $1"
@@ -144,7 +148,8 @@ async def list_for_vault(
         rows = await conn.fetch(
             """
             SELECT vt.id, vt.collection_id, c.path AS collection,
-                   vt.name, vt.description, vt.columns, vt.created_at
+                   vt.name, vt.description, vt.columns,
+                   vt.unique_keys, vt.indexes, vt.created_at
               FROM vault_tables vt
               LEFT JOIN collections c ON c.id = vt.collection_id
              WHERE vt.vault_id = $1
@@ -166,16 +171,21 @@ async def insert(
     created_by: str | None,
     now: datetime,
     collection_id: uuid.UUID | None = None,
+    unique_keys: list[dict] | None = None,
+    indexes: list[dict] | None = None,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO vault_tables
             (id, vault_id, collection_id, name, description, columns,
+             unique_keys, indexes,
              created_by, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         """,
         table_id, vault_id, collection_id, name, description,
-        json.dumps(columns), created_by, now,
+        json.dumps(columns),
+        json.dumps(unique_keys or []), json.dumps(indexes or []),
+        created_by, now,
     )
 
 
@@ -190,10 +200,39 @@ async def update_columns(conn, table_id: uuid.UUID, columns: list[dict]) -> None
     )
 
 
+async def update_schema_meta(
+    conn,
+    table_id: uuid.UUID,
+    *,
+    unique_keys: list[dict],
+    indexes: list[dict],
+) -> None:
+    """Persist the resolved ``unique_keys`` / ``indexes`` metadata.
+
+    Called inside the same TX as the physical DDL so the registry can
+    never drift from the live schema (AKB #215 AC #10)."""
+    await conn.execute(
+        "UPDATE vault_tables "
+        "   SET unique_keys = $1, indexes = $2, updated_at = NOW() "
+        " WHERE id = $3",
+        json.dumps(unique_keys), json.dumps(indexes), table_id,
+    )
+
+
 def parse_columns(raw: Any) -> list[dict]:
     """Normalise the `columns` jsonb to list[dict]. asyncpg returns it as
     a pre-parsed list normally, but legacy rows inserted as JSON string
     literals come back as `str` — handle both."""
+    if isinstance(raw, str):
+        return ensure_list(raw)
+    return list(raw) if raw else []
+
+
+def parse_json_list(raw: Any) -> list[dict]:
+    """Normalise a JSONB list column (``unique_keys`` / ``indexes``) to
+    ``list[dict]``. Mirrors :func:`parse_columns`: asyncpg usually
+    returns a pre-parsed list, but legacy rows inserted as JSON string
+    literals come back as ``str`` — handle both, and ``None`` → ``[]``."""
     if isinstance(raw, str):
         return ensure_list(raw)
     return list(raw) if raw else []

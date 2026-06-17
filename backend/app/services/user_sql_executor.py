@@ -65,6 +65,22 @@ class PermissionDeniedError(Exception):
         self.pg_sqlstate = pg_sqlstate
 
 
+class UniqueViolationError(Exception):
+    """Raised when PG returns SQLSTATE 23505 for the user-supplied SQL.
+
+    An INSERT/UPDATE that breaks a declared unique key (#215) surfaces
+    here. Like `PermissionDeniedError`, we hold the PG message and
+    sqlstate so the caller can pin a *stable* envelope (a dedicated
+    code + `pg_sqlstate='23505'`) rather than letting 23505 fall
+    through the generic SQL_ERROR catch-all. The generated/declared
+    constraint name is embedded in the PG message verbatim.
+    """
+
+    def __init__(self, message: str, pg_sqlstate: str = "23505") -> None:
+        super().__init__(message)
+        self.pg_sqlstate = pg_sqlstate
+
+
 # ── Executor ──────────────────────────────────────────────────
 
 
@@ -137,6 +153,17 @@ class UserSqlExecutor:
                 "PG denied user_sql for user=%s: %s", user_id, e,
             )
             raise PermissionDeniedError(str(e), pg_sqlstate="42501") from e
+        except asyncpg.exceptions.UniqueViolationError as e:
+            # SQLSTATE 23505 — an INSERT/UPDATE broke a declared unique
+            # key (#215). This is the *contracted* conflict path: surface
+            # it under a dedicated stable code with pg_sqlstate attached
+            # so callers can key off 23505 (and the constraint name in
+            # the verbatim PG message), instead of the generic SQL_ERROR
+            # catch-all that drops pg_sqlstate.
+            logger.info(
+                "PG unique violation in user_sql for user=%s: %s", user_id, e,
+            )
+            raise UniqueViolationError(str(e), pg_sqlstate="23505") from e
         except asyncpg.exceptions.UndefinedTableError:
             # 42P01 — table doesn't exist OR exists but role can't see it.
             # PG reports the same code for both ("relation X does not

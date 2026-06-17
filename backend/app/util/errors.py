@@ -52,6 +52,7 @@ INVALID_PATH = "invalid_path"              # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"                      # version / expected-state mismatch
+UNIQUE_VIOLATION = "unique_violation"      # PG 23505 — INSERT/UPDATE breaks a unique key
 NO_OP = "no_op"                            # nothing to update / already in state
 EDIT_FAILED = "edit_failed"                # akb_edit: old_string match / uniqueness failure
 
