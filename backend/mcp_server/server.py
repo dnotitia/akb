@@ -42,6 +42,7 @@ from app.services.access_service import (
 from app.services.auth_service import resolve_token
 from app.util.errors import (
     err,
+    exception_envelope,
     CONFLICT,
     EDIT_FAILED,
     INTERNAL,
@@ -1275,8 +1276,11 @@ async def call_tool(name: str, arguments: dict):
         # unhandled exceptions that bubble up past handler-level
         # try/except blocks. Specific handlers should still catch their
         # known failure modes and return err(...) with a more precise
-        # code; this only catches what nothing else does.
-        envelope = err(str(e), code=INTERNAL)
+        # code; this maps the known AKBError subclasses (notably the
+        # access-guard ForbiddenError/NotFoundError raised before a
+        # handler's try) to their canonical codes and only labels the
+        # genuinely-unexpected as internal.
+        envelope = exception_envelope(e)
         # Audit the failure too — a crashing tool call is exactly what a
         # security review wants to see. record_tool never raises.
         audit_log.record_tool(name, arguments, user, envelope)

@@ -5,6 +5,23 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.17 — 2026-06-17  *(fix — MCP access-guard errors get stable codes, not code=internal, #221)*
+
+`check_vault_access` raises `ForbiddenError` / `NotFoundError` *outside* the
+per-handler try/except blocks, so the central `call_tool` dispatch's last-resort
+`except Exception -> code=internal` mislabeled every permission denial /
+missing-vault reference on admin/access-gated tools (`akb_alter_table`,
+`akb_drop_table`, `akb_grant`, `akb_vault_info`, …) as a 500-shaped `internal`
+instead of the 4xx it is. The gate always worked (the call is rejected before any
+side effect) — only the surfaced code was wrong.
+
+New pure helper `exception_envelope(e)` in `app/util/errors.py` maps known
+`AKBError` subclasses to their canonical codes (`ForbiddenError ->
+permission_denied`, `NotFoundError -> not_found`, `ConflictError -> conflict`,
+`ValidationError -> invalid_argument`); anything else stays `internal`. Living in
+the error-shape module (no import-time side effects) keeps it unit-testable
+without importing the MCP server. New `test_mcp_error_envelope_unit.py` +
+`test_forbidden_permission_code_e2e.sh` (registered in the CI shell-e2e gate).
 ## 0.8.16 — 2026-06-17  *(feat — declarative unique keys + indexes on the table DDL tools, #215)*
 
 `akb_create_table` accepts optional declarative `unique_keys` and `indexes`;

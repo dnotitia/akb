@@ -31,6 +31,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
+
 
 # ── Stable error codes ────────────────────────────────────────
 #
@@ -103,3 +110,26 @@ def err(
     if details:
         out["details"] = details
     return out
+
+
+def exception_envelope(e: Exception) -> dict:
+    """Map a bubbled-up exception to the canonical ``err()`` envelope.
+
+    Access guards (``check_vault_access``) raise ``AKBError`` subclasses
+    *outside* the per-handler try/except blocks, so a permission denial
+    (``ForbiddenError``) or a missing vault (``NotFoundError``) would otherwise
+    fall through the MCP dispatch's generic ``code=internal`` catch-all — which
+    reads as a 500 to clients rather than the 4xx it is. Known ``AKBError``
+    subclasses get their canonical, stable code; anything else is a genuine
+    internal error. Lives here (no import-time side effects) so it stays unit-
+    testable without importing the MCP server. See dnotitia/akb#221.
+    """
+    if isinstance(e, ForbiddenError):
+        return err(str(e), code=PERMISSION_DENIED)
+    if isinstance(e, NotFoundError):
+        return err(str(e), code=NOT_FOUND)
+    if isinstance(e, ConflictError):
+        return err(str(e), code=CONFLICT)
+    if isinstance(e, ValidationError):
+        return err(str(e), code=INVALID_ARGUMENT)
+    return err(str(e), code=INTERNAL)
