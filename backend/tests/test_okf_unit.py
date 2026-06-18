@@ -192,11 +192,13 @@ class TestImport:
         assert r["tags"] == ["api"]
         assert r["content"] == "# API v2\nBody."
 
-    def test_unknown_type_clamped_and_preserved_as_tag(self):
-        bundle = {"r.md": "---\ntype: runbook\ntitle: R\n---\nbody\n"}
+    def test_custom_type_preserved_verbatim(self):
+        # AKB types are open — an OKF producer-defined type imports as-is,
+        # no clamping, no lossy tag.
+        bundle = {"r.md": "---\ntype: runbook\ntitle: R\ntags:\n- ops\n---\nbody\n"}
         r = parse_okf_bundle(bundle)[0]
-        assert r["type"] == "reference"  # 'runbook' not in AKB enum → clamped
-        assert "okf-type:runbook" in r["tags"]
+        assert r["type"] == "runbook"
+        assert r["tags"] == ["ops"]  # no synthetic okf-type tag added
 
     def test_reserved_files_skipped(self):
         bundle = {
@@ -211,7 +213,7 @@ class TestImport:
         # Permissive consumer: no frontmatter → imported as a note, not rejected.
         recs = parse_okf_bundle({"a.md": "# Just a heading\n\ntext"})
         assert len(recs) == 1
-        assert recs[0]["type"] == "reference"
+        assert recs[0]["type"] == "note"  # default when no type present
         assert "Just a heading" in recs[0]["content"]
 
     def test_round_trip_document_preserves_core_fields(self):

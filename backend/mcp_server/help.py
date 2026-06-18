@@ -127,7 +127,9 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
 
 ## Document Types
-`note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`
+Free-form — any string is accepted. Recommended vocabulary:
+`note` (default), `report`, `decision`, `spec`, `plan`, `session`, `task`, `reference`, `skill`.
+Use a custom value when none fit (e.g. an OKF concept type).
 
 ## Document Status
 `draft` (default) → `active` → `archived`. Soft lifecycle signal; `archived`
@@ -652,7 +654,7 @@ akb_help(topic="link-resources")    # Workflow guide
 | title | ✓ | Document title |
 | slug | | Optional filename slug. When omitted, the path is derived from `title`; pass this to pin a stable URI filename independently of the display title. |
 | content | ✓ | Markdown body |
-| type | | note, report, decision, spec, plan, session, task, reference |
+| type | | free-form; recommended: note, report, decision, spec, plan, session, task, reference, skill |
 | tags | | ["auth", "api"] |
 | domain | | engineering, product, ops, legal, etc. |
 | summary | | Brief summary (auto-generated if omitted) |
@@ -829,7 +831,7 @@ Combines vector similarity (meaning) with keyword matching.
 | query | ✓ | Natural language search query |
 | vault | | Limit to specific vault |
 | collection | | Limit to specific collection |
-| type | | Filter: note, report, decision, spec, plan, session, task, reference |
+| type | | Filter by type (any string); common: note, report, decision, spec, plan, session, task, reference, skill |
 | tags | | Filter by tags |
 | limit | | Max results (default 10, max 50) |
 
