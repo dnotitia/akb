@@ -112,9 +112,10 @@ echo "$D1" | grep -q '"uri"' && pass "Doc 1 created (specs/)" || fail "Doc1" "$D
 D2=$(mcp_call akb_put "{\"vault\":\"$SRC_VAULT\",\"title\":\"Readme\",\"content\":\"# Readme\\n\\nRoot doc.\",\"type\":\"note\"}" | mcp_result)
 echo "$D2" | grep -q '"uri"' && pass "Doc 2 created (root)" || fail "Doc2" "$D2"
 
-# Table is best-effort: column type names are environment-dependent; the
-# concept-doc transform itself is covered by the unit suite.
-TBL=$(mcp_call akb_create_table "{\"vault\":\"$SRC_VAULT\",\"name\":\"metrics\",\"columns\":[{\"name\":\"region\",\"type\":\"text\"},{\"name\":\"hits\",\"type\":\"integer\"}]}" | mcp_result)
+# Table column types are AKB's set: text | number | boolean | date | json.
+# Best-effort (the concept-doc transform itself is covered by the unit suite),
+# but with a valid type the table→OKF-concept path is exercised live too.
+TBL=$(mcp_call akb_create_table "{\"vault\":\"$SRC_VAULT\",\"name\":\"metrics\",\"columns\":[{\"name\":\"region\",\"type\":\"text\"},{\"name\":\"hits\",\"type\":\"number\"}]}" | mcp_result)
 HAS_TABLE=0
 if echo "$TBL" | grep -q '"uri"'; then HAS_TABLE=1; note "table 'metrics' created"; else note "table create skipped ($TBL)"; fi
 
