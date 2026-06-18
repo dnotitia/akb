@@ -221,10 +221,19 @@ export default function SearchPage() {
   const showLiteralHint = mode === "dense" && isShortQuery && searched && !loading;
 
   const allTypesActive = activeTypes.size === ALL_TYPES.length;
+  // `type` is free-form on the backend (recommended vocabulary, not a closed
+  // enum), so a result may carry a type with no chip here (e.g. an OKF-imported
+  // concept type). The chips only gate the known/recommended types; an unknown
+  // type has no chip to toggle, so it must always pass — otherwise narrowing the
+  // filter would silently hide custom-typed docs with no way to bring them back.
+  const knownTypes = new Set<string>(ALL_TYPES);
   const filteredDense = allTypesActive
     ? denseResults
     : denseResults.filter(
-        (r) => !r.doc_type || activeTypes.has(r.doc_type as DocTypeFilter),
+        (r) =>
+          !r.doc_type ||
+          !knownTypes.has(r.doc_type) ||
+          activeTypes.has(r.doc_type as DocTypeFilter),
       );
   const groupedDense = groupByType(filteredDense);
   // Drive render gates off actual array length, not the count field (a falsy

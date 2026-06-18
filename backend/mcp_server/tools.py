@@ -135,8 +135,12 @@ TOOLS = [
                 "content": {"type": "string", "description": "Document body in Markdown"},
                 "type": {
                     "type": "string",
-                    "description": "Document type",
-                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
+                    "description": (
+                        "Document type. Free-form — any string is accepted. "
+                        "Recommended vocabulary: note (default), report, decision, "
+                        "spec, plan, session, task, reference, skill. Use a custom "
+                        "value when none fit (e.g. an OKF concept type)."
+                    ),
                     "default": "note",
                 },
                 "status": {
@@ -378,8 +382,10 @@ TOOLS = [
                 "collection": {"type": "string", "description": "Limit search to a specific collection"},
                 "type": {
                     "type": "string",
-                    "description": "Filter by document type",
-                    "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
+                    "description": (
+                        "Filter by document type (any string). Common values: note, "
+                        "report, decision, spec, plan, session, task, reference, skill."
+                    ),
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags"},
                 "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
