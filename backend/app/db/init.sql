@@ -404,3 +404,24 @@ CREATE INDEX IF NOT EXISTS idx_todos_created_by ON todos(created_by);
 -- is now expressed as a vault (agent-memory-{username}) with per-session
 -- collections, driven by the /api/v1/agent-sessions REST endpoints.
 -- Existing rows are dropped by migration 031.
+
+-- ============================================================
+-- Shared trigger function: auto-bump `updated_at` on UPDATE.
+-- ============================================================
+-- PostgreSQL has no MySQL-style ON UPDATE CURRENT_TIMESTAMP, so the
+-- dynamic vault data tables (`vt_*`) attach a BEFORE UPDATE trigger that
+-- calls this function (see `table_data_repo.create_dynamic_table`).
+-- Defined here so init.sql-only bootstraps (unit tests, bare CI DBs) have
+-- the function BEFORE `create_dynamic_table` references it. Migration 038
+-- also CREATE OR REPLACEs it (for DBs provisioned before this line existed)
+-- and backfills the trigger onto pre-existing `vt_*` tables. SECURITY
+-- INVOKER (the default) is correct: the assignment needs no privilege
+-- beyond NOW(), so it runs unchanged under the per-user `akb_user_<uid>`
+-- role that `akb_sql` switches into.
+CREATE OR REPLACE FUNCTION akb_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;

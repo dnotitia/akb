@@ -98,6 +98,17 @@ async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     await conn.execute(f'CREATE TABLE {pg_name} ({", ".join(col_defs)})')
+    # Auto-bump `updated_at` on every UPDATE. PG has no MySQL-style
+    # `ON UPDATE CURRENT_TIMESTAMP`, and user SQL reaches the table verbatim
+    # through `execute_sql` (no app-layer `SET updated_at = NOW()` hook), so a
+    # BEFORE UPDATE trigger is the only robust place to enforce it. The shared
+    # `akb_set_updated_at()` function is created by migration 038 (and exists
+    # before any runtime create, since migrations run at startup).
+    await conn.execute(
+        f"CREATE TRIGGER akb_set_updated_at_trigger "
+        f"BEFORE UPDATE ON {pg_name} "
+        f"FOR EACH ROW EXECUTE FUNCTION akb_set_updated_at()"
+    )
 
 
 async def drop_dynamic_table(conn, pg_name: str) -> None:
