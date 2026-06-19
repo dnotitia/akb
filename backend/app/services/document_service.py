@@ -711,7 +711,10 @@ class DocumentService:
             name_by_key[r["id"]] = r["name"]
             name_by_key[r["username"]] = r["name"]
         for e in entries:
-            name = name_by_key.get(e.get("author"))
+            author = e.get("author")
+            if not author:
+                continue
+            name = name_by_key.get(author)
             if name:
                 e["author_name"] = name
         return entries
