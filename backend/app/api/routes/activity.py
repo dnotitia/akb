@@ -14,12 +14,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
+from app.services.document_service import DocumentService
 from app.services.git_service import GitService
 from app.db.postgres import get_pool
 from app.repositories.document_repo import DocumentRepository
 
 router = APIRouter()
 git = GitService()
+doc_service = DocumentService()
 
 
 def _is_uuid(value: str | None) -> bool:
@@ -177,3 +179,23 @@ async def document_diff(
             raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
     return git.file_diff(vault, doc["path"], commit)
+
+
+@router.get("/history/{vault}/{doc_id:path}", summary="Get document version history (Git-based)")
+async def document_history(
+    vault: str,
+    doc_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """REST mirror of the akb_history MCP tool.
+
+    Lives under /history/... (not nested in /documents/...) so the greedy
+    {doc_id:path} converter on GET /documents/{vault}/{doc_id} — registered
+    first — can't swallow the /history suffix. Business logic (doc lookup,
+    created_at lineage boundary, author_name annotation) is shared via
+    DocumentService.history(); a missing vault/doc raises NotFoundError,
+    which the global AKBError handler maps to 404.
+    """
+    await check_vault_access(user.user_id, vault, required_role="reader")
+    return await doc_service.history(vault, doc_id, limit=limit)

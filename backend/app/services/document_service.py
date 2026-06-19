@@ -149,6 +149,7 @@ class EditError(AKBError):
 
 from app.util.text import normalize_collection_path as _normalize_collection
 from app.util.text import slugify
+from app.util.text import to_nfc
 from app.util.text import doc_path as _doc_path
 from app.util.text import split_doc_path as _split_doc_path
 from app.util.text import strip_own_suffix as _strip_own_suffix
@@ -641,6 +642,82 @@ class DocumentService:
             # banner alongside the historical body.
             metadata_is_current=True,
         )
+
+    async def history(self, vault: str, doc_ref: str, limit: int = 20) -> dict:
+        """Version history of a document — who changed it, when, and why.
+
+        Single source of truth behind both the ``akb_history`` MCP tool and
+        ``GET /api/v1/history/{vault}/{doc}``. Each entry is a git commit.
+
+        The doc's ``created_at`` is passed to git as a lineage boundary so
+        commits from a *previous* document at the same path (deleted-and-
+        recreated) don't leak into this doc's history — git keys by path,
+        not by document identity. Each entry is annotated with a human
+        ``author_name`` resolved from the git author.
+
+        Raises ``NotFoundError`` for a missing vault or document; callers
+        leave the HTTP/MCP mapping to the global error handlers.
+        """
+        doc_ref = to_nfc(doc_ref)
+        vault_repo, doc_repo, _ = await self._repos()
+
+        vault_id = await vault_repo.get_id_by_name(vault)
+        if not vault_id:
+            raise NotFoundError("Vault", vault)
+
+        row = await doc_repo.find_by_ref(vault_id, doc_ref)
+        if not row:
+            raise NotFoundError("Document", doc_ref)
+
+        since_epoch = None
+        created_at = row.get("created_at")
+        if created_at is not None:
+            since_epoch = int(created_at.timestamp())
+
+        entries = await asyncio.to_thread(
+            self.git.file_log,
+            vault, row["path"],
+            max_count=limit, since_epoch=since_epoch,
+        )
+        entries = await self._annotate_history_authors(entries)
+        return {"uri": doc_uri(row["vault_name"], row["path"]), "history": entries}
+
+    async def _annotate_history_authors(self, entries: list[dict]) -> list[dict]:
+        """Add a human ``author_name`` to each ``file_log`` entry.
+
+        The write path sets the git author name to the actor's ``agent_id``,
+        which is the user's ``username`` (see ``put``/``update``). Legacy or
+        external-git rows may instead carry a user UUID. Resolve *either*
+        form to ``display_name`` (falling back to username) in one batched
+        query so the UI shows a real name. Authors that match no user (e.g.
+        external-git imports) keep only the raw ``author``.
+        """
+        authors = {e["author"] for e in entries if e.get("author")}
+        if not authors:
+            return entries
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id::text AS id, username,
+                       COALESCE(display_name, username) AS name
+                  FROM users
+                 WHERE id::text = ANY($1) OR username = ANY($1)
+                """,
+                list(authors),
+            )
+        name_by_key: dict[str, str] = {}
+        for r in rows:
+            name_by_key[r["id"]] = r["name"]
+            name_by_key[r["username"]] = r["name"]
+        for e in entries:
+            author = e.get("author")
+            if not author:
+                continue
+            name = name_by_key.get(author)
+            if name:
+                e["author_name"] = name
+        return entries
 
     async def _get_public_slug(self, vault_name: str, doc_path: str) -> str | None:
         """Return the newest publication slug for a document, or None.
