@@ -31,20 +31,20 @@ def _patch_pool(monkeypatch, *, fetch_rows):
 async def test_resolves_by_username_and_uuid_dual_keyed(monkeypatch):
     rows = [
         {"id": "00000000-0000-0000-0000-000000000000",
-         "username": "younglo_kim", "name": "Younglo Kim"},
+         "username": "carol", "name": "Carol Carter"},
         {"id": "11111111-1111-1111-1111-111111111111",
          "username": "alice", "name": "Alice A"},
     ]
     conn = _patch_pool(monkeypatch, fetch_rows=rows)
 
     out = await user_directory.resolve_display_names(
-        ["younglo_kim", "11111111-1111-1111-1111-111111111111", "ghost"]
+        ["carol", "11111111-1111-1111-1111-111111111111", "ghost"]
     )
 
     # Each matched user is keyed by BOTH its id and its username, so a caller
     # resolves by whichever token it holds.
-    assert out["younglo_kim"] == "Younglo Kim"
-    assert out["00000000-0000-0000-0000-000000000000"] == "Younglo Kim"
+    assert out["carol"] == "Carol Carter"
+    assert out["00000000-0000-0000-0000-000000000000"] == "Carol Carter"
     assert out["11111111-1111-1111-1111-111111111111"] == "Alice A"
     assert out["alice"] == "Alice A"
     assert "ghost" not in out
@@ -52,7 +52,7 @@ async def test_resolves_by_username_and_uuid_dual_keyed(monkeypatch):
     conn.fetch.assert_called_once()
     keys = conn.fetch.call_args.args[1]
     assert set(keys) == {
-        "younglo_kim", "11111111-1111-1111-1111-111111111111", "ghost",
+        "carol", "11111111-1111-1111-1111-111111111111", "ghost",
     }
 
 

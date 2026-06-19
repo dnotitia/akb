@@ -112,13 +112,13 @@ async def test_annotate_authors_resolves_username_and_uuid(monkeypatch):
     carry a UUID. Both forms resolve to display_name in one query; an
     unknown author keeps only its raw value."""
     entries = [
-        {"hash": "a", "author": "younglo_kim"},
+        {"hash": "a", "author": "carol"},
         {"hash": "b", "author": "11111111-1111-1111-1111-111111111111"},
         {"hash": "c", "author": "external-committer"},
     ]
     rows = [
         {"id": "00000000-0000-0000-0000-000000000000",
-         "username": "younglo_kim", "name": "Younglo Kim"},
+         "username": "carol", "name": "Carol Carter"},
         {"id": "11111111-1111-1111-1111-111111111111",
          "username": "alice", "name": "Alice A"},
     ]
@@ -128,7 +128,7 @@ async def test_annotate_authors_resolves_username_and_uuid(monkeypatch):
     out = await svc._annotate_history_authors(entries)
 
     by_hash = {e["hash"]: e for e in out}
-    assert by_hash["a"]["author_name"] == "Younglo Kim"   # by username
+    assert by_hash["a"]["author_name"] == "Carol Carter"   # by username
     assert by_hash["b"]["author_name"] == "Alice A"       # by UUID
     assert "author_name" not in by_hash["c"]              # unresolved
 
@@ -150,11 +150,11 @@ async def test_resolve_author_name_resolves_username(monkeypatch):
     resolve to display_name (the latent gap: the old UUID-only resolver
     returned None for usernames)."""
     rows = [{"id": "00000000-0000-0000-0000-000000000000",
-             "username": "younglo_kim", "name": "Younglo Kim"}]
+             "username": "carol", "name": "Carol Carter"}]
     _patch_pool(monkeypatch, fetch_rows=rows)
     svc = DocumentService(git=MagicMock())
 
-    assert await svc._resolve_author_name("younglo_kim") == "Younglo Kim"
+    assert await svc._resolve_author_name("carol") == "Carol Carter"
 
 
 @pytest.mark.asyncio

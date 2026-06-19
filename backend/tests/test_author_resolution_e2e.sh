@@ -34,7 +34,7 @@ echo "╚═══════════════════════�
 echo ""
 echo "▸ 0. Setup"
 
-DISPLAY="Younglo Display E2E"
+DISPLAY="Display Name E2E"
 
 # register → login → PAT; returns "PAT JWT"
 setup_user() {
