@@ -199,6 +199,26 @@ mcp "$PAT" "$SID" akb_alter_table "{\"uri\":\"akb://$VAULT/table/nul\",\"drop_un
 R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO nul (email) VALUES ('a@b')\"}")
 assert_ok "$R" "AC#3 dropped UK physically gone (dup INSERT now succeeds)"
 
+# ── updated_at auto-bump (migration 038) ──────────────────────────
+# PG has no MySQL-style ON UPDATE CURRENT_TIMESTAMP. A BEFORE UPDATE
+# trigger (akb_set_updated_at, attached by create_dynamic_table) must
+# keep updated_at fresh; without it updated_at stays frozen at insert
+# time (a useless duplicate of created_at). COUNT(*) over a predicate
+# keeps the assertion robust to clock formatting / row ordering.
+mcp "$PAT" "$SID" akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"ua\",\"columns\":[{\"name\":\"note\",\"type\":\"text\"}]}" >/dev/null
+mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO ua (note) VALUES ('v1')\"}" >/dev/null
+# right after INSERT both stamps share one NOW() → equal
+R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) AS n FROM ua WHERE updated_at = created_at\"}")
+[ "$(echo "$R" | field "['items'][0]['n']")" = "1" ] && pass "updated_at == created_at right after INSERT" || fail "updated_at insert baseline" "$R"
+sleep 1
+mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"UPDATE ua SET note = 'v2'\"}" >/dev/null
+# trigger must have advanced updated_at strictly past created_at
+R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) AS n FROM ua WHERE updated_at > created_at\"}")
+[ "$(echo "$R" | field "['items'][0]['n']")" = "1" ] && pass "updated_at auto-bumped on UPDATE (trigger fired)" || fail "updated_at not bumped on UPDATE" "$R"
+# sanity: the UPDATE itself took effect, and we did NOT touch created_at
+R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT note FROM ua\"}")
+echo "$R" | field "['items'][0]['note']" | grep -q "v2" && pass "UPDATE applied (note=v2)" || fail "update sanity" "$R"
+
 # ── cleanup: drop the ephemeral vault + ALL its tables ────────────
 # Required for idempotent re-runs: several tests use caller-supplied
 # constraint/index names, and a UNIQUE constraint's implicit index name is
