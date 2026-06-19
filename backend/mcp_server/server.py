@@ -1212,27 +1212,12 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
 @_h("akb_history")
 async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
-    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
-    doc = await _find_doc(vault, doc_path)
-    if not doc:
-        return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
-    from app.services.git_service import GitService
-    git = GitService()
-    # Pass the doc's created_at as a lineage boundary so commits from a
-    # previous document at the same path (deleted-and-recreated) don't
-    # leak into this doc's history. created_at lives on the documents
-    # row; convert to Unix seconds for git's filter.
-    since_epoch = None
-    created_at = doc.get("created_at")
-    if created_at is not None:
-        since_epoch = int(created_at.timestamp())
-    history = git.file_log(
-        vault, doc["path"],
-        max_count=args.get("limit", 20),
-        since_epoch=since_epoch,
-    )
-    return {"uri": doc_uri(vault, doc["path"]), "history": history}
+    # Doc resolution, the created_at lineage boundary, and author
+    # annotation all live in DocumentService.history() so this tool and
+    # GET /history stay byte-for-byte identical. A missing doc raises
+    # NotFoundError, mapped to err(code=NOT_FOUND) by exception_envelope.
+    return await doc_service.history(vault, doc_path, limit=args.get("limit", 20))
 
 
 @_h("akb_export")
