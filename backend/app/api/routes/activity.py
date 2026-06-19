@@ -7,7 +7,6 @@ management. The file was renamed accordingly.
 """
 
 import json
-import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -16,6 +15,7 @@ from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.document_service import DocumentService
 from app.services.git_service import GitService
+from app.services.user_directory import resolve_display_names
 from app.db.postgres import get_pool
 from app.repositories.document_repo import DocumentRepository
 
@@ -24,44 +24,23 @@ git = GitService()
 doc_service = DocumentService()
 
 
-def _is_uuid(value: str | None) -> bool:
-    if not value:
-        return False
-    try:
-        _uuid.UUID(str(value))
-        return True
-    except (ValueError, AttributeError, TypeError):
-        return False
-
-
 async def _resolve_activity_authors(entries: list[dict]) -> list[dict]:
     """Add a human `author_name` to each commit-log entry.
 
-    App commits set the git author to the actor's user UUID, so the raw log
-    shows raw ids. Batch-resolve the UUID author/agent values to display names
-    (display_name → username) so the UI can show a name instead. Non-UUID
-    authors (external-git imports) are left for the UI to show as-is.
+    The git author/agent token is the actor's username on the normal write
+    path (older rows / some lifecycle ops carry the user UUID). Resolve either
+    form to a display name so the UI shows a name instead of a raw token.
+    Authors that match no user (external-git imports) are left as-is.
     """
-    ids = {
-        v
-        for e in entries
-        for v in (e.get("agent"), e.get("author"))
-        if _is_uuid(v)
-    }
-    if not ids:
+    names = await resolve_display_names(
+        v for e in entries for v in (e.get("agent"), e.get("author"))
+    )
+    if not names:
         return entries
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id::text AS id, COALESCE(display_name, username) AS name "
-            "FROM users WHERE id::text = ANY($1)",
-            list(ids),
-        )
-    name_by_id = {r["id"]: r["name"] for r in rows}
     for e in entries:
         raw = e.get("agent") or e.get("author")
-        if raw in name_by_id:
-            e["author_name"] = name_by_id[raw]
+        if raw and raw in names:
+            e["author_name"] = names[raw]
     return entries
 
 

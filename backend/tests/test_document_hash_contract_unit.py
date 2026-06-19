@@ -3,12 +3,26 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.exceptions import ConflictError
 from app.models.document import BrowseItem, DocumentPutResponse, DocumentResponse, DocumentUpdateRequest
 from app.services.document_service import DocumentService
+
+
+@pytest.fixture(autouse=True)
+def _stub_author_resolution(monkeypatch):
+    """get()/get_at_commit() resolve created_by → display_name via a DB query
+    (user_directory.resolve_display_names). These hash-contract tests mock the
+    document repos but run without a DB, so stub the resolver to keep the read
+    path from opening a real pool. Resolution itself is covered in
+    test_user_directory_unit.py."""
+    monkeypatch.setattr(
+        "app.services.document_service.resolve_display_names",
+        AsyncMock(return_value={}),
+    )
 
 
 class _FakeVaultRepo:

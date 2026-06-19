@@ -1,10 +1,13 @@
-"""Unit tests for DocumentService.history() and its author annotation.
+"""Unit tests for DocumentService.history(), author annotation, and
+_resolve_author_name.
 
 history() is the single source of truth behind both the akb_history MCP
 tool and GET /api/v1/history/{vault}/{doc}. These tests pin the bits that
 are easy to regress without a live DB/git: the created_at lineage boundary,
-the NotFoundError surface, and the id-OR-username → display_name resolver.
-Full git integration is covered by the e2e suites.
+the NotFoundError surface, and the id-OR-username → display_name resolver
+(shared via user_directory.resolve_display_names). Full git integration is
+covered by the e2e suites; the resolver itself is unit-tested in
+test_user_directory_unit.py.
 """
 
 from contextlib import asynccontextmanager
@@ -29,8 +32,10 @@ def _service_with_repos(*, vault_id, doc_row):
 
 
 def _patch_pool(monkeypatch, *, fetch_rows):
-    """Patch document_service.get_pool so a `async with pool.acquire()` block
-    yields a conn whose .fetch(...) returns `fetch_rows`."""
+    """Patch user_directory.get_pool (where author resolution queries) so a
+    `async with pool.acquire()` block yields a conn whose .fetch(...) returns
+    `fetch_rows`. Author annotation flows through resolve_display_names, so the
+    annotate/history tests exercise the real resolver against this mock."""
     conn = MagicMock()
     conn.fetch = AsyncMock(return_value=fetch_rows)
 
@@ -41,7 +46,7 @@ def _patch_pool(monkeypatch, *, fetch_rows):
     pool = MagicMock()
     pool.acquire = _acquire
     monkeypatch.setattr(
-        "app.services.document_service.get_pool", AsyncMock(return_value=pool)
+        "app.services.user_directory.get_pool", AsyncMock(return_value=pool)
     )
     return conn
 
@@ -107,13 +112,13 @@ async def test_annotate_authors_resolves_username_and_uuid(monkeypatch):
     carry a UUID. Both forms resolve to display_name in one query; an
     unknown author keeps only its raw value."""
     entries = [
-        {"hash": "a", "author": "younglo_kim"},
+        {"hash": "a", "author": "carol"},
         {"hash": "b", "author": "11111111-1111-1111-1111-111111111111"},
         {"hash": "c", "author": "external-committer"},
     ]
     rows = [
         {"id": "00000000-0000-0000-0000-000000000000",
-         "username": "younglo_kim", "name": "Younglo Kim"},
+         "username": "carol", "name": "Carol Carter"},
         {"id": "11111111-1111-1111-1111-111111111111",
          "username": "alice", "name": "Alice A"},
     ]
@@ -123,7 +128,7 @@ async def test_annotate_authors_resolves_username_and_uuid(monkeypatch):
     out = await svc._annotate_history_authors(entries)
 
     by_hash = {e["hash"]: e for e in out}
-    assert by_hash["a"]["author_name"] == "Younglo Kim"   # by username
+    assert by_hash["a"]["author_name"] == "Carol Carter"   # by username
     assert by_hash["b"]["author_name"] == "Alice A"       # by UUID
     assert "author_name" not in by_hash["c"]              # unresolved
 
@@ -137,3 +142,28 @@ async def test_annotate_authors_empty_skips_query(monkeypatch):
 
     assert out == []
     conn.fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_author_name_resolves_username(monkeypatch):
+    """created_by holds the actor's username on the write path; it must
+    resolve to display_name (the latent gap: the old UUID-only resolver
+    returned None for usernames)."""
+    rows = [{"id": "00000000-0000-0000-0000-000000000000",
+             "username": "carol", "name": "Carol Carter"}]
+    _patch_pool(monkeypatch, fetch_rows=rows)
+    svc = DocumentService(git=MagicMock())
+
+    assert await svc._resolve_author_name("carol") == "Carol Carter"
+
+
+@pytest.mark.asyncio
+async def test_resolve_author_name_none_and_unknown(monkeypatch):
+    conn = _patch_pool(monkeypatch, fetch_rows=[])
+    svc = DocumentService(git=MagicMock())
+
+    # Empty token short-circuits before any query.
+    assert await svc._resolve_author_name(None) is None
+    conn.fetch.assert_not_called()
+    # Unknown token (external-git import) → no match → None.
+    assert await svc._resolve_author_name("ext-committer") is None
