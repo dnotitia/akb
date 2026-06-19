@@ -782,7 +782,11 @@ async def resolve_document_publication(publication: dict) -> dict:
                    COALESCE(u.display_name, u.username) AS created_by_name
             FROM documents d
             JOIN vaults v ON d.vault_id = v.id
-            LEFT JOIN users u ON u.id::text = d.created_by
+            -- created_by holds the actor's username on the normal write path
+            -- (older rows store a UUID); match either form, mirroring
+            -- user_directory.resolve_display_names.
+            LEFT JOIN users u
+                ON u.id::text = d.created_by OR u.username = d.created_by
             WHERE v.name = $1 AND d.path = $2
             """,
             uri_vault, doc_path,

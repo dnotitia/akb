@@ -134,6 +134,7 @@ from app.services.kg_service import delete_document_relations, store_document_re
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
+from app.services.user_directory import resolve_display_names
 from app.repositories import table_data_repo
 from app.utils import ensure_list
 
@@ -226,28 +227,17 @@ class DocumentService:
         return VaultRepository(pool), DocumentRepository(pool), CollectionRepository(pool)
 
     async def _resolve_author_name(self, created_by: str | None) -> str | None:
-        """Resolve a `created_by` user id to a human display name for the UI.
+        """Resolve a `created_by` token to a human display name for the UI.
 
-        App-authored docs store a user UUID; external-git imports store a
-        non-UUID author string (left for the caller to show as-is). Returns the
-        user's display_name (falling back to username), or None when the id
-        isn't a UUID or doesn't match a user.
+        The write path stores the actor's ``username`` in ``created_by`` (it is
+        the ``agent_id`` passed to ``put``); older rows may store a user UUID.
+        Resolve either form to ``display_name`` (falling back to username), or
+        None when the token is empty or matches no user (external-git imports).
         """
         if not created_by:
             return None
-        try:
-            uuid.UUID(str(created_by))
-        except (ValueError, AttributeError, TypeError):
-            return None
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT display_name, username FROM users WHERE id::text = $1",
-                str(created_by),
-            )
-        if not row:
-            return None
-        return row["display_name"] or row["username"]
+        names = await resolve_display_names([created_by])
+        return names.get(created_by)
 
     async def _ensure_document_hash(
         self,
@@ -687,34 +677,18 @@ class DocumentService:
 
         The write path sets the git author name to the actor's ``agent_id``,
         which is the user's ``username`` (see ``put``/``update``). Legacy or
-        external-git rows may instead carry a user UUID. Resolve *either*
-        form to ``display_name`` (falling back to username) in one batched
-        query so the UI shows a real name. Authors that match no user (e.g.
-        external-git imports) keep only the raw ``author``.
+        external-git rows may instead carry a user UUID. ``resolve_display_names``
+        handles either form; authors that match no user keep only the raw
+        ``author``.
         """
-        authors = {e["author"] for e in entries if e.get("author")}
-        if not authors:
+        names = await resolve_display_names(e.get("author") for e in entries)
+        if not names:
             return entries
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id::text AS id, username,
-                       COALESCE(display_name, username) AS name
-                  FROM users
-                 WHERE id::text = ANY($1) OR username = ANY($1)
-                """,
-                list(authors),
-            )
-        name_by_key: dict[str, str] = {}
-        for r in rows:
-            name_by_key[r["id"]] = r["name"]
-            name_by_key[r["username"]] = r["name"]
         for e in entries:
             author = e.get("author")
             if not author:
                 continue
-            name = name_by_key.get(author)
+            name = names.get(author)
             if name:
                 e["author_name"] = name
         return entries
