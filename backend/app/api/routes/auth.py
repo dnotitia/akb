@@ -42,11 +42,13 @@ class LoginRequest(NFCModel):
 class CreatePATRequest(NFCModel):
     name: str
     expires_days: int | None = None
-    # NOTE: scopes are stored on the `tokens` row but not enforced
-    # anywhere in the backend yet; accepting them as input would lie
-    # to the caller about a restriction that doesn't exist. When
-    # scope enforcement lands, re-expose this field with the matching
-    # check in the request handlers.
+    # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
+    # ``None`` = unscoped. Validated (well-formedness) + enforced (mutating
+    # access ∩ scope). Self-minting any scope is safe by construction
+    # (effective = user-ACL ∩ scope — only ever narrows). The read/write
+    # ``scopes`` remain non-tunable (the backend doesn't enforce those);
+    # ``vault_scope`` is the dimension that IS enforced.
+    vault_scope: dict[str, list[str]] | None = None
 
 
 class ChangePasswordRequest(NFCModel):
@@ -309,7 +311,12 @@ async def update_my_profile(
 
 @router.post("/auth/tokens", summary="Create a Personal Access Token")
 async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await create_pat(user.user_id, req.name, expires_days=req.expires_days)
+    from app.models.vault_scope import VaultScope
+
+    scope = VaultScope.parse_input(req.vault_scope)
+    return await create_pat(
+        user.user_id, req.name, expires_days=req.expires_days, vault_scope=scope
+    )
 
 
 @router.get("/auth/tokens", summary="List your PATs")

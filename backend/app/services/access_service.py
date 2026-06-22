@@ -11,6 +11,7 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from app.models.vault_scope import current_vault_scope
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
@@ -21,6 +22,11 @@ logger = logging.getLogger("akb.access")
 ROLE_HIERARCHY = {"owner": 4, "admin": 3, "writer": 2, "reader": 1}
 VALID_ROLES = set(ROLE_HIERARCHY.keys())
 VALID_PUBLIC_ACCESS = {"none", "reader", "writer"}
+
+# Roles that MUTATE a vault — the Option B per-PAT vault-scope guard fires only
+# for these (reads are never scope-restricted: a scoped agent still reads
+# broadly, the scope bounds WRITES).
+_MUTATING_ROLES = frozenset({"writer", "admin", "owner"})
 
 
 def _role_level(role: str) -> int:
@@ -95,6 +101,25 @@ async def check_vault_access(
                 raise ForbiddenError(
                     f"Vault '{vault_name}' is a read-only external git mirror"
                 )
+
+        # Option B — per-PAT vault scope (token-scoping backstop). If this
+        # request's token carries a vault scope, a MUTATING access
+        # (writer/admin/owner) to a vault OUTSIDE the scope is refused here —
+        # BEFORE the is_admin / owner short-circuits below, so even a scoped
+        # admin token cannot escape its scope. Reads are unaffected (a scoped
+        # agent still reads broadly; the scope bounds WRITES only). Effective
+        # write permission = user-ACL ∩ scope, for the whole surface that
+        # routes through check_vault_access (REST + MCP). NULL token scope ⇒
+        # current_vault_scope is None ⇒ historical full-ACL behaviour.
+        scope = current_vault_scope.get()
+        if (
+            scope is not None
+            and required_role in _MUTATING_ROLES
+            and not scope.permits(vault_name)
+        ):
+            raise ForbiddenError(
+                f"Token scope does not permit '{required_role}' on vault '{vault_name}'"
+            )
 
         # System admin bypasses all vault ACL
         is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)

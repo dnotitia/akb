@@ -178,6 +178,7 @@ async def _apply_migrations() -> None:
         "037_table_unique_keys_indexes.py",     # vault_tables.unique_keys + .indexes JSONB (declarative DDL metadata; AKB #215)
         "038_dynamic_table_updated_at_trigger.py",  # akb_set_updated_at() + BEFORE UPDATE trigger on vt_* tables (PG has no ON UPDATE CURRENT_TIMESTAMP)
         "039_edges_vault_endpoint_indexes.py",  # composite (vault_id, source_uri)/(vault_id, target_uri) indexes for graph reads (overview/BFS/degree; AKB graph viewer Phase 2)
+        "040_tokens_vault_scope.py",            # tokens.vault_scope JSONB (per-PAT vault scope; NULL = unscoped)
     ):
         if filename in applied:
             continue
