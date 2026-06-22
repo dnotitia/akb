@@ -35,10 +35,11 @@ export const LABEL_CAP = 150;
 export const LOD_HYST = 0.08;
 
 /** Detail bands keyed on RELATIVE zoom (currentZoom / fitZoom, where 1.0 = the
- *  fit / whole-graph overview). Each band targets ~`target` highest-degree
- *  nodes *within the viewport* — a COUNT target, not an absolute degree, so the
- *  policy adapts to any vault's degree distribution (an absolute floor would
- *  blank an overview whose max degree is below it). Ordered far → near. */
+ *  fit / whole-graph overview). Each band renders the top `target` highest-
+ *  degree nodes (ranked over the whole graph, then intersected with the viewport
+ *  cull) in full — a COUNT target, not an absolute degree, so the policy adapts
+ *  to any vault's degree distribution (an absolute floor would blank an overview
+ *  whose max degree is below it). Ordered far → near. */
 export const LOD_BANDS: ReadonlyArray<{ maxRel: number; target: number }> = [
   { maxRel: 1.5, target: 30 },            // overview: a readable hub constellation
   { maxRel: 2.5, target: 80 },            // mid: hubs + secondary connectors

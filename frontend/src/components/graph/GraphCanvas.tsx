@@ -11,7 +11,7 @@ import {
   type GraphNode,
   type GraphColors,
 } from "./graph-types";
-import { endpointUri, degreeMap } from "./use-graph-data";
+import { endpointUri, degreeMap, impactCones } from "./use-graph-data";
 import { KindSwatch, RelationSwatch } from "./graph-swatches";
 import {
   groupColor,
@@ -179,8 +179,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   // ── Viewport culling + LOD (refs so the per-frame visibility predicates stay
   //    O(1) and never trigger a React re-render). The cull layer skips paint +
-  //    hit-test for off-screen elements; the LOD layer raises a degree floor at
-  //    overview zoom so only hubs draw, revealing leaves as you zoom in. ──
+  //    hit-test for OFF-SCREEN elements; the LOD layer keeps a top-N-by-degree
+  //    set per zoom band so that at overview only those hubs render in full and
+  //    everything else is DEMOTED to a dim dot (not hidden), revealing more as
+  //    you zoom in. ──
   const sizeRef = useRef(size);
   sizeRef.current = size;
   const transformRef = useRef({ k: 1, cx: 0, cy: 0 });
@@ -195,8 +197,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const fitZoomRef = useRef(0);
   const degreeRankedUrisRef = useRef<string[]>([]);
   const labelCountRef = useRef(0);
-  // Forced elements always paint (selection / hover / pin / focus-neighbor),
-  // even below the LOD floor or off-screen — read via refs by stable predicates.
+  // Forced elements always paint in full (selection / hover / pin / focus-
+  // neighbor / impact cone), even when outside the LOD top-N or off-screen —
+  // read via refs by the stable predicates.
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const hoveredRef = useRef(hovered);
@@ -223,8 +226,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   }, []);
 
   // Recompute the visible world rect + the LOD band/set from the current camera.
-  // O(1) viewport math + an O(target≤200) set rebuild, reading the CACHED fit
-  // zoom — cheap enough to run on every zoom tick. Reads refs only → stable id.
+  // Constant-time viewport math + an O(target≤200) set slice, reading the CACHED
+  // fit zoom (the O(n) bbox scan is NOT here) — cheap enough to run on every zoom
+  // tick. Reads refs only → stable identity.
   const recomputeCull = useCallback(() => {
     const { k, cx, cy } = transformRef.current;
     if (!k) return;
@@ -397,38 +401,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // closures over STRUCTURAL edges from the selected node — `out` = its
   // dependencies (follow source→target), `in` = its dependents (target→source).
   // Recomputed only when the structure / selection / mode changes.
-  const impactSets = useMemo<{ out: Set<string>; in: Set<string> } | null>(() => {
-    if (!impactMode || !selected) return null;
-    const fwd = new Map<string, string[]>();
-    const bwd = new Map<string, string[]>();
-    const push = (m: Map<string, string[]>, k: string, v: string) => {
-      const a = m.get(k);
-      if (a) a.push(v);
-      else m.set(k, [v]);
-    };
-    for (const e of visibleEdges) {
-      if (RELATION_CLASS[e.relation] !== "structural") continue;
-      const s = endpointUri(e.source);
-      const t = endpointUri(e.target);
-      push(fwd, s, t);
-      push(bwd, t, s);
-    }
-    const bfs = (start: string, adj: Map<string, string[]>) => {
-      const seen = new Set<string>();
-      const queue = [start];
-      while (queue.length) {
-        const u = queue.shift() as string;
-        for (const v of adj.get(u) ?? []) {
-          if (v !== start && !seen.has(v)) {
-            seen.add(v);
-            queue.push(v);
-          }
-        }
-      }
-      return seen;
-    };
-    return { out: bfs(selected, fwd), in: bfs(selected, bwd) };
-  }, [impactMode, selected, visibleEdges]);
+  const impactSets = useMemo<{ out: Set<string>; in: Set<string> } | null>(
+    () => (impactMode && selected ? impactCones(visibleEdges, selected) : null),
+    [impactMode, selected, visibleEdges],
+  );
   const impactSetsRef = useRef(impactSets);
   impactSetsRef.current = impactSets;
 
@@ -445,11 +421,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   // ── Visibility predicates: O(1), ref-only, so force-graph can call them once
   //    per element per frame cheaply (it skips paint AND hit-test for a false
-  //    return). `forced` elements always show; otherwise a node shows iff it
-  //    clears the LOD degree floor AND sits in the viewport rect; an edge shows
-  //    iff both endpoints clear the floor and at least one is on-screen (so
-  //    edges follow their nodes — overview = a hub skeleton). Identity bumps on
-  //    cullEpoch (non-camera repaints); camera moves repaint + re-run on their
+  //    return). A NODE is culled only when off-screen — never for low degree
+  //    (below-top-N nodes still paint, demoted to a dot in paintNode). An EDGE,
+  //    though, shows iff both endpoints are in the LOD top-N set and its segment
+  //    overlaps the viewport (else the overview edge-haze returns) — so edges
+  //    follow the labeled hubs while leaf dots stay edgeless. Forced elements
+  //    bypass both. Identity bumps on cullEpoch (non-camera repaints); camera
+  //    moves repaint + re-run on their
   //    own against the updated refs. ──
   const isForced = useCallback((uri: string): boolean => {
     if (uri === selectedRef.current || uri === hoveredRef.current || pinnedRef.current.has(uri)) {

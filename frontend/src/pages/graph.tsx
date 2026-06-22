@@ -124,33 +124,39 @@ export default function GraphPage() {
   async function expandNode(node: GraphNode) {
     const id = node.doc_id || docIdFromUri(node.uri);
     if (!id) return;
+    // Only the FETCH is guarded — a network/5xx/auth failure is logged (so it's
+    // diagnosable instead of looking identical to "no neighbors"), and an empty
+    // result is a genuine silent no-op. The seed+merge below runs OUTSIDE the
+    // catch, so a real bug there surfaces rather than being swallowed.
+    let payload;
     try {
-      const payload = await fetchNeighbors(vault!, id, 1);
-      // Tuck each genuinely-new neighbor in a small deterministic spiral around
-      // the node being expanded, so it appears beside its parent instead of
-      // spawning at the origin and flying across the canvas. The live damped
-      // sim (forceCenterPull keeps it bounded) then relaxes them into place. If
-      // the parent has no position yet (pre-settle) leave x/y unset so the sim
-      // seeds it.
-      const present = new Set(merged.nodes.map((n) => n.uri));
-      const cx = node.x;
-      const cy = node.y;
-      const hasPos = cx != null && cy != null;
-      let i = 0;
-      for (const n of payload.nodes) {
-        if (present.has(n.uri)) continue;
-        if (hasPos) {
-          const angle = i * 2.39996; // golden angle → an even, non-overlapping fan
-          const radius = 12 + i * 6;
-          n.x = cx + Math.cos(angle) * radius;
-          n.y = cy + Math.sin(angle) * radius;
-        }
-        i++;
-      }
-      setOverlay((prev) => mergeGraph(prev, payload));
-    } catch {
-      /* node simply doesn't expand — leave the graph unchanged */
+      payload = await fetchNeighbors(vault!, id, 1);
+    } catch (err) {
+      console.error("graph: failed to expand node", id, err);
+      return;
     }
+    if (payload.nodes.length === 0) return;
+    // Tuck each genuinely-new neighbor in a small deterministic spiral around
+    // the node being expanded, so it appears beside its parent instead of
+    // spawning at the origin and flying across the canvas. The live damped sim
+    // (forceCenterPull keeps it bounded) then relaxes them into place. If the
+    // parent has no position yet (pre-settle) leave x/y unset so the sim seeds it.
+    const present = new Set(merged.nodes.map((n) => n.uri));
+    const cx = node.x;
+    const cy = node.y;
+    const hasPos = cx != null && cy != null;
+    let i = 0;
+    for (const n of payload.nodes) {
+      if (present.has(n.uri)) continue;
+      if (hasPos) {
+        const angle = i * 2.39996; // golden angle → an even, non-overlapping fan
+        const radius = 12 + i * 6;
+        n.x = cx + Math.cos(angle) * radius;
+        n.y = cy + Math.sin(angle) * radius;
+      }
+      i++;
+    }
+    setOverlay((prev) => mergeGraph(prev, payload));
   }
 
   const pinNode = (uri: string) =>

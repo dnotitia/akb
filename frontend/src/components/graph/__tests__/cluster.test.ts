@@ -4,6 +4,7 @@ import {
   groupColor,
   forceCluster,
   forceCollide,
+  forceCenterPull,
   COLLIDE_RADIUS,
 } from "../cluster";
 import type { GraphNode } from "../graph-types";
@@ -70,6 +71,26 @@ describe("forceCluster", () => {
     f(1);
     expect(lone.vx).toBe(0);
     expect(lone.vy).toBe(0);
+  });
+});
+
+describe("forceCenterPull", () => {
+  it("pulls a node toward the origin (restoring spring → bounded layout)", () => {
+    const a: GraphNode = { uri: "a", name: "a", kind: "document", x: 100, y: -40, vx: 0, vy: 0 };
+    const f = forceCenterPull(0.1);
+    f.initialize([a]);
+    f(1);
+    expect(a.vx!).toBeLessThan(0); // +x → pulled back toward 0
+    expect(a.vy!).toBeGreaterThan(0); // -y → pulled back toward 0
+  });
+
+  it("leaves a node already at the origin untouched", () => {
+    const o: GraphNode = { uri: "o", name: "o", kind: "document", x: 0, y: 0, vx: 0, vy: 0 };
+    const f = forceCenterPull(0.1);
+    f.initialize([o]);
+    f(1);
+    expect(o.vx).toBe(0);
+    expect(o.vy).toBe(0);
   });
 });
 
