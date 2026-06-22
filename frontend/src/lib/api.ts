@@ -365,6 +365,9 @@ export interface GraphApiEdge {
   source: string;
   target: string;
   relation?: string;
+  // 'implicit' (parsed from doc body) vs 'explicit' (akb_link). Present on
+  // overview + BFS responses; optional so legacy callers stay valid.
+  kind?: "implicit" | "explicit";
 }
 // Build the canonical URI from (vault, path) before calling REST so
 // every call site presents the unified shape to the backend.
@@ -381,6 +384,43 @@ export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) 
   if (docPath) p.set("uri", _docUri(vault, docPath));
   else p.set("vault", vault);
   return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
+};
+
+// Whole-vault overview: the top-`topK` highest-degree nodes + induced edges,
+// with honest totals so the UI can show "showing N of M" instead of a silent
+// recency cap. Backed by GET /graph/overview (degree-ranked, deterministic).
+export interface GraphOverviewResponse {
+  nodes: GraphApiNode[];
+  edges: GraphApiEdge[];
+  nodes_total: number;
+  edges_total: number;
+  returned: number;
+  truncated: boolean;
+}
+export const getGraphOverview = (vault: string, topK = 200) => {
+  const p = new URLSearchParams({ vault, top_k: String(topK) });
+  return api<GraphOverviewResponse>(`/graph/overview?${p}`);
+};
+
+// KB-health audit: over-connected hubs + orphan documents (no relations).
+// Backed by GET /graph/health.
+export interface GraphHealthNode {
+  uri: string;
+  name: string;
+  resource_type?: string;
+  degree?: number;
+}
+export interface GraphHealthResponse {
+  hubs: GraphHealthNode[];
+  orphans: { count: number; sample: GraphHealthNode[] };
+}
+export const getGraphHealth = (vault: string, hubThreshold = 5, limit = 20) => {
+  const p = new URLSearchParams({
+    vault,
+    hub_threshold: String(hubThreshold),
+    limit: String(limit),
+  });
+  return api<GraphHealthResponse>(`/graph/health?${p}`);
 };
 
 // ── Drill Down ──

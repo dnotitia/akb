@@ -5,6 +5,48 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.0 — 2026-06-22  *(feat — graph viewer Phase 2: degree-ranked overview + health endpoints, single-call BFS, edge `kind`)*
+
+Two new reader-gated graph read endpoints under `/api/v1`, replacing the
+overview's old arbitrary recency cap with a deterministic, honest slice:
+
+- **`GET /graph/overview?vault=&top_k=`** — the `top_k` (default 200)
+  highest-**degree** nodes plus the edges *induced among them*, returned with
+  `nodes_total` / `edges_total` / `returned` / `truncated`. The previous
+  no-`uri` branch of `/graph` kept `LIMIT limit*3 ORDER BY created_at DESC` — an
+  arbitrary recency subset whose composition drifted with `limit`. Degree
+  ranking is deterministic (tie-broken by URI) and surfaces the structurally
+  important hubs, and the totals let the UI render an explicit "showing N of M"
+  instead of silently truncating. `get_graph` with no `resource_uri` now
+  **delegates to this single path** — so MCP `akb_graph(vault)` and
+  `GET /graph?vault=` also return the deterministic, totals-bearing result
+  instead of the old recency slice, collapsing two divergent whole-vault
+  builders into one.
+- **`GET /graph/health?vault=&hub_threshold=&limit=`** — a KB-health audit: the
+  over-connected **hubs** (degree ≥ `hub_threshold`) and the **orphan**
+  documents (no relation at all — the undiscoverable corners). Reader-scoped.
+
+Graph correctness fixes carried by the same change:
+
+- **Edges now carry `kind`** (`implicit` | `explicit`) on every graph read
+  (overview + BFS), exposing whether a link was parsed from a doc body or
+  created via `akb_link` to any API/MCP consumer. (The web canvas styles edges
+  by `relation`, not `kind`, today — the field is available for agents and for
+  future implicit-vs-explicit styling, not yet rendered.)
+- **`_bfs_collect` prunes dangling edges**: the node cap could truncate the final
+  BFS wave *after* an edge to one of its targets was emitted, leaving a stub edge
+  to a node the client never received. Those are now dropped before the response.
+- **New composite indexes** `idx_edges_vault_source(vault_id, source_uri)` and
+  `idx_edges_vault_target(vault_id, target_uri)` (migration 039 + `init.sql`):
+  the "scope by vault AND look up by endpoint" access pattern shared by BFS, the
+  overview's induced-edge query, and the degree rollups now hits one index
+  instead of forcing a single-column pick + per-row re-check.
+
+Frontend wiring (same PR): `useFullGraph` → `/graph/overview` with a persistent
+"Showing the N most-connected of M nodes" banner; `useNeighborhood` collapsed
+from N per-node `/relations` round trips to a **single server-side BFS call**;
+the client-side `bfsExpand` walker and its helpers were removed.
+
 ## 0.8.17 — 2026-06-17  *(fix — MCP access-guard errors get stable codes, not code=internal, #221)*
 
 `check_vault_access` raises `ForbiddenError` / `NotFoundError` *outside* the
