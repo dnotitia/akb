@@ -7,14 +7,13 @@ import { useDebounce } from "@/hooks/use-debounce";
 import {
   ALL_NODE_KINDS,
   ALL_RELATIONS,
-  RELATION_CLASS,
-  RELATION_DASH,
   RELATION_LABEL,
   type GraphNode,
   type GraphView,
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
+import { KindSwatch, RelationSwatch } from "./graph-swatches";
 import { viewToQuery } from "./graph-state";
 import { Section } from "./Section";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -32,6 +31,10 @@ interface Props {
   orphanCount: number;
   hideOrphans: boolean;
   onToggleOrphans: () => void;
+  /** How many nodes the user has hidden (Hide from the context menu) — for the
+   *  "Unhide all" recovery, since a hidden node can't be right-clicked back. */
+  hiddenCount: number;
+  onUnhideAll: () => void;
   /** Select + center a node (used by the Hubs list). */
   onSelectNode: (uri: string) => void;
   /** When provided, renders a collapse control in the sidebar header. */
@@ -52,40 +55,6 @@ function savedHops(): 1 | 2 | 3 {
   return v === "1" ? 1 : v === "3" ? 3 : 2;
 }
 
-/** A tiny line in the relation's own encoding (structural = solid/darker/
- *  thicker, associative = dashed/muted/thinner) so the sidebar doubles as the
- *  legend — the user can connect "this dashed line in the canvas = related_to". */
-function RelationSwatch({ relation }: { relation: RelationKind }) {
-  const structural = RELATION_CLASS[relation] === "structural";
-  const dash = RELATION_DASH[relation].join(" ") || undefined;
-  return (
-    <svg
-      width="20"
-      height="6"
-      aria-hidden
-      className={structural ? "text-foreground" : "text-foreground-muted"}
-    >
-      <line
-        x1="0"
-        y1="3"
-        x2="20"
-        y2="3"
-        stroke="currentColor"
-        strokeWidth={structural ? 1.6 : 1.1}
-        strokeDasharray={dash}
-      />
-    </svg>
-  );
-}
-
-/** The kind's canvas silhouette (document = circle, table = rounded square,
- *  file = dashed-ring circle) as a small DOM swatch. */
-function KindSwatch({ kind }: { kind: NodeKind }) {
-  const base = "inline-block h-3 w-3 shrink-0";
-  if (kind === "table") return <span aria-hidden className={cn(base, "border border-foreground rounded-[var(--radius-xs)] bg-surface")} />;
-  if (kind === "file") return <span aria-hidden className={cn(base, "border border-dashed border-foreground-muted rounded-full")} />;
-  return <span aria-hidden className={cn(base, "border border-foreground rounded-full bg-surface-muted")} />;
-}
 
 export function GraphSidebar({
   vault,
@@ -96,6 +65,8 @@ export function GraphSidebar({
   orphanCount,
   hideOrphans,
   onToggleOrphans,
+  hiddenCount,
+  onUnhideAll,
   onSelectNode,
   onCollapse,
 }: Props) {
@@ -297,15 +268,32 @@ export function GraphSidebar({
         )}
       </Section>
 
-      {orphanCount > 0 && (
+      {(orphanCount > 0 || hiddenCount > 0) && (
         <Section label="Display" className="px-2">
-          <label className="inline-flex items-center gap-2 text-[11px] cursor-pointer">
-            <input type="checkbox" checked={hideOrphans} onChange={onToggleOrphans} />
-            Hide orphans
-            <span className="coord text-foreground-muted">
-              ({orphanCount} unconnected)
-            </span>
-          </label>
+          <div className="flex flex-col gap-1.5">
+            {orphanCount > 0 && (
+              <label className="inline-flex items-center gap-2 text-[11px] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={hideOrphans}
+                  onChange={onToggleOrphans}
+                  className="accent-[var(--color-primary)] cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                />
+                Hide orphans
+                <span className="coord text-foreground-muted">({orphanCount} unconnected)</span>
+              </label>
+            )}
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                onClick={onUnhideAll}
+                className="inline-flex w-max items-center gap-1.5 px-2 h-7 rounded-[var(--radius-sm)] border border-border text-[11px] text-foreground-muted hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+              >
+                Unhide all
+                <span className="coord text-foreground-muted">({hiddenCount})</span>
+              </button>
+            )}
+          </div>
         </Section>
       )}
 
@@ -338,7 +326,7 @@ export function GraphSidebar({
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+                "inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-sm)] border text-[11px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
                 view.types.has(k)
                   ? "border-primary bg-surface-selected text-surface-selected-foreground"
                   : "border-border text-foreground-muted hover:bg-surface-hover",
@@ -453,7 +441,7 @@ export function GraphSidebar({
                 <button
                   type="button"
                   onClick={() => onNavigate(s.url)}
-                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:opacity-60 transition-opacity duration-150 truncate"
+                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:bg-surface-active truncate"
                 >
                   <TooltipText className="truncate">{s.name}</TooltipText>
                 </button>

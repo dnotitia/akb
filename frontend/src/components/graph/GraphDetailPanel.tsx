@@ -24,6 +24,9 @@ interface Props {
   onClose: () => void;
   onTogglePin?: () => void;
   pinned?: boolean;
+  /** Re-root the graph on this node (parity with the context menu's "Focus
+   *  here"). Omitted when it's already the root. */
+  onFocus?: () => void;
 }
 
 interface DocResponse {
@@ -56,6 +59,7 @@ export function GraphDetailPanel({
   onClose,
   onTogglePin,
   pinned,
+  onFocus,
 }: Props) {
   const [metaOpen, setMetaOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
@@ -150,6 +154,11 @@ export function GraphDetailPanel({
             <ExternalLink className="h-3 w-3" /> Open
           </Button>
           <CopyButton value={uri} label="Copy URI" />
+          {onFocus && (
+            <Button size="sm" variant="outline" onClick={onFocus}>
+              <Crosshair className="h-3 w-3" /> Focus
+            </Button>
+          )}
           {onTogglePin && (
             // Pin is a toggle, not a CTA — when pinned it reads as a teal
             // selected control, not a second filled-orange marquee.

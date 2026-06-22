@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { PanelLeftOpen, X } from "lucide-react";
+import { HelpCircle, PanelLeftOpen, X } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { Alert } from "@/components/ui/alert";
@@ -21,7 +21,7 @@ import {
 } from "@/components/graph/use-graph-data";
 import { GraphContextMenu, type GraphMenuState } from "@/components/graph/GraphContextMenu";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
-import { kindToSegment, type GraphEdge, type GraphNode, type GraphView, type RelatedRef } from "@/components/graph/graph-types";
+import { ALL_NODE_KINDS, ALL_RELATIONS, kindToSegment, type GraphEdge, type GraphNode, type GraphView, type RelatedRef } from "@/components/graph/graph-types";
 import { groupOf } from "@/components/graph/cluster";
 
 export default function GraphPage() {
@@ -292,6 +292,8 @@ export default function GraphPage() {
           orphanCount={orphanCount}
           hideOrphans={hideOrphans}
           onToggleOrphans={() => setHideOrphans((v) => !v)}
+          hiddenCount={hidden.size}
+          onUnhideAll={() => setHidden(new Set())}
           onSelectNode={(uri) => {
             handleSelect(uri);
             canvasRef.current?.centerOnNode(uri);
@@ -338,31 +340,46 @@ export default function GraphPage() {
           </div>
         )}
 
-        {/* Non-blocking orientation hint (whole-graph view only), dismissible
-            + persisted. Replaces the old blocking "pick an entry point" gate. */}
-        {!view.entry && hintOpen && !loading && !error && merged.nodes.length > 0 && (
-          <div className="absolute bottom-3 left-3 z-[var(--z-raised)] w-max max-w-[90%]">
-            <Alert variant="info">
-              <div className="flex items-center gap-3">
-                <span>
-                  {displayed.nodes.length} nodes · {displayed.edges.length} links — drag to pan ·
-                  scroll to zoom · click a node to focus
-                </span>
-                <button
-                  type="button"
-                  onClick={dismissHint}
-                  aria-label="Dismiss hint"
-                  className="shrink-0 text-foreground-muted hover:text-foreground transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <X className="h-3 w-3" aria-hidden />
-                </button>
-              </div>
-            </Alert>
-          </div>
-        )}
+        {/* Non-blocking gesture hint (both modes), dismissible + persisted.
+            Once dismissed it collapses to a '?' affordance so the full gesture
+            list is always recallable (it used to vanish forever). */}
+        {!loading && !error && merged.nodes.length > 0 &&
+          (hintOpen ? (
+            <div className="absolute bottom-3 left-3 z-[var(--z-raised)] w-max max-w-[90%]">
+              <Alert variant="info">
+                <div className="flex items-start gap-3">
+                  <span className="leading-relaxed">
+                    {displayed.nodes.length} nodes · {displayed.edges.length} links<br />
+                    drag to pan · scroll to zoom · click to focus · double-click to expand ·
+                    right-click for menu · drag to pin
+                  </span>
+                  <button
+                    type="button"
+                    onClick={dismissHint}
+                    aria-label="Dismiss hint"
+                    className="shrink-0 text-foreground-muted hover:text-foreground transition-colors cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <X className="h-3 w-3" aria-hidden />
+                  </button>
+                </div>
+              </Alert>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setHintOpen(true)}
+              aria-label="Show graph gestures"
+              title="Graph gestures"
+              className="absolute bottom-3 left-3 z-[var(--z-raised)] inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface shadow-sm text-foreground-muted hover:text-foreground hover:bg-surface-hover transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              <HelpCircle className="h-4 w-4" aria-hidden />
+            </button>
+          ))}
 
         {loading ? (
-          <div className="p-8"><Skeleton className="h-64 w-full" /></div>
+          <div className="absolute inset-0 p-6">
+            <Skeleton className="h-full w-full rounded-[var(--radius-lg)]" />
+          </div>
         ) : error ? (
           <EmptyState
             title="Failed to load graph"
@@ -378,7 +395,25 @@ export default function GraphPage() {
             }
           />
         ) : merged.nodes.length === 0 ? (
-          <EmptyState title="Empty graph" description="No relations match the current filters." />
+          <EmptyState
+            title="Empty graph"
+            description="No nodes match the current Type / Relation filters."
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setView({
+                    ...view,
+                    types: new Set(ALL_NODE_KINDS),
+                    relations: new Set(ALL_RELATIONS),
+                  })
+                }
+              >
+                Reset filters
+              </Button>
+            }
+          />
         ) : (
           <>
             <GraphCanvas
@@ -439,6 +474,13 @@ export default function GraphPage() {
           uri={selectedNode.uri}
           onSelectRelated={handleSelectRelated}
           onFitToNode={(fitUri) => canvasRef.current?.centerOnNode(fitUri)}
+          // Re-root the graph on the selected node (parity with the context
+          // menu's "Focus here"). Hidden when it's already the root.
+          onFocus={
+            selectedDocId && view.entry !== selectedDocId
+              ? () => setView({ ...view, entry: selectedDocId, selected: undefined })
+              : undefined
+          }
           onClose={() => setView({ ...view, selected: undefined })}
           onTogglePin={() => {
             setPinned((prev) => {

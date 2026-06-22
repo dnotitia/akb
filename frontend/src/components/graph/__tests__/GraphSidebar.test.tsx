@@ -26,6 +26,8 @@ const navProps = {
   orphanCount: 0,
   hideOrphans: false,
   onToggleOrphans: () => {},
+  hiddenCount: 0,
+  onUnhideAll: () => {},
   onSelectNode: () => {},
 };
 

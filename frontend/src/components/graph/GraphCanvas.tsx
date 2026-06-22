@@ -12,6 +12,7 @@ import {
   type GraphColors,
 } from "./graph-types";
 import { endpointUri, degreeMap } from "./use-graph-data";
+import { KindSwatch, RelationSwatch } from "./graph-swatches";
 import {
   groupColor,
   forceCluster,
@@ -905,23 +906,23 @@ function GraphLegend() {
           </div>
           <ul className="space-y-1">
             <li className="flex items-center gap-2">
-              <span className="inline-block h-3 w-3 border border-foreground rounded-full bg-surface-muted" aria-hidden />
+              <KindSwatch kind="document" />
               Document
             </li>
             <li className="flex items-center gap-2">
-              <span className="inline-block h-3 w-3 border border-foreground rounded-[var(--radius-xs)] bg-surface" aria-hidden />
+              <KindSwatch kind="table" />
               Table
             </li>
             <li className="flex items-center gap-2">
-              <span className="inline-block h-3 w-3 border border-dashed border-foreground-muted rounded-full" aria-hidden />
+              <KindSwatch kind="file" />
               File
             </li>
             <li className="flex items-center gap-2 pt-1">
-              <svg width="22" height="6" aria-hidden className="text-foreground"><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.6" /></svg>
+              <RelationSwatch relation="depends_on" />
               Structural
             </li>
             <li className="flex items-center gap-2">
-              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.1" strokeDasharray="3 3" /></svg>
+              <RelationSwatch relation="references" />
               Associative
             </li>
           </ul>
