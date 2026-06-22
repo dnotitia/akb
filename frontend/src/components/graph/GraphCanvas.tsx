@@ -22,6 +22,18 @@ import {
   CHARGE_STRENGTH,
   DEFAULT_CHARGE,
 } from "./cluster";
+import {
+  computeViewportRect,
+  inViewportPoint,
+  nextBand,
+  bandTargetCount,
+  floorFromDegrees,
+  MARGIN_PX,
+  CULL_MIN_NODES,
+  LABEL_MIN_NODE_PX,
+  LABEL_CAP,
+  type ViewportRect,
+} from "./lod";
 
 /** True when the OS asks for reduced motion — used to snap the force layout
  *  instead of animating it (the canvas rAF sim is unreachable by CSS). */
@@ -97,9 +109,6 @@ interface RenderEdge {
  *  graph (the ForceAtlas2 degree-sizing convention). */
 const NODE_BASE_R = 5;
 const DEGREE_R_GAIN = 1.9;
-/** Above this zoom every node labels; below it only hovered/selected/pinned do,
- *  so a 600-node graph reads as dots instead of a smear of names. */
-const LABEL_ALL_ZOOM = 1.2;
 /** The drawn radius is CLAMPED to a screen-pixel range so a node neither
  *  balloons when a small graph fits-to-view (zoomed way in) nor vanishes on a
  *  big graph (zoomed out). Drawn at `clamp(baseR·zoom, MIN, MAX) / zoom` graph
@@ -159,18 +168,65 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const [hovered, setHovered] = useState<string>();
   const [size, setSize] = useState({ w: 0, h: 0 });
 
+  // ── Viewport culling + LOD (refs so the per-frame visibility predicates stay
+  //    O(1) and never trigger a React re-render). The cull layer skips paint +
+  //    hit-test for off-screen elements; the LOD layer raises a degree floor at
+  //    overview zoom so only hubs draw, revealing leaves as you zoom in. ──
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
+  const transformRef = useRef({ k: 1, cx: 0, cy: 0 });
+  const viewportRef = useRef<ViewportRect | null>(null);
+  const degreeFloorRef = useRef(0);
+  const lodBandRef = useRef(0);
+  const fitZoomRef = useRef(0); // captured post-fit; 0 until then (relZoom→1)
+  const degreeRef = useRef<Map<string, number>>(new Map());
+  const sortedDegreesRef = useRef<number[]>([]);
+  const labelCountRef = useRef(0);
+  // Forced elements always paint (selection / hover / pin / focus-neighbor),
+  // even below the LOD floor or off-screen — read via refs by stable predicates.
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const hoveredRef = useRef(hovered);
+  hoveredRef.current = hovered;
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
+  const focusUriRef = useRef<string | undefined>(undefined);
+  const adjacencyRef = useRef<Map<string, Set<string>>>(new Map());
+  // Bumped on NON-camera triggers (resize / zoom-settle / fit-capture) to force
+  // one repaint so the cull re-runs; camera moves already repaint on their own.
+  const [cullEpoch, setCullEpoch] = useState(0);
+
+  // Recompute the visible world rect + the LOD degree floor from the current
+  // camera. Cheap (a few ops) — called on zoom/resize, never per frame. Reads
+  // refs only, so its identity is stable.
+  const recomputeCull = useCallback(() => {
+    const { k, cx, cy } = transformRef.current;
+    if (!k) return;
+    const { w, h } = sizeRef.current;
+    viewportRef.current = computeViewportRect({ w, h, k, cx, cy, marginPx: MARGIN_PX });
+    const relZoom = fitZoomRef.current ? k / fitZoomRef.current : 1;
+    const band = nextBand(relZoom, lodBandRef.current);
+    lodBandRef.current = band;
+    degreeFloorRef.current = floorFromDegrees(sortedDegreesRef.current, bandTargetCount(band));
+  }, []);
+
   // react-force-graph-2d defaults to window.innerWidth/Height with no resize
   // handling — measure the actual wrapper so the canvas fills its grid cell and
   // reflows when the sidebar/detail panel toggles.
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(([e]) =>
-      setSize({ w: e.contentRect.width, h: e.contentRect.height }),
-    );
+    const ro = new ResizeObserver(([e]) => {
+      const w = e.contentRect.width;
+      const h = e.contentRect.height;
+      setSize({ w, h });
+      sizeRef.current = { w, h };
+      recomputeCull();
+      setCullEpoch((x) => x + 1);
+    });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [recomputeCull]);
 
   useImperativeHandle(
     ref,
@@ -219,8 +275,24 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     if (!fittedRef.current) {
       fg.zoomToFit(400, 60);
       fittedRef.current = true;
+      // Capture the FITTED zoom (after the 400ms animation) as the relZoom=1
+      // anchor — the whole-graph overview. Until then relZoom defaults to 1, so
+      // a graph that never settles still gets the overview LOD. Then run the
+      // first cull + force one repaint so the overview opens decluttered.
+      setTimeout(() => {
+        const live = fgRef.current;
+        if (!live) return;
+        const z = live.zoom();
+        const c = live.centerAt();
+        if (z) {
+          fitZoomRef.current = z;
+          transformRef.current = { k: z, cx: c?.x ?? 0, cy: c?.y ?? 0 };
+          recomputeCull();
+          setCullEpoch((x) => x + 1);
+        }
+      }, 450);
     }
-  }, []);
+  }, [recomputeCull]);
 
   // node.group is assigned at data ingest (use-graph-data.ts), so it travels
   // with the node and this stays a pure filter.
@@ -250,6 +322,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     }
     return d;
   }, [visibleEdges]);
+
+  // Descending degree list backs the LOD count→floor mapping; both it and the
+  // degree map are mirrored to refs so the ref-only visibility predicates +
+  // recomputeCull can read them. Recompute the floor when the distribution
+  // changes (a filter/expand) so the overview stays calibrated.
+  const sortedDegrees = useMemo(() => [...degree.values()].sort((a, b) => b - a), [degree]);
+  degreeRef.current = degree;
+  sortedDegreesRef.current = sortedDegrees;
+  // Cull + LOD only engage past a node-count threshold; smaller graphs show
+  // everything at every zoom (mirrors layoutTier's count-gating).
+  const cullActive = visibleNodes.length > CULL_MIN_NODES;
+  useEffect(() => {
+    recomputeCull();
+  }, [sortedDegrees, recomputeCull]);
 
   // Paint hubs FIRST so a high-degree node's label claims its collision box
   // before a leaf's (the label cull is first-come, in onRenderFramePre order).
@@ -287,9 +373,53 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // pointer previews a node's neighborhood without committing a selection. When
   // neither is active, nothing dims (the plain overview).
   const focusUri = hovered ?? selected;
+  adjacencyRef.current = adjacency;
+  focusUriRef.current = focusUri;
   const isRelated = useCallback(
     (uri: string) => !focusUri || uri === focusUri || (adjacency.get(focusUri)?.has(uri) ?? false),
     [focusUri, adjacency],
+  );
+
+  // ── Visibility predicates: O(1), ref-only, so force-graph can call them once
+  //    per element per frame cheaply (it skips paint AND hit-test for a false
+  //    return). `forced` elements always show; otherwise a node shows iff it
+  //    clears the LOD degree floor AND sits in the viewport rect; an edge shows
+  //    iff both endpoints clear the floor and at least one is on-screen (so
+  //    edges follow their nodes — overview = a hub skeleton). Identity bumps on
+  //    cullEpoch (non-camera repaints); camera moves repaint + re-run on their
+  //    own against the updated refs. ──
+  const isForced = useCallback((uri: string): boolean => {
+    if (uri === selectedRef.current || uri === hoveredRef.current || pinnedRef.current.has(uri)) {
+      return true;
+    }
+    const f = focusUriRef.current;
+    return f != null && (uri === f || (adjacencyRef.current.get(f)?.has(uri) ?? false));
+  }, []);
+  const nodeVisible = useCallback(
+    (n: RenderNode): boolean => {
+      if (isForced(n.uri)) return true;
+      const v = viewportRef.current;
+      if (!v) return true;
+      if ((degreeRef.current.get(n.uri) ?? 0) < degreeFloorRef.current) return false;
+      return inViewportPoint(n.x ?? 0, n.y ?? 0, v);
+    },
+    [cullEpoch, isForced],
+  );
+  const linkVisible = useCallback(
+    (l: RenderEdge): boolean => {
+      const src = typeof l.source === "object" ? l.source : null;
+      const tgt = typeof l.target === "object" ? l.target : null;
+      if (!src || !tgt) return true;
+      const f = focusUriRef.current;
+      if (f != null && (src.uri === f || tgt.uri === f)) return true; // incident always
+      const floor = degreeFloorRef.current;
+      if ((degreeRef.current.get(src.uri) ?? 0) < floor) return false;
+      if ((degreeRef.current.get(tgt.uri) ?? 0) < floor) return false;
+      const v = viewportRef.current;
+      if (!v) return true;
+      return inViewportPoint(src.x ?? 0, src.y ?? 0, v) || inViewportPoint(tgt.x ?? 0, tgt.y ?? 0, v);
+    },
+    [cullEpoch],
   );
 
   // Accepted-label boxes for the greedy collision cull in paintNode's label
@@ -392,6 +522,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // Cluster membership re-tints the node outline; selection (teal) always
       // wins; ungrouped nodes keep their kind stroke.
       const groupStroke = clustered && n.group ? groupColor(n.group, colors.cat) : null;
+      // Far-overview LOD (band 0, large graphs only): every kind draws as a
+      // plain circle — the rounded-square/dashed-ring kind silhouettes are
+      // illegible at that scale and redundant with the legend.
+      const simplified = cullActive && lodBandRef.current === 0;
 
       ctx.save();
       // Hover/selection neighbor-highlight: dim everything not adjacent to the
@@ -418,8 +552,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           kindStroke = colors.foreground;
           break;
       }
+      if (simplified) dashed = false; // plain circle at far overview
       ctx.beginPath();
-      traceNode(ctx, n.kind, x, y, r);
+      traceNode(ctx, simplified ? "document" : n.kind, x, y, r);
       ctx.fillStyle = fill;
       ctx.fill();
       ctx.strokeStyle = isSelected ? colors.primary : (groupStroke ?? kindStroke);
@@ -459,24 +594,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       //  • constant ON-SCREEN size: divide the graph-space font by the zoom, so
       //    labels don't balloon when a small graph fits-to-view zoomed-in;
       //  • restraint: forced (selected/hovered/pinned/focus-neighbor) always;
-      //    otherwise only when zoomed in past LABEL_ALL_ZOOM or for hubs
-      //    (degree ≥ 4); in focus mode only the focused neighborhood labels;
+      //    otherwise only when the node's ON-SCREEN radius is big enough
+      //    (degree-driven → hubs label first, leaves as you zoom in), under a
+      //    per-frame hard cap, and in focus mode only the focused neighborhood;
       //  • collision culling: a non-forced label that would overlap one already
       //    drawn this frame is skipped (labelBoxes resets in onRenderFramePre);
       //  • translucent pill behind the text for legibility over edges/nodes.
       const forced = isSelected || n.uri === hovered || isPinned || (focusUri != null && related);
-      const wantLabel = forced || (focusUri == null && (scale > LABEL_ALL_ZOOM || deg >= 4));
+      const rPx = r * scale;
+      const wantLabel =
+        forced ||
+        (focusUri == null && rPx >= LABEL_MIN_NODE_PX && labelCountRef.current < LABEL_CAP);
       if (wantLabel && n.name) {
         const fontSize = 12 / scale;
         const lp = 3 / scale;
         ctx.font = `${fontSize}px ${fontSans}`;
         // Title as-authored — never .toUpperCase() (corrupts acronyms/non-Latin).
-        const label = n.name.length > 24 ? n.name.slice(0, 24) + "…" : n.name;
+        // Truncate harder at overview/mid LOD bands, full 24 chars zoomed in.
+        const maxLen = cullActive && lodBandRef.current < 3 ? 12 : 24;
+        const label = n.name.length > maxLen ? n.name.slice(0, maxLen) + "…" : n.name;
         const w = ctx.measureText(label).width;
         const ly = y + r + lp;
         const box = { x: x - w / 2 - lp, y: ly, w: w + lp * 2, h: fontSize + lp * 2 };
         if (forced || !overlaps(box)) {
           labelBoxes.current.push(box);
+          if (!forced) labelCountRef.current++;
           ctx.globalAlpha = 0.82;
           ctx.fillStyle = colors.background;
           ctx.fillRect(box.x, box.y, box.w, box.h);
@@ -489,7 +631,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       }
       ctx.restore();
     },
-    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps, fontSans],
+    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps, fontSans, cullActive],
   );
 
   const paintLink = useCallback(
@@ -500,8 +642,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const dash = RELATION_DASH[l.relation];
       const structural = RELATION_CLASS[l.relation] === "structural";
       // Edges touching the focused node (hovered, else selected) light up
-      // (teal + thicker + glow); the rest dim so the focused node's
-      // connections stand out of a dense graph.
+      // (teal + thicker); the rest dim so the focused node's connections stand
+      // out of a dense graph. No shadowBlur — a per-pixel gaussian blur is the
+      // costliest canvas op and a focused mega-hub would queue dozens of them
+      // per frame; teal + weight already reads as "incident".
       const incident = focusUri != null && (src.uri === focusUri || tgt.uri === focusUri);
       ctx.save();
       ctx.beginPath();
@@ -510,8 +654,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       if (incident) {
         ctx.strokeStyle = colors.primary;
         ctx.lineWidth = 2.5;
-        ctx.shadowColor = colors.primary;
-        ctx.shadowBlur = 6;
       } else {
         // Structural ties (depends_on/implements/derived_from/attached_to) read
         // darker + thicker; associative ties (references/related_to/links_to)
@@ -623,6 +765,23 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         nodeId="uri"
         linkSource="source"
         linkTarget="target"
+        // Viewport culling + LOD: force-graph evaluates these once per element
+        // per frame and skips BOTH paint and hit-test for a false return, while
+        // the d3 sim keeps the full set — so this is a pure paint/LOD win that
+        // never disturbs layout. Disabled (always-true) below the count gate.
+        nodeVisibility={cullActive ? (nodeVisible as never) : true}
+        linkVisibility={cullActive ? (linkVisible as never) : true}
+        // onZoom fires continuously through a wheel/drag/programmatic zoom and
+        // each fire repaints, so updating the refs here is enough — the last
+        // frame paints the settled cull/LOD. No setState in these handlers:
+        // force-graph can fire them synchronously during its own render, and a
+        // setState there warns "update while rendering". Idle re-culls that DO
+        // need a forced repaint (resize, fit-capture) bump cullEpoch from async
+        // callbacks instead.
+        onZoom={(t) => {
+          transformRef.current = { k: t.k, cx: t.x, cy: t.y };
+          recomputeCull();
+        }}
         nodeCanvasObject={paintNode as never}
         linkCanvasObject={paintLink as never}
         linkDirectionalArrowLength={5}
@@ -636,8 +795,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         d3VelocityDecay={0.5}
         d3AlphaDecay={0.04}
         onRenderFramePre={() => {
-          // Reset the per-frame label-collision accumulator before nodes paint.
+          // Reset the per-frame label accumulators before nodes paint: the
+          // collision boxes and the non-forced label hard-cap counter.
           labelBoxes.current = [];
+          labelCountRef.current = 0;
         }}
         onEngineStop={handleEngineStop}
         onNodeHover={(n) => setHovered((n as RenderNode | undefined)?.uri)}
