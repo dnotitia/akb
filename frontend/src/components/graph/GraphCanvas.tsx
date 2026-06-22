@@ -1,7 +1,7 @@
 // frontend/src/components/graph/GraphCanvas.tsx
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
-import { Pause, Play, Maximize2, Minus, Plus, Boxes } from "lucide-react";
+import { Pause, Play, Maximize2, Minus, Plus, Boxes, Crosshair } from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
 import {
   RELATION_DASH,
@@ -168,6 +168,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const frozenRef = useRef(frozen);
   frozenRef.current = frozen;
   const [clustered, setClustered] = useState(true);
+  // Impact-analysis mode: when on + a node selected, light its directed
+  // STRUCTURAL dependency cone (teal, outgoing) + dependent cone (orange,
+  // incoming) and dim the rest — "what does this depend on, and what depends
+  // on it" before an edit/delete. Client-side (edges carry directed
+  // source/target + relation); no backend.
+  const [impactMode, setImpactMode] = useState(false);
   const [hovered, setHovered] = useState<string>();
   const [size, setSize] = useState({ w: 0, h: 0 });
 
@@ -387,6 +393,45 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     return adj;
   }, [visibleEdges]);
 
+  // Impact-analysis cones (impact mode + a selection): directed transitive
+  // closures over STRUCTURAL edges from the selected node — `out` = its
+  // dependencies (follow source→target), `in` = its dependents (target→source).
+  // Recomputed only when the structure / selection / mode changes.
+  const impactSets = useMemo<{ out: Set<string>; in: Set<string> } | null>(() => {
+    if (!impactMode || !selected) return null;
+    const fwd = new Map<string, string[]>();
+    const bwd = new Map<string, string[]>();
+    const push = (m: Map<string, string[]>, k: string, v: string) => {
+      const a = m.get(k);
+      if (a) a.push(v);
+      else m.set(k, [v]);
+    };
+    for (const e of visibleEdges) {
+      if (RELATION_CLASS[e.relation] !== "structural") continue;
+      const s = endpointUri(e.source);
+      const t = endpointUri(e.target);
+      push(fwd, s, t);
+      push(bwd, t, s);
+    }
+    const bfs = (start: string, adj: Map<string, string[]>) => {
+      const seen = new Set<string>();
+      const queue = [start];
+      while (queue.length) {
+        const u = queue.shift() as string;
+        for (const v of adj.get(u) ?? []) {
+          if (v !== start && !seen.has(v)) {
+            seen.add(v);
+            queue.push(v);
+          }
+        }
+      }
+      return seen;
+    };
+    return { out: bfs(selected, fwd), in: bfs(selected, bwd) };
+  }, [impactMode, selected, visibleEdges]);
+  const impactSetsRef = useRef(impactSets);
+  impactSetsRef.current = impactSets;
+
   // Hover takes precedence over selection for the highlight focus, so moving the
   // pointer previews a node's neighborhood without committing a selection. When
   // neither is active, nothing dims (the plain overview).
@@ -410,6 +455,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     if (uri === selectedRef.current || uri === hoveredRef.current || pinnedRef.current.has(uri)) {
       return true;
     }
+    const imp = impactSetsRef.current;
+    if (imp && (imp.out.has(uri) || imp.in.has(uri))) return true; // impact cone
     const f = focusUriRef.current;
     return f != null && (uri === f || (adjacencyRef.current.get(f)?.has(uri) ?? false));
   }, []);
@@ -553,9 +600,23 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // plain circle — the rounded-square/dashed-ring kind silhouettes are
       // illegible at that scale and redundant with the legend.
       const simplified = cullActive && lodBandRef.current === 0;
-      // Forced (selection / hover / pin / focus-neighbor) always renders full.
+      // Impact mode role: 1 = the selected root, 2 = a dependency (outgoing
+      // structural cone, teal), 3 = a dependent (incoming cone, orange), 0 =
+      // outside the cones (dimmed). Off when impact mode isn't active.
+      const impactActive = impactSets != null;
+      const coneRole = !impactActive
+        ? 0
+        : isSelected
+          ? 1
+          : impactSets.out.has(n.uri)
+            ? 2
+            : impactSets.in.has(n.uri)
+              ? 3
+              : 0;
+      // Forced (selection / hover / pin / focus-neighbor / impact cone) renders
+      // full — never demoted to a dot.
       const forcedNode =
-        isSelected || n.uri === hovered || isPinned || (focusUri != null && related);
+        isSelected || n.uri === hovered || isPinned || (focusUri != null && related) || coneRole > 0;
 
       // LOD DEMOTION (not hiding): a node outside the current top-N renders as a
       // small dim dot — visible, so the structure stays honest (a leaf field
@@ -566,7 +627,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const demoted = cullActive && !forcedNode && lodSet != null && !lodSet.has(n.uri);
       if (demoted) {
         ctx.save();
-        ctx.globalAlpha = focusUri && !related ? 0.12 : 0.5;
+        // Dimmer in a focus/impact view (these dots are outside the cone /
+        // neighborhood), softer otherwise.
+        ctx.globalAlpha = impactActive || (focusUri && !related) ? 0.12 : 0.5;
         ctx.beginPath();
         ctx.arc(x, y, 2.2 / scale, 0, 2 * Math.PI);
         ctx.fillStyle = (clustered && n.group ? groupStroke : null) ?? colors.foregroundMuted;
@@ -576,9 +639,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       }
 
       ctx.save();
-      // Hover/selection neighbor-highlight: dim everything not adjacent to the
-      // focused node so its neighborhood pops out of a dense graph.
-      if (focusUri && !related) ctx.globalAlpha = 0.18;
+      // Dim everything outside the focus: in impact mode, anything not in either
+      // cone; otherwise the hovered/selected node's non-neighbors.
+      if (impactActive) {
+        if (coneRole === 0) ctx.globalAlpha = 0.1;
+      } else if (focusUri && !related) {
+        ctx.globalAlpha = 0.18;
+      }
 
       // Kind → fill + default stroke + dash. Shape (traceNode) carries the kind:
       // document = circle, table = rounded square, file = dashed-ring circle.
@@ -605,8 +672,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       traceNode(ctx, simplified ? "document" : n.kind, x, y, r);
       ctx.fillStyle = fill;
       ctx.fill();
-      ctx.strokeStyle = isSelected ? colors.primary : (groupStroke ?? kindStroke);
-      ctx.lineWidth = isSelected ? 2.5 : 1.5;
+      // Impact cones recolor the outline: dependency = teal, dependent = orange.
+      const coneStroke = coneRole === 2 ? colors.primary : coneRole === 3 ? colors.accent : null;
+      ctx.strokeStyle = isSelected ? colors.primary : (coneStroke ?? groupStroke ?? kindStroke);
+      ctx.lineWidth = isSelected || coneRole > 0 ? 2.5 : 1.5;
       ctx.setLineDash(dashed ? [3, 2] : []);
       ctx.stroke();
       ctx.setLineDash([]);
@@ -678,7 +747,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       }
       ctx.restore();
     },
-    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps, fontSans, cullActive],
+    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps, fontSans, cullActive, impactSets],
   );
 
   const paintLink = useCallback(
@@ -694,11 +763,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // costliest canvas op and a focused mega-hub would queue dozens of them
       // per frame; teal + weight already reads as "incident".
       const incident = focusUri != null && (src.uri === focusUri || tgt.uri === focusUri);
+      // Impact mode: a structural edge inside the dependency cone (both ends in
+      // out ∪ {selected}) paints teal; inside the dependent cone, orange; any
+      // other edge dims. Computed before the focus-incident path so it wins.
+      const imp = impactSets;
+      let coneColor: string | null = null;
+      let coneDim = false;
+      if (imp) {
+        const inOut =
+          (src.uri === selected || imp.out.has(src.uri)) &&
+          (tgt.uri === selected || imp.out.has(tgt.uri));
+        const inIn =
+          (src.uri === selected || imp.in.has(src.uri)) &&
+          (tgt.uri === selected || imp.in.has(tgt.uri));
+        if (structural && inOut) coneColor = colors.primary;
+        else if (structural && inIn) coneColor = colors.accent;
+        else coneDim = true;
+      }
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(src.x || 0, src.y || 0);
       ctx.lineTo(tgt.x || 0, tgt.y || 0);
-      if (incident) {
+      if (coneColor) {
+        ctx.strokeStyle = coneColor;
+        ctx.lineWidth = 2.5;
+      } else if (incident && !imp) {
         ctx.strokeStyle = colors.primary;
         ctx.lineWidth = 2.5;
       } else {
@@ -707,13 +796,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         // muted + thinner — color/weight the primary channel, dash the secondary.
         ctx.strokeStyle = structural ? colors.foreground : colors.foregroundMuted;
         ctx.lineWidth = structural ? 1.6 : 1.1;
-        if (focusUri != null) ctx.globalAlpha = 0.15;
+        if (coneDim) ctx.globalAlpha = 0.08;
+        else if (focusUri != null) ctx.globalAlpha = 0.15;
       }
       ctx.setLineDash(dash);
       ctx.stroke();
       ctx.restore();
     },
-    [colors, focusUri],
+    [colors, focusUri, impactSets, selected],
   );
 
   // Arrowheads inherit their edge's encoding (teal when incident, else
@@ -794,6 +884,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           active={clustered}
         />
         <CanvasButton
+          onClick={() => setImpactMode((m) => !m)}
+          label={impactMode ? "Exit impact mode" : "Impact mode (select a node to see its deps)"}
+          icon={Crosshair}
+          active={impactMode}
+        />
+        <CanvasButton
           onClick={() => setFrozen((f) => !f)}
           label={frozen ? "Resume" : "Freeze"}
           icon={frozen ? Play : Pause}
@@ -814,6 +910,21 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           icon={Plus}
         />
       </div>
+      {impactMode && (
+        <div className="absolute top-14 left-3 z-[var(--z-raised)] rounded-[var(--radius-md)] border border-border bg-surface/90 backdrop-blur px-2.5 py-1.5 shadow-sm text-[11px] text-foreground-muted">
+          <div className="flex items-center gap-3">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[var(--color-primary)]" aria-hidden />
+              depends&nbsp;on
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[var(--color-accent)]" aria-hidden />
+              dependents
+            </span>
+            {!selected && <span className="text-foreground-muted/70">— select a node</span>}
+          </div>
+        </div>
+      )}
       <GraphLegend />
       <ForceGraph2D
         ref={fgRef as never}
