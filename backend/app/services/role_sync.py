@@ -73,11 +73,13 @@ import asyncio
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
 import asyncpg
 
+from app.models.vault_scope import VaultScope
 from app.repositories.table_data_repo import PG_IDENT_MAX_LEN
 
 logger = logging.getLogger("akb.role_sync")
@@ -105,6 +107,44 @@ def vault_group_role_name(
     if scope not in ("reader", "writer", "admin"):
         raise ValueError(f"invalid scope: {scope!r}")
     return f"akb_vault_{str(vault_id).replace('-', '_')}_{scope}"
+
+
+def token_role_name(token_id: uuid.UUID | str) -> str:
+    """`akb_token_<tid_with_dashes_to_underscores>` — the per-PAT narrow role.
+
+    Provisioned ONLY for SCOPED PATs (``tokens.vault_scope IS NOT NULL``). Its
+    membership is the intersection of the token-owner's vault grants with the
+    token's scope (see :func:`wanted_token_group_roles`), so an ``akb_sql``
+    statement run under it is PG-confined to the scope — PG returns 42501 for
+    any out-of-scope table reference. This is surface 2 (PG-native) of the
+    Option-B backstop; surface 1 (app-layer ``check_vault_access``) is M1."""
+    return f"akb_token_{str(token_id).replace('-', '_')}"
+
+
+def wanted_token_group_roles(
+    accessible: Sequence[tuple[uuid.UUID | str, str, str]],
+    scope: VaultScope,
+) -> set[str]:
+    """The vault group roles a scoped token's ``akb_token_<tid>`` should join.
+
+    ``accessible`` is the token-owner's reachable vaults as
+    ``(vault_id, vault_name, role)`` (role ∈ reader/writer/admin) — the union
+    of explicit ``vault_access`` grants and owned vaults (owner ⇒ admin). The
+    token role gets the SAME role on every accessible vault whose NAME is
+    inside ``scope``; out-of-scope vaults are dropped ENTIRELY (the akb_sql
+    surface is scope-confined for BOTH read and write — defense-in-depth on
+    the raw-SQL power tool, intentionally stricter than the doc-tool surface
+    which stays read-broad).
+
+    Pure function (no PG) so the intersection — the security-critical core —
+    is unit-tested adversarially. The result is ``owner-ACL ∩ scope``: a scope
+    only ever SUBTRACTS, so it can never grant a role the owner lacks, and an
+    out-of-scope vault is excluded no matter how strong the owner's role."""
+    return {
+        vault_group_role_name(vid, role)
+        for (vid, vname, role) in accessible
+        if scope.permits(vname)
+    }
 
 
 def _public_access_scope(level: str) -> str | None:
@@ -141,6 +181,8 @@ class ReconcileReport:
     user_roles_dropped: int = 0
     vault_roles_created: int = 0
     vault_roles_dropped: int = 0
+    token_roles_created: int = 0
+    token_roles_dropped: int = 0
     grants_added: int = 0
     grants_removed: int = 0
     table_grants_applied: int = 0
@@ -151,6 +193,7 @@ class ReconcileReport:
         return (
             f"users(+{self.user_roles_created}/-{self.user_roles_dropped}) "
             f"vaults(+{self.vault_roles_created}/-{self.vault_roles_dropped}) "
+            f"tokens(+{self.token_roles_created}/-{self.token_roles_dropped}) "
             f"grants(+{self.grants_added}/-{self.grants_removed}) "
             f"table_grants({self.table_grants_applied}) "
             f"public_grants({self.public_grants_applied}) "
@@ -170,6 +213,12 @@ class RoleStateDiff:
     orphan_user_roles: list[str] = field(default_factory=list)
     missing_vault_roles: list[str] = field(default_factory=list)
     orphan_vault_roles: list[str] = field(default_factory=list)
+    # Token roles are diffed at ROLE granularity only (present/orphan). Their
+    # per-vault MEMBERSHIP is converged by reconcile (GRANT+REVOKE against the
+    # owner-ACL ∩ scope), not surfaced here — a missing token role is the
+    # operator-actionable signal; membership drift self-heals each reconcile.
+    missing_token_roles: list[str] = field(default_factory=list)
+    orphan_token_roles: list[str] = field(default_factory=list)
     missing_memberships: list[dict] = field(default_factory=list)
     missing_public_grants: list[dict] = field(default_factory=list)
     stale_public_grants: list[dict] = field(default_factory=list)
@@ -183,6 +232,8 @@ class RoleStateDiff:
             + len(self.orphan_user_roles)
             + len(self.missing_vault_roles)
             + len(self.orphan_vault_roles)
+            + len(self.missing_token_roles)
+            + len(self.orphan_token_roles)
             + len(self.missing_memberships)
             + len(self.missing_public_grants)
             + len(self.stale_public_grants)
@@ -336,6 +387,44 @@ class RoleSync:
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_user_delete", e, user_id)
 
+    async def on_token_create(
+        self,
+        token_id: uuid.UUID | str,
+        user_id: uuid.UUID | str,
+        scope: VaultScope,
+    ) -> None:
+        """Provision `akb_token_<tid>` (NOLOGIN) for a SCOPED PAT.
+
+        Grants it the owner's vault grants ∩ scope so a later
+        ``SET LOCAL ROLE akb_token_<tid>`` (in :class:`UserSqlExecutor`)
+        confines ``akb_sql`` to the scope. Call ONLY when the token carries
+        a scope (an unscoped PAT runs under ``akb_user_<uid>`` and needs no
+        token role). Idempotent + best-effort: a failure here leaves the
+        token role missing, which is FAIL-CLOSED (the executor's role-switch
+        raises rather than silently falling back to the full user role), and
+        the startup/periodic reconciler rebuilds it from the catalog."""
+        role = token_role_name(token_id)
+        try:
+            async with self.pool.acquire() as conn:
+                await self._create_role_if_missing(conn, role)
+                accessible = await self._fetch_user_accessible(conn, user_id)
+                for group in wanted_token_group_roles(accessible, scope):
+                    await self._grant_membership(conn, group, role)
+        except Exception as e:  # noqa: BLE001
+            self._record_failure("on_token_create", e, token_id)
+
+    async def on_token_revoke(self, token_id: uuid.UUID | str) -> None:
+        """Drop `akb_token_<tid>` when a PAT is revoked. Idempotent and safe
+        to call for ANY token: an unscoped token never had a role, so this is
+        a no-op for it (``DROP ROLE IF EXISTS``). Token EXPIRY has no hook —
+        the reconciler drops orphan token roles for expired/cascaded tokens."""
+        role = token_role_name(token_id)
+        try:
+            async with self.pool.acquire() as conn:
+                await self._drop_role_if_present(conn, role)
+        except Exception as e:  # noqa: BLE001
+            self._record_failure("on_token_revoke", e, token_id)
+
     async def on_vault_create(
         self,
         vault_id: uuid.UUID | str,
@@ -357,6 +446,10 @@ class RoleSync:
                     owner_role = user_role_name(owner_user_id)
                     await self._create_role_if_missing(conn, owner_role)
                     await self._grant_membership(conn, admin, owner_role)
+                    # A scoped token of the owner whose scope permits this new
+                    # vault must gain akb_sql reach to it NOW (e.g. a gardener
+                    # creating its own gdn-* vault via its scoped PAT).
+                    await self._sync_user_scoped_tokens(conn, owner_user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_vault_create", e, vault_id)
 
@@ -399,6 +492,9 @@ class RoleSync:
                     await self._revoke_membership_if_present(conn, other, user)
                 await self._create_role_if_missing(conn, user)
                 await self._grant_membership(conn, group, user)
+                # Propagate to the grantee's scoped tokens (gain/downgrade
+                # in-scope reach to match the new grant).
+                await self._sync_user_scoped_tokens(conn, user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_grant", e, vault_id, user_id, scope)
 
@@ -415,6 +511,9 @@ class RoleSync:
                 for scope in ("reader", "writer", "admin"):
                     group = vault_group_role_name(vault_id, scope)
                     await self._revoke_membership_if_present(conn, group, user)
+                # Withdraw the revoked vault from the user's scoped tokens too
+                # (effective = owner-ACL ∩ scope; a lost grant must propagate).
+                await self._sync_user_scoped_tokens(conn, user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_revoke", e, vault_id, user_id)
 
@@ -433,6 +532,8 @@ class RoleSync:
             async with self.pool.acquire() as conn:
                 await self._create_role_if_missing(conn, new_role)
                 await self._grant_membership(conn, admin, new_role)
+                # New owner's scoped tokens may now reach this vault in-scope.
+                await self._sync_user_scoped_tokens(conn, new_owner_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure(
                 "on_ownership_transfer", e, vault_id, old_owner_id, new_owner_id,
@@ -542,6 +643,10 @@ class RoleSync:
           5. For each vault_tables row → grant table-level perms.
           6. For each vault → sync `public_access` to akb_authenticated
              memberships.
+          7. For each live SCOPED token → ensure `akb_token_<tid>` exists and
+             its memberships = owner-ACL ∩ scope (GRANT missing + REVOKE
+             stale); drop orphan token roles (revoked/expired/unscoped). This
+             is where a new `gdn-*` vault auto-joins matching scoped tokens.
 
         Idempotent. Safe to run repeatedly.
         """
@@ -555,6 +660,9 @@ class RoleSync:
             await self._reconcile_memberships(conn, report)
             await self._reconcile_table_grants(conn, report)
             await self._reconcile_public_access(conn, report)
+            # Token roles depend on user + vault group roles + memberships
+            # existing, so converge them LAST.
+            await self._reconcile_token_roles(conn, report)
 
         self.metrics.last_reconcile_errors = len(report.errors)
         self.metrics.last_reconcile_at = datetime.now(timezone.utc).isoformat()
@@ -720,6 +828,174 @@ class RoleSync:
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT on {pg_name}: {e}")
 
+    async def _fetch_user_accessible(
+        self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
+    ) -> list[tuple[uuid.UUID, str, str]]:
+        """The user's reachable vaults as ``(vault_id, vault_name, role)``.
+
+        Union of explicit ``vault_access`` grants and owned vaults (owner ⇒
+        admin). Public vaults are intentionally EXCLUDED: a scoped token gets
+        ONLY its owner's explicit authority ∩ scope, never the
+        ``akb_authenticated`` wildcard (joining it would let a scoped token
+        write a public-writer vault out of scope — a widen, which the
+        backstop must forbid). Feeds :func:`wanted_token_group_roles`.
+
+        A user who both owns a vault AND has an explicit lower-role row on it
+        yields two tuples; the token then joins both group roles, which is
+        harmless (admin already includes reader via the hierarchy)."""
+        uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        rows = await conn.fetch(
+            """
+            SELECT va.vault_id AS vault_id, v.name AS vault_name, va.role AS role
+              FROM vault_access va JOIN vaults v ON va.vault_id = v.id
+             WHERE va.user_id = $1
+            UNION
+            SELECT id AS vault_id, name AS vault_name, 'admin' AS role
+              FROM vaults WHERE owner_id = $1
+            """,
+            uid,
+        )
+        return [(r["vault_id"], r["vault_name"], r["role"]) for r in rows]
+
+    async def _token_group_memberships(
+        self, conn: asyncpg.Connection, token_role: str,
+    ) -> set[str]:
+        """The akb_vault_* group roles ``token_role`` is currently a member of."""
+        rows = await conn.fetch(
+            """
+            SELECT r.rolname AS group_role
+              FROM pg_auth_members am
+              JOIN pg_roles r ON r.oid = am.roleid
+              JOIN pg_roles m ON m.oid = am.member
+             WHERE m.rolname = $1
+               AND r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
+            """,
+            token_role,
+        )
+        return {r["group_role"] for r in rows}
+
+    async def _sync_user_scoped_tokens(
+        self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
+    ) -> None:
+        """Re-converge every live SCOPED token of ``user_id`` to owner-ACL ∩ scope.
+
+        Called from the vault-access lifecycle hooks (vault create, grant,
+        revoke, ownership transfer) so a scoped token gains/loses akb_sql reach
+        the INSTANT its owner's authority changes — not only at the periodic
+        reconcile. Without this, a gardener that mints its scoped PAT and THEN
+        creates its own gdn-* vault could not akb_sql that vault until the next
+        reconcile (the token role would be missing the just-created vault's
+        group). A no-op for users with no scoped tokens. Runs inside the
+        caller hook's connection + best-effort try/except."""
+        uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        token_rows = await conn.fetch(
+            """
+            SELECT id, vault_scope FROM tokens
+             WHERE user_id = $1 AND vault_scope IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
+            """,
+            uid,
+        )
+        if not token_rows:
+            return
+        accessible = await self._fetch_user_accessible(conn, uid)
+        for r in token_rows:
+            try:
+                scope = VaultScope.from_db_json(r["vault_scope"])
+            except ValueError:
+                continue
+            if scope is None:
+                continue
+            role = token_role_name(r["id"])
+            await self._create_role_if_missing(conn, role)
+            wanted = wanted_token_group_roles(accessible, scope)
+            have = await self._token_group_memberships(conn, role)
+            for group in wanted - have:
+                await self._grant_membership(conn, group, role)
+            for group in have - wanted:
+                await self._revoke_membership_if_present(conn, group, role)
+
+    async def _reconcile_token_roles(
+        self, conn: asyncpg.Connection, report: ReconcileReport,
+    ) -> None:
+        """Converge `akb_token_<tid>` roles for every live SCOPED PAT.
+
+        Role layer: CREATE for scoped, non-expired tokens; DROP orphans
+        (revoked, expired, or de-scoped tokens whose role lingers).
+        Membership layer: per token, GRANT missing + REVOKE stale so the set
+        equals ``owner-ACL ∩ scope`` — this is where a NEW in-scope vault
+        joins, and a revoked/downgraded owner grant is withdrawn from the
+        token. A malformed scope is logged and skipped (it never widens —
+        the token role just keeps its current, already-narrow membership)."""
+        token_rows = await conn.fetch(
+            """
+            SELECT id, user_id, vault_scope
+              FROM tokens
+             WHERE vault_scope IS NOT NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
+            """
+        )
+        live: list[tuple[str, uuid.UUID, VaultScope]] = []
+        for r in token_rows:
+            try:
+                scope = VaultScope.from_db_json(r["vault_scope"])
+            except ValueError as e:
+                report.errors.append(f"token {r['id']} scope parse: {e}")
+                continue
+            if scope is None:
+                continue
+            live.append((token_role_name(r["id"]), r["user_id"], scope))
+
+        wanted_roles = {name for (name, _uid, _s) in live}
+        existing = {
+            r["rolname"]
+            for r in await conn.fetch(
+                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_token\\_%' ESCAPE '\\'"
+            )
+        }
+        for role in wanted_roles - existing:
+            try:
+                await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+                report.token_roles_created += 1
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"CREATE ROLE {role}: {e}")
+        for orphan in existing - wanted_roles:
+            try:
+                await self._drop_role_if_present(conn, orphan)
+                report.token_roles_dropped += 1
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"DROP ROLE {orphan}: {e}")
+
+        # Per-token membership convergence. Pull all current akb_token_* →
+        # akb_vault_* memberships once, then GRANT/REVOKE to the wanted set.
+        mem_rows = await conn.fetch(
+            """
+            SELECT m.rolname AS token_role, r.rolname AS group_role
+              FROM pg_auth_members am
+              JOIN pg_roles r ON r.oid = am.roleid
+              JOIN pg_roles m ON m.oid = am.member
+             WHERE m.rolname LIKE 'akb_token\\_%' ESCAPE '\\'
+               AND r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
+            """
+        )
+        actual: dict[str, set[str]] = {}
+        for r in mem_rows:
+            actual.setdefault(r["token_role"], set()).add(r["group_role"])
+
+        for role, uid, scope in live:
+            try:
+                accessible = await self._fetch_user_accessible(conn, uid)
+                wanted = wanted_token_group_roles(accessible, scope)
+                have = actual.get(role, set())
+                for group in wanted - have:
+                    await self._grant_membership(conn, group, role)
+                    report.grants_added += 1
+                for group in have - wanted:
+                    await self._revoke_membership_if_present(conn, group, role)
+                    report.grants_removed += 1
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"token role {role} membership: {e}")
+
     # ── Drift inspection (read-only) ──
 
     async def diff_against_catalog(self) -> RoleStateDiff:
@@ -738,6 +1014,7 @@ class RoleSync:
         async with self.pool.acquire() as conn:
             await self._diff_users(conn, diff)
             await self._diff_vaults(conn, diff)
+            await self._diff_token_roles(conn, diff)
             await self._diff_memberships(conn, diff)
             await self._diff_public_grants(conn, diff)
             await self._diff_authenticated(conn, diff)
@@ -778,6 +1055,27 @@ class RoleSync:
         }
         diff.missing_vault_roles = sorted(wanted - existing)
         diff.orphan_vault_roles = sorted(existing - wanted)
+
+    async def _diff_token_roles(
+        self, conn: asyncpg.Connection, diff: RoleStateDiff,
+    ) -> None:
+        # Role-granularity only (see RoleStateDiff.missing_token_roles): a
+        # live scoped token must have its akb_token_<tid> role; an orphan is
+        # a revoked/expired/de-scoped token whose role lingers. Per-membership
+        # token drift is converged by reconcile, not surfaced here.
+        rows = await conn.fetch(
+            "SELECT id FROM tokens WHERE vault_scope IS NOT NULL "
+            "AND (expires_at IS NULL OR expires_at > NOW())"
+        )
+        wanted = {token_role_name(r["id"]) for r in rows}
+        existing = {
+            r["rolname"]
+            for r in await conn.fetch(
+                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_token\\_%' ESCAPE '\\'"
+            )
+        }
+        diff.missing_token_roles = sorted(wanted - existing)
+        diff.orphan_token_roles = sorted(existing - wanted)
 
     async def _diff_memberships(
         self, conn: asyncpg.Connection, diff: RoleStateDiff,

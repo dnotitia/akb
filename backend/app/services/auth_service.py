@@ -38,6 +38,9 @@ class AuthenticatedUser:
     # Per-PAT vault scope (Option B). None = unscoped: JWT logins, and PATs
     # minted without a scope. A concrete scope gates mutating vault access.
     vault_scope: VaultScope | None = None
+    # The authenticating PAT's id (None for JWT logins). The PG-native akb_sql
+    # executor switches to akb_token_<tid> when this PAT is ALSO scoped.
+    token_id: str | None = None
 
 
 # ── Password hashing ────────────────────────────────────────
@@ -520,6 +523,16 @@ async def create_pat(
             expires_at,
         )
 
+    # PG-native RBAC (surface 2): provision the narrow akb_token_<tid> role for
+    # a SCOPED PAT so akb_sql run under it is PG-confined to the scope. Best-
+    # effort, mirroring on_user_create at register() — the reconciler rebuilds
+    # on failure, and the executor fails CLOSED if the role is missing (it
+    # never falls back to the full akb_user_<uid>). Unscoped PATs need none.
+    if vault_scope is not None:
+        await get_role_sync().on_token_create(
+            token_id, uuid.UUID(user_id), vault_scope,
+        )
+
     return {
         "token": raw_token,
         "token_id": str(token_id),
@@ -563,7 +576,13 @@ async def revoke_pat(user_id: str, token_id: str) -> bool:
             "DELETE FROM tokens WHERE id = $1 AND user_id = $2",
             uuid.UUID(token_id), uuid.UUID(user_id),
         )
-        return "DELETE 1" in result
+    deleted = "DELETE 1" in result
+    if deleted:
+        # PG-native RBAC: drop the narrow akb_token_<tid> role (a no-op for an
+        # unscoped token, which never had one). Best-effort; the reconciler
+        # also drops orphan token roles for expired/cascaded tokens.
+        await get_role_sync().on_token_revoke(uuid.UUID(token_id))
+    return deleted
 
 
 # ── JWT revocation ──────────────────────────────────────────
@@ -650,12 +669,13 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     - Bearer <jwt>
     - Bearer akb_<pat>
     """
-    # Option B: reset the request-scoped vault scope on every resolve. Only a
-    # scoped PAT (set in _resolve_pat) carries a non-None value; JWT logins and
-    # tokenless/worker paths stay unscoped.
-    from app.models.vault_scope import current_vault_scope
+    # Option B: reset the request-scoped vault scope + token id on every
+    # resolve. Only a PAT (set in _resolve_pat) carries non-None values; JWT
+    # logins and tokenless/worker paths stay unscoped + token-less.
+    from app.models.vault_scope import current_token_id, current_vault_scope
 
     current_vault_scope.set(None)
+    current_token_id.set(None)
 
     if not authorization or not authorization.startswith("Bearer "):
         return None
@@ -744,12 +764,16 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
             return None
 
         # Option B: carry the PAT's vault scope (NULL column ⇒ None = unscoped)
-        # on the request-scoped ContextVar so check_vault_access can intersect
-        # every mutation against it — REST and MCP alike resolve through here.
-        from app.models.vault_scope import current_vault_scope
+        # AND its token id on the request-scoped ContextVars — check_vault_access
+        # (surface 1) reads the scope, and the PG-native akb_sql executor
+        # (surface 2) reads both to SET LOCAL ROLE akb_token_<tid> for a scoped
+        # PAT. REST and MCP alike resolve through here.
+        from app.models.vault_scope import current_token_id, current_vault_scope
 
         scope = VaultScope.from_db_json(row["vault_scope"])
+        token_id = str(row["token_id"])
         current_vault_scope.set(scope)
+        current_token_id.set(token_id)
 
         return AuthenticatedUser(
             user_id=str(row["user_id"]),
@@ -759,4 +783,5 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
             is_admin=row["is_admin"],
             auth_method="pat",
             vault_scope=scope,
+            token_id=token_id,
         )
