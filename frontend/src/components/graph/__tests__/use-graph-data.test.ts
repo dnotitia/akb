@@ -1,7 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
+  apiToPayload,
   mergeGraph,
-  bfsExpand,
   applyFilters,
   docIdFromUri,
   endpointUri,
@@ -9,7 +9,39 @@ import {
   impactCones,
 } from "../use-graph-data";
 import { docUri } from "@/lib/uri";
-import { DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
+import { ALL_RELATIONS, DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
+
+describe("apiToPayload", () => {
+  it("maps backend nodes/edges into the renderer shape", () => {
+    const out = apiToPayload({
+      nodes: [
+        { uri: "akb://v/doc/a.md", name: "A", resource_type: "doc" },
+        { uri: "akb://v/table/t", name: "", resource_type: "table" },
+      ],
+      edges: [{ source: "akb://v/doc/a.md", target: "akb://v/table/t", relation: "depends_on" }],
+    });
+    expect(out.nodes.map((n) => n.kind)).toEqual(["document", "table"]);
+    // empty name falls back to the uri
+    expect(out.nodes[1].name).toBe("akb://v/table/t");
+    expect(out.edges).toEqual([
+      { source: "akb://v/doc/a.md", target: "akb://v/table/t", relation: "depends_on" },
+    ]);
+  });
+
+  it("drops edges whose relation is not in the renderer allowlist", () => {
+    const out = apiToPayload({
+      nodes: [{ uri: "a", resource_type: "doc" }, { uri: "b", resource_type: "doc" }],
+      // `mentions` is not a RelationKind → that edge must be filtered out;
+      // `links_to` (implicit body links) must survive — the exact regression
+      // the deleted bfsExpand suite used to guard.
+      edges: [
+        { source: "a", target: "b", relation: "mentions" },
+        { source: "a", target: "b", relation: "links_to" },
+      ],
+    });
+    expect(out.edges).toEqual([{ source: "a", target: "b", relation: "links_to" }]);
+  });
+});
 
 describe("mergeGraph", () => {
   it("dedupes nodes by uri", () => {
@@ -35,6 +67,17 @@ describe("mergeGraph", () => {
     ];
     const merged = mergeGraph({ nodes: [], edges: e1 }, { nodes: [], edges: e2 });
     expect(merged.edges.length).toBe(2);
+  });
+
+  it("carries the BASE payload's meta through an expansion overlay merge", () => {
+    const meta = { nodesTotal: 500, edgesTotal: 900, returned: 200, truncated: true };
+    const merged = mergeGraph(
+      { nodes: [], edges: [], meta },
+      { nodes: [{ uri: "n1", name: "A", kind: "document" }], edges: [] },
+    );
+    // The overlay (b) describes a neighborhood, not the whole vault, so the
+    // base (a) totals must survive — that's what "showing N of M" reads.
+    expect(merged.meta).toEqual(meta);
   });
 });
 
@@ -99,6 +142,28 @@ describe("applyFilters", () => {
     expect(out.nodes.length).toBe(3);
     expect(out.edges.length).toBe(2);
   });
+
+  it("preserves the overview meta across a filter pass", () => {
+    const meta = { nodesTotal: 42, edgesTotal: 99, returned: 30, truncated: true };
+    const v = { ...DEFAULT_VIEW, types: new Set<GraphNode["kind"]>(["document"]) };
+    const out = applyFilters({ nodes, edges, meta }, v);
+    // Filtering hides nodes locally but the vault totals are unchanged, so the
+    // honesty banner must keep reading the same "N of M".
+    expect(out.meta).toEqual(meta);
+  });
+
+  it("keeps links_to (implicit body-link) edges under the default view", () => {
+    // Regression guard: ALL_RELATIONS must include `links_to`, or applyFilters
+    // silently drops every body/wikilink edge even when the backend returns it.
+    expect(ALL_RELATIONS).toContain("links_to" as GraphEdge["relation"]);
+    const linkNodes: GraphNode[] = [
+      { uri: "a", name: "A", kind: "document" },
+      { uri: "b", name: "B", kind: "document" },
+    ];
+    const linkEdges: GraphEdge[] = [{ source: "a", target: "b", relation: "links_to" }];
+    const out = applyFilters({ nodes: linkNodes, edges: linkEdges }, DEFAULT_VIEW);
+    expect(out.edges.map((e) => e.relation)).toEqual(["links_to"]);
+  });
 });
 
 describe("docIdFromUri", () => {
@@ -147,262 +212,6 @@ describe("docIdFromUri", () => {
     for (const path of ["readme.md", "notes/hello.md", "specs/2026/api.md", "a/b/c/d.md"]) {
       expect(docIdFromUri(docUri("v", path))).toBe(path);
     }
-  });
-});
-
-describe("bfsExpand", () => {
-  it("walks depth-1 with one fetch and produces seed neighbors", async () => {
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
-      doc_id: docId,
-      uri: `akb://v/doc/${docId}`,
-      relations: [
-        {
-          direction: "outgoing" as const,
-          relation: "depends_on",
-          uri: "akb://v/doc/d-2",
-          name: "Second",
-          resource_type: "document",
-        },
-      ],
-    }));
-    const out = await bfsExpand({
-      vault: "v",
-      entry: "d-1",
-      hops: 1,
-      fetchRelations,
-    });
-    expect(fetchRelations).toHaveBeenCalledTimes(1);
-    expect(out.nodes.map((n) => n.uri).sort()).toEqual([
-      "akb://v/doc/d-1",
-      "akb://v/doc/d-2",
-    ]);
-    expect(out.edges.length).toBe(1);
-  });
-
-  // Regression: `links_to` (body markdown / wikilink edges) was missing
-  // from normalizeRelation's allowlist, so every body-link edge was
-  // silently dropped — the neighbor node appeared but its edge never did,
-  // leaving floating nodes with no lines in the graph.
-  it("keeps links_to edges (not just the frontmatter relation kinds)", async () => {
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
-      doc_id: docId,
-      uri: `akb://v/doc/${docId}`,
-      relations: [
-        {
-          direction: "outgoing" as const,
-          relation: "links_to",
-          uri: "akb://v/doc/d-2",
-          name: "Linked",
-          resource_type: "document",
-        },
-      ],
-    }));
-    const out = await bfsExpand({ vault: "v", entry: "d-1", hops: 1, fetchRelations });
-    expect(out.edges).toEqual([
-      { source: "akb://v/doc/d-1", target: "akb://v/doc/d-2", relation: "links_to" },
-    ]);
-  });
-
-  it("DEFAULT_VIEW keeps links_to edges through applyFilters", () => {
-    const nodes: GraphNode[] = [
-      { uri: "akb://v/doc/a", name: "A", kind: "document" },
-      { uri: "akb://v/doc/b", name: "B", kind: "document" },
-    ];
-    const edges: GraphEdge[] = [{ source: "akb://v/doc/a", target: "akb://v/doc/b", relation: "links_to" }];
-    const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
-    expect(out.edges).toEqual(edges);
-  });
-
-  it("walks depth-2 by following neighbors discovered in hop 1", async () => {
-    const calls: string[] = [];
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => {
-      calls.push(docId);
-      if (docId === "d-1") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-1",
-          relations: [
-            {
-              direction: "outgoing" as const,
-              relation: "depends_on",
-              uri: "akb://v/doc/d-2",
-              name: "Second",
-              resource_type: "document",
-            },
-          ],
-        };
-      }
-      if (docId === "d-2") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-2",
-          relations: [
-            {
-              direction: "outgoing" as const,
-              relation: "references",
-              uri: "akb://v/doc/d-3",
-              name: "Third",
-              resource_type: "document",
-            },
-          ],
-        };
-      }
-      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
-    });
-    const out = await bfsExpand({
-      vault: "v",
-      entry: "d-1",
-      hops: 2,
-      fetchRelations,
-    });
-    expect(calls.sort()).toEqual(["d-1", "d-2"]);
-    expect(out.nodes.map((n) => n.uri).sort()).toEqual([
-      "akb://v/doc/d-1",
-      "akb://v/doc/d-2",
-      "akb://v/doc/d-3",
-    ]);
-  });
-
-  it("does not re-fetch already-visited nodes", async () => {
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
-      doc_id: docId,
-      uri: `akb://v/doc/${docId}`,
-      relations: [
-        {
-          direction: "outgoing" as const,
-          relation: "depends_on",
-          uri: "akb://v/doc/d-1", // cycle back to entry
-          name: "First",
-          resource_type: "document",
-        },
-      ],
-    }));
-    await bfsExpand({ vault: "v", entry: "d-1", hops: 3, fetchRelations });
-    // d-1 fetched once at hop 0; hop 1 returns d-1 again but it's already visited,
-    // so no further fetch.
-    expect(fetchRelations).toHaveBeenCalledTimes(1);
-  });
-
-  it("returns only the seed when entry has no neighbors", async () => {
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => ({
-      doc_id: docId,
-      uri: `akb://v/doc/${docId}`,
-      relations: [],
-    }));
-    const out = await bfsExpand({
-      vault: "v",
-      entry: "d-lonely",
-      hops: 3,
-      fetchRelations,
-    });
-    expect(fetchRelations).toHaveBeenCalledTimes(1);
-    expect(out.nodes.map((n) => n.uri)).toEqual(["akb://v/doc/d-lonely"]);
-    expect(out.edges).toEqual([]);
-  });
-
-  it("continues past a mid-hop fetch failure and includes the survivors", async () => {
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => {
-      if (docId === "d-1") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-1",
-          relations: [
-            { direction: "outgoing" as const, relation: "depends_on",
-              uri: "akb://v/doc/d-fail", name: "Fail", resource_type: "document" },
-            { direction: "outgoing" as const, relation: "depends_on",
-              uri: "akb://v/doc/d-ok", name: "OK", resource_type: "document" },
-          ],
-        };
-      }
-      if (docId === "d-fail") throw new Error("network down");
-      if (docId === "d-ok") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-ok",
-          relations: [
-            { direction: "outgoing" as const, relation: "references",
-              uri: "akb://v/doc/d-deep", name: "Deep", resource_type: "document" },
-          ],
-        };
-      }
-      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
-    });
-    const out = await bfsExpand({
-      vault: "v",
-      entry: "d-1",
-      hops: 2,
-      fetchRelations,
-    });
-    // d-1 fetched at hop 0; hop 1 attempts d-fail (rejects) and d-ok (succeeds).
-    // The survivor's neighbors (d-deep) appear; the failed branch only contributes
-    // the neighbor node that the seed already announced.
-    const uris = new Set(out.nodes.map((n) => n.uri));
-    expect(uris.has("akb://v/doc/d-1")).toBe(true);
-    expect(uris.has("akb://v/doc/d-ok")).toBe(true);
-    expect(uris.has("akb://v/doc/d-fail")).toBe(true); // listed as a neighbor by seed
-    expect(uris.has("akb://v/doc/d-deep")).toBe(true); // discovered via d-ok in hop 1
-  });
-
-  it("collapses two hop-1 nodes sharing the same hop-2 neighbor into one fetch", async () => {
-    const seen: string[] = [];
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => {
-      seen.push(docId);
-      if (docId === "d-1") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-1",
-          relations: [
-            { direction: "outgoing" as const, relation: "depends_on",
-              uri: "akb://v/doc/d-a", name: "A", resource_type: "document" },
-            { direction: "outgoing" as const, relation: "depends_on",
-              uri: "akb://v/doc/d-b", name: "B", resource_type: "document" },
-          ],
-        };
-      }
-      if (docId === "d-a" || docId === "d-b") {
-        return {
-          doc_id: docId,
-          uri: `akb://v/doc/${docId}`,
-          relations: [
-            { direction: "outgoing" as const, relation: "references",
-              uri: "akb://v/doc/d-shared", name: "Shared", resource_type: "document" },
-          ],
-        };
-      }
-      if (docId === "d-shared") {
-        return {
-          doc_id: docId,
-          uri: "akb://v/doc/d-shared",
-          relations: [],
-        };
-      }
-      return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
-    });
-    await bfsExpand({ vault: "v", entry: "d-1", hops: 3, fetchRelations });
-    // d-shared is announced by both d-a and d-b in hop 1, but the visited set
-    // collapses it to a single fetch in hop 2.
-    const sharedCalls = seen.filter((id) => id === "d-shared").length;
-    expect(sharedCalls).toBe(1);
-  });
-
-  it("breaks a longer cycle without re-fetching nodes already seen", async () => {
-    const calls: string[] = [];
-    const fetchRelations = vi.fn(async (_v: string, docId: string) => {
-      calls.push(docId);
-      const next = { "A": "B", "B": "C", "C": "A" }[docId];
-      if (!next) return { doc_id: docId, uri: `akb://v/doc/${docId}`, relations: [] };
-      return {
-        doc_id: docId,
-        uri: `akb://v/doc/${docId}`,
-        relations: [
-          { direction: "outgoing" as const, relation: "depends_on",
-            uri: `akb://v/doc/${next}`, name: next, resource_type: "document" },
-        ],
-      };
-    });
-    await bfsExpand({ vault: "v", entry: "A", hops: 3, fetchRelations });
-    // A → B → C → (A — already visited; cycle breaks here, no re-fetch)
-    expect(calls.sort()).toEqual(["A", "B", "C"]);
   });
 });
 

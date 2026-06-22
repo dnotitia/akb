@@ -177,6 +177,7 @@ async def _apply_migrations() -> None:
         "036_resource_aliases.py",              # rename/move redirect table (old path/name → current resource id); old akb:// URIs keep resolving after a move
         "037_table_unique_keys_indexes.py",     # vault_tables.unique_keys + .indexes JSONB (declarative DDL metadata; AKB #215)
         "038_dynamic_table_updated_at_trigger.py",  # akb_set_updated_at() + BEFORE UPDATE trigger on vt_* tables (PG has no ON UPDATE CURRENT_TIMESTAMP)
+        "039_edges_vault_endpoint_indexes.py",  # composite (vault_id, source_uri)/(vault_id, target_uri) indexes for graph reads (overview/BFS/degree; AKB graph viewer Phase 2)
     ):
         if filename in applied:
             continue

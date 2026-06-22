@@ -2,10 +2,9 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getGraph,
-  getRelations,
+  getGraphOverview,
   type GraphApiNode,
   type GraphApiEdge,
-  type RelationRow,
 } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import { groupOf } from "./cluster";
@@ -19,9 +18,20 @@ import {
   type RelationKind,
 } from "./graph-types";
 
+/** Honest counts behind a possibly-truncated overview, so the UI can render
+ *  "showing N of M" instead of silently capping. Only the full-vault overview
+ *  load sets this; expansions/filters carry the base load's meta through. */
+export interface GraphMeta {
+  nodesTotal: number;
+  edgesTotal: number;
+  returned: number;
+  truncated: boolean;
+}
+
 export interface GraphPayload {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  meta?: GraphMeta;
 }
 
 const KIND_SET = new Set<string>(ALL_NODE_KINDS);
@@ -78,7 +88,9 @@ export function mergeGraph(a: GraphPayload, b: GraphPayload): GraphPayload {
     edgeKeys.add(k);
     edges.push(e);
   }
-  return { nodes: [...nodeByUri.values()], edges };
+  // `b` is an expansion overlay merged onto base `a`; the base's totals still
+  // describe the whole vault, so carry them (not b's neighborhood counts).
+  return { nodes: [...nodeByUri.values()], edges, meta: a.meta };
 }
 
 // react-force-graph mutates edge.source/edge.target from string-URI to a
@@ -167,46 +179,7 @@ export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
       target: endpointUri(e.target),
       relation: e.relation,
     }));
-  return { nodes, edges };
-}
-
-interface BfsExpandArgs {
-  vault: string;
-  entry: string; // doc path within the vault
-  // BFS traversal radius in edge hops. Named to match the backend's
-  // `akb_graph.hops` — same concept (graph traversal distance),
-  // just at different layers (this function makes `hops` round
-  // trips through `akb_relations`; the backend graph endpoint
-  // does its own BFS in a single round trip).
-  hops: 1 | 2 | 3;
-  fetchRelations: (
-    vault: string,
-    docPath: string,
-  ) => Promise<{ uri: string; relations: RelationRow[] }>;
-}
-
-function rowToEdge(row: RelationRow, selfUri: string): GraphEdge | null {
-  const relation = normalizeRelation(row.relation);
-  if (!relation) return null;
-  // The relations endpoint can in principle emit an edge whose
-  // counter-party URI is null (unresolved forward ref). Skipping
-  // those keeps the graph free of `{source: "...", target: undefined}`
-  // shapes that would silently confuse the layout / viz layer.
-  if (!row.uri) return null;
-  if (row.direction === "outgoing") {
-    return { source: selfUri, target: row.uri, relation };
-  }
-  return { source: row.uri, target: selfUri, relation };
-}
-
-function rowToNeighbor(row: RelationRow): GraphNode | null {
-  if (!row.uri) return null;
-  return {
-    uri: row.uri,
-    name: row.name || row.uri,
-    kind: normalizeKind(row.resource_type),
-    group: groupOf(row.uri),
-  };
+  return { nodes, edges, meta: p.meta };
 }
 
 // Extract the doc / table / file id from an `akb://{vault}/{kind}/{path}` URI.
@@ -248,84 +221,24 @@ export function docIdFromUri(uri: string): string | null {
   return safeDecode(parsed.id);
 }
 
-export async function bfsExpand(args: BfsExpandArgs): Promise<GraphPayload> {
-  const { vault, entry, hops, fetchRelations } = args;
-  const visited = new Set<string>();
-  visited.add(entry);
-
-  const seedResp = await fetchRelations(vault, entry);
-  const seedNode: GraphNode = {
-    uri: seedResp.uri,
-    name: entry,
-    kind: "document",
-    doc_id: entry,
-    group: groupOf(seedResp.uri),
-  };
-  const nodesByUri = new Map<string, GraphNode>([[seedNode.uri, seedNode]]);
-  const edgeKeys = new Set<string>();
-  const edges: GraphEdge[] = [];
-
-  function ingest(rows: RelationRow[], selfUri: string): string[] {
-    const newDocIds: string[] = [];
-    for (const row of rows) {
-      const edge = rowToEdge(row, selfUri);
-      if (edge) {
-        const k = `${edge.source}\u0001${edge.target}\u0001${edge.relation}`;
-        if (!edgeKeys.has(k)) {
-          edgeKeys.add(k);
-          edges.push(edge);
-        }
-      }
-      const neighbor = rowToNeighbor(row);
-      if (neighbor && !nodesByUri.has(neighbor.uri)) {
-        nodesByUri.set(neighbor.uri, neighbor);
-        const id = docIdFromUri(neighbor.uri);
-        if (id && !visited.has(id)) newDocIds.push(id);
-      }
-    }
-    return newDocIds;
-  }
-
-  // Seed hop populates the first frontier from the entry's neighbors.
-  // Dedup is enforced inside the loop's `toFetch` filter (visited.add
-  // claims the docId atomically), so duplicate entries in `frontier`
-  // — e.g. siblings pointing at the same neighbor — collapse to a
-  // single fetch on the next hop.
-  let frontier: string[] = ingest(seedResp.relations, seedResp.uri);
-
-  for (let hop = 1; hop < hops; hop++) {
-    const toFetch = frontier.filter((docId) => {
-      if (visited.has(docId)) return false;
-      visited.add(docId);
-      return true;
-    });
-    if (toFetch.length === 0) break;
-    const responses = await Promise.all(
-      toFetch.map((docId) => fetchRelations(vault, docId).catch(() => null)),
-    );
-    const nextFrontier: string[] = [];
-    for (const r of responses) {
-      if (!r) continue;
-      nextFrontier.push(...ingest(r.relations, r.uri));
-    }
-    if (nextFrontier.length === 0) break;
-    frontier = nextFrontier;
-  }
-
-  return { nodes: [...nodesByUri.values()], edges };
-}
-
 export function useFullGraph(vault: string, enabled: boolean) {
   return useQuery({
-    queryKey: ["graph", vault, "full"],
+    queryKey: ["graph", vault, "overview"],
     enabled,
     queryFn: async (): Promise<GraphPayload> => {
-      // Loads the whole vault graph. The 200 here is the backend BFS relation
-      // fan-out `limit` (per traversal), NOT a cap on |V| — large vaults return
-      // hundreds/thousands of nodes, which the canvas handles via its layout
-      // perf tiers (GraphCanvas.layoutTier), not a render gate.
-      const resp = await getGraph(vault, undefined, 2, 200);
-      return apiToPayload(resp);
+      // Degree-ranked overview. `top_k` (200) keeps the highest-degree nodes
+      // plus the edges induced among them, with honest totals so the UI can
+      // show "showing N of M" instead of the old arbitrary recency cap.
+      const resp = await getGraphOverview(vault, 200);
+      return {
+        ...apiToPayload(resp),
+        meta: {
+          nodesTotal: resp.nodes_total,
+          edgesTotal: resp.edges_total,
+          returned: resp.returned,
+          truncated: resp.truncated,
+        },
+      };
     },
   });
 }
@@ -336,9 +249,10 @@ export function useFullGraph(vault: string, enabled: boolean) {
 export async function fetchNeighbors(
   vault: string,
   id: string,
-  hops: 1 | 2 = 1,
+  hops: 1 | 2 | 3 = 1,
+  limit = 100,
 ): Promise<GraphPayload> {
-  const resp = await getGraph(vault, id, hops, 100);
+  const resp = await getGraph(vault, id, hops, limit);
   return apiToPayload(resp);
 }
 
@@ -350,16 +264,8 @@ export function useNeighborhood(
   return useQuery({
     queryKey: ["graph", vault, "neighborhood", entry, hops],
     enabled: !!entry,
-    queryFn: () =>
-      bfsExpand({
-        vault,
-        // `enabled: !!entry` above gates this query; entry is defined here.
-        entry: entry!,
-        hops,
-        fetchRelations: async (v, docPath) => {
-          const r = await getRelations(v, docPath);
-          return { uri: r.uri, relations: r.relations };
-        },
-      }),
+    // Single server-side BFS call (was N per-node /relations round trips).
+    // `enabled: !!entry` gates this query; entry is defined here.
+    queryFn: () => fetchNeighbors(vault, entry!, hops, 200),
   });
 }

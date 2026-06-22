@@ -275,6 +275,11 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_uri);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(relation_type);
 CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source_type);
 CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target_type);
+-- Composite (vault_id, endpoint): the common graph-read access pattern is
+-- "scope by vault AND look up by endpoint URI" (BFS / overview induced edges /
+-- degree rollups). See migration 039.
+CREATE INDEX IF NOT EXISTS idx_edges_vault_source ON edges(vault_id, source_uri);
+CREATE INDEX IF NOT EXISTS idx_edges_vault_target ON edges(vault_id, target_uri);
 
 -- ============================================================
 -- Resource aliases (rename/move redirects)

@@ -346,6 +346,21 @@ export default function GraphPage() {
           </div>
         )}
 
+        {/* "Showing N of M" honesty: the overview is a degree-ranked top-K
+            slice, not the whole vault. Persistent (not dismissible) so the
+            truncation is never silent. Full-graph mode only. */}
+        {!loading && !error && !view.entry && base?.meta?.truncated && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-[var(--z-raised)] w-max max-w-[90%]">
+            <Alert variant="info">
+              <span className="text-xs leading-relaxed">
+                Showing the {base.meta.returned} most-connected of{" "}
+                {base.meta.nodesTotal} nodes · open a document to explore its
+                neighborhood
+              </span>
+            </Alert>
+          </div>
+        )}
+
         {/* Non-blocking gesture hint (both modes), dismissible + persisted.
             Once dismissed it collapses to a '?' affordance so the full gesture
             list is always recallable (it used to vanish forever). */}

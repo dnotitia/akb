@@ -535,7 +535,18 @@ async def get_graph(
     have verified reader access on this vault. When `vault_id` is
     omitted we look it up by name as a convenience for legacy
     callers — but the auth check is still the caller's responsibility.
+
+    With no ``resource_uri`` this delegates to :func:`get_overview` so the
+    whole-vault graph has ONE code path: degree-ranked, deterministic, and
+    carrying honest totals (``nodes_total``/``truncated``/…). That replaced an
+    earlier inline branch which capped on ``created_at DESC`` — an arbitrary
+    recency slice whose composition drifted with ``limit``. ``limit`` becomes
+    the overview's node ``top_k`` (a node cap is a cleaner visualization
+    safety net than an edge cap).
     """
+    if not resource_uri:
+        return await get_overview(vault, vault_id=vault_id, top_k=limit)
+
     pool = await get_pool()
     nodes: dict[str, dict] = {}
     edge_list: list[dict] = []
@@ -547,54 +558,235 @@ async def get_graph(
                 return {"nodes": [], "edges": []}
             vault_id = vault_row["id"]
 
-        if resource_uri:
-            await _bfs_collect(conn, vault_id, vault, resource_uri, hops, limit, nodes, edge_list)
-        else:
-            # Vault-scope full graph. The cap is a visualization safety net
-            # — large graphs are unrenderable client-side — but the old code
-            # used `LIMIT (limit * 3)` *without* an ORDER BY, so PG returned
-            # an arbitrary subset and the result was non-deterministic across
-            # callers and across runs. Pin to `created_at DESC` so the cap
-            # consistently keeps the most recent edges (better UX than
-            # whatever order the heap happened to produce). The same anti-
-            # pattern that bit `grep` (count drifts with WHERE clause because
-            # the cap is tied to `limit`).
-            edge_rows = await conn.fetch(
-                """
-                SELECT source_uri, target_uri, source_type, target_type, relation_type
-                FROM edges WHERE vault_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2
-                """,
-                vault_id, limit * 3,
-            )
-
-            uris_to_resolve: list[tuple[str, str]] = []
-            for r in edge_rows:
-                uris_to_resolve.append((r["source_uri"], r["source_type"]))
-                uris_to_resolve.append((r["target_uri"], r["target_type"]))
-                edge_list.append({
-                    "source": r["source_uri"],
-                    "target": r["target_uri"],
-                    "relation": r["relation_type"],
-                })
-
-            # Resolve names within this vault only — cross-vault endpoints
-            # come back as the URI string itself (no title/description leak).
-            # Every URI referenced by an edge MUST still become a node so
-            # the visualization doesn't get orphan source/target IDs.
-            names = await _batch_resolve_names(conn, uris_to_resolve, vault_id=vault_id)
-            for uri, rtype in uris_to_resolve:
-                if uri not in nodes:
-                    nodes[uri] = {
-                        "uri": uri,
-                        "resource_type": rtype,
-                        "name": names.get(uri) or uri,
-                    }
+        await _bfs_collect(conn, vault_id, vault, resource_uri, hops, limit, nodes, edge_list)
 
     return {
         "nodes": list(nodes.values()),
         "edges": edge_list,
+    }
+
+
+async def get_overview(
+    vault: str,
+    *,
+    vault_id: uuid.UUID | None = None,
+    top_k: int = 200,
+) -> dict:
+    """Whole-vault overview: the `top_k` highest-DEGREE nodes plus the edges
+    induced among them, with honest totals so the client can render an explicit
+    "showing N of M" instead of silently truncating.
+
+    Supersedes the old no-`resource_uri` branch of :func:`get_graph`, which
+    capped on ``created_at DESC`` (an arbitrary recency slice whose composition
+    drifted with `limit`). Degree ranking is deterministic and surfaces the
+    structurally important hubs — the nodes a reader actually wants to see first
+    in an overview — regardless of when they were created.
+
+    Caller must have verified reader access; ``vault_id`` scopes every query.
+    When omitted it is resolved by name for legacy callers (auth still theirs).
+    """
+    empty = {
+        "nodes": [], "edges": [],
+        "nodes_total": 0, "edges_total": 0, "returned": 0, "truncated": False,
+    }
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if vault_id is None:
+            vault_row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault)
+            if not vault_row:
+                return empty
+            vault_id = vault_row["id"]
+
+        totals = await conn.fetchrow(
+            """
+            WITH endpoints AS (
+                SELECT source_uri AS uri FROM edges WHERE vault_id = $1
+                UNION ALL
+                SELECT target_uri FROM edges WHERE vault_id = $1
+            )
+            SELECT (SELECT count(*) FROM edges WHERE vault_id = $1) AS edges_total,
+                   (SELECT count(DISTINCT uri) FROM endpoints) AS nodes_total
+            """,
+            vault_id,
+        )
+        nodes_total = totals["nodes_total"] if totals else 0
+        edges_total = totals["edges_total"] if totals else 0
+        if not nodes_total:
+            return empty
+
+        # Top-`top_k` endpoints by degree. `degree` here is INCIDENT-EDGE count
+        # (count(*) over the endpoint stream) — the same definition the canvas
+        # uses (use-graph-data.ts `degreeMap`), so node sizing stays consistent
+        # between server ranking and client render. Parallel edges (the same
+        # pair joined by several relation_types) therefore each add 1, which is
+        # intended: more relationships = more central. A node's resource_type is
+        # consistent wherever it appears (a doc URI is always 'doc'), so
+        # max(rtype) just picks that single value. The `uri` tie-break makes the
+        # cut deterministic when several nodes share the boundary degree.
+        top_rows = await conn.fetch(
+            """
+            WITH endpoints AS (
+                SELECT source_uri AS uri, source_type AS rtype FROM edges WHERE vault_id = $1
+                UNION ALL
+                SELECT target_uri, target_type FROM edges WHERE vault_id = $1
+            )
+            SELECT uri, max(rtype) AS rtype, count(*) AS degree
+            FROM endpoints
+            GROUP BY uri
+            ORDER BY degree DESC, uri
+            LIMIT $2
+            """,
+            vault_id, top_k,
+        )
+
+        nodes: dict[str, dict] = {}
+        for r in top_rows:
+            nodes[r["uri"]] = {
+                "uri": r["uri"],
+                "resource_type": r["rtype"],
+                "name": r["uri"],
+                "degree": r["degree"],
+            }
+        top_uris = list(nodes.keys())
+
+        edge_list: list[dict] = []
+        if top_uris:
+            # Induced subgraph: only edges whose BOTH endpoints are in the
+            # top-K set — so the overview never paints a dangling stub to a
+            # node it didn't include.
+            edge_rows = await conn.fetch(
+                """
+                SELECT source_uri, target_uri, relation_type, kind
+                FROM edges
+                WHERE vault_id = $1
+                  AND source_uri = ANY($2::text[])
+                  AND target_uri = ANY($2::text[])
+                """,
+                vault_id, top_uris,
+            )
+            for r in edge_rows:
+                edge_list.append({
+                    "source": r["source_uri"],
+                    "target": r["target_uri"],
+                    "relation": r["relation_type"],
+                    "kind": r["kind"],
+                })
+
+        names = await _batch_resolve_names(
+            conn, [(u, n["resource_type"]) for u, n in nodes.items()], vault_id=vault_id
+        )
+        for uri, node in nodes.items():
+            node["name"] = names.get(uri) or uri
+
+    return {
+        "nodes": list(nodes.values()),
+        "edges": edge_list,
+        "nodes_total": nodes_total,
+        "edges_total": edges_total,
+        "returned": len(nodes),
+        "truncated": len(nodes) < nodes_total,
+    }
+
+
+async def get_health(
+    vault: str,
+    *,
+    vault_id: uuid.UUID | None = None,
+    hub_threshold: int = 5,
+    limit: int = 20,
+) -> dict:
+    """KB-health audit for one vault: the over-connected HUBS (degree ≥
+    ``hub_threshold``) and the ORPHAN documents (no relation at all — the
+    undiscoverable corners a graph view exists to surface).
+
+    "Orphan" means *no relation within THIS vault's graph*. Vault isolation
+    scopes the connected set to ``edges WHERE vault_id = vault`` — the same
+    edges the vault's graph view renders — so a doc referenced only from another
+    vault (that incoming edge lives in the OTHER vault's graph and never shows
+    here) is correctly an orphan *of this graph*. ``hubs`` degree is incident-
+    edge count, matching :func:`get_overview` and the canvas.
+
+    Orphans are computed over documents only (the dominant resource type in the
+    graph); tables/files are intentionally out of v1 scope. This is an on-demand
+    *audit* endpoint (not a hot path), so it scans every non-archived doc once to
+    count orphans exactly; a SQL anti-join would bound the cost for very large
+    vaults and is the natural next step if this becomes a dashboard auto-refresh.
+    Reader-scoped via ``vault_id``; ``vault`` (the name) builds the doc URIs
+    matched against the connected set.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if vault_id is None:
+            vault_row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault)
+            if not vault_row:
+                return {"hubs": [], "orphans": {"count": 0, "sample": []}}
+            vault_id = vault_row["id"]
+
+        hub_rows = await conn.fetch(
+            """
+            WITH endpoints AS (
+                SELECT source_uri AS uri, source_type AS rtype FROM edges WHERE vault_id = $1
+                UNION ALL
+                SELECT target_uri, target_type FROM edges WHERE vault_id = $1
+            )
+            SELECT uri, max(rtype) AS rtype, count(*) AS degree
+            FROM endpoints
+            GROUP BY uri
+            HAVING count(*) >= $2
+            ORDER BY degree DESC, uri
+            LIMIT $3
+            """,
+            vault_id, hub_threshold, limit,
+        )
+
+        # Every URI that appears on either end of an edge → "connected".
+        connected_rows = await conn.fetch(
+            """
+            SELECT source_uri AS uri FROM edges WHERE vault_id = $1
+            UNION
+            SELECT target_uri FROM edges WHERE vault_id = $1
+            """,
+            vault_id,
+        )
+        connected = {r["uri"] for r in connected_rows}
+
+        # Orphans: non-archived docs whose URI is in no edge.
+        doc_rows = await conn.fetch(
+            "SELECT path, title FROM documents WHERE vault_id = $1 AND status != 'archived'",
+            vault_id,
+        )
+        orphan_count = 0
+        orphan_sample: list[dict] = []
+        for r in doc_rows:
+            uri = doc_uri(vault, r["path"])
+            if uri in connected:
+                continue
+            orphan_count += 1
+            if len(orphan_sample) < limit:
+                orphan_sample.append({
+                    "uri": uri,
+                    "name": r["title"] or uri,
+                    "resource_type": "doc",
+                })
+
+        hubs: list[dict] = []
+        if hub_rows:
+            hub_names = await _batch_resolve_names(
+                conn, [(r["uri"], r["rtype"]) for r in hub_rows], vault_id=vault_id
+            )
+            hubs = [
+                {
+                    "uri": r["uri"],
+                    "name": hub_names.get(r["uri"]) or r["uri"],
+                    "resource_type": r["rtype"],
+                    "degree": r["degree"],
+                }
+                for r in hub_rows
+            ]
+
+    return {
+        "hubs": hubs,
+        "orphans": {"count": orphan_count, "sample": orphan_sample},
     }
 
 
@@ -913,12 +1105,12 @@ async def _bfs_collect(
             break
 
         outgoing = await conn.fetch(
-            "SELECT source_uri, target_uri, target_type, relation_type "
+            "SELECT source_uri, target_uri, target_type, relation_type, kind "
             "FROM edges WHERE source_uri = ANY($1::text[]) AND vault_id = $2",
             unvisited, vault_id,
         )
         incoming = await conn.fetch(
-            "SELECT source_uri, source_type, target_uri, relation_type "
+            "SELECT source_uri, source_type, target_uri, relation_type, kind "
             "FROM edges WHERE target_uri = ANY($1::text[]) AND vault_id = $2",
             unvisited, vault_id,
         )
@@ -960,6 +1152,7 @@ async def _bfs_collect(
                         "source": uri,
                         "target": r["target_uri"],
                         "relation": r["relation_type"],
+                        "kind": r["kind"],
                     })
                 if r["target_uri"] not in visited:
                     next_queue.append(r["target_uri"])
@@ -972,11 +1165,18 @@ async def _bfs_collect(
                         "source": r["source_uri"],
                         "target": uri,
                         "relation": r["relation_type"],
+                        "kind": r["kind"],
                     })
                 if r["source_uri"] not in visited:
                     next_queue.append(r["source_uri"])
 
         queue = next_queue
+
+    # The node cap (`len(nodes) >= limit`) can truncate the final BFS wave
+    # after an edge to one of its targets was already emitted — leaving a
+    # dangling edge to a node that was never materialized. Drop those so the
+    # client never receives a stub endpoint it has no node for.
+    edges[:] = [e for e in edges if e["source"] in nodes and e["target"] in nodes]
 
     uris_to_resolve = [(uri, n["resource_type"]) for uri, n in nodes.items()]
     names = await _batch_resolve_names(conn, uris_to_resolve, vault_id=vault_id)

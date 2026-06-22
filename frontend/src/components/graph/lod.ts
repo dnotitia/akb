@@ -23,8 +23,14 @@ export interface ViewportRect {
  *  ~60px label-pill band. Converted to world units (÷ zoom) at use. */
 export const MARGIN_PX = 80;
 /** Below this rendered-node count, culling + LOD are OFF — small graphs show
- *  everything at every zoom (mirrors layoutTier's count-gating). */
-export const CULL_MIN_NODES = 300;
+ *  everything at every zoom. Kept BELOW the overview's `top_k` node cap (200,
+ *  see `useFullGraph`): the degree-ranked overview is the densely-interconnected
+ *  core of a vault, so once it carries more than this many nodes it must engage
+ *  LOD (hub constellation + culled edges) instead of drawing every node and edge
+ *  at full detail — otherwise a 200-node overview falls *under* the threshold
+ *  and paints as an undifferentiated hairball. 140 leaves headroom under 200
+ *  while still letting genuinely small vaults render in full. */
+export const CULL_MIN_NODES = 140;
 /** A non-forced label only draws once the node's on-screen radius reaches this,
  *  so labels turn on hub-first as you zoom in. */
 export const LABEL_MIN_NODE_PX = 7.5;

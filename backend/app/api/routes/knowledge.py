@@ -18,6 +18,8 @@ from app.services.kg_service import (
     LinkRelationType as RelationType,
     get_resource_relations,
     get_graph,
+    get_health,
+    get_overview,
     get_provenance,
     link_resources,
     unlink_resources,
@@ -199,6 +201,40 @@ async def vault_graph(
     return await get_graph(
         vault_name, resource_uri=uri, hops=hops, limit=limit,
         vault_id=access["vault_id"],
+    )
+
+
+@router.get("/graph/overview", summary="Get vault graph overview (degree-ranked top-K + totals)")
+async def vault_graph_overview(
+    vault: str = Query(..., description="Vault name"),
+    top_k: int = Query(
+        200, ge=1, le=1000,
+        description="Keep the top-K highest-degree nodes (and the edges induced among them).",
+    ),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Whole-vault overview ranked by node degree, with honest `nodes_total` /
+    `edges_total` / `truncated` so the client can render "showing N of M".
+    Replaces the recency-capped no-`uri` branch of `/graph` for overviews."""
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await get_overview(vault, vault_id=access["vault_id"], top_k=top_k)
+
+
+@router.get("/graph/health", summary="Get vault graph health (hubs + orphans)")
+async def vault_graph_health(
+    vault: str = Query(..., description="Vault name"),
+    hub_threshold: int = Query(
+        5, ge=1, le=1000,
+        description="Minimum degree for a node to count as a hub.",
+    ),
+    limit: int = Query(20, ge=1, le=200, description="Max hubs and max orphan sample size."),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """KB-health audit: over-connected hubs (degree ≥ `hub_threshold`) and the
+    orphan documents (no relations) that the graph view exists to surface."""
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await get_health(
+        vault, vault_id=access["vault_id"], hub_threshold=hub_threshold, limit=limit,
     )
 
 

@@ -230,6 +230,54 @@ rdel "$PAT1" "$URI_A/" "$URI_B/" "references" >/dev/null
 C=$(rel_count "$PAT1" "$URI_A")
 [ "$C" = "0" ] && pass "unlink via slash-suffixed URIs removes the canonical edge" || fail "noncanon unlink" "still $C — unlink did not canonicalize"
 
+# ── 5. GET /graph/overview + /graph/health (read surface) ────
+# Degree-ranked overview with honest totals, and the hubs/orphans health
+# audit. Reader-gated; vault-scoped. Builds a tiny known graph in V1:
+#   A → B, A → C  (so A is a degree-2 hub), and a 4th doc D left ORPHAN.
+echo ""
+echo "▸ 5. GET /graph/overview + /graph/health"
+
+URI_D=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Orphan Doc\",\"content\":\"# Orphan\"}")")
+rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}" >/dev/null
+rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_C\",\"relation\":\"depends_on\"}" >/dev/null
+
+gov()      { curl -sk             -G "$BASE_URL/api/v1/graph/overview" --data-urlencode "vault=$2" --data-urlencode "top_k=${3:-200}" -H "Authorization: Bearer $1"; }
+gov_code() { curl -sk -o /dev/null -w '%{http_code}' -G "$BASE_URL/api/v1/graph/overview" --data-urlencode "vault=$2" -H "Authorization: Bearer $1"; }
+ghealth()  { curl -sk             -G "$BASE_URL/api/v1/graph/health"   --data-urlencode "vault=$2" --data-urlencode "hub_threshold=${3:-2}" -H "Authorization: Bearer $1"; }
+
+# overview: totals are honest, top node is the degree-2 hub A, edges carry kind.
+OVCHECK=$(gov "$PAT1" "$VAULT1" 200 | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+top=max(d['nodes'], key=lambda n: n.get('degree',0)) if d['nodes'] else {}
+kinds=sorted({e.get('kind') for e in d['edges']})
+ok = (d['edges_total']==2 and d['nodes_total']==3 and d['truncated'] is False
+      and top.get('degree')==2 and top.get('uri')=='$URI_A' and kinds==['explicit'])
+print('OK' if ok else 'BAD '+json.dumps({'edges_total':d['edges_total'],'nodes_total':d['nodes_total'],'trunc':d['truncated'],'top':top.get('uri'),'deg':top.get('degree'),'kinds':kinds}))
+" 2>&1)
+[ "$OVCHECK" = "OK" ] && pass "overview: totals(3/2) + degree-ranked hub A + edge kind" || fail "overview" "$OVCHECK"
+
+# overview truncation: top_k=1 keeps only the single highest-degree node.
+TRUNC=$(gov "$PAT1" "$VAULT1" 1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['returned']==1 and d['truncated'] is True and d['nodes_total']==3)" 2>/dev/null)
+[ "$TRUNC" = "True" ] && pass "overview: top_k=1 → returned 1 of 3, truncated true" || fail "overview trunc" "got $TRUNC"
+
+# health: A is a hub (deg>=2); the unlinked doc D is reported as an orphan.
+HCHECK=$(ghealth "$PAT1" "$VAULT1" 2 | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+hubs=d.get('hubs',[]); orph=d.get('orphans',{})
+hub_ok = any(h.get('uri')=='$URI_A' and h.get('degree')==2 for h in hubs)
+orph_ok = orph.get('count',0)>=1 and any('Orphan Doc' in (o.get('name') or '') for o in orph.get('sample',[]))
+print('OK' if (hub_ok and orph_ok) else 'BAD '+json.dumps({'hubs':[(h.get('uri'),h.get('degree')) for h in hubs],'orphans':orph}))
+" 2>&1)
+[ "$HCHECK" = "OK" ] && pass "health: hub A(deg2) + orphan D reported" || fail "health" "$HCHECK"
+
+# Reader-gating + cross-vault isolation.
+CODE=$(gov_code "$PAT2" "$VAULT1"); [ "$CODE" = "200" ] && pass "overview: reader (USER2) on V1 → 200" || fail "overview reader" "got $CODE"
+CODE=$(gov_code "$PAT2" "$VAULT2"); [ "$CODE" = "403" ] && pass "overview: no-access vault (V2) → 403" || fail "overview isolation" "got $CODE"
+CODE=$(curl -sk -o /dev/null -w '%{http_code}' -G "$BASE_URL/api/v1/graph/overview" --data-urlencode "vault=$VAULT1")
+[ "$CODE" = "401" ] && pass "overview: unauthenticated → 401" || fail "overview no-auth" "got $CODE"
+
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
