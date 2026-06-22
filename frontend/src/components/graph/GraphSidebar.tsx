@@ -263,15 +263,27 @@ export function GraphSidebar({
       {/* Hops shown in BOTH modes (it sets the depth a future focus will use),
           with a hint when there's no focus yet so the rail isn't half-disabled. */}
       <Section label="Depth" className="px-2">
-        <div className="flex items-center gap-3 text-[11px]">
+        {/* Hops apply to a FOCUSED neighborhood only — there's no center to
+            traverse from on the whole-graph view, so the radios are disabled
+            (not just hinted) there to avoid the "I clicked it and nothing
+            happened" confusion. */}
+        <div className={cn("flex items-center gap-3 text-[11px]", !view.entry && "opacity-50")}>
           {([1, 2, 3] as const).map((d) => (
-            <label key={d} className="inline-flex items-center gap-1 cursor-pointer">
+            <label
+              key={d}
+              className={cn(
+                "inline-flex items-center gap-1",
+                view.entry ? "cursor-pointer" : "cursor-not-allowed",
+              )}
+            >
               <input
                 type="radio"
                 name="hops"
                 checked={view.hops === d}
+                disabled={!view.entry}
                 onChange={() => setHops(d)}
                 aria-label={`${d} hop${d === 1 ? "" : "s"}`}
+                className="accent-[var(--color-primary)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed"
               />
               {d}
             </label>
@@ -280,7 +292,7 @@ export function GraphSidebar({
         </div>
         {!view.entry && (
           <p className="coord text-foreground-muted mt-1 leading-relaxed">
-            Focus on a document to traverse this many hops out.
+            Focus on a document (search above or click a node) to traverse this many hops out.
           </p>
         )}
       </Section>

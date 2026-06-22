@@ -83,3 +83,7 @@ Desktop.ini
 # Data (local dev)
 /data/
 .playwright-mcp/
+
+# stray local screenshots (Playwright/manual)
+/*.png
+.playwright-mcp/

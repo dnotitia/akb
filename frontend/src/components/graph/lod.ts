@@ -95,11 +95,32 @@ export function bandTargetCount(band: number): number {
   return LOD_BANDS[Math.max(0, Math.min(LOD_BANDS.length - 1, band))].target;
 }
 
-/** Minimum degree a node needs to render in a band: the degree at rank
- *  `targetCount` of the DESCENDING-sorted degree list, so ~targetCount nodes
- *  pass (plus ties). target ≥ list length → floor 0 (everything shows). */
-export function floorFromDegrees(sortedDesc: number[], targetCount: number): number {
-  if (targetCount >= sortedDesc.length) return 0;
-  if (targetCount <= 0) return sortedDesc.length ? sortedDesc[0] + 1 : 0;
-  return sortedDesc[targetCount - 1];
+/** The set of node URIs visible at a band: the top `targetCount` by degree
+ *  (rankedUris is the URI list sorted DESCENDING by degree). Returns null when
+ *  targetCount covers everything → "all visible", skip the membership test.
+ *  EXACT-count (rank-based) on purpose: a degree FLOOR over-admits when many
+ *  nodes tie at the threshold degree (e.g. 24 hubs at degree 13, target 30 →
+ *  the 30th-ranked node has degree 1 → a floor of 1 admits every leaf). */
+export function lodVisibleSet(rankedUris: string[], targetCount: number): Set<string> | null {
+  if (targetCount >= rankedUris.length) return null;
+  return new Set(rankedUris.slice(0, Math.max(0, targetCount)));
+}
+
+/** The zoom at which the whole graph would fit the viewport: min(w/bboxW,
+ *  h/bboxH) × a padding factor. relZoom (currentZoom / this) anchors the LOD
+ *  bands. Derived from the LIVE graph bbox on every recompute — NOT captured
+ *  once after the fit animation — so it self-calibrates after an expand / filter
+ *  / cluster change, with no settle-timing race and no stale anchor. Returns 0
+ *  (→ relZoom falls back to 1, the overview band) for a missing/degenerate bbox. */
+export function fitZoomFromBbox(
+  bbox: { x: [number, number]; y: [number, number] } | null | undefined,
+  w: number,
+  h: number,
+  padding = 0.92,
+): number {
+  if (!bbox || w <= 0 || h <= 0) return 0;
+  const bw = bbox.x[1] - bbox.x[0];
+  const bh = bbox.y[1] - bbox.y[0];
+  if (!(bw > 0) || !(bh > 0)) return 0;
+  return Math.min(w / bw, h / bh) * padding;
 }

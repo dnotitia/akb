@@ -5,7 +5,8 @@ import {
   lodBand,
   nextBand,
   bandTargetCount,
-  floorFromDegrees,
+  lodVisibleSet,
+  fitZoomFromBbox,
   LOD_BANDS,
 } from "../lod";
 
@@ -86,17 +87,34 @@ describe("bandTargetCount", () => {
   });
 });
 
-describe("floorFromDegrees", () => {
-  const sorted = [25, 20, 18, 15, 12, 8, 4, 2, 1, 1]; // descending
-  it("returns the degree at rank targetCount so ~targetCount pass", () => {
-    expect(floorFromDegrees(sorted, 3)).toBe(18); // top 3 → floor 18 (≥18: 25,20,18)
-    expect(floorFromDegrees(sorted, 5)).toBe(12);
+describe("lodVisibleSet", () => {
+  const ranked = ["a", "b", "c", "d", "e"]; // already degree-desc
+  it("returns the top-N URIs as a set (exact count, tie-proof)", () => {
+    expect(lodVisibleSet(ranked, 2)).toEqual(new Set(["a", "b"]));
+    expect(lodVisibleSet(ranked, 3)).toEqual(new Set(["a", "b", "c"]));
   });
-  it("floors to 0 when the target covers the whole list", () => {
-    expect(floorFromDegrees(sorted, 10)).toBe(0);
-    expect(floorFromDegrees(sorted, 999)).toBe(0);
+  it("returns null (all visible) when the target covers everything", () => {
+    expect(lodVisibleSet(ranked, 5)).toBeNull();
+    expect(lodVisibleSet(ranked, 999)).toBeNull();
   });
-  it("is safe on an empty list", () => {
-    expect(floorFromDegrees([], 30)).toBe(0);
+  it("admits EXACTLY N even when many nodes would tie on a degree floor", () => {
+    // 24 hubs (deg 13) + leaves (deg 1): a floor would admit all; the set is exact
+    const r = Array.from({ length: 100 }, (_, i) => `n${i}`);
+    expect(lodVisibleSet(r, 30)?.size).toBe(30);
+  });
+});
+
+describe("fitZoomFromBbox", () => {
+  const bbox = { x: [-100, 100] as [number, number], y: [-50, 50] as [number, number] }; // 200×100
+  it("is min(w/bboxW, h/bboxH) × padding", () => {
+    // w/bboxW = 800/200 = 4; h/bboxH = 600/100 = 6 → min 4 × 0.92
+    expect(fitZoomFromBbox(bbox, 800, 600)).toBeCloseTo(4 * 0.92);
+    // taller viewport → height dimension binds
+    expect(fitZoomFromBbox(bbox, 800, 100)).toBeCloseTo(1 * 0.92); // min(4, 1)=1
+  });
+  it("returns 0 for a missing or degenerate bbox (→ relZoom falls back to 1)", () => {
+    expect(fitZoomFromBbox(null, 800, 600)).toBe(0);
+    expect(fitZoomFromBbox({ x: [5, 5], y: [0, 10] }, 800, 600)).toBe(0); // zero width
+    expect(fitZoomFromBbox(bbox, 0, 600)).toBe(0);
   });
 });
