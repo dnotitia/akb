@@ -84,6 +84,10 @@ export default function GraphPage() {
   const [pinned, setPinned] = useState<Set<string>>(new Set());
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Orphan declutter (Obsidian-style): hide degree-0 nodes — the periphery
+  // confetti that only widens zoom-to-fit. A transient view toggle, like
+  // `hidden`, not a persisted URL filter.
+  const [hideOrphans, setHideOrphans] = useState(false);
   // One-time orientation hint (persisted dismissed).
   const [hintOpen, setHintOpen] = useState(
     () => localStorage.getItem("akb:graph:hint-dismissed") !== "1",
@@ -180,19 +184,60 @@ export default function GraphPage() {
     merged.nodes.find((n) => docIdFromUri(n.uri) === view.entry || n.doc_id === view.entry)?.name ??
     view.entry;
 
-  // Degree-ranked top 50 for the sr-only list — 600 raw buttons is a
-  // screen-reader wall; surface the structurally important nodes first, with
-  // the sidebar search as the path to the long tail.
-  const topNodes = useMemo(() => {
-    const degree = new Map<string, number>();
+  // How many degree-0 (orphan) nodes the filtered graph has, for the orphans
+  // toggle. Computed from `merged` so the count is stable whether or not they're
+  // currently hidden.
+  const orphanCount = useMemo(() => {
+    const connected = new Set<string>();
     for (const e of merged.edges) {
+      connected.add(e.source);
+      connected.add(e.target);
+    }
+    return merged.nodes.reduce((acc, n) => acc + (connected.has(n.uri) ? 0 : 1), 0);
+  }, [merged]);
+
+  // What the canvas actually renders: `merged`, minus orphans when the declutter
+  // toggle is on. (Orphans have no edges by definition, so dropping them never
+  // orphans an edge.)
+  const displayed = useMemo(() => {
+    if (!hideOrphans || orphanCount === 0) return merged;
+    const connected = new Set<string>();
+    for (const e of merged.edges) {
+      connected.add(e.source);
+      connected.add(e.target);
+    }
+    return { nodes: merged.nodes.filter((n) => connected.has(n.uri)), edges: merged.edges };
+  }, [merged, hideOrphans, orphanCount]);
+
+  // Degree-ranked nodes of what's shown: `topNodes` (≤50) backs the sr-only
+  // a11y list (600 raw buttons is a screen-reader wall — surface the
+  // structurally important ones, with sidebar search for the long tail);
+  // `hubs` (≤8, degree>0) is the visible "way in" list in the sidebar.
+  const { topNodes, hubs } = useMemo(() => {
+    const degree = new Map<string, number>();
+    for (const e of displayed.edges) {
       degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
       degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
     }
-    return [...merged.nodes]
-      .sort((a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0))
-      .slice(0, 50);
-  }, [merged]);
+    const ranked = [...displayed.nodes].sort(
+      (a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0),
+    );
+    return {
+      topNodes: ranked.slice(0, 50),
+      hubs: ranked.filter((n) => (degree.get(n.uri) ?? 0) > 0).slice(0, 8),
+    };
+  }, [displayed]);
+
+  // Screen-reader announcement for the current selection (+ its degree) — the
+  // canvas selection has no DOM focus change to convey it otherwise.
+  const selectionAnnounce = useMemo(() => {
+    if (!selectedNode) return "";
+    let n = 0;
+    for (const e of displayed.edges) {
+      if (e.source === selectedNode.uri || e.target === selectedNode.uri) n++;
+    }
+    return `Selected ${selectedNode.name}, ${selectedNode.kind}, ${n} connection${n === 1 ? "" : "s"}`;
+  }, [selectedNode, displayed]);
 
   // Clicking a relation in the detail panel selects that node in the graph.
   // If it isn't currently rendered (filtered out, or outside the loaded
@@ -236,6 +281,14 @@ export default function GraphPage() {
           onChange={setView}
           onNavigate={(qs) => {
             navigate({ search: qs.startsWith("?") ? qs : `?${qs}` }, { replace: true });
+          }}
+          hubs={hubs}
+          orphanCount={orphanCount}
+          hideOrphans={hideOrphans}
+          onToggleOrphans={() => setHideOrphans((v) => !v)}
+          onSelectNode={(uri) => {
+            handleSelect(uri);
+            canvasRef.current?.centerOnNode(uri);
           }}
           onCollapse={() => setSidebarOpen(false)}
         />
@@ -286,7 +339,7 @@ export default function GraphPage() {
             <Alert variant="info">
               <div className="flex items-center gap-3">
                 <span>
-                  {merged.nodes.length} nodes · {merged.edges.length} links — drag to pan ·
+                  {displayed.nodes.length} nodes · {displayed.edges.length} links — drag to pan ·
                   scroll to zoom · click a node to focus
                 </span>
                 <button
@@ -323,13 +376,14 @@ export default function GraphPage() {
         ) : (
           <>
             <GraphCanvas
-              // Remount on a STRUCTURAL change (entry/hops/filters), not on
-              // selection, so the new graph auto-fits instead of rendering
-              // off-screen. structureKey excludes `selected` by design.
-              key={structureKey}
+              // Remount on a STRUCTURAL change (entry/hops/filters/orphan
+              // toggle), not on selection, so the new graph auto-fits onto the
+              // shown set instead of rendering off-screen. structureKey excludes
+              // `selected` by design.
+              key={`${structureKey}:${hideOrphans ? "o" : ""}`}
               ref={canvasRef}
-              nodes={merged.nodes}
-              edges={merged.edges}
+              nodes={displayed.nodes}
+              edges={displayed.edges}
               selected={selectedNode?.uri}
               pinned={pinned}
               hidden={hidden}
@@ -340,9 +394,11 @@ export default function GraphPage() {
             />
             {/* Text alternative + keyboard path: the canvas is opaque to AT, so
                 expose every node as a focusable button that selects it (opening
-                the detail panel — the same handler the canvas click uses). */}
+                the detail panel — the same handler the canvas click uses). The
+                visible Hubs list in the sidebar gives sighted keyboard users the
+                same fast way in. */}
             <div className="sr-only">
-              <h2>Graph nodes ({merged.nodes.length})</h2>
+              <h2>Graph nodes ({displayed.nodes.length})</h2>
               <ul>
                 {topNodes.map((n) => (
                   <li key={n.uri}>
@@ -352,13 +408,18 @@ export default function GraphPage() {
                     </button>
                   </li>
                 ))}
-                {merged.nodes.length > topNodes.length && (
+                {displayed.nodes.length > topNodes.length && (
                   <li>
-                    {merged.nodes.length - topNodes.length} more — use the sidebar search to
+                    {displayed.nodes.length - topNodes.length} more — use the sidebar search to
                     reach them.
                   </li>
                 )}
               </ul>
+            </div>
+            {/* Announce the current selection (+ its degree) to screen readers,
+                since selecting on the canvas has no DOM focus change. */}
+            <div aria-live="polite" className="sr-only">
+              {selectionAnnounce}
             </div>
           </>
         )}

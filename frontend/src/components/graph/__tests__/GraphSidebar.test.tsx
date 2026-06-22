@@ -1,4 +1,5 @@
 // frontend/src/components/graph/__tests__/GraphSidebar.test.tsx
+import type { ComponentProps } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -18,6 +19,16 @@ beforeEach(() => {
   mockedSearchDocs.mockReset();
 });
 
+// Props added in the Phase-1 navigation pass — defaulted here so each test only
+// sets what it exercises.
+const navProps = {
+  hubs: [],
+  orphanCount: 0,
+  hideOrphans: false,
+  onToggleOrphans: () => {},
+  onSelectNode: () => {},
+};
+
 function setup(view: Partial<GraphView> = {}) {
   const onChange = vi.fn();
   const onNavigate = vi.fn();
@@ -27,9 +38,31 @@ function setup(view: Partial<GraphView> = {}) {
       view={{ ...DEFAULT_VIEW, ...view }}
       onChange={onChange}
       onNavigate={onNavigate}
+      {...navProps}
     />,
   );
   return { onChange, onNavigate };
+}
+
+type SidebarProps = ComponentProps<typeof GraphSidebar>;
+
+/** Render with full default props + a typed rerender that re-applies them, for
+ *  the prop-driven (hubs / orphans) tests. */
+function renderSidebar(overrides: Partial<SidebarProps> = {}) {
+  const props: SidebarProps = {
+    vault: "akb",
+    view: DEFAULT_VIEW,
+    onChange: vi.fn(),
+    onNavigate: vi.fn(),
+    ...navProps,
+    ...overrides,
+  };
+  const utils = render(<GraphSidebar {...props} />);
+  return {
+    ...utils,
+    rerender: (next: Partial<SidebarProps>) =>
+      utils.rerender(<GraphSidebar {...props} {...next} />),
+  };
 }
 
 describe("GraphSidebar · types", () => {
@@ -45,16 +78,38 @@ describe("GraphSidebar · types", () => {
 });
 
 describe("GraphSidebar · hops", () => {
-  it("is hidden until a focus is set", () => {
-    setup();
-    expect(screen.queryByRole("radio", { name: /3 hops/i })).toBeNull();
+  it("shows the hops control in both modes (incl. whole-graph)", () => {
+    setup(); // no entry
+    expect(screen.getByRole("radio", { name: /3 hops/i })).toBeTruthy();
   });
 
-  it("emits hops change when entry is set", async () => {
+  it("emits a hops change and persists it", async () => {
     const u = userEvent.setup();
     const { onChange } = setup({ entry: "d-1", hops: 2 });
     await u.click(screen.getByRole("radio", { name: /3 hops/i }));
     expect(onChange.mock.calls[0][0].hops).toBe(3);
+    expect(localStorage.getItem("akb:graph:hops")).toBe("3");
+  });
+});
+
+describe("GraphSidebar · orphans + hubs", () => {
+  it("shows the orphans toggle only when there are orphans", () => {
+    const { rerender } = renderSidebar({ orphanCount: 0 });
+    expect(screen.queryByText(/hide orphans/i)).toBeNull();
+    rerender({ orphanCount: 3 });
+    expect(screen.getByText(/hide orphans/i)).toBeTruthy();
+    expect(screen.getByText(/3 unconnected/i)).toBeTruthy();
+  });
+
+  it("lists hubs and selects one on click", async () => {
+    const u = userEvent.setup();
+    const onSelectNode = vi.fn();
+    renderSidebar({
+      hubs: [{ uri: "akb://akb/doc/a.md", name: "Hub A", kind: "document" }],
+      onSelectNode,
+    });
+    await u.click(screen.getByRole("button", { name: /hub a/i }));
+    expect(onSelectNode).toHaveBeenCalledWith("akb://akb/doc/a.md");
   });
 });
 
@@ -107,6 +162,7 @@ describe("GraphSidebar · entry search", () => {
         view={DEFAULT_VIEW}
         onChange={onChange}
         onNavigate={() => {}}
+        {...navProps}
       />,
     );
     const input = screen.getByPlaceholderText(/search to focus/i);
@@ -140,6 +196,7 @@ describe("GraphSidebar · entry search", () => {
         view={DEFAULT_VIEW}
         onChange={onChange}
         onNavigate={() => {}}
+        {...navProps}
       />,
     );
     const input = screen.getByPlaceholderText(/search to focus/i);
