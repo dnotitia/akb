@@ -706,7 +706,7 @@ export default function DocumentPage() {
               sourceUri={doc.path ? docUri(name!, doc.path) : ""}
               relations={relations}
               relationsError={relationsError}
-              graphHref={`/vault/${name}/graph?focus=${encodeURIComponent(doc.path ? docUri(name!, doc.path) : "")}`}
+              graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
               onReload={reloadRelations}
             />
           </TabsContent>

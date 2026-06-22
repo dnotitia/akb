@@ -75,6 +75,11 @@ export interface GraphColors {
   surfaceMuted: string;
   foreground: string;
   foregroundMuted: string;
+  /** Teal brand (`--color-primary`) — the single SELECTION/focus signal
+   *  (selected node border + halo, incident edges, focused-neighbor labels). */
+  primary: string;
+  /** Orange brand (`--color-accent`) — reserved now for the PINNED marker only,
+   *  so selection (teal) never competes with a second orange. */
   accent: string;
   border: string;
   /** Tokenized categorical scale (--color-cat-1..6) for cluster coloring.
@@ -92,6 +97,7 @@ export function readColors(): GraphColors {
     surfaceMuted: pick("--color-surface-muted"),
     foreground: pick("--color-foreground"),
     foregroundMuted: pick("--color-foreground-muted"),
+    primary: pick("--color-primary"),
     accent: pick("--color-accent"),
     border: pick("--color-border"),
     cat: [1, 2, 3, 4, 5, 6].map((i) => root.getPropertyValue(`--color-cat-${i}`).trim() || "gray"),
@@ -110,4 +116,33 @@ export const RELATION_DASH: Record<RelationKind, number[]> = {
   attached_to: [],
   derived_from: [6, 2],
   links_to: [1, 3],
+};
+
+/** Two-tier edge encoding so the seven typed relations read at a glance:
+ *  STRUCTURAL ties (hard dependencies / containment) paint solid, darker, and
+ *  thicker; ASSOCIATIVE ties (soft references / body links) paint dashed,
+ *  muted, and thinner. Color/weight is the primary channel, the per-relation
+ *  dash (RELATION_DASH) the secondary one — together they stay distinguishable
+ *  without a seven-color rainbow. `links_to` (implicit body wikilinks) is the
+ *  lightest, as the weakest signal. */
+export type EdgeClass = "structural" | "associative";
+export const RELATION_CLASS: Record<RelationKind, EdgeClass> = {
+  depends_on: "structural",
+  implements: "structural",
+  derived_from: "structural",
+  attached_to: "structural",
+  references: "associative",
+  related_to: "associative",
+  links_to: "associative",
+};
+
+/** Human-readable relation labels for the legend / chips (no raw snake_case). */
+export const RELATION_LABEL: Record<RelationKind, string> = {
+  depends_on: "depends on",
+  implements: "implements",
+  derived_from: "derived from",
+  attached_to: "attached to",
+  references: "references",
+  related_to: "related to",
+  links_to: "links to",
 };

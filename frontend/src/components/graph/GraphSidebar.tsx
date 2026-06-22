@@ -7,10 +7,13 @@ import { useDebounce } from "@/hooks/use-debounce";
 import {
   ALL_NODE_KINDS,
   ALL_RELATIONS,
+  RELATION_LABEL,
+  type GraphNode,
   type GraphView,
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
+import { KindSwatch, RelationSwatch } from "./graph-swatches";
 import { viewToQuery } from "./graph-state";
 import { Section } from "./Section";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -21,6 +24,19 @@ interface Props {
   view: GraphView;
   onChange: (next: GraphView) => void;
   onNavigate: (queryString: string) => void;
+  /** Highest-degree nodes in the current graph — a visible way INTO a large
+   *  graph (click to select + center). */
+  hubs: GraphNode[];
+  /** How many degree-0 nodes the current graph has (for the orphans toggle). */
+  orphanCount: number;
+  hideOrphans: boolean;
+  onToggleOrphans: () => void;
+  /** How many nodes the user has hidden (Hide from the context menu) — for the
+   *  "Unhide all" recovery, since a hidden node can't be right-clicked back. */
+  hiddenCount: number;
+  onUnhideAll: () => void;
+  /** Select + center a node (used by the Hubs list). */
+  onSelectNode: (uri: string) => void;
   /** When provided, renders a collapse control in the sidebar header. */
   onCollapse?: () => void;
 }
@@ -31,7 +47,29 @@ interface SearchHit {
   type: NodeKind;
 }
 
-export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: Props) {
+/** Last-used traversal depth, persisted so a focus picks up the user's
+ *  preferred radius instead of always resetting to 2. */
+const HOPS_KEY = "akb:graph:hops";
+function savedHops(): 1 | 2 | 3 {
+  const v = typeof localStorage !== "undefined" ? localStorage.getItem(HOPS_KEY) : null;
+  return v === "1" ? 1 : v === "3" ? 3 : 2;
+}
+
+
+export function GraphSidebar({
+  vault,
+  view,
+  onChange,
+  onNavigate,
+  hubs,
+  orphanCount,
+  hideOrphans,
+  onToggleOrphans,
+  hiddenCount,
+  onUnhideAll,
+  onSelectNode,
+  onCollapse,
+}: Props) {
   const { recent, pushRecent, clearRecent, saved, saveView, deleteView } =
     useGraphHistory(vault);
   const [query, setQuery] = useState("");
@@ -74,9 +112,14 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
 
   function commitEntry(hit: SearchHit) {
     pushRecent({ doc_id: hit.doc_id, title: hit.title });
-    onChange({ ...view, entry: hit.doc_id });
+    onChange({ ...view, entry: hit.doc_id, hops: savedHops() });
     setQuery("");
     setHits([]);
+  }
+
+  function setHops(d: 1 | 2 | 3) {
+    if (typeof localStorage !== "undefined") localStorage.setItem(HOPS_KEY, String(d));
+    onChange({ ...view, hops: d });
   }
 
   function toggleType(k: NodeKind) {
@@ -188,24 +231,88 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
         )}
       </Section>
 
-      {/* Hops only matters inside a focus — hidden in the whole-graph view so
-          the rail isn't half-disabled on first open. */}
-      {view.entry && (
-        <Section label="Hops" className="px-2">
-          <div className="flex items-center gap-3 text-[11px]">
-            {([1, 2, 3] as const).map((d) => (
-              <label key={d} className="inline-flex items-center gap-1 cursor-pointer">
+      {/* Hops shown in BOTH modes (it sets the depth a future focus will use),
+          with a hint when there's no focus yet so the rail isn't half-disabled. */}
+      <Section label="Depth" className="px-2">
+        {/* Hops apply to a FOCUSED neighborhood only — there's no center to
+            traverse from on the whole-graph view, so the radios are disabled
+            (not just hinted) there to avoid the "I clicked it and nothing
+            happened" confusion. */}
+        <div className={cn("flex items-center gap-3 text-[11px]", !view.entry && "opacity-50")}>
+          {([1, 2, 3] as const).map((d) => (
+            <label
+              key={d}
+              className={cn(
+                "inline-flex items-center gap-1",
+                view.entry ? "cursor-pointer" : "cursor-not-allowed",
+              )}
+            >
+              <input
+                type="radio"
+                name="hops"
+                checked={view.hops === d}
+                disabled={!view.entry}
+                onChange={() => setHops(d)}
+                aria-label={`${d} hop${d === 1 ? "" : "s"}`}
+                className="accent-[var(--color-primary)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed"
+              />
+              {d}
+            </label>
+          ))}
+          <span className="coord text-foreground-muted">hops</span>
+        </div>
+        {!view.entry && (
+          <p className="coord text-foreground-muted mt-1 leading-relaxed">
+            Focus on a document (search above or click a node) to traverse this many hops out.
+          </p>
+        )}
+      </Section>
+
+      {(orphanCount > 0 || hiddenCount > 0) && (
+        <Section label="Display" className="px-2">
+          <div className="flex flex-col gap-1.5">
+            {orphanCount > 0 && (
+              <label className="inline-flex items-center gap-2 text-[11px] cursor-pointer">
                 <input
-                  type="radio"
-                  name="hops"
-                  checked={view.hops === d}
-                  onChange={() => onChange({ ...view, hops: d })}
-                  aria-label={`${d} hop${d === 1 ? "" : "s"}`}
+                  type="checkbox"
+                  checked={hideOrphans}
+                  onChange={onToggleOrphans}
+                  className="accent-[var(--color-primary)] cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 />
-                {d}
+                Hide orphans
+                <span className="coord text-foreground-muted">({orphanCount} unconnected)</span>
               </label>
-            ))}
+            )}
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                onClick={onUnhideAll}
+                className="inline-flex w-max items-center gap-1.5 px-2 h-7 rounded-[var(--radius-sm)] border border-border text-[11px] text-foreground-muted hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+              >
+                Unhide all
+                <span className="coord text-foreground-muted">({hiddenCount})</span>
+              </button>
+            )}
           </div>
+        </Section>
+      )}
+
+      {hubs.length > 0 && (
+        <Section label="Hubs" className="px-2">
+          <ul className="flex flex-col gap-px">
+            {hubs.map((h) => (
+              <li key={h.uri}>
+                <button
+                  type="button"
+                  onClick={() => onSelectNode(h.uri)}
+                  className="w-full flex items-center gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-hover rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                >
+                  <KindSwatch kind={h.kind} />
+                  <TooltipText className="truncate">{h.name}</TooltipText>
+                </button>
+              </li>
+            ))}
+          </ul>
         </Section>
       )}
 
@@ -219,12 +326,13 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold",
+                "inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-sm)] border text-[11px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
                 view.types.has(k)
                   ? "border-primary bg-surface-selected text-surface-selected-foreground"
                   : "border-border text-foreground-muted hover:bg-surface-hover",
               )}
             >
+              <KindSwatch kind={k} />
               {k}
             </button>
           ))}
@@ -232,25 +340,30 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
       </Section>
 
       <Section label="Relations" className="px-2">
-        <div className="grid grid-cols-2 gap-1">
-          {ALL_RELATIONS.map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => toggleRelation(r)}
-              aria-label={`Toggle ${r}`}
-              aria-pressed={view.relations.has(r)}
-              className={cn(
-                "inline-flex items-center h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold text-left",
-                view.relations.has(r)
-                  ? "border-primary bg-surface-selected text-surface-selected-foreground"
-                  : "border-border text-foreground-muted hover:bg-surface-hover",
-              )}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
+        <ul className="flex flex-col gap-px">
+          {ALL_RELATIONS.map((r) => {
+            const on = view.relations.has(r);
+            return (
+              <li key={r}>
+                <button
+                  type="button"
+                  onClick={() => toggleRelation(r)}
+                  aria-label={`Toggle ${RELATION_LABEL[r]}`}
+                  aria-pressed={on}
+                  className={cn(
+                    "w-full flex items-center gap-2 px-2 h-7 rounded-[var(--radius-sm)] border text-[11px] text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+                    on
+                      ? "border-primary bg-surface-selected text-surface-selected-foreground"
+                      : "border-border text-foreground-muted hover:bg-surface-hover",
+                  )}
+                >
+                  <RelationSwatch relation={r} />
+                  <span className="truncate">{RELATION_LABEL[r]}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
       </Section>
 
       <Section
@@ -272,7 +385,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
               <li key={r.doc_id}>
                 <button
                   type="button"
-                  onClick={() => onChange({ ...view, entry: r.doc_id })}
+                  onClick={() => onChange({ ...view, entry: r.doc_id, hops: savedHops() })}
                   className="w-full text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:bg-surface-active truncate"
                 >
                   <TooltipText className="truncate">{r.title}</TooltipText>
@@ -328,7 +441,7 @@ export function GraphSidebar({ vault, view, onChange, onNavigate, onCollapse }: 
                 <button
                   type="button"
                   onClick={() => onNavigate(s.url)}
-                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:opacity-60 transition-opacity duration-150 truncate"
+                  className="flex-1 text-left px-2 h-7 text-[11px] hover:bg-surface-hover active:bg-surface-active truncate"
                 >
                   <TooltipText className="truncate">{s.name}</TooltipText>
                 </button>

@@ -11,6 +11,7 @@ import { parseUri } from "@/lib/uri";
 import { groupOf } from "./cluster";
 import {
   ALL_NODE_KINDS,
+  RELATION_CLASS,
   type GraphEdge,
   type GraphNode,
   type GraphView,
@@ -90,6 +91,61 @@ export function endpointUri(end: unknown): string {
     return (end as { uri: string }).uri;
   }
   return "";
+}
+
+/** uri → degree (incident visible-edge count). Endpoints are normalized via
+ *  endpointUri so it's correct whether the sim has mutated source/target from
+ *  URI strings to node objects yet. Shared by the canvas (node sizing + LOD
+ *  ranking) and the page (hubs / sr-only list) so the degree rule lives once. */
+export function degreeMap(edges: GraphEdge[]): Map<string, number> {
+  const d = new Map<string, number>();
+  for (const e of edges) {
+    const s = endpointUri(e.source);
+    const t = endpointUri(e.target);
+    d.set(s, (d.get(s) ?? 0) + 1);
+    d.set(t, (d.get(t) ?? 0) + 1);
+  }
+  return d;
+}
+
+/** Directed impact cones from `selected` over STRUCTURAL edges only:
+ *  `out` = its DEPENDENCIES (reachable by following source→target),
+ *  `in`  = its DEPENDENTS  (reachable by following target→source).
+ *  The root is excluded from both; cycle-safe (visited guard). Pure helper for
+ *  the impact-analysis view — endpoints normalized via endpointUri. */
+export function impactCones(
+  edges: GraphEdge[],
+  selected: string,
+): { out: Set<string>; in: Set<string> } {
+  const fwd = new Map<string, string[]>();
+  const bwd = new Map<string, string[]>();
+  const push = (m: Map<string, string[]>, k: string, v: string) => {
+    const a = m.get(k);
+    if (a) a.push(v);
+    else m.set(k, [v]);
+  };
+  for (const e of edges) {
+    if (RELATION_CLASS[e.relation] !== "structural") continue;
+    const s = endpointUri(e.source);
+    const t = endpointUri(e.target);
+    push(fwd, s, t);
+    push(bwd, t, s);
+  }
+  const bfs = (start: string, adj: Map<string, string[]>) => {
+    const seen = new Set<string>();
+    const queue = [start];
+    while (queue.length) {
+      const u = queue.shift() as string;
+      for (const v of adj.get(u) ?? []) {
+        if (v !== start && !seen.has(v)) {
+          seen.add(v);
+          queue.push(v);
+        }
+      }
+    }
+    return seen;
+  };
+  return { out: bfs(selected, fwd), in: bfs(selected, bwd) };
 }
 
 export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {

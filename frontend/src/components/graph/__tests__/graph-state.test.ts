@@ -60,6 +60,28 @@ describe("graph-state codec", () => {
     expect(back.hops).toBe(2);
   });
 
+  // Back-compat: the doc page's "Open in graph" link historically emitted
+  // `?focus=<akb-uri>`, but the graph only consumes `entry=<doc-id>`. queryToView
+  // normalizes a focus URI to its doc-id so already-shipped links land focused
+  // instead of silently dumping the whole vault graph.
+  it("normalizes a legacy ?focus=<uri> into the entry doc-id", () => {
+    const uri = "akb://akb/doc/specs/2026/foo.md";
+    const back = queryToView(new URLSearchParams(`focus=${encodeURIComponent(uri)}`));
+    expect(back.entry).toBe("specs/2026/foo.md");
+  });
+
+  it("prefers entry over focus when both are present", () => {
+    const back = queryToView(
+      new URLSearchParams(`entry=d-123&focus=${encodeURIComponent("akb://akb/doc/x.md")}`),
+    );
+    expect(back.entry).toBe("d-123");
+  });
+
+  it("falls through to the whole graph for an unparseable focus URI", () => {
+    const back = queryToView(new URLSearchParams("focus=not-a-uri"));
+    expect(back.entry).toBeUndefined();
+  });
+
   it("ignores unknown node kinds in types", () => {
     const back = queryToView(new URLSearchParams("types=document,bogus"));
     expect(back.types).toEqual(new Set(["document"]));

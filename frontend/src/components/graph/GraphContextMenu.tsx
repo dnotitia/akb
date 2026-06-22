@@ -117,7 +117,7 @@ const MenuItem = ({
     type="button"
     role="menuitem"
     onClick={onClick}
-    className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-foreground hover:bg-surface-hover focus:bg-surface-hover focus:outline-none cursor-pointer transition-colors"
+    className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-foreground hover:bg-surface-hover focus-visible:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset cursor-pointer transition-colors"
   >
     <Icon className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
     {label}

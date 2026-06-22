@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
-import { mergeGraph, bfsExpand, applyFilters, docIdFromUri } from "../use-graph-data";
+import {
+  mergeGraph,
+  bfsExpand,
+  applyFilters,
+  docIdFromUri,
+  endpointUri,
+  degreeMap,
+  impactCones,
+} from "../use-graph-data";
 import { docUri } from "@/lib/uri";
 import { DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
 
@@ -395,5 +403,76 @@ describe("bfsExpand", () => {
     await bfsExpand({ vault: "v", entry: "A", hops: 3, fetchRelations });
     // A → B → C → (A — already visited; cycle breaks here, no re-fetch)
     expect(calls.sort()).toEqual(["A", "B", "C"]);
+  });
+});
+
+describe("endpointUri", () => {
+  it("passes a string endpoint through", () => {
+    expect(endpointUri("akb://v/doc/a.md")).toBe("akb://v/doc/a.md");
+  });
+  it("extracts .uri once the sim has mutated the endpoint to a node object", () => {
+    expect(endpointUri({ uri: "akb://v/doc/a.md", x: 1, y: 2 })).toBe("akb://v/doc/a.md");
+  });
+  it("returns '' for a malformed endpoint", () => {
+    expect(endpointUri(null)).toBe("");
+    expect(endpointUri(42)).toBe("");
+  });
+});
+
+describe("degreeMap", () => {
+  it("counts both endpoints of every edge (undirected degree)", () => {
+    const edges: GraphEdge[] = [
+      { source: "a", target: "b", relation: "depends_on" },
+      { source: "a", target: "c", relation: "references" },
+    ];
+    const d = degreeMap(edges);
+    expect(d.get("a")).toBe(2);
+    expect(d.get("b")).toBe(1);
+    expect(d.get("c")).toBe(1);
+  });
+  it("is correct whether endpoints are strings or sim-mutated node objects", () => {
+    const edges = [
+      { source: { uri: "a" }, target: "b", relation: "depends_on" },
+    ] as unknown as GraphEdge[];
+    const d = degreeMap(edges);
+    expect(d.get("a")).toBe(1);
+    expect(d.get("b")).toBe(1);
+  });
+});
+
+describe("impactCones", () => {
+  // a → b → c (depends_on, structural); d → a (structural); b ~ e (references, associative)
+  const edges: GraphEdge[] = [
+    { source: "a", target: "b", relation: "depends_on" },
+    { source: "b", target: "c", relation: "implements" },
+    { source: "d", target: "a", relation: "depends_on" },
+    { source: "b", target: "e", relation: "references" },
+  ];
+
+  it("follows source→target for the dependency (out) cone, transitively", () => {
+    const { out } = impactCones(edges, "a");
+    expect(out).toEqual(new Set(["b", "c"])); // a depends on b, b depends on c
+  });
+
+  it("follows target→source for the dependent (in) cone, transitively", () => {
+    const { in: dependents } = impactCones(edges, "c");
+    // c ← b ← a ← d : everything whose depends_on chain reaches c.
+    expect(dependents).toEqual(new Set(["b", "a", "d"]));
+  });
+
+  it("excludes associative (non-structural) edges from the cones", () => {
+    const { out } = impactCones(edges, "b");
+    expect(out.has("e")).toBe(false); // b → e is `references` (associative)
+    expect(out.has("c")).toBe(true); // b → c is structural
+  });
+
+  it("excludes the root and terminates on a cycle", () => {
+    const cyclic: GraphEdge[] = [
+      { source: "x", target: "y", relation: "depends_on" },
+      { source: "y", target: "x", relation: "depends_on" },
+    ];
+    const { out } = impactCones(cyclic, "x");
+    expect(out.has("x")).toBe(false); // root excluded
+    expect(out).toEqual(new Set(["y"])); // and it returns (no infinite loop)
   });
 });
