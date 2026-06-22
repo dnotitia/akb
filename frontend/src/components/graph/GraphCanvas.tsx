@@ -11,7 +11,7 @@ import {
   type GraphNode,
   type GraphColors,
 } from "./graph-types";
-import { endpointUri } from "./use-graph-data";
+import { endpointUri, degreeMap } from "./use-graph-data";
 import {
   groupColor,
   forceCluster,
@@ -25,6 +25,7 @@ import {
 import {
   computeViewportRect,
   inViewportPoint,
+  segmentOverlapsRect,
   nextBand,
   bandTargetCount,
   lodVisibleSet,
@@ -182,6 +183,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // when many nodes tie at the threshold degree.
   const lodVisibleRef = useRef<Set<string> | null>(null);
   const lodBandRef = useRef(0);
+  // Cached fit zoom (the relZoom=1 anchor). Refreshed only on layout changes
+  // (settle / data / resize), so the per-zoom-tick cull stays O(1) on this read.
+  const fitZoomRef = useRef(0);
   const degreeRankedUrisRef = useRef<string[]>([]);
   const labelCountRef = useRef(0);
   // Forced elements always paint (selection / hover / pin / focus-neighbor),
@@ -198,21 +202,28 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // one repaint so the cull re-runs; camera moves already repaint on their own.
   const [cullEpoch, setCullEpoch] = useState(0);
 
-  // Recompute the visible world rect + the LOD degree floor from the current
-  // camera. Cheap (a few ops) — called on zoom/resize, never per frame. Reads
-  // refs only, so its identity is stable.
-  const recomputeCull = useCallback(() => {
+  // The fit zoom (relZoom=1 anchor) is the only O(n) part — it scans the graph
+  // bbox. The bbox only changes when the LAYOUT changes (a settle / data change /
+  // resize), NOT when the camera pans or zooms, so it's cached here and refreshed
+  // only on those events — never per zoom tick. Deriving it from the live bbox
+  // (not a one-time captured zoom) means it self-calibrates after an expand /
+  // filter / cluster change with no stale anchor.
+  const recomputeFitZoom = useCallback(() => {
     const fg = fgRef.current;
+    if (!fg) return;
+    const { w, h } = sizeRef.current;
+    fitZoomRef.current = fitZoomFromBbox(fg.getGraphBbox?.(), w, h);
+  }, []);
+
+  // Recompute the visible world rect + the LOD band/set from the current camera.
+  // O(1) viewport math + an O(target≤200) set rebuild, reading the CACHED fit
+  // zoom — cheap enough to run on every zoom tick. Reads refs only → stable id.
+  const recomputeCull = useCallback(() => {
     const { k, cx, cy } = transformRef.current;
-    if (!fg || !k) return;
+    if (!k) return;
     const { w, h } = sizeRef.current;
     viewportRef.current = computeViewportRect({ w, h, k, cx, cy, marginPx: MARGIN_PX });
-    // relZoom = current zoom / fit zoom, where fit zoom is derived from the LIVE
-    // graph bbox each time — so it self-calibrates after an expand/filter/cluster
-    // change (no captured anchor that goes stale when the graph grows without a
-    // remount, no settle-timing race).
-    const fitZoom = fitZoomFromBbox(fg.getGraphBbox?.(), w, h);
-    const relZoom = fitZoom ? k / fitZoom : 1;
+    const relZoom = fitZoomRef.current ? k / fitZoomRef.current : 1;
     const band = nextBand(relZoom, lodBandRef.current);
     lodBandRef.current = band;
     lodVisibleRef.current = lodVisibleSet(degreeRankedUrisRef.current, bandTargetCount(band));
@@ -229,12 +240,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const h = e.contentRect.height;
       setSize({ w, h });
       sizeRef.current = { w, h };
+      recomputeFitZoom(); // size changed → fit zoom changed
       recomputeCull();
       setCullEpoch((x) => x + 1);
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [recomputeCull]);
+  }, [recomputeFitZoom, recomputeCull]);
 
   useImperativeHandle(
     ref,
@@ -280,24 +292,28 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const handleEngineStop = useCallback(() => {
     const fg = fgRef.current;
     if (!fg) return;
+    // Recompute the fit anchor + cull on EVERY settle, not just the first fit —
+    // an expand / cluster-toggle / filter reheat re-settles here and shifts the
+    // bbox without a camera event, so a one-shot recompute would leave the LOD
+    // band frozen at pre-reheat values until the next pan/zoom.
+    const apply = () => {
+      const live = fgRef.current;
+      if (!live) return;
+      const c = live.centerAt();
+      transformRef.current = { k: live.zoom(), cx: c?.x ?? 0, cy: c?.y ?? 0 };
+      recomputeFitZoom();
+      recomputeCull();
+      setCullEpoch((x) => x + 1);
+    };
     if (!fittedRef.current) {
-      fg.zoomToFit(400, 60);
+      fg.zoomToFit(400, 60); // fit once on the first settle
       fittedRef.current = true;
-      // After the fit animation, sync the camera into transformRef and run the
-      // first cull + one repaint so the overview opens decluttered. recomputeCull
-      // derives the fit zoom from the live bbox, so this timing only schedules
-      // the repaint — it captures no anchor (the band stays correct even if the
-      // read lands a little early/late).
-      setTimeout(() => {
-        const live = fgRef.current;
-        if (!live) return;
-        const c = live.centerAt();
-        transformRef.current = { k: live.zoom(), cx: c?.x ?? 0, cy: c?.y ?? 0 };
-        recomputeCull();
-        setCullEpoch((x) => x + 1);
-      }, 450);
+      // The fit animates 400ms; read the settled camera just after.
+      setTimeout(apply, 450);
+    } else {
+      apply();
     }
-  }, [recomputeCull]);
+  }, [recomputeFitZoom, recomputeCull]);
 
   // node.group is assigned at data ingest (use-graph-data.ts), so it travels
   // with the node and this stays a pure filter.
@@ -317,16 +333,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 
   // Node degree (visible edges) — drives node sizing AND which labels surface
   // first at overview zoom (hubs before leaves) via the paint order below.
-  const degree = useMemo(() => {
-    const d = new Map<string, number>();
-    for (const e of visibleEdges) {
-      const s = endpointUri(e.source);
-      const t = endpointUri(e.target);
-      d.set(s, (d.get(s) ?? 0) + 1);
-      d.set(t, (d.get(t) ?? 0) + 1);
-    }
-    return d;
-  }, [visibleEdges]);
+  const degree = useMemo(() => degreeMap(visibleEdges), [visibleEdges]);
 
   // Node URIs ranked by DESCENDING degree — the LOD set takes the top-N of
   // this. Mirrored to a ref so recomputeCull (and thus the ref-only predicates)
@@ -341,8 +348,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // everything at every zoom (mirrors layoutTier's count-gating).
   const cullActive = visibleNodes.length > CULL_MIN_NODES;
   useEffect(() => {
+    // Data changed → re-rank + re-anchor immediately (the post-settle
+    // handleEngineStop will re-anchor again against the final layout).
+    recomputeFitZoom();
     recomputeCull();
-  }, [degreeRankedUris, recomputeCull]);
+  }, [degreeRankedUris, recomputeFitZoom, recomputeCull]);
 
   // Paint hubs FIRST so a high-degree node's label claims its collision box
   // before a leaf's (the label cull is first-come, in onRenderFramePre order).
@@ -422,15 +432,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const src = typeof l.source === "object" ? l.source : null;
       const tgt = typeof l.target === "object" ? l.target : null;
       if (!src || !tgt) return true;
-      const f = focusUriRef.current;
-      if (f != null && (src.uri === f || tgt.uri === f)) return true; // incident always
+      // Force-show edges whose BOTH endpoints are forced (focus neighborhood /
+      // selection / pins). nodeVisible force-shows all those nodes, so the edges
+      // among them must show too — otherwise a highlighted neighborhood (or a
+      // pinned pair) renders a missing connection.
+      if (isForced(src.uri) && isForced(tgt.uri)) return true;
       const lod = lodVisibleRef.current;
-      if (lod && (!lod.has(src.uri) || !lod.has(tgt.uri))) return false; // an endpoint is LOD-hidden
+      if (lod && (!lod.has(src.uri) || !lod.has(tgt.uri))) return false; // an endpoint is LOD-demoted
       const v = viewportRef.current;
       if (!v) return true;
-      return inViewportPoint(src.x ?? 0, src.y ?? 0, v) || inViewportPoint(tgt.x ?? 0, tgt.y ?? 0, v);
+      // The SEGMENT overlaps the viewport — so an edge that CROSSES the view with
+      // both endpoints off-screen still draws (a per-endpoint test would cull it).
+      return segmentOverlapsRect(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, v);
     },
-    [cullEpoch],
+    [cullEpoch, isForced],
   );
 
   // Accepted-label boxes for the greedy collision cull in paintNode's label
@@ -632,10 +647,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       //  • collision culling: a non-forced label that would overlap one already
       //    drawn this frame is skipped (labelBoxes resets in onRenderFramePre);
       //  • translucent pill behind the text for legibility over edges/nodes.
-      const forced = forcedNode;
       const rPx = r * scale;
       const wantLabel =
-        forced ||
+        forcedNode ||
         (focusUri == null && rPx >= LABEL_MIN_NODE_PX && labelCountRef.current < LABEL_CAP);
       if (wantLabel && n.name) {
         const fontSize = 12 / scale;
@@ -648,9 +662,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         const w = ctx.measureText(label).width;
         const ly = y + r + lp;
         const box = { x: x - w / 2 - lp, y: ly, w: w + lp * 2, h: fontSize + lp * 2 };
-        if (forced || !overlaps(box)) {
+        if (forcedNode || !overlaps(box)) {
           labelBoxes.current.push(box);
-          if (!forced) labelCountRef.current++;
+          if (!forcedNode) labelCountRef.current++;
           ctx.globalAlpha = 0.82;
           ctx.fillStyle = colors.background;
           ctx.fillRect(box.x, box.y, box.w, box.h);
@@ -713,6 +727,24 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       return RELATION_CLASS[l.relation] === "structural" ? colors.foreground : colors.foregroundMuted;
     },
     [colors, focusUri],
+  );
+
+  // Hit-test area: force-graph hit-tests on a separate shadow canvas and, with a
+  // custom nodeCanvasObject, would otherwise use a default circle that doesn't
+  // match our degree-driven radius. Paint the SAME radius here so clicks/hover
+  // land on the drawn node, with a ~7px on-screen floor so the tiny demoted dots
+  // (2.2px) and small leaves stay clickable.
+  const paintPointerArea = useCallback(
+    (n: RenderNode, color: string, ctx: CanvasRenderingContext2D, scale: number) => {
+      const deg = degree.get(n.uri) ?? 0;
+      const baseR = NODE_BASE_R + Math.sqrt(deg) * DEGREE_R_GAIN;
+      const r = Math.max(NODE_MIN_R_PX, Math.min(NODE_MAX_R_PX, baseR * scale)) / scale;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(n.x || 0, n.y || 0, Math.max(r, 7 / scale), 0, 2 * Math.PI);
+      ctx.fill();
+    },
+    [degree],
   );
 
   // Single click selects; a second click on the same node within 250 ms
@@ -815,6 +847,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           recomputeCull();
         }}
         nodeCanvasObject={paintNode as never}
+        nodePointerAreaPaint={paintPointerArea as never}
         linkCanvasObject={paintLink as never}
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}

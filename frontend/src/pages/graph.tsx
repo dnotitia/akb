@@ -17,6 +17,7 @@ import {
   fetchNeighbors,
   docIdFromUri,
   endpointUri,
+  degreeMap,
 } from "@/components/graph/use-graph-data";
 import { GraphContextMenu, type GraphMenuState } from "@/components/graph/GraphContextMenu";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
@@ -168,29 +169,32 @@ export default function GraphPage() {
   // currently hidden. endpointUri normalizes endpoints that react-force-graph
   // mutates from URI strings to node objects in place after the first tick —
   // without it a post-render recompute would see node objects and mis-count.
-  const orphanCount = useMemo(() => {
-    const connected = new Set<string>();
+  // The set of URIs that appear as an edge endpoint — computed ONCE and shared
+  // by orphanCount + displayed (both used to walk merged.edges independently).
+  // endpointUri normalizes endpoints that react-force-graph mutates from URI
+  // strings to node objects in place after the first tick — without it a
+  // post-render recompute would see node objects and mis-count / blank the graph.
+  const connected = useMemo(() => {
+    const set = new Set<string>();
     for (const e of merged.edges) {
-      connected.add(endpointUri(e.source));
-      connected.add(endpointUri(e.target));
+      set.add(endpointUri(e.source));
+      set.add(endpointUri(e.target));
     }
-    return merged.nodes.reduce((acc, n) => acc + (connected.has(n.uri) ? 0 : 1), 0);
+    return set;
   }, [merged]);
+
+  const orphanCount = useMemo(
+    () => merged.nodes.reduce((acc, n) => acc + (connected.has(n.uri) ? 0 : 1), 0),
+    [merged, connected],
+  );
 
   // What the canvas actually renders: `merged`, minus orphans when the declutter
   // toggle is on. (Orphans have no edges by definition, so dropping them never
-  // orphans an edge.) Same endpointUri normalization: this memo recomputes on
-  // the toggle AFTER the sim has mutated edge endpoints, so a raw read here
-  // would match zero nodes and blank the canvas.
+  // orphans an edge.)
   const displayed = useMemo(() => {
     if (!hideOrphans || orphanCount === 0) return merged;
-    const connected = new Set<string>();
-    for (const e of merged.edges) {
-      connected.add(endpointUri(e.source));
-      connected.add(endpointUri(e.target));
-    }
     return { nodes: merged.nodes.filter((n) => connected.has(n.uri)), edges: merged.edges };
-  }, [merged, hideOrphans, orphanCount]);
+  }, [merged, hideOrphans, orphanCount, connected]);
 
   // Resolve the selected node + its lookup id once per (graph, selection)
   // change. Resolved against `displayed` (not `merged`) so hiding an orphan
@@ -220,13 +224,7 @@ export default function GraphPage() {
   // structurally important ones, with sidebar search for the long tail);
   // `hubs` (≤8, degree>0) is the visible "way in" list in the sidebar.
   const { topNodes, hubs } = useMemo(() => {
-    const degree = new Map<string, number>();
-    for (const e of displayed.edges) {
-      const s = endpointUri(e.source);
-      const t = endpointUri(e.target);
-      degree.set(s, (degree.get(s) ?? 0) + 1);
-      degree.set(t, (degree.get(t) ?? 0) + 1);
-    }
+    const degree = degreeMap(displayed.edges);
     const ranked = [...displayed.nodes].sort(
       (a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0),
     );

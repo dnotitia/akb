@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   computeViewportRect,
   inViewportPoint,
+  segmentOverlapsRect,
   lodBand,
   nextBand,
   bandTargetCount,
@@ -45,6 +46,21 @@ describe("inViewportPoint", () => {
   });
   it("includes the boundary", () => {
     expect(inViewportPoint(400, 300, r)).toBe(true);
+  });
+});
+
+describe("segmentOverlapsRect", () => {
+  const r = { minX: -100, maxX: 100, minY: -100, maxY: 100 };
+  it("admits an edge that crosses the rect with BOTH endpoints outside", () => {
+    // horizontal line through the middle, endpoints far left + far right
+    expect(segmentOverlapsRect(-500, 0, 500, 0, r)).toBe(true);
+  });
+  it("admits an edge with one endpoint inside", () => {
+    expect(segmentOverlapsRect(0, 0, 500, 500, r)).toBe(true);
+  });
+  it("culls an edge whose bbox is entirely off to one side", () => {
+    expect(segmentOverlapsRect(200, 200, 500, 500, r)).toBe(false);
+    expect(segmentOverlapsRect(-500, -500, -200, -200, r)).toBe(false);
   });
 });
 

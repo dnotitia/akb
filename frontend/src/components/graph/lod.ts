@@ -73,6 +73,26 @@ export function inViewportPoint(x: number, y: number, r: ViewportRect): boolean 
   return x >= r.minX && x <= r.maxX && y >= r.minY && y <= r.maxY;
 }
 
+/** Whether a segment (x1,y1)-(x2,y2) might cross the rect — tested via its
+ *  bounding box overlapping the rect. Conservative (admits a few near-miss
+ *  diagonals), but it catches the case BOTH endpoints are off-screen yet the
+ *  edge crosses the visible area — which a per-endpoint test wrongly culls. A
+ *  few extra edge paints are far cheaper than an exact segment-rect intersect. */
+export function segmentOverlapsRect(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  r: ViewportRect,
+): boolean {
+  return (
+    Math.min(x1, x2) <= r.maxX &&
+    Math.max(x1, x2) >= r.minX &&
+    Math.min(y1, y2) <= r.maxY &&
+    Math.max(y1, y2) >= r.minY
+  );
+}
+
 /** Stateless band index for a relative zoom (no hysteresis). */
 export function lodBand(relZoom: number): number {
   for (let i = 0; i < LOD_BANDS.length; i++) {

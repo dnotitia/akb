@@ -92,6 +92,21 @@ export function endpointUri(end: unknown): string {
   return "";
 }
 
+/** uri → degree (incident visible-edge count). Endpoints are normalized via
+ *  endpointUri so it's correct whether the sim has mutated source/target from
+ *  URI strings to node objects yet. Shared by the canvas (node sizing + LOD
+ *  ranking) and the page (hubs / sr-only list) so the degree rule lives once. */
+export function degreeMap(edges: GraphEdge[]): Map<string, number> {
+  const d = new Map<string, number>();
+  for (const e of edges) {
+    const s = endpointUri(e.source);
+    const t = endpointUri(e.target);
+    d.set(s, (d.get(s) ?? 0) + 1);
+    d.set(t, (d.get(t) ?? 0) + 1);
+  }
+  return d;
+}
+
 export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
   const nodes = p.nodes.filter((n) => v.types.has(n.kind));
   const keep = new Set(nodes.map((n) => n.uri));
