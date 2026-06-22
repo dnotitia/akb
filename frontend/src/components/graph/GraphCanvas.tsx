@@ -15,6 +15,7 @@ import {
   groupColor,
   forceCluster,
   forceCollide,
+  forceCenterPull,
   CLUSTER_STRENGTH,
   COLLIDE_RADIUS,
   CHARGE_STRENGTH,
@@ -24,7 +25,16 @@ import {
 /** True when the OS asks for reduced motion — used to snap the force layout
  *  instead of animating it (the canvas rAF sim is unreachable by CSS). */
 function prefersReducedMotion(): boolean {
-  return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  return typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+}
+
+/** The app's sans stack (`--font-sans`, Pretendard) for canvas labels. Read
+ *  once — it's theme-independent — so paintNode never touches getComputedStyle
+ *  on the hot path. Labels match the title as rendered in the detail panel;
+ *  the design system reserves mono for ids/code. */
+function readFontSans(): string {
+  if (typeof document === "undefined") return "sans-serif";
+  return getComputedStyle(document.documentElement).getPropertyValue("--font-sans").trim() || "sans-serif";
 }
 
 export interface GraphCanvasHandle {
@@ -62,15 +72,6 @@ interface RenderEdge {
   target: string | RenderNode;
   relation: GraphEdge["relation"];
 }
-
-// react-force-graph-2d's typed ForceGraphMethods omits graphData(); the live
-// node array (with simulation-mutated x/y/fx/fy) is reachable through it at
-// runtime. Narrow cast so we can pin / read positions without `any`.
-type FgData = { graphData: () => { nodes: RenderNode[]; links: RenderEdge[] } };
-const liveNodes = (fg: ForceGraphMethods | undefined): RenderNode[] => {
-  const gd = (fg as unknown as Partial<FgData> | undefined)?.graphData;
-  return typeof gd === "function" ? gd().nodes : [];
-};
 
 const NODE_SIZE = 16;
 /** Above this zoom every node labels; below it only hovered/selected/pinned do,
@@ -115,14 +116,17 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const fittedRef = useRef(false);
   const wrapRef = useRef<HTMLDivElement>(null);
-  // Latest user-pin set, read inside effects without making them depend on it
-  // (so a pin/unpin never reheats the simulation).
-  const pinnedRef = useRef(pinned);
-  pinnedRef.current = pinned;
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
+  // App sans stack for canvas labels — read once (theme-independent).
+  const [fontSans] = useState(() => readFontSans());
   // Snap (don't animate) the layout when the OS asks for reduced motion.
   const [frozen, setFrozen] = useState(() => prefersReducedMotion());
+  // Latest frozen flag, read inside the cluster/expand reheat path without
+  // making those effects depend on it — so Freeze/Resume never reinstalls the
+  // forces, yet a reheat still respects the live state (reduced-motion Resume).
+  const frozenRef = useRef(frozen);
+  frozenRef.current = frozen;
   const [clustered, setClustered] = useState(true);
   const [hovered, setHovered] = useState<string>();
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -170,23 +174,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     else fg.resumeAnimation();
   }, [frozen]);
 
-  // On settle: PIN every node where it landed (fx/fy = x/y), then fit once.
+  // On first settle: fit the view once. We do NOT pin nodes here.
   //
-  // Pinning is the cure for the "click makes nodes drift apart" bug: d3-drag
-  // reheats the simulation on every click (a click is a zero-distance drag),
-  // and the cluster/collide forces have no stable equilibrium, so each reheat
-  // nudges nodes farther out — ratcheting. A pinned node has x=fx every tick,
-  // so no reheat (click, hover, expand) can move it. This runs on EVERY settle,
-  // so a deliberate re-layout (cluster toggle / expand) re-pins afterward.
-  // User pins (drag/context-menu) and auto-pins are both fx/fy here; they're
-  // told apart by the `pinned` Set, which the cluster re-layout consults.
+  // The old code pinned EVERY node (fx/fy = x/y) on every settle to stop a
+  // "click makes clusters drift apart" ratchet — but that froze the layout
+  // permanently, so overlaps never relaxed and expand/cluster-toggle had to
+  // un-pin and reheat into the same frozen mess. The real cause of the ratchet
+  // was an unbounded layout (charge repulsion with no restoring force); it's
+  // fixed properly by forceCenterPull (a weak spring to the origin → a real
+  // equilibrium the live sim settles back to after any reheat). So the sim
+  // stays alive and only USER drags pin nodes (onNodeDragEnd) — the
+  // Obsidian/d3 model.
   const handleEngineStop = useCallback(() => {
     const fg = fgRef.current;
     if (!fg) return;
-    for (const n of liveNodes(fg)) {
-      n.fx = n.x;
-      n.fy = n.y;
-    }
     if (!fittedRef.current) {
       fg.zoomToFit(400, 60);
       fittedRef.current = true;
@@ -275,6 +276,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   // keeps nodes spaced (so clumps aren't cramped), and the global charge is
   // softened so separate clusters sit closer together rather than flying
   // apart. All restored/removed when clustering is off.
+  // Install the restoring centering spring once, on mount. Always active
+  // (clustered or not) so the layout has a bounded equilibrium and can't
+  // ratchet outward on a reheat — the root-cause fix that lets us drop
+  // pin-on-settle and keep a live simulation.
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    fg.d3Force("centerPull", forceCenterPull() as never);
+    return () => {
+      fgRef.current?.d3Force("centerPull", null);
+    };
+  }, []);
+
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg) return;
@@ -284,19 +298,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     fg.d3Force("collide", collideOn ? (forceCollide(COLLIDE_RADIUS) as never) : null);
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
-    // Release auto-pinned positions so the changed force can actually re-lay
-    // the graph out — without this, a cluster toggle does nothing visible
-    // because pin-on-settle has fixed every node. User pins (drag / context
-    // menu) stay put. Then reheat so the new force takes effect.
-    for (const n of liveNodes(fg)) {
-      if (!pinnedRef.current.has(n.uri)) {
-        n.fx = undefined;
-        n.fy = undefined;
-      }
-    }
-    // Don't reheat on a reduced-motion preference — the freeze effect owns
-    // pause/resume; reheating from alpha=1 is the cost Freeze exists to avoid.
-    if (!prefersReducedMotion()) fg.d3ReheatSimulation();
+    // The sim is live (no pin-on-settle): just reheat to a low alpha and let
+    // forceCenterPull + the changed forces re-settle. User drag-pins survive
+    // (their fx/fy are untouched). Gate on the LIVE `frozen` flag — not a fresh
+    // media query — so a Resume by a reduced-motion user actually re-lays out.
+    if (!frozenRef.current) fg.d3ReheatSimulation();
     return () => {
       fgRef.current?.d3Force("cluster", null);
       fgRef.current?.d3Force("collide", null);
@@ -397,7 +403,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       if (wantLabel && n.name) {
         const fontSize = 12 / scale;
         const lp = 3 / scale;
-        ctx.font = `${fontSize}px ui-monospace, SFMono-Regular, monospace`;
+        ctx.font = `${fontSize}px ${fontSans}`;
         // Title as-authored — never .toUpperCase() (corrupts acronyms/non-Latin).
         const label = n.name.length > 24 ? n.name.slice(0, 24) + "…" : n.name;
         const w = ctx.measureText(label).width;
@@ -417,7 +423,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       }
       ctx.restore();
     },
-    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps],
+    [colors, selected, pinned, clustered, hovered, focusUri, isRelated, degree, overlaps, fontSans],
   );
 
   const paintLink = useCallback(
@@ -490,7 +496,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       role="img"
       aria-label={`Knowledge graph: ${nodes.length} nodes, ${edges.length} edges`}
     >
-      <div className="absolute top-3 left-3 z-10 flex gap-1">
+      <div className="absolute top-3 left-3 z-[var(--z-raised)] flex gap-1">
         <CanvasButton
           onClick={() => setClustered((c) => !c)}
           label={clustered ? "Hide clusters" : "Show clusters"}
@@ -574,7 +580,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 function GraphLegend() {
   const [open, setOpen] = useState(true);
   return (
-    <div className="absolute bottom-3 right-3 z-10">
+    <div className="absolute bottom-3 right-3 z-[var(--z-raised)]">
       {open ? (
         <div className="rounded-[var(--radius-md)] border border-border bg-surface/90 backdrop-blur px-3 py-2 shadow-sm text-[11px] text-foreground-muted">
           <div className="flex items-center justify-between gap-4 mb-1.5">

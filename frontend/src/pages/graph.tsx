@@ -120,18 +120,26 @@ export default function GraphPage() {
     if (!id) return;
     try {
       const payload = await fetchNeighbors(vault!, id, 1);
-      // Seed each genuinely-new node next to the node being expanded, so it
-      // tucks in beside its neighbor instead of spawning at the origin and
-      // flying across the canvas (existing nodes stay pinned from pin-on-settle,
-      // so only these new free nodes move).
+      // Tuck each genuinely-new neighbor in a small deterministic spiral around
+      // the node being expanded, so it appears beside its parent instead of
+      // spawning at the origin and flying across the canvas. The live damped
+      // sim (forceCenterPull keeps it bounded) then relaxes them into place. If
+      // the parent has no position yet (pre-settle) leave x/y unset so the sim
+      // seeds it.
       const present = new Set(merged.nodes.map((n) => n.uri));
-      const cx = node.x ?? 0;
-      const cy = node.y ?? 0;
+      const cx = node.x;
+      const cy = node.y;
+      const hasPos = cx != null && cy != null;
+      let i = 0;
       for (const n of payload.nodes) {
-        if (!present.has(n.uri)) {
-          n.x = cx + (Math.random() - 0.5) * 40;
-          n.y = cy + (Math.random() - 0.5) * 40;
+        if (present.has(n.uri)) continue;
+        if (hasPos) {
+          const angle = i * 2.39996; // golden angle → an even, non-overlapping fan
+          const radius = 12 + i * 6;
+          n.x = cx + Math.cos(angle) * radius;
+          n.y = cy + Math.sin(angle) * radius;
         }
+        i++;
       }
       setOverlay((prev) => mergeGraph(prev, payload));
     } catch {
@@ -255,7 +263,7 @@ export default function GraphPage() {
         {/* Focus mode: a clear "you're zoomed into one node — get out" banner.
             The whole-graph view (no entry) shows the orientation hint instead. */}
         {view.entry && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 w-max max-w-[90%]">
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-[var(--z-raised)] w-max max-w-[90%]">
             <Alert variant="info">
               <div className="flex items-center gap-3">
                 <TooltipText className="truncate max-w-[40ch]" tip={entryTitle}>Focused on {entryTitle}</TooltipText>
@@ -274,7 +282,7 @@ export default function GraphPage() {
         {/* Non-blocking orientation hint (whole-graph view only), dismissible
             + persisted. Replaces the old blocking "pick an entry point" gate. */}
         {!view.entry && hintOpen && !loading && !error && merged.nodes.length > 0 && (
-          <div className="absolute bottom-3 left-3 z-10 w-max max-w-[90%]">
+          <div className="absolute bottom-3 left-3 z-[var(--z-raised)] w-max max-w-[90%]">
             <Alert variant="info">
               <div className="flex items-center gap-3">
                 <span>

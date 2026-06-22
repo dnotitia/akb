@@ -34,6 +34,13 @@ export const COLLIDE_RADIUS = 20;
 export const CHARGE_STRENGTH = -16;
 /** d3 / force-graph default many-body charge, restored when clustering off. */
 export const DEFAULT_CHARGE = -30;
+/** Strength of the weak pull every node feels toward the origin. This is what
+ *  gives the layout a real EQUILIBRIUM (a bounded potential well) so charge
+ *  repulsion can't ratchet clusters outward on every reheat — the bug the old
+ *  pin-every-node-on-settle freeze worked around. Gentle on purpose: strong
+ *  enough to bound spread, soft enough not to crush structure. d3's own
+ *  forceX/forceY centering uses a comparable strength. */
+export const CENTER_PULL_STRENGTH = 0.04;
 
 /**
  * The cluster a node belongs to: the first GROUP_DEPTH segments of its
@@ -48,15 +55,23 @@ export function groupOf(uri: string): string | null {
 
 // ── Color ─────────────────────────────────────────────────────────────────
 
+/** Cluster hues are restricted to the first four categoricals (cat-1..4:
+ *  teal → amber). cat-5 is orange — reserved for the selection/accent signal,
+ *  so a cluster must never wear it (it would fight selection) — and cat-6 is
+ *  gray, which reads as "ungrouped". Capping here keeps groups on the
+ *  separable, non-accent subset. */
+const CLUSTER_HUE_COUNT = 4;
+
 /**
  * Stable cluster color for a group key, drawn from the tokenized, CVD-vetted
- * categorical scale (--color-cat-1..6, resolved by readColors() — already
+ * categorical scale (--color-cat-1..4, resolved by readColors() — already
  * theme-correct, so there is no per-component light/dark fork here). hashHue
- * buckets the group deterministically into one of the `cat` colors.
+ * buckets the group deterministically into one of the cluster colors.
  */
 export function groupColor(group: string, cat: string[]): string {
   if (!cat.length) return "gray"; // emergency fallback if the token scale didn't resolve
-  return cat[hashHue(group) % cat.length];
+  const n = Math.min(CLUSTER_HUE_COUNT, cat.length);
+  return cat[hashHue(group) % n];
 }
 
 // ── Forces ──────────────────────────────────────────────────────────────
@@ -97,6 +112,30 @@ export function forceCluster(strength = CLUSTER_STRENGTH): SimForce {
       if (!c) continue;
       n.vx = (n.vx ?? 0) + (c.x - n.x) * k;
       n.vy = (n.vy ?? 0) + (c.y - n.y) * k;
+    }
+  };
+  force.initialize = (ns: GraphNode[]) => {
+    nodes = ns;
+  };
+  return force;
+}
+
+/**
+ * A weak velocity pull toward the origin (0,0) — the layout's restoring spring.
+ * Unlike d3's built-in `center` force (which only removes net translation by
+ * recentering the centroid, so two clusters can still drift apart symmetrically),
+ * this gives every node an individual pull home, bounding the overall spread.
+ * That bounded equilibrium is what lets the live simulation absorb a click /
+ * expand / cluster-toggle reheat and settle back instead of ratcheting outward.
+ */
+export function forceCenterPull(strength = CENTER_PULL_STRENGTH): SimForce {
+  let nodes: GraphNode[] = [];
+  const force = (alpha: number) => {
+    const k = strength * alpha;
+    for (const n of nodes) {
+      if (n.x == null || n.y == null) continue;
+      n.vx = (n.vx ?? 0) - n.x * k;
+      n.vy = (n.vy ?? 0) - n.y * k;
     }
   };
   force.initialize = (ns: GraphNode[]) => {

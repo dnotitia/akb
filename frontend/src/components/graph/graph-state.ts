@@ -7,6 +7,7 @@ import {
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
+import { docIdFromUri } from "./use-graph-data";
 
 const ALL_KIND_SET = new Set<NodeKind>(ALL_NODE_KINDS);
 const ALL_REL_SET = new Set<RelationKind>(ALL_RELATIONS);
@@ -44,8 +45,15 @@ function parseHops(raw: string | null): 1 | 2 | 3 {
 export function queryToView(q: URLSearchParams): GraphView {
   const types = q.get("types");
   const rel = q.get("rel");
+  // `entry` carries the doc-id the rest of the graph consumes. `focus` is a
+  // back-compat alias that carries a full akb:// URI (the doc page's "Open in
+  // graph" link historically emitted `?focus=<uri>`) — normalize it to a
+  // doc-id so already-shipped links still land focused. `entry` wins if both
+  // are present; an unparseable focus URI falls through to the whole graph.
+  const focus = q.get("focus");
+  const entry = q.get("entry") || (focus ? docIdFromUri(focus) ?? undefined : undefined);
   return {
-    entry: q.get("entry") || undefined,
+    entry: entry || undefined,
     // Read `hops` first; fall back to legacy `depth` from pre-0.3.0
     // bookmarked URLs.
     hops: parseHops(q.get("hops") ?? q.get("depth")),
