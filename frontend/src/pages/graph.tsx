@@ -16,6 +16,7 @@ import {
   mergeGraph,
   fetchNeighbors,
   docIdFromUri,
+  endpointUri,
 } from "@/components/graph/use-graph-data";
 import { GraphContextMenu, type GraphMenuState } from "@/components/graph/GraphContextMenu";
 import { viewToQuery, queryToView } from "@/components/graph/graph-state";
@@ -162,12 +163,42 @@ export default function GraphPage() {
     });
   const hideNode = (uri: string) => setHidden((prev) => new Set(prev).add(uri));
 
+  // How many degree-0 (orphan) nodes the filtered graph has, for the orphans
+  // toggle. Computed from `merged` so the count is stable whether or not they're
+  // currently hidden. endpointUri normalizes endpoints that react-force-graph
+  // mutates from URI strings to node objects in place after the first tick —
+  // without it a post-render recompute would see node objects and mis-count.
+  const orphanCount = useMemo(() => {
+    const connected = new Set<string>();
+    for (const e of merged.edges) {
+      connected.add(endpointUri(e.source));
+      connected.add(endpointUri(e.target));
+    }
+    return merged.nodes.reduce((acc, n) => acc + (connected.has(n.uri) ? 0 : 1), 0);
+  }, [merged]);
+
+  // What the canvas actually renders: `merged`, minus orphans when the declutter
+  // toggle is on. (Orphans have no edges by definition, so dropping them never
+  // orphans an edge.) Same endpointUri normalization: this memo recomputes on
+  // the toggle AFTER the sim has mutated edge endpoints, so a raw read here
+  // would match zero nodes and blank the canvas.
+  const displayed = useMemo(() => {
+    if (!hideOrphans || orphanCount === 0) return merged;
+    const connected = new Set<string>();
+    for (const e of merged.edges) {
+      connected.add(endpointUri(e.source));
+      connected.add(endpointUri(e.target));
+    }
+    return { nodes: merged.nodes.filter((n) => connected.has(n.uri)), edges: merged.edges };
+  }, [merged, hideOrphans, orphanCount]);
+
   // Resolve the selected node + its lookup id once per (graph, selection)
-  // change rather than on every render — the find scans up to ~200 nodes and
-  // each comparison may parse a URI.
+  // change. Resolved against `displayed` (not `merged`) so hiding an orphan
+  // that happens to be selected also closes its detail panel + silences the
+  // aria-live announce — keeping panel, canvas, and SR pointed at one set.
   const { selectedNode, selectedDocId } = useMemo(() => {
     const node = view.selected
-      ? merged.nodes.find(
+      ? displayed.nodes.find(
           (n) =>
             n.uri === view.selected ||
             n.doc_id === view.selected ||
@@ -176,38 +207,13 @@ export default function GraphPage() {
       : undefined;
     const docId = node ? node.doc_id || docIdFromUri(node.uri) : null;
     return { selectedNode: node, selectedDocId: docId };
-  }, [merged, view.selected]);
+  }, [displayed, view.selected]);
   const detailOpen = !!selectedNode && !!selectedDocId;
 
   // Friendly title for the focus-mode banner.
   const entryTitle =
     merged.nodes.find((n) => docIdFromUri(n.uri) === view.entry || n.doc_id === view.entry)?.name ??
     view.entry;
-
-  // How many degree-0 (orphan) nodes the filtered graph has, for the orphans
-  // toggle. Computed from `merged` so the count is stable whether or not they're
-  // currently hidden.
-  const orphanCount = useMemo(() => {
-    const connected = new Set<string>();
-    for (const e of merged.edges) {
-      connected.add(e.source);
-      connected.add(e.target);
-    }
-    return merged.nodes.reduce((acc, n) => acc + (connected.has(n.uri) ? 0 : 1), 0);
-  }, [merged]);
-
-  // What the canvas actually renders: `merged`, minus orphans when the declutter
-  // toggle is on. (Orphans have no edges by definition, so dropping them never
-  // orphans an edge.)
-  const displayed = useMemo(() => {
-    if (!hideOrphans || orphanCount === 0) return merged;
-    const connected = new Set<string>();
-    for (const e of merged.edges) {
-      connected.add(e.source);
-      connected.add(e.target);
-    }
-    return { nodes: merged.nodes.filter((n) => connected.has(n.uri)), edges: merged.edges };
-  }, [merged, hideOrphans, orphanCount]);
 
   // Degree-ranked nodes of what's shown: `topNodes` (≤50) backs the sr-only
   // a11y list (600 raw buttons is a screen-reader wall — surface the
@@ -216,8 +222,10 @@ export default function GraphPage() {
   const { topNodes, hubs } = useMemo(() => {
     const degree = new Map<string, number>();
     for (const e of displayed.edges) {
-      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
-      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+      const s = endpointUri(e.source);
+      const t = endpointUri(e.target);
+      degree.set(s, (degree.get(s) ?? 0) + 1);
+      degree.set(t, (degree.get(t) ?? 0) + 1);
     }
     const ranked = [...displayed.nodes].sort(
       (a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0),
@@ -234,7 +242,7 @@ export default function GraphPage() {
     if (!selectedNode) return "";
     let n = 0;
     for (const e of displayed.edges) {
-      if (e.source === selectedNode.uri || e.target === selectedNode.uri) n++;
+      if (endpointUri(e.source) === selectedNode.uri || endpointUri(e.target) === selectedNode.uri) n++;
     }
     return `Selected ${selectedNode.name}, ${selectedNode.kind}, ${n} connection${n === 1 ? "" : "s"}`;
   }, [selectedNode, displayed]);

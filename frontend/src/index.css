@@ -123,6 +123,7 @@
   /* ── Radius — soft, rounded family look (12px controls, 14px cards,
      16px modals/hero — mirrors seahorse/akb-platform) ─────────────── */
   --radius: 0.875rem;
+  --radius-xs: 0.1875rem; /* 3px — tiny swatches / legend chips */
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;   /* buttons, inputs, chips */
   --radius-lg: 0.875rem;  /* cards, panels, lists */

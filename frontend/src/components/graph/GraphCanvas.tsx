@@ -139,6 +139,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const fittedRef = useRef(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  // Latest node array (the live objects react-force-graph mutates in place),
+  // read inside the pin-sync effect without keying it on `nodes` — so the
+  // physics reconciliation runs on a pin/unpin, not on every data change.
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
   const { theme } = useTheme();
   const [colors, setColors] = useState<GraphColors>(() => readColors());
   // App sans stack for canvas labels — read once (theme-independent).
@@ -331,15 +336,45 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     const charge = fg.d3Force("charge") as { strength?: (v: number) => unknown } | undefined;
     charge?.strength?.(on ? CHARGE_STRENGTH : DEFAULT_CHARGE);
     // The sim is live (no pin-on-settle): just reheat to a low alpha and let
-    // forceCenterPull + the changed forces re-settle. User drag-pins survive
-    // (their fx/fy are untouched). Gate on the LIVE `frozen` flag — not a fresh
-    // media query — so a Resume by a reduced-motion user actually re-lays out.
+    // forceCenterPull + the changed forces re-settle. User pins survive (their
+    // fx/fy are reconciled by the pin-sync effect). Gate on the LIVE `frozen`
+    // flag — not a fresh media query — so a later reheat (cluster-toggle/expand)
+    // by a now-resumed reduced-motion user takes effect instead of staying
+    // permanently blocked.
     if (!frozenRef.current) fg.d3ReheatSimulation();
     return () => {
-      fgRef.current?.d3Force("cluster", null);
-      fgRef.current?.d3Force("collide", null);
+      fg.d3Force("cluster", null);
+      fg.d3Force("collide", null);
     };
   }, [clustered, tier.collide]);
+
+  // Reconcile node physics to the `pinned` Set. A pinned node is fixed at its
+  // current spot (fx/fy = x/y) so it survives relayout; an unpinned node is
+  // released (fx/fy = undefined) so the live sim can move it. This is what makes
+  // a context-menu / detail-panel Pin actually FREEZE the node and Unpin
+  // actually RELEASE it — a drag already sets fx/fy (onNodeDragEnd) before
+  // adding to the Set, but the menu/panel toggles only ever touched the Set.
+  // Without this, removing pin-on-settle left those two paths cosmetic. The
+  // node objects are the live ones force-graph mutates in place, so x/y are
+  // current here. Skip the reheat on the first run (the sim is already warming
+  // up on mount); on later pin/unpin, reheat so the layout settles around it.
+  const pinSyncInit = useRef(true);
+  useEffect(() => {
+    for (const n of nodesRef.current) {
+      if (pinned.has(n.uri)) {
+        n.fx = n.x;
+        n.fy = n.y;
+      } else {
+        n.fx = undefined;
+        n.fy = undefined;
+      }
+    }
+    if (pinSyncInit.current) {
+      pinSyncInit.current = false;
+      return;
+    }
+    if (!frozenRef.current) fgRef.current?.d3ReheatSimulation();
+  }, [pinned]);
 
   const paintNode = useCallback(
     (n: RenderNode, ctx: CanvasRenderingContext2D, scale: number) => {
@@ -648,7 +683,7 @@ function GraphLegend() {
               Document
             </li>
             <li className="flex items-center gap-2">
-              <span className="inline-block h-3 w-3 border border-foreground rounded-[3px] bg-surface" aria-hidden />
+              <span className="inline-block h-3 w-3 border border-foreground rounded-[var(--radius-xs)] bg-surface" aria-hidden />
               Table
             </li>
             <li className="flex items-center gap-2">

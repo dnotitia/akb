@@ -82,7 +82,7 @@ function RelationSwatch({ relation }: { relation: RelationKind }) {
  *  file = dashed-ring circle) as a small DOM swatch. */
 function KindSwatch({ kind }: { kind: NodeKind }) {
   const base = "inline-block h-3 w-3 shrink-0";
-  if (kind === "table") return <span aria-hidden className={cn(base, "border border-foreground rounded-[3px] bg-surface")} />;
+  if (kind === "table") return <span aria-hidden className={cn(base, "border border-foreground rounded-[var(--radius-xs)] bg-surface")} />;
   if (kind === "file") return <span aria-hidden className={cn(base, "border border-dashed border-foreground-muted rounded-full")} />;
   return <span aria-hidden className={cn(base, "border border-foreground rounded-full bg-surface-muted")} />;
 }
@@ -305,7 +305,7 @@ export function GraphSidebar({
                 <button
                   type="button"
                   onClick={() => onSelectNode(h.uri)}
-                  className="w-full flex items-center gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-hover rounded-[var(--radius-sm)]"
+                  className="w-full flex items-center gap-2 px-2 h-7 text-left text-[11px] hover:bg-surface-hover rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   <KindSwatch kind={h.kind} />
                   <TooltipText className="truncate">{h.name}</TooltipText>
@@ -326,7 +326,7 @@ export function GraphSidebar({
               aria-label={`Toggle ${k}`}
               aria-pressed={view.types.has(k)}
               className={cn(
-                "inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold",
+                "inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-sm)] border text-[10px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
                 view.types.has(k)
                   ? "border-primary bg-surface-selected text-surface-selected-foreground"
                   : "border-border text-foreground-muted hover:bg-surface-hover",
@@ -351,8 +351,10 @@ export function GraphSidebar({
                   aria-label={`Toggle ${RELATION_LABEL[r]}`}
                   aria-pressed={on}
                   className={cn(
-                    "w-full flex items-center gap-2 px-2 h-7 rounded-[var(--radius-sm)] text-[11px] text-left text-foreground hover:bg-surface-hover transition-opacity",
-                    on ? "" : "opacity-40",
+                    "w-full flex items-center gap-2 px-2 h-7 rounded-[var(--radius-sm)] border text-[11px] text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
+                    on
+                      ? "border-primary bg-surface-selected text-surface-selected-foreground"
+                      : "border-border text-foreground-muted hover:bg-surface-hover",
                   )}
                 >
                   <RelationSwatch relation={r} />
