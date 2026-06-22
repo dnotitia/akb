@@ -5,6 +5,7 @@ import { Pause, Play, Maximize2, Minus, Plus, Boxes } from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
 import {
   RELATION_DASH,
+  RELATION_CLASS,
   readColors,
   type GraphEdge,
   type GraphNode,
@@ -35,6 +36,23 @@ function prefersReducedMotion(): boolean {
 function readFontSans(): string {
   if (typeof document === "undefined") return "sans-serif";
   return getComputedStyle(document.documentElement).getPropertyValue("--font-sans").trim() || "sans-serif";
+}
+
+/** Trace a node's kind-specific outline into the current path (the caller fills
+ *  + strokes). Documents — the 90% case — are a plain degree-sized circle so
+ *  the graph reads as dots like every reference tool; tables a rounded square
+ *  (a distinct silhouette); files a circle the caller strokes dashed. Kind is
+ *  thus carried by shape, freeing the old per-node D/T/F glyph (illegible at
+ *  overview zoom, redundant with the legend). */
+function traceNode(ctx: CanvasRenderingContext2D, kind: GraphNode["kind"], x: number, y: number, r: number) {
+  if (kind === "table") {
+    const s = r * 1.8;
+    const rad = r * 0.4;
+    if (typeof ctx.roundRect === "function") ctx.roundRect(x - s / 2, y - s / 2, s, s, rad);
+    else ctx.rect(x - s / 2, y - s / 2, s, s);
+  } else {
+    ctx.arc(x, y, r, 0, 2 * Math.PI);
+  }
 }
 
 export interface GraphCanvasHandle {
@@ -73,16 +91,21 @@ interface RenderEdge {
   relation: GraphEdge["relation"];
 }
 
-const NODE_SIZE = 16;
+/** Node RADIUS (graph units, pre-clamp): a base plus a sqrt(degree) term so
+ *  topology is the primary visual channel — hubs read clearly bigger than
+ *  leaves — while sqrt compresses the tail so one giant hub doesn't dwarf the
+ *  graph (the ForceAtlas2 degree-sizing convention). */
+const NODE_BASE_R = 5;
+const DEGREE_R_GAIN = 1.9;
 /** Above this zoom every node labels; below it only hovered/selected/pinned do,
- *  so a 600-node graph reads as glyphed squares instead of a smear of names. */
+ *  so a 600-node graph reads as dots instead of a smear of names. */
 const LABEL_ALL_ZOOM = 1.2;
-/** Node draw size is CLAMPED to a screen-pixel range so it neither balloons
- *  when a small graph fits-to-view (zoomed way in) nor vanishes on a big graph
- *  (zoomed out). Drawn at `clamp(baseSize·zoom, MIN, MAX) / zoom` graph units →
- *  a constant-ish on-screen size that still grows a little with degree. */
-const NODE_MIN_PX = 7;
-const NODE_MAX_PX = 26;
+/** The drawn radius is CLAMPED to a screen-pixel range so a node neither
+ *  balloons when a small graph fits-to-view (zoomed way in) nor vanishes on a
+ *  big graph (zoomed out). Drawn at `clamp(baseR·zoom, MIN, MAX) / zoom` graph
+ *  units → a constant-ish on-screen size that still grows with degree. */
+const NODE_MIN_R_PX = 4;
+const NODE_MAX_R_PX = 20;
 
 /**
  * Layout effort by node count. `warmup` ticks run SYNCHRONOUSLY off-screen
@@ -210,9 +233,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     [edges, hidden],
   );
 
+  // Node degree (visible edges) — drives node sizing AND which labels surface
+  // first at overview zoom (hubs before leaves) via the paint order below.
+  const degree = useMemo(() => {
+    const d = new Map<string, number>();
+    for (const e of visibleEdges) {
+      const s = endpointUri(e.source);
+      const t = endpointUri(e.target);
+      d.set(s, (d.get(s) ?? 0) + 1);
+      d.set(t, (d.get(t) ?? 0) + 1);
+    }
+    return d;
+  }, [visibleEdges]);
+
+  // Paint hubs FIRST so a high-degree node's label claims its collision box
+  // before a leaf's (the label cull is first-come, in onRenderFramePre order).
+  // Node order doesn't affect the simulation — react-force-graph treats nodes
+  // as a set — only paint/label priority.
   const graphData = useMemo(
-    () => ({ nodes: visibleNodes as RenderNode[], links: visibleEdges as RenderEdge[] }),
-    [visibleNodes, visibleEdges],
+    () => ({
+      nodes: [...visibleNodes].sort(
+        (a, b) => (degree.get(b.uri) ?? 0) - (degree.get(a.uri) ?? 0),
+      ) as RenderNode[],
+      links: visibleEdges as RenderEdge[],
+    }),
+    [visibleNodes, visibleEdges, degree],
   );
 
   // Adjacency (uri → neighbor uris) for hover/selection neighbor-highlighting.
@@ -231,19 +276,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       link(t, s);
     }
     return adj;
-  }, [visibleEdges]);
-
-  // Node degree (visible edges) — drives both node sizing and which labels
-  // surface first at overview zoom (hubs before leaves).
-  const degree = useMemo(() => {
-    const d = new Map<string, number>();
-    for (const e of visibleEdges) {
-      const s = endpointUri(e.source);
-      const t = endpointUri(e.target);
-      d.set(s, (d.get(s) ?? 0) + 1);
-      d.set(t, (d.get(t) ?? 0) + 1);
-    }
-    return d;
   }, [visibleEdges]);
 
   // Hover takes precedence over selection for the highlight focus, so moving the
@@ -285,7 +317,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
     if (!fg) return;
     fg.d3Force("centerPull", forceCenterPull() as never);
     return () => {
-      fgRef.current?.d3Force("centerPull", null);
+      fg.d3Force("centerPull", null);
     };
   }, []);
 
@@ -317,15 +349,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const isPinned = pinned.has(n.uri);
       const related = isRelated(n.uri);
       const deg = degree.get(n.uri) ?? 0;
-      // Degree sizing (hubs read larger) clamped to a screen-pixel range, then
-      // converted back to graph units, so the node is a constant-ish on-screen
-      // size at any zoom — never ballooning on a small fit-to-view graph nor
-      // shrinking to nothing on a big one.
-      const baseSz = NODE_SIZE + Math.min(8, deg);
-      const sz = Math.max(NODE_MIN_PX, Math.min(NODE_MAX_PX, baseSz * scale)) / scale;
-      // Cluster membership re-tints the node ring (keeping the kind-based
-      // fill + glyph so document/table/file stay distinguishable). Selection
-      // always wins; ungrouped nodes keep their kind stroke.
+      // Degree-driven RADIUS (topology as the primary channel) clamped to a
+      // screen-pixel range, then back to graph units, so a node is a
+      // constant-ish on-screen size at any zoom while hubs read larger.
+      const baseR = NODE_BASE_R + Math.sqrt(deg) * DEGREE_R_GAIN;
+      const r = Math.max(NODE_MIN_R_PX, Math.min(NODE_MAX_R_PX, baseR * scale)) / scale;
+      // Cluster membership re-tints the node outline; selection (teal) always
+      // wins; ungrouped nodes keep their kind stroke.
       const groupStroke = clustered && n.group ? groupColor(n.group, colors.cat) : null;
 
       ctx.save();
@@ -333,58 +363,59 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       // focused node so its neighborhood pops out of a dense graph.
       if (focusUri && !related) ctx.globalAlpha = 0.18;
 
-      ctx.beginPath();
-      ctx.rect(x - sz / 2, y - sz / 2, sz, sz);
+      // Kind → fill + default stroke + dash. Shape (traceNode) carries the kind:
+      // document = circle, table = rounded square, file = dashed-ring circle.
+      let fill: string;
+      let kindStroke: string;
+      let dashed = false;
       switch (n.kind) {
-        case "document":
-          ctx.fillStyle = colors.surfaceMuted;
-          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.foreground);
-          ctx.lineWidth = isSelected ? 2.5 : 1.5;
-          ctx.setLineDash([]);
-          break;
         case "table":
-          ctx.fillStyle = colors.surface;
-          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.accent);
-          ctx.lineWidth = isSelected ? 2.5 : 1.5;
-          ctx.setLineDash([]);
+          fill = colors.surface;
+          kindStroke = colors.foreground;
           break;
         case "file":
-          ctx.fillStyle = "transparent";
-          ctx.strokeStyle = isSelected ? colors.accent : (groupStroke ?? colors.foregroundMuted);
-          ctx.lineWidth = isSelected ? 2.5 : 1;
-          ctx.setLineDash([3, 2]);
+          fill = colors.background; // hollow ring look
+          kindStroke = colors.foregroundMuted;
+          dashed = true;
+          break;
+        default: // document
+          fill = colors.surfaceMuted;
+          kindStroke = colors.foreground;
           break;
       }
+      ctx.beginPath();
+      traceNode(ctx, n.kind, x, y, r);
+      ctx.fillStyle = fill;
       ctx.fill();
+      ctx.strokeStyle = isSelected ? colors.primary : (groupStroke ?? kindStroke);
+      ctx.lineWidth = isSelected ? 2.5 : 1.5;
+      ctx.setLineDash(dashed ? [3, 2] : []);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Selected node: a glowing accent halo ring so the selection is
-      // unmistakable (the inner accent border alone read too subtly).
+      // Selected node: a glowing TEAL halo ring so the selection is
+      // unmistakable (the inner border alone read too subtly).
       if (isSelected) {
-        const pad = 5;
+        const pad = 4 / scale;
         ctx.save();
-        ctx.shadowColor = colors.accent;
+        ctx.shadowColor = colors.primary;
         ctx.shadowBlur = 12;
-        ctx.strokeStyle = colors.accent;
+        ctx.strokeStyle = colors.primary;
         ctx.lineWidth = 2;
-        ctx.strokeRect(x - sz / 2 - pad, y - sz / 2 - pad, sz + pad * 2, sz + pad * 2);
+        ctx.beginPath();
+        ctx.arc(x, y, r + pad, 0, 2 * Math.PI);
+        ctx.stroke();
         ctx.restore();
       }
 
+      // Pinned: a small ORANGE marker dot — the one place orange survives (a
+      // user-applied pin, never selection), so the two signals never collide.
       if (isPinned) {
+        const m = Math.max(2 / scale, r * 0.32);
+        ctx.beginPath();
+        ctx.arc(x + r * 0.72, y - r * 0.72, m, 0, 2 * Math.PI);
         ctx.fillStyle = colors.accent;
-        ctx.fillRect(x + sz / 2 - 3, y - sz / 2, 3, 3);
-      }
-
-      if (scale > 0.6) {
-        const glyph = n.kind === "document" ? "D" : n.kind === "table" ? "T" : "F";
-        // Glyph scales with the (clamped) node size so it always fits the box.
-        ctx.font = `bold ${sz * 0.5}px ui-monospace, SFMono-Regular, monospace`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillStyle = colors.foregroundMuted;
-        ctx.fillText(glyph, x, y);
+        ctx.fill();
       }
 
       // Label — readability rules synthesized from Obsidian (zoom restraint),
@@ -407,7 +438,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         // Title as-authored — never .toUpperCase() (corrupts acronyms/non-Latin).
         const label = n.name.length > 24 ? n.name.slice(0, 24) + "…" : n.name;
         const w = ctx.measureText(label).width;
-        const ly = y + sz / 2 + lp;
+        const ly = y + r + lp;
         const box = { x: x - w / 2 - lp, y: ly, w: w + lp * 2, h: fontSize + lp * 2 };
         if (forced || !overlaps(box)) {
           labelBoxes.current.push(box);
@@ -417,7 +448,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
           ctx.globalAlpha = 1;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillStyle = isSelected ? colors.accent : colors.foreground;
+          ctx.fillStyle = isSelected ? colors.primary : colors.foreground;
           ctx.fillText(label, x, ly + lp);
         }
       }
@@ -432,9 +463,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const tgt = typeof l.target === "object" ? l.target : null;
       if (!src || !tgt) return;
       const dash = RELATION_DASH[l.relation];
-      const isAccent = l.relation === "implements" || l.relation === "derived_from";
+      const structural = RELATION_CLASS[l.relation] === "structural";
       // Edges touching the focused node (hovered, else selected) light up
-      // (accent + thicker + glow); the rest dim so the focused node's
+      // (teal + thicker + glow); the rest dim so the focused node's
       // connections stand out of a dense graph.
       const incident = focusUri != null && (src.uri === focusUri || tgt.uri === focusUri);
       ctx.save();
@@ -442,18 +473,35 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       ctx.moveTo(src.x || 0, src.y || 0);
       ctx.lineTo(tgt.x || 0, tgt.y || 0);
       if (incident) {
-        ctx.strokeStyle = colors.accent;
+        ctx.strokeStyle = colors.primary;
         ctx.lineWidth = 2.5;
-        ctx.shadowColor = colors.accent;
+        ctx.shadowColor = colors.primary;
         ctx.shadowBlur = 6;
       } else {
-        ctx.strokeStyle = isAccent ? colors.accent : colors.foregroundMuted;
-        ctx.lineWidth = l.relation === "attached_to" ? 1 : 1.5;
+        // Structural ties (depends_on/implements/derived_from/attached_to) read
+        // darker + thicker; associative ties (references/related_to/links_to)
+        // muted + thinner — color/weight the primary channel, dash the secondary.
+        ctx.strokeStyle = structural ? colors.foreground : colors.foregroundMuted;
+        ctx.lineWidth = structural ? 1.6 : 1.1;
         if (focusUri != null) ctx.globalAlpha = 0.15;
       }
       ctx.setLineDash(dash);
       ctx.stroke();
       ctx.restore();
+    },
+    [colors, focusUri],
+  );
+
+  // Arrowheads inherit their edge's encoding (teal when incident, else
+  // structural/associative) instead of a single uniform gray, so direction
+  // reads with the same vocabulary as the line.
+  const arrowColor = useCallback(
+    (l: RenderEdge) => {
+      const src = typeof l.source === "object" ? l.source : null;
+      const tgt = typeof l.target === "object" ? l.target : null;
+      const incident = focusUri != null && (src?.uri === focusUri || tgt?.uri === focusUri);
+      if (incident) return colors.primary;
+      return RELATION_CLASS[l.relation] === "structural" ? colors.foreground : colors.foregroundMuted;
     },
     [colors, focusUri],
   );
@@ -544,7 +592,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         linkCanvasObject={paintLink as never}
         linkDirectionalArrowLength={5}
         linkDirectionalArrowRelPos={1}
-        linkDirectionalArrowColor={colors.foregroundMuted}
+        linkDirectionalArrowColor={arrowColor as never}
         warmupTicks={tier.warmup}
         cooldownTicks={frozen ? 0 : tier.cooldownTicks}
         // Steadier, quicker settle: more friction + faster cooling so the
@@ -596,23 +644,23 @@ function GraphLegend() {
           </div>
           <ul className="space-y-1">
             <li className="flex items-center gap-2">
-              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-foreground rounded-[2px] bg-surface-muted font-mono text-[7px] text-foreground-muted">D</span>
+              <span className="inline-block h-3 w-3 border border-foreground rounded-full bg-surface-muted" aria-hidden />
               Document
             </li>
             <li className="flex items-center gap-2">
-              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-accent rounded-[2px] bg-surface font-mono text-[7px] text-foreground-muted">T</span>
+              <span className="inline-block h-3 w-3 border border-foreground rounded-[3px] bg-surface" aria-hidden />
               Table
             </li>
             <li className="flex items-center gap-2">
-              <span className="inline-flex h-3.5 w-3.5 items-center justify-center border border-dashed border-foreground-muted rounded-[2px] font-mono text-[7px] text-foreground-muted">F</span>
+              <span className="inline-block h-3 w-3 border border-dashed border-foreground-muted rounded-full" aria-hidden />
               File
             </li>
             <li className="flex items-center gap-2 pt-1">
-              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.5" /></svg>
+              <svg width="22" height="6" aria-hidden className="text-foreground"><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.6" /></svg>
               Structural
             </li>
             <li className="flex items-center gap-2">
-              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.5" strokeDasharray="3 3" /></svg>
+              <svg width="22" height="6" aria-hidden><line x1="0" y1="3" x2="22" y2="3" stroke="currentColor" strokeWidth="1.1" strokeDasharray="3 3" /></svg>
               Associative
             </li>
           </ul>
