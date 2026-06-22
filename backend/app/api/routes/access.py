@@ -212,6 +212,11 @@ async def admin_reset_user_password(
 class AdminMintTokenRequest(NFCModel):
     name: str
     expires_days: int | None = None
+    # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
+    # ``None`` = unscoped. The admin-mint path provisions a managed agent's
+    # scoped PAT (e.g. a gardener token scoped to ``gdn-*`` ∪ an operator
+    # whitelist) without the member's password.
+    vault_scope: dict[str, list[str]] | None = None
 
 
 @router.post(
@@ -235,6 +240,7 @@ async def admin_mint_user_token(
     _require_admin(user)
     import uuid as _uuid
     from app.db.postgres import get_pool
+    from app.models.vault_scope import VaultScope
     from app.services.auth_service import create_pat
 
     pool = await get_pool()
@@ -249,7 +255,12 @@ async def admin_mint_user_token(
             )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
-    return await create_pat(str(row["id"]), req.name, expires_days=req.expires_days)
+    return await create_pat(
+        str(row["id"]),
+        req.name,
+        expires_days=req.expires_days,
+        vault_scope=VaultScope.parse_input(req.vault_scope),
+    )
 
 
 @router.get(

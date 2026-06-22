@@ -22,6 +22,7 @@ import jwt
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AuthenticationError, ConflictError, NotFoundError, ValidationError
+from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 
@@ -34,6 +35,9 @@ class AuthenticatedUser:
     display_name: str | None
     is_admin: bool
     auth_method: str  # "jwt" or "pat"
+    # Per-PAT vault scope (Option B). None = unscoped: JWT logins, and PATs
+    # minted without a scope. A concrete scope gates mutating vault access.
+    vault_scope: VaultScope | None = None
 
 
 # ── Password hashing ────────────────────────────────────────
@@ -470,16 +474,25 @@ async def update_profile(
 
 # ── PAT operations ──────────────────────────────────────────
 
-async def create_pat(user_id: str, name: str, *, expires_days: int | None = None) -> dict:
+async def create_pat(
+    user_id: str,
+    name: str,
+    *,
+    expires_days: int | None = None,
+    vault_scope: VaultScope | None = None,
+) -> dict:
     """Issue a Personal Access Token.
 
-    Scopes are NOT a caller-tunable knob: the backend doesn't enforce
-    them anywhere, so accepting a `scopes` argument would falsely
-    imply that a "read-only" PAT exists. Tokens always store the full
-    `[read, write]` default; the response surfaces it so listings stay
-    consistent. When scope enforcement is wired into the request
-    handlers, re-introduce the argument with the matching check.
+    The read/write `scopes` are still NOT a caller-tunable knob (the
+    backend doesn't enforce them); tokens always store the `[read, write]`
+    default. `vault_scope` (Option B) IS the tunable dimension: it restricts
+    the token to a vault set (prefixes ∪ extra_vaults), enforced for mutating
+    access in `check_vault_access`. It is escalation-impossible by
+    construction (effective = user-ACL ∩ scope — a scope only ever narrows).
+    `None` = unscoped (the historical full-ACL token).
     """
+    import json
+
     pool = await get_pool()
     raw_token, token_hash, token_prefix = generate_pat()
 
@@ -488,13 +501,14 @@ async def create_pat(user_id: str, name: str, *, expires_days: int | None = None
         expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
 
     default_scopes = ["read", "write"]
+    vault_scope_json = json.dumps(vault_scope.to_db_json()) if vault_scope else None
 
     async with pool.acquire() as conn:
         token_id = uuid.uuid4()
         await conn.execute(
             """
-            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, scopes, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, scopes, vault_scope, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             token_id,
             uuid.UUID(user_id),
@@ -502,6 +516,7 @@ async def create_pat(user_id: str, name: str, *, expires_days: int | None = None
             token_hash,
             token_prefix,
             default_scopes,
+            vault_scope_json,
             expires_at,
         )
 
@@ -511,6 +526,7 @@ async def create_pat(user_id: str, name: str, *, expires_days: int | None = None
         "name": name,
         "prefix": token_prefix,
         "scopes": default_scopes,
+        "vault_scope": vault_scope.to_db_json() if vault_scope else None,
         "expires_at": expires_at.isoformat() if expires_at else None,
         "note": "Save this token — it won't be shown again.",
     }
@@ -634,6 +650,13 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     - Bearer <jwt>
     - Bearer akb_<pat>
     """
+    # Option B: reset the request-scoped vault scope on every resolve. Only a
+    # scoped PAT (set in _resolve_pat) carries a non-None value; JWT logins and
+    # tokenless/worker paths stay unscoped.
+    from app.models.vault_scope import current_vault_scope
+
+    current_vault_scope.set(None)
+
     if not authorization or not authorization.startswith("Bearer "):
         return None
 
@@ -712,13 +735,21 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
              WHERE t.user_id = u.id
                AND t.token_hash = $1
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
-            RETURNING t.id AS token_id, t.user_id, t.scopes, t.expires_at,
-                      u.username, u.email, u.display_name, u.is_admin
+            RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope,
+                      t.expires_at, u.username, u.email, u.display_name, u.is_admin
             """,
             token_hash,
         )
         if not row:
             return None
+
+        # Option B: carry the PAT's vault scope (NULL column ⇒ None = unscoped)
+        # on the request-scoped ContextVar so check_vault_access can intersect
+        # every mutation against it — REST and MCP alike resolve through here.
+        from app.models.vault_scope import current_vault_scope
+
+        scope = VaultScope.from_db_json(row["vault_scope"])
+        current_vault_scope.set(scope)
 
         return AuthenticatedUser(
             user_id=str(row["user_id"]),
@@ -727,4 +758,5 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
             display_name=row["display_name"],
             is_admin=row["is_admin"],
             auth_method="pat",
+            vault_scope=scope,
         )

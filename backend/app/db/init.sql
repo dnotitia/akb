@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     token_hash TEXT NOT NULL UNIQUE,   -- sha256 of the token
     token_prefix TEXT NOT NULL,        -- first 8 chars for identification (akb_xxxx)
     scopes TEXT[] DEFAULT '{read,write}',  -- read, write, admin
+    vault_scope JSONB,                     -- per-PAT vault scope {prefixes, extra_vaults}; NULL = unscoped (full user ACL). See migration 040.
     expires_at TIMESTAMPTZ,
     last_used_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
