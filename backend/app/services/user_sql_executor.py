@@ -25,7 +25,8 @@ from typing import Any, Optional
 
 import asyncpg
 
-from app.services.role_sync import user_role_name
+from app.models.vault_scope import current_token_id, current_vault_scope
+from app.services.role_sync import token_role_name, user_role_name
 
 logger = logging.getLogger("akb.user_sql")
 
@@ -90,7 +91,10 @@ class UserSqlExecutor:
     The class holds a reference to the pool (same pool the rest of the
     backend uses; no separate pool). Per-call:
       1. Open transaction.
-      2. SET LOCAL ROLE akb_user_<uid>  (skipped if `is_admin=True`).
+      2. SET LOCAL ROLE:
+           - scoped PAT     → akb_token_<tid>  (owner-ACL ∩ scope; even if admin)
+           - else non-admin → akb_user_<uid>
+           - else (unscoped admin) → no switch (connection default = full)
       3. SET LOCAL search_path = public.
       4. Execute SQL.
       5. Commit (or rollback on exception).
@@ -120,12 +124,26 @@ class UserSqlExecutor:
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    if not is_admin:
+                    scope = current_vault_scope.get()
+                    token_id = current_token_id.get()
+                    if scope is not None and token_id is not None:
+                        # Scoped PAT → the narrow per-token role (membership =
+                        # owner-ACL ∩ scope). Precedence over is_admin: a
+                        # SCOPED admin token does NOT bypass — PG confines its
+                        # akb_sql to the scope (42501 outside). If the role is
+                        # missing (a best-effort provisioning hook failed
+                        # before the reconciler ran), this SET raises →
+                        # fail-CLOSED: we never fall back to the full
+                        # akb_user_<uid>, which would defeat the scope.
+                        role = token_role_name(token_id)
+                        await conn.execute(f'SET LOCAL ROLE "{role}"')
+                    elif not is_admin:
                         role = user_role_name(user_id)
                         # asyncpg passes the role name as an identifier here;
                         # we built it ourselves from a UUID so the only chars
                         # are [a-z0-9_]. No injection risk.
                         await conn.execute(f'SET LOCAL ROLE "{role}"')
+                    # else: unscoped admin → connection default (full access).
                     # Reset search_path defensively — a previous tx on this
                     # pooled connection might have left a different default
                     # (it shouldn't, but be explicit).

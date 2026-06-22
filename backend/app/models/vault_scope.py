@@ -121,3 +121,15 @@ class VaultScope:
 current_vault_scope: ContextVar[VaultScope | None] = ContextVar(
     "current_vault_scope", default=None
 )
+
+# Request-scoped carrier for the authenticated PAT's id, set alongside
+# ``current_vault_scope`` in ``auth_service.resolve_token``. The PG-native
+# ``akb_sql`` executor (``user_sql_executor.execute``) reads it to
+# ``SET LOCAL ROLE akb_token_<tid>`` when a scope is present — the narrow role
+# whose membership is the owner-ACL ∩ scope (surface 2 of the backstop). The
+# executor only consults it when ``current_vault_scope`` is also set, so a
+# JWT / unscoped-PAT / worker path (``None``) runs under ``akb_user_<uid>``
+# (or the admin bypass) exactly as before.
+current_token_id: ContextVar[str | None] = ContextVar(
+    "current_token_id", default=None
+)
