@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import uuid
+from itertools import zip_longest
 from typing import Literal, get_args
 
 from app.db.postgres import get_pool
@@ -566,15 +567,95 @@ async def get_graph(
     }
 
 
+async def _fetch_orphan_nodes(
+    conn, vault: str, vault_id, *,
+    doc_paths: set[str], table_names: set[str], file_ids: set[str], limit: int,
+) -> tuple[list[dict], bool]:
+    """Resources — non-archived docs, tables, files — that appear in NO edge,
+    returned as degree-0 isolated nodes. Without these, a vault whose resources
+    aren't linked yet (e.g. a tables-only vault) renders a BLANK canvas: the
+    overview is built from edge endpoints, so an unlinked resource is never an
+    endpoint and would otherwise be invisible everywhere in the graph.
+
+    The "is it connected?" test is pushed into SQL as an anti-join on the
+    resource's OWN IDENTITY column — doc ``path`` / table ``name`` / file ``id``,
+    NOT the full URI. Two reasons:
+      - The per-catalog ``LIMIT`` then caps the number of ORPHANS, not "recent
+        rows" — so a vault whose newest N rows are all linked still surfaces its
+        older orphans (a recency-windowed Python filter would miss them).
+      - Identity (not URI) matching is robust to a non-canonical collection
+        segment on a stored edge URI: a table is uniquely the vault's ``name``,
+        a file its ``id`` — so a link written with a mis-cased ``/coll/…/`` can't
+        make a linked table/file re-appear as a phantom orphan duplicate.
+
+    The three types are interleaved (round-robin) before the cap so a flood of
+    orphan docs never starves orphan tables/files (the motivating case).
+    """
+    per = max(0, limit)
+    doc_rows = await conn.fetch(
+        "SELECT path, title FROM documents "
+        "WHERE vault_id = $1 AND status != 'archived' AND path != ALL($2::text[]) "
+        "ORDER BY created_at DESC LIMIT $3",
+        vault_id, list(doc_paths), per,
+    )
+    tbl_rows = await conn.fetch(
+        "SELECT t.name, t.description, c.path AS coll "
+        "FROM vault_tables t LEFT JOIN collections c ON t.collection_id = c.id "
+        "WHERE t.vault_id = $1 AND t.name != ALL($2::text[]) "
+        "ORDER BY t.created_at DESC LIMIT $3",
+        vault_id, list(table_names), per,
+    )
+    file_rows = await conn.fetch(
+        "SELECT f.id::text AS id, f.name, c.path AS coll "
+        "FROM vault_files f LEFT JOIN collections c ON f.collection_id = c.id "
+        "WHERE f.vault_id = $1 AND f.id::text != ALL($2::text[]) "
+        "ORDER BY f.created_at DESC LIMIT $3",
+        vault_id, list(file_ids), per,
+    )
+
+    docs = [{"uri": doc_uri(vault, r["path"]), "resource_type": "doc",
+             "name": r["title"] or doc_uri(vault, r["path"]), "degree": 0} for r in doc_rows]
+    tables = [{"uri": table_uri(vault, r["name"], r["coll"]), "resource_type": "table",
+               "name": r["description"] or r["name"], "degree": 0} for r in tbl_rows]
+    files = [{"uri": file_uri(vault, r["id"], r["coll"]), "resource_type": "file",
+              "name": r["name"] or file_uri(vault, r["id"], r["coll"]), "degree": 0} for r in file_rows]
+
+    # Round-robin interleave, then cap at `limit` so each type is represented.
+    merged = [n for trio in zip_longest(docs, tables, files) for n in trio if n is not None]
+    # Honest truncation signal (parallel to the connected `truncated`): any
+    # catalog that hit its LIMIT may have more orphans we didn't fetch, or the
+    # interleaved set exceeded the cap. Lets the client say "+N more unlinked"
+    # instead of silently implying these are ALL the orphans.
+    truncated = (
+        len(doc_rows) >= per or len(tbl_rows) >= per or len(file_rows) >= per
+        or len(merged) > limit
+    )
+    return merged[:limit], truncated
+
+
 async def get_overview(
     vault: str,
     *,
     vault_id: uuid.UUID | None = None,
     top_k: int = 200,
+    include_orphans: bool = True,
+    orphan_limit: int = 500,
 ) -> dict:
     """Whole-vault overview: the `top_k` highest-DEGREE nodes plus the edges
     induced among them, with honest totals so the client can render an explicit
-    "showing N of M" instead of silently truncating.
+    "showing N of M" instead of silently truncating. With `include_orphans`,
+    unlinked resources (docs/tables/files in no edge) are appended as degree-0
+    isolated nodes so a vault with no relations yet still renders its resources
+    instead of a blank canvas; the client's "Hide orphans" toggle governs them.
+
+    Response contract: ``nodes_total`` / ``returned`` / ``truncated`` describe
+    the CONNECTED graph only (the degree-ranked slice), while the ``nodes`` array
+    additionally carries the orphan nodes. So ``len(nodes) == returned +
+    orphans_returned`` — do NOT assume ``len(nodes) <= nodes_total``. The
+    "showing N of M" banner reads ``returned``/``nodes_total`` (connected); the
+    orphans are extra and toggle-hideable, and ``orphans_truncated`` says whether
+    the orphan set itself was capped at ``orphan_limit`` (more unlinked resources
+    exist than returned).
 
     Supersedes the old no-`resource_uri` branch of :func:`get_graph`, which
     capped on ``created_at DESC`` (an arbitrary recency slice whose composition
@@ -588,6 +669,7 @@ async def get_overview(
     empty = {
         "nodes": [], "edges": [],
         "nodes_total": 0, "edges_total": 0, "returned": 0, "truncated": False,
+        "orphans_returned": 0, "orphans_truncated": False,
     }
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -611,8 +693,9 @@ async def get_overview(
         )
         nodes_total = totals["nodes_total"] if totals else 0
         edges_total = totals["edges_total"] if totals else 0
-        if not nodes_total:
-            return empty
+        # NB: do NOT early-return when nodes_total == 0 — a vault may have
+        # unlinked resources (orphans) to render even with zero edges. The
+        # degree query below simply yields nothing in that case.
 
         # Top-`top_k` endpoints by degree. `degree` here is INCIDENT-EDGE count
         # (count(*) over the endpoint stream) — the same definition the canvas
@@ -678,13 +761,65 @@ async def get_overview(
         for uri, node in nodes.items():
             node["name"] = names.get(uri) or uri
 
+        connected_count = len(nodes)
+
+        # Append unlinked resources as degree-0 isolated nodes (so a tables-only
+        # / freshly-seeded vault renders its resources, not a blank canvas).
+        # `_fetch_orphan_nodes` anti-joins each catalog against the set of
+        # connected IDENTITIES (doc paths / table names / file ids), so a
+        # linked-but-low-degree resource is never mistaken for an orphan — and
+        # identity (not URI) matching is robust to a non-canonical collection
+        # segment on a stored edge URI. Identities come from EVERY edge endpoint
+        # (not just the top-K shown); UNION ALL since the Python sets dedup.
+        orphans_truncated = False
+        if include_orphans and orphan_limit > 0:
+            doc_paths: set[str] = set()
+            table_names: set[str] = set()
+            file_ids: set[str] = set()
+            if nodes_total:
+                conn_rows = await conn.fetch(
+                    "SELECT source_uri AS uri FROM edges WHERE vault_id = $1 "
+                    "UNION ALL SELECT target_uri FROM edges WHERE vault_id = $1",
+                    vault_id,
+                )
+                for r in conn_rows:
+                    p = parse_uri(r["uri"])
+                    if not p or not p.identifier:
+                        # An edge endpoint we can't parse drops out of the
+                        # connected-identity set, so its resource could surface
+                        # as a phantom orphan — log it (matches the other
+                        # edge-skip debug lines in this module) rather than fail
+                        # silently. Validated edges don't hit this; legacy/
+                        # malformed URIs might.
+                        logger.debug(
+                            "overview orphan-partition: unparseable edge endpoint "
+                            "%r in vault %s", r["uri"], vault,
+                        )
+                        continue
+                    if p.kind == "doc":
+                        doc_paths.add(p.identifier)
+                    elif p.kind == "table":
+                        table_names.add(p.identifier)
+                    elif p.kind == "file":
+                        file_ids.add(p.identifier)
+            orphan_nodes, orphans_truncated = await _fetch_orphan_nodes(
+                conn, vault, vault_id,
+                doc_paths=doc_paths, table_names=table_names, file_ids=file_ids,
+                limit=orphan_limit,
+            )
+            for o in orphan_nodes:
+                if o["uri"] not in nodes:
+                    nodes[o["uri"]] = o
+
     return {
         "nodes": list(nodes.values()),
         "edges": edge_list,
         "nodes_total": nodes_total,
         "edges_total": edges_total,
-        "returned": len(nodes),
-        "truncated": len(nodes) < nodes_total,
+        "returned": connected_count,
+        "truncated": connected_count < nodes_total,
+        "orphans_returned": len(nodes) - connected_count,
+        "orphans_truncated": orphans_truncated,
     }
 
 

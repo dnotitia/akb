@@ -257,6 +257,19 @@ print('OK' if ok else 'BAD '+json.dumps({'edges_total':d['edges_total'],'nodes_t
 " 2>&1)
 [ "$OVCHECK" = "OK" ] && pass "overview: totals(3/2) + degree-ranked hub A + edge kind" || fail "overview" "$OVCHECK"
 
+# overview surfaces unlinked resources as degree-0 isolated nodes (so a vault
+# with orphans isn't a blank canvas). Orphan doc D must appear with degree 0,
+# and orphans_returned must count it. nodes_total stays the CONNECTED total (3).
+ORPHCHECK=$(gov "$PAT1" "$VAULT1" 200 | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+by_uri={n['uri']:n for n in d['nodes']}
+dn=by_uri.get('$URI_D')
+ok = (d.get('orphans_returned',0) >= 1 and dn is not None and dn.get('degree')==0 and d['nodes_total']==3)
+print('OK' if ok else 'BAD orphans_returned='+str(d.get('orphans_returned'))+' D='+json.dumps(dn))
+" 2>&1)
+[ "$ORPHCHECK" = "OK" ] && pass "overview: unlinked doc D surfaced as degree-0 orphan node" || fail "overview orphans" "$ORPHCHECK"
+
 # overview truncation: top_k=1 keeps only the single highest-degree node.
 TRUNC=$(gov "$PAT1" "$VAULT1" 1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['returned']==1 and d['truncated'] is True and d['nodes_total']==3)" 2>/dev/null)
 [ "$TRUNC" = "True" ] && pass "overview: top_k=1 → returned 1 of 3, truncated true" || fail "overview trunc" "got $TRUNC"
@@ -271,6 +284,32 @@ orph_ok = orph.get('count',0)>=1 and any('Orphan Doc' in (o.get('name') or '') f
 print('OK' if (hub_ok and orph_ok) else 'BAD '+json.dumps({'hubs':[(h.get('uri'),h.get('degree')) for h in hubs],'orphans':orph}))
 " 2>&1)
 [ "$HCHECK" = "OK" ] && pass "health: hub A(deg2) + orphan D reported" || fail "health" "$HCHECK"
+
+# Identity-based orphan matching (regression guard for the false-orphan-duplicate
+# bug): a collection-scoped TABLE linked via a NON-CANONICAL (mis-cased
+# collection) URI must NOT re-appear as a phantom orphan duplicate of its
+# connected self; an unlinked table must surface as a degree-0 'table' orphan.
+# Also pins the contract len(nodes) == returned + orphans_returned. (Placed last
+# in §5 — linking a table changes the connected count the checks above assert.)
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT1" -H "Authorization: Bearer $PAT1" -H 'Content-Type: application/json' \
+  -d '{"name":"linked_tbl","columns":[{"name":"k","type":"text"}],"collection":"specs"}' >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT1" -H "Authorization: Bearer $PAT1" -H 'Content-Type: application/json' \
+  -d '{"name":"lonely_tbl","columns":[{"name":"k","type":"text"}],"collection":"specs"}' >/dev/null
+# link doc A -> table via a MIS-CASED collection segment (canonical is 'specs')
+rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"akb://$VAULT1/coll/SPECS/table/linked_tbl\",\"relation\":\"references\"}" >/dev/null
+TBLCHECK=$(gov "$PAT1" "$VAULT1" 200 | python3 -c "
+import sys,json,collections
+d=json.load(sys.stdin)
+dups=[u for u,c in collections.Counter(n['uri'] for n in d['nodes']).items() if c>1]
+linked=[n for n in d['nodes'] if n['uri'].endswith('/table/linked_tbl')]
+lonely=[n for n in d['nodes'] if n['uri'].endswith('/table/lonely_tbl')]
+ok = (not dups
+      and len(linked)==1 and (linked[0].get('degree') or 0)>=1
+      and len(lonely)==1 and lonely[0].get('degree')==0 and lonely[0].get('resource_type')=='table'
+      and len(d['nodes'])==d['returned']+d['orphans_returned'])
+print('OK' if ok else 'BAD dups='+str(dups)+' linked='+json.dumps(linked)+' lonely='+json.dumps(lonely))
+" 2>&1)
+[ "$TBLCHECK" = "OK" ] && pass "overview: non-canonical-linked table not duplicated; unlinked table is degree-0 orphan" || fail "overview table orphan" "$TBLCHECK"
 
 # Reader-gating + cross-vault isolation.
 CODE=$(gov_code "$PAT2" "$VAULT1"); [ "$CODE" = "200" ] && pass "overview: reader (USER2) on V1 → 200" || fail "overview reader" "got $CODE"

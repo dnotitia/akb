@@ -396,6 +396,17 @@ export interface GraphOverviewResponse {
   edges_total: number;
   returned: number;
   truncated: boolean;
+  // Count of unlinked resources appended as degree-0 isolated nodes (so a vault
+  // with no relations still renders its resources, governed by the "Hide
+  // orphans" toggle). nodes_total/returned/truncated describe the CONNECTED
+  // graph only; `nodes` additionally holds the orphans (len(nodes) = returned +
+  // orphans_returned). INFORMATIONAL — the canvas recomputes its own orphan
+  // count from edge connectivity (graph.tsx), it does not read this field.
+  orphans_returned?: number;
+  // True when the orphan set was capped (orphan_limit) — more unlinked
+  // resources exist than were returned. Parallel to `truncated` for the
+  // connected graph.
+  orphans_truncated?: boolean;
 }
 export const getGraphOverview = (vault: string, topK = 200) => {
   const p = new URLSearchParams({ vault, top_k: String(topK) });
