@@ -5,6 +5,38 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.2 — 2026-06-23  *(feat — graph overview surfaces unlinked resources as isolated nodes)*
+
+The graph overview was built purely from edge endpoints, so a resource in **no
+relation** (an unlinked table, file, or doc) never appeared anywhere in the
+graph — and a vault with **only unlinked resources** (e.g. a tables-only vault)
+rendered a **blank canvas** with no way to discover them.
+
+`get_overview` now appends unlinked resources as **degree-0 isolated nodes**
+(`include_orphans=True`, capped at `orphan_limit=500`): non-archived docs,
+tables, and files that appear in no edge. The early "no edges → empty" return is
+gone — a zero-edge vault still renders. Response adds `orphans_returned` (and
+`orphans_truncated`, the honest "the orphan set itself was capped" signal,
+parallel to the connected `truncated`); `nodes_total` / `returned` / `truncated`
+still describe the **connected** graph only, so `len(nodes) == returned +
+orphans_returned`.
+
+Orphan detection is a **SQL anti-join on each resource's own identity** — doc
+`path` / table `name` / file `id`, not the full URI:
+- the per-catalog `LIMIT` then caps the number of ORPHANS, not "recent rows", so
+  a vault whose newest rows are all linked still surfaces its older orphans;
+- identity (not URI) matching is robust to a non-canonical collection segment on
+  a stored edge URI — a table linked via a mis-cased `/coll/…/` can't reappear as
+  a phantom orphan duplicate of a node that's already connected;
+- the three types are round-robin **interleaved** before the cap, so a flood of
+  orphan docs never starves orphan tables/files (the motivating case).
+
+Client-side needs no change: the existing **"Hide orphans"** toggle already
+governs degree-0 nodes, so the overview defaults to showing everything and users
+declutter on demand. Since `get_graph(no resource_uri)` delegates to
+`get_overview`, MCP `akb_graph(vault)` and `GET /graph?vault=` inherit it; the
+BFS (`uri`) path is unaffected (a focused neighborhood stays connected-only).
+
 ## 0.9.1 — 2026-06-23  *(security — gate the sensitive `/health` internals (RBAC + audit) behind auth)*
 
 `GET /health` is unauthenticated (uptime monitors + many e2e callers poll it),
