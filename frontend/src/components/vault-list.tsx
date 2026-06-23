@@ -130,42 +130,14 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
 }
 
 /**
- * A 4px composition meter — the doc/table/file proportion as a tinted texture
- * cue (cat-1/cat-3/cat-4), NOT a chart: no axis, no legend, exact counts stay
- * in the cell's tooltip. Empty vaults show a faint full-width track instead of
- * a bare dash so the column always reserves its width.
- */
-function CompositionBar({ d, t, f }: { d: number; t: number; f: number }) {
-  const total = d + t + f;
-  if (total === 0) {
-    return <span className="h-1 w-10 shrink-0 rounded-full bg-surface-muted" aria-hidden />;
-  }
-  const seg = (n: number, color: string) =>
-    n > 0 ? (
-      <span style={{ width: `${(n / total) * 100}%`, backgroundColor: color }} />
-    ) : null;
-  return (
-    <span
-      className="inline-flex h-1 w-10 shrink-0 overflow-hidden rounded-full bg-surface-muted"
-      aria-hidden
-    >
-      {seg(d, recentTone("document"))}
-      {seg(t, recentTone("table"))}
-      {seg(f, recentTone("file"))}
-    </span>
-  );
-}
-
-/**
- * Compact stats cell: a composition meter + icon/count per non-empty category.
- * A skeleton bar while metrics load (stable row width, no pop-in); the meter
- * carries the shape, the counts the exact numbers, the tooltip the full
- * breakdown.
+ * Compact stats cell: an icon/count per non-empty category (document/table/
+ * file), with the full breakdown in the cell's tooltip. A skeleton bar while
+ * metrics load keeps the row width stable (no pop-in).
  */
 function VaultStatsCell({ m }: { m?: VaultMetrics }) {
   if (!m) {
     return (
-      <span className="h-3 w-[88px] rounded bg-surface-muted animate-pulse" aria-hidden />
+      <span className="h-3 w-[56px] rounded bg-surface-muted animate-pulse" aria-hidden />
     );
   }
   const d = m.document_count ?? 0;
@@ -179,7 +151,6 @@ function VaultStatsCell({ m }: { m?: VaultMetrics }) {
       role="img"
       aria-label={title}
     >
-      <CompositionBar d={d} t={t} f={f} />
       {d + t + f === 0 ? (
         <span className="text-foreground-muted">—</span>
       ) : (
