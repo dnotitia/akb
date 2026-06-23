@@ -207,6 +207,23 @@ HTTP=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE_URL/health/vault/$VAULT1")
 HTTP=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $PAT1" "$BASE_URL/health/vault/nonexistent-vault-xyz")
 [ "$HTTP" = "404" ] && pass "Unknown vault returns 404" || fail "vault health 404" "got HTTP $HTTP"
 
+echo ""
+echo "▸ 1d. Global /health: sensitive internals (rbac/audit) gated"
+
+# Operational stats (vector_store, etc.) stay anon — they're monitoring data
+# many callers poll unauthenticated. But the sensitive internals (rbac
+# hook-failure counters, audit stats) must NOT be world-readable.
+ANON=$(curl -sk "$BASE_URL/health")
+HTTP=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE_URL/health")
+[ "$HTTP" = "200" ] && pass "Anon /health → 200" || fail "anon health code" "got HTTP $HTTP"
+ANONOK=$(echo "$ANON" | python3 -c "import sys,json; d=json.load(sys.stdin); print('vector_store' in d and 'rbac' not in d and 'audit' not in d)" 2>/dev/null)
+[ "$ANONOK" = "True" ] && pass "Anon /health: operational stats present, rbac+audit withheld" || fail "anon health body" "$ANON"
+
+# Authenticated callers DO get the internals.
+AUTHED=$(curl -sk -H "Authorization: Bearer $PAT1" "$BASE_URL/health")
+AUTHOK=$(echo "$AUTHED" | python3 -c "import sys,json; d=json.load(sys.stdin); print('rbac' in d and 'audit' in d and 'vector_store' in d)" 2>/dev/null)
+[ "$AUTHOK" = "True" ] && pass "Authed /health: rbac + audit included" || fail "authed health body" "$AUTHED"
+
 # ── 2. Grep Regex Validation ─────────────────────────────────
 echo ""
 echo "▸ 2. Grep Regex Validation"
