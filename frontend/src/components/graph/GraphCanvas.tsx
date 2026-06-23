@@ -596,6 +596,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       const forcedNode =
         isSelected || n.uri === hovered || isPinned || (focusUri != null && related) || coneRole > 0;
 
+      // Orphan = no connection in the current view (degree 0). Render faded with
+      // a muted-grey outline so unlinked resources read as subordinate to the
+      // connected graph (the "Hide orphans" toggle hides them entirely). Skipped
+      // for forced states (selection/hover/pin/focus/cone keep full prominence);
+      // in large graphs degree-0 nodes are already LOD-demoted to dots above, so
+      // this only styles the full-rendered nodes of small/medium graphs.
+      const isOrphan = deg === 0 && !forcedNode;
+
       // LOD DEMOTION (not hiding): a node outside the current top-N renders as a
       // small dim dot — visible, so the structure stays honest (a leaf field
       // around each hub), but subordinate to the labeled hubs. Cluster colour
@@ -623,6 +631,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
         if (coneRole === 0) ctx.globalAlpha = 0.1;
       } else if (focusUri && !related) {
         ctx.globalAlpha = 0.18;
+      } else if (isOrphan) {
+        // Unconnected node in the default view → faded so the connected graph
+        // reads first. Skipped above when a focus/impact view is already dimming.
+        ctx.globalAlpha = 0.55;
       }
 
       // Kind → fill + default stroke + dash. Shape (traceNode) carries the kind:
@@ -652,7 +664,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
       ctx.fill();
       // Impact cones recolor the outline: dependency = teal, dependent = orange.
       const coneStroke = coneRole === 2 ? colors.primary : coneRole === 3 ? colors.accent : null;
-      ctx.strokeStyle = isSelected ? colors.primary : (coneStroke ?? groupStroke ?? kindStroke);
+      // Orphans get a muted-grey outline (overriding the cluster tint) so they
+      // read as subordinate; selection/cone still win as interaction states.
+      ctx.strokeStyle = isSelected
+        ? colors.primary
+        : (coneStroke ?? (isOrphan ? colors.foregroundMuted : (groupStroke ?? kindStroke)));
       ctx.lineWidth = isSelected || coneRole > 0 ? 2.5 : 1.5;
       ctx.setLineDash(dashed ? [3, 2] : []);
       ctx.stroke();
