@@ -14,6 +14,7 @@ import {
   type RelationKind,
 } from "./graph-types";
 import { KindSwatch, RelationSwatch } from "./graph-swatches";
+import { docIdFromUri } from "./use-graph-data";
 import { viewToQuery } from "./graph-state";
 import { Section } from "./Section";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -99,11 +100,25 @@ export function GraphSidebar({
     searchDocs(debouncedQuery.trim(), vault, 8)
       .then((resp) => {
         if (cancelled) return;
-        const rows = (resp.results || []).slice(0, 8).map((r: any) => ({
-          doc_id: r.doc_id || r.id,
-          title: r.title || r.name || r.doc_id || "(untitled)",
-          type: (r.resource_type || r.type || "document") as NodeKind,
-        }));
+        // Search results identify a resource by `uri`/`path` — there is NO
+        // `doc_id`/`id` field — so derive the SAME id the graph uses for its
+        // nodes (docIdFromUri), or clicking a hit set `entry` to undefined and
+        // silently no-oped (stayed on the whole graph). `source_type` is the
+        // real kind field ('document'|'table'|'file' — already a NodeKind for
+        // doc/table/file); map it for the chip, defaulting unknown → document.
+        // Drop any hit we can't resolve an id for (can't focus on it).
+        const rows: SearchHit[] = (resp.results || [])
+          .slice(0, 8)
+          .map((r: any) => {
+            const st = r.source_type;
+            const type: NodeKind = st === "table" ? "table" : st === "file" ? "file" : "document";
+            return {
+              doc_id: docIdFromUri(r.uri) ?? r.path ?? "",
+              title: r.title || r.path || "(untitled)",
+              type,
+            };
+          })
+          .filter((h) => h.doc_id);
         setHits(rows);
       })
       .catch(() => { if (!cancelled) setHits([]); });

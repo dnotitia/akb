@@ -1,7 +1,7 @@
 // frontend/src/components/graph/__tests__/GraphSidebar.test.tsx
 import type { ComponentProps } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { GraphSidebar } from "../GraphSidebar";
 import { DEFAULT_VIEW, type GraphView } from "../graph-types";
@@ -152,8 +152,12 @@ describe("GraphSidebar · entry search", () => {
       total: 1,
       returned: 1,
       total_matches: 1,
+      // Real /search result shape: identifies a doc by uri/path (no doc_id/id);
+      // source_type is 'document'|'table'|'file'. `path` is deliberately set to
+      // a DIFFERENT value than the uri-derived id so the assertion pins the
+      // PRIMARY docIdFromUri(uri) branch (not the `?? r.path` fallback).
       results: [
-        { doc_id: "d-1", title: "Roadmap", resource_type: "document" },
+        { uri: "akb://akb/coll/specs/doc/roadmap.md", path: "ignored/fallback.md", title: "Roadmap", source_type: "document" },
       ],
     });
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -176,9 +180,9 @@ describe("GraphSidebar · entry search", () => {
     fireEvent.click(hit);
     expect(onChange).toHaveBeenCalled();
     const lastArg = onChange.mock.calls.at(-1)?.[0];
-    expect(lastArg?.entry).toBe("d-1");
+    expect(lastArg?.entry).toBe("specs/roadmap.md");
     const stored = localStorage.getItem("akb-graph-recent:akb");
-    expect(stored).toContain("d-1");
+    expect(stored).toContain("specs/roadmap.md");
     vi.useRealTimers();
   });
 
@@ -188,7 +192,7 @@ describe("GraphSidebar · entry search", () => {
       total: 1,
       returned: 1,
       total_matches: 1,
-      results: [{ doc_id: "d-1", title: "Roadmap", resource_type: "document" }],
+      results: [{ uri: "akb://akb/coll/specs/doc/roadmap.md", path: "specs/roadmap.md", title: "Roadmap", source_type: "document" }],
     });
     const u = userEvent.setup();
     const onChange = vi.fn();
@@ -208,8 +212,37 @@ describe("GraphSidebar · entry search", () => {
     await u.click(hit);
     expect(mockedSearchDocs).toHaveBeenCalledWith("road", "akb", 8);
     const lastArg = onChange.mock.calls.at(-1)?.[0];
-    expect(lastArg?.entry).toBe("d-1");
+    expect(lastArg?.entry).toBe("specs/roadmap.md");
     const stored = localStorage.getItem("akb-graph-recent:akb");
-    expect(stored).toContain("d-1");
+    expect(stored).toContain("specs/roadmap.md");
+  });
+
+  it("drops hits with no resolvable id and maps source_type to the chip kind", async () => {
+    mockedSearchDocs.mockResolvedValue({
+      query: "x", total: 3, returned: 3, total_matches: 3,
+      results: [
+        { uri: "akb://akb/coll/specs/doc/roadmap.md", path: "specs/roadmap.md", title: "Roadmap", source_type: "document" },
+        { uri: "akb://akb/coll/metrics/table/usage", path: "metrics/usage", title: "Usage Table", source_type: "table" },
+        // A collection URI resolves to no doc/table/file id and carries no path,
+        // so docIdFromUri()→null, doc_id→"" → must be filtered out (clicking it
+        // would set entry="" → the silent no-op this PR exists to kill).
+        { uri: "akb://akb/coll/specs", title: "Specs Collection" },
+      ],
+    });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    setup();
+    const input = screen.getByPlaceholderText(/search to focus/i);
+    fireEvent.change(input, { target: { value: "x" } });
+    await vi.advanceTimersByTimeAsync(300);
+    // Resolvable hits render…
+    expect(await screen.findByText("Roadmap")).toBeInTheDocument();
+    expect(screen.getByText("Usage Table")).toBeInTheDocument();
+    // …the unresolvable collection hit is dropped.
+    expect(screen.queryByText("Specs Collection")).toBeNull();
+    // source_type drives the chip kind — scope to the hit button so the chip
+    // isn't confused with the "table" type-filter toggle elsewhere in the rail.
+    const tableHit = screen.getByRole("button", { name: /Usage Table/i });
+    expect(within(tableHit).getByText("table")).toBeInTheDocument();
+    vi.useRealTimers();
   });
 });
