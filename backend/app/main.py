@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_optional_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, knowledge_io, tables
@@ -171,8 +171,17 @@ async def readyz():
 
 
 @app.get("/health")
-async def health():
+async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     """Detailed system health for dashboards.
+
+    Auth posture: the operational stats (vector-store reachability, indexing /
+    backfill counts, BM25, external-git / metadata / events backlogs) are
+    monitoring data and stay readable by anyone — many e2e and uptime callers
+    poll them unauthenticated. The sensitive operational INTERNALS, though —
+    the RBAC hook-failure counters (which reveal role-sync security drift) and
+    the audit-log stats — are returned ONLY to authenticated callers, so they
+    are not world-readable. `/health/vault/{name}` remains the per-vault,
+    reader-gated surface.
 
     Indexing is a single stage post-Phase-4 (embed + sparse + upsert
     in one atomic worker), so backfill stats live under
@@ -205,26 +214,28 @@ async def health():
         except Exception as e:  # noqa: BLE001
             return {"error": str(e)}
 
-    # PG-RBAC subsystem: hook-failure counters + last reconcile
-    # outcome. Lets dashboards / oncall see silent role-sync drift
-    # without grepping logs.
-    rbac_info: dict
-    try:
-        from app.services.role_sync import get_role_sync
-        rbac_info = get_role_sync().metrics_snapshot()
-    except Exception as e:  # noqa: BLE001
-        rbac_info = {"error": str(e)}
-
-    return {
+    result: dict = {
         "status": "ok",
         "service": "akb",
         "external_git": await _safe(external_git_poller.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
         "vector_store": vs_info,
-        "rbac": rbac_info,
-        "audit": audit_log.stats(),
     }
+
+    # Sensitive operational internals — authenticated callers only:
+    #  - PG-RBAC hook-failure counters + last reconcile outcome (silent
+    #    role-sync drift); lets dashboards / oncall see it without grepping logs.
+    #  - audit-log stats.
+    if user is not None:
+        try:
+            from app.services.role_sync import get_role_sync
+            result["rbac"] = get_role_sync().metrics_snapshot()
+        except Exception as e:  # noqa: BLE001
+            result["rbac"] = {"error": str(e)}
+        result["audit"] = audit_log.stats()
+
+    return result
 
 
 @app.get("/health/vault/{name}", summary="Per-vault indexing health (auth required)")

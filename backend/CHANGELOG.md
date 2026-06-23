@@ -5,6 +5,26 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.1 — 2026-06-23  *(security — gate the sensitive `/health` internals (RBAC + audit) behind auth)*
+
+`GET /health` is unauthenticated (uptime monitors + many e2e callers poll it),
+and it exposed **operational security internals** to anyone who could reach the
+host: the **RBAC hook-failure counters** (`rbac` — reveals silent role-sync
+drift, i.e. security-infrastructure health) and the **audit-log stats**
+(`audit`). Those should not be world-readable.
+
+`/health` now takes **optional auth** (`get_optional_user`) and includes `rbac`
++ `audit` **only for authenticated callers**. The operational stats
+(`vector_store` reachability + indexing/backfill counts, BM25, `external_git` /
+`metadata_backfill` / `events` backlogs) stay anonymous — they are monitoring
+data the codebase already treats as world-readable (e2e suites and uptime checks
+poll them without auth), and they carry no per-vault names/IDs.
+`/health/vault/{name}` remains the per-vault, reader-gated surface.
+
+Scoped deliberately to the two sensitive internals (not the whole body) so the
+established unauthenticated `/health` monitoring contract — relied on across the
+e2e suite and by uptime probes — keeps working unchanged.
+
 ## 0.9.0 — 2026-06-22  *(feat — graph viewer Phase 2: degree-ranked overview + health endpoints, single-call BFS, edge `kind`)*
 
 Two new reader-gated graph read endpoints under `/api/v1`, replacing the
