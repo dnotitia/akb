@@ -166,7 +166,7 @@ export default function SearchPage() {
       if (m === "dense") {
         // Web shows a fuller page than the agent default (10). 25 stays under
         // the server-side ceiling (search_limit_max, 50).
-        const d = await searchDocs(s, vs.length ? vs : undefined, 25);
+        const d = await searchDocs(s, vs, 25);
         if (id !== reqId.current) return; // superseded
         setDenseResults(d.results);
         setLiteralResults([]);
@@ -177,7 +177,7 @@ export default function SearchPage() {
         setTruncated(Boolean(d.truncated));
         setDegraded(Boolean(d.degraded));
       } else {
-        const d = await grepDocs(s, vs.length ? vs : undefined);
+        const d = await grepDocs(s, vs);
         if (id !== reqId.current) return;
         setLiteralResults(d.results);
         setDenseResults([]);

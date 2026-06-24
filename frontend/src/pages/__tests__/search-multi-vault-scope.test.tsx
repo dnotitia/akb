@@ -97,14 +97,14 @@ describe("SearchPage · multi-vault scope · interactions (write path)", () => {
     );
   });
 
-  it("Clear resets to all vaults (searchDocs called with undefined scope)", async () => {
+  it("Clear resets to all vaults (searchDocs called with empty scope)", async () => {
     const user = userEvent.setup();
     renderAt("/search?q=x&v=alpha,beta");
     await waitFor(() => expect(mockedSearch).toHaveBeenCalled());
     await user.click(await screen.findByRole("button", { name: /Search scope/ }));
     await user.click(await screen.findByRole("menuitem", { name: /Clear/ }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenLastCalledWith("x", undefined, 25),
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", [], 25),
     );
     expect(await screen.findByText("All vaults (3)")).toBeTruthy();
   });

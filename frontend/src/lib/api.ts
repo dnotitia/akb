@@ -353,12 +353,11 @@ export interface GrepResponse {
   hint?: string | null;
   results: GrepDoc[];
 }
-export const grepDocs = (query: string, vaults?: string[] | string, limit = 20) =>
-  api<GrepResponse>(`/grep?${(() => {
-    const p = new URLSearchParams({ q: query, limit: String(limit) });
-    for (const v of vaultScopeParams(vaults)) p.append("vault", v);
-    return p;
-  })()}`);
+export const grepDocs = (query: string, vaults?: string[] | string, limit = 20) => {
+  const p = new URLSearchParams({ q: query, limit: String(limit) });
+  for (const v of vaultScopeParams(vaults)) p.append("vault", v);
+  return api<GrepResponse>(`/grep?${p}`);
+};
 
 // ── Graph ──
 export interface GraphApiNode {
