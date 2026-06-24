@@ -5,6 +5,31 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.3 — 2026-06-24  *(fix — tokenize on a ProcessPool to stop event-loop starvation / 503)*
+
+Kiwi (the BM25 sparse tokenizer) is a CPU-bound C++ extension that does **not**
+release the GIL during native `tokenize()` — the long-standing claim that it did
+was wrong. Running it via `asyncio.to_thread` therefore did not parallelize it:
+concurrent tokenizations serialized on the GIL and the worker threads starved the
+single event-loop thread, so even `/livez` (a no-dependency coroutine) couldn't
+be scheduled → readiness/liveness probes timed out → the pod was pulled from the
+Service → intermittent **503 flapping** under search + indexing load.
+
+`sparse_encoder.tokenize()` now offloads `_tokenize_sync` to a dedicated `spawn`
+**`ProcessPoolExecutor`** (each worker process has its own GIL; an `initializer`
+warms Kiwi per worker), created/torn-down in the lifespan. It falls back to
+`asyncio.to_thread` when the pool isn't started (tests). The one shared
+`tokenize()` means query encoding (`encode_query`), the indexing worker
+(`encode_document`) and the corpus BM25 stats refresher all benefit. Search
+results are unchanged; single-replica / RWO git storage is unaffected.
+
+Measured locally (32 concurrent tokenizations of a chunk-sized text): event-loop
+max stall dropped from ~472 ms (`to_thread`, ≈ total tokenize wall-time → fully
+serial) to ~13–34 ms (`ProcessPool`), with ~4× tokenization throughput. This is
+the classic GIL rule — CPU-bound work that doesn't release the GIL must use
+multiprocessing, not threading; the I/O-bound embed/rerank HTTP calls were
+already async and were left as-is.
+
 ## 0.9.2 — 2026-06-23  *(feat — graph overview surfaces unlinked resources as isolated nodes)*
 
 The graph overview was built purely from edge endpoints, so a resource in **no
