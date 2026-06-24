@@ -16,7 +16,7 @@ search_service = SearchService()
 @router.get("/search", response_model=SearchResponse, summary="Search documents")
 async def search_documents(
     q: str = Query(..., description="Search query"),
-    vault: str | None = Query(None),
+    vault: list[str] | None = Query(None, description="Limit to one or more vaults (repeat the param); omit for all accessible vaults."),
     collection: str | None = Query(None),
     type: str | None = Query(None),
     tags: list[str] | None = Query(None),
@@ -57,7 +57,7 @@ async def drill_down(
 @router.get("/grep", summary="Literal substring / regex search across documents")
 async def grep_documents(
     q: str = Query(..., description="Pattern to search for"),
-    vault: str | None = Query(None),
+    vault: list[str] | None = Query(None, description="Limit to one or more vaults (repeat the param); omit for all accessible vaults."),
     collection: str | None = Query(None),
     regex: bool = Query(False),
     case_sensitive: bool = Query(False),

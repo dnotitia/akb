@@ -6,7 +6,7 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { SelectMenu } from "@/components/ui/select-menu";
+import { VaultScopePicker } from "@/components/vault-scope-picker";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -90,8 +90,16 @@ export default function SearchPage() {
   // not slip through as a truthy non-dense value that routes to grep with
   // neither toggle highlighted.
   const mode: Mode = searchParams.get("mode") === "literal" ? "literal" : "dense";
-  const queryVault = searchParams.get("v") || "";
-  const vault = scopedVault || queryVault;
+  // `?v=` is a comma-joined list of vault names — the multi-vault search scope.
+  // On the scoped `/vault/:name/search` route the vault is fixed by the URL
+  // param (single). Empty list = search every accessible vault.
+  const queryVaults = (searchParams.get("v") || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const scopeVaults: string[] = scopedVault ? [scopedVault] : queryVaults;
+  // Stable string key for effect deps (the array identity changes each render).
+  const vaultKey = scopeVaults.join(",");
 
   const [denseResults, setDenseResults] = useState<DenseResult[]>([]);
   const [literalResults, setLiteralResults] = useState<GrepDoc[]>([]);
@@ -136,14 +144,14 @@ export default function SearchPage() {
   }, [scopedVault]);
 
   useEffect(() => {
-    if (q) doSearch(q, mode, vault);
+    if (q) doSearch(q, mode, scopeVaults);
     // Bump the epoch on cleanup so an in-flight resolve after a param change
     // or unmount is ignored (reqId is a request counter, not a DOM ref).
     // eslint-disable-next-line react-hooks/exhaustive-deps
     return () => { reqId.current++; };
-  }, [q, mode, vault]);
+  }, [q, mode, vaultKey]);
 
-  async function doSearch(s: string, m: Mode, v: string) {
+  async function doSearch(s: string, m: Mode, vs: string[]) {
     if (!s.trim()) return;
     const id = ++reqId.current;
     setLoading(true);
@@ -153,7 +161,7 @@ export default function SearchPage() {
       if (m === "dense") {
         // Web shows a fuller page than the agent default (10). 25 stays under
         // the server-side ceiling (search_limit_max, 50).
-        const d = await searchDocs(s, v || undefined, 25);
+        const d = await searchDocs(s, vs.length ? vs : undefined, 25);
         if (id !== reqId.current) return; // superseded
         setDenseResults(d.results);
         setLiteralResults([]);
@@ -164,7 +172,7 @@ export default function SearchPage() {
         setTruncated(Boolean(d.truncated));
         setDegraded(Boolean(d.degraded));
       } else {
-        const d = await grepDocs(s, v || undefined);
+        const d = await grepDocs(s, vs.length ? vs : undefined);
         if (id !== reqId.current) return;
         setLiteralResults(d.results);
         setDenseResults([]);
@@ -208,11 +216,11 @@ export default function SearchPage() {
     setSearchParams(next, { replace: true });
   }
 
-  function switchVault(v: string) {
+  function setScopeVaults(vs: string[]) {
     const next = new URLSearchParams(searchParams);
     const trimmed = draft.trim();
     if (trimmed) next.set("q", trimmed);
-    if (v) next.set("v", v);
+    if (vs.length) next.set("v", vs.join(","));
     else next.delete("v");
     setSearchParams(next, { replace: true });
   }
@@ -397,28 +405,13 @@ export default function SearchPage() {
       )}
 
       {!scopedVault && vaults.length > 0 && (
-        <div className="flex items-center gap-3 mb-6">
-          <span className="coord shrink-0">Scope</span>
-          <SelectMenu
-            value={vault}
-            onValueChange={switchVault}
-            aria-label="Search scope — limit to a vault"
-            className="h-9 w-auto min-w-[220px] max-w-sm"
-            searchable
-            searchPlaceholder="Filter vaults"
-            options={[
-              { value: "", label: `All vaults (${vaults.length})` },
-              ...vaults.map((v) => ({ value: v.name, label: v.name })),
-            ]}
+        <div className="flex items-start gap-3 mb-6">
+          <span className="coord shrink-0 mt-2">Scope</span>
+          <VaultScopePicker
+            vaults={vaults}
+            selected={scopeVaults}
+            onChange={setScopeVaults}
           />
-          {vault && (
-            <button
-              onClick={() => switchVault("")}
-              className="coord hover:text-link transition-token cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              clear
-            </button>
-          )}
         </div>
       )}
 
@@ -464,7 +457,7 @@ export default function SearchPage() {
         <Alert variant="destructive" className="mt-6">
           Search failed — {error}.{" "}
           <button
-            onClick={() => doSearch(q, mode, vault)}
+            onClick={() => doSearch(q, mode, scopeVaults)}
             className="underline font-medium hover:text-link cursor-pointer rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             Retry

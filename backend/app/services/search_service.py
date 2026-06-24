@@ -140,7 +140,7 @@ class SearchService:
     async def search(
         self,
         query: str,
-        vault: str | None = None,
+        vault: str | list[str] | None = None,
         collection: str | None = None,
         doc_type: str | None = None,
         tags: list[str] | None = None,
@@ -156,13 +156,21 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
+        # `vault` accepts a single name (MCP / legacy callers) or a list (the
+        # REST multi-vault scope picker). Normalize to a list of names, or None
+        # for "no vault scope" → search every vault the user can access.
+        vaults: list[str] | None = (
+            [vault] if isinstance(vault, str)
+            else ([v for v in vault if v] or None) if vault
+            else None
+        )
         # ACL guard mirroring `grep` below: when neither vault nor
         # user_id scopes the query, the prefilter block ends up
         # skipped (has_filters=False) and `_run_vector_search` runs
         # unscoped — a cross-vault scan. The MCP and REST handlers
         # both forward user_id today (see issue #66 / PR #67), but
         # this self-defends against any future caller that forgets.
-        if vault is None and user_id is None:
+        if not vaults and user_id is None:
             raise ValidationError("vault or user_id required")
 
         # Server-side limit clamp (issue #189): the MCP schema caps `limit` at
@@ -194,7 +202,7 @@ class SearchService:
 
         # Always pre-filter when user_id is provided so we never leak
         # documents from vaults the user can't read.
-        has_filters = any([vault, collection, doc_type, tags, user_id, source_uris])
+        has_filters = any([vaults, collection, doc_type, tags, user_id, source_uris])
         candidate_source_ids: list[str] | None = None
         candidate_vault_ids: list[str] | None = None
 
@@ -220,7 +228,7 @@ class SearchService:
                     "SELECT is_admin FROM users WHERE id = $1", user_uuid,
                 )) if user_uuid is not None else False
                 candidate_vault_ids = await self._accessible_vault_ids(
-                    conn, user_uuid=user_uuid, is_admin=is_admin, vault=vault,
+                    conn, user_uuid=user_uuid, is_admin=is_admin, vaults=vaults,
                 )
             # None  → admin / anon-with-named-vault → unscoped (mirrors the
             #         source path's no-ACL admin behavior; admin sees all).
@@ -270,9 +278,9 @@ class SearchService:
                 conditions = []
                 params: list = []
                 idx = 1
-                if vault:
-                    conditions.append(f"v.name = ${idx}")
-                    params.append(vault); idx += 1
+                if vaults:
+                    conditions.append(f"v.name = ANY(${idx})")
+                    params.append(vaults); idx += 1
                 if collection:
                     conditions.append(f"d.path LIKE ${idx} || '%'")
                     params.append(collection); idx += 1
@@ -439,7 +447,7 @@ class SearchService:
         )
 
     async def _accessible_vault_ids(
-        self, conn, *, user_uuid: uuid.UUID | None, is_admin: bool, vault: str | None,
+        self, conn, *, user_uuid: uuid.UUID | None, is_admin: bool, vaults: list[str] | None,
     ) -> list[str] | None:
         """The vault ids the user may read — the VAULT-path ACL (issue #189
         Phase 2). Mirrors the per-vault `_vault_acl` predicate exactly so the
@@ -454,21 +462,25 @@ class SearchService:
         """
         # admin / anon mirror `_vault_acl` returning (None, []): no predicate.
         if user_uuid is None or is_admin:
-            if vault:
-                vid = await conn.fetchval("SELECT id FROM vaults WHERE name = $1", vault)
-                return [str(vid)] if vid is not None else []
+            if vaults:
+                rows = await conn.fetch(
+                    "SELECT id FROM vaults WHERE name = ANY($1)", vaults,
+                )
+                return [str(r["id"]) for r in rows]
             return None  # admin, no named vault → unscoped
         # Authenticated non-admin: owner / explicit grant / public.
         acl = (
             "v.id IN (SELECT vault_id FROM vault_access WHERE user_id = $1) "
             "OR v.owner_id = $1 OR v.public_access IN ('reader', 'writer')"
         )
-        if vault:
-            vid = await conn.fetchval(
-                f"SELECT v.id FROM vaults v WHERE v.name = $2 AND ({acl})",
-                user_uuid, vault,
+        if vaults:
+            # Intersect the chosen vault names with the user's accessible set —
+            # a name the user can't read simply drops out (no leak).
+            rows = await conn.fetch(
+                f"SELECT v.id FROM vaults v WHERE v.name = ANY($2) AND ({acl})",
+                user_uuid, vaults,
             )
-            return [str(vid)] if vid is not None else []
+            return [str(r["id"]) for r in rows]
         rows = await conn.fetch(f"SELECT v.id FROM vaults v WHERE {acl}", user_uuid)
         return [str(r["id"]) for r in rows]
 
@@ -753,7 +765,7 @@ class SearchService:
     async def grep(
         self,
         pattern: str,
-        vault: str | None = None,
+        vault: str | list[str] | None = None,
         collection: str | None = None,
         regex: bool = False,
         case_sensitive: bool = False,
@@ -806,10 +818,17 @@ class SearchService:
                     "results": [],
                 }
 
+        # `vault` accepts a single name (MCP / legacy) or a list (REST multi-
+        # vault scope). Normalize to a list of names, or None for "no scope".
+        vaults: list[str] | None = (
+            [vault] if isinstance(vault, str)
+            else ([v for v in vault if v] or None) if vault
+            else None
+        )
         # ACL guard: when no vault is given we MUST have a user_id so the
         # SQL can scope to the vaults that user can access. A None user_id
         # in that branch would silently produce a cross-vault scan.
-        if vault is None and user_id is None:
+        if not vaults and user_id is None:
             raise ValidationError("vault or user_id required")
 
         # Server-side limit clamp (issue #189) — same ceiling as search().
@@ -834,13 +853,14 @@ class SearchService:
                 params.append(pattern)
             idx += 1
 
-            if vault:
-                conditions.append(f"v.name = ${idx}")
-                params.append(vault)
+            if vaults:
+                conditions.append(f"v.name = ANY(${idx})")
+                params.append(vaults)
                 idx += 1
-            elif user_id:
-                # No vault specified: restrict to vaults the user can access
-                # (vault_access for explicit grants OR owner OR public_access)
+            if user_id:
+                # Restrict to vaults the user can access (vault_access grant OR
+                # owner OR public). Applied even when `vaults` is given so the
+                # named set is intersected with the accessible set (no leak).
                 conditions.append(
                     f"(v.id IN (SELECT vault_id FROM vault_access WHERE user_id = ${idx}) "
                     f"OR v.owner_id = ${idx} "
