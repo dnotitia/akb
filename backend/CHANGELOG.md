@@ -5,6 +5,22 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.4 — 2026-06-24  *(feat — search can be scoped to multiple vaults)*
+
+`GET /search` and `GET /grep` now accept a **repeatable** `vault` query param
+(`?vault=a&vault=b`), so a search can be scoped to a CHOSEN SUBSET of vaults —
+not just one vault or all of them. The chosen names are intersected with the
+caller's accessible set (a vault you can't read simply drops out — no leak), via
+`v.name = ANY($)` in both the metadata pre-filter and the `_accessible_vault_ids`
+vector-ACL path (and the `grep` SQL, which now always applies the access
+predicate alongside the name filter). `vault` still accepts a single name for
+MCP / legacy callers (normalized to a one-element list internally), so nothing
+else changes.
+
+On the web, the `/search` page gains a **multi-vault scope picker** — a checkbox
+dropdown (search-filterable) plus removable chips for the current selection;
+empty = "All vaults". The scope is deep-linkable via `?v=a,b,c`.
+
 ## 0.9.3 — 2026-06-24  *(fix — tokenize on a ProcessPool to stop event-loop starvation / 503)*
 
 Kiwi (the BM25 sparse tokenizer) is a CPU-bound C++ extension that does **not**

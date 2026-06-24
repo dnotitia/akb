@@ -315,9 +315,14 @@ export interface SearchResponse {
   degradation_reason?: string | null;
   results: any[];
 }
-export const searchDocs = (query: string, vault?: string, limit = 10) => {
+// Scope a search to one or more vaults. The backend `vault` query param is
+// repeatable (`?vault=a&vault=b`); omit it for all accessible vaults.
+const vaultScopeParams = (vaults?: string[] | string): string[] =>
+  (Array.isArray(vaults) ? vaults : vaults ? [vaults] : []).filter(Boolean);
+
+export const searchDocs = (query: string, vaults?: string[] | string, limit = 10) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
-  if (vault) p.set("vault", vault);
+  for (const v of vaultScopeParams(vaults)) p.append("vault", v);
   return api<SearchResponse>(`/search?${p}`);
 };
 
@@ -348,10 +353,10 @@ export interface GrepResponse {
   hint?: string | null;
   results: GrepDoc[];
 }
-export const grepDocs = (query: string, vault?: string, limit = 20) =>
+export const grepDocs = (query: string, vaults?: string[] | string, limit = 20) =>
   api<GrepResponse>(`/grep?${(() => {
     const p = new URLSearchParams({ q: query, limit: String(limit) });
-    if (vault) p.set("vault", vault);
+    for (const v of vaultScopeParams(vaults)) p.append("vault", v);
     return p;
   })()}`);
 
