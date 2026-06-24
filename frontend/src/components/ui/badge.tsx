@@ -3,7 +3,10 @@ import type { HTMLAttributes } from "react";
 import { cn } from "@/lib/utils";
 
 const badgeVariants = cva(
-  "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] tracking-normal font-medium",
+  // whitespace-nowrap: a pill must never wrap its label — without it, a chip
+  // like "indexing 1,234" breaks at the space when the row is tight and the
+  // count drops onto a second line, ballooning the pill vertically.
+  "inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] tracking-normal font-medium",
   {
     variants: {
       variant: {
