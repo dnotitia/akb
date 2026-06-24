@@ -448,8 +448,11 @@ export default function VaultPage() {
       {/* Recent writes — primary. Same grammar as the Home dashboard's Recent
           activity (loading flag → skeleton, type-tinted leading chip,
           fresh-token spark, card-hover lift) so a change reads identically
-          across the app. Single-vault context here, so no per-row VaultChip;
-          the git commit ref stays (demoted) since the href is commit-pinned. */}
+          across the app. Single-vault context here, so no per-row VaultChip.
+          The row links to the LIVE document (no ?commit pin): /recent returns
+          each doc's current_commit, so pinning it opened the latest version in
+          read-only "historical" mode. The commit ref still shows (demoted) as
+          an at-a-glance HEAD label. */}
       <section
         className="mt-10"
         aria-labelledby="recent-heading"
@@ -521,10 +524,7 @@ export default function VaultPage() {
                 return (
                   <li key={`${c.doc_id}:${c.commit ?? ""}:${i}`}>
                     <Link
-                      to={
-                        `/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}` +
-                        (c.commit ? `?commit=${encodeURIComponent(c.commit)}` : "")
-                      }
+                      to={`/vault/${name}/doc/${encodeURIComponent(c.path || c.doc_id)}`}
                       className="group card-hover relative z-0 hover:z-10 grid grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-x-3 px-3 py-2.5 bg-surface hover:bg-surface-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
                       <span

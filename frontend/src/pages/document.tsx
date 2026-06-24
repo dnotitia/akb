@@ -25,6 +25,7 @@ import {
 import { timeAgo } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { parseHeadings } from "@/lib/markdown";
+import { sameCommitRef } from "@/lib/commit";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
 import { SummaryFold } from "@/components/summary-fold";
@@ -91,9 +92,6 @@ export default function DocumentPage() {
   const hydratedKey = useRef<number | null>(null);
   const isDirty = editingContent !== originalContent;
   const docId = id ? decodeURIComponent(id) : "";
-  const canEdit =
-    !commitHash &&
-    (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
 
   const applyView = (next: DocView) => {
     const p = new URLSearchParams(searchParams);
@@ -127,6 +125,28 @@ export default function DocumentPage() {
   });
 
   const doc = docOverride ?? docQuery.data ?? null;
+
+  // A versioned read reports current_commit = the requested version (not HEAD),
+  // so `doc` alone can't reveal the doc's true latest commit. While a commit is
+  // pinned, fetch HEAD separately so we can tell a pin that IS the latest (a
+  // Recent-activity / commit-log click on the newest commit) apart from a
+  // genuinely older one. The key matches the un-pinned docQuery key so the two
+  // share a cache entry rather than double-fetching HEAD.
+  const headQuery = useQuery({
+    queryKey: ["document", name, docId, undefined],
+    queryFn: () => getDocument(name!, docId),
+    enabled: !!name && !!docId && !!commitHash,
+    retry: false,
+  });
+  const headCommit = commitHash ? headQuery.data?.current_commit : doc?.current_commit;
+  // Genuinely historical only when the pin points at a commit OTHER than HEAD.
+  // sameCommitRef does a prefix-tolerant compare (the commit log links 12-char
+  // short hashes; current_commit is the full SHA) and returns false while HEAD
+  // is still loading — so a real older version is never briefly editable.
+  const isHistorical = !!commitHash && !sameCommitRef(commitHash, headCommit);
+  const canEdit =
+    !isHistorical &&
+    (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
   // Parse headings once for the outline-tab count (the outline + renderer each
   // re-scan internally; this removes the third pass that ran on every render).
   const headingSlugs = useMemo(() => parseHeadings(doc?.content || ""), [doc?.content]);
@@ -334,7 +354,7 @@ export default function DocumentPage() {
     }
   }
 
-  const commitShort = doc.current_commit?.slice(0, 7);
+  const commitShort = headCommit?.slice(0, 7);
   const inEditMode = view === "edit";
 
   return (
@@ -350,7 +370,7 @@ export default function DocumentPage() {
         aria-labelledby="doc-title"
         className="min-w-0 w-full max-w-none"
       >
-        {commitHash && (
+        {isHistorical && (
           <div
             role="status"
             aria-live="polite"
@@ -612,7 +632,7 @@ export default function DocumentPage() {
 
       {!inEditMode && (
       <aside className="lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100dvh-9rem)] flex flex-col text-sm min-h-0">
-        {!commitHash && (() => {
+        {!isHistorical && (() => {
           const canWrite = vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner";
           const rowCls =
             "w-full flex items-center gap-2.5 px-3 py-2.5 text-sm transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
