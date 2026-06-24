@@ -114,8 +114,15 @@ def start_workers() -> None:
     # once at startup and then on a configurable cadence so the sparse
     # leg of hybrid search isn't silently degraded on fresh installs or
     # after long periods without manual init.
+    # Dedicated Kiwi tokenizer process pool. Kiwi's native tokenize() holds the
+    # GIL, so asyncio.to_thread can't parallelize it and concurrent tokenization
+    # (search + this corpus-wide stats refresher + embed_worker) starves the
+    # event loop → probe timeouts → 503. Run it off-process. Start it BEFORE the
+    # stats refresher, which tokenizes the whole corpus on first tick. (Serving
+    # also depends on it — move to the always-run path if API/worker tiers split.)
+    sparse_encoder.start_tokenizer_pool()
     sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
-    started = ["embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
+    started = ["tokenizer_pool", "embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -176,6 +183,7 @@ async def stop_workers() -> None:
     await embed_worker.stop()
     await vault_backfill.stop()
     await sparse_encoder.stop_stats_refresher()
+    sparse_encoder.stop_tokenizer_pool()
 
 
 async def shutdown_storage() -> None:

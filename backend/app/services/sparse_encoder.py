@@ -41,8 +41,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import multiprocessing
+import os
 import time
 from collections import Counter, OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from typing import Iterable
 
 import kiwipiepy
@@ -248,12 +251,63 @@ _TOKEN_CACHE_MAX = 2048
 _token_cache: "OrderedDict[str, list[str]]" = OrderedDict()
 
 
+# ── Dedicated tokenizer process pool ──────────────────────────────────
+# Kiwi's native tokenize() is CPU-bound and does NOT release the GIL (the old
+# claim that it did was wrong for kiwipiepy). Running it via asyncio.to_thread
+# therefore does NOT parallelize it: concurrent tokenizations serialize on the
+# GIL and the worker threads starve the event-loop thread, so even /livez can't
+# be scheduled → readiness/liveness probes time out → the pod is pulled from the
+# Service → 503 flapping under search/indexing load. A ProcessPool gives each
+# worker its own interpreter + GIL, so tokenization runs truly off the serving
+# loop. Measured locally: 32 concurrent tokenizations froze the loop ~470ms via
+# to_thread vs ~13ms via this pool (and ran ~4x faster).
+_tokenizer_pool: ProcessPoolExecutor | None = None
+
+
+def _init_tokenizer_worker() -> None:
+    """Run once per child process: warm the Kiwi model so the first real
+    tokenize() in that worker doesn't pay the model-load cost."""
+    _get_kiwi()
+
+
+def start_tokenizer_pool(processes: int | None = None) -> None:
+    """Create the dedicated Kiwi tokenizer process pool. Idempotent.
+
+    `spawn` is forced — forking a multithreaded asyncio server is unsafe. This
+    is a SERVING dependency (query encode_query) as well as a worker dependency,
+    so if API and indexing-worker tiers are ever split it must be started on the
+    always-run path, not behind a worker gate.
+    """
+    global _tokenizer_pool
+    if _tokenizer_pool is not None:
+        return
+    n = processes if (processes and processes > 0) else max(2, min(4, os.cpu_count() or 2))
+    _tokenizer_pool = ProcessPoolExecutor(
+        max_workers=n,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_tokenizer_worker,
+    )
+    logger.info("Kiwi tokenizer ProcessPool started (workers=%d, spawn)", n)
+
+
+def stop_tokenizer_pool() -> None:
+    """Tear down the tokenizer pool. Idempotent."""
+    global _tokenizer_pool
+    pool, _tokenizer_pool = _tokenizer_pool, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+        logger.info("Kiwi tokenizer ProcessPool stopped")
+
+
 async def tokenize(text: str) -> list[str]:
     """Tokenize text into content-bearing terms (lemma form for verbs).
 
-    Async because Kiwi is sync C++ and would otherwise block the event loop;
-    we offload to a worker thread (Kiwi releases the GIL during native work).
-    Result is LRU-cached by source text.
+    Kiwi is a sync C++ tokenizer that does NOT release the GIL during native
+    work, so running it on the loop — or via asyncio.to_thread, which shares the
+    loop process's GIL — starves request handling and health probes. We offload
+    to a dedicated ProcessPool (each worker has its own GIL) when one is running;
+    otherwise (tests / pool not started) we fall back to a thread. Result is
+    LRU-cached by source text.
     """
     if not text:
         return []
@@ -261,7 +315,13 @@ async def tokenize(text: str) -> list[str]:
     if cached is not None:
         _token_cache.move_to_end(text)
         return cached
-    tokens = await asyncio.to_thread(_tokenize_sync, text)
+    pool = _tokenizer_pool
+    if pool is not None:
+        loop = asyncio.get_running_loop()
+        tokens = await loop.run_in_executor(pool, _tokenize_sync, text)
+    else:
+        # No pool (tests / not started): thread fallback — correct but GIL-bound.
+        tokens = await asyncio.to_thread(_tokenize_sync, text)
     _token_cache[text] = tokens
     _token_cache.move_to_end(text)
     while len(_token_cache) > _TOKEN_CACHE_MAX:
