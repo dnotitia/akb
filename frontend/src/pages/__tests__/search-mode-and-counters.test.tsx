@@ -65,7 +65,7 @@ describe("SearchPage · semantic (dense) mode", () => {
       ],
     });
     renderAt("/search?q=postgres");
-    await waitFor(() => expect(mockedSearch).toHaveBeenCalledWith("postgres", undefined, 25));
+    await waitFor(() => expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25));
     expect(await screen.findByText("PostgreSQL tuning")).toBeTruthy();
     expect(mockedGrep).not.toHaveBeenCalled();
   });
@@ -124,6 +124,6 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
       .find((b) => b.hasAttribute("aria-pressed"));
     if (!toggle) throw new Error("Literal toggle button not found");
     await u.click(toggle);
-    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", undefined));
+    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", []));
   });
 });

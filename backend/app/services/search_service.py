@@ -169,9 +169,7 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
-        # Single name (MCP/legacy) or list (REST multi-vault scope) → canonical
-        # list, or None for "every accessible vault". See _normalize_vault_scope.
-        vaults = _normalize_vault_scope(vault)
+        vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
         # ACL guard mirroring `grep` below: when neither vault nor
         # user_id scopes the query, the prefilter block ends up
         # skipped (has_filters=False) and `_run_vector_search` runs
@@ -828,9 +826,7 @@ class SearchService:
                     "results": [],
                 }
 
-        # Single name (MCP/legacy) or list (REST multi-vault scope) → canonical
-        # list, or None for "every accessible vault". See _normalize_vault_scope.
-        vaults = _normalize_vault_scope(vault)
+        vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
         # ACL guard: when no vault is given we MUST have a user_id so the
         # SQL can scope to the vaults that user can access. A None user_id
         # in that branch would silently produce a cross-vault scan.
