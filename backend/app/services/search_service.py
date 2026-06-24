@@ -135,6 +135,19 @@ def resolve_first_stage_unique_limit(
     return max(configured, limit)
 
 
+def _normalize_vault_scope(vault: str | list[str] | None) -> list[str] | None:
+    """Canonicalize the `vault` arg to a list of names, or None for "no scope".
+
+    `vault` accepts a single name (MCP / legacy callers) or a list (the REST
+    multi-vault scope picker). Blank/empty entries are dropped, and an empty
+    result collapses to None ("search every vault the user can read") — so a
+    stray `?vault=&vault=` can't be read as a real (empty-named) vault.
+    """
+    if isinstance(vault, str):
+        vault = [vault]
+    return [v for v in (vault or []) if v] or None
+
+
 class SearchService:
 
     async def search(
@@ -156,14 +169,9 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
-        # `vault` accepts a single name (MCP / legacy callers) or a list (the
-        # REST multi-vault scope picker). Normalize to a list of names, or None
-        # for "no vault scope" → search every vault the user can access.
-        vaults: list[str] | None = (
-            [vault] if isinstance(vault, str)
-            else ([v for v in vault if v] or None) if vault
-            else None
-        )
+        # Single name (MCP/legacy) or list (REST multi-vault scope) → canonical
+        # list, or None for "every accessible vault". See _normalize_vault_scope.
+        vaults = _normalize_vault_scope(vault)
         # ACL guard mirroring `grep` below: when neither vault nor
         # user_id scopes the query, the prefilter block ends up
         # skipped (has_filters=False) and `_run_vector_search` runs
@@ -230,9 +238,10 @@ class SearchService:
                 candidate_vault_ids = await self._accessible_vault_ids(
                     conn, user_uuid=user_uuid, is_admin=is_admin, vaults=vaults,
                 )
-            # None  → admin / anon-with-named-vault → unscoped (mirrors the
-            #         source path's no-ACL admin behavior; admin sees all).
-            # []    → the user can read no matching vault → no results.
+            # None  → admin / anon with NO named vault → unscoped (mirrors the
+            #         source path's no-ACL admin behavior; admin sees all). A
+            #         named scope always resolves to ids (a list), never None.
+            # []    → the named vaults are all unreadable → no results.
             if candidate_vault_ids is not None and not candidate_vault_ids:
                 return SearchResponse(
                     query=query, total=0, returned=0, total_matches=0, results=[],
@@ -322,9 +331,9 @@ class SearchService:
                 if not doc_type or doc_type == "table":
                     t_params: list = []
                     t_conds: list[str] = []
-                    if vault:
-                        t_conds.append("v.name = $1")
-                        t_params.append(vault)
+                    if vaults:
+                        t_conds.append("v.name = ANY($1)")
+                        t_params.append(vaults)
                     acl_sql, acl_params = _vault_acl(len(t_params) + 1)
                     if acl_sql:
                         t_conds.append(acl_sql)
@@ -341,9 +350,9 @@ class SearchService:
                 if not doc_type or doc_type == "file":
                     f_params: list = []
                     f_conds: list[str] = []
-                    if vault:
-                        f_conds.append("v.name = $1")
-                        f_params.append(vault)
+                    if vaults:
+                        f_conds.append("v.name = ANY($1)")
+                        f_params.append(vaults)
                     if collection:
                         # vault_files.collection (TEXT) was dropped in
                         # migration 020 → collection_id FK. Filter via the
@@ -454,10 +463,11 @@ class SearchService:
         flag is a pure performance change, never a security change.
 
         Returns:
-          - ``None``  → no ACL filter needed (admin, or an anon caller scoped by
-            an explicit vault name) → an unscoped vector search, same as the
-            source path's no-ACL admin behavior.
-          - ``[]``    → the user can read no matching vault → caller returns [].
+          - ``None``  → no ACL filter needed: admin / anon with NO named scope
+            → an unscoped vector search (same as the source path's no-ACL admin
+            behavior). A named scope ALWAYS resolves to ids (never None).
+          - ``[]``    → the named vaults are all unreadable (or don't exist) →
+            caller returns [].
           - ``[id…]`` → the accessible vault id(s) to filter on.
         """
         # admin / anon mirror `_vault_acl` returning (None, []): no predicate.
@@ -818,13 +828,9 @@ class SearchService:
                     "results": [],
                 }
 
-        # `vault` accepts a single name (MCP / legacy) or a list (REST multi-
-        # vault scope). Normalize to a list of names, or None for "no scope".
-        vaults: list[str] | None = (
-            [vault] if isinstance(vault, str)
-            else ([v for v in vault if v] or None) if vault
-            else None
-        )
+        # Single name (MCP/legacy) or list (REST multi-vault scope) → canonical
+        # list, or None for "every accessible vault". See _normalize_vault_scope.
+        vaults = _normalize_vault_scope(vault)
         # ACL guard: when no vault is given we MUST have a user_id so the
         # SQL can scope to the vaults that user can access. A None user_id
         # in that branch would silently produce a cross-vault scan.

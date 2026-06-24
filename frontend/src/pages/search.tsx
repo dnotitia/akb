@@ -82,8 +82,8 @@ export default function SearchPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   // `/vault/:name/search` routes the vault in via URL params — that
   // scope is implicit and cannot be changed from the scope picker
-  // (you'd navigate to /search for cross-vault). The legacy `?v=`
-  // query param is honored only on the global `/search` route.
+  // (you'd navigate to /search for cross-vault). The `?v=` scope param
+  // (below) is honored only on the global `/search` route.
   const { name: scopedVault } = useParams<{ name: string }>();
   const q = searchParams.get("q") || "";
   // Sanitize instead of a bare cast: an unknown ?mode= must fall back to dense,
@@ -139,7 +139,12 @@ export default function SearchPage() {
 
   useEffect(() => {
     if (!scopedVault) {
-      listVaults().then((d) => setVaults(d.vaults || [])).catch(() => {});
+      // On failure the scope picker just won't render (the search still runs,
+      // unscoped or with whatever `?v=` is in the URL) — but don't swallow the
+      // error silently: log it so a broken /my/vaults is diagnosable.
+      listVaults()
+        .then((d) => setVaults(d.vaults || []))
+        .catch((e) => console.error("Failed to load vaults for the scope picker", e));
     }
   }, [scopedVault]);
 

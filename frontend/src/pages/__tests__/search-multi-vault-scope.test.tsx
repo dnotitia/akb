@@ -8,6 +8,7 @@
 //   - a selection renders the count label + a removable chip per vault
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 
 import SearchPage from "../search";
@@ -65,5 +66,46 @@ describe("SearchPage · multi-vault scope", () => {
     expect(
       screen.getByRole("button", { name: "Remove beta from search scope" }),
     ).toBeTruthy();
+  });
+});
+
+describe("SearchPage · multi-vault scope · interactions (write path)", () => {
+  it("checking a vault in the picker adds it to the scope and re-searches", async () => {
+    const user = userEvent.setup();
+    renderAt("/search?q=x&v=alpha");
+    await waitFor(() =>
+      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha"], 25),
+    );
+    await user.click(await screen.findByRole("button", { name: /Search scope/ }));
+    await user.click(await screen.findByRole("menuitemcheckbox", { name: "beta" }));
+    await waitFor(() =>
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["alpha", "beta"], 25),
+    );
+  });
+
+  it("removing a chip drops that vault from the scope and re-searches", async () => {
+    const user = userEvent.setup();
+    renderAt("/search?q=x&v=alpha,beta");
+    await waitFor(() =>
+      expect(mockedSearch).toHaveBeenCalledWith("x", ["alpha", "beta"], 25),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "Remove alpha from search scope" }),
+    );
+    await waitFor(() =>
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", ["beta"], 25),
+    );
+  });
+
+  it("Clear resets to all vaults (searchDocs called with undefined scope)", async () => {
+    const user = userEvent.setup();
+    renderAt("/search?q=x&v=alpha,beta");
+    await waitFor(() => expect(mockedSearch).toHaveBeenCalled());
+    await user.click(await screen.findByRole("button", { name: /Search scope/ }));
+    await user.click(await screen.findByRole("menuitem", { name: /Clear/ }));
+    await waitFor(() =>
+      expect(mockedSearch).toHaveBeenLastCalledWith("x", undefined, 25),
+    );
+    expect(await screen.findByText("All vaults (3)")).toBeTruthy();
   });
 });
