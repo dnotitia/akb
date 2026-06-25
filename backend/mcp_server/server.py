@@ -45,6 +45,7 @@ from app.util.errors import (
     exception_envelope,
     CONFLICT,
     EDIT_FAILED,
+    INSUFFICIENT_SCOPE,
     INTERNAL,
     INVALID_ARGUMENT,
     INVALID_PATH,
@@ -90,10 +91,17 @@ class _MCPUser:
         user_id: str = "00000000-0000-0000-0000-000000000000",
         username: str = "system",
         is_admin: bool = False,
+        oauth_scopes: list[str] | None = None,
     ):
         self.user_id = user_id
         self.username = username
         self.is_admin = is_admin
+        # OAuth scopes when the call came in via a Keycloak access token
+        # at /mcp; None for PAT / AKB JWT / fallback. The scope check in
+        # `_dispatch` is no-op when this is None — current behaviour for
+        # everyone who has not opted into the MCP-OAuth Resource Server
+        # path.
+        self.oauth_scopes = oauth_scopes
 
 _FALLBACK_USER = _MCPUser()
 
@@ -113,7 +121,12 @@ async def _get_user() -> _MCPUser:
             if auth_header:
                 user = await resolve_token(auth_header)
                 if user:
-                    return _MCPUser(user.user_id, user.username, is_admin=user.is_admin)
+                    return _MCPUser(
+                        user.user_id,
+                        user.username,
+                        is_admin=user.is_admin,
+                        oauth_scopes=user.oauth_scopes,
+                    )
                 # A credential was presented and rejected — that's a
                 # security-relevant event, so audit the denial. No token
                 # material is recorded.
@@ -131,6 +144,75 @@ search_service = SearchService()
 # ── Handler Registry ────────────────────────────────────────────
 
 _HANDLERS: dict[str, Any] = {}
+
+# OAuth scope required to invoke each tool — checked in _dispatch when
+# the caller authenticated via the MCP OAuth Resource Server path (a
+# Keycloak access token with a non-None `oauth_scopes`). PAT and AKB
+# JWT callers carry `oauth_scopes is None` and skip the check entirely,
+# preserving current behaviour for stdio / CLI clients.
+#
+# The vocabulary is deliberately coarse — read vs write at the vault
+# level. Finer-grained access (per-vault role, public visibility,
+# collection ACL) stays in PG-RBAC + `vault_access`; surfacing those as
+# OAuth scopes would force users to consent to a list of vaults the
+# realm cannot know about. Two scopes are the right altitude for the
+# consent screen.
+#
+# Categorisation rule of thumb: any tool that mutates a vault, table,
+# document, file, edge, publication, vault membership, or vault
+# settings → `akb:vault:write`. Everything else (read / browse /
+# search / metadata / introspection) → `akb:vault:read`. `akb_sql` is
+# write-grade because the surface accepts INSERT/UPDATE/DELETE; the
+# safer "read-only SQL" cut would need a separate tool, deferred.
+_READ_SCOPE = "akb:vault:read"
+_WRITE_SCOPE = "akb:vault:write"
+_TOOL_SCOPES: dict[str, str] = {
+    # --- read ---
+    "akb_help": _READ_SCOPE,
+    "akb_whoami": _READ_SCOPE,
+    "akb_list_vaults": _READ_SCOPE,
+    "akb_vault_info": _READ_SCOPE,
+    "akb_vault_members": _READ_SCOPE,
+    "akb_search_users": _READ_SCOPE,
+    "akb_browse": _READ_SCOPE,
+    "akb_get": _READ_SCOPE,
+    "akb_search": _READ_SCOPE,
+    "akb_grep": _READ_SCOPE,
+    "akb_drill_down": _READ_SCOPE,
+    "akb_activity": _READ_SCOPE,
+    "akb_diff": _READ_SCOPE,
+    "akb_history": _READ_SCOPE,
+    "akb_relations": _READ_SCOPE,
+    "akb_graph": _READ_SCOPE,
+    "akb_provenance": _READ_SCOPE,
+    "akb_publications": _READ_SCOPE,
+    "akb_publication_snapshot": _READ_SCOPE,
+    "akb_export": _READ_SCOPE,
+    # --- write ---
+    "akb_put": _WRITE_SCOPE,
+    "akb_update": _WRITE_SCOPE,
+    "akb_move": _WRITE_SCOPE,
+    "akb_edit": _WRITE_SCOPE,
+    "akb_delete": _WRITE_SCOPE,
+    "akb_link": _WRITE_SCOPE,
+    "akb_unlink": _WRITE_SCOPE,
+    "akb_create_collection": _WRITE_SCOPE,
+    "akb_delete_collection": _WRITE_SCOPE,
+    "akb_create_vault": _WRITE_SCOPE,
+    "akb_delete_vault": _WRITE_SCOPE,
+    "akb_archive_vault": _WRITE_SCOPE,
+    "akb_create_table": _WRITE_SCOPE,
+    "akb_alter_table": _WRITE_SCOPE,
+    "akb_drop_table": _WRITE_SCOPE,
+    "akb_sql": _WRITE_SCOPE,
+    "akb_grant": _WRITE_SCOPE,
+    "akb_revoke": _WRITE_SCOPE,
+    "akb_publish": _WRITE_SCOPE,
+    "akb_unpublish": _WRITE_SCOPE,
+    "akb_set_public": _WRITE_SCOPE,
+    "akb_transfer_ownership": _WRITE_SCOPE,
+    "akb_import": _WRITE_SCOPE,
+}
 
 # Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
 # to reject unknown arguments with a fuzzy hint. Built once at import
@@ -1319,6 +1401,29 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     handler = _HANDLERS.get(name)
     if not handler:
         return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+
+    # OAuth scope enforcement — only when the caller's session is
+    # authenticated via a Keycloak access token (oauth_scopes is a
+    # concrete list, possibly empty). PAT and AKB JWT keep
+    # `oauth_scopes is None` so this check is a no-op for them, which
+    # preserves stdio/CLI behaviour bit-for-bit.
+    #
+    # Tools not present in `_TOOL_SCOPES` fail CLOSED to the write
+    # scope. A newly added tool that forgets a scope mapping is almost
+    # always a write tool (the new tools shipped this PR cycle are);
+    # writing for OAuth requires `akb:vault:write`, which the user has
+    # to have explicitly consented to, so the closed default is safe.
+    # A test in `test_mcp_oauth_unit` asserts every registered handler
+    # has an explicit mapping so CI catches the omission anyway.
+    if user.oauth_scopes is not None:
+        required = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+        if required not in user.oauth_scopes:
+            return err(
+                f"OAuth token is missing required scope '{required}' for tool '{name}'",
+                code=INSUFFICIENT_SCOPE,
+                required_scope=required,
+                granted_scopes=list(user.oauth_scopes),
+            )
 
     # Reject unknown arguments before the handler sees them. Without
     # this, a typo like `akb_activity(user=...)` (real name: `author`)

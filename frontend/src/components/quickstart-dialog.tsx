@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Rocket, Plus, Copy, Check, Eye, EyeOff } from "lucide-react";
 import {
   Dialog,
@@ -13,8 +13,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { CodeSnippet } from "@/components/ui/code-snippet";
-import { createPAT } from "@/lib/api";
-import { mcpInstallSnippets, MCP_AGENT_LABELS, MCP_AGENT_FILES, type McpAgent } from "@/lib/mcp-snippets";
+import { createPAT, getAuthConfig } from "@/lib/api";
+import {
+  mcpInstallSnippets,
+  mcpOAuthSnippets,
+  MCP_AGENT_LABELS,
+  MCP_AGENT_FILES,
+  type McpAgent,
+} from "@/lib/mcp-snippets";
+
+type ConnectMode = "pat" | "oauth";
 
 export const QUICKSTART_DISMISS_KEY = "akb.quickstartDismissed";
 
@@ -39,6 +47,22 @@ export function QuickstartDialog({
   const [showPat, setShowPat] = useState(true);
   const [copied, setCopied] = useState(false);
   const [agent, setAgent] = useState<McpAgent>("claude");
+  // Surface the OAuth path alongside PAT mint when the backend has
+  // mcp_oauth_enabled. Default mode = `pat` for parity with the rest of
+  // the quickstart flow, but a fresh user with OAuth available can flip
+  // and skip Step 1 entirely.
+  const [oauthEnabled, setOauthEnabled] = useState(false);
+  const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
+  useEffect(() => {
+    let cancelled = false;
+    getAuthConfig().then((cfg) => {
+      if (!cancelled) setOauthEnabled(!!cfg.mcp_oauth?.enabled);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const oauthSnippetsMap = useMemo(() => mcpOAuthSnippets(), []);
 
   const snippets = useMemo(() => mcpInstallSnippets(pat || "<YOUR_PAT>"), [pat]);
 
@@ -149,6 +173,36 @@ export function QuickstartDialog({
         {/* Step 2 — install snippet */}
         <div className="space-y-2">
           <div className="coord-spark">Step 2 · Add it to your agent</div>
+          {/* Same Token/OAuth toggle as Settings → Tokens — hidden when
+              the backend doesn't advertise the OAuth path. */}
+          {oauthEnabled && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="coord">Auth</span>
+              <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setConnectMode("pat")}
+                  className={`px-3 py-1 ${connectMode === "pat" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                  aria-pressed={connectMode === "pat"}
+                >
+                  Token (PAT)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConnectMode("oauth")}
+                  className={`px-3 py-1 ${connectMode === "oauth" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                  aria-pressed={connectMode === "oauth"}
+                >
+                  OAuth
+                </button>
+              </div>
+              <span className="text-foreground-muted">
+                {connectMode === "oauth"
+                  ? "Skip Step 1 — sign in via browser."
+                  : "Use the PAT minted in Step 1."}
+              </span>
+            </div>
+          )}
           <Tabs value={agent} onValueChange={(v) => setAgent(v as McpAgent)}>
             <TabsList className="flex-wrap">
               {(Object.keys(MCP_AGENT_LABELS) as McpAgent[]).map((a) => (
@@ -156,9 +210,25 @@ export function QuickstartDialog({
               ))}
             </TabsList>
             <TabsContent value={agent} className="pt-2">
-              <CodeSnippet code={snippets[agent]} filename={MCP_AGENT_FILES[agent]} />
-              {!pat && (
-                <p className="mt-2 coord">Mint a token above to drop a ready-to-paste command.</p>
+              {connectMode === "oauth" ? (
+                oauthSnippetsMap[agent] !== undefined ? (
+                  <CodeSnippet
+                    code={oauthSnippetsMap[agent] as string}
+                    filename={MCP_AGENT_FILES[agent]}
+                  />
+                ) : (
+                  <div className="rounded-[var(--radius-md)] border border-border px-4 py-3 text-sm text-foreground-muted">
+                    {MCP_AGENT_LABELS[agent]} uses the stdio path — switch the
+                    toggle to <span className="text-accent-strong">Token (PAT)</span> for its snippet.
+                  </div>
+                )
+              ) : (
+                <>
+                  <CodeSnippet code={snippets[agent]} filename={MCP_AGENT_FILES[agent]} />
+                  {!pat && (
+                    <p className="mt-2 coord">Mint a token above to drop a ready-to-paste command.</p>
+                  )}
+                </>
               )}
             </TabsContent>
           </Tabs>

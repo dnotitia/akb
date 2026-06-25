@@ -49,6 +49,18 @@ def _validate_required_settings() -> None:
                 "keycloak_client_secret (confidential client — set it in "
                 "secret.yaml, or set keycloak_public_client: true for PKCE)"
             )
+    # MCP-OAuth (the Resource Server path) reuses the Keycloak JWKS,
+    # issuer, and audience-mapped scopes — so it's only meaningful when
+    # `keycloak_enabled` is also true. A deployment with mcp_oauth on +
+    # keycloak off would 503 mid-discovery and silently reject every
+    # RS256 token. Fail the boot instead so the misconfig surfaces at
+    # deploy time.
+    if settings.mcp_oauth_enabled and not settings.keycloak_enabled:
+        missing.append(
+            "keycloak_enabled (mcp_oauth_enabled is true — the OAuth "
+            "Resource Server path keys on the realm's JWKS + issuer; "
+            "either turn keycloak on, or turn mcp_oauth off)"
+        )
     if missing:
         raise RuntimeError(
             "Required configuration missing:\n  - " + "\n  - ".join(missing)

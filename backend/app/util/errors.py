@@ -51,6 +51,11 @@ NOT_FOUND = "not_found"
 # Authorization / permission
 PERMISSION_DENIED = "permission_denied"
 VAULT_ARCHIVED = "vault_archived"
+# RFC 6750 §3.1 — OAuth scope check failed at MCP tool dispatch
+# (caller is authenticated but the access token lacks the scope the
+# tool requires). PERMISSION_DENIED is for AKB-internal access (vault
+# role, public visibility); this is the OAuth-layer counterpart.
+INSUFFICIENT_SCOPE = "insufficient_scope"
 
 # Caller-side input
 INVALID_ARGUMENT = "invalid_argument"      # generic argument shape problem

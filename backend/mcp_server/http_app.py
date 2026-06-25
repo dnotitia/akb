@@ -1,9 +1,14 @@
 """MCP Streamable HTTP — mounts MCP server as ASGI app at /mcp.
 
 Each authenticated session gets its own transport + server loop.
-Agents connect via:
+Agents connect via one of:
   POST http://localhost:8000/mcp/
-  Authorization: Bearer akb_<pat>
+  Authorization: Bearer akb_<pat>              # PAT (always)
+  Authorization: Bearer <hs256-jwt>            # AKB session JWT (always)
+  Authorization: Bearer <rs256-jwt>            # Keycloak access token,
+                                               # when mcp_oauth_enabled=true.
+                                               # Discovery + DCR via
+                                               # /.well-known/oauth-protected-resource.
 """
 
 from __future__ import annotations
@@ -18,9 +23,30 @@ from starlette.types import Receive, Scope, Send
 
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 
+from app.config import settings
 from app.services.auth_service import resolve_token
 
 logger = logging.getLogger("akb.mcp")
+
+
+def _www_authenticate_header() -> str:
+    """Build the RFC 9728 §5 `WWW-Authenticate` header value for 401s.
+
+    When MCP-OAuth is enabled the header carries a `resource_metadata`
+    parameter pointing the client at the protected-resource metadata
+    document, so a standards-compliant MCP client (Claude Code,
+    claude.ai, ChatGPT) can autodiscover the authorization server and
+    initiate DCR + the auth-code flow. When disabled (PAT-only), we
+    emit the plain `Bearer` challenge — there is no AS to discover.
+    """
+    base = 'Bearer realm="akb-mcp"'
+    if settings.mcp_oauth_enabled and settings.public_base_url:
+        meta_url = (
+            f"{settings.public_base_url.rstrip('/')}"
+            "/.well-known/oauth-protected-resource"
+        )
+        return f'{base}, resource_metadata="{meta_url}"'
+    return base
 
 # Active transports keyed by session ID
 _transports: dict[str, StreamableHTTPServerTransport] = {}
@@ -65,19 +91,34 @@ class MCPApp:
 
         request = Request(scope, receive, send)
 
-        # Auth check
+        # Auth check. resolve_token handles all three Bearer shapes
+        # (PAT, AKB JWT, Keycloak access token); MCP-OAuth gating is
+        # internal to it. 401s carry an RFC 9728 WWW-Authenticate
+        # header so a standards-compliant MCP client can autodiscover
+        # the AS and complete OAuth without an out-of-band tip-off.
         auth_header = request.headers.get("authorization", "")
+        www_auth = _www_authenticate_header()
         if not auth_header:
+            hint = (
+                "Authorization required."
+                if settings.mcp_oauth_enabled
+                else "Authorization required. Use: Bearer akb_<your-pat>"
+            )
             response = JSONResponse(
-                {"error": "Authorization required. Use: Bearer akb_<your-pat>"},
+                {"error": hint},
                 status_code=401,
+                headers={"WWW-Authenticate": www_auth},
             )
             await response(scope, receive, send)
             return
 
         user = await resolve_token(auth_header)
         if not user:
-            response = JSONResponse({"error": "Invalid or expired token"}, status_code=401)
+            response = JSONResponse(
+                {"error": "Invalid or expired token"},
+                status_code=401,
+                headers={"WWW-Authenticate": www_auth},
+            )
             await response(scope, receive, send)
             return
 

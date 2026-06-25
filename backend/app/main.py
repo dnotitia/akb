@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.deps import get_current_user, get_optional_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
-from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, public, search, collections, knowledge, knowledge_io, tables
+from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
 from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -78,6 +78,11 @@ app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"]
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
 app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])
+
+# RFC 9728 — well-known protected-resource metadata for /mcp. Mounted
+# at the root (not under /api/v1) because the spec requires
+# `/.well-known/...` literally on the resource's own origin.
+app.include_router(oauth_metadata.router)
 
 # Mount MCP Streamable HTTP at /mcp
 app.mount("/mcp", mcp_app)

@@ -37,6 +37,20 @@ spec:
                 name: backend
                 port:
                   number: 8000
+          # OAuth 2.0 Protected Resource Metadata (RFC 9728) — and any
+          # other `/.well-known/*` an MCP client probes for discovery
+          # (RFC 8414 oauth-authorization-server, openid-configuration).
+          # We route the whole prefix to the backend so unknown paths
+          # return a proper 404 JSON instead of being caught by the
+          # frontend SPA's index.html catch-all (which would deliver a
+          # 200 HTML page that breaks the client's JSON parser).
+          - path: /.well-known/
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
           # Health endpoints (detailed, liveness, readiness)
           - path: /health
             pathType: Exact

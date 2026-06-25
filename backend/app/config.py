@@ -250,6 +250,31 @@ class Settings(BaseModel):
     # POST so the token never rides in a URL. Keep this small.
     keycloak_exchange_code_ttl_secs: int = 60
 
+    # === MCP OAuth Resource Server (optional, separate from SSO) ===
+    # When true, AKB's /mcp endpoint accepts Keycloak-issued access tokens
+    # (RS256) in addition to the existing PAT (`akb_*`) and AKB JWT (HS256)
+    # paths. Web-hosted LLM clients (claude.ai / ChatGPT Custom Connectors,
+    # Claude Code's HTTP transport) discover the authorization server via
+    # `/.well-known/oauth-protected-resource` (RFC 9728), register
+    # themselves via DCR (RFC 7591) against Keycloak, and obtain an access
+    # token with the `akb:vault:read` / `akb:vault:write` scopes.
+    #
+    # Requires `keycloak_enabled = true` — AKB is a Resource Server only;
+    # the Authorization Server (DCR / authorize / consent / token /
+    # refresh) is the OIDC IdP. AKB never registers clients or issues
+    # OAuth access tokens itself.
+    #
+    # Disabled (the default) keeps /mcp on PAT-only behaviour
+    # bit-for-bit — stdio clients (Claude Desktop, Codex CLI via
+    # akb-mcp) are unaffected even when this is left off.
+    #
+    # See docs/designs/mcp-oauth-dcr/00-overview.md.
+    mcp_oauth_enabled: bool = False
+    # Audience claim the access token must carry to be usable at /mcp.
+    # Defaults to `<public_base_url>/mcp`; override only if you front the
+    # MCP endpoint at a separate hostname.
+    mcp_oauth_audience: str = ""
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
@@ -411,6 +436,19 @@ class Settings(BaseModel):
     def keycloak_end_session_endpoint(self) -> str:
         # Browser-facing → public issuer.
         return f"{self.keycloak_issuer}/protocol/openid-connect/logout"
+
+    @property
+    def mcp_oauth_audience_effective(self) -> str:
+        """Resolved audience claim required on Keycloak access tokens
+        presented at /mcp. Empty string when MCP-OAuth is off."""
+        if not self.mcp_oauth_enabled:
+            return ""
+        if self.mcp_oauth_audience:
+            return self.mcp_oauth_audience
+        # Default: <public_base_url>/mcp. public_base_url is required at
+        # startup (lifecycle validates it), so by the time this property
+        # is read in a request path it will be non-empty.
+        return f"{self.public_base_url.rstrip('/')}/mcp"
 
     @property
     def database_url(self) -> str:

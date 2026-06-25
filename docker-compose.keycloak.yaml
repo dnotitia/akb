@@ -1,10 +1,11 @@
 # OPTIONAL local Keycloak overlay — for developing/testing the optional
-# Keycloak SSO login path. NOT part of the default stack.
+# Keycloak SSO login path AND the MCP OAuth Resource Server path
+# (claude.ai / Claude Code Custom Connectors). NOT part of the default stack.
 #
 # Usage:
 #   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up
 #
-# Then enable SSO in config/app.yaml (these match the imported realm
+# === SSO path === enable in config/app.yaml (matches the imported realm
 # `deploy/keycloak-dev/akb-realm.json` and the split localhost/container URLs):
 #
 #   keycloak_enabled: true
@@ -20,9 +21,32 @@
 #
 # Test user (in the imported realm): alice / alice-password (alice@example.com).
 #
-# The realm import ships a FIXED dev client secret ("local-akb-dev-secret").
-# That is a throwaway local value (same spirit as the hard-coded `akb`
-# Postgres password in docker-compose.yaml) — never reuse it anywhere real.
+# === MCP OAuth path === additionally:
+#
+#   mcp_oauth_enabled: true
+#   public_base_url: "http://localhost:8000"
+#   mcp_oauth_audience: ""    # default → "http://localhost:8000/mcp"
+#                             # MUST match the audience baked into the
+#                             # akb:vault:* scope mappers in akb-realm.json
+#
+# For E2E / CI (`backend/tests/test_mcp_oauth_e2e.sh`) the realm ships
+# `akb-mcp-test` — a confidential service-account client (secret
+# "local-akb-mcp-test-secret") with `akb:vault:read|write` as default
+# scopes. It mints access tokens via the client_credentials grant so
+# the test exercises the Resource Server path headlessly, without a
+# browser DCR roundtrip.
+#
+# Real Claude Code / claude.ai validation: the local Keycloak overlay
+# works for headless E2E but Claude Code's OAuth discovery requires
+# the AS metadata URL to be HTTPS. Easiest path is to point a local
+# AKB backend at an already-deployed HTTPS Keycloak realm (e.g. a
+# staging instance). See `docs/mcp-clients/web-connectors.md` for the
+# walkthrough.
+#
+# The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
+# "local-akb-mcp-test-secret"). Throwaway local values (same spirit as
+# the hard-coded `akb` Postgres password in docker-compose.yaml) — never
+# reuse them anywhere real.
 
 services:
   keycloak:
