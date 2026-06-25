@@ -158,14 +158,50 @@ def main() -> int:
     current = set(th.get("config", {}).get("trusted-hosts", []) or [])
     print(f"    current: {sorted(current)}")
     desired = current | set(args.trusted_host)
+    changed = False
     if desired != current:
         th["config"]["trusted-hosts"] = sorted(desired)
+        changed = True
+    # The sender-host check rejects every legitimate DCR from a moving
+    # client (Claude Code on a laptop, claude.ai's egress, etc.) because
+    # those hosts can't be allowlisted upfront. The redirect-URI check
+    # below is the meaningful guard; turn the sender-host check off so
+    # DCR actually works from anywhere a client lives.
+    if th.get("config", {}).get("host-sending-registration-request-must-match") != ["false"]:
+        th["config"]["host-sending-registration-request-must-match"] = ["false"]
+        changed = True
+    if changed:
         s, r, _ = http("PUT", f"{base}/components/{th['id']}", token, body=th)
         if s not in (200, 204):
             sys.exit(f"PUT trusted-hosts failed: {s} {r}")
-        print(f"    updated: {th['config']['trusted-hosts']}")
+        print(f"    updated: trusted-hosts={th['config']['trusted-hosts']} sender-check=off")
     else:
-        print("    no-op (already contains requested hosts)")
+        print("    no-op (already permissive on sender + contains requested hosts)")
+
+    # ── 1b. allowed-client-templates ──────────────────────────
+    # The default "Allowed Client Scopes" anonymous-DCR policy rejects
+    # any DCR body that includes `scope=openid` because Keycloak does
+    # not list `openid` in the realm's client-scope catalog (it is the
+    # OIDC sentinel, not a Keycloak scope). MCP-spec clients (Claude
+    # Code, claude.ai, ChatGPT) always send `openid` in the DCR scope
+    # field, so this policy must be removed for anonymous DCR. The
+    # `consent-required`, `trusted-hosts` (URI), and `max-clients`
+    # policies remain as the meaningful guards. The [authenticated]
+    # variant of this policy stays — it gates registrations made with
+    # an Initial Access Token, which is the operator-controlled path.
+    print("\n[1b] allowed-client-templates policy (anonymous)")
+    actp = next(
+        (c for c in comps if c.get("providerId") == "allowed-client-templates"
+         and c.get("subType") == "anonymous"),
+        None,
+    )
+    if actp:
+        s, r, _ = http("DELETE", f"{base}/components/{actp['id']}", token)
+        if s not in (200, 204):
+            sys.exit(f"DELETE allowed-client-templates failed: {s} {r}")
+        print("    removed (was rejecting DCR bodies that include scope=openid)")
+    else:
+        print("    no-op (already removed)")
 
     # ── 2. client scopes + audience mappers ───────────────────
     created_ids: dict[str, str] = {}
