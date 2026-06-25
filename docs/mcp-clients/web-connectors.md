@@ -86,8 +86,14 @@ Should return JSON with `resource`, `authorization_servers`, and
 ## Add AKB to Claude Code
 
 ```bash
-claude mcp add --transport http akb https://akb.example.com/mcp
+claude mcp add --transport http akb https://akb.example.com/mcp/
 ```
+
+> **Trailing slash matters.** Register with the trailing `/mcp/`, not
+> bare `/mcp`. Backend issues a 307 redirect from `/mcp` → `/mcp/`,
+> which drops the POST body and breaks the session/initialize
+> handshake — the connector then appears as "Failed to connect" in
+> `claude mcp list` even though OAuth succeeded.
 
 The command itself does **not** open a browser. `claude mcp list` will
 show:
