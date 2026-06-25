@@ -295,11 +295,20 @@ class KeycloakOIDC:
         if not kid:
             return None
 
-        jwks = await self._fetch_jwks()
-        key = self._find_key(jwks, kid)
-        if key is None:
-            jwks = await self._fetch_jwks(force=True)
+        # `_fetch_jwks` raises `AKBError` on IdP unreachability — catch
+        # it here so a transient JWKS blip surfaces as a clean 401
+        # (with the RFC 9728 `WWW-Authenticate` header the MCP handler
+        # adds) rather than a bare 502. The 401 lets a spec-compliant
+        # client re-run discovery; a 502 has no such affordance.
+        try:
+            jwks = await self._fetch_jwks()
             key = self._find_key(jwks, kid)
+            if key is None:
+                jwks = await self._fetch_jwks(force=True)
+                key = self._find_key(jwks, kid)
+        except AKBError as e:
+            logger.warning("MCP access token: JWKS unavailable (%s)", e)
+            return None
         if key is None:
             return None
 

@@ -1406,14 +1406,18 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # authenticated via a Keycloak access token (oauth_scopes is a
     # concrete list, possibly empty). PAT and AKB JWT keep
     # `oauth_scopes is None` so this check is a no-op for them, which
-    # preserves stdio/CLI behaviour bit-for-bit. The required scope is
-    # the static per-tool map; tools not in the map are open by default
-    # so a newly added tool that forgets a scope mapping fails open at
-    # this layer (and stays gated by PG-RBAC + vault role, which is the
-    # authoritative access boundary).
+    # preserves stdio/CLI behaviour bit-for-bit.
+    #
+    # Tools not present in `_TOOL_SCOPES` fail CLOSED to the write
+    # scope. A newly added tool that forgets a scope mapping is almost
+    # always a write tool (the new tools shipped this PR cycle are);
+    # writing for OAuth requires `akb:vault:write`, which the user has
+    # to have explicitly consented to, so the closed default is safe.
+    # A test in `test_mcp_oauth_unit` asserts every registered handler
+    # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _TOOL_SCOPES.get(name)
-        if required and required not in user.oauth_scopes:
+        required = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+        if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
                 code=INSUFFICIENT_SCOPE,

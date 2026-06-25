@@ -45,8 +45,21 @@ If the realm already had any of the above, those steps no-op.
 
 In the Keycloak admin console, in your realm:
 
-- **Realm Settings → Client Registration → Policies**: open `Trusted
-  Hosts` and add `localhost`, `127.0.0.1` to the trusted hosts list.
+- **Realm Settings → Client Registration → Policies → Trusted Hosts**:
+  - Add `localhost`, `127.0.0.1` to the trusted hosts list (the
+    redirect-URI guard).
+  - **Turn OFF** `Host sending registration request must match` —
+    MCP clients DCR from dynamic IPs (a laptop on the move,
+    claude.ai's egress) that can't be allowlisted upfront. The
+    redirect-URI guard is the meaningful check; the sender-IP check
+    rejects every legitimate registration if left on.
+- **Realm Settings → Client Registration → Policies → Allowed Client
+  Scopes (anonymous)**: **Delete this policy.** Keycloak does not
+  list the OIDC sentinel scope `openid` in its client-scope catalog,
+  so the default policy rejects every spec-compliant DCR request
+  (Claude Code, claude.ai, ChatGPT all include `openid` in the DCR
+  scope field). The `Consent Required`, `Trusted Hosts` (URI), and
+  `Max Clients Limit` policies stay as the meaningful guards.
 - **Client Scopes → Create**: add `akb:vault:read` and `akb:vault:write`
   with the listed display + consent text. Add an `oidc-audience-mapper`
   protocol mapper to each, with `Included Custom Audience` set to your

@@ -39,10 +39,17 @@ import {
   createPAT,
   listPATs,
   revokePAT,
+  getAuthConfig,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { recentIcon, recentTone } from "@/lib/recent";
-import { mcpInstallSnippets, MCP_AGENT_FILES } from "@/lib/mcp-snippets";
+import {
+  mcpInstallSnippets,
+  mcpOAuthSnippets,
+  MCP_AGENT_FILES,
+} from "@/lib/mcp-snippets";
+
+type ConnectMode = "pat" | "oauth";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 
@@ -189,6 +196,20 @@ export default function HomePage() {
 
   const pat = activePat || "<YOUR_PAT>";
   const snippets = useMemo(() => mcpInstallSnippets(pat), [pat]);
+  const oauthSnippetsMap = useMemo(() => mcpOAuthSnippets(), []);
+  // Toggle gated on the backend advertising mcp_oauth.enabled. Default
+  // mode = PAT for parity with the rest of the home CONNECT UX.
+  const [oauthEnabled, setOauthEnabled] = useState(false);
+  const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
+  useEffect(() => {
+    let cancelled = false;
+    getAuthConfig().then((cfg) => {
+      if (!cancelled) setOauthEnabled(!!cfg.mcp_oauth?.enabled);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Home shows a preview of the vault directory; the full list (with filter)
   // lives on /vault. Memoized so <VaultList> doesn't re-fetch metrics on every
@@ -483,6 +504,31 @@ export default function HomePage() {
               {/* Snippet — compact tabs, one panel. */}
               <div className="p-4 border-b border-border">
                 <div className="coord-spark mb-2">Drop snippet</div>
+                {oauthEnabled && (
+                  <div className="flex items-center gap-2 text-[10px] mb-2">
+                    <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => setConnectMode("pat")}
+                        className={`px-2 py-0.5 ${connectMode === "pat" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                        aria-pressed={connectMode === "pat"}
+                      >
+                        PAT
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConnectMode("oauth")}
+                        className={`px-2 py-0.5 ${connectMode === "oauth" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                        aria-pressed={connectMode === "oauth"}
+                      >
+                        OAuth
+                      </button>
+                    </div>
+                    <span className="text-foreground-muted">
+                      {connectMode === "oauth" ? "Browser sign-in." : "Paste a minted token."}
+                    </span>
+                  </div>
+                )}
                 <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
                   <TabsList className="flex-wrap gap-0 mb-2">
                     <TabsTrigger value="claude" className="px-2 py-1 text-[10px]">Claude Code</TabsTrigger>
@@ -492,7 +538,20 @@ export default function HomePage() {
                     <TabsTrigger value="openclaw" className="px-2 py-1 text-[10px]">OpenClaw</TabsTrigger>
                   </TabsList>
                   <TabsContent value={tab}>
-                    <CodeSnippet code={snippets[tab]} filename={MCP_AGENT_FILES[tab]} />
+                    {connectMode === "oauth" ? (
+                      oauthSnippetsMap[tab] !== undefined ? (
+                        <CodeSnippet
+                          code={oauthSnippetsMap[tab] as string}
+                          filename={MCP_AGENT_FILES[tab]}
+                        />
+                      ) : (
+                        <div className="rounded-[var(--radius-md)] border border-border px-3 py-2 text-[10px] text-foreground-muted">
+                          stdio path — switch to PAT for this client.
+                        </div>
+                      )
+                    ) : (
+                      <CodeSnippet code={snippets[tab]} filename={MCP_AGENT_FILES[tab]} />
+                    )}
                   </TabsContent>
                 </Tabs>
               </div>

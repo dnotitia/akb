@@ -39,10 +39,9 @@
 # Real Claude Code / claude.ai validation: the local Keycloak overlay
 # works for headless E2E but Claude Code's OAuth discovery requires
 # the AS metadata URL to be HTTPS. Easiest path is to point a local
-# AKB backend at the prod Keycloak realm at
-# `https://auth.seahorse.dnotitia.com/realms/akb` — already https, DCR
-# trusted-hosts already include `localhost`/`127.0.0.1`. See
-# `docs/mcp-clients/web-connectors.md` for the walkthrough.
+# AKB backend at an already-deployed HTTPS Keycloak realm (e.g. a
+# staging instance). See `docs/mcp-clients/web-connectors.md` for the
+# walkthrough.
 #
 # The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
 # "local-akb-mcp-test-secret"). Throwaway local values (same spirit as

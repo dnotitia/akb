@@ -462,3 +462,108 @@ def test_www_authenticate_carries_resource_metadata_when_oauth_on(monkeypatch):
     h = _www_authenticate_header()
     assert h.startswith("Bearer realm=")
     assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource"' in h
+
+
+# ── _TOOL_SCOPES completeness (CI guard) ──────────────────────────
+
+
+def test_every_registered_tool_has_an_explicit_scope_mapping():
+    """A new tool added to `_HANDLERS` without an entry in `_TOOL_SCOPES`
+    would silently fail closed to write (which is safe) — but the
+    intent is that every tool's scope is an explicit, reviewed choice.
+    Lock that down here so a PR adding a read-grade tool can't
+    inadvertently promote it to write-grade by forgetting the map."""
+    from mcp_server.server import _HANDLERS, _TOOL_SCOPES
+
+    unmapped = sorted(set(_HANDLERS.keys()) - set(_TOOL_SCOPES.keys()))
+    assert unmapped == [], (
+        f"Tools registered without a _TOOL_SCOPES entry: {unmapped}. "
+        "Add each to _TOOL_SCOPES with the appropriate read/write scope."
+    )
+
+
+@pytest.mark.asyncio
+async def test_unmapped_tool_falls_back_to_write_scope_when_oauth_caller():
+    """A defensive check for the fail-closed path: even with the
+    completeness test above in place, if a future tool slips through
+    (test bypass / dynamic registration), an OAuth caller without
+    `akb:vault:write` must NOT be able to invoke it."""
+    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
+
+    # Register a fake tool that's deliberately NOT in _TOOL_SCOPES.
+    async def _stub(args, uid, user):
+        return {"ok": True}
+
+    _HANDLERS["__unmapped_test_tool__"] = _stub
+    try:
+        # Read-only OAuth caller — must be refused at unmapped tool.
+        read_user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
+        result = await _dispatch("__unmapped_test_tool__", {}, read_user)
+        assert result.get("code") == "insufficient_scope"
+        assert result.get("details", {}).get("required_scope") == "akb:vault:write"
+        # Write-grade OAuth caller — allowed through.
+        write_user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:write"])
+        result = await _dispatch("__unmapped_test_tool__", {}, write_user)
+        assert result == {"ok": True}
+    finally:
+        _HANDLERS.pop("__unmapped_test_tool__", None)
+
+
+# ── verify_access_token resilience ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_access_token_returns_none_on_jwks_unreachable(monkeypatch, rsa_keypair):
+    """JWKS endpoint flap must not surface as 502 — return None so the
+    MCP handler issues a clean 401 with the RFC 9728 hint and the
+    client retries discovery."""
+    from app.services.keycloak_oidc import KeycloakOIDC
+    from app.exceptions import AKBError
+
+    issuer = "https://kc.example.com/realms/akb"
+    audience = "https://akb.example.com/mcp"
+    monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
+    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+
+    svc = KeycloakOIDC()
+    # Stub _fetch_jwks to simulate "Keycloak unreachable".
+    async def _boom(*_a, **_kw):
+        raise AKBError("Keycloak unreachable fetching JWKS", status_code=502)
+    monkeypatch.setattr(svc, "_fetch_jwks", _boom)
+
+    token = _mint_access_token(
+        private_pem=rsa_keypair["private_pem"],
+        kid="test-key-1",
+        audience=audience,
+        issuer=issuer,
+    )
+    assert await svc.verify_access_token(token, audience) is None
+
+
+# ── SPA-audience token must not be usable at /mcp ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_rejects_spa_audience_token(monkeypatch, rsa_keypair):
+    """The existing `akb-web` SSO client mints ID tokens with
+    aud=akb-web for the browser login flow. Those tokens must NOT be
+    accepted at /mcp — the audience binding is what stops cross-client
+    confusion."""
+    from app.services.keycloak_oidc import KeycloakOIDC
+
+    issuer = "https://kc.example.com/realms/akb"
+    monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
+    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+
+    svc = KeycloakOIDC()
+    svc._jwks = {"keys": [rsa_keypair["jwk"]]}
+
+    # Token minted with the SPA's audience (the client_id).
+    spa_token = _mint_access_token(
+        private_pem=rsa_keypair["private_pem"],
+        kid="test-key-1",
+        audience="akb-web",
+        issuer=issuer,
+    )
+    # Validated against the MCP resource audience → rejected.
+    assert await svc.verify_access_token(spa_token, "https://akb.example.com/mcp") is None
