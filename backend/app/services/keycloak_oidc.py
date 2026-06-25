@@ -259,6 +259,66 @@ class KeycloakOIDC:
 
         return claims
 
+    # ── Access-token verification (MCP OAuth Resource Server) ────────
+    async def verify_access_token(
+        self, token: str, audience: str
+    ) -> dict[str, Any] | None:
+        """Verify a Keycloak-issued access token for the MCP Resource
+        Server path. Returns the claim set on success, ``None`` on any
+        verification failure.
+
+        Distinct from :meth:`verify_id_token` in three ways:
+        - The expected ``aud`` is the *resource* (``<host>/mcp``), not the
+          OIDC client id, because Keycloak emits the audience via the
+          scope-level hardcoded-audience mapper set up by the realm
+          bootstrap script.
+        - Returns ``None`` rather than raising on failure: the caller is
+          an MCP request handler that distinguishes "no auth" from "bad
+          auth" via response codes, not exceptions.
+        - Stricter required-claims set: ``exp``, ``iat``, ``iss``, ``aud``,
+          ``sub`` (a Keycloak access token may carry no ``scope`` claim
+          when no scopes were requested — the scope check is enforced
+          downstream in the MCP dispatcher, not here).
+        """
+        try:
+            header = jwt.get_unverified_header(token)
+        except jwt.InvalidTokenError as e:
+            logger.debug("MCP access token: malformed header (%s)", e)
+            return None
+
+        # AKB-issued JWTs are HS256; only RS256 (Keycloak) reaches this
+        # path. The caller already discriminated by alg, but defend in
+        # depth so a config flip doesn't silently downgrade trust.
+        if header.get("alg") != "RS256":
+            return None
+        kid = header.get("kid")
+        if not kid:
+            return None
+
+        jwks = await self._fetch_jwks()
+        key = self._find_key(jwks, kid)
+        if key is None:
+            jwks = await self._fetch_jwks(force=True)
+            key = self._find_key(jwks, kid)
+        if key is None:
+            return None
+
+        try:
+            public_key = RSAAlgorithm.from_jwk(json.dumps(key))
+            claims = jwt.decode(
+                token,
+                public_key,
+                algorithms=["RS256"],
+                audience=audience,
+                issuer=settings.keycloak_issuer,
+                options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+            )
+        except jwt.InvalidTokenError as e:
+            logger.debug("MCP access token verification failed: %s", e)
+            return None
+
+        return claims
+
     # ── Logout URL ───────────────────────────────────────────────────
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str | None) -> str:
         params: dict[str, str] = {}

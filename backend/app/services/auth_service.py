@@ -34,13 +34,20 @@ class AuthenticatedUser:
     email: str
     display_name: str | None
     is_admin: bool
-    auth_method: str  # "jwt" or "pat"
+    auth_method: str  # "jwt" | "pat" | "oauth"
     # Per-PAT vault scope (Option B). None = unscoped: JWT logins, and PATs
     # minted without a scope. A concrete scope gates mutating vault access.
     vault_scope: VaultScope | None = None
     # The authenticating PAT's id (None for JWT logins). The PG-native akb_sql
     # executor switches to akb_token_<tid> when this PAT is ALSO scoped.
     token_id: str | None = None
+    # OAuth 2.1 scopes carried by a Keycloak access token at /mcp. None
+    # for any non-OAuth path (PAT, AKB JWT) — those are unscoped at the
+    # OAuth layer, and the MCP dispatcher skips its scope check when this
+    # is None. A list is meaningful even when empty: an OAuth caller that
+    # presented a valid token with zero scopes is rejected by the
+    # dispatcher's `vault:read|write` requirement.
+    oauth_scopes: list[str] | None = None
 
 
 # ── Password hashing ────────────────────────────────────────
@@ -210,16 +217,21 @@ async def _unique_username(conn, base: str | None) -> str:
     return f"{base}-{secrets.token_hex(4)}"
 
 
-async def login_with_keycloak_claims(claims: dict) -> dict:
-    """Map a verified Keycloak ID token to an AKB session.
+async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
+    """Map a verified Keycloak claim set (ID token *or* access token) to
+    an AKB user row, JIT-provisioning on first sight. Shared by the SSO
+    browser callback and the MCP OAuth Resource Server path.
 
-    First login JIT-provisions an AKB user (keyed by email) and its
-    per-user PG role; subsequent logins reuse the row. Returns the same
-    ``{token, user}`` shape as :func:`login` so the SSO callback path is
-    indistinguishable downstream.
+    Returns a dict with keys:
+        user_id, username, email, display_name, is_admin,
+        not_before (datetime | None — pin for AKB JWT iat when caller
+                    is minting one; ignored on the MCP path),
+        newly_provisioned (bool — caller must run RoleSync.on_user_create
+                           when True, outside the DB connection scope).
 
-    Keycloak is authentication only — ``realm_access.roles`` are NOT
-    mapped to AKB ``is_admin`` or vault grants here (see the design doc).
+    Raises ``AuthenticationError`` / ``ConflictError`` on the same
+    conditions the SSO callback does (missing email, unverified email
+    with strict policy on, cross-provider account conflict).
     """
     email = (claims.get("email") or "").strip().lower()
     if not email:
@@ -272,13 +284,9 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
             user_id = row["id"]
             uname = row["username"]
             not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
-            user_payload = {
-                "id": str(row["id"]),
-                "username": row["username"],
-                "email": row["email"],
-                "display_name": row["display_name"],
-                "is_admin": row["is_admin"],
-            }
+            display_name_out = row["display_name"]
+            email_out = row["email"]
+            is_admin_out = row["is_admin"]
         else:
             user_id = uuid.uuid4()
             uname = await _unique_username(conn, preferred_username)
@@ -310,13 +318,9 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
                     )
                 new_user_id = user_id
                 not_before = None
-                user_payload = {
-                    "id": str(user_id),
-                    "username": uname,
-                    "email": email,
-                    "display_name": display_name,
-                    "is_admin": is_admin,
-                }
+                display_name_out = display_name
+                email_out = email
+                is_admin_out = is_admin
             except asyncpg.UniqueViolationError:
                 # Concurrent first-login for the same email won the race.
                 # Re-fetch and treat as the existing user (idempotent JIT)
@@ -354,22 +358,105 @@ async def login_with_keycloak_claims(claims: dict) -> dict:
                 user_id = row["id"]
                 uname = row["username"]
                 not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
-                user_payload = {
-                    "id": str(row["id"]),
-                    "username": row["username"],
-                    "email": row["email"],
-                    "display_name": row["display_name"],
-                    "is_admin": row["is_admin"],
-                }
+                display_name_out = row["display_name"]
+                email_out = row["email"]
+                is_admin_out = row["is_admin"]
 
-    # PG-native RBAC: create the per-user role outside the insert's
-    # connection, mirroring register(). Best-effort — the reconciler at
-    # next startup rebuilds any role this misses.
-    if new_user_id is not None:
-        await get_role_sync().on_user_create(new_user_id)
+    return {
+        "user_id": user_id,
+        "username": uname,
+        "email": email_out,
+        "display_name": display_name_out,
+        "is_admin": is_admin_out,
+        "not_before": not_before,
+        "newly_provisioned": new_user_id is not None,
+    }
 
-    token = create_jwt(str(user_id), uname, not_before=not_before)
-    return {"token": token, "user": user_payload}
+
+async def login_with_keycloak_claims(claims: dict) -> dict:
+    """Map a verified Keycloak ID token to an AKB session.
+
+    First login JIT-provisions an AKB user (keyed by email) and its
+    per-user PG role; subsequent logins reuse the row. Returns the same
+    ``{token, user}`` shape as :func:`login` so the SSO callback path is
+    indistinguishable downstream.
+
+    Keycloak is authentication only — ``realm_access.roles`` are NOT
+    mapped to AKB ``is_admin`` or vault grants here (see the design doc).
+    """
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    # PG-native RBAC: create the per-user role outside the resolve helper's
+    # connection scope, mirroring register(). Best-effort — the reconciler
+    # at next startup rebuilds any role this misses.
+    if resolved["newly_provisioned"]:
+        await get_role_sync().on_user_create(resolved["user_id"])
+
+    token = create_jwt(
+        str(resolved["user_id"]),
+        resolved["username"],
+        not_before=resolved["not_before"],
+    )
+    return {
+        "token": token,
+        "user": {
+            "id": str(resolved["user_id"]),
+            "username": resolved["username"],
+            "email": resolved["email"],
+            "display_name": resolved["display_name"],
+            "is_admin": resolved["is_admin"],
+        },
+    }
+
+
+async def resolve_keycloak_access_token(token: str) -> AuthenticatedUser | None:
+    """Resolve a Keycloak-issued access token to an :class:`AuthenticatedUser`
+    for the MCP OAuth Resource Server path. Returns ``None`` on any failure
+    (gating disabled, signature/audience/issuer mismatch, claim refusal).
+
+    The OAuth scopes are surfaced on ``user.oauth_scopes``; the MCP
+    dispatcher uses them to enforce per-tool ``vault:read`` / ``vault:write``
+    requirements. ``oauth_scopes is None`` everywhere else (PAT, AKB JWT)
+    means "skip the scope check" — current behaviour for those paths.
+    """
+    if not settings.mcp_oauth_enabled or not settings.keycloak_enabled:
+        return None
+    audience = settings.mcp_oauth_audience_effective
+    if not audience:
+        return None
+
+    from app.services.keycloak_oidc import get_keycloak_oidc
+
+    claims = await get_keycloak_oidc().verify_access_token(token, audience)
+    if not claims:
+        return None
+
+    try:
+        resolved = await _resolve_or_provision_keycloak_user(claims)
+    except (AuthenticationError, ConflictError) as e:
+        # Refuse rather than crash — the caller maps this to 401.
+        logging.getLogger("akb.auth").info(
+            "MCP access token: user resolution rejected (%s)", e
+        )
+        return None
+
+    if resolved["newly_provisioned"]:
+        await get_role_sync().on_user_create(resolved["user_id"])
+
+    # RFC 6749 §3.3 — scopes are a space-delimited list in the `scope`
+    # claim. Defensive split: any empty fragments are dropped.
+    scope_str = claims.get("scope", "") or ""
+    scopes = [s for s in scope_str.split(" ") if s]
+
+    return AuthenticatedUser(
+        user_id=str(resolved["user_id"]),
+        username=resolved["username"],
+        email=resolved["email"] or "",
+        display_name=resolved["display_name"],
+        is_admin=resolved["is_admin"],
+        auth_method="oauth",
+        oauth_scopes=scopes,
+    )
 
 
 class BadPasswordChange(Exception):
@@ -665,9 +752,14 @@ async def revoke_all_sessions(
 async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     """Resolve an Authorization header to an authenticated user.
 
-    Supports:
-    - Bearer <jwt>
-    - Bearer akb_<pat>
+    Supports three token shapes:
+    - ``Bearer akb_<pat>`` — Personal Access Token (always)
+    - ``Bearer <hs256-jwt>`` — AKB-issued session JWT (always)
+    - ``Bearer <rs256-jwt>`` — Keycloak-issued access token for the MCP
+      Resource Server path (only when ``mcp_oauth_enabled`` AND
+      ``keycloak_enabled``; rejected to ``None`` otherwise so deployments
+      that have not opted in cannot have an external token accidentally
+      accepted).
     """
     # Option B: reset the request-scoped vault scope + token id on every
     # resolve. Only a PAT (set in _resolve_pat) carries non-None values; JWT
@@ -686,7 +778,27 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     if token.startswith("akb_"):
         return await _resolve_pat(token)
 
-    # JWT
+    # JWT — discriminate by `alg` header. AKB-issued JWTs are HS256;
+    # Keycloak access tokens are RS256. We pick the verifier from the
+    # token's own header so a single Bearer surface accepts both without
+    # an O(2) verify attempt per request.
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+    except (jwt.InvalidTokenError, Exception):
+        return None
+    alg = unverified_header.get("alg")
+
+    if alg == "RS256":
+        # Keycloak access token. Gated on mcp_oauth_enabled inside.
+        return await resolve_keycloak_access_token(token)
+
+    if alg != "HS256":
+        # Neither AKB nor Keycloak — reject rather than fall through to
+        # decode_jwt, which would attempt HS256 verify against an RS256
+        # token and (correctly) refuse but only after burning CPU.
+        return None
+
+    # AKB-issued session JWT (existing path)
     payload = decode_jwt(token)
     if not payload:
         return None
