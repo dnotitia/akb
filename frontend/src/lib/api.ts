@@ -155,14 +155,25 @@ export const authLogin = (username: string, password: string) =>
 
 export interface AuthConfig {
   keycloak: { enabled: boolean; login_url: string | null };
+  // Optional — present on newer backends. Tells the connect-snippet UI
+  // whether the OAuth Resource Server path is live so it can offer
+  // `claude mcp add --transport http … && claude mcp login` alongside
+  // the PAT snippet.
+  mcp_oauth?: { enabled: boolean };
 }
 
-/** Public auth config — drives whether the optional SSO button shows.
- * Falls back to SSO-disabled if the endpoint is unreachable/old. */
+const _AUTH_CONFIG_FALLBACK: AuthConfig = {
+  keycloak: { enabled: false, login_url: null },
+  mcp_oauth: { enabled: false },
+};
+
+/** Public auth config — drives whether the optional SSO button shows
+ * and whether the connect-snippet UI offers the OAuth path. Falls back
+ * to all-disabled if the endpoint is unreachable/old. */
 export const getAuthConfig = (): Promise<AuthConfig> =>
   fetch(`${API_BASE}/auth/config`)
-    .then((r) => (r.ok ? r.json() : { keycloak: { enabled: false, login_url: null } }))
-    .catch(() => ({ keycloak: { enabled: false, login_url: null } }));
+    .then((r) => (r.ok ? r.json() : _AUTH_CONFIG_FALLBACK))
+    .catch(() => _AUTH_CONFIG_FALLBACK);
 
 /** Redeem the one-time SSO code from the Keycloak callback for an AKB JWT. */
 export const keycloakExchange = (code: string) =>

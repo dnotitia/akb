@@ -60,7 +60,19 @@ async def protected_resource_metadata() -> dict:
     return {
         "resource": resource,
         "authorization_servers": [settings.keycloak_issuer],
+        # Includes the OIDC base scopes (`openid`, `profile`, `email`)
+        # in addition to AKB's resource scopes. Spec-compliant MCP
+        # clients (Claude Code, claude.ai) read scopes_supported and
+        # request exactly those at DCR + authorize time — so listing
+        # OIDC base scopes here is the right way to get `email` and
+        # `profile` claims into the access token AKB then keys user
+        # identity on. Without these, the token only carries `sub` and
+        # AKB rejects with "no email claim". `offline_access` enables
+        # silent refresh on Claude Code's 5-min token TTL.
         "scopes_supported": [
+            "openid",
+            "profile",
+            "email",
             "akb:vault:read",
             "akb:vault:write",
             "offline_access",

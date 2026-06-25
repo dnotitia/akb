@@ -16,6 +16,13 @@ vi.mock("@/lib/api", () => ({
   adminDeleteUser: vi.fn(),
   changePassword: vi.fn(),
   updateProfile: vi.fn(),
+  // tokens-section calls this on mount to decide whether to show the
+  // OAuth toggle alongside the PAT snippet. Mock as "OAuth off" so
+  // these tests stay focused on the PAT-mint UX they were written for.
+  getAuthConfig: vi.fn().mockResolvedValue({
+    keycloak: { enabled: false, login_url: null },
+    mcp_oauth: { enabled: false },
+  }),
 }));
 
 vi.mock("@/hooks/use-theme", () => ({

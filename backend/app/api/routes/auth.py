@@ -76,13 +76,18 @@ async def login_user(req: LoginRequest):
 @router.get("/auth/config", summary="Public auth configuration")
 async def auth_config():
     """Unauthenticated. Tells the frontend whether the optional Keycloak
-    SSO button should be shown and where it points. Reveals no secrets."""
+    SSO button should be shown and where it points, and whether the
+    optional MCP-OAuth path is live so connector UIs can offer the
+    OAuth snippet alongside the PAT one. Reveals no secrets."""
     return {
         "keycloak": {
             "enabled": settings.keycloak_enabled,
             # SPA appends ?redirect=<path> when navigating here.
             "login_url": "/api/v1/auth/keycloak/login" if settings.keycloak_enabled else None,
-        }
+        },
+        "mcp_oauth": {
+            "enabled": settings.mcp_oauth_enabled,
+        },
     }
 
 

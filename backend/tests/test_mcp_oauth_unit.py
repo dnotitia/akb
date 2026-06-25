@@ -434,6 +434,13 @@ def test_metadata_route_full_shape_when_enabled(monkeypatch):
     assert "akb:vault:read" in body["scopes_supported"]
     assert "akb:vault:write" in body["scopes_supported"]
     assert "offline_access" in body["scopes_supported"]
+    # OIDC base scopes are also advertised so spec-compliant MCP
+    # clients (which request exactly scopes_supported) include them in
+    # DCR + authorize. Without these the access token carries `sub`
+    # only and AKB's email-keyed user matching falls through.
+    assert "openid" in body["scopes_supported"]
+    assert "profile" in body["scopes_supported"]
+    assert "email" in body["scopes_supported"]
     assert body["bearer_methods_supported"] == ["header"]
 
 

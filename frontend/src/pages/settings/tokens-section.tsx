@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { createPAT, revokePAT } from "@/lib/api";
+import { createPAT, getAuthConfig, revokePAT } from "@/lib/api";
 import { formatDate, timeAgo } from "@/lib/utils";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -21,13 +21,16 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  MCP_URL,
   mcpInstallSnippets,
+  mcpOAuthSnippets,
   MCP_AGENT_FILES,
   MCP_AGENT_LABELS,
   type McpAgent,
 } from "@/lib/mcp-snippets";
 
 type ClientTab = McpAgent;
+type ConnectMode = "pat" | "oauth";
 
 export interface PAT {
   token_id: string;
@@ -60,6 +63,26 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
   const [pendingRevokePat, setPendingRevokePat] = useState<PAT | null>(null);
 
   const [clientTab, setClientTab] = useState<ClientTab>("claude");
+  // OAuth path is gated on the backend advertising mcp_oauth.enabled.
+  // Fetched once on mount; stays `false` if the auth-config endpoint is
+  // a pre-MCP-OAuth backend (the field will be absent and the optional
+  // chain falls through).
+  const [oauthEnabled, setOauthEnabled] = useState(false);
+  const [connectMode, setConnectMode] = useState<ConnectMode>("pat");
+  useEffect(() => {
+    let cancelled = false;
+    getAuthConfig().then((cfg) => {
+      if (!cancelled) setOauthEnabled(!!cfg.mcp_oauth?.enabled);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // OAuth snippets cover only the agents whose remote-HTTP MCP support
+  // is solid (Claude Code, Cursor, VS Code). Codex / OpenClaw still
+  // route through the stdio PAT proxy, so a tab in OAuth mode that has
+  // no snippet falls back to a hint pointing the user back to PAT.
+  const oauthSnippetsMap = useMemo(() => mcpOAuthSnippets(), []);
   const [setupOpen, setSetupOpen] = useState<boolean | null>(() => {
     const saved = localStorage.getItem("akb:tokens-setup-open");
     if (saved === "true") return true;
@@ -401,6 +424,40 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
                   next launch.
                 </p>
 
+                {/* PAT vs OAuth mode toggle — only visible when this AKB
+                    deployment has the OAuth Resource Server path enabled.
+                    OAuth is the lighter UX (no token to mint or rotate) but
+                    requires a configured OIDC provider on the backend; the
+                    PAT flow keeps working unchanged in either mode. */}
+                {oauthEnabled && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="coord">Auth</span>
+                    <div className="inline-flex rounded-[var(--radius-sm)] border border-border overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => setConnectMode("pat")}
+                        className={`px-3 py-1 ${connectMode === "pat" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                        aria-pressed={connectMode === "pat"}
+                      >
+                        Token (PAT)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConnectMode("oauth")}
+                        className={`px-3 py-1 ${connectMode === "oauth" ? "bg-primary text-primary-foreground" : "bg-surface text-foreground-muted hover:text-foreground"}`}
+                        aria-pressed={connectMode === "oauth"}
+                      >
+                        OAuth
+                      </button>
+                    </div>
+                    <span className="text-foreground-muted">
+                      {connectMode === "oauth"
+                        ? "Agent signs in via browser — no PAT needed."
+                        : "Mint a token in Step 01 above and paste below."}
+                    </span>
+                  </div>
+                )}
+
                 {/* Client picker + snippet — Tabs gives roving tabindex,
                     role=tab/aria-selected, arrow-key nav, and the teal
                     raised-pill active state for free. CodeSnippet supplies
@@ -414,11 +471,30 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
                     ))}
                   </TabsList>
                   <TabsContent value={clientTab} className="space-y-2">
-                    <CodeSnippet
-                      code={snippets[clientTab]}
-                      filename={MCP_AGENT_FILES[clientTab]}
-                    />
-                    {clientTab === "cursor" && (
+                    {connectMode === "oauth" ? (
+                      oauthSnippetsMap[clientTab] !== undefined ? (
+                        <CodeSnippet
+                          code={oauthSnippetsMap[clientTab] as string}
+                          filename={MCP_AGENT_FILES[clientTab]}
+                        />
+                      ) : (
+                        // Agents without a known remote-HTTP-OAuth integration
+                        // (Codex / OpenClaw at the time of writing) — bounce
+                        // the user back to PAT for that tab specifically,
+                        // rather than rendering an empty snippet box.
+                        <div className="rounded-[var(--radius-md)] border border-border px-4 py-3 text-sm text-foreground-muted">
+                          {MCP_AGENT_LABELS[clientTab]} uses the stdio path —
+                          switch the toggle to <span className="text-accent-strong">Token (PAT)</span>
+                          {" "}to see its snippet.
+                        </div>
+                      )
+                    ) : (
+                      <CodeSnippet
+                        code={snippets[clientTab]}
+                        filename={MCP_AGENT_FILES[clientTab]}
+                      />
+                    )}
+                    {connectMode === "pat" && clientTab === "cursor" && (
                       <div className="rounded-[var(--radius-md)] border border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted space-y-0.5">
                         <div><span className="coord mr-2">Cursor</span>~/.cursor/mcp.json</div>
                         <div><span className="coord mr-2">Windsurf</span>~/.codeium/windsurf/mcp_config.json</div>
@@ -430,9 +506,16 @@ export function TokensSection({ pats, patsError, onReloadPats }: Props) {
                         </div>
                       </div>
                     )}
+                    {connectMode === "oauth" && clientTab === "claude" && (
+                      <div className="rounded-[var(--radius-md)] border border-border px-4 py-2 text-[11px] font-mono bg-surface-muted text-foreground-muted">
+                        First line registers the server, second opens a browser
+                        for the OAuth + consent flow. Run them back-to-back.
+                        Resource: <span className="text-foreground">{MCP_URL}</span>
+                      </div>
+                    )}
                   </TabsContent>
                 </Tabs>
-                {snippetPat === "<YOUR_PAT>" && (
+                {connectMode === "pat" && snippetPat === "<YOUR_PAT>" && (
                   <p className="coord text-foreground-muted">
                     ↑ Replace <span className="text-accent-strong">&lt;YOUR_PAT&gt;</span> with the
                     token string shown after Step 01.
