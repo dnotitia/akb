@@ -50,21 +50,10 @@ export default function AuthPage() {
       navigate(next, { replace: true });
       return;
     }
-    // Optional Keycloak SSO: show the button only if the backend reports it on.
-    getAuthConfig().then((cfg) => {
-      if (!cfg.keycloak.enabled || !cfg.keycloak.login_url) return;
-      setSsoLoginUrl(cfg.keycloak.login_url);
-      // SSO-only mode — every account goes through Keycloak, so skip
-      // the local form entirely. Honor `?local=1` so an admin can
-      // recover if the IdP is down. The /auth/login API stays live
-      // either way; the gate is purely UX.
-      if (cfg.keycloak.sso_only && !localEscape) {
-        setRedirectingToSso(true);
-        window.location.href = `${cfg.keycloak.login_url}?redirect=${encodeURIComponent(next)}`;
-      }
-    });
-    // Surface a friendly message if the SSO callback bounced back, then strip
-    // the param so a refresh / bookmark doesn't replay a stale error.
+    // Read sso_error BEFORE the async getAuthConfig() so the captured
+    // value is available to the auto-redirect branch below — without
+    // this, an SSO-only deployment whose callback fails would loop:
+    // /auth?sso_error → auto-redirect → IdP same failure → /auth?sso_error → …
     const params = new URLSearchParams(window.location.search);
     const ssoErr = params.get("sso_error");
     if (ssoErr) {
@@ -73,6 +62,24 @@ export default function AuthPage() {
       const qs = params.toString();
       window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
     }
+    // Optional Keycloak SSO: show the button only if the backend reports it on.
+    getAuthConfig().then((cfg) => {
+      if (!cfg.keycloak.enabled || !cfg.keycloak.login_url) return;
+      setSsoLoginUrl(cfg.keycloak.login_url);
+      // SSO-only mode — every account goes through Keycloak, so skip
+      // the local form entirely. Three things turn the auto-redirect
+      // off so the user can recover instead of looping:
+      //   - `?local=1` (admin escape hatch)
+      //   - landing here with `?sso_error=…` (we just bounced from a
+      //     failed callback; immediately re-firing the redirect would
+      //     re-attempt the same failure)
+      // When auto-redirect is suppressed, the hybrid view renders
+      // with the error message + the manual SSO retry button.
+      if (cfg.keycloak.sso_only && !localEscape && !ssoErr) {
+        setRedirectingToSso(true);
+        window.location.href = `${cfg.keycloak.login_url}?redirect=${encodeURIComponent(next)}`;
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

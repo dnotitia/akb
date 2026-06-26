@@ -126,6 +126,35 @@ describe("AuthPage — SSO-only mode", () => {
     expect(hrefAssignments).toEqual([]);
   });
 
+  it("`?sso_error=…` suppresses the auto-redirect even in sso_only mode", async () => {
+    // Without this guard an SSO-only deployment whose callback fails
+    // (realm misconfig, IdP downtime, email_verified rejection) would
+    // loop forever: /auth?sso_error → auto-redirect → IdP same fail →
+    // /auth?sso_error → … The user can never see the error or escape.
+    stubbedSearch = "?sso_error=invalid_state";
+    vi.mocked(getAuthConfig).mockResolvedValue({
+      keycloak: {
+        enabled: true,
+        login_url: "/api/v1/auth/keycloak/login",
+        sso_only: true,
+      },
+    });
+
+    renderAuth();
+
+    // Form renders with the error; the SSO button stays available
+    // for a manual retry.
+    await waitFor(() =>
+      expect(screen.getByLabelText(/Username/i)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/SSO login failed/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Sign in with SSO/i }),
+    ).toBeInTheDocument();
+    // Critical: no auto-redirect was dispatched.
+    expect(hrefAssignments).toEqual([]);
+  });
+
   it("does not redirect when sso_only is false (hybrid mode)", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
       keycloak: {
