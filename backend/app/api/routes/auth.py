@@ -84,6 +84,12 @@ async def auth_config():
             "enabled": settings.keycloak_enabled,
             # SPA appends ?redirect=<path> when navigating here.
             "login_url": "/api/v1/auth/keycloak/login" if settings.keycloak_enabled else None,
+            # SSO-only mode — when true the SPA skips the local login
+            # form and redirects straight to Keycloak (with `?local=1`
+            # as an escape hatch). Forced to false when SSO itself is
+            # off so a mis-toggled deployment can't trap users at a
+            # broken redirect.
+            "sso_only": settings.keycloak_sso_only and settings.keycloak_enabled,
         },
         "mcp_oauth": {
             "enabled": settings.mcp_oauth_enabled,

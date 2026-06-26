@@ -154,7 +154,15 @@ export const authLogin = (username: string, password: string) =>
   }).then(parseAuthResponse);
 
 export interface AuthConfig {
-  keycloak: { enabled: boolean; login_url: string | null };
+  keycloak: {
+    enabled: boolean;
+    login_url: string | null;
+    // Optional — present on newer backends. When true the SPA
+    // bypasses the local form and redirects straight to Keycloak. A
+    // `?local=1` query param on the auth page is the escape hatch
+    // for local admins.
+    sso_only?: boolean;
+  };
   // Optional — present on newer backends. Tells the connect-snippet UI
   // whether the OAuth Resource Server path is live so it can offer
   // `claude mcp add --transport http … && claude mcp login` alongside
@@ -163,7 +171,7 @@ export interface AuthConfig {
 }
 
 const _AUTH_CONFIG_FALLBACK: AuthConfig = {
-  keycloak: { enabled: false, login_url: null },
+  keycloak: { enabled: false, login_url: null, sso_only: false },
   mcp_oauth: { enabled: false },
 };
 
