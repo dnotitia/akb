@@ -179,6 +179,18 @@ class Settings(BaseModel):
     #
     # See docs/designs/keycloak-oidc/00-overview.md.
     keycloak_enabled: bool = False
+    # When true AND `keycloak_enabled` is also true, the AKB sign-in page
+    # bypasses the local username/password form entirely and redirects an
+    # unauthenticated browser straight to Keycloak. Use this on
+    # deployments where every account is provisioned through SSO and the
+    # local form is more confusing than useful.
+    #
+    # The login page still honours `?local=1` as an escape hatch so a
+    # local administrator can recover if the IdP is down. The /auth/login
+    # API remains live either way — the gate is purely a UX one.
+    #
+    # Ignored when `keycloak_enabled = false`.
+    keycloak_sso_only: bool = False
     keycloak_server_url: str = ""          # e.g. https://auth.example.com (no /realms suffix)
     # Optional backchannel base URL for server→Keycloak calls (token
     # exchange + JWKS). Defaults to keycloak_server_url. Set this only

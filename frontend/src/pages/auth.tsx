@@ -34,6 +34,14 @@ export default function AuthPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [ssoLoginUrl, setSsoLoginUrl] = useState<string | null>(null);
+  // True while we're navigating away to Keycloak in sso_only mode — used
+  // to suppress the form flash that would otherwise render between the
+  // useEffect dispatching the redirect and the browser actually leaving.
+  const [redirectingToSso, setRedirectingToSso] = useState(false);
+  // The escape hatch — `?local=1` forces the local form even when the
+  // backend has SSO-only mode on. Evaluated once at mount so a stale
+  // tab doesn't lose its escape after a config reload.
+  const localEscape = new URLSearchParams(window.location.search).has("local");
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
 
   useEffect(() => {
@@ -44,8 +52,15 @@ export default function AuthPage() {
     }
     // Optional Keycloak SSO: show the button only if the backend reports it on.
     getAuthConfig().then((cfg) => {
-      if (cfg.keycloak.enabled && cfg.keycloak.login_url) {
-        setSsoLoginUrl(cfg.keycloak.login_url);
+      if (!cfg.keycloak.enabled || !cfg.keycloak.login_url) return;
+      setSsoLoginUrl(cfg.keycloak.login_url);
+      // SSO-only mode — every account goes through Keycloak, so skip
+      // the local form entirely. Honor `?local=1` so an admin can
+      // recover if the IdP is down. The /auth/login API stays live
+      // either way; the gate is purely UX.
+      if (cfg.keycloak.sso_only && !localEscape) {
+        setRedirectingToSso(true);
+        window.location.href = `${cfg.keycloak.login_url}?redirect=${encodeURIComponent(next)}`;
       }
     });
     // Surface a friendly message if the SSO callback bounced back, then strip
@@ -113,6 +128,20 @@ export default function AuthPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  // SSO-only redirect in flight — suppress the form flash. The browser
+  // is leaving in milliseconds; rendering the form would show it for a
+  // beat and look like a UI glitch. Local-escape (?local=1) bypasses
+  // this block via `redirectingToSso` staying false.
+  if (redirectingToSso) {
+    return (
+      <div className="relative flex min-h-screen items-center justify-center bg-background text-foreground">
+        <div className="text-center coord" role="status" aria-live="polite">
+          Redirecting to SSO…
+        </div>
+      </div>
+    );
   }
 
   return (

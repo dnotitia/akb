@@ -50,6 +50,7 @@ keyed on it — is preserved.
 | First login | **JIT auto-provision** by email | Any realm member who authenticates gets an AKB user + `akb_user_<uid>` role via the existing `on_user_create` hook. |
 | Token delivery to SPA | **one-time code exchange** (60s TTL) | Keeps AKB's Bearer + localStorage model; no token in URL history; no cookie-auth rewrite of the API client. |
 | Default | `enabled = false` | Local auth is the baseline; Keycloak is opt-in per deployment. |
+| SSO-only mode | Optional `keycloak_sso_only` toggle, default false | Deployments where every account is provisioned through SSO can hide the local form entirely. The `/auth/login` API stays live (gate is UX-only); `?local=1` on the sign-in URL is the escape hatch so a local admin can recover when the IdP is down. |
 
 ## Flow
 
