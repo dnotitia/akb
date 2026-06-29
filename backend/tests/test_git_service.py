@@ -8,6 +8,7 @@ tests never touch the real `/data/vaults` directory.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import uuid
@@ -376,3 +377,44 @@ def test_ensure_local_bare_unchanged_when_synced_and_sha_matches(tmp_path):
     # Now synced at `head`: a matching sha must short-circuit.
     action = svc.ensure_local_bare(name, head, head, url, "main", None)
     assert action == "unchanged"
+
+
+def test_is_healthy_repo(tmp_path):
+    """Structural soundness probe: absent → False, healthy clone → True,
+    objects dropped → False."""
+    git = GitService(storage_path=str(tmp_path / "vaults"))
+    svc = ExternalGitService(git=git)
+    url, head = _make_upstream(tmp_path)
+    name = f"mirror_{uuid.uuid4().hex[:8]}"
+
+    assert git.is_healthy_repo(name) is False  # absent
+    svc.ensure_local_bare(name, None, head, url, "main", None)
+    assert git.is_healthy_repo(name) is True  # healthy clone
+    shutil.rmtree(git._bare_path(name) / "objects")  # corrupt
+    assert git.is_healthy_repo(name) is False
+
+
+def test_ensure_local_bare_reclones_corrupt_synced_repo(tmp_path):
+    """A previously-synced repo (last_synced_sha set) that is now corrupt
+    must be re-cloned, not fetched-into. Closes the 'post-sync corruption'
+    self-heal gap: keying on last_synced_sha alone would take the fetch /
+    unchanged branch and never recover the broken repo.
+    """
+    git = GitService(storage_path=str(tmp_path / "vaults"))
+    svc = ExternalGitService(git=git)
+    url, head = _make_upstream(tmp_path)
+    name = f"mirror_{uuid.uuid4().hex[:8]}"
+
+    assert svc.ensure_local_bare(name, None, head, url, "main", None) == "cloned"
+    assert git.is_healthy_repo(name)
+
+    # Corrupt the now-synced repo (partial fetch / disk error shape).
+    shutil.rmtree(git._bare_path(name) / "objects")
+    assert not git.is_healthy_repo(name)
+
+    # last_synced_sha set AND sha unchanged, but the repo is broken — the
+    # integrity gate must still force a clean re-clone.
+    action = svc.ensure_local_bare(name, head, head, url, "main", None)
+    assert action == "cloned"
+    assert git.is_healthy_repo(name)
+    assert "doc.md" in git.ls_tree(name, head)

@@ -168,6 +168,28 @@ class GitService:
     def vault_exists(self, vault_name: str) -> bool:
         return self._bare_path(vault_name).exists()
 
+    def is_healthy_repo(self, vault_name: str) -> bool:
+        """Cheap structural soundness check on the bare repo: does it exist
+        as a git repo whose HEAD resolves to a real commit?
+
+        Catches the gross corruption a partial clone, partial fetch, disk
+        error, or non-git leftover dir produces (no valid HEAD, missing
+        root object). Fine-grained missing-blob corruption is caught
+        downstream by the reconciler's per-file error handling. Used to
+        decide self-heal-by-reclone vs. a normal fetch — and it never
+        false-positives a transient network fetch failure as corruption,
+        because it only inspects local on-disk state.
+        """
+        bare = self._bare_path(vault_name)
+        if not bare.exists():
+            return False
+        try:
+            with _vault_lock(vault_name):
+                Repo(str(bare)).git.rev_parse("--verify", "HEAD^{commit}")
+            return True
+        except Exception:  # noqa: BLE001 — any failure means "not sound"
+            return False
+
     def cleanup_stale_locks(self, max_age_seconds: float = 60.0) -> int:
         """Remove `index.lock` files for every vault that are older than
         `max_age_seconds`.

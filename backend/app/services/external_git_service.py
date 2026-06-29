@@ -90,36 +90,45 @@ class ExternalGitService:
         reconcile reads blobs from it. Returns 'cloned', 'fetched', or
         'unchanged'.
 
-        The decision keys on DB sync state (`last_synced_sha`), NOT on the
-        on-disk path:
+        Trust is decided by DB sync state + a local integrity probe, NOT
+        by on-disk path existence. Any untrustworthy local state
+        self-heals via a fresh clone:
 
         - No local repo -> clone.
-        - A repo exists but `last_synced_sha is None` -> it is UNTRUSTED:
-          either a stale dir left by a prior same-named vault (whose
-          delete cleanup raced an in-flight clone) or a clone that crashed
-          before recording success. Remove it and clone fresh so a
-          partial/corrupt dir can never be adopted. reconcile is
-          idempotent and the first successful sync sets `last_synced_sha`,
-          so this re-clone happens at most once.
-        - A trusted repo exists -> 'unchanged' on sha match, else fetch.
+        - A repo exists but is UNTRUSTED -> remove it and clone fresh.
+          Untrusted means either:
+            * `last_synced_sha is None` (never recorded a success): a stale
+              dir left by a prior same-named vault whose delete cleanup
+              raced an in-flight clone, or a clone that crashed before
+              recording success; or
+            * `not git.is_healthy_repo(...)`: a previously-synced repo that
+              is now structurally broken (partial fetch, disk error, kill
+              mid-write).
+          reconcile is idempotent and the first success sets
+          `last_synced_sha`, so a stale-dir re-clone happens at most once;
+          a corruption re-clone only fires while the repo is actually
+          broken.
+        - A trusted, healthy repo -> 'unchanged' on sha match, else fetch.
 
         Keying on `vault_exists()` alone (the previous behaviour) silently
         adopted a stale/corrupt dir: the clone was skipped and the
         subsequent fetch ran against a broken repo, failing on every
-        retry. This is the second half of the
-        delete-mid-sync -> stale-bare hazard; the first half (the race
-        that creates the stale dir) is closed by serializing
-        `cleanup_vault_dirs` under `_vault_lock`.
+        retry. The companion serialization of `cleanup_vault_dirs` under
+        `_vault_lock` closes the race that *creates* the stale dir; this
+        method closes its *adoption* (and corruption from any other
+        cause). The integrity probe inspects only local state, so a
+        transient network fetch failure is never mistaken for corruption.
         """
         host = _host_only(remote_url)
         if not self.git.vault_exists(vault_name):
             logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
             self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
             return "cloned"
-        if last_synced_sha is None:
+        if last_synced_sha is None or not self.git.is_healthy_repo(vault_name):
+            reason = "never-synced" if last_synced_sha is None else "corrupt"
             logger.warning(
-                "Untrusted bare repo for never-synced mirror %s; re-cloning from %s",
-                vault_name, host,
+                "Untrusted bare repo for mirror %s (%s); re-cloning from %s",
+                vault_name, reason, host,
             )
             self.git.cleanup_vault_dirs(vault_name)
             self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
