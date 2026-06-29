@@ -8,6 +8,7 @@ tests never touch the real `/data/vaults` directory.
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 
 import pytest
@@ -248,3 +249,45 @@ def test_delete_paths_bulk_dedupes_input(git_service, vault):
     assert sha is not None
     assert after == before + 1
     assert git_service.read_file(vault, "dup.md") is None
+
+
+def test_cleanup_vault_dirs_serializes_with_vault_lock(git_service, vault):
+    """On-disk teardown must hold `_vault_lock` so it cannot race an
+    in-flight clone/fetch writing the same bare repo.
+
+    `cleanup_vault_dirs` is the only git-touching op that mutates the
+    on-disk repo; before this it ran lock-free, so a `delete_vault`
+    rmtree could race a poller `clone_mirror` and leave a partial bare
+    dir that a same-named recreate then adopts (`vault_exists()` True →
+    bootstrap clone skipped → fetch into a broken repo, failing every
+    retry). Here we hold the lock and assert teardown blocks until it is
+    released — proving the serialization.
+    """
+    from app.services import git_service as gs
+
+    assert git_service.vault_exists(vault)  # bare + worktree present
+
+    cleanup_started = threading.Event()
+    cleanup_done = threading.Event()
+
+    def _cleanup() -> None:
+        cleanup_started.set()
+        git_service.cleanup_vault_dirs(vault)
+        cleanup_done.set()
+
+    lock = gs._vault_lock(vault)
+    lock.acquire()
+    worker = threading.Thread(target=_cleanup)
+    try:
+        worker.start()
+        assert cleanup_started.wait(timeout=2.0)
+        # Lock held → teardown is hard-blocked: dirs stay intact.
+        assert not cleanup_done.wait(timeout=0.3)
+        assert git_service.vault_exists(vault)
+    finally:
+        lock.release()
+
+    # Lock released → teardown completes and removes everything.
+    assert cleanup_done.wait(timeout=3.0)
+    worker.join(timeout=3.0)
+    assert not git_service.vault_exists(vault)

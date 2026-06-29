@@ -256,11 +256,23 @@ class GitService:
         Errors during cleanup propagate — callers handle via their
         own try/except so a rollback failure doesn't hide the
         original exception.
+
+        Held under `_vault_lock(vault_name)` so teardown serializes with
+        any in-flight clone/fetch/commit on the same vault. This is the
+        only git-touching op that mutates the on-disk repo outside the
+        lock, so without it a `delete_vault` rmtree can race a poller
+        `clone_mirror` writing the same bare dir — leaving a partial /
+        corrupt repo that a same-named recreate then adopts
+        (`vault_exists()` is True → bootstrap clone skipped → fetch into a
+        broken repo, failing every retry). No caller holds the lock when
+        invoking this (delete_vault, create-vault rollback, rename
+        rollback), so re-entry is safe.
         """
         import shutil
-        for path in (self._bare_path(vault_name), self._worktree_path(vault_name)):
-            if path.exists():
-                shutil.rmtree(path)
+        with _vault_lock(vault_name):
+            for path in (self._bare_path(vault_name), self._worktree_path(vault_name)):
+                if path.exists():
+                    shutil.rmtree(path)
 
     # ── External remote operations ───────────────────────────
 
