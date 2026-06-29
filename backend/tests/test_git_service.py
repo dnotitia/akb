@@ -8,12 +8,38 @@ tests never touch the real `/data/vaults` directory.
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import uuid
 
 import pytest
 
+from app.services.external_git_service import ExternalGitService
 from app.services.git_service import GitService
+
+
+def _make_upstream(tmp_path) -> tuple[str, str]:
+    """Create a real on-disk git repo with one commit on `main`, usable as
+    a clone source. Returns (clone_url, head_sha)."""
+    up = tmp_path / "upstream"
+    up.mkdir()
+
+    def g(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=str(up), check=True, capture_output=True, text=True
+        )
+
+    g("init", "-b", "main")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "Test")
+    (up / "doc.md").write_text("# Hello\n")
+    g("add", ".")
+    g("commit", "-m", "init")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(up), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return str(up), head
 
 
 @pytest.fixture
@@ -291,3 +317,62 @@ def test_cleanup_vault_dirs_serializes_with_vault_lock(git_service, vault):
     assert cleanup_done.wait(timeout=3.0)
     worker.join(timeout=3.0)
     assert not git_service.vault_exists(vault)
+
+
+def test_ensure_local_bare_clones_when_absent(tmp_path):
+    """No local repo → fresh clone of the upstream head."""
+    git = GitService(storage_path=str(tmp_path / "vaults"))
+    svc = ExternalGitService(git=git)
+    url, head = _make_upstream(tmp_path)
+    name = f"mirror_{uuid.uuid4().hex[:8]}"
+
+    assert not git.vault_exists(name)
+    action = svc.ensure_local_bare(name, None, head, url, "main", None)
+
+    assert action == "cloned"
+    assert git.vault_exists(name)
+    assert "doc.md" in git.ls_tree(name, head)
+
+
+def test_ensure_local_bare_reclones_untrusted_stale_dir(tmp_path):
+    """A bare dir present for a NEVER-synced mirror (last_synced_sha=None)
+    is untrusted — a stale leftover (e.g. a prior same-named vault whose
+    delete cleanup raced an in-flight clone) or a clone that crashed before
+    recording success. ensure_local_bare must REMOVE it and clone fresh,
+    never adopt it.
+
+    Reproduces the failure the old `vault_exists()`-only bootstrap caused:
+    the path existed → clone was skipped → fetch ran against a broken repo
+    → the mirror retried forever with document_count stuck at 0.
+    """
+    git = GitService(storage_path=str(tmp_path / "vaults"))
+    svc = ExternalGitService(git=git)
+    url, head = _make_upstream(tmp_path)
+    name = f"mirror_{uuid.uuid4().hex[:8]}"
+
+    # Plant a stale / corrupt bare dir where the vault's repo would live.
+    stale = git._bare_path(name)
+    stale.mkdir(parents=True)
+    (stale / "garbage").write_text("not a git repo")
+    assert git.vault_exists(name)  # path present → old code would SKIP clone
+
+    action = svc.ensure_local_bare(name, None, head, url, "main", None)
+
+    assert action == "cloned"
+    # Stale garbage gone, replaced by a valid clone at the upstream head.
+    assert not (git._bare_path(name) / "garbage").exists()
+    assert "doc.md" in git.ls_tree(name, head)
+
+
+def test_ensure_local_bare_unchanged_when_synced_and_sha_matches(tmp_path):
+    """A trusted repo (last_synced_sha set) at the current head → no git
+    work, just 'unchanged'."""
+    git = GitService(storage_path=str(tmp_path / "vaults"))
+    svc = ExternalGitService(git=git)
+    url, head = _make_upstream(tmp_path)
+    name = f"mirror_{uuid.uuid4().hex[:8]}"
+
+    assert svc.ensure_local_bare(name, None, head, url, "main", None) == "cloned"
+    # Now synced at `head`: a matching sha must short-circuit.
+    action = svc.ensure_local_bare(name, head, head, url, "main", None)
+    assert action == "unchanged"
