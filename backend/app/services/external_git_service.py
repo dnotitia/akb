@@ -75,6 +75,69 @@ class ExternalGitService:
     def __init__(self, git: GitService | None = None):
         self.git = git or GitService()
 
+    # ── Bootstrap (local bare repo) ──────────────────────────
+
+    def ensure_local_bare(
+        self,
+        vault_name: str,
+        last_synced_sha: str | None,
+        new_sha: str,
+        remote_url: str,
+        branch: str,
+        auth_token: str | None,
+    ) -> str:
+        """Make the local bare repo present and trustworthy before
+        reconcile reads blobs from it. Returns 'cloned', 'fetched', or
+        'unchanged'.
+
+        Trust is decided by DB sync state + a local integrity probe, NOT
+        by on-disk path existence. Any untrustworthy local state
+        self-heals via a fresh clone:
+
+        - No local repo -> clone.
+        - A repo exists but is UNTRUSTED -> remove it and clone fresh.
+          Untrusted means either:
+            * `last_synced_sha is None` (never recorded a success): a stale
+              dir left by a prior same-named vault whose delete cleanup
+              raced an in-flight clone, or a clone that crashed before
+              recording success; or
+            * `not git.is_healthy_repo(...)`: a previously-synced repo that
+              is now structurally broken (partial fetch, disk error, kill
+              mid-write).
+          reconcile is idempotent and the first success sets
+          `last_synced_sha`, so a stale-dir re-clone happens at most once;
+          a corruption re-clone only fires while the repo is actually
+          broken.
+        - A trusted, healthy repo -> 'unchanged' on sha match, else fetch.
+
+        Keying on `vault_exists()` alone (the previous behaviour) silently
+        adopted a stale/corrupt dir: the clone was skipped and the
+        subsequent fetch ran against a broken repo, failing on every
+        retry. The companion serialization of `cleanup_vault_dirs` under
+        `_vault_lock` closes the race that *creates* the stale dir; this
+        method closes its *adoption* (and corruption from any other
+        cause). The integrity probe inspects only local state, so a
+        transient network fetch failure is never mistaken for corruption.
+        """
+        host = _host_only(remote_url)
+        if not self.git.vault_exists(vault_name):
+            logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
+            self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+            return "cloned"
+        if last_synced_sha is None or not self.git.is_healthy_repo(vault_name):
+            reason = "never-synced" if last_synced_sha is None else "corrupt"
+            logger.warning(
+                "Untrusted bare repo for mirror %s (%s); re-cloning from %s",
+                vault_name, reason, host,
+            )
+            self.git.cleanup_vault_dirs(vault_name)
+            self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+            return "cloned"
+        if new_sha == last_synced_sha:
+            return "unchanged"
+        self.git.fetch_remote(vault_name, remote_url, branch, auth_token)
+        return "fetched"
+
     # ── Reconcile (called by poller) ─────────────────────────
 
     async def reconcile(self, vault_id: uuid.UUID, vault_name: str) -> dict:
@@ -104,31 +167,23 @@ class ExternalGitService:
                 f"Remote branch '{cfg['remote_branch']}' not found at {cfg['remote_url']}"
             )
 
-        # Bootstrap: first poll after vault creation has no local bare repo yet.
-        if not self.git.vault_exists(vault_name):
-            logger.info(
-                "Bootstrap clone: vault=%s host=%s",
-                vault_name, _host_only(cfg["remote_url"]),
-            )
-            await asyncio.to_thread(
-                self.git.clone_mirror,
-                vault_name=vault_name,
-                remote_url=cfg["remote_url"],
-                branch=cfg["remote_branch"],
-                auth_token=cfg["auth_token"],
-            )
-        elif new_sha == cfg["last_synced_sha"]:
+        # Ensure a trusted local bare repo exists. The clone-vs-fetch
+        # decision keys on DB sync state (last_synced_sha), not on-disk
+        # path existence — see ensure_local_bare. 'unchanged' short-
+        # circuits the rest of the reconcile.
+        action = await asyncio.to_thread(
+            self.ensure_local_bare,
+            vault_name,
+            cfg["last_synced_sha"],
+            new_sha,
+            cfg["remote_url"],
+            cfg["remote_branch"],
+            cfg["auth_token"],
+        )
+        if action == "unchanged":
             await ext_repo.mark_success(vault_id, cfg["poll_interval_secs"])
             return {"status": "unchanged", "sha": new_sha}
-        else:
-            # Fetch objects so the reconcile can read blobs locally.
-            await asyncio.to_thread(
-                self.git.fetch_remote,
-                vault_name=vault_name,
-                remote_url=cfg["remote_url"],
-                branch=cfg["remote_branch"],
-                auth_token=cfg["auth_token"],
-            )
+
         remote_tree = await asyncio.to_thread(self.git.ls_tree, vault_name, new_sha)
 
         doc_repo = DocumentRepository(pool)
