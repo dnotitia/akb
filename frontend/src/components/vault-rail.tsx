@@ -29,8 +29,9 @@ import { cn } from "@/lib/utils";
  * in its OWN column / scroll axis, separate from the collection tree to its
  * right. Two modes the user toggles:
  *
- *   • expanded (w-44): VaultChip + NAME + a hover star (pin) + a trailing role
- *     glyph, grouped Favorites-first, with a name filter + a role-scope filter;
+ *   • expanded (drag-resizable, default 240px): VaultChip + NAME + a hover star
+ *     (pin) + a trailing role glyph, grouped Favorites-first, with a name filter
+ *     + a role-scope filter;
  *   • collapsed (w-14): an icon RAIL of monograms, favorites first, a teal
  *     corner dot on pinned vaults, role + favorite surfaced via the tooltip.
  *
@@ -43,11 +44,16 @@ export function VaultRail({
   onRefetchReady,
   collapsed,
   onToggleCollapsed,
+  width,
 }: {
   current: string;
   onRefetchReady?: (refetch: () => void) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Requested rail width (px) from VaultShell's drag-resize; applied only in
+   *  expanded mode — the collapsed branch is a fixed w-14 icon rail and ignores
+   *  it. The right divider is drawn by the shell's resize handle, not this nav. */
+  width?: number;
 }) {
   const { vaults, loading, refetch } = useVaults();
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
@@ -247,7 +253,8 @@ export function VaultRail({
   return (
     <nav
       aria-label="Vaults"
-      className="w-44 shrink-0 h-full flex flex-col bg-surface border-r border-border"
+      style={{ width }}
+      className="shrink-0 h-full flex flex-col bg-surface"
     >
       <div className="flex items-center justify-between h-9 px-3 shrink-0 border-b border-border">
         <span className="coord-ink">Vaults</span>
