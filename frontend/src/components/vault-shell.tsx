@@ -27,6 +27,9 @@ export function VaultShell() {
     return window.localStorage.getItem(TREE_VISIBLE_KEY) !== "0";
   });
   const tree = useColumnResize({ storageKey: "akb.treeWidth", min: 240, max: 640, default: 300 });
+  // Vault switcher rail (expanded mode) — drag-resizable like the tree, its own
+  // persisted width. Collapsed mode stays a fixed w-14 icon rail.
+  const rail = useColumnResize({ storageKey: "akb.vaultRailWidth", min: 192, max: 360, default: 240 });
 
   // The vault column can simplify to a thin icon rail (persisted) when the user
   // wants the space back; the tree column collapses independently via ⌘\.
@@ -154,7 +157,24 @@ export function VaultShell() {
                 onRefetchReady={onVaultsRefetchReady}
                 collapsed={vaultCollapsed}
                 onToggleCollapsed={toggleVaultCollapsed}
+                width={rail.width}
               />
+              {/* Rail resize handle — sits between the vault rail and the tree
+                  column INSIDE the card, and is the divider for the two. Only
+                  in expanded mode with a tree region to its right (off /graph);
+                  the collapsed icon rail is a fixed strip. */}
+              {!vaultCollapsed && !isGraph && (
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize vault list"
+                  title="Drag to resize · double-click to reset"
+                  {...rail.handlers}
+                  className="group relative z-10 w-2 shrink-0 cursor-col-resize touch-none"
+                >
+                  <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
+                </div>
+              )}
               {/* Collection tree column — expanded: a "Collections" header (with
                   a « collapse toggle that mirrors the vault column's) over the
                   tree. Collapsed: it doesn't vanish — it leaves a thin strip

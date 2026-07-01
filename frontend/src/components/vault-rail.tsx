@@ -43,11 +43,15 @@ export function VaultRail({
   onRefetchReady,
   collapsed,
   onToggleCollapsed,
+  width,
 }: {
   current: string;
   onRefetchReady?: (refetch: () => void) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Expanded-mode width (px), driven by VaultShell's drag-resize. The
+   *  right divider is drawn by the shell's resize handle, not this nav. */
+  width?: number;
 }) {
   const { vaults, loading, refetch } = useVaults();
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
@@ -247,7 +251,8 @@ export function VaultRail({
   return (
     <nav
       aria-label="Vaults"
-      className="w-44 shrink-0 h-full flex flex-col bg-surface border-r border-border"
+      style={{ width }}
+      className="shrink-0 h-full flex flex-col bg-surface"
     >
       <div className="flex items-center justify-between h-9 px-3 shrink-0 border-b border-border">
         <span className="coord-ink">Vaults</span>
