@@ -29,8 +29,9 @@ import { cn } from "@/lib/utils";
  * in its OWN column / scroll axis, separate from the collection tree to its
  * right. Two modes the user toggles:
  *
- *   • expanded (w-44): VaultChip + NAME + a hover star (pin) + a trailing role
- *     glyph, grouped Favorites-first, with a name filter + a role-scope filter;
+ *   • expanded (drag-resizable, default 240px): VaultChip + NAME + a hover star
+ *     (pin) + a trailing role glyph, grouped Favorites-first, with a name filter
+ *     + a role-scope filter;
  *   • collapsed (w-14): an icon RAIL of monograms, favorites first, a teal
  *     corner dot on pinned vaults, role + favorite surfaced via the tooltip.
  *
@@ -49,8 +50,9 @@ export function VaultRail({
   onRefetchReady?: (refetch: () => void) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  /** Expanded-mode width (px), driven by VaultShell's drag-resize. The
-   *  right divider is drawn by the shell's resize handle, not this nav. */
+  /** Requested rail width (px) from VaultShell's drag-resize; applied only in
+   *  expanded mode — the collapsed branch is a fixed w-14 icon rail and ignores
+   *  it. The right divider is drawn by the shell's resize handle, not this nav. */
   width?: number;
 }) {
   const { vaults, loading, refetch } = useVaults();
