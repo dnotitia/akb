@@ -407,21 +407,28 @@ body::before {
    Static (no motion), pointer-events:none, behind the header content (z-0). */
 .aurora-header {
   position: relative;
+  /* Own stacking context so ::before (z-0) can never paint over the
+     content grid that follows in normal flow — without this the wash
+     tinted the top of "Recent activity". */
+  isolation: isolate;
 }
 .aurora-header::before {
   content: "";
   position: absolute;
-  inset: -1.5rem -1rem auto -1rem;
-  height: 200%;
+  /* Bound all four edges to the header band (+ small bleed). Previously
+     `bottom: auto; height: 200%` let the box run ~1× header-height past
+     the band, unclipped, so the teal bloom's core landed in the content
+     area below — now it fades within its own box as intended. */
+  inset: -1.5rem -1rem -1rem -1rem;
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(30rem 16rem at 10% 115%, rgba(0, 64, 89, 0.07), transparent 62%),
+    radial-gradient(30rem 16rem at 10% 85%, rgba(0, 64, 89, 0.07), transparent 62%),
     radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.06), transparent 60%);
 }
 .dark .aurora-header::before {
   background:
-    radial-gradient(30rem 16rem at 10% 115%, rgba(10, 111, 134, 0.13), transparent 62%),
+    radial-gradient(30rem 16rem at 10% 85%, rgba(10, 111, 134, 0.13), transparent 62%),
     radial-gradient(24rem 14rem at 94% -12%, rgba(229, 94, 44, 0.1), transparent 60%);
 }
 .aurora-header > * {
