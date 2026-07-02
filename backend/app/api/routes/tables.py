@@ -53,6 +53,7 @@ class CreateTableRequest(NFCModel):
 
 class SqlRequest(NFCModel):
     sql: str
+    params: list[Any] | None = None
     vaults: list[str] | None = None
 
 
@@ -92,6 +93,7 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             vault_names=vaults,
             user_id=user.user_id,
             sql=req.sql.strip(),
+            params=req.params,
             is_admin=user.is_admin,
         )
     )

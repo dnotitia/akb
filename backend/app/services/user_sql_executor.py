@@ -115,6 +115,7 @@ class UserSqlExecutor:
         *,
         user_id: uuid.UUID | str,
         sql: str,
+        params: list[Any] | None = None,
         is_admin: bool = False,
         vault_names: Optional[list[str]] = None,
     ) -> dict:
@@ -125,6 +126,7 @@ class UserSqlExecutor:
         downstream consumers but does NOT gate execution — PG ACL does.
         """
         is_select = sql.strip().upper().startswith(("SELECT", "WITH"))
+        bind_params = params or []
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
@@ -160,7 +162,7 @@ class UserSqlExecutor:
                         )
 
                     if is_select:
-                        rows = await conn.fetch(sql)
+                        rows = await conn.fetch(sql, *bind_params)
                         return {
                             "kind": "table_query",
                             "vaults": vault_names or [],
@@ -168,7 +170,7 @@ class UserSqlExecutor:
                             "items": [_coerce_row(r) for r in rows],
                             "total": len(rows),
                         }
-                    result = await conn.execute(sql)
+                    result = await conn.execute(sql, *bind_params)
                     return {
                         "kind": "table_sql",
                         "vaults": vault_names or [],
