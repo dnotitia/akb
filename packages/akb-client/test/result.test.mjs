@@ -114,6 +114,53 @@ test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
   );
 });
 
+test("vault sql tag parameterizes interpolations and forwards actingAs claims", async () => {
+  const severity = "high' OR TRUE --";
+  const minScore = 3;
+  let seenUrl = "";
+  let seenHeaders = {};
+  let seenBody = {};
+
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      seenUrl = String(input);
+      seenHeaders = Object.fromEntries(new Headers(init?.headers));
+      seenBody = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({ kind: "table_query", columns: ["title"], items: [{ title: "Ship" }], total: 1 }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  }).vault("eng").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const result = await client.sql`SELECT title FROM incidents WHERE severity = ${severity} AND score >= ${minScore}`;
+
+  assert.equal(seenUrl, "https://akb.test/api/v1/tables/eng/sql");
+  assert.equal(seenHeaders.authorization, "Bearer service-key");
+  assert.equal(seenHeaders["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(seenHeaders["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.deepEqual(seenBody, {
+    sql: "SELECT title FROM incidents WHERE severity = $1 AND score >= $2",
+    params: [severity, minScore],
+  });
+  assert.equal(seenBody.sql.includes(severity), false);
+  assert.equal(result.throwOnError().data.items[0].title, "Ship");
+});
+
+test("vault sql tag requires a selected vault and tagged template", () => {
+  const client = createClient("https://akb.test/api/v1", { apiKey: "service-key" });
+
+  assert.throws(() => client.sql`SELECT 1`, /Select a vault/);
+  assert.throws(
+    () => client.vault("eng").sql("SELECT 1"),
+    /tagged template/,
+  );
+});
+
 test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary", async () => {
   let seenUrl = "";
   let seenInit = {};

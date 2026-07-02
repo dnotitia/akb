@@ -192,6 +192,16 @@ function makeClient(config, scope) {
     actingAs(claims) {
       return makeClient(config, { ...scope, claims: normalizeClaims(claims) });
     },
+    sql(strings, ...values) {
+      if (!scope.defaultVault) {
+        throw new TypeError("Select a vault before using raw SQL: client.vault(\"...\").sql`...`.");
+      }
+      const compiled = compileSqlTemplate(strings, values);
+      return request(`/tables/${encodeURIComponent(scope.defaultVault)}/sql`, {
+        method: "POST",
+        body: JSON.stringify({ sql: compiled.text, params: compiled.params }),
+      });
+    },
     from(table) {
       return createQueryBuilder({
         baseUrl: config.baseUrl,
@@ -239,6 +249,41 @@ function normalizeClaims(claims) {
     throw new TypeError("actingAs claims require a non-empty app_metadata.role.");
   }
   return claims;
+}
+
+/**
+ * @param {TemplateStringsArray} strings
+ * @param {unknown[]} values
+ * @returns {{ text: string, params: unknown[] }}
+ */
+function compileSqlTemplate(strings, values) {
+  if (!isTemplateStringsArray(strings)) {
+    throw new TypeError("client.sql must be used as a tagged template.");
+  }
+  if (values.length !== strings.length - 1) {
+    throw new TypeError("Tagged SQL template interpolation count is invalid.");
+  }
+
+  let text = "";
+  for (let index = 0; index < strings.length; index += 1) {
+    text += strings[index];
+    if (index < values.length) {
+      text += `$${index + 1}`;
+    }
+  }
+  return { text, params: Array.from(values) };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is TemplateStringsArray}
+ */
+function isTemplateStringsArray(value) {
+  return Array.isArray(value)
+    && Array.isArray(/** @type {{ raw?: unknown }} */ (value).raw)
+    && Object.isFrozen(value)
+    && Object.isFrozen(/** @type {{ raw: unknown[] }} */ (value).raw)
+    && value.length === /** @type {{ raw: unknown[] }} */ (value).raw.length;
 }
 
 /**

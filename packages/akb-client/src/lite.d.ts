@@ -11,7 +11,9 @@ export {
   type AkbJsonValue,
   type AkbNamespaceStub,
   type AkbResult,
+  type AkbSqlTag,
   type AkbSuccessEnvelope,
   type AkbTableStub,
   type AkbThrowingResult,
+  type AkbVaultSqlResult,
 } from "./index.js";

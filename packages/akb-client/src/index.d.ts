@@ -201,6 +201,17 @@ export type AkbSelectResult<Row, Columns extends string> =
   true extends AkbSelectHasWideToken<Columns> ? Row :
   Pick<Row, AkbPlainSelectKeys<Row, Columns>> & AkbJsonSelectShape<Row, Columns>;
 
+export type AkbVaultSqlResult<Row = Record<string, unknown>> =
+  | import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>
+  | import("./core/schema.gen.js").AkbTableSqlEnvelope;
+
+export interface AkbSqlTag {
+  <Row = Record<string, unknown>>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<AkbResult<AkbVaultSqlResult<Row>>>;
+}
+
 export interface AkbClaims {
   sub: string;
   app_metadata: {
@@ -300,6 +311,7 @@ export interface AkbClient<Schema = unknown> {
   request<T = AkbSuccessEnvelope>(path: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
   vault(vault: string): AkbClient<Schema>;
   actingAs(claims: AkbClaims): AkbClient<Schema>;
+  readonly sql: AkbSqlTag;
   from<TableName extends AkbTableNames<Schema>>(table: TableName): AkbTableStub<
     AkbTableRow<Schema, TableName>,
     import("./core/schema.gen.js").AkbTableQueryEnvelope<AkbTableRow<Schema, TableName>>,

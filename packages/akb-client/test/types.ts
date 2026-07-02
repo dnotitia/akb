@@ -45,6 +45,11 @@ typedClient satisfies AkbClient<AkbSchema>;
 typedClient.vault("eng").actingAs({ sub: "u1", app_metadata: { org_id: "o1", role: "member" } });
 // @ts-expect-error org_id and role are required by the BFF X-Akb-Claims parser.
 typedClient.vault("eng").actingAs({ sub: "u1", app_metadata: {} });
+const rawSqlResult = await typedClient.vault("eng").sql<{ title: string }>`SELECT title FROM tasks WHERE status = ${"todo"}`;
+const rawSqlData = rawSqlResult.throwOnError().data;
+if (rawSqlData.kind === "table_query") {
+  rawSqlData.items.at(0)?.title satisfies string | undefined;
+}
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
 typedClient.vault("eng").from("incidents").request("/rows");
 typedClient.vault("eng").from("tasks").request("/rows");
