@@ -382,6 +382,7 @@ akb/
 │   └── tests/                # E2E shell tests
 ├── frontend/                 # React 19 + TypeScript + Vite + Tailwind
 ├── packages/
+│   ├── akb-client/           # REST SDK boundary (npm: @akb/client)
 │   └── akb-mcp-client/       # stdio ↔ HTTP MCP proxy (npm: akb-mcp)
 ├── agents/                   # Reference Python agent runtime (think/act loop over MCP)
 ├── plugins/                  # Claude Code / Codex agent plugins (ingest, query, session capture, lifecycle)

@@ -5,7 +5,9 @@ from collections import Counter
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+import pytest
 
+from app.api.routes.tables import _raise_service_error
 from app.main import app
 
 
@@ -86,6 +88,50 @@ def test_api_error_responses_reference_single_akb_error_component():
             )
 
 
+def test_success_envelope_components_are_kind_discriminated():
+    schemas = app.openapi()["components"]["schemas"]
+    union = schemas["AkbSuccessEnvelope"]
+    assert union["discriminator"] == {
+        "propertyName": "kind",
+        "mapping": {
+            "table": "#/components/schemas/AkbTableEnvelope",
+            "table_query": "#/components/schemas/AkbTableQueryEnvelope",
+            "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
+            "file": "#/components/schemas/AkbFileEnvelope",
+        },
+    }
+    for name, kind in (
+        ("AkbTableEnvelope", "table"),
+        ("AkbTableQueryEnvelope", "table_query"),
+        ("AkbTableSqlEnvelope", "table_sql"),
+        ("AkbFileEnvelope", "file"),
+    ):
+        schema = schemas[name]
+        assert "kind" in schema["required"]
+        assert schema["properties"]["kind"]["enum"] == [kind]
+
+
+def test_kind_envelope_routes_reference_typed_success_schemas():
+    schema = app.openapi()
+    expected = {
+        ("/api/v1/tables/{vault}", "post"): "AkbTableEnvelope",
+        ("/api/v1/tables/{vault}", "get"): "AkbTableEnvelope",
+        ("/api/v1/tables/{vault}/sql", "post"): "AkbSqlEnvelope",
+        ("/api/v1/tables/{vault}/{table_name}", "delete"): "AkbTableEnvelope",
+        ("/api/v1/files/{vault}/upload", "post"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/confirm", "post"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/download", "get"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}", "get"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}", "delete"): "AkbFileEnvelope",
+    }
+    for (path, method), component in expected.items():
+        success_schema = (
+            schema["paths"][path][method]["responses"]["200"]
+            ["content"]["application/json"]["schema"]
+        )
+        assert success_schema == {"$ref": f"#/components/schemas/{component}"}
+
+
 def test_http_exception_runtime_shape_matches_akb_error_schema():
     test_app = FastAPI()
 
@@ -107,6 +153,56 @@ def test_http_exception_runtime_shape_matches_akb_error_schema():
         "code": "conflict",
         "detail": {"message": "Collection is not empty", "doc_count": 2},
         "details": {"doc_count": 2},
+    }
+
+
+def test_http_exception_preserves_nested_details_as_akb_error_details():
+    test_app = FastAPI()
+
+    @test_app.get("/boom")
+    async def boom():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "SQL failed",
+                "code": "sql_error",
+                "details": {"pg_sqlstate": "42601"},
+            },
+        )
+
+    for handler_key, handler in app.exception_handlers.items():
+        test_app.add_exception_handler(handler_key, handler)
+
+    response = TestClient(test_app).get("/boom")
+    assert response.status_code == 400
+    assert response.json() == {
+        "message": "SQL failed",
+        "error": "SQL failed",
+        "code": "sql_error",
+        "detail": {
+            "message": "SQL failed",
+            "code": "sql_error",
+            "details": {"pg_sqlstate": "42601"},
+        },
+        "details": {"pg_sqlstate": "42601"},
+    }
+
+
+def test_table_rest_bridge_promotes_service_err_dict_to_http_akb_error():
+    with pytest.raises(HTTPException) as exc:
+        _raise_service_error({
+            "error": "Multi-statement SQL is not allowed.",
+            "code": "multi_statement",
+            "hint": "Send one statement at a time.",
+            "details": {"separator_count": 2},
+        })
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == {
+        "message": "Multi-statement SQL is not allowed.",
+        "code": "multi_statement",
+        "hint": "Send one statement at a time.",
+        "details": {"separator_count": 2},
     }
 
 
