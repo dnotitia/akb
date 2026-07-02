@@ -149,7 +149,54 @@ BAD_RENAME_DUP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api
 [ "$BAD_RENAME_DUP" = "422" ] && pass "alter.bad-rename-dup: HTTP 422" || fail "alter.bad-rename-dup" "expected 422, got $BAD_RENAME_DUP"
 
 echo ""
-echo "▸ 3. Schema introspection — registry/live merge + reader gate"
+echo "▸ 3. Table migrations — idempotency, checksum conflict, writer gate"
+
+MIG_KEY=$(python3 -c 'import uuid; print(uuid.uuid4())')
+MIG_BODY="[{\"op\":\"add_column\",\"table\":\"$TABLE\",\"name\":\"tier\",\"type\":\"text\",\"default\":\"bronze\",\"check\":{\"op\":\"in\",\"values\":[\"bronze\",\"silver\"]}},{\"op\":\"alter_column\",\"table\":\"$TABLE\",\"name\":\"tier\",\"set_not_null\":true}]"
+
+MIG_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/migrations" \
+  -H "Authorization: Bearer $READER_PAT" \
+  -H "Idempotency-Key: $MIG_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "$MIG_BODY")
+[ "$MIG_DENY" = "403" ] && pass "migration.reader: HTTP 403" || fail "migration.reader" "expected 403, got $MIG_DENY"
+
+MIG=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/migrations" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Idempotency-Key: $MIG_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "$MIG_BODY")
+assert_keys "migration.apply" "$MIG" kind vault idempotency_key checksum applied operations results
+assert_value "migration.apply" "$MIG" "v=d['kind']" "table_migration"
+assert_value "migration.apply" "$MIG" "v=d['vault']" "$VAULT"
+assert_value "migration.apply" "$MIG" "v=d['idempotency_key']" "$MIG_KEY"
+assert_value "migration.apply" "$MIG" "v=d['applied']" "True"
+assert_value "migration.apply" "$MIG" "v=d['operations']" "2"
+
+MIG_SCHEMA=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT/$TABLE/schema" \
+  -H "Authorization: Bearer $PAT")
+assert_value "migration.schema" "$MIG_SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'tier')['default']" "bronze"
+assert_value "migration.schema" "$MIG_SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'tier')['required']" "True"
+assert_value "migration.schema" "$MIG_SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'tier')['check']['op']" "in"
+
+MIG_REPLAY=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/migrations" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Idempotency-Key: $MIG_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "$MIG_BODY")
+assert_value "migration.replay" "$MIG_REPLAY" "v=d['applied']" "False"
+assert_value "migration.replay" "$MIG_REPLAY" "v=d['operations']" "2"
+
+MIG_CONFLICT_BODY="[{\"op\":\"add_column\",\"table\":\"$TABLE\",\"name\":\"migration_note\",\"type\":\"text\"}]"
+MIG_CONFLICT=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/migrations" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Idempotency-Key: $MIG_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "$MIG_CONFLICT_BODY")
+[ "$MIG_CONFLICT" = "409" ] && pass "migration.conflict: HTTP 409" || fail "migration.conflict" "expected 409, got $MIG_CONFLICT"
+
+echo ""
+echo "▸ 4. Schema introspection — registry/live merge + reader gate"
 
 SCHEMA_DENY=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/tables/$VAULT/$TABLE/schema" \
   -H "Authorization: Bearer $OUTSIDER_PAT")
@@ -167,6 +214,7 @@ assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['check']['op']" "in"
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['enum'][0]" "active"
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['pg_type']" "text"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'tier')['required']" "True"
 assert_value "schema.table" "$SCHEMA" "v=d['drift']['has_drift']" "False"
 
 VAULT_SCHEMA=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT/schema" \
@@ -177,7 +225,7 @@ assert_value "schema.vault" "$VAULT_SCHEMA" "v=d['total']" "1"
 assert_value "schema.vault" "$VAULT_SCHEMA" "v=d['tables'][0]['name']" "$TABLE"
 
 echo ""
-echo "▸ 4. List tables — envelope shape"
+echo "▸ 5. List tables — envelope shape"
 
 LIST=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT")
@@ -190,7 +238,7 @@ assert_value "list" "$LIST" "v=d['items'][0]['name']" "$TABLE"
 assert_value "list" "$LIST" "v=d['items'][0]['uri']" "$TABLE_URI"
 
 echo ""
-echo "▸ 5. Rich column DDL — defaults, unique, check, index"
+echo "▸ 6. Rich column DDL — defaults, unique, check, index"
 
 RICH="rich"
 RICH_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
@@ -378,7 +426,7 @@ RICH_PRIORITY_FREE_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql
 assert_keys "rich.priority-free-insert" "$RICH_PRIORITY_FREE_INSERT" kind result vaults
 
 echo ""
-echo "▸ 6. Foreign keys — same-vault references + on_delete"
+echo "▸ 7. Foreign keys — same-vault references + on_delete"
 
 FK_PARENT="fk_parent"
 FK_CASCADE="fk_child_cascade"
@@ -513,7 +561,7 @@ curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" -H "Authorization
 curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$OTHER_VAULT" -H "Authorization: Bearer $PAT" >/dev/null 2>&1 || true
 
 echo ""
-echo "▸ 7. SQL SELECT — envelope shape (rows → items)"
+echo "▸ 8. SQL SELECT — envelope shape (rows → items)"
 
 INS=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
@@ -533,7 +581,7 @@ assert_value "sql.select" "$SEL" "v=d['items'][0]['email']" "a@x"
 assert_value "sql.select" "$SEL" "v=d['items'][0]['status']" "active"
 
 echo ""
-echo "▸ 8. Drop table — envelope shape"
+echo "▸ 9. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
@@ -544,7 +592,7 @@ assert_value "drop" "$DROP" "v=d['name']" "$TABLE"
 assert_value "drop" "$DROP" "v=str(d['deleted']).lower()" "true"
 
 echo ""
-echo "▸ 9. Drop missing table — proper 4xx error"
+echo "▸ 10. Drop missing table — proper 4xx error"
 
 MISS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/does-not-exist" \
   -H "Authorization: Bearer $PAT")

@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
@@ -126,6 +126,26 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
 async def get_vault_schema(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     return await table_service.get_vault_schema(access["vault_id"])
+
+
+@router.post(
+    "/tables/{vault}/migrations",
+    summary="Apply an idempotent table schema migration",
+    operation_id="tablesApplyMigration",
+)
+async def apply_table_migration(
+    vault: str,
+    operations: list[dict] = Body(...),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    return await table_service.apply_table_migration(
+        access["vault_id"],
+        actor_id=user.username,
+        idempotency_key=idempotency_key,
+        operations=operations,
+    )
 
 
 @router.get(

@@ -95,6 +95,7 @@ def test_success_envelope_components_are_kind_discriminated():
         "propertyName": "kind",
         "mapping": {
             "table": "#/components/schemas/AkbTableEnvelope",
+            "table_migration": "#/components/schemas/AkbTableMigrationEnvelope",
             "table_schema": "#/components/schemas/AkbTableSchemaEnvelope",
             "vault_table_schema": "#/components/schemas/AkbVaultTableSchemaEnvelope",
             "table_query": "#/components/schemas/AkbTableQueryEnvelope",
@@ -104,6 +105,7 @@ def test_success_envelope_components_are_kind_discriminated():
     }
     for name, kind in (
         ("AkbTableEnvelope", "table"),
+        ("AkbTableMigrationEnvelope", "table_migration"),
         ("AkbTableSchemaEnvelope", "table_schema"),
         ("AkbVaultTableSchemaEnvelope", "vault_table_schema"),
         ("AkbTableQueryEnvelope", "table_query"),
@@ -121,6 +123,7 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/tables/{vault}", "post", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}", "get", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}/schema", "get", "200"): "AkbVaultTableSchemaEnvelope",
+        ("/api/v1/tables/{vault}/migrations", "post", "200"): "AkbTableMigrationEnvelope",
         ("/api/v1/tables/{vault}/{table}/schema", "get", "200"): "AkbTableSchemaEnvelope",
         ("/api/v1/tables/{vault}/sql", "post", "200"): "AkbSqlEnvelope",
         ("/api/v1/tables/{vault}/{table}/rows", "get", "200"): "AkbTableQueryEnvelope",
@@ -220,6 +223,38 @@ def test_alter_table_openapi_contract_is_codegen_typed():
     assert (
         operation["requestBody"]["content"]["application/json"]["schema"]
         == {"$ref": "#/components/schemas/AlterTableRequest"}
+    )
+    for status in ERROR_STATUSES:
+        assert (
+            operation["responses"][status]["content"]["application/json"]["schema"]
+            == {"$ref": "#/components/schemas/AkbError"}
+        )
+
+
+def test_table_migration_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    operation = schema["paths"]["/api/v1/tables/{vault}/migrations"]["post"]
+
+    assert operation["operationId"] == "tablesApplyMigration"
+    assert operation["tags"] == ["tables"]
+    assert (
+        operation["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbTableMigrationEnvelope"}
+    )
+    idempotency = next(
+        param for param in operation["parameters"] if param["name"] == "Idempotency-Key"
+    )
+    assert idempotency["in"] == "header"
+    assert idempotency["required"] is True
+    assert idempotency["schema"]["type"] == "string"
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "items": {"additionalProperties": True, "type": "object"},
+        "title": "Operations",
+        "type": "array",
+    }
+    migration = schema["components"]["schemas"]["AkbTableMigrationEnvelope"]
+    assert {"kind", "vault", "idempotency_key", "checksum", "applied", "operations", "results"}.issubset(
+        migration["required"]
     )
     for status in ERROR_STATUSES:
         assert (

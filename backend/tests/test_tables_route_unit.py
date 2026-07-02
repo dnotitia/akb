@@ -103,6 +103,50 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_table_migration_route_forwards_key_ops_with_writer_gate(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: dict[str, Any] = {}
+    roles: list[str] = []
+
+    async def fake_check_vault_access(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        roles.append(kwargs["required_role"])
+        return {"vault_id": "vault-1"}
+
+    async def fake_apply_table_migration(vault_id: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"vault_id": vault_id, **kwargs})
+        return {
+            "kind": "table_migration",
+            "vault": "demo",
+            "idempotency_key": kwargs["idempotency_key"],
+            "checksum": "abc123",
+            "applied": True,
+            "operations": len(kwargs["operations"]),
+            "results": [],
+        }
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_service, "apply_table_migration", fake_apply_table_migration)
+
+    ops = [{"op": "add_column", "table": "incidents", "name": "title", "type": "text"}]
+    result = await tables.apply_table_migration(
+        "demo",
+        ops,
+        "11111111-1111-4111-8111-111111111111",
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result["kind"] == "table_migration"
+    assert roles == ["writer"]
+    assert captured == {
+        "vault_id": "vault-1",
+        "actor_id": "김영로",
+        "idempotency_key": "11111111-1111-4111-8111-111111111111",
+        "operations": ops,
+    }
+
+
+@pytest.mark.asyncio
 async def test_table_schema_routes_use_reader_gate(monkeypatch) -> None:
     from app.api.routes import tables
 

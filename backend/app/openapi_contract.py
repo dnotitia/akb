@@ -74,6 +74,7 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("post", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("get", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("get", "/api/v1/tables/{vault}/schema"): "#/components/schemas/AkbVaultTableSchemaEnvelope",
+    ("post", "/api/v1/tables/{vault}/migrations"): "#/components/schemas/AkbTableMigrationEnvelope",
     ("get", "/api/v1/tables/{vault}/{table}/schema"): "#/components/schemas/AkbTableSchemaEnvelope",
     ("post", "/api/v1/tables/{vault}/sql"): "#/components/schemas/AkbSqlEnvelope",
     ("get", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
@@ -247,6 +248,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             "description": "HTTP success envelope union. SDKs unwrap this to {data,error}.",
             "oneOf": [
                 {"$ref": "#/components/schemas/AkbTableEnvelope"},
+                {"$ref": "#/components/schemas/AkbTableMigrationEnvelope"},
                 {"$ref": "#/components/schemas/AkbTableSchemaEnvelope"},
                 {"$ref": "#/components/schemas/AkbVaultTableSchemaEnvelope"},
                 {"$ref": "#/components/schemas/AkbTableQueryEnvelope"},
@@ -257,6 +259,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "propertyName": "kind",
                 "mapping": {
                     "table": "#/components/schemas/AkbTableEnvelope",
+                    "table_migration": "#/components/schemas/AkbTableMigrationEnvelope",
                     "table_schema": "#/components/schemas/AkbTableSchemaEnvelope",
                     "vault_table_schema": "#/components/schemas/AkbVaultTableSchemaEnvelope",
                     "table_query": "#/components/schemas/AkbTableQueryEnvelope",
@@ -306,6 +309,29 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "total": {"type": "integer"},
             },
             "Table resource, list, mutation, and delete success envelope.",
+        ),
+        "AkbTableMigrationEnvelope": _kind_schema(
+            "table_migration",
+            {
+                "id": {"type": "string"},
+                "vault": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+                "checksum": {"type": "string"},
+                "applied": {"type": "boolean"},
+                "applied_at": {"type": "string", "format": "date-time"},
+                "operations": {"type": "integer"},
+                "results": JSON_OBJECT_ARRAY_SCHEMA,
+            },
+            "Idempotent table schema migration result.",
+            required=(
+                "kind",
+                "vault",
+                "idempotency_key",
+                "checksum",
+                "applied",
+                "operations",
+                "results",
+            ),
         ),
         "AkbTableSchemaEnvelope": _kind_schema(
             "table_schema",
