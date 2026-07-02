@@ -2,12 +2,12 @@
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services import table_service
+from app.services import table_row_query, table_service
 from app.util.errors import (
     CONFLICT,
     INVALID_ARGUMENT,
@@ -97,6 +97,32 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             is_admin=user.is_admin,
         )
     )
+
+
+@router.get("/tables/{vault}/{table}/rows", summary="Select rows from a vault table")
+async def select_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    result = await table_row_query.select_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        range_header=request.headers.get("range"),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_query.RowQueryResponse):
+        if result.content_range is not None:
+            response.headers["Content-Range"] = result.content_range
+        return result.body
+    return _raise_service_error(result)
 
 
 def _raise_service_error(result: Any) -> Any:
