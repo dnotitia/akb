@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from app.services.table_row_query import compile_row_query
+from app.services.table_row_query import compile_ast_row_query, compile_row_query
 
 
 COLUMNS = [
@@ -88,6 +88,75 @@ def test_compile_boolean_group_and_numeric_conversion() -> None:
     assert compiled["params"] == ["high", Decimal("0.9")]
 
 
+def test_compile_ast_matches_url_sql_for_equivalent_query() -> None:
+    url = compile_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        query_params=[
+            ("select", "id,severity"),
+            ("or", "(severity.eq.high,score.gte.0.9)"),
+            ("order", "created_at.desc"),
+            ("limit", "2"),
+        ],
+        prefer_header="count=exact",
+    )
+    ast = compile_ast_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "select": ["id", "severity"],
+            "filter": {
+                "or": [
+                    {"col": "severity", "op": "eq", "val": "high"},
+                    {"col": "score", "op": "gte", "val": 0.9},
+                ],
+            },
+            "order": [{"col": "created_at", "dir": "desc"}],
+            "limit": 2,
+            "count": "exact",
+        },
+    )
+
+    assert "error" not in url
+    assert "error" not in ast
+    assert ast["sql"] == url["sql"]
+    assert ast["params"] == url["params"]
+
+
+def test_compile_ast_json_path_and_boolean_group() -> None:
+    compiled = compile_ast_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "and": [
+                {"col": "severity", "op": "in", "val": ["high", "critical"]},
+                {
+                    "jsonb": {"col": "metadata", "path": ["stats", "count"], "cast": "int"},
+                    "op": "gt",
+                    "val": 5,
+                },
+            ],
+            "select": ["title", "metadata#>>{stats,count}::int"],
+        },
+    )
+
+    assert "error" not in compiled
+    assert compiled["sql"] == (
+        "SELECT title, (metadata #>> $1::text[])::integer AS __akb_col_1 "
+        "FROM vt_eng__incidents WHERE ((severity = ANY($2)) "
+        "AND ((metadata #>> $3::text[])::integer > $4)) LIMIT 100 OFFSET 0"
+    )
+    assert compiled["params"] == [
+        ["stats", "count"],
+        ["high", "critical"],
+        ["stats", "count"],
+        5,
+    ]
+
+
 def test_compile_json_containment_object_as_json_param() -> None:
     compiled = compile_row_query(
         vault_name="eng",
@@ -156,6 +225,40 @@ def test_compile_rejects_empty_boolean_group() -> None:
         query_params=[("and", "(or())")],
     )
     assert nested["code"] == "invalid_filter"
+
+
+def test_compile_ast_rejects_write_ast_and_bad_depth() -> None:
+    write = compile_ast_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={"insert": [{"title": "nope"}]},
+    )
+    assert write["code"] == "method_not_allowed"
+
+    too_deep = compile_ast_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "or": [
+                {
+                    "and": [
+                        {
+                            "or": [
+                                {
+                                    "and": [
+                                        {"col": "severity", "op": "eq", "val": "high"},
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    assert too_deep["code"] == "filter_too_deep"
 
 
 def test_range_header_overrides_limit_offset_and_clamps() -> None:
