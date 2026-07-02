@@ -14,6 +14,7 @@ from app.services.table_row_write import (
 COLUMNS = [
     {"name": "title", "type": "text"},
     {"name": "severity", "type": "text"},
+    {"name": "external_id", "type": "text"},
     {"name": "metadata", "type": "json"},
 ]
 
@@ -94,16 +95,66 @@ def test_compile_insert_rejects_unknown_columns_and_bulk_overflow() -> None:
     assert isinstance(overflow, dict)
     assert overflow["code"] == "bulk_too_large"
 
-    upsert = compile_insert_rows(
+    no_unique = compile_insert_rows(
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
         actor_id="alice",
-        body={"id": "00000000-0000-0000-0000-000000000001", "title": "a"},
-        query_params=[("on_conflict", "id")],
+        body={"severity": "high", "title": "a"},
+        query_params=[("on_conflict", "severity")],
     )
-    assert isinstance(upsert, dict)
-    assert upsert["code"] == "method_not_allowed"
+    assert isinstance(no_unique, dict)
+    assert no_unique["code"] == "no_unique_constraint"
+
+
+def test_compile_upsert_merge_on_primary_key() -> None:
+    compiled = compile_insert_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        actor_id="alice",
+        body={
+            "id": "00000000-0000-0000-0000-000000000001",
+            "title": "merged",
+            "created_at": "2026-07-02T00:00:00Z",
+        },
+        query_params=[("on_conflict", "id")],
+        prefer_header="return=representation",
+    )
+
+    assert not isinstance(compiled, dict)
+    assert compiled.sql == (
+        "INSERT INTO vt_eng__incidents (id, title, created_at, created_by) "
+        "VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, "
+        "updated_at = NOW() RETURNING *"
+    )
+    assert compiled.params == [
+        "00000000-0000-0000-0000-000000000001",
+        "merged",
+        "2026-07-02T00:00:00Z",
+        "alice",
+    ]
+
+
+def test_compile_upsert_uses_declared_unique_key_and_ignore_resolution() -> None:
+    compiled = compile_insert_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        unique_keys=[{"name": "incidents_external_id_key", "columns": ["external_id"]}],
+        actor_id="alice",
+        body={"external_id": "INC-1", "title": "ignored"},
+        query_params=[("on_conflict", "external_id")],
+        prefer_header="resolution=ignore-duplicates, return=representation",
+    )
+
+    assert not isinstance(compiled, dict)
+    assert compiled.sql == (
+        "INSERT INTO vt_eng__incidents (external_id, title, created_by) "
+        "VALUES ($1, $2, $3) ON CONFLICT (external_id) DO NOTHING RETURNING *"
+    )
+    assert compiled.params == ["INC-1", "ignored", "alice"]
 
 
 def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
