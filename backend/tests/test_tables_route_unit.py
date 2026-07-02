@@ -143,6 +143,61 @@ async def test_query_rows_route_forwards_ast_and_headers(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_rows_route_dispatches_write_ast_to_writer(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: dict[str, Any] = {}
+    access_roles: list[str] = []
+
+    class _Request:
+        headers = Headers({"prefer": "return=representation"})
+
+    class _Response:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+            self.status_code: int | None = None
+
+    async def fake_check_vault_access(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        access_roles.append(kwargs["required_role"])
+        return {"vault_id": "vault-1"}
+
+    async def fake_write_query_rows(**kwargs: Any) -> tables.table_row_write.RowMutationResponse:
+        captured.update(kwargs)
+        return tables.table_row_write.RowMutationResponse(
+            status_code=201,
+            body={"kind": "table_query", "items": [{"id": "1"}], "total": 1},
+            content_range="0-0/1",
+        )
+
+    async def fail_read_query_rows(**_kwargs: Any) -> None:
+        raise AssertionError("read query_rows should not handle write AST")
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_row_write, "query_rows", fake_write_query_rows)
+    monkeypatch.setattr(tables.table_row_query, "query_rows", fail_read_query_rows)
+
+    response = _Response()
+    result = await tables.query_rows(
+        "demo",
+        "incidents",
+        tables.QueryRowsRequest.model_validate(
+            {"insert": [{"title": "hello"}], "returning": ["id"]},
+        ),
+        _Request(),  # type: ignore[arg-type]
+        response,  # type: ignore[arg-type]
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result["kind"] == "table_query"
+    assert response.status_code == 201
+    assert response.headers["Content-Range"] == "0-0/1"
+    assert access_roles == ["reader", "writer"]
+    assert captured["actor_id"] == "김영로"
+    assert captured["ast"] == {"insert": [{"title": "hello"}], "returning": ["id"]}
+    assert captured["prefer_header"] == "return=representation"
+
+
+@pytest.mark.asyncio
 async def test_insert_rows_route_forwards_body_query_and_prefer(monkeypatch) -> None:
     from app.api.routes import tables
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from app.services.table_row_write import (
+    compile_ast_mutation,
     compile_delete_rows,
     compile_insert_rows,
     compile_update_rows,
@@ -155,6 +156,71 @@ def test_compile_upsert_uses_declared_unique_key_and_ignore_resolution() -> None
         "VALUES ($1, $2, $3) ON CONFLICT (external_id) DO NOTHING RETURNING *"
     )
     assert compiled.params == ["INC-1", "ignored", "alice"]
+
+
+def test_compile_write_ast_insert_uses_same_insert_compiler() -> None:
+    compiled = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "insert": [{"title": "a"}, {"title": "b", "severity": "high"}],
+            "returning": ["id", "title"],
+        },
+        actor_id="alice",
+    )
+
+    assert not isinstance(compiled, dict)
+    assert compiled.fetch is True
+    assert compiled.sql == (
+        "INSERT INTO vt_eng__incidents (title, severity, created_by) "
+        "VALUES ($1, DEFAULT, $2), ($3, $4, $5) RETURNING id, title"
+    )
+    assert compiled.params == ["a", "alice", "b", "high", "alice"]
+
+
+def test_compile_write_ast_update_reuses_ast_filter() -> None:
+    compiled = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "update": {"severity": "critical"},
+            "where": {"col": "severity", "op": "eq", "val": "high"},
+            "returning": "*",
+        },
+        actor_id="alice",
+    )
+
+    assert not isinstance(compiled, dict)
+    assert compiled.fetch is True
+    assert compiled.sql == (
+        "UPDATE vt_eng__incidents SET severity = $1, updated_at = NOW() "
+        "WHERE severity = $2 RETURNING *"
+    )
+    assert compiled.params == ["critical", "high"]
+
+
+def test_compile_write_ast_delete_requires_filter_or_all_true() -> None:
+    unfiltered = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={"delete": True},
+        actor_id="alice",
+    )
+    assert isinstance(unfiltered, dict)
+    assert unfiltered["code"] == "unfiltered_mutation"
+
+    all_rows = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={"delete": True, "all": True},
+        actor_id="alice",
+    )
+    assert not isinstance(all_rows, dict)
+    assert all_rows.sql == "DELETE FROM vt_eng__incidents WHERE TRUE"
 
 
 def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:

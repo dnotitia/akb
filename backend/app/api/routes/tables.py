@@ -263,21 +263,37 @@ async def query_rows(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    result = await table_row_query.query_rows(
+    ast = req.model_dump(exclude_none=True)
+    if table_row_write.is_write_ast(ast):
+        access = await check_vault_access(user.user_id, vault, required_role="writer")
+        write_result = await table_row_write.query_rows(
+            vault_name=vault,
+            vault_id=access["vault_id"],
+            table_name=table,
+            user_id=user.user_id,
+            actor_id=user.username,
+            is_admin=user.is_admin,
+            ast=ast,
+            prefer_header=request.headers.get("prefer"),
+        )
+        if isinstance(write_result, table_row_write.RowMutationResponse):
+            return _apply_row_mutation_response(write_result, response)
+        return _raise_service_error(write_result)
+    read_result = await table_row_query.query_rows(
         vault_name=vault,
         vault_id=access["vault_id"],
         table_name=table,
         user_id=user.user_id,
         is_admin=user.is_admin,
-        ast=req.model_dump(exclude_none=True),
+        ast=ast,
         range_header=request.headers.get("range"),
         prefer_header=request.headers.get("prefer"),
     )
-    if isinstance(result, table_row_query.RowQueryResponse):
-        if result.content_range is not None:
-            response.headers["Content-Range"] = result.content_range
-        return result.body
-    return _raise_service_error(result)
+    if isinstance(read_result, table_row_query.RowQueryResponse):
+        if read_result.content_range is not None:
+            response.headers["Content-Range"] = read_result.content_range
+        return read_result.body
+    return _raise_service_error(read_result)
 
 
 def _apply_row_mutation_response(
