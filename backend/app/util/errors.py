@@ -74,6 +74,9 @@ METHOD_NOT_ALLOWED = "method_not_allowed"  # DDL via akb_sql, etc.
 SQL_ERROR = "sql_error"                    # generic PG error after enrichment
 UNDEFINED_COLUMN = "undefined_column"
 UNDEFINED_TABLE = "undefined_table"
+UNFILTERED_MUTATION = "unfiltered_mutation"
+BULK_TOO_LARGE = "bulk_too_large"
+NO_UNIQUE_CONSTRAINT = "no_unique_constraint"
 
 # Knowledge-graph linking
 SELF_LINK = "self_link"
