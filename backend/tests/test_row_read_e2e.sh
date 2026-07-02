@@ -82,6 +82,7 @@ echo "$BODY" | python3 -c '
 import sys,json
 d=json.load(sys.stdin)
 assert d["kind"] == "table_query"
+assert "vaults" not in d
 assert d["columns"] == ["title","severity","metadata->>tier"]
 assert d["total"] == 2
 assert [r["severity"] for r in d["items"]] == ["high","critical"]
@@ -144,6 +145,7 @@ echo "$BODY" | python3 -c '
 import sys,json
 d=json.load(sys.stdin)
 assert d["kind"] == "table_query"
+assert "vaults" not in d
 assert d["columns"] == ["title","severity","metadata->>tier"]
 assert d["total"] == 2
 assert [r["title"] for r in d["items"]] == ["API outage","DB pressure"]

@@ -1,6 +1,6 @@
 """REST API routes for vault tables (structured data)."""
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import ConfigDict
@@ -71,6 +71,16 @@ class QueryRowsRequest(NFCModel):
     count: bool | str | None = None
 
 
+class TableQueryResponse(NFCModel):
+    kind: Literal["table_query"]
+    vault: str | None = None
+    table: str | None = None
+    vaults: list[str] | None = None
+    columns: list[str]
+    items: list[dict[str, Any]]
+    total: int
+
+
 @router.post("/tables/{vault}", summary="Create a table in a vault")
 async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
@@ -113,7 +123,13 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     )
 
 
-@router.get("/tables/{vault}/{table}/rows", summary="Select rows from a vault table")
+@router.get(
+    "/tables/{vault}/{table}/rows",
+    summary="Select rows from a vault table",
+    operation_id="tablesSelectRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+)
 async def select_rows(
     vault: str,
     table: str,
@@ -139,7 +155,13 @@ async def select_rows(
     return _raise_service_error(result)
 
 
-@router.post("/tables/{vault}/{table}/query", summary="Select rows from a vault table using JSON AST")
+@router.post(
+    "/tables/{vault}/{table}/query",
+    summary="Select rows from a vault table using JSON AST",
+    operation_id="tablesQueryRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+)
 async def query_rows(
     vault: str,
     table: str,
