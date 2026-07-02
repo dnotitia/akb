@@ -50,6 +50,8 @@ const rawSqlData = rawSqlResult.throwOnError().data;
 if (rawSqlData.kind === "table_query") {
   rawSqlData.items.at(0)?.title satisfies string | undefined;
 }
+// @ts-expect-error raw SQL is only exposed as a tagged template.
+typedClient.vault("eng").sql("SELECT title FROM tasks");
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
 typedClient.vault("eng").from("incidents").request("/rows");
 typedClient.vault("eng").from("tasks").request("/rows");

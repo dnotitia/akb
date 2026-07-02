@@ -161,6 +161,27 @@ test("vault sql tag requires a selected vault and tagged template", () => {
   );
 });
 
+test("vault sql tag preserves permission-denied errors from cross-vault SQL", async () => {
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async () => new Response(
+      JSON.stringify({
+        message: "permission denied for schema external",
+        code: "permission_denied",
+        details: { pg_sqlstate: "42501" },
+      }),
+      { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } },
+    ),
+  }).vault("eng");
+
+  const result = await client.sql`SELECT * FROM external__tasks`;
+
+  assert.equal(result.data, null);
+  assert.equal(result.error instanceof AkbError, true);
+  assert.equal(result.error?.code, "permission_denied");
+  assert.deepEqual(result.error?.details, { pg_sqlstate: "42501" });
+});
+
 test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary", async () => {
   let seenUrl = "";
   let seenInit = {};
@@ -264,6 +285,7 @@ test("from query builder serializes read operators to the URL contract", async (
     .in("severity", ["high", "low"])
     .cs("metadata", ["a", "b"])
     .not("status", "eq", "closed")
+    .and("owner_id.eq.u1,score.gte.3")
     .filter("metadata#>>{audit,actor}::text", "eq", "kim");
 
   assert.deepEqual([...new URL(seenUrl).searchParams.entries()], [
@@ -280,6 +302,7 @@ test("from query builder serializes read operators to the URL contract", async (
     ["severity", "in.(high,low)"],
     ["metadata", "cs.{a,b}"],
     ["status", "not.eq.closed"],
+    ["and", "(owner_id.eq.u1,score.gte.3)"],
     ["metadata#>>{audit,actor}::text", "eq.kim"],
   ]);
 });
@@ -511,6 +534,44 @@ test("from write builder maps insert/update/upsert/delete to rows verbs", async 
   assert.equal(calls[4].init.method, "DELETE");
   assert.equal(new Headers(calls[4].init.headers).get("prefer"), "return=minimal");
   assert.equal(calls[4].init.body, undefined);
+});
+
+test("from write builder covers bulk insert, filtered delete, and default upsert conflict", async () => {
+  const calls = [];
+  const responses = [
+    new Response(null, { status: 204 }),
+    new Response(null, { status: 204 }),
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id"], items: [{ id: "1" }], total: 1 }), {
+      status: 201,
+      headers: { "content-type": "application/json", "content-range": "0-0/1" },
+    }),
+  ];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return responses.shift();
+    },
+  });
+
+  await client.vault("eng").from("tasks").insert([{ title: "One" }, { title: "Two", status: "todo" }]);
+  await client.vault("eng").from("tasks").delete().eq("status", "done");
+  await client.vault("eng").from("tasks").upsert({ id: "1", title: "Ship" }).select("id");
+
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/rows");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(new Headers(calls[0].init.headers).get("prefer"), "return=minimal");
+  assert.deepEqual(JSON.parse(calls[0].init.body), [{ title: "One" }, { title: "Two", status: "todo" }]);
+
+  assert.equal(calls[1].input, "https://akb.test/api/v1/tables/eng/tasks/rows?status=eq.done");
+  assert.equal(calls[1].init.method, "DELETE");
+  assert.equal(new Headers(calls[1].init.headers).get("prefer"), "return=minimal");
+  assert.equal(calls[1].init.body, undefined);
+
+  assert.equal(calls[2].input, "https://akb.test/api/v1/tables/eng/tasks/rows?select=id&on_conflict=id");
+  assert.equal(calls[2].init.method, "POST");
+  assert.equal(new Headers(calls[2].init.headers).get("prefer"), "return=representation");
+  assert.deepEqual(JSON.parse(calls[2].init.body), { id: "1", title: "Ship" });
 });
 
 test("from write builder falls back to write AST for unsafe mutation filters", async () => {
