@@ -23,7 +23,7 @@ from typing import Any
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -39,6 +39,7 @@ from app.services.user_sql_executor import (
 )
 from app.util.errors import (
     err,
+    INVALID_ARGUMENT,
     METHOD_NOT_ALLOWED,
     MULTI_STATEMENT,
     PERMISSION_DENIED,
@@ -335,6 +336,131 @@ def _normalize_enum_renames(spec: dict, old_values: list, new_values: list[str])
     return renames
 
 
+def _single_column_unique_names(unique_keys: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for unique_key in unique_keys:
+        cols = unique_key.get("columns", [])
+        if len(cols) == 1 and isinstance(cols[0], str):
+            names.add(cols[0].lower())
+    return names
+
+
+async def _validate_column_references(
+    conn,
+    vault_id: uuid.UUID,
+    columns: list[dict],
+) -> None:
+    """Validate same-vault FK references before any DDL reaches PostgreSQL."""
+    for col in columns:
+        refs = col.get("references")
+        if refs is None:
+            continue
+        refs, on_delete = table_data_repo.normalize_reference_spec(refs, col.get("on_delete"))
+        col["references"] = refs
+        col["on_delete"] = on_delete
+        if on_delete == "set null" and col.get("required") is True:
+            raise ValidationError(
+                f"Column {col['name']!r}: ON DELETE SET NULL requires a nullable source column."
+            )
+
+        target_table = await table_registry_repo.find_by_name(conn, vault_id, refs["table"])
+        if not target_table:
+            raise AKBError(
+                f"Column {col['name']!r}: references target table {refs['table']!r} "
+                "must exist in the same vault.",
+                status_code=400,
+                code=INVALID_ARGUMENT,
+            )
+
+        target_column = refs["column"]
+        if target_column == "id":
+            target_type = "uuid"
+            target_is_unique = True
+        else:
+            target_columns = table_registry_repo.parse_columns(target_table["columns"])
+            lookup = _declared_column_lookup(target_columns)
+            target_key = target_column.lower()
+            if target_key not in lookup:
+                raise ValidationError(
+                    f"Column {col['name']!r}: references target column "
+                    f"{target_column!r} does not exist on table {refs['table']!r}."
+                )
+            canonical_target = lookup[target_key]
+            refs["column"] = canonical_target
+            target_meta = next(c for c in target_columns if c["name"] == canonical_target)
+            target_type = table_data_repo.normalize_column_type(target_meta.get("type", "text"))
+            target_unique_names = _single_column_unique_names(
+                table_registry_repo.parse_json_list(target_table.get("unique_keys"))
+            )
+            target_is_unique = bool(
+                target_meta.get("unique") is True or canonical_target.lower() in target_unique_names
+            )
+        if not target_is_unique:
+            raise ValidationError(
+                f"Column {col['name']!r}: references target "
+                f"{refs['table']!r}.{refs['column']!r} must be a primary key or single-column UNIQUE key."
+            )
+
+        source_pg_type = _canonical_pg_type(table_data_repo.normalize_column_type(col.get("type", "text")))
+        target_pg_type = _canonical_pg_type(target_type)
+        if source_pg_type != target_pg_type:
+            raise ValidationError(
+                f"Column {col['name']!r}: references type mismatch; source "
+                f"{source_pg_type} cannot reference {refs['table']}.{refs['column']} "
+                f"({target_pg_type})."
+            )
+
+
+async def _referencing_columns(
+    conn,
+    vault_id: uuid.UUID,
+    target_table_name: str,
+    target_columns: set[str],
+) -> list[str]:
+    refs: list[str] = []
+    targets = {c.lower() for c in target_columns}
+    for table in await table_registry_repo.list_for_vault(conn, vault_id):
+        for col in table_registry_repo.parse_columns(table.get("columns")):
+            reference = col.get("references")
+            if not isinstance(reference, dict):
+                continue
+            ref_table = reference.get("table")
+            ref_column = reference.get("column") or "id"
+            if (
+                isinstance(ref_table, str)
+                and isinstance(ref_column, str)
+                and ref_table.lower() == target_table_name.lower()
+                and ref_column.lower() in targets
+            ):
+                refs.append(f"{table['name']}.{col.get('name')}")
+    return sorted(refs)
+
+
+async def _reject_referenced_target_columns(
+    conn,
+    vault_id: uuid.UUID,
+    table_name: str,
+    column_names: set[str],
+    *,
+    action: str,
+) -> None:
+    refs = await _referencing_columns(conn, vault_id, table_name, column_names)
+    if refs:
+        raise ConflictError(
+            f"Cannot {action} referenced column(s) on table {table_name!r}: "
+            f"{sorted(column_names)} are referenced by {refs}. Drop dependent "
+            "tables or columns first."
+        )
+
+
+def _foreign_key_validation_message(table_name: str, e: Exception) -> str:
+    return (
+        f"Foreign-key constraint for table {table_name!r} is invalid: {e}. "
+        "references must target a same-vault table column backed by a primary "
+        "key or single-column UNIQUE key, with compatible column types."
+    )
+
+
 # ── Indexing helpers ─────────────────────────────────────────────
 
 
@@ -468,9 +594,12 @@ async def create_table(
             )
             _reject_duplicate_meta_names(resolved_uks, label="unique-key")
             _reject_duplicate_meta_names(resolved_idxs, label="index")
+            await _validate_column_references(conn, vault_id, columns)
 
             try:
-                await table_data_repo.create_dynamic_table(conn, pg_name, columns)
+                await table_data_repo.create_dynamic_table(
+                    conn, pg_name, columns, vault_name=vault["name"],
+                )
                 for uk in resolved_uks:
                     await table_data_repo.create_unique_constraint(
                         conn, pg_name, uk["name"], uk["columns"],
@@ -508,6 +637,13 @@ async def create_table(
                     f"shared schema-wide — choose a different name (or omit it "
                     f"to let AKB generate a collision-safe one)."
                 ) from e
+            except (
+                asyncpg.ForeignKeyViolationError,
+                asyncpg.InvalidForeignKeyError,
+                asyncpg.UndefinedTableError,
+                asyncpg.UndefinedColumnError,
+            ) as e:
+                raise ValidationError(_foreign_key_validation_message(name, e)) from e
             except asyncpg.UniqueViolationError as e:
                 # Concurrent create past the find_by_name check races on
                 # UNIQUE(vault_tables) or pg_type. Surface as 409.
@@ -766,7 +902,13 @@ async def drop_table(
 
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-            await table_data_repo.drop_dynamic_table(conn, pg_name)
+            try:
+                await table_data_repo.drop_dynamic_table(conn, pg_name)
+            except asyncpg.DependentObjectsStillExistError as e:
+                raise ConflictError(
+                    f"Cannot drop table {table_name!r}: other vault tables reference it. "
+                    "Drop dependent tables or columns first."
+                ) from e
             # Chunks + vector outbox enqueue must commit with the DDL/registry
             # delete so a crash mid-drop can't leave orphan chunks.
             from app.services.index_service import delete_table_chunks
@@ -907,19 +1049,29 @@ async def alter_table(
             renamed: dict[str, str] = {}
 
             if add_columns:
+                await _validate_column_references(conn, vault_id, add_columns)
                 taken_uk_names = {uk["name"] for uk in existing_uks}
                 taken_idx_names = {idx["name"] for idx in existing_idxs}
                 for col in add_columns:
                     if any(c["name"] == col["name"] for c in columns):
                         continue
                     try:
-                        await table_data_repo.add_column(conn, pg_name, col)
+                        await table_data_repo.add_column(
+                            conn, pg_name, col, vault_name=vault["name"],
+                        )
                     except asyncpg.NotNullViolationError as e:
                         raise ValidationError(
                             f"Cannot add required column {col['name']!r} without a default: "
                             f"existing rows would receive NULL. Provide a default or add the "
                             f"column as optional first."
                         ) from e
+                    except (
+                        asyncpg.ForeignKeyViolationError,
+                        asyncpg.InvalidForeignKeyError,
+                        asyncpg.UndefinedTableError,
+                        asyncpg.UndefinedColumnError,
+                    ) as e:
+                        raise ValidationError(_foreign_key_validation_message(table_name, e)) from e
                     columns.append(col)
                     added.append(col["name"])
                     if col.get("unique") is True:
@@ -969,9 +1121,23 @@ async def alter_table(
                         idx_changed = True
 
             if drop_columns:
+                await _reject_referenced_target_columns(
+                    conn,
+                    vault_id,
+                    table_name,
+                    {c for c in drop_columns if isinstance(c, str)},
+                    action="drop",
+                )
                 for col_name in drop_columns:
                     safe_name = table_data_repo.safe_ident(col_name)
-                    await table_data_repo.drop_column(conn, pg_name, safe_name)
+                    try:
+                        await table_data_repo.drop_column(conn, pg_name, safe_name)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot drop column {col_name!r} on table {table_name!r}: "
+                            "other vault tables reference it. Drop dependent tables "
+                            "or columns first."
+                        ) from e
                     dropped.append(col_name)
                 columns = [c for c in columns if c["name"] not in drop_columns]
 
@@ -995,11 +1161,25 @@ async def alter_table(
                             f"Cannot rename multiple columns to {new_name!r} on table {table_name!r}."
                         )
                     rename_targets.add(new_key)
+                await _reject_referenced_target_columns(
+                    conn,
+                    vault_id,
+                    table_name,
+                    {old for old in rename_columns if isinstance(old, str)},
+                    action="rename",
+                )
                 for old_name, new_name in rename_columns.items():
                     old_col = next((dict(c) for c in columns if c["name"] == old_name), None)
                     old_safe = table_data_repo.safe_ident(old_name)
                     new_safe = table_data_repo.safe_ident(new_name)
-                    await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    try:
+                        await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot rename column {old_name!r} on table {table_name!r}: "
+                            "other vault tables reference it. Drop dependent tables "
+                            "or columns first."
+                        ) from e
                     updated_col = None
                     for c in columns:
                         if c["name"] == old_name:
@@ -1012,6 +1192,10 @@ async def alter_table(
                             table_data_repo.enum_constraint_name(pg_name, old_name),
                         )
                         await table_data_repo.create_enum_constraint(conn, pg_name, updated_col)
+                    if old_col and old_col.get("references") is not None and updated_col:
+                        await table_data_repo.replace_foreign_key_constraint(
+                            conn, pg_name, old_name, updated_col, vault_name=vault["name"],
+                        )
 
             # ── Declarative unique keys / indexes (AKB #215) ─────────
             # Existing metadata from the registry row; the merged result
@@ -1114,7 +1298,25 @@ async def alter_table(
                 remaining_uks = []
                 for uk in existing_uks:
                     if uk.get("name") in drop_uk_names:
-                        await table_data_repo.drop_constraint(conn, pg_name, uk["name"])
+                        uk_columns = {
+                            col for col in uk.get("columns", []) if isinstance(col, str)
+                        }
+                        if len(uk_columns) == 1:
+                            await _reject_referenced_target_columns(
+                                conn,
+                                vault_id,
+                                table_name,
+                                uk_columns,
+                                action=f"drop unique key {uk['name']!r} for",
+                            )
+                        try:
+                            await table_data_repo.drop_constraint(conn, pg_name, uk["name"])
+                        except asyncpg.DependentObjectsStillExistError as e:
+                            raise ConflictError(
+                                f"Cannot drop unique key {uk['name']!r} on table "
+                                f"{table_name!r}: other vault tables reference it. "
+                                "Drop dependent tables or columns first."
+                            ) from e
                         uk_changed = True
                     else:
                         remaining_uks.append(uk)

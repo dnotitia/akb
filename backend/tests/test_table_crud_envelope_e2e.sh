@@ -123,7 +123,7 @@ ALTER_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/
 ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d '{"add_columns":[{"name":"status","type":"text","default":"active","check":{"op":"in","values":["active","inactive"]},"enum":["active","inactive"],"references":{"table":"statuses","column":"code"},"on_delete":"restrict","index":true}],"rename_columns":{"age":"age_years"}}')
+  -d '{"add_columns":[{"name":"status","type":"text","default":"active","check":{"op":"in","values":["active","inactive"]},"enum":["active","inactive"],"index":true}],"rename_columns":{"age":"age_years"}}')
 assert_keys "alter" "$ALTER" kind uri vault name columns
 assert_value "alter" "$ALTER" "v=d['kind']" "table"
 assert_value "alter" "$ALTER" "v=d['vault']" "$VAULT"
@@ -166,8 +166,6 @@ assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['default']" "active"
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['check']['op']" "in"
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['enum'][0]" "active"
-assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['references']['table']" "statuses"
-assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['on_delete']" "restrict"
 assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['pg_type']" "text"
 assert_value "schema.table" "$SCHEMA" "v=d['drift']['has_drift']" "False"
 
@@ -329,7 +327,142 @@ assert_value "rich.alter" "$RICH_ALTER" "v=next(c for c in d['columns'] if c.get
 assert_value "rich.alter" "$RICH_ALTER" "v=len(d['indexes'])" "2"
 
 echo ""
-echo "▸ 6. SQL SELECT — envelope shape (rows → items)"
+echo "▸ 6. Foreign keys — same-vault references + on_delete"
+
+FK_PARENT="fk_parent"
+FK_CASCADE="fk_child_cascade"
+FK_SETNULL="fk_child_setnull"
+FK_RESTRICT="fk_child_restrict"
+OTHER_VAULT="$VAULT-other"
+
+FK_PARENT_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$FK_PARENT\",\"columns\":[{\"name\":\"code\",\"type\":\"text\",\"required\":true,\"unique\":true}]}")
+assert_keys "fk.parent-create" "$FK_PARENT_CREATE" kind uri vault name columns unique_keys indexes
+FK_PARENT_UK=$(echo "$FK_PARENT_CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["unique_keys"][0]["name"])' 2>/dev/null)
+
+FK_CASCADE_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$FK_CASCADE\",\"columns\":[{\"name\":\"parent_code\",\"type\":\"text\",\"references\":{\"table\":\"$FK_PARENT\",\"column\":\"code\",\"on_delete\":\"cascade\"}},{\"name\":\"label\",\"type\":\"text\"}]}")
+assert_value "fk.cascade-create" "$FK_CASCADE_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'parent_code')['references']['table']" "$FK_PARENT"
+assert_value "fk.cascade-create" "$FK_CASCADE_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'parent_code')['on_delete']" "cascade"
+
+FK_BAD_INSERT=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_CASCADE (parent_code, label) VALUES ('missing', 'bad')\"}")
+[ "$FK_BAD_INSERT" = "400" ] && pass "fk.raw-invalid: HTTP 400" || fail "fk.raw-invalid" "expected 400, got $FK_BAD_INSERT"
+
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_PARENT (code) VALUES ('p1')\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_CASCADE (parent_code, label) VALUES ('p1', 'child')\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"DELETE FROM $FK_PARENT WHERE code = 'p1'\"}" >/dev/null
+FK_CASCADE_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT COUNT(*)::int AS n FROM $FK_CASCADE\"}")
+assert_value "fk.cascade" "$FK_CASCADE_SELECT" "v=d['items'][0]['n']" "0"
+
+FK_SETNULL_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$FK_SETNULL\",\"columns\":[{\"name\":\"parent_code\",\"type\":\"text\",\"references\":{\"table\":\"$FK_PARENT\",\"column\":\"code\"},\"on_delete\":\"set null\"},{\"name\":\"label\",\"type\":\"text\"}]}")
+assert_value "fk.setnull-create" "$FK_SETNULL_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'parent_code')['on_delete']" "set null"
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_PARENT (code) VALUES ('p2')\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_SETNULL (parent_code, label) VALUES ('p2', 'child')\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"DELETE FROM $FK_PARENT WHERE code = 'p2'\"}" >/dev/null
+FK_SETNULL_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT parent_code IS NULL AS cleared FROM $FK_SETNULL WHERE label = 'child'\"}")
+assert_value "fk.setnull" "$FK_SETNULL_SELECT" "v=d['items'][0]['cleared']" "True"
+
+FK_RESTRICT_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$FK_RESTRICT\",\"columns\":[{\"name\":\"parent_code\",\"type\":\"text\",\"references\":{\"table\":\"$FK_PARENT\",\"column\":\"code\"},\"on_delete\":\"restrict\"},{\"name\":\"label\",\"type\":\"text\"}]}")
+assert_value "fk.restrict-create" "$FK_RESTRICT_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'parent_code')['on_delete']" "restrict"
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_PARENT (code) VALUES ('p3')\"}" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $FK_RESTRICT (parent_code, label) VALUES ('p3', 'child')\"}" >/dev/null
+FK_RESTRICT_DELETE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"DELETE FROM $FK_PARENT WHERE code = 'p3'\"}")
+[ "$FK_RESTRICT_DELETE" = "400" ] && pass "fk.restrict: HTTP 400" || fail "fk.restrict" "expected 400, got $FK_RESTRICT_DELETE"
+
+FK_PARENT_DROP_BLOCK=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" \
+  -H "Authorization: Bearer $PAT")
+[ "$FK_PARENT_DROP_BLOCK" = "409" ] && pass "fk.parent-drop-blocked: HTTP 409" || fail "fk.parent-drop-blocked" "expected 409, got $FK_PARENT_DROP_BLOCK"
+
+FK_TARGET_COLUMN_DROP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"drop_columns":["code"]}')
+[ "$FK_TARGET_COLUMN_DROP" = "409" ] && pass "fk.target-column-drop-blocked: HTTP 409" || fail "fk.target-column-drop-blocked" "expected 409, got $FK_TARGET_COLUMN_DROP"
+
+FK_TARGET_COLUMN_RENAME=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"rename_columns":{"code":"code_renamed"}}')
+[ "$FK_TARGET_COLUMN_RENAME" = "409" ] && pass "fk.target-column-rename-blocked: HTTP 409" || fail "fk.target-column-rename-blocked" "expected 409, got $FK_TARGET_COLUMN_RENAME"
+
+FK_TARGET_UK_DROP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"drop_unique_keys\":[\"$FK_PARENT_UK\"]}")
+[ "$FK_TARGET_UK_DROP" = "409" ] && pass "fk.target-unique-drop-blocked: HTTP 409" || fail "fk.target-unique-drop-blocked" "expected 409, got $FK_TARGET_UK_DROP"
+
+FK_BAD_ON_DELETE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"fk_bad_action\",\"columns\":[{\"name\":\"parent_code\",\"type\":\"text\",\"references\":{\"table\":\"$FK_PARENT\",\"column\":\"code\",\"on_delete\":\"explode\"}}]}")
+[ "$FK_BAD_ON_DELETE" = "422" ] && pass "fk.bad-on-delete: HTTP 422" || fail "fk.bad-on-delete" "expected 422, got $FK_BAD_ON_DELETE"
+
+curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$OTHER_VAULT&description=fk%20cross%20vault" \
+  -H "Authorization: Bearer $PAT" >/dev/null
+curl -sk -X POST "$BASE_URL/api/v1/tables/$OTHER_VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"foreign_parent","columns":[{"name":"code","type":"text","required":true,"unique":true}]}' >/dev/null
+FK_CROSS=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"fk_cross","columns":[{"name":"parent_code","type":"text","references":{"table":"foreign_parent","column":"code"}}]}')
+[ "$FK_CROSS" = "400" ] && pass "fk.cross-vault: HTTP 400" || fail "fk.cross-vault" "expected 400, got $FK_CROSS"
+
+curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_CASCADE" -H "Authorization: Bearer $PAT" >/dev/null
+curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_SETNULL" -H "Authorization: Bearer $PAT" >/dev/null
+curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_RESTRICT" -H "Authorization: Bearer $PAT" >/dev/null
+curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$FK_PARENT" -H "Authorization: Bearer $PAT" >/dev/null
+curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$OTHER_VAULT" -H "Authorization: Bearer $PAT" >/dev/null 2>&1 || true
+
+echo ""
+echo "▸ 7. SQL SELECT — envelope shape (rows → items)"
 
 INS=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
@@ -349,7 +482,7 @@ assert_value "sql.select" "$SEL" "v=d['items'][0]['email']" "a@x"
 assert_value "sql.select" "$SEL" "v=d['items'][0]['status']" "active"
 
 echo ""
-echo "▸ 7. Drop table — envelope shape"
+echo "▸ 8. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
@@ -360,7 +493,7 @@ assert_value "drop" "$DROP" "v=d['name']" "$TABLE"
 assert_value "drop" "$DROP" "v=str(d['deleted']).lower()" "true"
 
 echo ""
-echo "▸ 8. Drop missing table — proper 4xx error"
+echo "▸ 9. Drop missing table — proper 4xx error"
 
 MISS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/does-not-exist" \
   -H "Authorization: Bearer $PAT")

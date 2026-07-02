@@ -21,7 +21,7 @@ import uuid
 import asyncpg
 import pytest
 
-from app.exceptions import InvalidColumnTypeError, ValidationError
+from app.exceptions import AKBError, ConflictError, InvalidColumnTypeError, ValidationError
 from app.repositories import table_data_repo
 from app.repositories.table_registry_repo import parse_json_list
 
@@ -157,6 +157,61 @@ def test_enum_column_rejects_invalid_values_default_and_raw_check():
             "type": "enum",
             "enum": ["draft"],
             "check": {"op": "in", "values": ["draft"]},
+        })
+
+
+def test_foreign_key_column_normalizes_references_and_on_delete():
+    col = table_data_repo.normalize_column_spec({
+        "name": "owner_id",
+        "type": "uuid",
+        "references": {"table": "users", "on_delete": "CASCADE"},
+    })
+
+    assert col["references"] == {"table": "users", "column": "id"}
+    assert col["on_delete"] == "cascade"
+    constraint = table_data_repo.foreign_key_constraint_definition("vt_demo__tasks", col)
+    assert constraint.startswith("CONSTRAINT vt_demo__tasks")
+    assert "FOREIGN KEY (owner_id)" in constraint
+    assert "REFERENCES vt_demo__users (id)" in constraint
+    assert constraint.endswith("ON DELETE CASCADE")
+
+
+def test_foreign_key_definition_uses_vault_name_for_double_underscore_tables():
+    col = table_data_repo.normalize_column_spec({
+        "name": "parent_code",
+        "type": "text",
+        "references": {"table": "parents", "column": "code"},
+    })
+
+    constraint = table_data_repo.foreign_key_constraint_definition(
+        "vt_demo__foo__child",
+        col,
+        vault_name="demo",
+    )
+
+    assert "REFERENCES vt_demo__parents (code)" in constraint
+    assert "vt_demo__foo__parents" not in constraint
+
+
+def test_foreign_key_column_rejects_bad_reference_shape():
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "other-vault.users"},
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "users", "on_delete": "drop table"},
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "users", "on_delete": "cascade"},
+            "on_delete": "restrict",
         })
 
 
@@ -337,6 +392,24 @@ async def test_replace_enum_constraint_drops_and_readds_named_check():
 
 
 @pytest.mark.asyncio
+async def test_create_foreign_key_constraint_shape():
+    conn = _ExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "owner_id",
+        "type": "uuid",
+        "references": {"table": "users", "column": "id"},
+        "on_delete": "restrict",
+    })
+
+    await table_data_repo.create_foreign_key_constraint(conn, "vt_demo__tasks", col)
+
+    assert "ADD CONSTRAINT" in conn.sql.upper()
+    assert "FOREIGN KEY (owner_id)" in conn.sql
+    assert "REFERENCES vt_demo__users (id)" in conn.sql
+    assert "ON DELETE RESTRICT" in conn.sql
+
+
+@pytest.mark.asyncio
 async def test_alter_column_default_sets_and_drops_validated_default():
     class _ManyExecConn:
         def __init__(self):
@@ -406,6 +479,140 @@ def test_resolve_unique_keys_generates_stable_name():
     assert len(resolved) == 1
     assert resolved[0]["columns"] == ["actor", "ts"]
     assert resolved[0]["name"].endswith("__uk")
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_accepts_same_vault_unique_target(monkeypatch):
+    async def fake_find_by_name(conn, vault_id, name):
+        assert name == "parents"
+        return {
+            "columns": [{"name": "code", "type": "text", "unique": True}],
+            "unique_keys": [],
+        }
+
+    monkeypatch.setattr(
+        table_service.table_registry_repo,
+        "find_by_name",
+        fake_find_by_name,
+    )
+    cols = [
+        table_data_repo.normalize_column_spec({
+            "name": "parent_code",
+            "type": "text",
+            "references": {"table": "parents", "column": "code", "on_delete": "cascade"},
+        })
+    ]
+
+    await table_service._validate_column_references(object(), uuid.uuid4(), cols)
+
+    assert cols[0]["references"] == {"table": "parents", "column": "code"}
+    assert cols[0]["on_delete"] == "cascade"
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_rejects_missing_nonunique_and_type_mismatch(monkeypatch):
+    async def missing_find_by_name(conn, vault_id, name):
+        return None
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", missing_find_by_name)
+    with pytest.raises(AKBError) as exc:
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "uuid",
+                "references": {"table": "parents"},
+            })],
+        )
+    assert exc.value.status_code == 400
+
+    async def nonunique_find_by_name(conn, vault_id, name):
+        return {
+            "columns": [{"name": "code", "type": "text"}],
+            "unique_keys": [],
+        }
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", nonunique_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_code",
+                "type": "text",
+                "references": {"table": "parents", "column": "code"},
+            })],
+        )
+
+    async def id_find_by_name(conn, vault_id, name):
+        return {"columns": [], "unique_keys": []}
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", id_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "text",
+                "references": {"table": "parents"},
+            })],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_rejects_set_null_required(monkeypatch):
+    async def fake_find_by_name(conn, vault_id, name):
+        return {"columns": [], "unique_keys": []}
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", fake_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "uuid",
+                "required": True,
+                "references": {"table": "parents", "on_delete": "set null"},
+            })],
+        )
+
+
+@pytest.mark.asyncio
+async def test_reject_referenced_target_columns_blocks_drop_or_rename(monkeypatch):
+    async def fake_list_for_vault(conn, vault_id):
+        return [
+            {
+                "name": "parents",
+                "columns": [{"name": "code", "type": "text", "unique": True}],
+            },
+            {
+                "name": "children",
+                "columns": [
+                    {
+                        "name": "parent_code",
+                        "type": "text",
+                        "references": {"table": "parents", "column": "code"},
+                    }
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(table_service.table_registry_repo, "list_for_vault", fake_list_for_vault)
+
+    with pytest.raises(ConflictError) as exc:
+        await table_service._reject_referenced_target_columns(
+            object(),
+            uuid.uuid4(),
+            "parents",
+            {"code"},
+            action="drop",
+        )
+
+    assert exc.value.status_code == 409
+    assert "children.parent_code" in exc.value.message
 
 
 def test_resolve_unique_keys_uses_caller_name_verbatim():
@@ -580,7 +787,7 @@ async def test_alter_required_column_without_default_is_clean_validation(monkeyp
     async def _fake_get_pool():
         return _Pool()
 
-    async def _raise_not_null(_conn, _pg_name, _col):
+    async def _raise_not_null(_conn, _pg_name, _col, **_kwargs):
         raise asyncpg.NotNullViolationError("column contains null values")
 
     monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)

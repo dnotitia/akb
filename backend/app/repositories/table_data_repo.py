@@ -95,6 +95,15 @@ _LENGTH_CHECK_OPERATORS = {
     "len_gte": ">=",
 }
 
+_REFERENCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+_FK_ON_DELETE_SQL = {
+    "cascade": "CASCADE",
+    "set null": "SET NULL",
+    "restrict": "RESTRICT",
+    "no action": "NO ACTION",
+}
+
 
 # ── Identifier helpers ───────────────────────────────────────────
 
@@ -170,6 +179,10 @@ def normalize_column_spec(col: dict) -> dict:
     """Copy a caller column spec and normalize its logical type."""
     out = dict(col)
     out["type"] = normalize_column_type(out.get("type", "text"))
+    if out.get("references") is not None:
+        refs, on_delete = normalize_reference_spec(out["references"], out.get("on_delete"))
+        out["references"] = refs
+        out["on_delete"] = on_delete
     if out["type"] == "enum":
         values = _normalize_enum_values(out.get("enum"))
         if out.get("check") is not None:
@@ -330,6 +343,59 @@ def _normalize_enum_values(values: Any) -> list[str]:
     return out
 
 
+def normalize_on_delete(value: Any) -> str:
+    if value is None or value == "":
+        return "no action"
+    if not isinstance(value, str):
+        raise ValidationError("references.on_delete must be a string when provided.")
+    key = value.strip().lower().replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+    if key not in _FK_ON_DELETE_SQL:
+        raise ValidationError(
+            "references.on_delete must be one of "
+            f"{sorted(_FK_ON_DELETE_SQL)}; got {value!r}."
+        )
+    return key
+
+
+def normalize_reference_spec(refs: Any, on_delete: Any = None) -> tuple[dict, str]:
+    if not isinstance(refs, dict):
+        raise ValidationError("references must be an object like {table, column?, on_delete?}.")
+    table = refs.get("table") or refs.get("referenced_table")
+    if not isinstance(table, str) or not table:
+        raise ValidationError("references.table must be a non-empty table name.")
+    if not _REFERENCE_NAME_RE.fullmatch(table):
+        raise ValidationError(
+            f"Invalid references.table {table!r}: must match {_REFERENCE_NAME_RE.pattern}."
+        )
+    column = refs.get("column") or refs.get("referenced_column") or "id"
+    if not isinstance(column, str) or not column:
+        raise ValidationError("references.column must be a non-empty column name.")
+    if column != "id" and not _REFERENCE_NAME_RE.fullmatch(column):
+        raise ValidationError(
+            f"Invalid references.column {column!r}: must be 'id' or match "
+            f"{_REFERENCE_NAME_RE.pattern}."
+        )
+    nested_on_delete = refs.get("on_delete")
+    if nested_on_delete is not None and on_delete is not None:
+        nested = normalize_on_delete(nested_on_delete)
+        top_level = normalize_on_delete(on_delete)
+        if nested != top_level:
+            raise ValidationError(
+                "references.on_delete and column on_delete disagree; provide only one value."
+            )
+        normalized_on_delete = nested
+    else:
+        normalized_on_delete = normalize_on_delete(
+            nested_on_delete if nested_on_delete is not None else on_delete
+        )
+    return {"table": table, "column": column}, normalized_on_delete
+
+
+def reference_on_delete_sql(value: Any) -> str:
+    return _FK_ON_DELETE_SQL[normalize_on_delete(value)]
+
+
 def enum_constraint_name(pg_name: str, col_name: str) -> str:
     return generate_constraint_name(pg_name, [col_name], kind="enum")
 
@@ -345,10 +411,45 @@ def enum_constraint_definition(pg_name: str, col: dict) -> str:
     return f"CONSTRAINT {name} CHECK ({enum_check_sql(col)})"
 
 
+def foreign_key_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="fkey")
+
+
+def _same_vault_reference_pg_name(pg_name: str, table_name: str) -> str:
+    vault_prefix, _sep, _table_part = pg_name.rpartition("__")
+    if not vault_prefix:
+        raise ValidationError(f"Invalid dynamic table name {pg_name!r}.")
+    return f"{vault_prefix}__{pg_short_name(table_name)}"
+
+
+def foreign_key_constraint_definition(
+    pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> str:
+    refs = col.get("references")
+    if refs is None:
+        raise ValidationError(f"Column {col.get('name')!r} has no references spec.")
+    refs, on_delete = normalize_reference_spec(refs, col.get("on_delete"))
+    name = safe_ident(foreign_key_constraint_name(pg_name, col["name"]))
+    source_col = safe_ident(col["name"])
+    target_table = (
+        pg_table_name(vault_name, refs["table"])
+        if vault_name is not None
+        else _same_vault_reference_pg_name(pg_name, refs["table"])
+    )
+    target_col = safe_ident(refs["column"])
+    return (
+        f"CONSTRAINT {name} FOREIGN KEY ({source_col}) "
+        f"REFERENCES {target_table} ({target_col}) "
+        f"ON DELETE {reference_on_delete_sql(on_delete)}"
+    )
+
+
 # ── DDL ──────────────────────────────────────────────────────────
 
 
-async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
+async def create_dynamic_table(
+    conn, pg_name: str, columns: list[dict], *, vault_name: str | None = None,
+) -> None:
     """Create the data-bearing PG table for a vault table. Caller is
     responsible for sanitising `pg_name` (use `pg_table_name`)."""
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
@@ -357,6 +458,11 @@ async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
     for col in columns:
         if normalize_column_type(col.get("type", "text")) == "enum":
             col_defs.append(enum_constraint_definition(pg_name, col))
+    for col in columns:
+        if col.get("references") is not None:
+            col_defs.append(
+                foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)
+            )
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
@@ -387,11 +493,15 @@ async def count_rows(conn, pg_name: str) -> int:
         return 0
 
 
-async def add_column(conn, pg_name: str, col: dict) -> None:
+async def add_column(
+    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> None:
     """Add a column to the dynamic table. Column DDL is validated here."""
     await conn.execute(f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {column_definition(col)}")
     if normalize_column_type(col.get("type", "text")) == "enum":
         await create_enum_constraint(conn, pg_name, col)
+    if col.get("references") is not None:
+        await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
 
 
 async def drop_column(conn, pg_name: str, col_name: str) -> None:
@@ -482,6 +592,27 @@ async def create_enum_constraint(conn, pg_name: str, col: dict) -> None:
 async def replace_enum_constraint(conn, pg_name: str, col: dict) -> None:
     await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, col["name"]))
     await create_enum_constraint(conn, pg_name, col)
+
+
+async def create_foreign_key_constraint(
+    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD "
+        f"{foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)}"
+    )
+
+
+async def replace_foreign_key_constraint(
+    conn,
+    pg_name: str,
+    old_col_name: str,
+    col: dict,
+    *,
+    vault_name: str | None = None,
+) -> None:
+    await drop_constraint(conn, pg_name, foreign_key_constraint_name(pg_name, old_col_name))
+    await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
 
 
 async def alter_column_default(conn, pg_name: str, col: dict) -> None:
