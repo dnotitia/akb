@@ -146,6 +146,263 @@ test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary",
   assert.equal(result.throwOnError().data.kind, "vault_table_schema");
 });
 
+test("from query builder is lazy thenable and fires once", async () => {
+  let calls = 0;
+  let seenUrl = "";
+  let seenInit = {};
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls += 1;
+      seenUrl = String(input);
+      seenInit = init ?? {};
+      return new Response(
+        JSON.stringify({ kind: "table_query", columns: ["title"], items: [{ title: "Ship" }], total: 1 }),
+        { status: 200, headers: { "content-type": "application/json", "content-range": "0-0/1" } },
+      );
+    },
+  });
+
+  const builder = client
+    .vault("eng")
+    .from("tasks")
+    .select("title,status")
+    .eq("status", "todo")
+    .order("title", { ascending: false })
+    .range(0, 9)
+    .count();
+
+  assert.equal(calls, 0);
+  const first = await builder;
+  const second = await builder;
+
+  assert.equal(calls, 1);
+  assert.equal(first, second);
+  assert.equal(
+    seenUrl,
+    "https://akb.test/api/v1/tables/eng/tasks/rows?select=title%2Cstatus&status=eq.todo&order=title.desc",
+  );
+  assert.equal(seenInit.method, "GET");
+  assert.equal(new Headers(seenInit.headers).get("prefer"), "count=exact");
+  assert.equal(new Headers(seenInit.headers).get("range"), "0-9");
+  assert.equal(first.throwOnError().data.items[0].title, "Ship");
+});
+
+test("from query builder serializes read operators to the URL contract", async () => {
+  let seenUrl = "";
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input) => {
+      seenUrl = String(input);
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client
+    .vault("eng")
+    .from("incidents")
+    .select("id,metadata->>tier")
+    .eq("title", "ship")
+    .neq("severity", "low")
+    .gt("score", 1)
+    .gte("score", 2)
+    .lt("score", 10)
+    .lte("score", 11)
+    .like("title", "*ship*")
+    .ilike("metadata->>tier", "gold*")
+    .is("archived", null)
+    .in("severity", ["high", "low"])
+    .cs("metadata", ["a", "b"])
+    .not("status", "eq", "closed")
+    .filter("metadata#>>{audit,actor}::text", "eq", "kim");
+
+  assert.deepEqual([...new URL(seenUrl).searchParams.entries()], [
+    ["select", "id,metadata->>tier"],
+    ["title", "eq.ship"],
+    ["severity", "neq.low"],
+    ["score", "gt.1"],
+    ["score", "gte.2"],
+    ["score", "lt.10"],
+    ["score", "lte.11"],
+    ["title", "like.*ship*"],
+    ["metadata->>tier", "ilike.gold*"],
+    ["archived", "is.null"],
+    ["severity", "in.(high,low)"],
+    ["metadata", "cs.{a,b}"],
+    ["status", "not.eq.closed"],
+    ["metadata#>>{audit,actor}::text", "eq.kim"],
+  ]);
+});
+
+test("from query builder falls back to AST on URL budget and nested groups", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    maxUrlBytes: 8,
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.vault("eng").from("tasks").select("*").eq("status", "todo");
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    select: "*",
+    filter: { col: "status", op: "eq", val: "todo" },
+  });
+
+  const nestedClient = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await nestedClient
+    .vault("eng")
+    .from("tasks")
+    .or((group) => group.eq("status", "todo").and((inner) => inner.eq("owner_id", "u1")));
+
+  assert.equal(calls[1].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    filter: {
+      or: [
+        { col: "status", op: "eq", val: "todo" },
+        { and: [{ col: "owner_id", op: "eq", val: "u1" }] },
+      ],
+    },
+  });
+});
+
+test("from query builder maps jsonb and boolean string groups to AST fallback", async () => {
+  let seenInit = {};
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    maxUrlBytes: 4,
+    fetch: async (_input, init) => {
+      seenInit = init ?? {};
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client
+    .vault("eng")
+    .from("incidents")
+    .select("id")
+    .eq("metadata->>tier", "gold")
+    .or("title.eq.ship,and(severity.eq.high,score.gte.3)")
+    .order("metadata->>rank::int", { ascending: false })
+    .limit(5)
+    .count();
+
+  assert.deepEqual(JSON.parse(seenInit.body), {
+    select: "id",
+    filter: {
+      and: [
+        { jsonb: { col: "metadata", path: ["tier"] }, op: "eq", val: "gold" },
+        {
+          or: [
+            { col: "title", op: "eq", val: "ship" },
+            {
+              and: [
+                { col: "severity", op: "eq", val: "high" },
+                { col: "score", op: "gte", val: "3" },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    order: [{ jsonb: { col: "metadata", path: ["rank"], cast: "int" }, dir: "desc" }],
+    limit: 5,
+    count: "exact",
+  });
+  assert.equal(new Headers(seenInit.headers).get("prefer"), "count=exact");
+});
+
+test("from query builder uses AST when URL arrays cannot round-trip losslessly", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.vault("eng").from("tasks").in("title", ["ACME, Inc."]);
+
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    filter: { col: "title", op: "in", val: ["ACME, Inc."] },
+  });
+
+  await client.vault("eng").from("tasks").cs("metadata", [{ tier: "gold" }]);
+
+  assert.equal(calls[1].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    filter: { col: "metadata", op: "cs", val: [{ tier: "gold" }] },
+  });
+});
+
+test("from query builder uses AST when boolean scalar values cannot round-trip in URL groups", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.vault("eng").from("tasks").or((group) => group.eq("title", "ACME, Inc."));
+
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    filter: { or: [{ col: "title", op: "eq", val: "ACME, Inc." }] },
+  });
+});
+
+test("from query builder applies maxUrlBytes to the full rows URL", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    maxUrlBytes: 15,
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ kind: "table_query", columns: [], items: [], total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.vault("eng").from("tasks").select("id");
+
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { select: "id" });
+});
+
 test("lite subpath exposes the client boundary without a separate runtime", () => {
   assert.equal(createLiteClient, createClient);
 });

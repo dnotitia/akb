@@ -73,6 +73,7 @@ export interface AkbClientConfig {
   apiKey?: string | null | (() => string | null | undefined);
   token?: string | null | (() => string | null | undefined);
   defaultVault?: string | null;
+  maxUrlBytes?: number;
   fetch?: typeof fetch;
 }
 
@@ -111,8 +112,56 @@ export interface AkbTableStub<Row = unknown> {
   readonly table: string;
   readonly vault: string | null;
   request<T = AkbSuccessEnvelope>(path?: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
+  select(columns?: string): AkbTableStub<Row>;
+  filter(column: string, operator: string, value: unknown): AkbTableStub<Row>;
+  eq(column: string, value: unknown): AkbTableStub<Row>;
+  neq(column: string, value: unknown): AkbTableStub<Row>;
+  gt(column: string, value: unknown): AkbTableStub<Row>;
+  gte(column: string, value: unknown): AkbTableStub<Row>;
+  lt(column: string, value: unknown): AkbTableStub<Row>;
+  lte(column: string, value: unknown): AkbTableStub<Row>;
+  like(column: string, value: unknown): AkbTableStub<Row>;
+  ilike(column: string, value: unknown): AkbTableStub<Row>;
+  is(column: string, value: unknown): AkbTableStub<Row>;
+  in(column: string, value: readonly unknown[]): AkbTableStub<Row>;
+  cs(column: string, value: unknown): AkbTableStub<Row>;
+  not(column: string, operator: string, value: unknown): AkbTableStub<Row>;
+  or(group: string | AkbFilterGroupCallback): AkbTableStub<Row>;
+  and(group: string | AkbFilterGroupCallback): AkbTableStub<Row>;
+  order(column: string, options?: AkbOrderOptions): AkbTableStub<Row>;
+  limit(count: number): AkbTableStub<Row>;
+  range(from: number, to: number): AkbTableStub<Row>;
+  count(mode?: "exact" | "planned" | "estimated"): AkbTableStub<Row>;
+  then<TResult1 = AkbResult<import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>>, TResult2 = never>(
+    onfulfilled?: ((value: AkbResult<import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>>) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2>;
   readonly __row?: Row;
 }
+
+export interface AkbOrderOptions {
+  ascending?: boolean;
+}
+
+export interface AkbFilterGroup {
+  filter(column: string, operator: string, value: unknown): AkbFilterGroup;
+  eq(column: string, value: unknown): AkbFilterGroup;
+  neq(column: string, value: unknown): AkbFilterGroup;
+  gt(column: string, value: unknown): AkbFilterGroup;
+  gte(column: string, value: unknown): AkbFilterGroup;
+  lt(column: string, value: unknown): AkbFilterGroup;
+  lte(column: string, value: unknown): AkbFilterGroup;
+  like(column: string, value: unknown): AkbFilterGroup;
+  ilike(column: string, value: unknown): AkbFilterGroup;
+  is(column: string, value: unknown): AkbFilterGroup;
+  in(column: string, value: readonly unknown[]): AkbFilterGroup;
+  cs(column: string, value: unknown): AkbFilterGroup;
+  not(column: string, operator: string, value: unknown): AkbFilterGroup;
+  or(group: string | AkbFilterGroupCallback): AkbFilterGroup;
+  and(group: string | AkbFilterGroupCallback): AkbFilterGroup;
+}
+
+export type AkbFilterGroupCallback = (group: AkbFilterGroup) => AkbFilterGroup | void;
 
 export interface AkbClient<Schema = unknown> {
   readonly __schema?: Schema;

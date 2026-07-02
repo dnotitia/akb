@@ -213,7 +213,7 @@ function schemaLines() {
     "  [key: string]: unknown;",
     "}",
     "",
-    "export interface AkbTableQueryEnvelope<Row extends AkbJsonObject = AkbJsonObject> {",
+    "export interface AkbTableQueryEnvelope<Row = AkbJsonObject> {",
     "  kind: \"table_query\";",
     "  columns: string[];",
     "  items: Row[];",

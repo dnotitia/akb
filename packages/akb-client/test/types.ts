@@ -48,6 +48,8 @@ typedClient.vault("eng").actingAs({ sub: "u1", app_metadata: {} });
 typedClient.vault("eng").from("incidents").request("/rows");
 typedClient.vault("eng").from("tasks").request("/rows");
 typedClient.docs.request("/eng/readme.md");
+const builderResult = await typedClient.vault("eng").from("tasks").select("title").eq("status", "todo");
+builderResult.throwOnError().data.items.at(0)?.title satisfies string | undefined;
 
 const liteClient = createLiteClient<AkbSchema>("https://akb.test", { apiKey: "service-key" });
 liteClient satisfies AkbClient<AkbSchema>;

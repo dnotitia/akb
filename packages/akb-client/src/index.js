@@ -22,6 +22,7 @@ export class AkbError extends Error {
 }
 
 export { createTypedFetch } from "./core/fetch.js";
+import { createQueryBuilder } from "./client/query-builder.js";
 
 /**
  * Convert one parsed HTTP response body into a `{data,error}` result.
@@ -237,7 +238,13 @@ function makeClient(config, scope) {
       return makeClient(config, { ...scope, claims: normalizeClaims(claims) });
     },
     from(table) {
-      return makeTableStub(table, scope, request);
+      return createQueryBuilder({
+        baseUrl: config.baseUrl,
+        table,
+        vault: scope.defaultVault,
+        request,
+        maxUrlBytes: config.maxUrlBytes ?? 8192,
+      });
     },
     search: makeNamespaceStub("search", "/search", request),
     graph: makeNamespaceStub("graph", "/graph", request),
@@ -289,26 +296,6 @@ function makeNamespaceStub(name, prefix, request) {
   return Object.freeze({
     name,
     request(path = "", init = {}) {
-      return request(joinPath(prefix, path), init);
-    },
-  });
-}
-
-/**
- * @param {string} table
- * @param {import("./index.js").AkbClientScope} scope
- * @param {import("./index.js").AkbClient["request"]} request
- * @returns {import("./index.js").AkbTableStub}
- */
-function makeTableStub(table, scope, request) {
-  return Object.freeze({
-    table,
-    vault: scope.defaultVault,
-    request(path = "", init = {}) {
-      if (!scope.defaultVault) {
-        throw new TypeError("Select a vault before using table helpers: client.vault(\"...\").from(\"...\").");
-      }
-      const prefix = `/tables/${encodeURIComponent(scope.defaultVault)}/${encodeURIComponent(table)}`;
       return request(joinPath(prefix, path), init);
     },
   });
