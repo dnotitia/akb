@@ -1,3 +1,5 @@
+import { AkbError } from "../errors.js";
+
 const NAMED_OPERATORS = new Set([
   "cs",
   "eq",
@@ -29,6 +31,12 @@ const JSON_PATH_COLUMN_RE = /^([a-z][a-z0-9_]*)(?:(->>|#>>)([^:]+))?(?:::([a-z]+
  * @typedef {FilterNode | GroupNode} QueryNode
  * @typedef {{ column: string, ascending: boolean }} OrderNode
  * @typedef {{
+ *   type: "insert" | "update" | "upsert" | "delete",
+ *   body?: unknown,
+ *   onConflict?: string | null,
+ *   ignoreDuplicates?: boolean,
+ * }} MutationState
+ * @typedef {{
  *   select: string | null,
  *   nodes: QueryNode[],
  *   order: OrderNode[],
@@ -36,6 +44,9 @@ const JSON_PATH_COLUMN_RE = /^([a-z][a-z0-9_]*)(?:(->>|#>>)([^:]+))?(?:::([a-z]+
  *   offset: number | null,
  *   range: { from: number, to: number } | null,
  *   count: "exact" | "planned" | "estimated" | null,
+ *   mutation: MutationState | null,
+ *   all: boolean,
+ *   resultMode: "rows" | "single" | "maybeSingle",
  * }} QueryState
  */
 
@@ -44,11 +55,11 @@ const JSON_PATH_COLUMN_RE = /^([a-z][a-z0-9_]*)(?:(->>|#>>)([^:]+))?(?:::([a-z]+
  * @returns {import("../index.js").AkbTableStub}
  */
 export function createQueryBuilder(options) {
-  return new QueryBuilder(options, emptyState());
+  return /** @type {import("../index.js").AkbTableStub} */ (new QueryBuilder(options, emptyState()));
 }
 
 class QueryBuilder {
-  /** @type {Promise<import("../index.js").AkbResult<import("../core/schema.gen.js").AkbTableQueryEnvelope>> | null} */
+  /** @type {Promise<import("../index.js").AkbResult<unknown>> | null} */
   #promise = null;
 
   /**
@@ -195,9 +206,69 @@ class QueryBuilder {
   }
 
   /**
+   * @param {unknown} values
+   * @returns {QueryBuilder}
+   */
+  insert(values) {
+    return this.#clone({ mutation: { type: "insert", body: values } });
+  }
+
+  /**
+   * @param {unknown} patch
+   * @returns {QueryBuilder}
+   */
+  update(patch) {
+    return this.#clone({ mutation: { type: "update", body: patch } });
+  }
+
+  /**
+   * @param {unknown} values
+   * @param {{ onConflict?: string, ignoreDuplicates?: boolean }} [options]
+   * @returns {QueryBuilder}
+   */
+  upsert(values, options = {}) {
+    return this.#clone({
+      mutation: {
+        type: "upsert",
+        body: values,
+        onConflict: options.onConflict ?? "id",
+        ignoreDuplicates: options.ignoreDuplicates === true,
+      },
+    });
+  }
+
+  /**
+   * @returns {QueryBuilder}
+   */
+  delete() {
+    return this.#clone({ mutation: { type: "delete" } });
+  }
+
+  /**
+   * @returns {QueryBuilder}
+   */
+  all() {
+    return this.#clone({ all: true });
+  }
+
+  /**
+   * @returns {QueryBuilder}
+   */
+  single() {
+    return this.#clone({ resultMode: "single" });
+  }
+
+  /**
+   * @returns {QueryBuilder}
+   */
+  maybeSingle() {
+    return this.#clone({ resultMode: "maybeSingle" });
+  }
+
+  /**
    * @template TResult1
    * @template TResult2
-   * @param {((value: import("../index.js").AkbResult<import("../core/schema.gen.js").AkbTableQueryEnvelope>) => TResult1 | PromiseLike<TResult1>) | null} [onfulfilled]
+   * @param {((value: import("../index.js").AkbResult<unknown>) => TResult1 | PromiseLike<TResult1>) | null} [onfulfilled]
    * @param {((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null} [onrejected]
    * @returns {Promise<TResult1 | TResult2>}
    */
@@ -223,9 +294,19 @@ class QueryBuilder {
   }
 
   /**
-   * @returns {Promise<import("../index.js").AkbResult<import("../core/schema.gen.js").AkbTableQueryEnvelope>>}
+   * @returns {Promise<import("../index.js").AkbResult<unknown>>}
    */
   async #execute() {
+    const result = this.#state.mutation
+      ? await this.#executeMutation()
+      : await this.#executeRead();
+    return applyResultMode(result, this.#state.resultMode);
+  }
+
+  /**
+   * @returns {Promise<import("../index.js").AkbResult<import("../core/schema.gen.js").AkbTableQueryEnvelope>>}
+   */
+  async #executeRead() {
     const rowsPath = this.#rowsPath();
     const compiled = compileQuery(
       this.#state,
@@ -242,6 +323,40 @@ class QueryBuilder {
       method: "POST",
       headers: compiled.headers,
       body: JSON.stringify(compiled.body),
+    });
+  }
+
+  /**
+   * @returns {Promise<import("../index.js").AkbResult<unknown>>}
+   */
+  async #executeMutation() {
+    if (!this.#state.mutation) {
+      throw new TypeError("Mutation execution requires a write verb.");
+    }
+    const unsupportedModifiers = unsupportedMutationModifiers(this.#state);
+    if (unsupportedModifiers.length > 0) {
+      return clientResult(
+        null,
+        new AkbError({
+          message: `Write builders do not support ${unsupportedModifiers.join(", ")} modifiers.`,
+          code: "unsupported_write_modifier",
+          details: { modifiers: unsupportedModifiers },
+        }),
+        null,
+      );
+    }
+    const rowsPath = this.#rowsPath();
+    const compiled = compileMutation(
+      this.#state,
+      this.#state.mutation,
+      this.#options.maxUrlBytes,
+      rowsPath,
+      `${this.#options.baseUrl}${rowsPath}`,
+    );
+    return await this.#options.request(compiled.path, {
+      method: compiled.method,
+      headers: compiled.headers,
+      ...(compiled.body === undefined ? {} : { body: JSON.stringify(compiled.body) }),
     });
   }
 
@@ -331,6 +446,9 @@ function emptyState() {
     offset: null,
     range: null,
     count: null,
+    mutation: null,
+    all: false,
+    resultMode: "rows",
   };
 }
 
@@ -386,6 +504,54 @@ function compileQuery(state, maxUrlBytes, rowsUrlPrefix) {
 
 /**
  * @param {QueryState} state
+ * @param {MutationState} mutation
+ * @param {number} maxUrlBytes
+ * @param {string} rowsPath
+ * @param {string} rowsUrlPrefix
+ * @returns {{ method: "POST" | "PATCH" | "DELETE", path: string, headers: Headers, body?: object | unknown }}
+ */
+function compileMutation(state, mutation, maxUrlBytes, rowsPath, rowsUrlPrefix) {
+  const headers = new Headers();
+  headers.set("prefer", mutationPreferHeader(state, mutation));
+  const query = serializeMutationUrl(state, mutation);
+  const canUseRows = byteLength(`${rowsUrlPrefix}${query}`) <= maxUrlBytes
+    && !containsNestedGroup(state.nodes)
+    && !containsUrlUnsafeArrayValue(state.nodes)
+    && !containsUrlUnsafeBooleanValue(state.nodes);
+
+  if (canUseRows) {
+    return {
+      method: mutationMethod(mutation),
+      path: `${rowsPath}${query}`,
+      headers,
+      ...(mutation.body === undefined ? {} : { body: mutation.body }),
+    };
+  }
+
+  return {
+    method: "POST",
+    path: `${rowsPath.slice(0, -"/rows".length)}/query`,
+    headers,
+    body: serializeMutationAst(state, mutation),
+  };
+}
+
+/**
+ * @param {QueryState} state
+ * @returns {string[]}
+ */
+function unsupportedMutationModifiers(state) {
+  /** @type {string[]} */
+  const modifiers = [];
+  if (state.order.length > 0) modifiers.push("order");
+  if (state.limit !== null) modifiers.push("limit");
+  if (state.range) modifiers.push("range");
+  if (state.count) modifiers.push("count");
+  return modifiers;
+}
+
+/**
+ * @param {QueryState} state
  * @returns {string}
  */
 function serializeUrl(state) {
@@ -399,6 +565,67 @@ function serializeUrl(state) {
   if (state.offset !== null) params.set("offset", String(state.offset));
   const suffix = params.toString();
   return suffix ? `?${suffix}` : "";
+}
+
+/**
+ * @param {QueryState} state
+ * @param {MutationState} mutation
+ * @returns {string}
+ */
+function serializeMutationUrl(state, mutation) {
+  const params = new URLSearchParams();
+  if (state.select) params.set("select", state.select);
+  if (mutation.type === "upsert") params.set("on_conflict", mutation.onConflict || "id");
+  if ((mutation.type === "update" || mutation.type === "delete") && state.all) {
+    params.set("all", "true");
+  }
+  if (mutation.type === "update" || mutation.type === "delete") {
+    for (const node of state.nodes) appendNodeParam(params, node);
+  }
+  const suffix = params.toString();
+  return suffix ? `?${suffix}` : "";
+}
+
+/**
+ * @param {QueryState} state
+ * @param {MutationState} mutation
+ * @returns {object}
+ */
+function serializeMutationAst(state, mutation) {
+  const filter = serializeAstFilterRoot(state.nodes);
+  return {
+    ...(mutation.type === "insert" ? { insert: mutation.body } : {}),
+    ...(mutation.type === "upsert" ? { insert: mutation.body, on_conflict: mutation.onConflict || "id" } : {}),
+    ...(mutation.type === "update" ? { update: mutation.body } : {}),
+    ...(mutation.type === "delete" ? { delete: true } : {}),
+    ...(filter ? { filter } : {}),
+    ...(state.all ? { all: true } : {}),
+    ...(state.select ? { returning: state.select } : {}),
+    ...(mutation.type === "upsert" && mutation.ignoreDuplicates ? { resolution: "ignore-duplicates" } : {}),
+  };
+}
+
+/**
+ * @param {MutationState} mutation
+ * @returns {"POST" | "PATCH" | "DELETE"}
+ */
+function mutationMethod(mutation) {
+  if (mutation.type === "update") return "PATCH";
+  if (mutation.type === "delete") return "DELETE";
+  return "POST";
+}
+
+/**
+ * @param {QueryState} state
+ * @param {MutationState} mutation
+ * @returns {string}
+ */
+function mutationPreferHeader(state, mutation) {
+  const parts = [state.select ? "return=representation" : "return=minimal"];
+  if (mutation.type === "upsert" && mutation.ignoreDuplicates) {
+    parts.unshift("resolution=ignore-duplicates");
+  }
+  return parts.join(", ");
 }
 
 /**
@@ -774,4 +1001,70 @@ function joinPath(prefix, path) {
   const suffix = String(path);
   if (!suffix) return prefix;
   return `${prefix}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+}
+
+/**
+ * @param {import("../index.js").AkbResult<unknown>} result
+ * @param {"rows" | "single" | "maybeSingle"} mode
+ * @returns {import("../index.js").AkbResult<unknown>}
+ */
+function applyResultMode(result, mode) {
+  if (mode === "rows") return result;
+  if (result.error) return result;
+  const tableQuery = tableQueryData(result.data);
+  if (!tableQuery) {
+    return clientResult(null, clientResultError("single() expects a table_query result.", "invalid_single_result"), result.response);
+  }
+  const total = typeof tableQuery.total === "number" ? tableQuery.total : tableQuery.items.length;
+  if (total === 1 && tableQuery.items.length === 1) {
+    return clientResult(tableQuery.items[0], null, result.response);
+  }
+  if (mode === "maybeSingle" && total === 0) {
+    return clientResult(null, null, result.response);
+  }
+  const label = mode === "single" ? "single()" : "maybeSingle()";
+  return clientResult(
+    null,
+    clientResultError(`${label} expected ${mode === "single" ? "exactly one row" : "zero or one rows"} but received ${total}.`, "invalid_single_result"),
+    result.response,
+  );
+}
+
+/**
+ * @param {unknown} data
+ * @returns {{ items: unknown[], total?: number } | null}
+ */
+function tableQueryData(data) {
+  if (!data || typeof data !== "object") return null;
+  const items = /** @type {{ items?: unknown }} */ (data).items;
+  if (!Array.isArray(items)) return null;
+  const total = /** @type {{ total?: unknown }} */ (data).total;
+  return { items, ...(typeof total === "number" ? { total } : {}) };
+}
+
+/**
+ * @param {unknown} data
+ * @param {Error | null} error
+ * @param {Pick<Response, "ok" | "status" | "statusText"> | null} response
+ * @returns {import("../index.js").AkbResult<unknown>}
+ */
+function clientResult(data, error, response) {
+  return {
+    data,
+    error: /** @type {import("../index.js").AkbError | null} */ (error),
+    response,
+    throwOnError() {
+      if (error) throw error;
+      return /** @type {import("../index.js").AkbThrowingResult<unknown>} */ (this);
+    },
+  };
+}
+
+/**
+ * @param {string} message
+ * @param {string} code
+ * @returns {Error}
+ */
+function clientResultError(message, code) {
+  return new AkbError({ message, code });
 }

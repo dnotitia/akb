@@ -403,6 +403,142 @@ test("from query builder applies maxUrlBytes to the full rows URL", async () => 
   assert.deepEqual(JSON.parse(calls[0].init.body), { select: "id" });
 });
 
+test("from write builder maps insert/update/upsert/delete to rows verbs", async () => {
+  const calls = [];
+  const responses = [
+    new Response(null, { status: 204, headers: { "content-range": "*/1" } }),
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id", "title"], items: [{ id: "1", title: "Ship" }], total: 1 }), {
+      status: 201,
+      headers: { "content-type": "application/json", "content-range": "0-0/1" },
+    }),
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id", "status"], items: [{ id: "1", status: "done" }], total: 1 }), {
+      status: 200,
+      headers: { "content-type": "application/json", "content-range": "0-0/1" },
+    }),
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id"], items: [{ id: "1" }], total: 1 }), {
+      status: 201,
+      headers: { "content-type": "application/json", "content-range": "0-0/1" },
+    }),
+    new Response(null, { status: 204, headers: { "content-range": "*/3" } }),
+  ];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      calls.push({ input: String(input), init });
+      return responses.shift();
+    },
+  });
+
+  const insertedMinimal = await client.vault("eng").from("tasks").insert({ title: "Draft" });
+  const inserted = await client.vault("eng").from("tasks").insert({ title: "Ship" }).select("id,title").single();
+  const updated = await client.vault("eng").from("tasks").update({ status: "done" }).eq("id", "1").select("id,status");
+  await client
+    .vault("eng")
+    .from("tasks")
+    .upsert({ external_id: "TASK-1", title: "Ship" }, { onConflict: "external_id", ignoreDuplicates: true })
+    .select("*");
+  await client.vault("eng").from("tasks").delete().all();
+
+  assert.equal(insertedMinimal.data, null);
+  assert.deepEqual(inserted.throwOnError().data, { id: "1", title: "Ship" });
+  assert.equal(updated.throwOnError().data.items[0].status, "done");
+
+  assert.equal(calls[0].input, "https://akb.test/api/v1/tables/eng/tasks/rows");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(new Headers(calls[0].init.headers).get("prefer"), "return=minimal");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { title: "Draft" });
+
+  assert.equal(calls[1].input, "https://akb.test/api/v1/tables/eng/tasks/rows?select=id%2Ctitle");
+  assert.equal(new Headers(calls[1].init.headers).get("prefer"), "return=representation");
+
+  assert.equal(calls[2].input, "https://akb.test/api/v1/tables/eng/tasks/rows?select=id%2Cstatus&id=eq.1");
+  assert.equal(calls[2].init.method, "PATCH");
+  assert.equal(new Headers(calls[2].init.headers).get("prefer"), "return=representation");
+  assert.deepEqual(JSON.parse(calls[2].init.body), { status: "done" });
+
+  assert.equal(calls[3].input, "https://akb.test/api/v1/tables/eng/tasks/rows?select=*&on_conflict=external_id");
+  assert.equal(calls[3].init.method, "POST");
+  assert.equal(new Headers(calls[3].init.headers).get("prefer"), "resolution=ignore-duplicates, return=representation");
+
+  assert.equal(calls[4].input, "https://akb.test/api/v1/tables/eng/tasks/rows?all=true");
+  assert.equal(calls[4].init.method, "DELETE");
+  assert.equal(new Headers(calls[4].init.headers).get("prefer"), "return=minimal");
+  assert.equal(calls[4].init.body, undefined);
+});
+
+test("from write builder falls back to write AST for unsafe mutation filters", async () => {
+  let seenUrl = "";
+  let seenInit = {};
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      seenUrl = String(input);
+      seenInit = init ?? {};
+      return new Response(JSON.stringify({ kind: "table_query", columns: ["id"], items: [{ id: "1" }], total: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.vault("eng").from("tasks").update({ status: "done" }).or((group) => group.eq("title", "ACME, Inc.")).select("id");
+
+  assert.equal(seenUrl, "https://akb.test/api/v1/tables/eng/tasks/query");
+  assert.equal(seenInit.method, "POST");
+  assert.equal(new Headers(seenInit.headers).get("prefer"), "return=representation");
+  assert.deepEqual(JSON.parse(seenInit.body), {
+    update: { status: "done" },
+    filter: { or: [{ col: "title", op: "eq", val: "ACME, Inc." }] },
+    returning: "id",
+  });
+});
+
+test("from write builder rejects unsupported read modifiers before destructive mutations", async () => {
+  let called = false;
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async () => {
+      called = true;
+      return new Response(null, { status: 204 });
+    },
+  });
+
+  const result = await client.vault("eng").from("tasks").delete().eq("status", "done").limit(1);
+
+  assert.equal(called, false);
+  assert.equal(result.data, null);
+  assert.equal(result.error instanceof AkbError, true);
+  assert.equal(result.error?.code, "unsupported_write_modifier");
+  assert.deepEqual(result.error?.details, { modifiers: ["limit"] });
+});
+
+test("from query builder single and maybeSingle unwrap table rows", async () => {
+  const responses = [
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id"], items: [], total: 0 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ kind: "table_query", columns: ["id"], items: [{ id: "1" }], total: 2 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  ];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async () => responses.shift(),
+  });
+
+  const maybe = await client.vault("eng").from("tasks").select("id").maybeSingle();
+  const tooMany = await client.vault("eng").from("tasks").select("id").single();
+
+  assert.equal(maybe.error, null);
+  assert.equal(maybe.data, null);
+  assert.equal(tooMany.data, null);
+  assert.equal(tooMany.error?.code, "invalid_single_result");
+  assert.equal(tooMany.error instanceof AkbError, true);
+  assert.throws(() => tooMany.throwOnError(), /single\(\) expected exactly one row/);
+});
+
 test("lite subpath exposes the client boundary without a separate runtime", () => {
   assert.equal(createLiteClient, createClient);
 });

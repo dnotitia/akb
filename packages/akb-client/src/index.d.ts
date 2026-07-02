@@ -88,6 +88,18 @@ export type AkbTableNames<Schema> = string & keyof AkbTableMap<Schema>;
 export type AkbTableRow<Schema, TableName extends string> =
   AkbTableMap<Schema> extends Record<TableName, { Row: infer Row }> ? Row : unknown;
 
+export type AkbTableInsert<Schema, TableName extends string> =
+  AkbTableMap<Schema> extends Record<TableName, { Insert: infer Insert }> ? Insert : AkbTableRow<Schema, TableName>;
+
+export type AkbTableUpdate<Schema, TableName extends string> =
+  AkbTableMap<Schema> extends Record<TableName, { Update: infer Update }> ? Update : Partial<AkbTableRow<Schema, TableName>>;
+
+export type AkbSingleResult<Row, Result> =
+  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>] ? Row : Result;
+
+export type AkbMaybeSingleResult<Row, Result> =
+  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>] ? Row | null : Result;
+
 export interface AkbClaims {
   sub: string;
   app_metadata: {
@@ -108,35 +120,52 @@ export interface AkbNamespaceStub {
   request<T = AkbSuccessEnvelope>(path?: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
 }
 
-export interface AkbTableStub<Row = unknown> {
+export interface AkbTableStub<
+  Row = unknown,
+  Result = import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>,
+  Insert = Row,
+  Update = Partial<Row>,
+> {
   readonly table: string;
   readonly vault: string | null;
   request<T = AkbSuccessEnvelope>(path?: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
-  select(columns?: string): AkbTableStub<Row>;
-  filter(column: string, operator: string, value: unknown): AkbTableStub<Row>;
-  eq(column: string, value: unknown): AkbTableStub<Row>;
-  neq(column: string, value: unknown): AkbTableStub<Row>;
-  gt(column: string, value: unknown): AkbTableStub<Row>;
-  gte(column: string, value: unknown): AkbTableStub<Row>;
-  lt(column: string, value: unknown): AkbTableStub<Row>;
-  lte(column: string, value: unknown): AkbTableStub<Row>;
-  like(column: string, value: unknown): AkbTableStub<Row>;
-  ilike(column: string, value: unknown): AkbTableStub<Row>;
-  is(column: string, value: unknown): AkbTableStub<Row>;
-  in(column: string, value: readonly unknown[]): AkbTableStub<Row>;
-  cs(column: string, value: unknown): AkbTableStub<Row>;
-  not(column: string, operator: string, value: unknown): AkbTableStub<Row>;
-  or(group: string | AkbFilterGroupCallback): AkbTableStub<Row>;
-  and(group: string | AkbFilterGroupCallback): AkbTableStub<Row>;
-  order(column: string, options?: AkbOrderOptions): AkbTableStub<Row>;
-  limit(count: number): AkbTableStub<Row>;
-  range(from: number, to: number): AkbTableStub<Row>;
-  count(mode?: "exact" | "planned" | "estimated"): AkbTableStub<Row>;
-  then<TResult1 = AkbResult<import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>>, TResult2 = never>(
-    onfulfilled?: ((value: AkbResult<import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>>) => TResult1 | PromiseLike<TResult1>) | null,
+  select(columns?: string): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>, Insert, Update>;
+  filter(column: string, operator: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  eq(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  neq(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  gt(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  gte(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  lt(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  lte(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  like(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  ilike(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  is(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  in(column: string, value: readonly unknown[]): AkbTableStub<Row, Result, Insert, Update>;
+  cs(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  not(column: string, operator: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
+  or(group: string | AkbFilterGroupCallback): AkbTableStub<Row, Result, Insert, Update>;
+  and(group: string | AkbFilterGroupCallback): AkbTableStub<Row, Result, Insert, Update>;
+  order(column: string, options?: AkbOrderOptions): AkbTableStub<Row, Result, Insert, Update>;
+  limit(count: number): AkbTableStub<Row, Result, Insert, Update>;
+  range(from: number, to: number): AkbTableStub<Row, Result, Insert, Update>;
+  count(mode?: "exact" | "planned" | "estimated"): AkbTableStub<Row, Result, Insert, Update>;
+  insert(values: Insert | readonly Insert[]): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row> | null, Insert, Update>;
+  update(patch: Update): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row> | null, Insert, Update>;
+  upsert(values: Insert | readonly Insert[], options?: AkbUpsertOptions): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row> | null, Insert, Update>;
+  delete(): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row> | null, Insert, Update>;
+  all(): AkbTableStub<Row, Result, Insert, Update>;
+  single(): AkbTableStub<Row, AkbSingleResult<Row, Result>, Insert, Update>;
+  maybeSingle(): AkbTableStub<Row, AkbMaybeSingleResult<Row, Result>, Insert, Update>;
+  then<TResult1 = AkbResult<Result>, TResult2 = never>(
+    onfulfilled?: ((value: AkbResult<Result>) => TResult1 | PromiseLike<TResult1>) | null,
     onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
   ): Promise<TResult1 | TResult2>;
   readonly __row?: Row;
+}
+
+export interface AkbUpsertOptions {
+  onConflict?: string;
+  ignoreDuplicates?: boolean;
 }
 
 export interface AkbOrderOptions {
@@ -168,7 +197,12 @@ export interface AkbClient<Schema = unknown> {
   request<T = AkbSuccessEnvelope>(path: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
   vault(vault: string): AkbClient<Schema>;
   actingAs(claims: AkbClaims): AkbClient<Schema>;
-  from<TableName extends AkbTableNames<Schema>>(table: TableName): AkbTableStub<AkbTableRow<Schema, TableName>>;
+  from<TableName extends AkbTableNames<Schema>>(table: TableName): AkbTableStub<
+    AkbTableRow<Schema, TableName>,
+    import("./core/schema.gen.js").AkbTableQueryEnvelope<AkbTableRow<Schema, TableName>>,
+    AkbTableInsert<Schema, TableName>,
+    AkbTableUpdate<Schema, TableName>
+  >;
   readonly search: AkbNamespaceStub;
   readonly graph: AkbNamespaceStub;
   readonly docs: AkbNamespaceStub;

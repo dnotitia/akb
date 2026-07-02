@@ -50,6 +50,23 @@ typedClient.vault("eng").from("tasks").request("/rows");
 typedClient.docs.request("/eng/readme.md");
 const builderResult = await typedClient.vault("eng").from("tasks").select("title").eq("status", "todo");
 builderResult.throwOnError().data.items.at(0)?.title satisfies string | undefined;
+const writeResult = await typedClient
+  .vault("eng")
+  .from("tasks")
+  .insert({ title: "Ship" });
+writeResult.throwOnError().data?.items.at(0)?.title satisfies string | undefined;
+await typedClient.vault("eng").from("tasks").select("title").insert({ title: "Draft" });
+const singleWriteResult = await typedClient
+  .vault("eng")
+  .from("tasks")
+  .upsert({ title: "Ship" }, { onConflict: "title" })
+  .select("title")
+  .single();
+singleWriteResult.throwOnError().data.title satisfies string;
+const maybeDeleted = await typedClient.vault("eng").from("tasks").delete().eq("status", "done").select("*").maybeSingle();
+maybeDeleted.throwOnError().data?.status satisfies "todo" | "done" | undefined;
+// @ts-expect-error generated Update restricts status to the table enum.
+typedClient.vault("eng").from("tasks").update({ status: "blocked" });
 
 const liteClient = createLiteClient<AkbSchema>("https://akb.test", { apiKey: "service-key" });
 liteClient satisfies AkbClient<AkbSchema>;
