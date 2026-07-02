@@ -18,6 +18,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 
@@ -915,6 +916,7 @@ async def execute_sql(
     vault_names: list[str],
     user_id: str,
     sql: str,
+    params: list[Any] | None = None,
     is_admin: bool = False,
 ) -> dict:
     """Execute raw SQL scoped to vault tables.
@@ -999,6 +1001,7 @@ async def execute_sql(
         return await get_user_sql_executor().execute(
             user_id=user_id,
             sql=rewritten,
+            params=params,
             is_admin=is_admin,
             vault_names=vault_names,
         )
