@@ -5,6 +5,7 @@ import {
   type AkbSuccessEnvelope,
   type AkbClient,
 } from "../src/index.js";
+import { createClient as createLiteClient } from "../src/lite.js";
 import type { AkbSchema } from "./fixtures/akb.types.ts";
 
 type TableQueryEnvelope = AkbSuccessEnvelope & {
@@ -37,3 +38,11 @@ requestResult.throwOnError().data.kind satisfies "table_query";
 
 const typedClient = createClient<AkbSchema>({ baseUrl: "https://akb.test/api/v1" });
 typedClient satisfies AkbClient<AkbSchema>;
+typedClient.vault("eng").actingAs({ sub: "u1", app_metadata: { org_id: "o1", role: "member" } });
+// @ts-expect-error org_id and role are required by the BFF X-Akb-Claims parser.
+typedClient.vault("eng").actingAs({ sub: "u1", app_metadata: {} });
+typedClient.vault("eng").from("incidents").request("/rows");
+typedClient.docs.request("/eng/readme.md");
+
+const liteClient = createLiteClient<AkbSchema>("https://akb.test", { apiKey: "service-key" });
+liteClient satisfies AkbClient<AkbSchema>;

@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Reference AKB REST client boundary for kind envelopes and {data,error} results.",
   "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
     "akb": "./bin/akb.mjs"
   },
@@ -10,6 +14,10 @@
     ".": {
       "types": "./src/index.d.ts",
       "import": "./src/index.js"
+    },
+    "./lite": {
+      "types": "./src/lite.d.ts",
+      "import": "./src/lite.js"
     }
   },
   "files": [
@@ -19,7 +27,9 @@
     "src/"
   ],
   "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
     "codegen:check": "node scripts/check-generated-types.mjs",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { AkbError, createClient, unwrapAkbResponse } from "../src/index.js";
+import { createClient as createLiteClient } from "../src/lite.js";
 
 test("unwrapAkbResponse keeps successful kind envelope as data", () => {
   const body = {
@@ -66,6 +67,55 @@ test("createClient sends bearer auth and JSON body through the boundary", async 
   assert.equal(seenHeaders["content-type"], "application/json");
   assert.equal(result.error, null);
   assert.equal(result.data.kind, "table_sql");
+});
+
+test("createClient supports vault scoping, actingAs claims, and namespace stubs", async () => {
+  let seenUrl = "";
+  let seenHeaders = {};
+
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      seenUrl = String(input);
+      seenHeaders = Object.fromEntries(new Headers(init?.headers));
+      return new Response(JSON.stringify({ kind: "table_sql", result: "SELECT 1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const scoped = client
+    .vault("reef")
+    .actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const result = await scoped.docs.request("/reef/doc/readme.md");
+
+  assert.equal(seenUrl, "https://akb.test/api/v1/documents/reef/doc/readme.md");
+  assert.equal(seenHeaders.authorization, "Bearer service-key");
+  assert.deepEqual(JSON.parse(seenHeaders["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.equal(scoped.from("incidents").vault, "reef");
+  assert.equal(result.error, null);
+});
+
+test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
+  const client = createClient("https://akb.test/api/v1", { apiKey: "service-key" });
+
+  assert.throws(
+    () => client.actingAs({ sub: "end-user-1", app_metadata: {} }),
+    /app_metadata\.org_id/,
+  );
+  assert.throws(
+    () => client.actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1" } }),
+    /app_metadata\.role/,
+  );
+});
+
+test("lite subpath exposes the client boundary without a separate runtime", () => {
+  assert.equal(createLiteClient, createClient);
 });
 
 test("createClient rejects cross-origin absolute URLs before adding credentials", async () => {

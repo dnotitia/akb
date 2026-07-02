@@ -19,9 +19,16 @@ The client unwraps that boundary into the Supabase-style tuple:
 ```js
 import { createClient } from "@akb/client";
 
-const akb = createClient({ baseUrl: "https://akb.example.com/api/v1", token: process.env.AKB_TOKEN });
+const akb = createClient("https://akb.example.com/api/v1", {
+  apiKey: process.env.AKB_SERVICE_KEY,
+});
 
-const { data, error } = await akb.request("/tables/reef/sql", {
+const tenant = akb.vault("reef").actingAs({
+  sub: "end-user-1",
+  app_metadata: { org_id: "org-1", role: "member" },
+});
+
+const { data, error } = await tenant.request("/tables/reef/sql", {
   method: "POST",
   body: JSON.stringify({ sql: "SELECT * FROM incidents" }),
 });
