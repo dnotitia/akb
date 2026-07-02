@@ -32,7 +32,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
@@ -381,7 +381,22 @@ _RAW_PREVIEWABLE_MIMES = {
 }
 
 
-@router.get("/public/{slug}/raw", summary="Stream file content for preview (small text files)")
+@router.get(
+    "/public/{slug}/raw",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+                "text/plain": {"schema": {"type": "string"}},
+            },
+            "description": "Raw preview bytes for a small text-like file",
+        }
+    },
+    summary="Stream file content for preview (small text files)",
+)
 async def publication_raw(slug: str, request: Request):
     """Proxy file content from S3 for in-browser preview.
 
@@ -424,7 +439,23 @@ async def publication_raw(slug: str, request: Request):
     return Response(content=body, media_type=mime)
 
 
-@router.get("/public/{slug}/download", summary="Force download (file or csv)")
+@router.get(
+    "/public/{slug}/download",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+                "text/csv": {"schema": {"type": "string"}},
+                "text/markdown": {"schema": {"type": "string"}},
+            },
+            "description": "Downloadable file bytes, CSV, or markdown",
+        }
+    },
+    summary="Force download (file or csv)",
+)
 async def publication_download(slug: str, request: Request):
     """For files: 302 to presigned URL with attachment disposition.
     For table_query: returns CSV.
@@ -508,7 +539,25 @@ def _to_csv_response(data: dict) -> Response:
     )
 
 
-@router.get("/public/{slug}", summary="Resolve and render a public publication")
+@router.get(
+    "/public/{slug}",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    }
+                },
+                "text/csv": {"schema": {"type": "string"}},
+                "text/html": {"schema": {"type": "string"}},
+            },
+            "description": "Publication content or metadata",
+        }
+    },
+    summary="Resolve and render a public publication",
+)
 async def get_public_publication(
     slug: str,
     request: Request,
@@ -526,14 +575,14 @@ async def get_public_publication(
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
     except PublicationPasswordRequired:
-        return JSONResponse(
+        raise HTTPException(
             status_code=401,
-            content={"error": "Password required", "password_required": True, "slug": slug},
+            detail={"message": "Password required", "password_required": True, "slug": slug},
         )
     except PublicationPasswordInvalid:
-        return JSONResponse(
+        raise HTTPException(
             status_code=401,
-            content={"error": "Invalid password", "password_required": True, "slug": slug},
+            detail={"message": "Invalid password", "password_required": True, "slug": slug},
         )
     except (PublicationExpired, PublicationViewLimitReached) as e:
         raise _publication_error_to_http(e)

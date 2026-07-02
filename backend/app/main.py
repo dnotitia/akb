@@ -7,12 +7,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.deps import get_current_user, get_optional_user
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
+from app.openapi_contract import install_openapi_contract
+from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
 from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker
 from app.services.access_service import check_vault_access
@@ -54,8 +58,98 @@ app = FastAPI(
 async def akb_error_handler(request: Request, exc: AKBError):
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": exc.message},
+        content=_error_payload(exc.status_code, exc.message),
     )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(exc.status_code, exc.detail),
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    details = exc.errors()
+    return JSONResponse(
+        status_code=422,
+        content=_error_payload(
+            422,
+            "Request validation failed",
+            details=details,
+            legacy_detail=details,
+        ),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled request error")
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload(500, "Internal server error"),
+    )
+
+
+def _error_payload(
+    status_code: int,
+    detail: object,
+    *,
+    details: object | None = None,
+    legacy_detail: object | None = None,
+) -> dict:
+    hint = None
+    code = _code_for_status(status_code)
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("error") or detail.get("detail") or status_code)
+        if isinstance(detail.get("code"), str):
+            code = detail["code"]
+        if isinstance(detail.get("hint"), str):
+            hint = detail["hint"]
+        if details is None:
+            details = {
+                k: v for k, v in detail.items()
+                if k not in {"message", "error", "detail", "code", "hint"}
+            } or None
+        if legacy_detail is None:
+            legacy_detail = detail
+    else:
+        message = str(detail)
+        if legacy_detail is None:
+            legacy_detail = detail
+
+    payload = {
+        "message": message,
+        "error": message,
+        "code": code,
+        "detail": legacy_detail,
+    }
+    if details is not None:
+        payload["details"] = details
+    if hint is not None:
+        payload["hint"] = hint
+    if isinstance(detail, dict):
+        for key in ("password_required", "slug"):
+            if key in detail:
+                payload[key] = detail[key]
+    return payload
+
+
+def _code_for_status(status_code: int) -> str:
+    if status_code in {400, 413, 415, 422}:
+        return INVALID_ARGUMENT
+    if status_code == 405:
+        return METHOD_NOT_ALLOWED
+    if status_code in {401, 403}:
+        return PERMISSION_DENIED
+    if status_code == 404:
+        return NOT_FOUND
+    if status_code == 409:
+        return CONFLICT
+    return INTERNAL
 
 
 app.add_middleware(
@@ -78,6 +172,7 @@ app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"]
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
 app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])
+install_openapi_contract(app)
 
 # RFC 9728 — well-known protected-resource metadata for /mcp. Mounted
 # at the root (not under /api/v1) because the spec requires

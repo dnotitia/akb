@@ -201,7 +201,12 @@ def _post_login_target(redirect: str | None, one_time_code: str) -> str:
     )
 
 
-@router.get("/auth/keycloak/login", summary="Begin Keycloak SSO login")
+@router.get(
+    "/auth/keycloak/login",
+    response_class=RedirectResponse,
+    status_code=status.HTTP_302_FOUND,
+    summary="Begin Keycloak SSO login",
+)
 async def keycloak_login(redirect: str = "/"):
     _require_keycloak()
     from app.services.keycloak_oidc import get_keycloak_oidc
@@ -217,7 +222,12 @@ async def keycloak_login(redirect: str = "/"):
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
-@router.get("/auth/keycloak/callback", summary="Keycloak SSO redirect callback")
+@router.get(
+    "/auth/keycloak/callback",
+    response_class=RedirectResponse,
+    status_code=status.HTTP_302_FOUND,
+    summary="Keycloak SSO redirect callback",
+)
 async def keycloak_callback(request: Request):
     _require_keycloak()
     from app.services.keycloak_oidc import get_keycloak_oidc, issue_exchange_code
@@ -257,7 +267,12 @@ async def keycloak_callback(request: Request):
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 
-@router.get("/auth/keycloak/logout", summary="RP-initiated Keycloak logout")
+@router.get(
+    "/auth/keycloak/logout",
+    response_class=RedirectResponse,
+    status_code=status.HTTP_302_FOUND,
+    summary="RP-initiated Keycloak logout",
+)
 async def keycloak_logout(id_token_hint: str | None = None):
     """End the Keycloak SSO session (so the next SSO login prompts again /
     can switch user). AKB already cleared its own JWT client-side; this
