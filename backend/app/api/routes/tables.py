@@ -1,14 +1,41 @@
 """REST API routes for vault tables (structured data)."""
 
-from fastapi import APIRouter, Depends
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services import table_service
+from app.util.errors import (
+    CONFLICT,
+    INVALID_ARGUMENT,
+    METHOD_NOT_ALLOWED,
+    MULTI_STATEMENT,
+    PERMISSION_DENIED,
+    SQL_ERROR,
+    UNDEFINED_COLUMN,
+    UNDEFINED_TABLE,
+    UNIQUE_VIOLATION,
+    VAULT_ARCHIVED,
+)
 from app.util.text import NFCModel
 
 router = APIRouter()
+
+_SERVICE_ERROR_STATUS = {
+    INVALID_ARGUMENT: 400,
+    METHOD_NOT_ALLOWED: 400,
+    MULTI_STATEMENT: 400,
+    SQL_ERROR: 400,
+    UNDEFINED_COLUMN: 400,
+    UNDEFINED_TABLE: 400,
+    PERMISSION_DENIED: 403,
+    CONFLICT: 409,
+    UNIQUE_VIOLATION: 409,
+    VAULT_ARCHIVED: 409,
+}
 
 
 class CreateTableRequest(NFCModel):
@@ -60,11 +87,37 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     for v in vaults:
         await check_vault_access(user.user_id, v, required_role="reader")
 
-    return await table_service.execute_sql(
-        vault_names=vaults,
-        user_id=user.user_id,
-        sql=req.sql.strip(),
-        is_admin=user.is_admin,
+    return _raise_service_error(
+        await table_service.execute_sql(
+            vault_names=vaults,
+            user_id=user.user_id,
+            sql=req.sql.strip(),
+            is_admin=user.is_admin,
+        )
+    )
+
+
+def _raise_service_error(result: Any) -> Any:
+    """Translate legacy service err() dicts to HTTP AkbError responses.
+
+    The MCP surface still passes ``err(...)`` dictionaries through as tool
+    output. REST should expose errors through status codes so SDK boundary
+    code can map every non-2xx response to the single AkbError contract.
+    """
+    if not isinstance(result, dict) or "kind" in result:
+        return result
+    code = result.get("code")
+    message = result.get("message") or result.get("error")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return result
+    detail: dict[str, Any] = {"message": message, "code": code}
+    if isinstance(result.get("hint"), str):
+        detail["hint"] = result["hint"]
+    if "details" in result:
+        detail["details"] = result["details"]
+    raise HTTPException(
+        status_code=_SERVICE_ERROR_STATUS.get(code, 400),
+        detail=detail,
     )
 
 

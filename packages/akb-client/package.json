@@ -1,0 +1,29 @@
+{
+  "name": "@akb/client",
+  "version": "0.1.0",
+  "description": "Reference AKB REST client boundary for kind envelopes and {data,error} results.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "README.md",
+    "src/"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dnotitia/akb.git",
+    "directory": "packages/akb-client"
+  }
+}

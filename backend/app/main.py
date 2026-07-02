@@ -109,10 +109,12 @@ def _error_payload(
             code = detail["code"]
         if isinstance(detail.get("hint"), str):
             hint = detail["hint"]
+        if details is None and "details" in detail:
+            details = detail["details"]
         if details is None:
             details = {
                 k: v for k, v in detail.items()
-                if k not in {"message", "error", "detail", "code", "hint"}
+                if k not in {"message", "error", "detail", "code", "hint", "details"}
             } or None
         if legacy_detail is None:
             legacy_detail = detail

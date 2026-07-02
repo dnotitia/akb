@@ -62,9 +62,25 @@ JSON_OBJECT_SCHEMA: dict[str, Any] = {
     "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
 }
 
+JSON_OBJECT_ARRAY_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"$ref": "#/components/schemas/AkbJsonObject"},
+}
+
 ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+KIND_SUCCESS_RESPONSE_REFS = {
+    ("post", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
+    ("get", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
+    ("post", "/api/v1/tables/{vault}/sql"): "#/components/schemas/AkbSqlEnvelope",
+    ("delete", "/api/v1/tables/{vault}/{table_name}"): "#/components/schemas/AkbTableEnvelope",
+    ("post", "/api/v1/files/{vault}/upload"): "#/components/schemas/AkbFileEnvelope",
+    ("post", "/api/v1/files/{vault}/{file_id}/confirm"): "#/components/schemas/AkbFileEnvelope",
+    ("get", "/api/v1/files/{vault}/{file_id}/download"): "#/components/schemas/AkbFileEnvelope",
+    ("get", "/api/v1/files/{vault}"): "#/components/schemas/AkbFileEnvelope",
+    ("delete", "/api/v1/files/{vault}/{file_id}"): "#/components/schemas/AkbFileEnvelope",
+}
 
 
 def install_openapi_contract(app: FastAPI) -> None:
@@ -114,6 +130,7 @@ def _install_components(schema: dict[str, Any]) -> None:
     )
     schemas["AkbJsonValue"] = JSON_VALUE_SCHEMA
     schemas["AkbJsonObject"] = JSON_OBJECT_SCHEMA
+    schemas.update(_success_envelope_schemas())
     security = components.setdefault("securitySchemes", {})
     security["bearerAuth"] = {
         "type": "http",
@@ -131,11 +148,11 @@ def _normalize_api_operations(schema: dict[str, Any]) -> None:
                 continue
             operation.setdefault("tags", [_namespace_for_path(path)])
             operation.setdefault("operationId", _operation_id_from_schema(path, method, operation))
-            _ensure_success_response(operation)
+            _ensure_success_response(path, method, operation)
             _ensure_error_responses(operation)
 
 
-def _ensure_success_response(operation: dict[str, Any]) -> None:
+def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) -> None:
     responses = operation.setdefault("responses", {})
     status = next((code for code in SUCCESS_STATUSES if code in responses), None)
     if status is None:
@@ -147,6 +164,9 @@ def _ensure_success_response(operation: dict[str, Any]) -> None:
     if content and "application/json" not in content:
         return
     media = content.setdefault("application/json", {})
+    if ref := KIND_SUCCESS_RESPONSE_REFS.get((method, path)):
+        media["schema"] = {"$ref": ref}
+        return
     schema = media.setdefault("schema", {})
     if schema == {}:
         media["schema"] = {"$ref": "#/components/schemas/AkbJsonObject"}
@@ -171,6 +191,155 @@ def _error_description(status: str) -> str:
         "422": "Validation Error",
         "500": "Internal Server Error",
     }[status]
+
+
+def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
+    return {
+        "AkbSuccessEnvelope": {
+            "description": "HTTP success envelope union. SDKs unwrap this to {data,error}.",
+            "oneOf": [
+                {"$ref": "#/components/schemas/AkbTableEnvelope"},
+                {"$ref": "#/components/schemas/AkbTableQueryEnvelope"},
+                {"$ref": "#/components/schemas/AkbTableSqlEnvelope"},
+                {"$ref": "#/components/schemas/AkbFileEnvelope"},
+            ],
+            "discriminator": {
+                "propertyName": "kind",
+                "mapping": {
+                    "table": "#/components/schemas/AkbTableEnvelope",
+                    "table_query": "#/components/schemas/AkbTableQueryEnvelope",
+                    "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
+                    "file": "#/components/schemas/AkbFileEnvelope",
+                },
+            },
+        },
+        "AkbSqlEnvelope": {
+            "description": "SQL execution success envelope.",
+            "oneOf": [
+                {"$ref": "#/components/schemas/AkbTableQueryEnvelope"},
+                {"$ref": "#/components/schemas/AkbTableSqlEnvelope"},
+            ],
+            "discriminator": {
+                "propertyName": "kind",
+                "mapping": {
+                    "table_query": "#/components/schemas/AkbTableQueryEnvelope",
+                    "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
+                },
+            },
+        },
+        "AkbTableEnvelope": _kind_schema(
+            "table",
+            {
+                "uri": {"type": "string"},
+                "vault": {"type": "string"},
+                "collection": _nullable_string(),
+                "name": {"type": "string"},
+                "sql_name": {"type": "string"},
+                "description": _nullable_string(),
+                "columns": JSON_OBJECT_ARRAY_SCHEMA,
+                "unique_keys": JSON_OBJECT_ARRAY_SCHEMA,
+                "indexes": JSON_OBJECT_ARRAY_SCHEMA,
+                "row_count": {"type": "integer"},
+                "created_at": {"type": "string", "format": "date-time"},
+                "deleted": {"type": "boolean"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["kind"],
+                        "properties": {"kind": _kind_property("table")},
+                        "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+                    },
+                },
+                "total": {"type": "integer"},
+            },
+            "Table resource, list, mutation, and delete success envelope.",
+        ),
+        "AkbTableQueryEnvelope": _kind_schema(
+            "table_query",
+            {
+                "vaults": {"type": "array", "items": {"type": "string"}},
+                "columns": {"type": "array", "items": {"type": "string"}},
+                "items": JSON_OBJECT_ARRAY_SCHEMA,
+                "total": {"type": "integer"},
+            },
+            "SQL SELECT/WITH success envelope.",
+            required=("kind", "vaults", "columns", "items", "total"),
+        ),
+        "AkbTableSqlEnvelope": _kind_schema(
+            "table_sql",
+            {
+                "vaults": {"type": "array", "items": {"type": "string"}},
+                "result": {"type": "string"},
+            },
+            "SQL mutation success envelope.",
+            required=("kind", "vaults", "result"),
+        ),
+        "AkbFileEnvelope": _kind_schema(
+            "file",
+            {
+                "uri": {"type": "string"},
+                "id": {"type": "string"},
+                "vault": {"type": "string"},
+                "collection": _nullable_string(),
+                "name": {"type": "string"},
+                "mime_type": {"type": "string"},
+                "size_bytes": {"type": "integer"},
+                "description": _nullable_string(),
+                "upload_url": {"type": "string"},
+                "download_url": {"type": "string"},
+                "s3_key": {"type": "string"},
+                "content_hash": _nullable_string(),
+                "hash_algorithm": _nullable_string(),
+                "etag": _nullable_string(),
+                "storage_version": _nullable_string(),
+                "expires_in": {"type": "integer"},
+                "deleted": {"type": "boolean"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["kind"],
+                        "properties": {"kind": _kind_property("file")},
+                        "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+                    },
+                },
+                "total": {"type": "integer"},
+            },
+            "File resource, list, upload, download, and delete success envelope.",
+        ),
+    }
+
+
+def _kind_schema(
+    kind: str,
+    properties: dict[str, Any],
+    description: str,
+    *,
+    required: tuple[str, ...] = ("kind",),
+) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": description,
+        "required": list(required),
+        "properties": {
+            "kind": _kind_property(kind),
+            **properties,
+        },
+        "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+    }
+
+
+def _kind_property(kind: str) -> dict[str, Any]:
+    return {
+        "type": "string",
+        "enum": [kind],
+        "description": "Success envelope discriminator.",
+    }
+
+
+def _nullable_string() -> dict[str, Any]:
+    return {"anyOf": [{"type": "string"}, {"type": "null"}]}
 
 
 def _operation_id(route: APIRoute) -> str:
