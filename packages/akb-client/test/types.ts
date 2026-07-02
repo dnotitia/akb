@@ -3,7 +3,9 @@ import {
   unwrapAkbResponse,
   type AkbResult,
   type AkbSuccessEnvelope,
+  type AkbClient,
 } from "../src/index.js";
+import type { AkbSchema } from "./fixtures/akb.types.ts";
 
 type TableQueryEnvelope = AkbSuccessEnvelope & {
   kind: "table_query";
@@ -32,3 +34,6 @@ const requestResult = await client.request<TableQueryEnvelope>("/tables/reef/sql
   body: JSON.stringify({ sql: "SELECT id FROM incidents" }),
 });
 requestResult.throwOnError().data.kind satisfies "table_query";
+
+const typedClient = createClient<AkbSchema>({ baseUrl: "https://akb.test/api/v1" });
+typedClient satisfies AkbClient<AkbSchema>;

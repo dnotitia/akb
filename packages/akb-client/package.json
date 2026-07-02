@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Reference AKB REST client boundary for kind envelopes and {data,error} results.",
   "type": "module",
+  "bin": {
+    "akb": "./bin/akb.mjs"
+  },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
@@ -10,10 +13,13 @@
     }
   },
   "files": [
+    "bin/",
     "README.md",
+    "scripts/",
     "src/"
   ],
   "scripts": {
+    "codegen:check": "node scripts/check-generated-types.mjs",
     "test": "node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

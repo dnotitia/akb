@@ -38,3 +38,29 @@ const { data } = result.throwOnError();
 ```
 
 The backend and MCP surfaces are not rewrapped. `kind` remains the HTTP success discriminator and `{ data, error }` exists only at the SDK boundary.
+
+## Runtime Table Types
+
+AKB user tables are created at runtime, so table row types come from the live schema introspection endpoint rather than static OpenAPI:
+
+```bash
+akb gen types --vault eng --url https://akb.example.com > akb.types.ts
+```
+
+The generated file exports Supabase-style `Database` and `AkbSchema` types:
+
+```ts
+import { createClient } from "@akb/client";
+import type { AkbSchema } from "./akb.types";
+
+const akb = createClient<AkbSchema>({
+  baseUrl: "https://akb.example.com/api/v1",
+  token: process.env.AKB_TOKEN,
+});
+```
+
+For CI drift checks, regenerate and compare the committed file:
+
+```bash
+akb gen types --vault eng --url "$AKB_URL" --check akb.types.ts
+```

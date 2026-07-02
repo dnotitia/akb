@@ -46,6 +46,16 @@ step "eslint (frontend)"
 step "tsc (frontend)"
 (cd frontend && npx --no-install tsc --noEmit)
 
+# ─── @akb/client: node tests + generated-type drift ─────────────
+step "node tests (@akb/client)"
+(cd packages/akb-client && npm test)
+
+step "tsc (@akb/client)"
+(cd packages/akb-client && ../../frontend/node_modules/.bin/tsc -p tsconfig.json --noEmit)
+
+step "generated type drift (@akb/client)"
+(cd packages/akb-client && node scripts/check-generated-types.mjs)
+
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge
 # because check.sh only ran lint/type. Stage 3 (Playwright) lives

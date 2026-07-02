@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "allowJs": true,
+    "allowImportingTsExtensions": true,
     "checkJs": true,
     "declaration": false,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
@@ -10,5 +11,5 @@
     "strict": true,
     "target": "ES2022"
   },
-  "include": ["src/index.js", "src/index.d.ts", "test/types.ts"]
+  "include": ["src/**/*.js", "src/**/*.d.ts", "test/types.ts"]
 }

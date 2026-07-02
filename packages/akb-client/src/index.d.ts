@@ -51,7 +51,8 @@ export interface AkbClientConfig {
   fetch?: typeof fetch;
 }
 
-export interface AkbClient {
+export interface AkbClient<Schema = unknown> {
+  readonly __schema?: Schema;
   request<T = AkbSuccessEnvelope>(path: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
 }
 
@@ -66,4 +67,4 @@ export function akbFetch<T = unknown>(
   fetchImpl?: typeof fetch,
 ): Promise<AkbResult<T>>;
 
-export function createClient(config: AkbClientConfig): AkbClient;
+export function createClient<Schema = unknown>(config: AkbClientConfig): AkbClient<Schema>;
