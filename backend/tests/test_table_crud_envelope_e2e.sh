@@ -192,7 +192,75 @@ assert_value "list" "$LIST" "v=d['items'][0]['name']" "$TABLE"
 assert_value "list" "$LIST" "v=d['items'][0]['uri']" "$TABLE_URI"
 
 echo ""
-echo "▸ 5. SQL SELECT — envelope shape (rows → items)"
+echo "▸ 5. Rich column DDL — defaults, unique, check, index"
+
+RICH="rich"
+RICH_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$RICH\",\"description\":\"rich columns\",\"columns\":[{\"name\":\"email\",\"type\":\"text\",\"required\":true,\"unique\":true,\"check\":{\"op\":\"len_lte\",\"value\":80}},{\"name\":\"status\",\"type\":\"text\",\"default\":\"todo\",\"check\":{\"op\":\"in\",\"values\":[\"todo\",\"done\"]},\"index\":true},{\"name\":\"qty\",\"type\":\"int\",\"default\":1,\"check\":{\"op\":\"gte\",\"value\":0}},{\"name\":\"rating\",\"type\":\"float\",\"default\":1.5},{\"name\":\"public_id\",\"type\":\"uuid\",\"default\":\"gen_random_uuid()\"},{\"name\":\"seen_at\",\"type\":\"timestamp\",\"default\":\"now()\"},{\"name\":\"tags\",\"type\":\"text[]\",\"default\":[\"new\"]}]}")
+assert_keys "rich.create" "$RICH_CREATE" kind uri vault name columns unique_keys indexes
+assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'qty')['type']" "int"
+assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'status')['index']" "True"
+assert_value "rich.create" "$RICH_CREATE" "v=len(d['unique_keys'])" "1"
+assert_value "rich.create" "$RICH_CREATE" "v=len(d['indexes'])" "1"
+
+BAD_TYPE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"badtype","columns":[{"name":"x","type":"varchar(20)"}]}')
+assert_value "rich.bad-type" "$BAD_TYPE" "v=d['code']" "invalid_column_type"
+
+BAD_DEFAULT=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"baddefault","columns":[{"name":"x","type":"timestamp","default":"now(); DROP"}]}')
+[ "$BAD_DEFAULT" = "422" ] && pass "rich.bad-default: HTTP 422" || fail "rich.bad-default" "expected 422, got $BAD_DEFAULT"
+
+BAD_CHECK=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"badcheck","columns":[{"name":"x","type":"text","check":"x <> ''''"}]}')
+[ "$BAD_CHECK" = "422" ] && pass "rich.bad-check: HTTP 422" || fail "rich.bad-check" "expected 422, got $BAD_CHECK"
+
+RICH_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email) VALUES ('one@test.dev')\"}")
+assert_keys "rich.insert" "$RICH_INSERT" kind result vaults
+
+RICH_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT email, status, qty, rating, public_id IS NOT NULL AS has_uuid, seen_at IS NOT NULL AS has_seen, tags[1] AS first_tag FROM $RICH\"}")
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['status']" "todo"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['qty']" "1"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['rating']" "1.5"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['has_uuid']" "True"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['has_seen']" "True"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['first_tag']" "new"
+
+RICH_DUP=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email) VALUES ('one@test.dev')\"}")
+[ "$RICH_DUP" = "409" ] && pass "rich.unique: HTTP 409" || fail "rich.unique" "expected 409, got $RICH_DUP"
+
+RICH_CHECK=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, status) VALUES ('two@test.dev', 'blocked')\"}")
+[ "$RICH_CHECK" = "400" ] && pass "rich.check: HTTP 400" || fail "rich.check" "expected 400, got $RICH_CHECK"
+
+RICH_ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"add_columns":[{"name":"score","type":"numeric","default":0,"check":{"op":"gte","value":0},"index":true}]}')
+assert_value "rich.alter" "$RICH_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'score')['type']" "numeric"
+assert_value "rich.alter" "$RICH_ALTER" "v=len(d['indexes'])" "2"
+
+echo ""
+echo "▸ 6. SQL SELECT — envelope shape (rows → items)"
 
 INS=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
@@ -212,7 +280,7 @@ assert_value "sql.select" "$SEL" "v=d['items'][0]['email']" "a@x"
 assert_value "sql.select" "$SEL" "v=d['items'][0]['status']" "active"
 
 echo ""
-echo "▸ 6. Drop table — envelope shape"
+echo "▸ 7. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
@@ -223,7 +291,7 @@ assert_value "drop" "$DROP" "v=d['name']" "$TABLE"
 assert_value "drop" "$DROP" "v=str(d['deleted']).lower()" "true"
 
 echo ""
-echo "▸ 7. Drop missing table — proper 4xx error"
+echo "▸ 8. Drop missing table — proper 4xx error"
 
 MISS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/does-not-exist" \
   -H "Authorization: Bearer $PAT")

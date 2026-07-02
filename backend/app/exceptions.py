@@ -7,9 +7,20 @@ Services raise these; the global handler in main.py maps them to HTTP responses.
 class AKBError(Exception):
     """Base exception for all AKB errors."""
 
-    def __init__(self, message: str, status_code: int = 500):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 500,
+        *,
+        code: str | None = None,
+        hint: str | None = None,
+        details: dict | None = None,
+    ):
         self.message = message
         self.status_code = status_code
+        self.code = code
+        self.hint = hint
+        self.details = details
         super().__init__(message)
 
 
@@ -44,3 +55,16 @@ class ValidationError(AKBError, ValueError):
 
     def __init__(self, message: str):
         super().__init__(message, status_code=422)
+
+
+class InvalidColumnTypeError(AKBError, ValueError):
+    """Unsupported dynamic-table column type → HTTP 400 invalid_column_type."""
+
+    def __init__(self, message: str, *, hint: str | None = None, details: dict | None = None):
+        super().__init__(
+            message,
+            status_code=400,
+            code="invalid_column_type",
+            hint=hint,
+            details=details,
+        )

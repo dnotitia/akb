@@ -56,9 +56,19 @@ app = FastAPI(
 # Global exception handler
 @app.exception_handler(AKBError)
 async def akb_error_handler(request: Request, exc: AKBError):
+    detail: object = exc.message
+    if exc.code or exc.hint or exc.details:
+        detail_dict: dict[str, object] = {"message": exc.message}
+        if exc.code:
+            detail_dict["code"] = exc.code
+        if exc.hint:
+            detail_dict["hint"] = exc.hint
+        if exc.details:
+            detail_dict["details"] = exc.details
+        detail = detail_dict
     return JSONResponse(
         status_code=exc.status_code,
-        content=_error_payload(exc.status_code, exc.message),
+        content=_error_payload(exc.status_code, detail),
     )
 
 

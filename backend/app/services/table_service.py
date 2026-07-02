@@ -275,6 +275,46 @@ def _resolve_indexes(
     return resolved
 
 
+def _normalize_column_spec(col: dict) -> dict:
+    for flag in ("required", "unique", "index"):
+        if flag in col and not isinstance(col[flag], bool):
+            raise ValidationError(f"Column {col.get('name')!r}: {flag} must be a boolean.")
+    return table_data_repo.normalize_column_spec(col)
+
+
+def _inline_unique_keys(columns: list[dict], pg_name: str) -> list[dict]:
+    return [
+        {
+            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="uk"),
+            "columns": [col["name"]],
+        }
+        for col in columns
+        if col.get("unique") is True
+    ]
+
+
+def _inline_indexes(columns: list[dict], pg_name: str) -> list[dict]:
+    return [
+        {
+            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="idx"),
+            "columns": [{"name": col["name"], "order": "asc"}],
+        }
+        for col in columns
+        if col.get("index") is True
+    ]
+
+
+def _reject_duplicate_meta_names(items: list[dict], *, label: str) -> None:
+    seen: set[str] = set()
+    for item in items:
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        if name in seen:
+            raise ValidationError(f"Duplicate {label} name {name!r}.")
+        seen.add(name)
+
+
 # ── Indexing helpers ─────────────────────────────────────────────
 
 
@@ -356,6 +396,7 @@ async def create_table(
                 raise ConflictError(f"Table already exists: {name}")
 
             seen: set[str] = set()
+            normalized_columns: list[dict] = []
             for col in columns:
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
@@ -371,6 +412,8 @@ async def create_table(
                         f"reserved names {sorted(_RESERVED)}."
                     )
                 seen.add(key)
+                normalized_columns.append(_normalize_column_spec(col))
+            columns = normalized_columns
 
             collection_id = None
             if collection_path:
@@ -397,8 +440,14 @@ async def create_table(
             # DDL so a bad spec rolls back with zero schema change. On a
             # freshly-created (empty) table there is no duplicate-preflight
             # to run — a later duplicate INSERT surfaces PG 23505 via akb_sql.
-            resolved_uks = _resolve_unique_keys(unique_keys, columns, pg_name)
-            resolved_idxs = _resolve_indexes(indexes, columns, pg_name)
+            resolved_uks = _inline_unique_keys(columns, pg_name) + _resolve_unique_keys(
+                unique_keys, columns, pg_name,
+            )
+            resolved_idxs = _inline_indexes(columns, pg_name) + _resolve_indexes(
+                indexes, columns, pg_name,
+            )
+            _reject_duplicate_meta_names(resolved_uks, label="unique-key")
+            _reject_duplicate_meta_names(resolved_idxs, label="index")
 
             try:
                 await table_data_repo.create_dynamic_table(conn, pg_name, columns)
@@ -786,6 +835,10 @@ async def alter_table(
 
             columns = table_registry_repo.parse_columns(table["columns"])
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+            existing_uks = table_registry_repo.parse_json_list(table.get("unique_keys"))
+            existing_idxs = table_registry_repo.parse_json_list(table.get("indexes"))
+            uk_changed = False
+            idx_changed = False
 
             # ── Guard rails (mirror create_table) ───────────────────
             # Reject reserved/malformed names BEFORE any DDL so the whole
@@ -794,12 +847,15 @@ async def alter_table(
             # bookkeeping columns (id/created_at/updated_at/created_by) —
             # those are exactly the _RESERVED set — so a client can no
             # longer drop the PK or shadow a reserved name.
+            normalized_add_columns: list[dict] = []
             for col in (add_columns or []):
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
                         f"Each added column must be an object with a 'name' field; got {col!r}."
                     )
                 _validate_column_name(col["name"])
+                normalized_add_columns.append(_normalize_column_spec(col))
+            add_columns = normalized_add_columns
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
                     raise ValidationError("Drop column name must be a non-empty string.")
@@ -819,14 +875,66 @@ async def alter_table(
             renamed: dict[str, str] = {}
 
             if add_columns:
+                taken_uk_names = {uk["name"] for uk in existing_uks}
+                taken_idx_names = {idx["name"] for idx in existing_idxs}
                 for col in add_columns:
                     if any(c["name"] == col["name"] for c in columns):
                         continue
-                    col_type = table_data_repo.TYPE_MAP.get(col.get("type", "text"), "TEXT")
-                    safe_name = table_data_repo.safe_ident(col["name"])
-                    await table_data_repo.add_column(conn, pg_name, safe_name, col_type)
+                    try:
+                        await table_data_repo.add_column(conn, pg_name, col)
+                    except asyncpg.NotNullViolationError as e:
+                        raise ValidationError(
+                            f"Cannot add required column {col['name']!r} without a default: "
+                            f"existing rows would receive NULL. Provide a default or add the "
+                            f"column as optional first."
+                        ) from e
                     columns.append(col)
                     added.append(col["name"])
+                    if col.get("unique") is True:
+                        uk = _inline_unique_keys([col], pg_name)[0]
+                        if uk["name"] in taken_uk_names:
+                            raise ValidationError(
+                                f"Unique-key name {uk['name']!r} already exists on this table."
+                            )
+                        try:
+                            await table_data_repo.create_unique_constraint(
+                                conn, pg_name, uk["name"], uk["columns"],
+                            )
+                        except asyncpg.UniqueViolationError as e:
+                            raise ValidationError(
+                                f"Cannot add unique column {col['name']!r}: existing rows "
+                                f"already violate uniqueness. De-duplicate the data first, "
+                                f"then retry."
+                            ) from e
+                        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                            raise ValidationError(
+                                f"Unique-key name {uk['name']!r} already exists in the "
+                                f"database: {e}. Names are shared schema-wide — choose a "
+                                f"different table or column name."
+                            ) from e
+                        taken_uk_names.add(uk["name"])
+                        existing_uks.append(uk)
+                        uk_changed = True
+                    if col.get("index") is True:
+                        idx = _inline_indexes([col], pg_name)[0]
+                        if idx["name"] in taken_idx_names:
+                            raise ValidationError(
+                                f"Index name {idx['name']!r} already exists on this table."
+                            )
+                        try:
+                            await table_data_repo.create_index(
+                                conn, pg_name, idx["name"],
+                                [(c["name"], c["order"]) for c in idx["columns"]],
+                            )
+                        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                            raise ValidationError(
+                                f"Index name {idx['name']!r} already exists in the database: "
+                                f"{e}. Names are shared schema-wide — choose a different "
+                                f"table or column name."
+                            ) from e
+                        taken_idx_names.add(idx["name"])
+                        existing_idxs.append(idx)
+                        idx_changed = True
 
             if drop_columns:
                 for col_name in drop_columns:
@@ -867,11 +975,6 @@ async def alter_table(
             # ── Declarative unique keys / indexes (AKB #215) ─────────
             # Existing metadata from the registry row; the merged result
             # is persisted via update_schema_meta in the SAME TX.
-            existing_uks = table_registry_repo.parse_json_list(table.get("unique_keys"))
-            existing_idxs = table_registry_repo.parse_json_list(table.get("indexes"))
-            uk_changed = False
-            idx_changed = False
-
             # Keep declarative metadata consistent with column rename/drop done
             # in THIS alter, else the registry drifts from the physical schema:
             # a PG column rename leaves the constraint/index under the old

@@ -16,10 +16,12 @@ no pool, no live PG.
 from __future__ import annotations
 
 import hashlib
+import uuid
 
+import asyncpg
 import pytest
 
-from app.exceptions import ValidationError
+from app.exceptions import InvalidColumnTypeError, ValidationError
 from app.repositories import table_data_repo
 from app.repositories.table_registry_repo import parse_json_list
 
@@ -102,6 +104,75 @@ def test_generated_name_hash_is_pure_hashlib():
 
 
 # ── preflight duplicate-detection query shape ─────────────────────
+
+
+def test_column_type_allowlist_and_aliases_are_canonical():
+    assert table_data_repo.normalize_column_type("number") == "numeric"
+    assert table_data_repo.normalize_column_type("json") == "jsonb"
+    assert table_data_repo.normalize_column_type("int") == "int"
+    assert table_data_repo.column_type_sql("text[]") == "TEXT[]"
+
+    with pytest.raises(InvalidColumnTypeError) as exc:
+        table_data_repo.normalize_column_type("varchar(255)")
+    assert exc.value.code == "invalid_column_type"
+    assert "Available" in (exc.value.hint or "")
+
+
+def test_column_definition_compiles_default_check_and_not_null():
+    definition = table_data_repo.column_definition({
+        "name": "qty",
+        "type": "int",
+        "required": True,
+        "default": 1,
+        "check": {"op": "gte", "value": 0},
+    })
+
+    assert definition == "qty BIGINT NOT NULL DEFAULT 1 CHECK (qty >= 0)"
+
+
+def test_column_definition_compiles_structured_scalar_properties():
+    assert table_data_repo.column_definition({
+        "name": "status",
+        "type": "text",
+        "default": "todo",
+        "check": {"op": "in", "values": ["todo", "done"]},
+    }) == "status TEXT DEFAULT 'todo' CHECK (status IN ('todo', 'done'))"
+    assert table_data_repo.column_definition({
+        "name": "slug",
+        "type": "text",
+        "check": {"op": "len_lte", "value": 80},
+    }) == "slug TEXT CHECK (char_length(slug) <= 80)"
+    assert table_data_repo.column_definition({
+        "name": "payload",
+        "type": "jsonb",
+        "default": {"ok": True},
+    }) == "payload JSONB DEFAULT '{\"ok\":true}'::jsonb"
+    assert table_data_repo.column_definition({
+        "name": "tags",
+        "type": "text[]",
+        "default": ["a", "b"],
+    }) == "tags TEXT[] DEFAULT ARRAY['a', 'b']::TEXT[]"
+    assert table_data_repo.column_definition({
+        "name": "created_at",
+        "type": "timestamp",
+        "default": "now()",
+    }) == "created_at TIMESTAMPTZ DEFAULT now()"
+    assert table_data_repo.column_definition({
+        "name": "public_id",
+        "type": "uuid",
+        "default": "gen_random_uuid()",
+    }) == "public_id UUID DEFAULT gen_random_uuid()"
+
+
+def test_column_definition_rejects_raw_type_default_and_check():
+    with pytest.raises(InvalidColumnTypeError):
+        table_data_repo.column_definition({"name": "x", "type": "TEXT; DROP TABLE users"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "timestamp", "default": "now(); DROP"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "text", "check": "x <> ''"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "numeric", "check": {"op": "raw", "value": "x > 0"}})
 
 
 class _RecordingConn:
@@ -324,6 +395,83 @@ def test_resolve_indexes_rejects_reserved_column():
     with pytest.raises(ValidationError):
         table_service._resolve_indexes(
             [{"columns": ["id"]}], _DECLARED, "vt_demo__events",
+        )
+
+
+def test_inline_unique_and_index_column_properties_resolve_to_metadata():
+    columns = [
+        table_service._normalize_column_spec({"name": "email", "type": "text", "unique": True}),
+        table_service._normalize_column_spec({"name": "status", "type": "text", "index": True}),
+    ]
+
+    unique_keys = table_service._inline_unique_keys(columns, "vt_demo__contacts")
+    indexes = table_service._inline_indexes(columns, "vt_demo__contacts")
+
+    assert unique_keys == [{
+        "name": table_service.table_data_repo.generate_constraint_name(
+            "vt_demo__contacts", ["email"], kind="uk",
+        ),
+        "columns": ["email"],
+    }]
+    assert indexes == [{
+        "name": table_service.table_data_repo.generate_constraint_name(
+            "vt_demo__contacts", ["status"], kind="idx",
+        ),
+        "columns": [{"name": "status", "order": "asc"}],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_alter_required_column_without_default_is_clean_validation(monkeypatch):
+    class _Tx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Conn:
+        def transaction(self):
+            return _Tx()
+
+        async def fetchrow(self, sql, *_params):
+            if "FROM vaults" in sql:
+                return {"name": "demo"}
+            return {
+                "id": uuid.uuid4(),
+                "name": "items",
+                "columns": [{"name": "label", "type": "text"}],
+                "unique_keys": [],
+                "indexes": [],
+                "collection": None,
+            }
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def _fake_get_pool():
+        return _Pool()
+
+    async def _raise_not_null(_conn, _pg_name, _col):
+        raise asyncpg.NotNullViolationError("column contains null values")
+
+    monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
+    monkeypatch.setattr(table_service.table_data_repo, "add_column", _raise_not_null)
+
+    with pytest.raises(ValidationError, match="Cannot add required column"):
+        await table_service.alter_table(
+            uuid.uuid4(),
+            "items",
+            actor_id="tester",
+            add_columns=[{"name": "code", "type": "text", "required": True}],
         )
 
 

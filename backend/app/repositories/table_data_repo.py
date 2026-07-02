@@ -18,17 +18,78 @@ row-CRUD API is added later it will live in this module.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from datetime import date, datetime
+from typing import Any
+from uuid import UUID
 
-from app.exceptions import ValidationError
+from app.exceptions import InvalidColumnTypeError, ValidationError
+from app.util.text import fuzzy_hint
 
 
 TYPE_MAP = {
     "text": "TEXT",
+    "int": "BIGINT",
+    "float": "DOUBLE PRECISION",
+    "numeric": "NUMERIC",
     "number": "NUMERIC",
     "boolean": "BOOLEAN",
+    "uuid": "UUID",
     "date": "DATE",
+    "timestamp": "TIMESTAMPTZ",
+    "jsonb": "JSONB",
     "json": "JSONB",
+    "text[]": "TEXT[]",
+}
+
+CANONICAL_TYPE_ALIASES = {
+    "text": "text",
+    "int": "int",
+    "float": "float",
+    "numeric": "numeric",
+    "number": "numeric",
+    "boolean": "boolean",
+    "uuid": "uuid",
+    "date": "date",
+    "timestamp": "timestamp",
+    "jsonb": "jsonb",
+    "json": "jsonb",
+    "text[]": "text[]",
+}
+
+CANONICAL_TYPES = [
+    "text",
+    "int",
+    "float",
+    "numeric",
+    "boolean",
+    "uuid",
+    "date",
+    "timestamp",
+    "jsonb",
+    "text[]",
+]
+
+_DEFAULT_FUNCTIONS = {
+    "timestamp": {"now()"},
+    "uuid": {"gen_random_uuid()"},
+}
+
+_CHECK_OPERATORS = {
+    "eq": "=",
+    "ne": "<>",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+}
+
+_LENGTH_CHECK_OPERATORS = {
+    "len_lt": "<",
+    "len_lte": "<=",
+    "len_gt": ">",
+    "len_gte": ">=",
 }
 
 
@@ -82,6 +143,162 @@ def safe_ident(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
+def normalize_column_type(logical_type: Any) -> str:
+    """Return the canonical AKB logical column type or raise a stable error."""
+    raw = "text" if logical_type in (None, "") else logical_type
+    if not isinstance(raw, str):
+        raise InvalidColumnTypeError(
+            f"Invalid column type {raw!r}: type must be a string.",
+            hint=f"Available column types: {', '.join(CANONICAL_TYPES)}",
+            details={"available_types": CANONICAL_TYPES},
+        )
+    key = raw.strip().lower()
+    canonical = CANONICAL_TYPE_ALIASES.get(key)
+    if canonical is None:
+        raise InvalidColumnTypeError(
+            f"Unsupported column type {raw!r}.",
+            hint=fuzzy_hint(key, CANONICAL_TYPES + ["number", "json"], label="column types"),
+            details={"available_types": CANONICAL_TYPES, "aliases": {"number": "numeric", "json": "jsonb"}},
+        )
+    return canonical
+
+
+def normalize_column_spec(col: dict) -> dict:
+    """Copy a caller column spec and normalize its logical type."""
+    out = dict(col)
+    out["type"] = normalize_column_type(out.get("type", "text"))
+    # Compile once here so invalid default/check specs fail before any DDL.
+    _column_default_sql(out)
+    _column_check_sql(out)
+    return out
+
+
+def column_type_sql(logical_type: Any) -> str:
+    return TYPE_MAP[normalize_column_type(logical_type)]
+
+
+def column_definition(col: dict) -> str:
+    """Build one validated user-column definition for CREATE/ALTER TABLE."""
+    col_name = safe_ident(col["name"])
+    parts = [col_name, column_type_sql(col.get("type", "text"))]
+    if col.get("required"):
+        parts.append("NOT NULL")
+    if default_sql := _column_default_sql(col):
+        parts.append(f"DEFAULT {default_sql}")
+    if check_sql := _column_check_sql(col):
+        parts.append(f"CHECK ({check_sql})")
+    return " ".join(parts)
+
+
+def _column_default_sql(col: dict) -> str | None:
+    if "default" not in col or col.get("default") is None:
+        return None
+    logical_type = normalize_column_type(col.get("type", "text"))
+    value = col["default"]
+    if isinstance(value, str) and value.strip().lower() in {"now()", "gen_random_uuid()"}:
+        func = value.strip().lower()
+        if func not in _DEFAULT_FUNCTIONS.get(logical_type, set()):
+            raise ValidationError(
+                f"Default function {func!r} is not allowed for {logical_type} columns."
+            )
+        return func
+    return _literal_sql(value, logical_type, ctx="default")
+
+
+def _column_check_sql(col: dict) -> str | None:
+    spec = col.get("check")
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise ValidationError("check must be an object like {op, value}; raw SQL is not allowed.")
+    op = spec.get("op")
+    if not isinstance(op, str):
+        raise ValidationError("check.op must be a string.")
+    op = op.lower()
+    col_name = safe_ident(col["name"])
+    logical_type = normalize_column_type(col.get("type", "text"))
+    if op in _CHECK_OPERATORS:
+        if "value" not in spec:
+            raise ValidationError(f"check.{op} requires a value.")
+        return f"{col_name} {_CHECK_OPERATORS[op]} {_literal_sql(spec['value'], logical_type, ctx='check.value')}"
+    if op in {"in", "not_in"}:
+        values = spec.get("value", spec.get("values"))
+        if not isinstance(values, list) or not values:
+            raise ValidationError(f"check.{op} requires a non-empty value list.")
+        literals = ", ".join(_literal_sql(v, logical_type, ctx="check.value") for v in values)
+        neg = "NOT " if op == "not_in" else ""
+        return f"{col_name} {neg}IN ({literals})"
+    if op in _LENGTH_CHECK_OPERATORS:
+        if logical_type != "text":
+            raise ValidationError(f"check.{op} is only supported for text columns.")
+        value = spec.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"check.{op} requires a non-negative integer value.")
+        return f"char_length({col_name}) {_LENGTH_CHECK_OPERATORS[op]} {value}"
+    raise ValidationError(
+        "Unsupported check.op "
+        f"{op!r}. Available ops: {sorted([*_CHECK_OPERATORS, 'in', 'not_in', *_LENGTH_CHECK_OPERATORS])}."
+    )
+
+
+def _literal_sql(value: Any, logical_type: str, *, ctx: str) -> str:
+    if logical_type == "text":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for text columns must be a string literal.")
+        return _quote(value)
+    if logical_type == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValidationError(f"{ctx} for int columns must be an integer literal.")
+        return str(value)
+    if logical_type in {"float", "numeric"}:
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            raise ValidationError(f"{ctx} for {logical_type} columns must be a numeric literal.")
+        return repr(value)
+    if logical_type == "boolean":
+        if not isinstance(value, bool):
+            raise ValidationError(f"{ctx} for boolean columns must be a boolean literal.")
+        return "TRUE" if value else "FALSE"
+    if logical_type == "uuid":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for uuid columns must be a UUID string literal.")
+        try:
+            UUID(value)
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for uuid columns must be a valid UUID string.") from e
+        return _quote(value)
+    if logical_type == "date":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for date columns must be an ISO date string.")
+        try:
+            date.fromisoformat(value)
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for date columns must be an ISO date string.") from e
+        return _quote(value)
+    if logical_type == "timestamp":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for timestamp columns must be an ISO timestamp string.")
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for timestamp columns must be an ISO timestamp string.") from e
+        return _quote(value)
+    if logical_type == "jsonb":
+        return f"{_quote(json.dumps(value, ensure_ascii=False, separators=(',', ':')))}::jsonb"
+    if logical_type == "text[]":
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValidationError(f"{ctx} for text[] columns must be a list of string literals.")
+        return "ARRAY[" + ", ".join(_quote(v) for v in value) + "]::TEXT[]"
+    raise InvalidColumnTypeError(
+        f"Unsupported column type {logical_type!r}.",
+        hint=fuzzy_hint(logical_type, CANONICAL_TYPES, label="column types"),
+        details={"available_types": CANONICAL_TYPES},
+    )
+
+
+def _quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 # ── DDL ──────────────────────────────────────────────────────────
 
 
@@ -90,10 +307,7 @@ async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
     responsible for sanitising `pg_name` (use `pg_table_name`)."""
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
     for col in columns:
-        col_name = safe_ident(col["name"])
-        col_type = TYPE_MAP.get(col.get("type", "text"), "TEXT")
-        not_null = " NOT NULL" if col.get("required") else ""
-        col_defs.append(f"{col_name} {col_type}{not_null}")
+        col_defs.append(column_definition(col))
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
@@ -124,11 +338,9 @@ async def count_rows(conn, pg_name: str) -> int:
         return 0
 
 
-async def add_column(conn, pg_name: str, col_name: str, col_type: str) -> None:
-    """Add a column to the dynamic table. Caller sanitises name/type."""
-    await conn.execute(
-        f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-    )
+async def add_column(conn, pg_name: str, col: dict) -> None:
+    """Add a column to the dynamic table. Column DDL is validated here."""
+    await conn.execute(f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {column_definition(col)}")
 
 
 async def drop_column(conn, pg_name: str, col_name: str) -> None:

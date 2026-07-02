@@ -44,7 +44,7 @@
         },
         {
           "name": "metadata",
-          "type": "json",
+          "type": "jsonb",
           "required": false,
           "default": null,
           "enum": null,

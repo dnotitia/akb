@@ -34,6 +34,7 @@ from typing import Any
 from app.exceptions import (
     ConflictError,
     ForbiddenError,
+    InvalidColumnTypeError,
     NotFoundError,
     ValidationError,
 )
@@ -59,6 +60,7 @@ INSUFFICIENT_SCOPE = "insufficient_scope"
 
 # Caller-side input
 INVALID_ARGUMENT = "invalid_argument"      # generic argument shape problem
+INVALID_COLUMN_TYPE = "invalid_column_type"
 INVALID_URI = "invalid_uri"                # akb:// URI parse failure
 INVALID_PATH = "invalid_path"              # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
@@ -138,6 +140,13 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
         return err(str(e), code=CONFLICT)
+    if isinstance(e, InvalidColumnTypeError):
+        return err(
+            str(e),
+            code=INVALID_COLUMN_TYPE,
+            hint=e.hint,
+            **(e.details or {}),
+        )
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
     return err(str(e), code=INTERNAL)

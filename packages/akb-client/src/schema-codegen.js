@@ -7,10 +7,17 @@
 
 const TYPE_MAP = new Map([
   ["text", "string"],
+  ["int", "number"],
+  ["float", "number"],
+  ["numeric", "number"],
   ["number", "number"],
   ["boolean", "boolean"],
+  ["uuid", "string"],
   ["date", "string"],
+  ["timestamp", "string"],
+  ["jsonb", "Json"],
   ["json", "Json"],
+  ["text[]", "string[]"],
 ]);
 
 /**

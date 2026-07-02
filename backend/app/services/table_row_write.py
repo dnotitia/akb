@@ -38,6 +38,10 @@ from app.util.errors import (
 )
 
 
+def _is_json_type(type_name: str) -> bool:
+    return type_name in {"json", "jsonb"}
+
+
 MAX_BULK_ROWS = 1000
 INSERT_SERVER_CONTROLLED = {"created_by", "updated_at"}
 UPDATE_IMMUTABLE = {"id", "created_by", "created_at", "updated_at"}
@@ -800,6 +804,6 @@ def _last_value(query_params: Sequence[tuple[str, str]], key: str) -> str | None
 
 
 def _normalize_value(value: Any, type_name: str) -> Any:
-    if type_name == "json" and not isinstance(value, str):
+    if _is_json_type(type_name) and not isinstance(value, str):
         return json.dumps(value)
     return value

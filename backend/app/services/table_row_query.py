@@ -46,6 +46,10 @@ CAST_SQL = {
     "uuid": "uuid",
     "text": "text",
 }
+
+
+def _is_json_type(type_name: str) -> bool:
+    return type_name in {"json", "jsonb"}
 _JSON_PATH_RE = re.compile(
     r"^(?P<base>[a-z][a-z0-9_]*)(?:(?P<arrow>->>|#>>)(?P<path>[^:]+))?(?:::(?P<cast>[a-z]+))?$"
 )
@@ -439,7 +443,7 @@ def _compile_ast_operand(node: Mapping[str, Any], column_meta: dict[str, str]) -
         return err("AST jsonb operand must include a column name.", code=INVALID_ARGUMENT)
     if base not in column_meta:
         return _unknown_column(base, column_meta)
-    if column_meta[base] != "json":
+    if not _is_json_type(column_meta[base]):
         return err(f"Column {base!r} is not a JSON column.", code=UNDEFINED_COLUMN)
     path = jsonb.get("path")
     if not isinstance(path, Sequence) or isinstance(path, (str, bytes, bytearray)) or not path:
@@ -521,7 +525,7 @@ def _compile_ast_operator(
             values.append(converted)
         return f"{operand.sql} = ANY({_add_param(params, values)})"
     if operator == "cs":
-        if operand.type_name != "json":
+        if not _is_json_type(operand.type_name):
             return err("cs operator is only supported for JSON columns in this table API.", code="invalid_operator")
         contains_value = json.dumps(value) if isinstance(value, (Mapping, list)) else _parse_contains_value(str(value), "json")
         if isinstance(contains_value, dict):
@@ -569,7 +573,7 @@ def _ast_count_exact(value: Any) -> bool:
 def _convert_ast_value(value: Any, type_name: str) -> Any | dict[str, Any]:
     if value is None:
         return err("Filter value cannot be null; use the is operator.", code=INVALID_ARGUMENT)
-    if type_name == "json" and not isinstance(value, str):
+    if _is_json_type(type_name) and not isinstance(value, str):
         return json.dumps(value)
     return _convert_value(str(value), type_name)
 
@@ -734,7 +738,7 @@ def _compile_operator(
         contains_value = _parse_contains_value(value, operand.type_name)
         if isinstance(contains_value, dict):
             return contains_value
-        cast = "::jsonb" if operand.type_name == "json" else ""
+        cast = "::jsonb" if _is_json_type(operand.type_name) else ""
         return f"{operand.sql} @> {_add_param(params, contains_value)}{cast}"
     return err(f"Unknown row-read operator: {operator}", code="invalid_operator")
 
@@ -778,7 +782,7 @@ def _compile_operand(raw: str, column_meta: dict[str, str]) -> _Operand | dict[s
             return err("Casts are only supported for JSON path operands.", code="invalid_cast")
         ident = table_data_repo.safe_ident(base)
         return _Operand(sql=ident, params=[], type_name=column_meta[base])
-    if column_meta[base] != "json":
+    if not _is_json_type(column_meta[base]):
         return err(f"Column {base!r} is not a JSON column.", code=UNDEFINED_COLUMN)
     path = (m.group("path") or "").strip()
     if not path:
@@ -916,7 +920,7 @@ def _parse_in_values(raw: str, type_name: str) -> list[Any] | dict[str, Any]:
 
 
 def _parse_contains_value(raw: str, type_name: str) -> Any | dict[str, Any]:
-    if type_name != "json":
+    if not _is_json_type(type_name):
         return err("cs operator is only supported for JSON columns in this table API.", code="invalid_operator")
     text = raw.strip()
     if text.startswith("{") and text.endswith("}") and ":" not in text:
@@ -929,7 +933,7 @@ def _parse_contains_value(raw: str, type_name: str) -> Any | dict[str, Any]:
 
 def _convert_value(raw: str, type_name: str) -> Any | dict[str, Any]:
     try:
-        if type_name in {"text", "json"}:
+        if type_name in {"text", "json", "jsonb"}:
             return raw
         if type_name in {"number", "numeric"}:
             return Decimal(raw)

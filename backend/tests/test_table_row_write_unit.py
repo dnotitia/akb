@@ -19,6 +19,11 @@ COLUMNS = [
     {"name": "metadata", "type": "json"},
 ]
 
+JSONB_COLUMNS = [
+    {"name": "severity", "type": "text"},
+    {"name": "metadata", "type": "jsonb"},
+]
+
 
 def test_compile_insert_bulk_uses_union_columns_defaults_and_server_actor() -> None:
     compiled = compile_insert_rows(
@@ -248,6 +253,28 @@ def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
         "updated_at = NOW() WHERE (severity = $3) RETURNING *"
     )
     assert compiled.params == ["critical", json.dumps({"tier": "gold"}), "high"]
+
+
+def test_compile_write_serializes_canonical_jsonb_values() -> None:
+    inserted = compile_insert_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=JSONB_COLUMNS,
+        actor_id="alice",
+        body={"metadata": {"tier": "gold"}},
+    )
+    assert not isinstance(inserted, dict)
+    assert inserted.params == [json.dumps({"tier": "gold"}), "alice"]
+
+    updated = compile_update_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=JSONB_COLUMNS,
+        body={"metadata": {"tier": "silver"}},
+        query_params=[("severity", "eq.high")],
+    )
+    assert not isinstance(updated, dict)
+    assert updated.params == [json.dumps({"tier": "silver"}), "high"]
 
 
 def test_compile_update_requires_filter_or_all_true() -> None:

@@ -14,6 +14,11 @@ COLUMNS = [
     {"name": "metadata", "type": "json"},
 ]
 
+JSONB_COLUMNS = [
+    {"name": "title", "type": "text"},
+    {"name": "metadata", "type": "jsonb"},
+]
+
 
 def test_compile_select_filter_order_count_and_page() -> None:
     compiled = compile_row_query(
@@ -170,6 +175,25 @@ def test_compile_json_containment_object_as_json_param() -> None:
         "SELECT * FROM vt_eng__incidents WHERE (metadata @> $1::jsonb) LIMIT 100 OFFSET 0"
     )
     assert compiled["params"] == ['{"tier": "gold"}']
+
+
+def test_compile_canonical_jsonb_column_supports_path_and_containment() -> None:
+    compiled = compile_row_query(
+        vault_name="eng",
+        table_name="incidents",
+        columns=JSONB_COLUMNS,
+        query_params=[
+            ("select", "metadata->>tier"),
+            ("metadata", 'cs.{"tier":"gold"}'),
+        ],
+    )
+
+    assert "error" not in compiled
+    assert compiled["sql"] == (
+        "SELECT metadata ->> $1::text AS __akb_col_0 FROM vt_eng__incidents "
+        "WHERE (metadata @> $2::jsonb) LIMIT 100 OFFSET 0"
+    )
+    assert compiled["params"] == ["tier", '{"tier": "gold"}']
 
 
 def test_compile_rejects_unknown_identifier_operator_and_cast() -> None:

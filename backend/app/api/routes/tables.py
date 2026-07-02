@@ -12,6 +12,7 @@ from app.services import table_row_query, table_row_write, table_service
 from app.util.errors import (
     BULK_TOO_LARGE,
     CONFLICT,
+    INVALID_COLUMN_TYPE,
     INVALID_ARGUMENT,
     METHOD_NOT_ALLOWED,
     MULTI_STATEMENT,
@@ -33,6 +34,7 @@ _SERVICE_ERROR_STATUS = {
     METHOD_NOT_ALLOWED: 400,
     MULTI_STATEMENT: 400,
     SQL_ERROR: 400,
+    INVALID_COLUMN_TYPE: 400,
     BULK_TOO_LARGE: 400,
     NO_UNIQUE_CONSTRAINT: 400,
     UNFILTERED_MUTATION: 400,
