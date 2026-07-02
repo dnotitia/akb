@@ -23,6 +23,7 @@ import json
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 
 from app.exceptions import ValidationError
 
@@ -144,4 +145,64 @@ current_key_class: ContextVar[str | None] = ContextVar(
 )
 current_token_scopes: ContextVar[frozenset[str] | None] = ContextVar(
     "current_token_scopes", default=None
+)
+
+
+@dataclass(frozen=True)
+class RequestJwtClaims:
+    """Validated end-user claims trusted for transaction-local RLS GUCs."""
+
+    sub: str
+    org_id: str
+    role: str
+
+    def to_db_json(self) -> dict[str, Any]:
+        return {
+            "sub": self.sub,
+            "app_metadata": {
+                "org_id": self.org_id,
+                "role": self.role,
+            },
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_db_json(), separators=(",", ":"), sort_keys=True)
+
+
+_CLAIMS_HEADER_MAX_BYTES = 8192
+
+
+def parse_request_jwt_claims_header(raw: str) -> RequestJwtClaims:
+    """Parse the AKB BaaS claim-injection header.
+
+    The trusted contract is intentionally narrow for T3/T4: callers may only
+    inject the invariant-A shape ``{sub, app_metadata:{org_id, role}}`` and
+    downstream code receives a canonicalized JSON object with those fields.
+    """
+    if len(raw.encode("utf-8")) > _CLAIMS_HEADER_MAX_BYTES:
+        raise ValueError("X-Akb-Claims is too large")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("X-Akb-Claims must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("X-Akb-Claims must be a JSON object")
+
+    sub = _required_claim_str(parsed.get("sub"), "sub")
+    app_metadata = parsed.get("app_metadata")
+    if not isinstance(app_metadata, dict):
+        raise ValueError("X-Akb-Claims.app_metadata must be a JSON object")
+    org_id = _required_claim_str(app_metadata.get("org_id"), "app_metadata.org_id")
+    role = _required_claim_str(app_metadata.get("role"), "app_metadata.role")
+    return RequestJwtClaims(sub=sub, org_id=org_id, role=role)
+
+
+def _required_claim_str(value: object, path: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"X-Akb-Claims.{path} must be a non-empty string")
+    return value
+
+
+current_request_jwt_claims: ContextVar[RequestJwtClaims | None] = ContextVar(
+    "current_request_jwt_claims", default=None
 )

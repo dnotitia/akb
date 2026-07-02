@@ -384,6 +384,108 @@ def count_statement_separators(sql: str) -> int:
     return count
 
 
+def contains_set_config_call(sql: str) -> bool:
+    """Return True when SQL calls PostgreSQL's ``set_config`` function.
+
+    ``request.jwt.claims`` is reserved for service-key claim injection. Since
+    callers can otherwise spoof that custom GUC from inside their own SQL,
+    ``akb_sql`` rejects all user-authored ``set_config(...)`` calls. The scan
+    is token-aware so string literals, comments, quoted identifiers, and
+    dollar-quoted bodies do not create false positives.
+    """
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if _token_identifier_name(m.lastgroup, m.group()) == "set_config":
+            if _next_significant_token_is_open_paren(sql, m.end()):
+                return True
+        pos = m.end()
+    return False
+
+
+def contains_unicode_escaped_identifier(sql: str) -> bool:
+    """Return True when SQL uses PostgreSQL ``U&"..."`` identifiers.
+
+    Dynamic table identifiers exposed by AKB are already sanitized ASCII names,
+    and Unicode-escaped identifiers create a second spelling for protected
+    function names such as ``set_config``. Keep this raw SQL surface simple:
+    callers may use normal quoted identifiers, but not ``U&`` escapes.
+    """
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if (
+            m.lastgroup == "ident"
+            and m.group().lower() == "u"
+            and m.end() + 1 < n
+            and sql[m.end()] == "&"
+            and sql[m.end() + 1] == '"'
+        ):
+            return True
+        pos = m.end()
+    return False
+
+
+def contains_pg_settings_identifier(sql: str) -> bool:
+    """Return True when SQL references PostgreSQL's ``pg_settings`` view."""
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if _token_identifier_name(m.lastgroup, m.group()) == "pg_settings":
+            return True
+        pos = m.end()
+    return False
+
+
+def _token_identifier_name(kind: str | None, text: str) -> str | None:
+    if kind == "ident":
+        return text.lower()
+    if kind == "qid":
+        return text[1:-1].replace('""', '"').lower()
+    return None
+
+
+def _next_significant_token_is_open_paren(sql: str, pos: int) -> bool:
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            return False
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if m.lastgroup in {"ws", "line_comment", "block_comment"}:
+            pos = m.end()
+            continue
+        return m.lastgroup == "sym" and m.group() == "("
+    return False
+
+
 # PostgreSQL keywords must not be rewritten as bare table aliases. The
 # rewriter is token-aware but not grammar-aware, so even non-reserved
 # context-sensitive keywords like BETWEEN, EXISTS, and OVER can be SQL

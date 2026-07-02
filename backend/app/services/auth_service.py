@@ -849,6 +849,7 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     # logins and tokenless/worker paths stay unscoped + token-less.
     from app.models.vault_scope import (
         current_key_class,
+        current_request_jwt_claims,
         current_token_id,
         current_token_scopes,
         current_vault_scope,
@@ -858,6 +859,7 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     current_token_id.set(None)
     current_key_class.set(None)
     current_token_scopes.set(None)
+    current_request_jwt_claims.set(None)
 
     if not authorization or not authorization.startswith("Bearer "):
         return None

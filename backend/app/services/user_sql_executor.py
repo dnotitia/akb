@@ -25,7 +25,11 @@ from typing import Any, Optional
 
 import asyncpg
 
-from app.models.vault_scope import current_token_id, current_vault_scope
+from app.models.vault_scope import (
+    current_request_jwt_claims,
+    current_token_id,
+    current_vault_scope,
+)
 from app.services.role_sync import token_role_name, user_role_name
 
 logger = logging.getLogger("akb.user_sql")
@@ -148,6 +152,12 @@ class UserSqlExecutor:
                     # pooled connection might have left a different default
                     # (it shouldn't, but be explicit).
                     await conn.execute("SET LOCAL search_path = public")
+                    request_claims = current_request_jwt_claims.get()
+                    if request_claims is not None:
+                        await conn.execute(
+                            "SELECT set_config('request.jwt.claims', $1, true)",
+                            request_claims.to_json(),
+                        )
 
                     if is_select:
                         rows = await conn.fetch(sql)
