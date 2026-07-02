@@ -212,6 +212,8 @@ async def admin_reset_user_password(
 class AdminMintTokenRequest(NFCModel):
     name: str
     expires_days: int | None = None
+    scopes: list[str] | None = None
+    key_class: str = "pat"
     # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
     # ``None`` = unscoped. The admin-mint path provisions a managed agent's
     # scoped PAT (e.g. a gardener token scoped to ``gdn-*`` ∪ an operator
@@ -260,6 +262,8 @@ async def admin_mint_user_token(
         req.name,
         expires_days=req.expires_days,
         vault_scope=VaultScope.parse_input(req.vault_scope),
+        scopes=req.scopes,
+        key_class=req.key_class,
     )
 
 

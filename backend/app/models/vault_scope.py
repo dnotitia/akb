@@ -133,3 +133,15 @@ current_vault_scope: ContextVar[VaultScope | None] = ContextVar(
 current_token_id: ContextVar[str | None] = ContextVar(
     "current_token_id", default=None
 )
+
+# Request-scoped token metadata, set by ``auth_service.resolve_token`` for
+# rows from the tokens table. JWT / OAuth / internal paths leave these as
+# None; PAT and service-key paths set both so entrypoints can enforce coarse
+# read/write scopes and AKB-038 can gate trusted claim injection on
+# ``current_key_class == "service"``.
+current_key_class: ContextVar[str | None] = ContextVar(
+    "current_key_class", default=None
+)
+current_token_scopes: ContextVar[frozenset[str] | None] = ContextVar(
+    "current_token_scopes", default=None
+)
