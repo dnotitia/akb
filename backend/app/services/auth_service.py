@@ -26,6 +26,11 @@ from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 
+TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
+ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
+TOKEN_SCOPES = frozenset({"read", "write", "admin"})
+DEFAULT_TOKEN_SCOPES = ("read", "write")
+
 
 @dataclass
 class AuthenticatedUser:
@@ -48,6 +53,12 @@ class AuthenticatedUser:
     # presented a valid token with zero scopes is rejected by the
     # dispatcher's `vault:read|write` requirement.
     oauth_scopes: list[str] | None = None
+    # Token-table class for PAT/service-key paths. None for JWT/OAuth.
+    key_class: str | None = None
+    # Coarse read/write/admin scopes carried by tokens.scopes. None means
+    # "not a tokens-table credential" (JWT/OAuth), so PAT scope enforcement
+    # is skipped. A concrete empty set is deny-all.
+    token_scopes: frozenset[str] | None = None
 
 
 # ── Password hashing ────────────────────────────────────────
@@ -106,10 +117,75 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def generate_pat() -> tuple[str, str, str]:
-    """Generate a PAT. Returns (raw_token, token_hash, token_prefix)."""
-    raw = "akb_" + secrets.token_urlsafe(32)
+def generate_pat(key_class: str = "pat") -> tuple[str, str, str]:
+    """Generate a PAT/service token. Returns (raw_token, token_hash, token_prefix)."""
+    key_class = _normalize_key_class(key_class)
+    prefix = "akb_secret_" if key_class == "service" else "akb_"
+    raw = prefix + secrets.token_urlsafe(32)
     return raw, _hash_token(raw), raw[:12]
+
+
+def _normalize_key_class(key_class: str | None) -> str:
+    value = key_class or "pat"
+    if value not in TOKEN_KEY_CLASSES:
+        raise ValidationError(
+            f"Invalid key_class {value!r}. Must be one of: {sorted(TOKEN_KEY_CLASSES)}"
+        )
+    return value
+
+
+def _normalize_issuable_key_class(key_class: str | None) -> str:
+    value = _normalize_key_class(key_class)
+    if value not in ISSUABLE_TOKEN_KEY_CLASSES:
+        raise ValidationError(
+            "key_class='publishable' is reserved for the future browser-direct "
+            "flow and cannot be issued yet."
+        )
+    return value
+
+
+def normalize_token_scopes(scopes: list[str] | None) -> list[str]:
+    """Validate caller-provided token scopes for storage.
+
+    ``None`` keeps the historical full PAT behavior: read + write. A concrete
+    list may narrow authority. ``admin`` is accepted as a future-compatible
+    super-scope and satisfies both read and write checks.
+    """
+    if scopes is None:
+        return list(DEFAULT_TOKEN_SCOPES)
+    if not isinstance(scopes, list):
+        raise ValidationError("scopes must be a list of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for scope in scopes:
+        if not isinstance(scope, str) or not scope:
+            raise ValidationError("scopes must contain non-empty strings")
+        if scope not in TOKEN_SCOPES:
+            raise ValidationError(
+                f"Invalid token scope {scope!r}. Must be one of: {sorted(TOKEN_SCOPES)}"
+            )
+        if scope not in seen:
+            normalized.append(scope)
+            seen.add(scope)
+    if not normalized:
+        raise ValidationError("scopes must include at least one scope")
+    return normalized
+
+
+def scopes_from_db(scopes: object) -> frozenset[str]:
+    """Normalize the tokens.scopes column for runtime checks."""
+    if scopes is None:
+        return frozenset(DEFAULT_TOKEN_SCOPES)
+    if not isinstance(scopes, (list, tuple, set, frozenset)):
+        raise ValueError(f"tokens.scopes must be an array, got {type(scopes).__name__}")
+    return frozenset(str(scope) for scope in scopes)
+
+
+def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
+    """Return True if this credential may perform the coarse operation."""
+    if granted is None:
+        return True
+    return "admin" in granted or required in granted
 
 
 # ── User operations ─────────────────────────────────────────
@@ -570,43 +646,48 @@ async def create_pat(
     *,
     expires_days: int | None = None,
     vault_scope: VaultScope | None = None,
+    scopes: list[str] | None = None,
+    key_class: str = "pat",
 ) -> dict:
-    """Issue a Personal Access Token.
+    """Issue a token backed by the existing tokens table.
 
-    The read/write `scopes` are still NOT a caller-tunable knob (the
-    backend doesn't enforce them); tokens always store the `[read, write]`
-    default. `vault_scope` (Option B) IS the tunable dimension: it restricts
-    the token to a vault set (prefixes ∪ extra_vaults), enforced for mutating
-    access in `check_vault_access`. It is escalation-impossible by
-    construction (effective = user-ACL ∩ scope — a scope only ever narrows).
-    `None` = unscoped (the historical full-ACL token).
+    ``key_class='pat'`` preserves the historical user-proving PAT path.
+    ``key_class='service'`` issues a BFF/server credential that AKB-038 can
+    trust for claim injection. ``publishable`` is a reserved DB value only.
+    ``scopes`` is now enforced as a coarse read/write gate; omitting it keeps
+    the historical read+write behavior.
     """
     import json
 
     pool = await get_pool()
-    raw_token, token_hash, token_prefix = generate_pat()
+    key_class = _normalize_issuable_key_class(key_class)
+    token_scopes = normalize_token_scopes(scopes)
+    raw_token, token_hash, token_prefix = generate_pat(key_class)
 
     expires_at = None
     if expires_days:
         expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
 
-    default_scopes = ["read", "write"]
     vault_scope_json = json.dumps(vault_scope.to_db_json()) if vault_scope else None
 
     async with pool.acquire() as conn:
         token_id = uuid.uuid4()
         await conn.execute(
             """
-            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, scopes, vault_scope, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO tokens (
+                id, user_id, name, token_hash, token_prefix,
+                scopes, vault_scope, key_class, expires_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
             token_id,
             uuid.UUID(user_id),
             name,
             token_hash,
             token_prefix,
-            default_scopes,
+            token_scopes,
             vault_scope_json,
+            key_class,
             expires_at,
         )
 
@@ -625,7 +706,8 @@ async def create_pat(
         "token_id": str(token_id),
         "name": name,
         "prefix": token_prefix,
-        "scopes": default_scopes,
+        "scopes": token_scopes,
+        "key_class": key_class,
         "vault_scope": vault_scope.to_db_json() if vault_scope else None,
         "expires_at": expires_at.isoformat() if expires_at else None,
         "note": "Save this token — it won't be shown again.",
@@ -637,7 +719,7 @@ async def list_pats(user_id: str) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, name, token_prefix, scopes, expires_at, last_used_at, created_at
+            SELECT id, name, token_prefix, scopes, key_class, expires_at, last_used_at, created_at
             FROM tokens WHERE user_id = $1 ORDER BY created_at DESC
             """,
             uuid.UUID(user_id),
@@ -648,6 +730,7 @@ async def list_pats(user_id: str) -> list[dict]:
                 "name": r["name"],
                 "prefix": r["token_prefix"],
                 "scopes": list(r["scopes"]) if r["scopes"] else [],
+                "key_class": r["key_class"] or "pat",
                 "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
                 "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None,
                 "created_at": r["created_at"].isoformat(),
@@ -764,10 +847,17 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     # Option B: reset the request-scoped vault scope + token id on every
     # resolve. Only a PAT (set in _resolve_pat) carries non-None values; JWT
     # logins and tokenless/worker paths stay unscoped + token-less.
-    from app.models.vault_scope import current_token_id, current_vault_scope
+    from app.models.vault_scope import (
+        current_key_class,
+        current_token_id,
+        current_token_scopes,
+        current_vault_scope,
+    )
 
     current_vault_scope.set(None)
     current_token_id.set(None)
+    current_key_class.set(None)
+    current_token_scopes.set(None)
 
     if not authorization or not authorization.startswith("Bearer "):
         return None
@@ -867,7 +957,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
              WHERE t.user_id = u.id
                AND t.token_hash = $1
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
-            RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope,
+            RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
                       t.expires_at, u.username, u.email, u.display_name, u.is_admin
             """,
             token_hash,
@@ -880,12 +970,21 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
         # (surface 1) reads the scope, and the PG-native akb_sql executor
         # (surface 2) reads both to SET LOCAL ROLE akb_token_<tid> for a scoped
         # PAT. REST and MCP alike resolve through here.
-        from app.models.vault_scope import current_token_id, current_vault_scope
+        from app.models.vault_scope import (
+            current_key_class,
+            current_token_id,
+            current_token_scopes,
+            current_vault_scope,
+        )
 
         scope = VaultScope.from_db_json(row["vault_scope"])
         token_id = str(row["token_id"])
+        key_class = row["key_class"] or "pat"
+        token_scopes = scopes_from_db(row["scopes"])
         current_vault_scope.set(scope)
         current_token_id.set(token_id)
+        current_key_class.set(key_class)
+        current_token_scopes.set(token_scopes)
 
         return AuthenticatedUser(
             user_id=str(row["user_id"]),
@@ -896,4 +995,6 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
             auth_method="pat",
             vault_scope=scope,
             token_id=token_id,
+            key_class=key_class,
+            token_scopes=token_scopes,
         )

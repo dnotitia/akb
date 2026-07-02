@@ -42,12 +42,13 @@ class LoginRequest(NFCModel):
 class CreatePATRequest(NFCModel):
     name: str
     expires_days: int | None = None
+    scopes: list[str] | None = None
+    key_class: str = "pat"
     # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
     # ``None`` = unscoped. Validated (well-formedness) + enforced (mutating
     # access ∩ scope). Self-minting any scope is safe by construction
-    # (effective = user-ACL ∩ scope — only ever narrows). The read/write
-    # ``scopes`` remain non-tunable (the backend doesn't enforce those);
-    # ``vault_scope`` is the dimension that IS enforced.
+    # (effective = user-ACL ∩ scope — only ever narrows). ``scopes`` are
+    # coarse API gates; omitting them keeps read+write.
     vault_scope: dict[str, list[str]] | None = None
 
 
@@ -339,9 +340,19 @@ async def update_my_profile(
 async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(get_current_user)):
     from app.models.vault_scope import VaultScope
 
+    if req.key_class != "pat" and not user.is_admin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only admins can issue service keys",
+        )
     scope = VaultScope.parse_input(req.vault_scope)
     return await create_pat(
-        user.user_id, req.name, expires_days=req.expires_days, vault_scope=scope
+        user.user_id,
+        req.name,
+        expires_days=req.expires_days,
+        vault_scope=scope,
+        scopes=req.scopes,
+        key_class=req.key_class,
     )
 
 

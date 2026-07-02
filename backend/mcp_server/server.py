@@ -39,7 +39,7 @@ from app.services.access_service import (
     list_accessible_vaults, get_vault_info, search_users, transfer_ownership,
     archive_vault,
 )
-from app.services.auth_service import resolve_token
+from app.services.auth_service import resolve_token, token_has_scope
 from app.util.errors import (
     err,
     exception_envelope,
@@ -92,6 +92,8 @@ class _MCPUser:
         username: str = "system",
         is_admin: bool = False,
         oauth_scopes: list[str] | None = None,
+        token_scopes: frozenset[str] | None = None,
+        key_class: str | None = None,
     ):
         self.user_id = user_id
         self.username = username
@@ -102,6 +104,8 @@ class _MCPUser:
         # everyone who has not opted into the MCP-OAuth Resource Server
         # path.
         self.oauth_scopes = oauth_scopes
+        self.token_scopes = token_scopes
+        self.key_class = key_class
 
 _FALLBACK_USER = _MCPUser()
 
@@ -126,6 +130,8 @@ async def _get_user() -> _MCPUser:
                         user.username,
                         is_admin=user.is_admin,
                         oauth_scopes=user.oauth_scopes,
+                        token_scopes=user.token_scopes,
+                        key_class=user.key_class,
                     )
                 # A credential was presented and rejected — that's a
                 # security-relevant event, so audit the denial. No token
@@ -186,9 +192,9 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_graph": _READ_SCOPE,
     "akb_provenance": _READ_SCOPE,
     "akb_publications": _READ_SCOPE,
-    "akb_publication_snapshot": _READ_SCOPE,
     "akb_export": _READ_SCOPE,
     # --- write ---
+    "akb_publication_snapshot": _WRITE_SCOPE,
     "akb_put": _WRITE_SCOPE,
     "akb_update": _WRITE_SCOPE,
     "akb_move": _WRITE_SCOPE,
@@ -1423,6 +1429,16 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 code=INSUFFICIENT_SCOPE,
                 required_scope=required,
                 granted_scopes=list(user.oauth_scopes),
+            )
+    if user.token_scopes is not None:
+        required = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+        required_token_scope = "write" if required == _WRITE_SCOPE else "read"
+        if not token_has_scope(user.token_scopes, required_token_scope):
+            return err(
+                f"Token scope is missing required scope '{required_token_scope}' for tool '{name}'",
+                code=INSUFFICIENT_SCOPE,
+                required_scope=required_token_scope,
+                granted_scopes=sorted(user.token_scopes),
             )
 
     # Reject unknown arguments before the handler sees them. Without

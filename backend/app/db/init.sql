@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     token_prefix TEXT NOT NULL,        -- first 8 chars for identification (akb_xxxx)
     scopes TEXT[] DEFAULT '{read,write}',  -- read, write, admin
     vault_scope JSONB,                     -- per-PAT vault scope {prefixes, extra_vaults}; NULL = unscoped (full user ACL). See migration 040.
+    key_class TEXT NOT NULL DEFAULT 'pat' CHECK (key_class IN ('pat', 'service', 'publishable')),
     expires_at TIMESTAMPTZ,
     last_used_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

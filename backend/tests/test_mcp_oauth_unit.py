@@ -393,6 +393,49 @@ async def test_dispatch_empty_oauth_scopes_rejects_scoped_tool():
     assert result.get("details", {}).get("required_scope") == "akb:vault:read"
 
 
+@pytest.mark.asyncio
+async def test_dispatch_read_only_pat_scope_rejects_write_tool():
+    """A PAT/service token with only the coarse `read` scope cannot call
+    write-grade MCP tools."""
+    from mcp_server.server import _dispatch, _MCPUser
+
+    user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
+    result = await _dispatch("akb_put", {"vault": "v", "title": "t", "content": "c"}, user)
+    assert result.get("code") == "insufficient_scope"
+    assert result.get("details", {}).get("required_scope") == "write"
+    assert result.get("details", {}).get("granted_scopes") == ["read"]
+
+
+def test_publication_snapshot_is_write_scoped():
+    from mcp_server.server import _TOOL_SCOPES, _WRITE_SCOPE
+
+    assert _TOOL_SCOPES["akb_publication_snapshot"] == _WRITE_SCOPE
+
+
+@pytest.mark.asyncio
+async def test_dispatch_read_only_pat_scope_allows_read_tool():
+    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
+
+    called = []
+
+    async def _stub(args, uid, user):
+        called.append((args, uid, user.token_scopes))
+        return {"ok": True}
+
+    original = _HANDLERS.get("akb_search")
+    _HANDLERS["akb_search"] = _stub
+    try:
+        user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
+        result = await _dispatch("akb_search", {"query": "x"}, user)
+        assert result == {"ok": True}
+        assert called == [({"query": "x"}, "u-1", frozenset({"read"}))]
+    finally:
+        if original is not None:
+            _HANDLERS["akb_search"] = original
+        else:
+            _HANDLERS.pop("akb_search", None)
+
+
 # ── /.well-known/oauth-protected-resource ──────────────────────────
 
 
