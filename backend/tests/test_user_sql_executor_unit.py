@@ -1,4 +1,4 @@
-"""Unit coverage for UserSqlExecutor parameter forwarding."""
+"""Unit coverage for UserSqlExecutor parameter forwarding and DML shaping."""
 
 from __future__ import annotations
 
@@ -25,6 +25,12 @@ class _Conn:
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
+        if sql.startswith("INSERT"):
+            return "INSERT 0 3"
+        if sql.startswith("UPDATE"):
+            return "UPDATE 5"
+        if sql.startswith("DELETE"):
+            return "DELETE 2"
         return "OK"
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
@@ -90,7 +96,67 @@ async def test_execute_forwards_params_to_non_select_execute() -> None:
     )
 
     assert conn.executed[-1] == ("UPDATE vt_demo__events SET actor = $1", ("alice",))
-    assert result == {"kind": "table_sql", "vaults": [], "result": "OK"}
+    assert result == {
+        "kind": "table_sql",
+        "vaults": [],
+        "result": "UPDATE 5",
+        "affected_rows": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_fetch_true_returns_dml_returning_rows() -> None:
+    from app.services.user_sql_executor import UserSqlExecutor
+
+    conn = _Conn()
+    executor = UserSqlExecutor(cast(Any, _Pool(conn)))
+
+    result = await executor.execute(
+        user_id="00000000-0000-0000-0000-000000000001",
+        sql="INSERT INTO vt_demo__events (actor) VALUES ($1) RETURNING actor",
+        params=["alice"],
+        fetch=True,
+        is_admin=True,
+    )
+
+    assert conn.fetched[-1] == (
+        "INSERT INTO vt_demo__events (actor) VALUES ($1) RETURNING actor",
+        ("alice",),
+    )
+    assert all(
+        not sql.startswith("INSERT INTO vt_demo__events")
+        for sql, _args in conn.executed
+    )
+    assert result == {
+        "kind": "table_query",
+        "vaults": [],
+        "columns": ["value"],
+        "items": [{"value": "alice"}],
+        "total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_parses_insert_and_delete_command_tags() -> None:
+    from app.services.user_sql_executor import UserSqlExecutor
+
+    conn = _Conn()
+    executor = UserSqlExecutor(cast(Any, _Pool(conn)))
+
+    insert = await executor.execute(
+        user_id="00000000-0000-0000-0000-000000000001",
+        sql="INSERT INTO vt_demo__events (actor) VALUES ($1), ($2), ($3)",
+        params=["a", "b", "c"],
+        is_admin=True,
+    )
+    delete = await executor.execute(
+        user_id="00000000-0000-0000-0000-000000000001",
+        sql="DELETE FROM vt_demo__events",
+        is_admin=True,
+    )
+
+    assert insert["affected_rows"] == 3
+    assert delete["affected_rows"] == 2
 
 
 @pytest.mark.asyncio

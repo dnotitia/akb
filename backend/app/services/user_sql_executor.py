@@ -53,6 +53,23 @@ def _coerce_row(row: asyncpg.Record) -> dict:
     return {k: _coerce_value(v) for k, v in dict(row).items()}
 
 
+def _affected_rows_from_command_tag(tag: str) -> int | None:
+    """Return the affected-row count from asyncpg command tags.
+
+    PostgreSQL emits tags such as ``INSERT 0 3``, ``UPDATE 5``, and
+    ``DELETE 2``. Other command families can reach this executor through the
+    raw SQL surface over time, so return ``None`` rather than guessing when the
+    tag is not a DML row-count shape.
+    """
+    parts = tag.split()
+    if not parts or parts[0] not in {"INSERT", "UPDATE", "DELETE"}:
+        return None
+    for token in reversed(parts[1:]):
+        if token.isdigit():
+            return int(token)
+    return None
+
+
 # ── Errors ────────────────────────────────────────────────────
 
 
@@ -116,6 +133,7 @@ class UserSqlExecutor:
         user_id: uuid.UUID | str,
         sql: str,
         params: list[Any] | None = None,
+        fetch: bool | None = None,
         is_admin: bool = False,
         vault_names: Optional[list[str]] = None,
     ) -> dict:
@@ -125,7 +143,10 @@ class UserSqlExecutor:
         `vault_names` is included in the response envelope for
         downstream consumers but does NOT gate execution — PG ACL does.
         """
-        is_select = sql.strip().upper().startswith(("SELECT", "WITH"))
+        should_fetch = (
+            sql.strip().upper().startswith(("SELECT", "WITH"))
+            if fetch is None else fetch
+        )
         bind_params = params or []
         try:
             async with self.pool.acquire() as conn:
@@ -161,7 +182,7 @@ class UserSqlExecutor:
                             request_claims.to_json(),
                         )
 
-                    if is_select:
+                    if should_fetch:
                         rows = await conn.fetch(sql, *bind_params)
                         return {
                             "kind": "table_query",
@@ -171,11 +192,15 @@ class UserSqlExecutor:
                             "total": len(rows),
                         }
                     result = await conn.execute(sql, *bind_params)
-                    return {
+                    out = {
                         "kind": "table_sql",
                         "vaults": vault_names or [],
                         "result": result,
                     }
+                    affected_rows = _affected_rows_from_command_tag(result)
+                    if affected_rows is not None:
+                        out["affected_rows"] = affected_rows
+                    return out
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
             # SQLSTATE 42501 — PG ACL denied. This is the *successful*
             # negative path: vault isolation is being enforced by PG.
