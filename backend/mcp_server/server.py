@@ -1000,6 +1000,7 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
             access["vault_id"], table_name,
             actor_id=user.username,
             add_columns=args.get("add_columns"),
+            alter_columns=args.get("alter_columns"),
             drop_columns=args.get("drop_columns"),
             rename_columns=args.get("rename_columns"),
             add_unique_keys=args.get("add_unique_keys"),

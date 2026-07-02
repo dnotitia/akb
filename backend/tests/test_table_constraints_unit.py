@@ -410,6 +410,36 @@ async def test_create_foreign_key_constraint_shape():
 
 
 @pytest.mark.asyncio
+async def test_replace_check_constraint_drops_legacy_column_checks():
+    class _CheckConn:
+        def __init__(self):
+            self.fetch_params = None
+            self.sqls = []
+
+        async def fetch(self, sql, *params):
+            self.fetch_params = (sql, params)
+            return [{"name": "legacy_inline_check"}, {"name": "vt_demo__tasks__prio__check"}]
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _CheckConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "priority",
+        "type": "text",
+        "check": {"op": "in", "values": ["low", "high"]},
+    })
+
+    await table_data_repo.replace_check_constraint(conn, "vt_demo__tasks", col)
+
+    assert conn.fetch_params[1] == ("vt_demo__tasks", "priority")
+    assert "DROP CONSTRAINT IF EXISTS legacy_inline_check" in conn.sqls[0][0]
+    assert "DROP CONSTRAINT IF EXISTS vt_demo__tasks__prio__check" in conn.sqls[1][0]
+    assert "ADD CONSTRAINT" in conn.sqls[2][0]
+    assert "CHECK (priority IN ('low', 'high'))" in conn.sqls[2][0]
+
+
+@pytest.mark.asyncio
 async def test_alter_column_default_sets_and_drops_validated_default():
     class _ManyExecConn:
         def __init__(self):

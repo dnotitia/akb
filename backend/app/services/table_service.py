@@ -1172,7 +1172,16 @@ async def alter_table(
                     old_col = next((dict(c) for c in columns if c["name"] == old_name), None)
                     old_safe = table_data_repo.safe_ident(old_name)
                     new_safe = table_data_repo.safe_ident(new_name)
+                    old_has_scalar_check = bool(
+                        old_col
+                        and old_col.get("check") is not None
+                        and old_col.get("type") != "enum"
+                    )
                     try:
+                        if old_has_scalar_check:
+                            await table_data_repo.drop_column_check_constraints(
+                                conn, pg_name, old_name,
+                            )
                         await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
                     except asyncpg.DependentObjectsStillExistError as e:
                         raise ConflictError(
@@ -1192,6 +1201,8 @@ async def alter_table(
                             table_data_repo.enum_constraint_name(pg_name, old_name),
                         )
                         await table_data_repo.create_enum_constraint(conn, pg_name, updated_col)
+                    if old_has_scalar_check and updated_col:
+                        await table_data_repo.create_check_constraint(conn, pg_name, updated_col)
                     if old_col and old_col.get("references") is not None and updated_col:
                         await table_data_repo.replace_foreign_key_constraint(
                             conn, pg_name, old_name, updated_col, vault_name=vault["name"],
@@ -1244,48 +1255,123 @@ async def alter_table(
                             f"Cannot alter missing column {spec['name']!r} on table {table_name!r}."
                         )
                     column_index, current = column_lookup[key]
-                    if current.get("type") != "enum":
+                    logical_type = table_data_repo.normalize_column_type(
+                        current.get("type", "text")
+                    )
+                    set_default = "set_default" in spec or "default" in spec
+                    drop_default = bool(spec.get("drop_default", False))
+                    if set_default and drop_default:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_default/default and "
+                            "drop_default are mutually exclusive."
+                        )
+                    set_check = "set_check" in spec or "check" in spec
+                    drop_check = bool(spec.get("drop_check", False))
+                    if set_check and drop_check:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_check/check and "
+                            "drop_check are mutually exclusive."
+                        )
+                    if logical_type == "enum" and (set_check or drop_check):
+                        raise ValidationError(
+                            f"Column {current['name']!r}: enum CHECK constraints are "
+                            "derived from enum values; use set_enum/enum."
+                        )
+                    set_not_null = bool(spec.get("set_not_null", False))
+                    drop_not_null = bool(spec.get("drop_not_null", False))
+                    if set_not_null and drop_not_null:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_not_null and "
+                            "drop_not_null are mutually exclusive."
+                        )
+                    enum_requested = "set_enum" in spec or "enum" in spec
+                    if enum_requested and logical_type != "enum":
                         raise ValidationError(
                             f"Column {current['name']!r} is not an enum column."
                         )
-                    if "enum" not in spec:
+                    if (spec.get("rename_enum_values") or spec.get("enum_renames")) and not enum_requested:
                         raise ValidationError(
-                            f"Enum column alter for {current['name']!r} requires an `enum` list."
+                            f"Enum rename for {current['name']!r} requires set_enum/enum."
+                        )
+                    if not any([
+                        set_default,
+                        drop_default,
+                        set_check,
+                        drop_check,
+                        set_not_null,
+                        drop_not_null,
+                        enum_requested,
+                    ]):
+                        raise ValidationError(
+                            f"Column {current['name']!r}: alter_columns requires at "
+                            "least one operation."
                         )
                     next_col = dict(current)
-                    next_col.pop("check", None)
-                    next_col["enum"] = spec["enum"]
-                    if "default" in spec:
-                        next_col["default"] = spec["default"]
+                    if logical_type == "enum":
+                        next_col.pop("check", None)
+                    if set_default:
+                        next_col["default"] = spec.get("set_default", spec.get("default"))
+                    if drop_default:
+                        next_col["default"] = None
+                    if set_check:
+                        next_col["check"] = spec.get("set_check", spec.get("check"))
+                    if drop_check:
+                        next_col.pop("check", None)
+                    if set_not_null:
+                        next_col["required"] = True
+                    if drop_not_null:
+                        next_col["required"] = False
+                    if enum_requested:
+                        next_col["enum"] = spec.get("set_enum", spec.get("enum"))
                     next_col = _normalize_column_spec(next_col)
                     current_enum = current.get("enum")
                     old_enum_values = current_enum if isinstance(current_enum, list) else []
                     renames = _normalize_enum_renames(
                         spec,
                         old_enum_values,
-                        next_col["enum"],
+                        next_col.get("enum", []),
                     )
                     try:
-                        await table_data_repo.drop_constraint(
-                            conn, pg_name,
-                            table_data_repo.enum_constraint_name(pg_name, current["name"]),
-                        )
-                        if renames:
-                            await table_data_repo.rename_enum_values(
-                                conn, pg_name, current["name"], renames,
+                        if enum_requested:
+                            await table_data_repo.drop_constraint(
+                                conn, pg_name,
+                                table_data_repo.enum_constraint_name(pg_name, current["name"]),
                             )
-                        if "default" in spec:
+                            if renames:
+                                await table_data_repo.rename_enum_values(
+                                    conn, pg_name, current["name"], renames,
+                                )
+                        if set_default or drop_default:
                             await table_data_repo.alter_column_default(conn, pg_name, next_col)
-                        await table_data_repo.create_enum_constraint(conn, pg_name, next_col)
+                        if set_check or drop_check:
+                            await table_data_repo.replace_check_constraint(
+                                conn, pg_name, next_col,
+                            )
+                        if set_not_null or drop_not_null:
+                            await table_data_repo.alter_column_required(
+                                conn, pg_name, current["name"], bool(next_col.get("required")),
+                            )
+                        if enum_requested:
+                            await table_data_repo.create_enum_constraint(conn, pg_name, next_col)
                     except asyncpg.CheckViolationError as e:
+                        if enum_requested:
+                            raise ValidationError(
+                                f"Cannot alter enum column {current['name']!r}: existing rows "
+                                f"contain values outside the new enum list {next_col['enum']!r}."
+                            ) from e
                         raise ValidationError(
-                            f"Cannot alter enum column {current['name']!r}: existing rows "
-                            f"contain values outside the new enum list {next_col['enum']!r}."
+                            f"Cannot alter check constraint for column {current['name']!r}: "
+                            "existing rows violate the new check."
+                        ) from e
+                    except asyncpg.NotNullViolationError as e:
+                        raise ValidationError(
+                            f"Cannot set column {current['name']!r} NOT NULL: existing rows "
+                            "contain NULL values."
                         ) from e
                     except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
                         raise ValidationError(
-                            f"Enum constraint for column {current['name']!r} already exists "
-                            f"in the database: {e}."
+                            f"Constraint for column {current['name']!r} already exists in "
+                            f"the database: {e}."
                         ) from e
                     columns[column_index] = next_col
                     column_lookup[key] = (column_index, next_col)

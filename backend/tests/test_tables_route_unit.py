@@ -74,6 +74,7 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
         "incidents",
         tables.AlterTableRequest(
             add_columns=[{"name": "title", "type": "text"}],
+            alter_columns=[{"name": "title", "set_default": "untitled"}],
             drop_columns=["legacy"],
             rename_columns={"summary": "body"},
             add_unique_keys=[{"columns": ["title"]}],
@@ -91,7 +92,7 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
         "table_name": "incidents",
         "actor_id": "김영로",
         "add_columns": [{"name": "title", "type": "text"}],
-        "alter_columns": None,
+        "alter_columns": [{"name": "title", "set_default": "untitled"}],
         "drop_columns": ["legacy"],
         "rename_columns": {"summary": "body"},
         "add_unique_keys": [{"columns": ["title"]}],

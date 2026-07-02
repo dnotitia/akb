@@ -326,6 +326,57 @@ RICH_ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
 assert_value "rich.alter" "$RICH_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'score')['type']" "numeric"
 assert_value "rich.alter" "$RICH_ALTER" "v=len(d['indexes'])" "2"
 
+RICH_PRIORITY_ADD=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"add_columns":[{"name":"priority","type":"text","default":"low"}]}')
+assert_value "rich.priority-add" "$RICH_PRIORITY_ADD" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['default']" "low"
+
+RICH_PRIORITY_ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"priority","set_default":"high","set_check":{"op":"in","values":["low","high"]},"set_not_null":true}]}')
+assert_value "rich.priority-alter" "$RICH_PRIORITY_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['default']" "high"
+assert_value "rich.priority-alter" "$RICH_PRIORITY_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['check']['op']" "in"
+assert_value "rich.priority-alter" "$RICH_PRIORITY_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['required']" "True"
+
+RICH_PRIORITY_DEFAULT_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email) VALUES ('priority-default@test.dev')\"}")
+assert_keys "rich.priority-default-insert" "$RICH_PRIORITY_DEFAULT_INSERT" kind result vaults
+RICH_PRIORITY_DEFAULT_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT priority FROM $RICH WHERE email = 'priority-default@test.dev'\"}")
+assert_value "rich.priority-default-row" "$RICH_PRIORITY_DEFAULT_SELECT" "v=d['items'][0]['priority']" "high"
+
+RICH_PRIORITY_BAD_CHECK=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, priority) VALUES ('priority-bad@test.dev', 'blocked')\"}")
+[ "$RICH_PRIORITY_BAD_CHECK" = "400" ] && pass "rich.priority-check: HTTP 400" || fail "rich.priority-check" "expected 400, got $RICH_PRIORITY_BAD_CHECK"
+
+RICH_PRIORITY_BAD_NULL=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, priority) VALUES ('priority-null@test.dev', NULL)\"}")
+[ "$RICH_PRIORITY_BAD_NULL" = "400" ] && pass "rich.priority-not-null: HTTP 400" || fail "rich.priority-not-null" "expected 400, got $RICH_PRIORITY_BAD_NULL"
+
+RICH_PRIORITY_DROP_OPS=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"priority","drop_default":true,"drop_check":true,"drop_not_null":true}]}')
+assert_value "rich.priority-drop-ops" "$RICH_PRIORITY_DROP_OPS" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['default']" "None"
+assert_value "rich.priority-drop-ops" "$RICH_PRIORITY_DROP_OPS" "v=next(c for c in d['columns'] if c.get('name') == 'priority').get('check') is None" "True"
+assert_value "rich.priority-drop-ops" "$RICH_PRIORITY_DROP_OPS" "v=next(c for c in d['columns'] if c.get('name') == 'priority')['required']" "False"
+
+RICH_PRIORITY_FREE_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, priority) VALUES ('priority-free@test.dev', 'blocked')\"}")
+assert_keys "rich.priority-free-insert" "$RICH_PRIORITY_FREE_INSERT" kind result vaults
+
 echo ""
 echo "▸ 6. Foreign keys — same-vault references + on_delete"
 

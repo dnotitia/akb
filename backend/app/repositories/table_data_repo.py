@@ -205,7 +205,7 @@ def column_type_sql(logical_type: Any) -> str:
     return TYPE_MAP[normalize_column_type(logical_type)]
 
 
-def column_definition(col: dict) -> str:
+def column_definition(col: dict, *, include_check: bool = True) -> str:
     """Build one validated user-column definition for CREATE/ALTER TABLE."""
     col_name = safe_ident(col["name"])
     logical_type = normalize_column_type(col.get("type", "text"))
@@ -214,7 +214,7 @@ def column_definition(col: dict) -> str:
         parts.append("NOT NULL")
     if default_sql := _column_default_sql(col):
         parts.append(f"DEFAULT {default_sql}")
-    if logical_type != "enum" and (check_sql := _column_check_sql(col)):
+    if include_check and logical_type != "enum" and (check_sql := _column_check_sql(col)):
         parts.append(f"CHECK ({check_sql})")
     return " ".join(parts)
 
@@ -400,6 +400,20 @@ def enum_constraint_name(pg_name: str, col_name: str) -> str:
     return generate_constraint_name(pg_name, [col_name], kind="enum")
 
 
+def check_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="check")
+
+
+def check_constraint_definition(pg_name: str, col: dict) -> str:
+    if normalize_column_type(col.get("type", "text")) == "enum":
+        raise ValidationError("Enum columns derive their CHECK constraint from `enum`.")
+    check_sql = _column_check_sql(col)
+    if not check_sql:
+        raise ValidationError(f"Column {col.get('name')!r} has no check spec.")
+    name = safe_ident(check_constraint_name(pg_name, col["name"]))
+    return f"CONSTRAINT {name} CHECK ({check_sql})"
+
+
 def enum_check_sql(col: dict) -> str:
     if normalize_column_type(col.get("type", "text")) != "enum":
         raise ValidationError(f"Column {col.get('name')!r} is not an enum column.")
@@ -454,7 +468,10 @@ async def create_dynamic_table(
     responsible for sanitising `pg_name` (use `pg_table_name`)."""
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
     for col in columns:
-        col_defs.append(column_definition(col))
+        col_defs.append(column_definition(col, include_check=False))
+    for col in columns:
+        if col.get("check") is not None and normalize_column_type(col.get("type", "text")) != "enum":
+            col_defs.append(check_constraint_definition(pg_name, col))
     for col in columns:
         if normalize_column_type(col.get("type", "text")) == "enum":
             col_defs.append(enum_constraint_definition(pg_name, col))
@@ -497,7 +514,12 @@ async def add_column(
     conn, pg_name: str, col: dict, *, vault_name: str | None = None,
 ) -> None:
     """Add a column to the dynamic table. Column DDL is validated here."""
-    await conn.execute(f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {column_definition(col)}")
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS "
+        f"{column_definition(col, include_check=False)}"
+    )
+    if col.get("check") is not None and normalize_column_type(col.get("type", "text")) != "enum":
+        await create_check_constraint(conn, pg_name, col)
     if normalize_column_type(col.get("type", "text")) == "enum":
         await create_enum_constraint(conn, pg_name, col)
     if col.get("references") is not None:
@@ -589,6 +611,45 @@ async def create_enum_constraint(conn, pg_name: str, col: dict) -> None:
     )
 
 
+async def create_check_constraint(conn, pg_name: str, col: dict) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD {check_constraint_definition(pg_name, col)}"
+    )
+
+
+async def drop_column_check_constraints(conn, pg_name: str, col_name: str) -> None:
+    """Drop all CHECK constraints on a column.
+
+    AKB now creates deterministic named checks, but older scalar checks were
+    emitted inline and PostgreSQL assigned auto names. Discovering by conkey
+    lets set_check/drop_check migrate those legacy constraints cleanly.
+    """
+    safe_col = safe_ident(col_name)
+    rows = await conn.fetch(
+        """
+        SELECT con.conname AS name
+          FROM pg_constraint con
+          JOIN pg_class cls ON cls.oid = con.conrelid
+          JOIN pg_attribute att
+            ON att.attrelid = con.conrelid
+           AND att.attnum = ANY(con.conkey)
+         WHERE cls.relname = $1
+           AND con.contype = 'c'
+           AND att.attname = $2
+        """,
+        pg_name,
+        safe_col,
+    )
+    for row in rows:
+        await drop_constraint(conn, pg_name, row["name"])
+
+
+async def replace_check_constraint(conn, pg_name: str, col: dict) -> None:
+    await drop_column_check_constraints(conn, pg_name, col["name"])
+    if col.get("check") is not None:
+        await create_check_constraint(conn, pg_name, col)
+
+
 async def replace_enum_constraint(conn, pg_name: str, col: dict) -> None:
     await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, col["name"]))
     await create_enum_constraint(conn, pg_name, col)
@@ -624,6 +685,12 @@ async def alter_column_default(conn, pg_name: str, col: dict) -> None:
         await conn.execute(
             f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} SET DEFAULT {default_sql}"
         )
+
+
+async def alter_column_required(conn, pg_name: str, col_name: str, required: bool) -> None:
+    safe_col = safe_ident(col_name)
+    op = "SET NOT NULL" if required else "DROP NOT NULL"
+    await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} {op}")
 
 
 async def rename_enum_values(
