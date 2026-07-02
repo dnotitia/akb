@@ -28,7 +28,7 @@ from app.services.user_sql_executor import (
 from app.util.errors import (
     BULK_TOO_LARGE,
     INVALID_ARGUMENT,
-    METHOD_NOT_ALLOWED,
+    NO_UNIQUE_CONSTRAINT,
     PERMISSION_DENIED,
     SQL_ERROR,
     UNFILTERED_MUTATION,
@@ -68,6 +68,12 @@ class _CompiledMutation:
     projections: list[Any]
 
 
+@dataclass
+class _TableInfo:
+    columns: list[dict]
+    unique_keys: list[dict]
+
+
 async def insert_rows(
     *,
     vault_name: str,
@@ -83,11 +89,11 @@ async def insert_rows(
     loaded = await _load_table(vault_id, table_name)
     if isinstance(loaded, dict):
         return loaded
-    columns = loaded
     compiled = compile_insert_rows(
         vault_name=vault_name,
         table_name=table_name,
-        columns=columns,
+        columns=loaded.columns,
+        unique_keys=loaded.unique_keys,
         body=body,
         actor_id=actor_id,
         query_params=query_params,
@@ -118,11 +124,10 @@ async def update_rows(
     loaded = await _load_table(vault_id, table_name)
     if isinstance(loaded, dict):
         return loaded
-    columns = loaded
     compiled = compile_update_rows(
         vault_name=vault_name,
         table_name=table_name,
-        columns=columns,
+        columns=loaded.columns,
         body=body,
         query_params=query_params,
         prefer_header=prefer_header,
@@ -151,11 +156,10 @@ async def delete_rows(
     loaded = await _load_table(vault_id, table_name)
     if isinstance(loaded, dict):
         return loaded
-    columns = loaded
     compiled = compile_delete_rows(
         vault_name=vault_name,
         table_name=table_name,
-        columns=columns,
+        columns=loaded.columns,
         query_params=query_params,
         prefer_header=prefer_header,
     )
@@ -175,16 +179,12 @@ def compile_insert_rows(
     vault_name: str,
     table_name: str,
     columns: list[dict],
+    unique_keys: list[dict] | None = None,
     body: Any,
     actor_id: str,
     query_params: Sequence[tuple[str, str]] = (),
     prefer_header: str | None = None,
 ) -> _CompiledMutation | dict[str, Any]:
-    if _last_value(query_params, "on_conflict") is not None:
-        return err(
-            "on_conflict upsert is not available on this route yet.",
-            code=METHOD_NOT_ALLOWED,
-        )
     rows_or_error = _normalize_insert_rows(body)
     if isinstance(rows_or_error, dict):
         return rows_or_error
@@ -203,6 +203,14 @@ def compile_insert_rows(
     if isinstance(insert_columns_or_error, dict):
         return insert_columns_or_error
     insert_columns = insert_columns_or_error
+    on_conflict_or_error = _compile_on_conflict(
+        _last_value(query_params, "on_conflict"),
+        column_meta,
+        unique_keys or [],
+    )
+    if isinstance(on_conflict_or_error, dict):
+        return on_conflict_or_error
+    conflict_columns = on_conflict_or_error
 
     values_sql: list[str] = []
     for row in rows:
@@ -216,6 +224,14 @@ def compile_insert_rows(
                 cells.append("DEFAULT")
         values_sql.append(f"({', '.join(cells)})")
 
+    conflict_sql = ""
+    if conflict_columns:
+        conflict_sql = _compile_upsert_clause(
+            conflict_columns=conflict_columns,
+            insert_columns=insert_columns,
+            prefer_header=prefer_header,
+        )
+
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -228,7 +244,7 @@ def compile_insert_rows(
     sql = (
         f"INSERT INTO {table_data_repo.pg_table_name(vault_name, table_name)} "
         f"({', '.join(table_data_repo.safe_ident(c) for c in insert_columns)}) "
-        f"VALUES {', '.join(values_sql)}{returning_sql}"
+        f"VALUES {', '.join(values_sql)}{conflict_sql}{returning_sql}"
     )
     return _CompiledMutation(
         sql=sql,
@@ -329,13 +345,16 @@ def compile_delete_rows(
     )
 
 
-async def _load_table(vault_id: uuid.UUID, table_name: str) -> list[dict] | dict[str, Any]:
+async def _load_table(vault_id: uuid.UUID, table_name: str) -> _TableInfo | dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
         if not table:
             raise NotFoundError("Table", table_name)
-        return table_registry_repo.parse_columns(table["columns"])
+        return _TableInfo(
+            columns=table_registry_repo.parse_columns(table["columns"]),
+            unique_keys=table_registry_repo.parse_json_list(table.get("unique_keys")),
+        )
 
 
 async def _execute_mutation(
@@ -453,8 +472,72 @@ def _compile_returning(
     return f" RETURNING {', '.join(p.sql for p in projections_or_error)}", projections_or_error
 
 
+def _compile_on_conflict(
+    raw: str | None,
+    column_meta: dict[str, str],
+    unique_keys: list[dict],
+) -> list[str] | dict[str, Any]:
+    if raw is None or not raw.strip():
+        return []
+    columns = [part.strip() for part in raw.split(",") if part.strip()]
+    if not columns:
+        return err("on_conflict must name at least one column.", code=INVALID_ARGUMENT)
+    seen: set[str] = set()
+    for col in columns:
+        if col not in column_meta:
+            return _unknown_column(col, column_meta)
+        key = col.lower()
+        if key in seen:
+            return err("on_conflict columns must be distinct.", code=INVALID_ARGUMENT)
+        seen.add(key)
+    if _is_unique_conflict_target(columns, unique_keys):
+        return columns
+    return err(
+        "on_conflict must target an existing UNIQUE or PRIMARY KEY constraint.",
+        code=NO_UNIQUE_CONSTRAINT,
+        target=columns,
+    )
+
+
+def _is_unique_conflict_target(columns: list[str], unique_keys: list[dict]) -> bool:
+    lowered = {col.lower() for col in columns}
+    if lowered == {"id"}:
+        return True
+    for unique_key in unique_keys:
+        raw_cols = unique_key.get("columns") if isinstance(unique_key, dict) else None
+        if not isinstance(raw_cols, list) or len(raw_cols) != len(columns):
+            continue
+        if {str(col).lower() for col in raw_cols} == lowered:
+            return True
+    return False
+
+
+def _compile_upsert_clause(
+    *,
+    conflict_columns: list[str],
+    insert_columns: list[str],
+    prefer_header: str | None,
+) -> str:
+    target = ", ".join(table_data_repo.safe_ident(col) for col in conflict_columns)
+    if _prefer_ignore_duplicates(prefer_header):
+        return f" ON CONFLICT ({target}) DO NOTHING"
+    conflict_lookup = {col.lower() for col in conflict_columns}
+    set_parts = [
+        f"{table_data_repo.safe_ident(col)} = EXCLUDED.{table_data_repo.safe_ident(col)}"
+        for col in insert_columns
+        if col.lower() not in conflict_lookup
+        and col not in {"created_by", *UPDATE_IMMUTABLE}
+    ]
+    set_parts.append("updated_at = NOW()")
+    return f" ON CONFLICT ({target}) DO UPDATE SET {', '.join(set_parts)}"
+
+
 def _prefer_return_representation(prefer_header: str | None) -> bool:
     return bool(prefer_header and "return=representation" in prefer_header.lower())
+
+
+def _prefer_ignore_duplicates(prefer_header: str | None) -> bool:
+    return bool(prefer_header and "resolution=ignore-duplicates" in prefer_header.lower())
 
 
 def _all_rows_enabled(query_params: Sequence[tuple[str, str]]) -> bool:
