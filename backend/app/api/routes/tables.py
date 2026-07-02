@@ -165,6 +165,12 @@ async def select_rows(
     "/tables/{vault}/{table}/rows",
     summary="Insert rows into a vault table",
     operation_id="tablesInsertRows",
+    status_code=201,
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows inserted without a response body."},
+    },
 )
 async def insert_rows(
     vault: str,
@@ -195,6 +201,11 @@ async def insert_rows(
     "/tables/{vault}/{table}/rows",
     summary="Update rows in a vault table",
     operation_id="tablesUpdateRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows updated without a response body."},
+    },
 )
 async def update_rows(
     vault: str,
@@ -224,6 +235,11 @@ async def update_rows(
     "/tables/{vault}/{table}/rows",
     summary="Delete rows from a vault table",
     operation_id="tablesDeleteRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows deleted without a response body."},
+    },
 )
 async def delete_rows(
     vault: str,
@@ -253,6 +269,10 @@ async def delete_rows(
     operation_id="tablesQueryRows",
     response_model=TableQueryResponse,
     response_model_exclude_none=True,
+    responses={
+        201: {"model": TableQueryResponse, "description": "Rows inserted by a write AST."},
+        204: {"description": "Rows mutated by a write AST without a response body."},
+    },
 )
 async def query_rows(
     vault: str,

@@ -63,6 +63,8 @@ def test_compile_insert_allows_client_id_and_created_at() -> None:
     )
 
     assert not isinstance(compiled, dict)
+    assert compiled.fetch is False
+    assert compiled.status_code == 204
     assert compiled.sql == (
         "INSERT INTO vt_eng__incidents (id, created_at, title, created_by) "
         "VALUES ($1, $2, $3, $4)"

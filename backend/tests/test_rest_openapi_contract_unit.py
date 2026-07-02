@@ -114,21 +114,24 @@ def test_success_envelope_components_are_kind_discriminated():
 def test_kind_envelope_routes_reference_typed_success_schemas():
     schema = app.openapi()
     expected = {
-        ("/api/v1/tables/{vault}", "post"): "AkbTableEnvelope",
-        ("/api/v1/tables/{vault}", "get"): "AkbTableEnvelope",
-        ("/api/v1/tables/{vault}/sql", "post"): "AkbSqlEnvelope",
-        ("/api/v1/tables/{vault}/{table}/rows", "get"): "AkbTableQueryEnvelope",
-        ("/api/v1/tables/{vault}/{table}/query", "post"): "AkbTableQueryEnvelope",
-        ("/api/v1/tables/{vault}/{table_name}", "delete"): "AkbTableEnvelope",
-        ("/api/v1/files/{vault}/upload", "post"): "AkbFileEnvelope",
-        ("/api/v1/files/{vault}/{file_id}/confirm", "post"): "AkbFileEnvelope",
-        ("/api/v1/files/{vault}/{file_id}/download", "get"): "AkbFileEnvelope",
-        ("/api/v1/files/{vault}", "get"): "AkbFileEnvelope",
-        ("/api/v1/files/{vault}/{file_id}", "delete"): "AkbFileEnvelope",
+        ("/api/v1/tables/{vault}", "post", "200"): "AkbTableEnvelope",
+        ("/api/v1/tables/{vault}", "get", "200"): "AkbTableEnvelope",
+        ("/api/v1/tables/{vault}/sql", "post", "200"): "AkbSqlEnvelope",
+        ("/api/v1/tables/{vault}/{table}/rows", "get", "200"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table}/rows", "post", "201"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table}/rows", "patch", "200"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table}/rows", "delete", "200"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table}/query", "post", "200"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table_name}", "delete", "200"): "AkbTableEnvelope",
+        ("/api/v1/files/{vault}/upload", "post", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/confirm", "post", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/download", "get", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}", "get", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}", "delete", "200"): "AkbFileEnvelope",
     }
-    for (path, method), component in expected.items():
+    for (path, method, status), component in expected.items():
         success_schema = (
-            schema["paths"][path][method]["responses"]["200"]
+            schema["paths"][path][method]["responses"][status]
             ["content"]["application/json"]["schema"]
         )
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
@@ -161,6 +164,40 @@ def test_row_read_openapi_contract_is_codegen_typed():
     table_query = schema["components"]["schemas"]["AkbTableQueryEnvelope"]
     assert {"kind", "columns", "items", "total"}.issubset(table_query["required"])
     assert {"vault", "table", "vaults"}.issubset(table_query["properties"])
+
+
+def test_row_write_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    rows_path = paths["/api/v1/tables/{vault}/{table}/rows"]
+    query = paths["/api/v1/tables/{vault}/{table}/query"]["post"]
+
+    expected = {
+        "post": ("tablesInsertRows", "201"),
+        "patch": ("tablesUpdateRows", "200"),
+        "delete": ("tablesDeleteRows", "200"),
+    }
+    for method, (operation_id, success_status) in expected.items():
+        operation = rows_path[method]
+        assert operation["operationId"] == operation_id
+        assert operation["tags"] == ["tables"]
+        assert (
+            operation["responses"][success_status]["content"]["application/json"]["schema"]
+            == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
+        )
+        assert "content" not in operation["responses"]["204"]
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": "#/components/schemas/AkbError"}
+            )
+
+    assert query["operationId"] == "tablesQueryRows"
+    assert (
+        query["responses"]["201"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
+    )
+    assert "content" not in query["responses"]["204"]
 
 
 def test_http_exception_runtime_shape_matches_akb_error_schema():
