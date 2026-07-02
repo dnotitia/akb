@@ -2,20 +2,23 @@
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services import table_row_query, table_service
+from app.services import table_row_query, table_row_write, table_service
 from app.util.errors import (
+    BULK_TOO_LARGE,
     CONFLICT,
     INVALID_ARGUMENT,
     METHOD_NOT_ALLOWED,
     MULTI_STATEMENT,
+    NO_UNIQUE_CONSTRAINT,
     PERMISSION_DENIED,
     SQL_ERROR,
+    UNFILTERED_MUTATION,
     UNDEFINED_COLUMN,
     UNDEFINED_TABLE,
     UNIQUE_VIOLATION,
@@ -30,6 +33,9 @@ _SERVICE_ERROR_STATUS = {
     METHOD_NOT_ALLOWED: 400,
     MULTI_STATEMENT: 400,
     SQL_ERROR: 400,
+    BULK_TOO_LARGE: 400,
+    NO_UNIQUE_CONSTRAINT: 400,
+    UNFILTERED_MUTATION: 400,
     UNDEFINED_COLUMN: 400,
     UNDEFINED_TABLE: 400,
     PERMISSION_DENIED: 403,
@@ -156,6 +162,92 @@ async def select_rows(
 
 
 @router.post(
+    "/tables/{vault}/{table}/rows",
+    summary="Insert rows into a vault table",
+    operation_id="tablesInsertRows",
+)
+async def insert_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    body: Any = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.insert_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        actor_id=user.username,
+        body=body,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.patch(
+    "/tables/{vault}/{table}/rows",
+    summary="Update rows in a vault table",
+    operation_id="tablesUpdateRows",
+)
+async def update_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    body: Any = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.update_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        body=body,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.delete(
+    "/tables/{vault}/{table}/rows",
+    summary="Delete rows from a vault table",
+    operation_id="tablesDeleteRows",
+)
+async def delete_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.delete_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.post(
     "/tables/{vault}/{table}/query",
     summary="Select rows from a vault table using JSON AST",
     operation_id="tablesQueryRows",
@@ -186,6 +278,21 @@ async def query_rows(
             response.headers["Content-Range"] = result.content_range
         return result.body
     return _raise_service_error(result)
+
+
+def _apply_row_mutation_response(
+    result: table_row_write.RowMutationResponse,
+    response: Response,
+) -> Any:
+    headers = {}
+    if result.content_range is not None:
+        headers["Content-Range"] = result.content_range
+    if result.body is None:
+        return Response(status_code=result.status_code, headers=headers)
+    response.status_code = result.status_code
+    for key, value in headers.items():
+        response.headers[key] = value
+    return result.body
 
 
 def _raise_service_error(result: Any) -> Any:
