@@ -23,7 +23,7 @@ class _DocumentRepo:
 
 
 class _MissingGit:
-    def read_file(self, _vault, _path):
+    def read_file(self, _vault, _path, _commit=None):
         return None
 
 
@@ -34,6 +34,9 @@ async def test_get_returns_not_found_when_document_row_outlives_git_blob(monkeyp
         "id": uuid.uuid4(),
         "vault_name": "race-vault",
         "path": "atomic-delete/delete-race.md",
+        # get() pins the body read to the row's recorded commit (E03);
+        # None exercises the legacy fallback-to-HEAD path in read_file.
+        "current_commit": None,
     }
     service = DocumentService(git=_MissingGit())
 
