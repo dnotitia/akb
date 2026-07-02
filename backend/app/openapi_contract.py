@@ -74,6 +74,8 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("post", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("get", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("post", "/api/v1/tables/{vault}/sql"): "#/components/schemas/AkbSqlEnvelope",
+    ("get", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
+    ("post", "/api/v1/tables/{vault}/{table}/query"): "#/components/schemas/AkbTableQueryEnvelope",
     ("delete", "/api/v1/tables/{vault}/{table_name}"): "#/components/schemas/AkbTableEnvelope",
     ("post", "/api/v1/files/{vault}/upload"): "#/components/schemas/AkbFileEnvelope",
     ("post", "/api/v1/files/{vault}/{file_id}/confirm"): "#/components/schemas/AkbFileEnvelope",
@@ -119,7 +121,8 @@ def _prepare_api_routes(app: FastAPI) -> None:
             continue
         if not route.tags:
             route.tags = [_namespace_for_path(route.path_format)]
-        route.operation_id = _operation_id(route)
+        if not route.operation_id:
+            route.operation_id = _operation_id(route)
 
 
 def _install_components(schema: dict[str, Any]) -> None:
@@ -258,13 +261,15 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         "AkbTableQueryEnvelope": _kind_schema(
             "table_query",
             {
+                "vault": {"type": "string"},
+                "table": {"type": "string"},
                 "vaults": {"type": "array", "items": {"type": "string"}},
                 "columns": {"type": "array", "items": {"type": "string"}},
                 "items": JSON_OBJECT_ARRAY_SCHEMA,
                 "total": {"type": "integer"},
             },
-            "SQL SELECT/WITH success envelope.",
-            required=("kind", "vaults", "columns", "items", "total"),
+            "Structured table query or SQL SELECT/WITH success envelope.",
+            required=("kind", "columns", "items", "total"),
         ),
         "AkbTableSqlEnvelope": _kind_schema(
             "table_sql",
