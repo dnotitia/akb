@@ -88,3 +88,54 @@ async def test_select_rows_route_sets_content_range(monkeypatch) -> None:
     assert captured["query_params"] == [("severity", "eq.high")]
     assert captured["range_header"] == "0-1"
     assert captured["prefer_header"] == "count=exact"
+
+
+@pytest.mark.asyncio
+async def test_query_rows_route_forwards_ast_and_headers(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: dict[str, Any] = {}
+
+    class _Request:
+        headers = Headers({"prefer": "count=exact", "range": "2-3"})
+
+    class _Response:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+    async def fake_check_vault_access(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        return {"vault_id": "vault-1"}
+
+    async def fake_query_rows(**kwargs: Any) -> tables.table_row_query.RowQueryResponse:
+        captured.update(kwargs)
+        return tables.table_row_query.RowQueryResponse(
+            body={"kind": "table_query", "items": [], "total": 0},
+            content_range="2-3/7",
+        )
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_row_query, "query_rows", fake_query_rows)
+
+    response = _Response()
+    result = await tables.query_rows(
+        "demo",
+        "incidents",
+        tables.QueryRowsRequest(
+            select=["title"],
+            filter={"col": "severity", "op": "eq", "val": "high"},
+        ),
+        _Request(),  # type: ignore[arg-type]
+        response,  # type: ignore[arg-type]
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result["kind"] == "table_query"
+    assert response.headers["Content-Range"] == "2-3/7"
+    assert captured["vault_name"] == "demo"
+    assert captured["table_name"] == "incidents"
+    assert captured["ast"] == {
+        "select": ["title"],
+        "filter": {"col": "severity", "op": "eq", "val": "high"},
+    }
+    assert captured["range_header"] == "2-3"
+    assert captured["prefer_header"] == "count=exact"

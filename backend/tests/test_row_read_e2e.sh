@@ -2,8 +2,8 @@
 #
 # AKB row-read REST E2E tests.
 #
-# Verifies GET /api/v1/tables/{vault}/{table}/rows compiles URL operators
-# into parameterized SQL while preserving the existing table ACL path.
+# Verifies GET /api/v1/tables/{vault}/{table}/rows and POST .../query compile
+# read filters into parameterized SQL while preserving the existing table ACL path.
 #
 set -uo pipefail
 
@@ -132,6 +132,26 @@ assert [r["title"] for r in d["items"]] == ["API outage","DB pressure"]
 ' >/dev/null 2>&1 &&
   pass "json containment object filter" || fail "json containment object filter" "$BODY"
 
+QUERY_PAYLOAD='{"select":["title","severity","metadata->>tier"],"and":[{"col":"severity","op":"in","val":["high","critical"]},{"jsonb":{"col":"metadata","path":["tier"],"cast":null},"op":"eq","val":"gold"}],"order":[{"col":"created_at","dir":"asc"}],"limit":2,"count":"exact"}'
+HDR=$(mktemp)
+BODY=$(curl -sk -D "$HDR" -X POST "$BASE_URL/api/v1/tables/$VAULT/incidents/query" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "$QUERY_PAYLOAD")
+grep -qi '^Content-Range: 0-1/2' "$HDR" &&
+  pass "query AST Content-Range exact count" || fail "query AST Content-Range" "$(cat "$HDR")"
+echo "$BODY" | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+assert d["kind"] == "table_query"
+assert d["columns"] == ["title","severity","metadata->>tier"]
+assert d["total"] == 2
+assert [r["title"] for r in d["items"]] == ["API outage","DB pressure"]
+assert [r["metadata->>tier"] for r in d["items"]] == ["gold","gold"]
+' >/dev/null 2>&1 &&
+  pass "query AST select/filter/order/count body" || fail "query AST body" "$BODY"
+rm -f "$HDR"
+
 TMP=$(mktemp)
 STATUS=$(curl -sk -o "$TMP" -w "%{http_code}" -G "$BASE_URL/api/v1/tables/$VAULT/incidents/rows" \
   -H "Authorization: Bearer $PAT" \
@@ -139,6 +159,16 @@ STATUS=$(curl -sk -o "$TMP" -w "%{http_code}" -G "$BASE_URL/api/v1/tables/$VAULT
 [ "$STATUS" = "400" ] &&
   python3 -c 'import sys,json; assert json.load(open(sys.argv[1]))["code"] == "undefined_column"' "$TMP" >/dev/null 2>&1 &&
   pass "unknown column rejected" || fail "unknown column rejected" "status=$STATUS body=$(cat "$TMP")"
+rm -f "$TMP"
+
+TMP=$(mktemp)
+STATUS=$(curl -sk -o "$TMP" -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/incidents/query" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"filter":{"col":"sevverity","op":"eq","val":"high"}}')
+[ "$STATUS" = "400" ] &&
+  python3 -c 'import sys,json; assert json.load(open(sys.argv[1]))["code"] == "undefined_column"' "$TMP" >/dev/null 2>&1 &&
+  pass "query AST unknown column rejected" || fail "query AST unknown column rejected" "status=$STATUS body=$(cat "$TMP")"
 rm -f "$TMP"
 
 echo ""

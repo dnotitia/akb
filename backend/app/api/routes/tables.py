@@ -3,6 +3,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
@@ -55,6 +56,19 @@ class SqlRequest(NFCModel):
     sql: str
     params: list[Any] | None = None
     vaults: list[str] | None = None
+
+
+class QueryRowsRequest(NFCModel):
+    model_config = ConfigDict(extra="allow")
+
+    select: Any | None = None
+    filter: Any | None = None
+    where: Any | None = None
+    order: Any | None = None
+    limit: int | None = None
+    offset: int | None = None
+    page: dict[str, Any] | None = None
+    count: bool | str | None = None
 
 
 @router.post("/tables/{vault}", summary="Create a table in a vault")
@@ -115,6 +129,33 @@ async def select_rows(
         user_id=user.user_id,
         is_admin=user.is_admin,
         query_params=list(request.query_params.multi_items()),
+        range_header=request.headers.get("range"),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_query.RowQueryResponse):
+        if result.content_range is not None:
+            response.headers["Content-Range"] = result.content_range
+        return result.body
+    return _raise_service_error(result)
+
+
+@router.post("/tables/{vault}/{table}/query", summary="Select rows from a vault table using JSON AST")
+async def query_rows(
+    vault: str,
+    table: str,
+    req: QueryRowsRequest,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    result = await table_row_query.query_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        is_admin=user.is_admin,
+        ast=req.model_dump(exclude_none=True),
         range_header=request.headers.get("range"),
         prefer_header=request.headers.get("prefer"),
     )
