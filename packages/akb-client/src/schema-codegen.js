@@ -18,6 +18,7 @@ const TYPE_MAP = new Map([
   ["jsonb", "Json"],
   ["json", "Json"],
   ["text[]", "string[]"],
+  ["enum", "string"],
 ]);
 
 /**

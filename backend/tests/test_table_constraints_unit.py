@@ -111,11 +111,53 @@ def test_column_type_allowlist_and_aliases_are_canonical():
     assert table_data_repo.normalize_column_type("json") == "jsonb"
     assert table_data_repo.normalize_column_type("int") == "int"
     assert table_data_repo.column_type_sql("text[]") == "TEXT[]"
+    assert table_data_repo.column_type_sql("enum") == "TEXT"
 
     with pytest.raises(InvalidColumnTypeError) as exc:
         table_data_repo.normalize_column_type("varchar(255)")
     assert exc.value.code == "invalid_column_type"
     assert "Available" in (exc.value.hint or "")
+
+
+def test_enum_column_compiles_text_with_named_check_constraint():
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active"],
+        "default": "draft",
+    })
+
+    assert col["type"] == "enum"
+    assert col["check"] == {"op": "in", "values": ["draft", "active"]}
+    assert table_data_repo.column_definition(col) == "status TEXT DEFAULT 'draft'"
+    constraint = table_data_repo.enum_constraint_definition("vt_demo__tasks", col)
+    assert constraint.startswith("CONSTRAINT vt_demo__tasks")
+    assert "CHECK (status IN ('draft', 'active'))" in constraint
+
+
+def test_enum_column_rejects_invalid_values_default_and_raw_check():
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({"name": "status", "type": "enum"})
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft", "draft"],
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft"],
+            "default": "active",
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft"],
+            "check": {"op": "in", "values": ["draft"]},
+        })
 
 
 def test_column_definition_compiles_default_check_and_not_null():
@@ -269,6 +311,84 @@ async def test_drop_constraint_and_index_are_if_exists():
     assert "DROP CONSTRAINT IF EXISTS" in conn.sql.upper()
     await table_data_repo.drop_index(conn, "vt_d__t__a__idx")
     assert "DROP INDEX IF EXISTS" in conn.sql.upper()
+
+
+@pytest.mark.asyncio
+async def test_replace_enum_constraint_drops_and_readds_named_check():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active", "archived"],
+    })
+
+    await table_data_repo.replace_enum_constraint(conn, "vt_demo__tasks", col)
+
+    assert "DROP CONSTRAINT IF EXISTS" in conn.sqls[0][0].upper()
+    assert "ADD CONSTRAINT" in conn.sqls[1][0].upper()
+    assert "CHECK (status IN ('draft', 'active', 'archived'))" in conn.sqls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_alter_column_default_sets_and_drops_validated_default():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active"],
+        "default": "active",
+    })
+    await table_data_repo.alter_column_default(conn, "vt_demo__tasks", col)
+    assert conn.sqls[-1] == (
+        "ALTER TABLE vt_demo__tasks ALTER COLUMN status SET DEFAULT 'active'",
+        (),
+    )
+
+    col["default"] = None
+    await table_data_repo.alter_column_default(conn, "vt_demo__tasks", col)
+    assert conn.sqls[-1] == (
+        "ALTER TABLE vt_demo__tasks ALTER COLUMN status DROP DEFAULT",
+        (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_enum_values_uses_one_case_update_for_chained_mappings():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+
+    await table_data_repo.rename_enum_values(
+        conn,
+        "vt_demo__tasks",
+        "status",
+        {"draft": "active", "active": "closed"},
+    )
+
+    assert len(conn.sqls) == 1
+    sql, params = conn.sqls[0]
+    assert "CASE status WHEN $1 THEN $2 WHEN $3 THEN $4 ELSE status END" in sql
+    assert "WHERE status = ANY($5::text[])" in sql
+    assert params == ("draft", "active", "active", "closed", ["draft", "active"])
 
 
 # ── service-layer validation/resolution ───────────────────────────

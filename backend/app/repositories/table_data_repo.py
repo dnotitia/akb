@@ -41,6 +41,7 @@ TYPE_MAP = {
     "jsonb": "JSONB",
     "json": "JSONB",
     "text[]": "TEXT[]",
+    "enum": "TEXT",
 }
 
 CANONICAL_TYPE_ALIASES = {
@@ -56,6 +57,7 @@ CANONICAL_TYPE_ALIASES = {
     "jsonb": "jsonb",
     "json": "jsonb",
     "text[]": "text[]",
+    "enum": "enum",
 }
 
 CANONICAL_TYPES = [
@@ -69,6 +71,7 @@ CANONICAL_TYPES = [
     "timestamp",
     "jsonb",
     "text[]",
+    "enum",
 ]
 
 _DEFAULT_FUNCTIONS = {
@@ -167,6 +170,18 @@ def normalize_column_spec(col: dict) -> dict:
     """Copy a caller column spec and normalize its logical type."""
     out = dict(col)
     out["type"] = normalize_column_type(out.get("type", "text"))
+    if out["type"] == "enum":
+        values = _normalize_enum_values(out.get("enum"))
+        if out.get("check") is not None:
+            raise ValidationError(
+                "Enum columns derive their CHECK constraint from `enum`; omit `check`."
+            )
+        out["enum"] = values
+        out["check"] = {"op": "in", "values": values}
+        if "default" in out and out.get("default") is not None and out["default"] not in values:
+            raise ValidationError(
+                f"Default {out['default']!r} is not one of enum values {values!r}."
+            )
     # Compile once here so invalid default/check specs fail before any DDL.
     _column_default_sql(out)
     _column_check_sql(out)
@@ -180,12 +195,13 @@ def column_type_sql(logical_type: Any) -> str:
 def column_definition(col: dict) -> str:
     """Build one validated user-column definition for CREATE/ALTER TABLE."""
     col_name = safe_ident(col["name"])
-    parts = [col_name, column_type_sql(col.get("type", "text"))]
+    logical_type = normalize_column_type(col.get("type", "text"))
+    parts = [col_name, TYPE_MAP[logical_type]]
     if col.get("required"):
         parts.append("NOT NULL")
     if default_sql := _column_default_sql(col):
         parts.append(f"DEFAULT {default_sql}")
-    if check_sql := _column_check_sql(col):
+    if logical_type != "enum" and (check_sql := _column_check_sql(col)):
         parts.append(f"CHECK ({check_sql})")
     return " ".join(parts)
 
@@ -242,9 +258,9 @@ def _column_check_sql(col: dict) -> str | None:
 
 
 def _literal_sql(value: Any, logical_type: str, *, ctx: str) -> str:
-    if logical_type == "text":
+    if logical_type in {"text", "enum"}:
         if not isinstance(value, str):
-            raise ValidationError(f"{ctx} for text columns must be a string literal.")
+            raise ValidationError(f"{ctx} for {logical_type} columns must be a string literal.")
         return _quote(value)
     if logical_type == "int":
         if not isinstance(value, int) or isinstance(value, bool):
@@ -299,6 +315,36 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _normalize_enum_values(values: Any) -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise ValidationError("Enum columns require a non-empty `enum` value list.")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValidationError("Enum values must be non-empty strings.")
+        if value in seen:
+            raise ValidationError(f"Duplicate enum value {value!r}.")
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def enum_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="enum")
+
+
+def enum_check_sql(col: dict) -> str:
+    if normalize_column_type(col.get("type", "text")) != "enum":
+        raise ValidationError(f"Column {col.get('name')!r} is not an enum column.")
+    return _column_check_sql(col) or "TRUE"
+
+
+def enum_constraint_definition(pg_name: str, col: dict) -> str:
+    name = safe_ident(enum_constraint_name(pg_name, col["name"]))
+    return f"CONSTRAINT {name} CHECK ({enum_check_sql(col)})"
+
+
 # ── DDL ──────────────────────────────────────────────────────────
 
 
@@ -308,6 +354,9 @@ async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
     for col in columns:
         col_defs.append(column_definition(col))
+    for col in columns:
+        if normalize_column_type(col.get("type", "text")) == "enum":
+            col_defs.append(enum_constraint_definition(pg_name, col))
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
@@ -341,6 +390,8 @@ async def count_rows(conn, pg_name: str) -> int:
 async def add_column(conn, pg_name: str, col: dict) -> None:
     """Add a column to the dynamic table. Column DDL is validated here."""
     await conn.execute(f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {column_definition(col)}")
+    if normalize_column_type(col.get("type", "text")) == "enum":
+        await create_enum_constraint(conn, pg_name, col)
 
 
 async def drop_column(conn, pg_name: str, col_name: str) -> None:
@@ -419,6 +470,48 @@ async def drop_constraint(conn, pg_name: str, name: str) -> None:
     safe_name = safe_ident(name)
     await conn.execute(
         f"ALTER TABLE {pg_name} DROP CONSTRAINT IF EXISTS {safe_name}"
+    )
+
+
+async def create_enum_constraint(conn, pg_name: str, col: dict) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD {enum_constraint_definition(pg_name, col)}"
+    )
+
+
+async def replace_enum_constraint(conn, pg_name: str, col: dict) -> None:
+    await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, col["name"]))
+    await create_enum_constraint(conn, pg_name, col)
+
+
+async def alter_column_default(conn, pg_name: str, col: dict) -> None:
+    safe_col = safe_ident(col["name"])
+    default_sql = _column_default_sql(col)
+    if default_sql is None:
+        await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} DROP DEFAULT")
+    else:
+        await conn.execute(
+            f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} SET DEFAULT {default_sql}"
+        )
+
+
+async def rename_enum_values(
+    conn, pg_name: str, col_name: str, renames: dict[str, str],
+) -> None:
+    if not renames:
+        return
+    safe_col = safe_ident(col_name)
+    params: list[Any] = []
+    cases: list[str] = []
+    for old_value, new_value in renames.items():
+        params.extend([old_value, new_value])
+        cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+    params.append(list(renames))
+    await conn.execute(
+        f"UPDATE {pg_name} "
+        f"SET {safe_col} = CASE {safe_col} {' '.join(cases)} ELSE {safe_col} END "
+        f"WHERE {safe_col} = ANY(${len(params)}::text[])",
+        *params,
     )
 
 

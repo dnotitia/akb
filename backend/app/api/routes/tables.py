@@ -62,6 +62,7 @@ class CreateTableRequest(NFCModel):
 
 class AlterTableRequest(NFCModel):
     add_columns: list[dict] | None = None
+    alter_columns: list[dict] | None = None
     drop_columns: list[str] | None = None
     rename_columns: dict[str, str] | None = None
     add_unique_keys: list[dict] | None = None
@@ -159,6 +160,7 @@ async def alter_table(
         access["vault_id"], table_name,
         actor_id=user.username,
         add_columns=req.add_columns,
+        alter_columns=req.alter_columns,
         drop_columns=req.drop_columns,
         rename_columns=req.rename_columns,
         add_unique_keys=req.add_unique_keys,

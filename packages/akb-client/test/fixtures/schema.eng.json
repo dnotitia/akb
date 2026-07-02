@@ -22,7 +22,7 @@
         },
         {
           "name": "status",
-          "type": "text",
+          "type": "enum",
           "required": true,
           "default": "todo",
           "enum": ["todo", "done"],

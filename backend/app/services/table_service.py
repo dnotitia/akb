@@ -315,6 +315,26 @@ def _reject_duplicate_meta_names(items: list[dict], *, label: str) -> None:
         seen.add(name)
 
 
+def _normalize_enum_renames(spec: dict, old_values: list, new_values: list[str]) -> dict[str, str]:
+    raw = spec.get("rename_enum_values") or spec.get("enum_renames") or {}
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValidationError("rename_enum_values must be an object mapping old enum values to new values.")
+    old_set = {v for v in old_values if isinstance(v, str)}
+    new_set = set(new_values)
+    renames: dict[str, str] = {}
+    for old, new in raw.items():
+        if not isinstance(old, str) or not isinstance(new, str) or not old or not new:
+            raise ValidationError("Enum rename mappings must use non-empty string values.")
+        if old not in old_set:
+            raise ValidationError(f"Cannot rename missing enum value {old!r}.")
+        if new not in new_set:
+            raise ValidationError(f"Renamed enum value {new!r} must appear in the new enum list.")
+        renames[old] = new
+    return renames
+
+
 # ── Indexing helpers ─────────────────────────────────────────────
 
 
@@ -792,6 +812,7 @@ async def alter_table(
     *,
     actor_id: str,
     add_columns: list[dict] | None = None,
+    alter_columns: list[dict] | None = None,
     drop_columns: list[str] | None = None,
     rename_columns: dict[str, str] | None = None,
     add_unique_keys: list[dict] | None = None,
@@ -801,6 +822,7 @@ async def alter_table(
 ) -> dict:
     """Apply schema changes to a vault table:
        - add_columns: [{name, type}, ...]
+       - alter_columns: [{name, enum, rename_enum_values?}, ...]
        - drop_columns: ["name", ...]
        - rename_columns: {"old": "new", ...}
        - add_unique_keys: [{name?, columns}, ...]
@@ -856,6 +878,15 @@ async def alter_table(
                 _validate_column_name(col["name"])
                 normalized_add_columns.append(_normalize_column_spec(col))
             add_columns = normalized_add_columns
+            normalized_alter_columns: list[dict] = []
+            for col in (alter_columns or []):
+                if not isinstance(col, dict) or "name" not in col:
+                    raise ValidationError(
+                        f"Each altered column must be an object with a 'name' field; got {col!r}."
+                    )
+                _validate_column_name(col["name"])
+                normalized_alter_columns.append(dict(col))
+            alter_columns = normalized_alter_columns
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
                     raise ValidationError("Drop column name must be a non-empty string.")
@@ -871,6 +902,7 @@ async def alter_table(
                 _validate_column_name(new_name)
 
             added: list[str] = []
+            altered: list[str] = []
             dropped: list[str] = []
             renamed: dict[str, str] = {}
 
@@ -964,13 +996,22 @@ async def alter_table(
                         )
                     rename_targets.add(new_key)
                 for old_name, new_name in rename_columns.items():
+                    old_col = next((dict(c) for c in columns if c["name"] == old_name), None)
                     old_safe = table_data_repo.safe_ident(old_name)
                     new_safe = table_data_repo.safe_ident(new_name)
                     await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    updated_col = None
                     for c in columns:
                         if c["name"] == old_name:
                             c["name"] = new_name
+                            updated_col = c
                     renamed[old_name] = new_name
+                    if old_col and old_col.get("type") == "enum" and updated_col:
+                        await table_data_repo.drop_constraint(
+                            conn, pg_name,
+                            table_data_repo.enum_constraint_name(pg_name, old_name),
+                        )
+                        await table_data_repo.create_enum_constraint(conn, pg_name, updated_col)
 
             # ── Declarative unique keys / indexes (AKB #215) ─────────
             # Existing metadata from the registry row; the merged result
@@ -1005,6 +1046,66 @@ async def alter_table(
                 if len(kept_idxs) != len(existing_idxs):
                     existing_idxs = kept_idxs
                     idx_changed = True
+
+            if alter_columns:
+                column_lookup: dict[str, tuple[int, dict]] = {
+                    c["name"].lower(): (column_index, c)
+                    for column_index, c in enumerate(columns)
+                    if isinstance(c, dict) and isinstance(c.get("name"), str)
+                }
+                for spec in alter_columns:
+                    key = spec["name"].lower()
+                    if key not in column_lookup:
+                        raise ValidationError(
+                            f"Cannot alter missing column {spec['name']!r} on table {table_name!r}."
+                        )
+                    column_index, current = column_lookup[key]
+                    if current.get("type") != "enum":
+                        raise ValidationError(
+                            f"Column {current['name']!r} is not an enum column."
+                        )
+                    if "enum" not in spec:
+                        raise ValidationError(
+                            f"Enum column alter for {current['name']!r} requires an `enum` list."
+                        )
+                    next_col = dict(current)
+                    next_col.pop("check", None)
+                    next_col["enum"] = spec["enum"]
+                    if "default" in spec:
+                        next_col["default"] = spec["default"]
+                    next_col = _normalize_column_spec(next_col)
+                    current_enum = current.get("enum")
+                    old_enum_values = current_enum if isinstance(current_enum, list) else []
+                    renames = _normalize_enum_renames(
+                        spec,
+                        old_enum_values,
+                        next_col["enum"],
+                    )
+                    try:
+                        await table_data_repo.drop_constraint(
+                            conn, pg_name,
+                            table_data_repo.enum_constraint_name(pg_name, current["name"]),
+                        )
+                        if renames:
+                            await table_data_repo.rename_enum_values(
+                                conn, pg_name, current["name"], renames,
+                            )
+                        if "default" in spec:
+                            await table_data_repo.alter_column_default(conn, pg_name, next_col)
+                        await table_data_repo.create_enum_constraint(conn, pg_name, next_col)
+                    except asyncpg.CheckViolationError as e:
+                        raise ValidationError(
+                            f"Cannot alter enum column {current['name']!r}: existing rows "
+                            f"contain values outside the new enum list {next_col['enum']!r}."
+                        ) from e
+                    except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                        raise ValidationError(
+                            f"Enum constraint for column {current['name']!r} already exists "
+                            f"in the database: {e}."
+                        ) from e
+                    columns[column_index] = next_col
+                    column_lookup[key] = (column_index, next_col)
+                    altered.append(current["name"])
 
             # Drops first so a drop+re-add of the same name in one alter
             # works, and so adds validate against the post-drop set.
@@ -1132,6 +1233,7 @@ async def alter_table(
                     "vault": vault["name"],
                     "table_name": table_name,
                     "added": added,
+                    "altered": altered,
                     "dropped": dropped,
                     "renamed": renamed,
                     "unique_keys_changed": uk_changed,

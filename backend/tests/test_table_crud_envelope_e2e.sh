@@ -198,9 +198,11 @@ RICH="rich"
 RICH_CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$RICH\",\"description\":\"rich columns\",\"columns\":[{\"name\":\"email\",\"type\":\"text\",\"required\":true,\"unique\":true,\"check\":{\"op\":\"len_lte\",\"value\":80}},{\"name\":\"status\",\"type\":\"text\",\"default\":\"todo\",\"check\":{\"op\":\"in\",\"values\":[\"todo\",\"done\"]},\"index\":true},{\"name\":\"qty\",\"type\":\"int\",\"default\":1,\"check\":{\"op\":\"gte\",\"value\":0}},{\"name\":\"rating\",\"type\":\"float\",\"default\":1.5},{\"name\":\"public_id\",\"type\":\"uuid\",\"default\":\"gen_random_uuid()\"},{\"name\":\"seen_at\",\"type\":\"timestamp\",\"default\":\"now()\"},{\"name\":\"tags\",\"type\":\"text[]\",\"default\":[\"new\"]}]}")
+  -d "{\"name\":\"$RICH\",\"description\":\"rich columns\",\"columns\":[{\"name\":\"email\",\"type\":\"text\",\"required\":true,\"unique\":true,\"check\":{\"op\":\"len_lte\",\"value\":80}},{\"name\":\"status\",\"type\":\"text\",\"default\":\"todo\",\"check\":{\"op\":\"in\",\"values\":[\"todo\",\"done\"]},\"index\":true},{\"name\":\"state\",\"type\":\"enum\",\"enum\":[\"draft\",\"active\"],\"default\":\"draft\"},{\"name\":\"qty\",\"type\":\"int\",\"default\":1,\"check\":{\"op\":\"gte\",\"value\":0}},{\"name\":\"rating\",\"type\":\"float\",\"default\":1.5},{\"name\":\"public_id\",\"type\":\"uuid\",\"default\":\"gen_random_uuid()\"},{\"name\":\"seen_at\",\"type\":\"timestamp\",\"default\":\"now()\"},{\"name\":\"tags\",\"type\":\"text[]\",\"default\":[\"new\"]}]}")
 assert_keys "rich.create" "$RICH_CREATE" kind uri vault name columns unique_keys indexes
 assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'qty')['type']" "int"
+assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'state')['type']" "enum"
+assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'state')['enum'][0]" "draft"
 assert_value "rich.create" "$RICH_CREATE" "v=next(c for c in d['columns'] if c.get('name') == 'status')['index']" "True"
 assert_value "rich.create" "$RICH_CREATE" "v=len(d['unique_keys'])" "1"
 assert_value "rich.create" "$RICH_CREATE" "v=len(d['indexes'])" "1"
@@ -232,8 +234,9 @@ assert_keys "rich.insert" "$RICH_INSERT" kind result vaults
 RICH_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d "{\"sql\":\"SELECT email, status, qty, rating, public_id IS NOT NULL AS has_uuid, seen_at IS NOT NULL AS has_seen, tags[1] AS first_tag FROM $RICH\"}")
+  -d "{\"sql\":\"SELECT email, status, state, qty, rating, public_id IS NOT NULL AS has_uuid, seen_at IS NOT NULL AS has_seen, tags[1] AS first_tag FROM $RICH\"}")
 assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['status']" "todo"
+assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['state']" "draft"
 assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['qty']" "1"
 assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['rating']" "1.5"
 assert_value "rich.defaults" "$RICH_SELECT" "v=d['items'][0]['has_uuid']" "True"
@@ -251,6 +254,72 @@ RICH_CHECK=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/t
   -H 'Content-Type: application/json' \
   -d "{\"sql\":\"INSERT INTO $RICH (email, status) VALUES ('two@test.dev', 'blocked')\"}")
 [ "$RICH_CHECK" = "400" ] && pass "rich.check: HTTP 400" || fail "rich.check" "expected 400, got $RICH_CHECK"
+
+RICH_ENUM_CHECK=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, state) VALUES ('bad-state@test.dev', 'blocked')\"}")
+[ "$RICH_ENUM_CHECK" = "400" ] && pass "rich.enum-check: HTTP 400" || fail "rich.enum-check" "expected 400, got $RICH_ENUM_CHECK"
+
+RICH_ENUM_ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"state","enum":["draft","active","archived"]}]}')
+assert_value "rich.enum-add" "$RICH_ENUM_ALTER" "v=next(c for c in d['columns'] if c.get('name') == 'state')['enum'][2]" "archived"
+
+RICH_ENUM_DEFAULT=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"state","enum":["draft","active","archived"],"default":"active"}]}')
+assert_value "rich.enum-default" "$RICH_ENUM_DEFAULT" "v=next(c for c in d['columns'] if c.get('name') == 'state')['default']" "active"
+
+RICH_DEFAULT_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email) VALUES ('default-state@test.dev')\"}")
+assert_keys "rich.enum-default-insert" "$RICH_DEFAULT_INSERT" kind result vaults
+
+RICH_DEFAULT_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT state FROM $RICH WHERE email = 'default-state@test.dev'\"}")
+assert_value "rich.enum-default-row" "$RICH_DEFAULT_SELECT" "v=d['items'][0]['state']" "active"
+
+RICH_DEFAULT_DELETE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"DELETE FROM $RICH WHERE email = 'default-state@test.dev'\"}")
+assert_keys "rich.enum-default-delete" "$RICH_DEFAULT_DELETE" kind result vaults
+
+RICH_ARCHIVED_INSERT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, state) VALUES ('archived@test.dev', 'archived')\"}")
+assert_keys "rich.enum-insert" "$RICH_ARCHIVED_INSERT" kind result vaults
+
+RICH_ENUM_RENAME=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"state","enum":["draft","active","closed"],"rename_enum_values":{"archived":"closed"}}]}')
+assert_value "rich.enum-rename" "$RICH_ENUM_RENAME" "v=next(c for c in d['columns'] if c.get('name') == 'state')['enum'][2]" "closed"
+
+RICH_RENAME_SELECT=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"SELECT state FROM $RICH WHERE email = 'archived@test.dev'\"}")
+assert_value "rich.enum-renamed-row" "$RICH_RENAME_SELECT" "v=d['items'][0]['state']" "closed"
+
+RICH_ENUM_REMOVE=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"alter_columns":[{"name":"state","enum":["draft","closed"],"default":"draft"}]}')
+assert_value "rich.enum-remove" "$RICH_ENUM_REMOVE" "v=len(next(c for c in d['columns'] if c.get('name') == 'state')['enum'])" "2"
+
+RICH_ACTIVE_REJECT=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"sql\":\"INSERT INTO $RICH (email, state) VALUES ('active@test.dev', 'active')\"}")
+[ "$RICH_ACTIVE_REJECT" = "400" ] && pass "rich.enum-remove-check: HTTP 400" || fail "rich.enum-remove-check" "expected 400, got $RICH_ACTIVE_REJECT"
 
 RICH_ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$RICH" \
   -H "Authorization: Bearer $PAT" \
