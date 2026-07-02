@@ -75,6 +75,9 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("get", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("post", "/api/v1/tables/{vault}/sql"): "#/components/schemas/AkbSqlEnvelope",
     ("get", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
+    ("post", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
+    ("patch", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
+    ("delete", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
     ("post", "/api/v1/tables/{vault}/{table}/query"): "#/components/schemas/AkbTableQueryEnvelope",
     ("delete", "/api/v1/tables/{vault}/{table_name}"): "#/components/schemas/AkbTableEnvelope",
     ("post", "/api/v1/files/{vault}/upload"): "#/components/schemas/AkbFileEnvelope",
@@ -82,6 +85,21 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("get", "/api/v1/files/{vault}/{file_id}/download"): "#/components/schemas/AkbFileEnvelope",
     ("get", "/api/v1/files/{vault}"): "#/components/schemas/AkbFileEnvelope",
     ("delete", "/api/v1/files/{vault}/{file_id}"): "#/components/schemas/AkbFileEnvelope",
+}
+KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS: dict[tuple[str, str], dict[str, str | None]] = {
+    ("post", "/api/v1/tables/{vault}/{table}/rows"): {
+        "204": None,
+    },
+    ("patch", "/api/v1/tables/{vault}/{table}/rows"): {
+        "204": None,
+    },
+    ("delete", "/api/v1/tables/{vault}/{table}/rows"): {
+        "204": None,
+    },
+    ("post", "/api/v1/tables/{vault}/{table}/query"): {
+        "201": "#/components/schemas/AkbTableQueryEnvelope",
+        "204": None,
+    },
 }
 
 
@@ -169,10 +187,34 @@ def _ensure_success_response(path: str, method: str, operation: dict[str, Any]) 
     media = content.setdefault("application/json", {})
     if ref := KIND_SUCCESS_RESPONSE_REFS.get((method, path)):
         media["schema"] = {"$ref": ref}
+        _ensure_additional_success_responses(path, method, responses)
         return
     schema = media.setdefault("schema", {})
     if schema == {}:
         media["schema"] = {"$ref": "#/components/schemas/AkbJsonObject"}
+    _ensure_additional_success_responses(path, method, responses)
+
+
+def _ensure_additional_success_responses(
+    path: str,
+    method: str,
+    responses: dict[str, Any],
+) -> None:
+    for status, ref in KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS.get((method, path), {}).items():
+        response = responses.setdefault(status, {"description": _success_description(status)})
+        response.setdefault("description", _success_description(status))
+        if ref is None:
+            response.pop("content", None)
+            continue
+        content = response.setdefault("content", {})
+        media = content.setdefault("application/json", {})
+        media["schema"] = {"$ref": ref}
+
+
+def _success_description(status: str) -> str:
+    if status == "204":
+        return "No Content"
+    return "Successful Response"
 
 
 def _ensure_error_responses(operation: dict[str, Any]) -> None:

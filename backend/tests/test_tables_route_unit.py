@@ -248,6 +248,45 @@ async def test_insert_rows_route_forwards_body_query_and_prefer(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_insert_rows_route_returns_empty_minimal_response(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    class _Request:
+        query_params = QueryParams("")
+        headers = Headers({})
+
+    class _Response:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+            self.status_code: int | None = None
+
+    async def fake_check_vault_access(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        return {"vault_id": "vault-1"}
+
+    async def fake_insert_rows(**_kwargs: Any) -> tables.table_row_write.RowMutationResponse:
+        return tables.table_row_write.RowMutationResponse(
+            status_code=204,
+            body=None,
+            content_range=None,
+        )
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_row_write, "insert_rows", fake_insert_rows)
+
+    result = await tables.insert_rows(
+        "demo",
+        "incidents",
+        _Request(),  # type: ignore[arg-type]
+        _Response(),  # type: ignore[arg-type]
+        {"title": "hello"},
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result.status_code == 204
+    assert result.body == b""
+
+
+@pytest.mark.asyncio
 async def test_update_rows_route_returns_empty_minimal_response(monkeypatch) -> None:
     from app.api.routes import tables
 

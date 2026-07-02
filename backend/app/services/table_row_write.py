@@ -290,7 +290,7 @@ def compile_insert_rows(
         sql=sql,
         params=params,
         fetch=fetch,
-        status_code=201,
+        status_code=201 if fetch else 204,
         projections=projections,
     )
 
