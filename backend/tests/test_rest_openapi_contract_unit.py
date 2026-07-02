@@ -95,6 +95,8 @@ def test_success_envelope_components_are_kind_discriminated():
         "propertyName": "kind",
         "mapping": {
             "table": "#/components/schemas/AkbTableEnvelope",
+            "table_schema": "#/components/schemas/AkbTableSchemaEnvelope",
+            "vault_table_schema": "#/components/schemas/AkbVaultTableSchemaEnvelope",
             "table_query": "#/components/schemas/AkbTableQueryEnvelope",
             "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
             "file": "#/components/schemas/AkbFileEnvelope",
@@ -102,6 +104,8 @@ def test_success_envelope_components_are_kind_discriminated():
     }
     for name, kind in (
         ("AkbTableEnvelope", "table"),
+        ("AkbTableSchemaEnvelope", "table_schema"),
+        ("AkbVaultTableSchemaEnvelope", "vault_table_schema"),
         ("AkbTableQueryEnvelope", "table_query"),
         ("AkbTableSqlEnvelope", "table_sql"),
         ("AkbFileEnvelope", "file"),
@@ -116,6 +120,8 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
     expected = {
         ("/api/v1/tables/{vault}", "post", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}", "get", "200"): "AkbTableEnvelope",
+        ("/api/v1/tables/{vault}/schema", "get", "200"): "AkbVaultTableSchemaEnvelope",
+        ("/api/v1/tables/{vault}/{table}/schema", "get", "200"): "AkbTableSchemaEnvelope",
         ("/api/v1/tables/{vault}/sql", "post", "200"): "AkbSqlEnvelope",
         ("/api/v1/tables/{vault}/{table}/rows", "get", "200"): "AkbTableQueryEnvelope",
         ("/api/v1/tables/{vault}/{table}/rows", "post", "201"): "AkbTableQueryEnvelope",
@@ -220,6 +226,53 @@ def test_alter_table_openapi_contract_is_codegen_typed():
             operation["responses"][status]["content"]["application/json"]["schema"]
             == {"$ref": "#/components/schemas/AkbError"}
         )
+
+
+def test_table_schema_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    table_schema = paths["/api/v1/tables/{vault}/{table}/schema"]["get"]
+    vault_schema = paths["/api/v1/tables/{vault}/schema"]["get"]
+
+    assert table_schema["operationId"] == "tablesGetTableSchema"
+    assert vault_schema["operationId"] == "tablesGetVaultSchema"
+    assert table_schema["tags"] == ["tables"]
+    assert vault_schema["tags"] == ["tables"]
+    assert (
+        table_schema["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbTableSchemaEnvelope"}
+    )
+    assert (
+        vault_schema["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbVaultTableSchemaEnvelope"}
+    )
+
+    component = schema["components"]["schemas"]["AkbTableSchemaEnvelope"]
+    assert {"kind", "vault", "name", "columns", "pg_types", "drift"}.issubset(
+        component["required"]
+    )
+    column_props = component["properties"]["columns"]["items"]["properties"]
+    for field in (
+        "name",
+        "type",
+        "required",
+        "default",
+        "check",
+        "enum",
+        "unique",
+        "index",
+        "references",
+        "on_delete",
+        "pg_type",
+        "drift",
+    ):
+        assert field in column_props
+    for operation in (table_schema, vault_schema):
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": "#/components/schemas/AkbError"}
+            )
 
 
 def test_http_exception_runtime_shape_matches_akb_error_schema():

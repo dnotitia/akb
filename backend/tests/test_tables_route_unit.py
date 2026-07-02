@@ -101,6 +101,41 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_table_schema_routes_use_reader_gate(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: list[tuple[str, tuple[Any, ...]]] = []
+    roles: list[str] = []
+
+    async def fake_check_vault_access(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        roles.append(kwargs["required_role"])
+        return {"vault_id": "vault-1"}
+
+    async def fake_get_table_schema(*args: Any) -> dict[str, Any]:
+        captured.append(("table", args))
+        return {"kind": "table_schema", "vault": "demo", "name": "incidents"}
+
+    async def fake_get_vault_schema(*args: Any) -> dict[str, Any]:
+        captured.append(("vault", args))
+        return {"kind": "vault_table_schema", "vault": "demo", "tables": [], "total": 0}
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_service, "get_table_schema", fake_get_table_schema)
+    monkeypatch.setattr(tables.table_service, "get_vault_schema", fake_get_vault_schema)
+
+    table_schema = await tables.get_table_schema("demo", "incidents", _User())  # type: ignore[arg-type]
+    vault_schema = await tables.get_vault_schema("demo", _User())  # type: ignore[arg-type]
+
+    assert table_schema["kind"] == "table_schema"
+    assert vault_schema["kind"] == "vault_table_schema"
+    assert roles == ["reader", "reader"]
+    assert captured == [
+        ("table", ("vault-1", "incidents")),
+        ("vault", ("vault-1",)),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_select_rows_route_sets_content_range(monkeypatch) -> None:
     from app.api.routes import tables
 

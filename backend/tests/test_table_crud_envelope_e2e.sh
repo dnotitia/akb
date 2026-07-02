@@ -10,6 +10,7 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 VAULT="tbl-envelope-$(date +%s)"
 USER="tbl-envelope-$(date +%s)"
 READER="tbl-envelope-reader-$(date +%s)"
+OUTSIDER="tbl-envelope-outsider-$(date +%s)"
 TABLE="cust"
 PASS=0
 FAIL=0
@@ -47,6 +48,19 @@ READER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
   -H "Authorization: Bearer $READER_JWT" \
   -H 'Content-Type: application/json' \
   -d '{"name":"tbl-envelope-reader"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$OUTSIDER\",\"email\":\"$OUTSIDER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+OUTSIDER_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$OUTSIDER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+OUTSIDER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $OUTSIDER_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"tbl-envelope-outsider"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
 # Create vault for the test (POST /vaults uses query params, not JSON body)
 curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=envelope%20test" \
@@ -87,7 +101,7 @@ echo "▸ 1. Create table — envelope shape"
 CREATE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$TABLE\",\"description\":\"customers\",\"columns\":[{\"name\":\"email\",\"type\":\"text\"},{\"name\":\"age\",\"type\":\"number\"}]}")
+  -d "{\"name\":\"$TABLE\",\"description\":\"customers\",\"columns\":[{\"name\":\"email\",\"type\":\"text\",\"required\":true},{\"name\":\"age\",\"type\":\"number\"}],\"unique_keys\":[{\"columns\":[\"email\"]}],\"indexes\":[{\"columns\":[{\"name\":\"age\",\"order\":\"desc\"}]}]}")
 # Tables are URI-addressed (no `d-` id like documents) — the envelope key
 # is `uri`, not `id`.
 assert_keys "create" "$CREATE" kind uri vault name columns
@@ -109,7 +123,7 @@ ALTER_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/
 ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d '{"add_columns":[{"name":"status","type":"text"}],"rename_columns":{"age":"age_years"}}')
+  -d '{"add_columns":[{"name":"status","type":"text","default":"active","check":{"op":"in","values":["active","inactive"]},"enum":["active","inactive"],"references":{"table":"statuses","column":"code"},"on_delete":"restrict","index":true}],"rename_columns":{"age":"age_years"}}')
 assert_keys "alter" "$ALTER" kind uri vault name columns
 assert_value "alter" "$ALTER" "v=d['kind']" "table"
 assert_value "alter" "$ALTER" "v=d['vault']" "$VAULT"
@@ -135,7 +149,37 @@ BAD_RENAME_DUP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api
 [ "$BAD_RENAME_DUP" = "422" ] && pass "alter.bad-rename-dup: HTTP 422" || fail "alter.bad-rename-dup" "expected 422, got $BAD_RENAME_DUP"
 
 echo ""
-echo "▸ 3. List tables — envelope shape"
+echo "▸ 3. Schema introspection — registry/live merge + reader gate"
+
+SCHEMA_DENY=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/tables/$VAULT/$TABLE/schema" \
+  -H "Authorization: Bearer $OUTSIDER_PAT")
+[ "$SCHEMA_DENY" = "403" ] && pass "schema.outsider: HTTP 403" || fail "schema.outsider" "expected 403, got $SCHEMA_DENY"
+
+SCHEMA=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT/$TABLE/schema" \
+  -H "Authorization: Bearer $READER_PAT")
+assert_keys "schema.table" "$SCHEMA" kind uri vault name table sql_name columns unique_keys indexes pg_types system_columns drift
+assert_value "schema.table" "$SCHEMA" "v=d['kind']" "table_schema"
+assert_value "schema.table" "$SCHEMA" "v=d['vault']" "$VAULT"
+assert_value "schema.table" "$SCHEMA" "v=d['name']" "$TABLE"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'email')['unique']" "True"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'age_years')['index']" "True"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['default']" "active"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['check']['op']" "in"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['enum'][0]" "active"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['references']['table']" "statuses"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['on_delete']" "restrict"
+assert_value "schema.table" "$SCHEMA" "v=next(c for c in d['columns'] if c.get('name') == 'status')['pg_type']" "text"
+assert_value "schema.table" "$SCHEMA" "v=d['drift']['has_drift']" "False"
+
+VAULT_SCHEMA=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT/schema" \
+  -H "Authorization: Bearer $READER_PAT")
+assert_keys "schema.vault" "$VAULT_SCHEMA" kind vault tables total
+assert_value "schema.vault" "$VAULT_SCHEMA" "v=d['kind']" "vault_table_schema"
+assert_value "schema.vault" "$VAULT_SCHEMA" "v=d['total']" "1"
+assert_value "schema.vault" "$VAULT_SCHEMA" "v=d['tables'][0]['name']" "$TABLE"
+
+echo ""
+echo "▸ 4. List tables — envelope shape"
 
 LIST=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT")
@@ -148,7 +192,7 @@ assert_value "list" "$LIST" "v=d['items'][0]['name']" "$TABLE"
 assert_value "list" "$LIST" "v=d['items'][0]['uri']" "$TABLE_URI"
 
 echo ""
-echo "▸ 4. SQL SELECT — envelope shape (rows → items)"
+echo "▸ 5. SQL SELECT — envelope shape (rows → items)"
 
 INS=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
@@ -168,7 +212,7 @@ assert_value "sql.select" "$SEL" "v=d['items'][0]['email']" "a@x"
 assert_value "sql.select" "$SEL" "v=d['items'][0]['status']" "active"
 
 echo ""
-echo "▸ 5. Drop table — envelope shape"
+echo "▸ 6. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
@@ -179,7 +223,7 @@ assert_value "drop" "$DROP" "v=d['name']" "$TABLE"
 assert_value "drop" "$DROP" "v=str(d['deleted']).lower()" "true"
 
 echo ""
-echo "▸ 6. Drop missing table — proper 4xx error"
+echo "▸ 7. Drop missing table — proper 4xx error"
 
 MISS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/does-not-exist" \
   -H "Authorization: Bearer $PAT")

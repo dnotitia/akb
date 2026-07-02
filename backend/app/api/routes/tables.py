@@ -115,6 +115,30 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
     return {"kind": "table", "vault": vault, "items": tables, "total": len(tables)}
 
 
+@router.get(
+    "/tables/{vault}/schema",
+    summary="Inspect all table schemas in a vault",
+    operation_id="tablesGetVaultSchema",
+)
+async def get_vault_schema(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await table_service.get_vault_schema(access["vault_id"])
+
+
+@router.get(
+    "/tables/{vault}/{table}/schema",
+    summary="Inspect a table schema",
+    operation_id="tablesGetTableSchema",
+)
+async def get_table_schema(
+    vault: str,
+    table: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await table_service.get_table_schema(access["vault_id"], table)
+
+
 @router.patch(
     "/tables/{vault}/{table_name}",
     summary="Alter a table schema",
