@@ -34,7 +34,7 @@ import logging
 import secrets
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import jwt
@@ -247,7 +247,7 @@ class KeycloakOIDC:
             public_key = RSAAlgorithm.from_jwk(json.dumps(key))
             claims = jwt.decode(
                 id_token,
-                public_key,
+                cast(Any, public_key),
                 algorithms=["RS256"],
                 audience=settings.keycloak_client_id,
                 issuer=settings.keycloak_issuer,
@@ -316,7 +316,7 @@ class KeycloakOIDC:
             public_key = RSAAlgorithm.from_jwk(json.dumps(key))
             claims = jwt.decode(
                 token,
-                public_key,
+                cast(Any, public_key),
                 algorithms=["RS256"],
                 audience=audience,
                 issuer=settings.keycloak_issuer,

@@ -1,4 +1,6 @@
 """Help router — exposes seed templates + vault-skill preview for agents."""
+from typing import Any
+
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 
@@ -12,7 +14,22 @@ router = APIRouter()
 doc_service = DocumentService()
 
 
-@router.get("/skill-template", summary="Default vault-skill template body")
+MARKDOWN_RESPONSE: dict[int | str, dict[str, Any]] = {
+    200: {
+        "content": {
+            "text/markdown": {"schema": {"type": "string"}},
+        },
+        "description": "Markdown text",
+    }
+}
+
+
+@router.get(
+    "/skill-template",
+    response_class=PlainTextResponse,
+    responses=MARKDOWN_RESPONSE,
+    summary="Default vault-skill template body",
+)
 async def get_skill_template() -> PlainTextResponse:
     """Return the canonical vault-skill seed body as text/markdown.
 
@@ -27,7 +44,12 @@ async def get_skill_template() -> PlainTextResponse:
     )
 
 
-@router.get("/vault-skill-preview/{vault}", summary="Agent-view preview of a vault's vault-skill")
+@router.get(
+    "/vault-skill-preview/{vault}",
+    response_class=PlainTextResponse,
+    responses=MARKDOWN_RESPONSE,
+    summary="Agent-view preview of a vault's vault-skill",
+)
 async def get_vault_skill_preview(
     vault: str,
     user: AuthenticatedUser = Depends(get_current_user),

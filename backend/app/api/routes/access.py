@@ -145,7 +145,7 @@ async def admin_list_users(user: AuthenticatedUser = Depends(get_current_user)):
     return {"users": await list_all_users_admin()}
 
 
-@router.delete("/admin/users/{user_id}", summary="[admin] Delete any user + owned vaults")
+@router.delete("/admin/users/{user_id}", summary="[admin] Delete a user + owned vaults")
 async def admin_delete_user(
     user_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
@@ -221,7 +221,7 @@ class AdminMintTokenRequest(NFCModel):
 
 @router.post(
     "/admin/users/{user_ref}/tokens",
-    summary="[admin] Mint a PAT for any user (by id or email)",
+    summary="[admin] Mint a PAT for a user (by id or email)",
 )
 async def admin_mint_user_token(
     user_ref: str,
