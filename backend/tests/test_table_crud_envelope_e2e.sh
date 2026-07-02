@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # AKB Table CRUD + Envelope E2E
-# Verifies the table REST contract: create/list/drop + alter via MCP,
+# Verifies the table REST contract: create/list/alter/drop,
 # focusing on the standard envelope keys (kind, id, vault, items, total).
 #
 set -uo pipefail
@@ -9,6 +9,7 @@ set -uo pipefail
 BASE_URL="${AKB_URL:-http://localhost:8000}"
 VAULT="tbl-envelope-$(date +%s)"
 USER="tbl-envelope-$(date +%s)"
+READER="tbl-envelope-reader-$(date +%s)"
 TABLE="cust"
 PASS=0
 FAIL=0
@@ -34,9 +35,27 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 [ -n "$PAT" ] || { echo "FATAL: could not get PAT"; exit 1; }
 
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$READER\",\"email\":\"$READER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+READER_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$READER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+READER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $READER_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"tbl-envelope-reader"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
 # Create vault for the test (POST /vaults uses query params, not JSON body)
 curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=envelope%20test" \
   -H "Authorization: Bearer $PAT" >/dev/null
+
+curl -sk -X POST "$BASE_URL/api/v1/vaults/$VAULT/grant" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"user\":\"$READER\",\"role\":\"reader\"}" >/dev/null
 
 # JSON-key assertion helper.
 assert_keys() {
@@ -79,7 +98,44 @@ assert_value "create" "$CREATE" "v=d['name']" "$TABLE"
 TABLE_URI=$(echo "$CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["uri"])')
 
 echo ""
-echo "▸ 2. List tables — envelope shape"
+echo "▸ 2. REST alter — envelope shape + permission gate"
+
+ALTER_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $READER_PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"add_columns":[{"name":"status","type":"text"}]}')
+[ "$ALTER_DENY" = "403" ] && pass "alter.reader: HTTP 403" || fail "alter.reader" "expected 403, got $ALTER_DENY"
+
+ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"add_columns":[{"name":"status","type":"text"}],"rename_columns":{"age":"age_years"}}')
+assert_keys "alter" "$ALTER" kind uri vault name columns
+assert_value "alter" "$ALTER" "v=d['kind']" "table"
+assert_value "alter" "$ALTER" "v=d['vault']" "$VAULT"
+assert_value "alter" "$ALTER" "v=any(c.get('name') == 'status' and c.get('type') == 'text' for c in d['columns'])" "True"
+assert_value "alter" "$ALTER" "v=any(c.get('name') == 'age_years' for c in d['columns'])" "True"
+
+BAD_RENAME=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"rename_columns":{"missing":"new_name"}}')
+[ "$BAD_RENAME" = "422" ] && pass "alter.bad-rename: HTTP 422" || fail "alter.bad-rename" "expected 422, got $BAD_RENAME"
+
+BAD_RENAME_CASE=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"rename_columns":{"AGE_YEARS":"age_again"}}')
+[ "$BAD_RENAME_CASE" = "422" ] && pass "alter.bad-rename-case: HTTP 422" || fail "alter.bad-rename-case" "expected 422, got $BAD_RENAME_CASE"
+
+BAD_RENAME_DUP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"rename_columns":{"email":"dup_name","status":"dup_name"}}')
+[ "$BAD_RENAME_DUP" = "422" ] && pass "alter.bad-rename-dup: HTTP 422" || fail "alter.bad-rename-dup" "expected 422, got $BAD_RENAME_DUP"
+
+echo ""
+echo "▸ 3. List tables — envelope shape"
 
 LIST=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $PAT")
@@ -92,26 +148,27 @@ assert_value "list" "$LIST" "v=d['items'][0]['name']" "$TABLE"
 assert_value "list" "$LIST" "v=d['items'][0]['uri']" "$TABLE_URI"
 
 echo ""
-echo "▸ 3. SQL SELECT — envelope shape (rows → items)"
+echo "▸ 4. SQL SELECT — envelope shape (rows → items)"
 
 INS=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d "{\"sql\":\"INSERT INTO $TABLE (email, age) VALUES ('a@x', 30), ('b@y', 40)\"}")
+  -d "{\"sql\":\"INSERT INTO $TABLE (email, age_years, status) VALUES ('a@x', 30, 'active'), ('b@y', 40, 'inactive')\"}")
 assert_keys "sql.insert" "$INS" kind result vaults
 assert_value "sql.insert" "$INS" "v=d['kind']" "table_sql"
 
 SEL=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d "{\"sql\":\"SELECT email, age FROM $TABLE ORDER BY age\"}")
+  -d "{\"sql\":\"SELECT email, age_years, status FROM $TABLE ORDER BY age_years\"}")
 assert_keys "sql.select" "$SEL" kind columns items total vaults
 assert_value "sql.select" "$SEL" "v=d['kind']" "table_query"
 assert_value "sql.select" "$SEL" "v=d['total']" "2"
 assert_value "sql.select" "$SEL" "v=d['items'][0]['email']" "a@x"
+assert_value "sql.select" "$SEL" "v=d['items'][0]['status']" "active"
 
 echo ""
-echo "▸ 4. Drop table — envelope shape"
+echo "▸ 5. Drop table — envelope shape"
 
 DROP=$(curl -sk -X DELETE "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT")
@@ -122,7 +179,7 @@ assert_value "drop" "$DROP" "v=d['name']" "$TABLE"
 assert_value "drop" "$DROP" "v=str(d['deleted']).lower()" "true"
 
 echo ""
-echo "▸ 5. Drop missing table — proper 4xx error"
+echo "▸ 6. Drop missing table — proper 4xx error"
 
 MISS=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE "$BASE_URL/api/v1/tables/$VAULT/does-not-exist" \
   -H "Authorization: Bearer $PAT")

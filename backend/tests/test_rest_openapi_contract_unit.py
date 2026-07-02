@@ -122,6 +122,7 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/tables/{vault}/{table}/rows", "patch", "200"): "AkbTableQueryEnvelope",
         ("/api/v1/tables/{vault}/{table}/rows", "delete", "200"): "AkbTableQueryEnvelope",
         ("/api/v1/tables/{vault}/{table}/query", "post", "200"): "AkbTableQueryEnvelope",
+        ("/api/v1/tables/{vault}/{table_name}", "patch", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}/{table_name}", "delete", "200"): "AkbTableEnvelope",
         ("/api/v1/files/{vault}/upload", "post", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}/confirm", "post", "200"): "AkbFileEnvelope",
@@ -198,6 +199,27 @@ def test_row_write_openapi_contract_is_codegen_typed():
         == {"$ref": "#/components/schemas/AkbTableQueryEnvelope"}
     )
     assert "content" not in query["responses"]["204"]
+
+
+def test_alter_table_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    operation = schema["paths"]["/api/v1/tables/{vault}/{table_name}"]["patch"]
+
+    assert operation["operationId"] == "tablesAlterTable"
+    assert operation["tags"] == ["tables"]
+    assert (
+        operation["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbTableEnvelope"}
+    )
+    assert (
+        operation["requestBody"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AlterTableRequest"}
+    )
+    for status in ERROR_STATUSES:
+        assert (
+            operation["responses"][status]["content"]["application/json"]["schema"]
+            == {"$ref": "#/components/schemas/AkbError"}
+        )
 
 
 def test_http_exception_runtime_shape_matches_akb_error_schema():

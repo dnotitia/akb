@@ -58,6 +58,16 @@ class CreateTableRequest(NFCModel):
     indexes: list[dict] | None = None
 
 
+class AlterTableRequest(NFCModel):
+    add_columns: list[dict] | None = None
+    drop_columns: list[str] | None = None
+    rename_columns: dict[str, str] | None = None
+    add_unique_keys: list[dict] | None = None
+    drop_unique_keys: list[str] | None = None
+    add_indexes: list[dict] | None = None
+    drop_indexes: list[str] | None = None
+
+
 class SqlRequest(NFCModel):
     sql: str
     params: list[Any] | None = None
@@ -103,6 +113,33 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     tables = await table_service.list_tables(access["vault_id"])
     return {"kind": "table", "vault": vault, "items": tables, "total": len(tables)}
+
+
+@router.patch(
+    "/tables/{vault}/{table_name}",
+    summary="Alter a table schema",
+    operation_id="tablesAlterTable",
+)
+async def alter_table(
+    vault: str,
+    table_name: str,
+    req: AlterTableRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    # REST BaaS schema changes are a writer-level surface by AKB-034/067;
+    # the legacy MCP alter tool keeps its stricter admin gate.
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    return await table_service.alter_table(
+        access["vault_id"], table_name,
+        actor_id=user.username,
+        add_columns=req.add_columns,
+        drop_columns=req.drop_columns,
+        rename_columns=req.rename_columns,
+        add_unique_keys=req.add_unique_keys,
+        drop_unique_keys=req.drop_unique_keys,
+        add_indexes=req.add_indexes,
+        drop_indexes=req.drop_indexes,
+    )
 
 
 @router.post("/tables/{vault}/sql", summary="Execute SQL on vault tables")

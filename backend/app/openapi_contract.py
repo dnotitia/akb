@@ -79,6 +79,7 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("patch", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
     ("delete", "/api/v1/tables/{vault}/{table}/rows"): "#/components/schemas/AkbTableQueryEnvelope",
     ("post", "/api/v1/tables/{vault}/{table}/query"): "#/components/schemas/AkbTableQueryEnvelope",
+    ("patch", "/api/v1/tables/{vault}/{table_name}"): "#/components/schemas/AkbTableEnvelope",
     ("delete", "/api/v1/tables/{vault}/{table_name}"): "#/components/schemas/AkbTableEnvelope",
     ("post", "/api/v1/files/{vault}/upload"): "#/components/schemas/AkbFileEnvelope",
     ("post", "/api/v1/files/{vault}/{file_id}/confirm"): "#/components/schemas/AkbFileEnvelope",

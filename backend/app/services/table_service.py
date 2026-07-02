@@ -665,11 +665,7 @@ async def alter_table(
             for old_name, new_name in (rename_columns or {}).items():
                 if not isinstance(old_name, str) or not old_name:
                     raise ValidationError("Rename source column must be a non-empty string.")
-                if old_name.lower() in _RESERVED:
-                    raise ValidationError(
-                        f"Column '{old_name}' is a reserved bookkeeping column "
-                        f"and cannot be renamed. Reserved: {sorted(_RESERVED)}."
-                    )
+                _validate_column_name(old_name)
                 _validate_column_name(new_name)
 
             added: list[str] = []
@@ -694,6 +690,25 @@ async def alter_table(
                 columns = [c for c in columns if c["name"] not in drop_columns]
 
             if rename_columns:
+                lookup = _declared_column_lookup(columns)
+                rename_targets: set[str] = set()
+                for old_name, new_name in rename_columns.items():
+                    old_key = old_name.lower()
+                    new_key = new_name.lower()
+                    if old_key not in lookup:
+                        raise ValidationError(
+                            f"Cannot rename missing column {old_name!r} on table {table_name!r}."
+                        )
+                    if new_key != old_key and new_key in lookup:
+                        raise ValidationError(
+                            f"Cannot rename column {old_name!r} to {new_name!r} "
+                            f"on table {table_name!r}: target column already exists."
+                        )
+                    if new_key in rename_targets:
+                        raise ValidationError(
+                            f"Cannot rename multiple columns to {new_name!r} on table {table_name!r}."
+                        )
+                    rename_targets.add(new_key)
                 for old_name, new_name in rename_columns.items():
                     old_safe = table_data_repo.safe_ident(old_name)
                     new_safe = table_data_repo.safe_ident(new_name)

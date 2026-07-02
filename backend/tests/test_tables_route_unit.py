@@ -47,6 +47,60 @@ async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: dict[str, Any] = {}
+    roles: list[str] = []
+
+    async def fake_check_vault_access(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        roles.append(kwargs["required_role"])
+        return {"vault_id": "vault-1"}
+
+    async def fake_alter_table(vault_id: str, table_name: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"vault_id": vault_id, "table_name": table_name, **kwargs})
+        return {
+            "kind": "table",
+            "vault": "demo",
+            "name": table_name,
+            "columns": [{"name": "title", "type": "text"}],
+        }
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_service, "alter_table", fake_alter_table)
+
+    result = await tables.alter_table(
+        "demo",
+        "incidents",
+        tables.AlterTableRequest(
+            add_columns=[{"name": "title", "type": "text"}],
+            drop_columns=["legacy"],
+            rename_columns={"summary": "body"},
+            add_unique_keys=[{"columns": ["title"]}],
+            drop_unique_keys=["old_title_key"],
+            add_indexes=[{"columns": ["title"]}],
+            drop_indexes=["old_title_idx"],
+        ),
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result["kind"] == "table"
+    assert roles == ["writer"]
+    assert captured == {
+        "vault_id": "vault-1",
+        "table_name": "incidents",
+        "actor_id": "김영로",
+        "add_columns": [{"name": "title", "type": "text"}],
+        "drop_columns": ["legacy"],
+        "rename_columns": {"summary": "body"},
+        "add_unique_keys": [{"columns": ["title"]}],
+        "drop_unique_keys": ["old_title_key"],
+        "add_indexes": [{"columns": ["title"]}],
+        "drop_indexes": ["old_title_idx"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_select_rows_route_sets_content_range(monkeypatch) -> None:
     from app.api.routes import tables
 
