@@ -54,6 +54,9 @@ from app.util.text import fuzzy_hint
 # `table_data_repo`.
 from app.repositories.table_data_repo import (  # noqa: F401
     build_table_name_map,
+    contains_pg_settings_identifier,
+    contains_set_config_call,
+    contains_unicode_escaped_identifier,
     count_statement_separators,
     rewrite_table_names,
 )
@@ -953,6 +956,23 @@ async def execute_sql(
                 "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
                 "akb_sql. Use akb_create_table / akb_alter_table / "
                 "akb_drop_table for schema changes.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_set_config_call(rewritten):
+            return err(
+                "set_config() is not allowed via akb_sql because "
+                "request.jwt.claims is reserved for service-key claim injection.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_unicode_escaped_identifier(rewritten):
+            return err(
+                "Unicode-escaped quoted identifiers are not allowed via akb_sql.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_pg_settings_identifier(rewritten):
+            return err(
+                "pg_settings is not available via akb_sql because "
+                "request.jwt.claims is reserved for service-key claim injection.",
                 code=METHOD_NOT_ALLOWED,
             )
 
