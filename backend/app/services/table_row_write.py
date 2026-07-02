@@ -15,6 +15,7 @@ from app.repositories import table_data_repo, table_registry_repo
 from app.services.table_row_query import (
     _add_param,
     _column_meta,
+    _compile_ast_filter,
     _compile_filters,
     _compile_select,
     _shape_result,
@@ -50,6 +51,7 @@ WRITE_CONTROL_PARAMS = {
     "limit",
     "offset",
 }
+WRITE_AST_KEYS = {"insert", "update", "delete"}
 
 
 @dataclass
@@ -174,6 +176,44 @@ async def delete_rows(
     )
 
 
+async def query_rows(
+    *,
+    vault_name: str,
+    vault_id: uuid.UUID,
+    table_name: str,
+    user_id: uuid.UUID | str,
+    actor_id: str,
+    ast: Mapping[str, Any],
+    is_admin: bool = False,
+    prefer_header: str | None = None,
+) -> RowMutationResponse | dict[str, Any]:
+    loaded = await _load_table(vault_id, table_name)
+    if isinstance(loaded, dict):
+        return loaded
+    compiled = compile_ast_mutation(
+        vault_name=vault_name,
+        table_name=table_name,
+        columns=loaded.columns,
+        unique_keys=loaded.unique_keys,
+        ast=ast,
+        actor_id=actor_id,
+        prefer_header=prefer_header,
+    )
+    if isinstance(compiled, dict):
+        return compiled
+    return await _execute_mutation(
+        compiled,
+        vault_name=vault_name,
+        table_name=table_name,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def is_write_ast(ast: Mapping[str, Any]) -> bool:
+    return any(key in ast for key in WRITE_AST_KEYS)
+
+
 def compile_insert_rows(
     *,
     vault_name: str,
@@ -255,6 +295,66 @@ def compile_insert_rows(
     )
 
 
+def compile_ast_mutation(
+    *,
+    vault_name: str,
+    table_name: str,
+    columns: list[dict],
+    unique_keys: list[dict] | None = None,
+    ast: Mapping[str, Any],
+    actor_id: str,
+    prefer_header: str | None = None,
+) -> _CompiledMutation | dict[str, Any]:
+    keys = [key for key in WRITE_AST_KEYS if key in ast]
+    if len(keys) != 1:
+        return err("Write AST must include exactly one of insert, update, or delete.", code=INVALID_ARGUMENT)
+    key = keys[0]
+    returning = _ast_returning_select(ast)
+    if isinstance(returning, dict):
+        return returning
+    ast_prefer = _ast_prefer_header(ast, prefer_header)
+    if key == "insert":
+        query_params = []
+        if returning is not None:
+            query_params.append(("select", returning))
+        on_conflict = ast.get("on_conflict")
+        if on_conflict is not None:
+            if not isinstance(on_conflict, str):
+                return err("AST on_conflict must be a string.", code=INVALID_ARGUMENT)
+            query_params.append(("on_conflict", on_conflict))
+        return compile_insert_rows(
+            vault_name=vault_name,
+            table_name=table_name,
+            columns=columns,
+            unique_keys=unique_keys,
+            body=ast["insert"],
+            actor_id=actor_id,
+            query_params=query_params,
+            prefer_header=ast_prefer,
+        )
+    if key == "update":
+        return _compile_update_ast(
+            vault_name=vault_name,
+            table_name=table_name,
+            columns=columns,
+            body=ast["update"],
+            ast=ast,
+            returning=returning,
+            prefer_header=ast_prefer,
+        )
+    delete_value = ast["delete"]
+    if delete_value is not True:
+        return err("AST delete must be true.", code=INVALID_ARGUMENT)
+    return _compile_delete_ast(
+        vault_name=vault_name,
+        table_name=table_name,
+        columns=columns,
+        ast=ast,
+        returning=returning,
+        prefer_header=ast_prefer,
+    )
+
+
 def compile_update_rows(
     *,
     vault_name: str,
@@ -268,20 +368,9 @@ def compile_update_rows(
         return err("PATCH /rows expects a JSON object body.", code=INVALID_ARGUMENT)
     column_meta = _column_meta(columns)
     params: list[Any] = []
-    set_parts: list[str] = []
-    for raw_col, value in body.items():
-        if not isinstance(raw_col, str) or not raw_col:
-            return err("PATCH column names must be non-empty strings.", code=INVALID_ARGUMENT)
-        if raw_col in UPDATE_IMMUTABLE:
-            continue
-        if raw_col not in column_meta:
-            return _unknown_column(raw_col, column_meta)
-        set_parts.append(
-            f"{table_data_repo.safe_ident(raw_col)} = "
-            f"{_add_param(params, _normalize_value(value, column_meta[raw_col]))}"
-        )
-    if not set_parts:
-        return err("PATCH body must include at least one mutable column.", code=INVALID_ARGUMENT)
+    set_parts = _compile_update_set_parts(body, column_meta, params)
+    if isinstance(set_parts, dict):
+        return set_parts
     set_parts.append("updated_at = NOW()")
 
     where_or_error = _compile_mutation_where(query_params, column_meta, params)
@@ -301,6 +390,48 @@ def compile_update_rows(
     sql = (
         f"UPDATE {table_data_repo.pg_table_name(vault_name, table_name)} "
         f"SET {', '.join(set_parts)} WHERE {where_sql}{returning_sql}"
+    )
+    return _CompiledMutation(
+        sql=sql,
+        params=params,
+        fetch=fetch,
+        status_code=200 if fetch else 204,
+        projections=projections,
+    )
+
+
+def _compile_update_ast(
+    *,
+    vault_name: str,
+    table_name: str,
+    columns: list[dict],
+    body: Any,
+    ast: Mapping[str, Any],
+    returning: str | None,
+    prefer_header: str | None,
+) -> _CompiledMutation | dict[str, Any]:
+    if not isinstance(body, Mapping):
+        return err("AST update must be an object.", code=INVALID_ARGUMENT)
+    column_meta = _column_meta(columns)
+    params: list[Any] = []
+    set_parts = _compile_update_set_parts(body, column_meta, params)
+    if isinstance(set_parts, dict):
+        return set_parts
+    set_parts.append("updated_at = NOW()")
+    where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
+    if isinstance(where_or_error, dict):
+        return where_or_error
+    fetch = _prefer_return_representation(prefer_header)
+    projections: list[Any] = []
+    returning_sql = ""
+    if fetch:
+        returning_or_error = _compile_returning(returning, column_meta, params)
+        if isinstance(returning_or_error, dict):
+            return returning_or_error
+        returning_sql, projections = returning_or_error
+    sql = (
+        f"UPDATE {table_data_repo.pg_table_name(vault_name, table_name)} "
+        f"SET {', '.join(set_parts)} WHERE {where_or_error}{returning_sql}"
     )
     return _CompiledMutation(
         sql=sql,
@@ -336,6 +467,38 @@ def compile_delete_rows(
         returning_sql, projections = returning_or_error
 
     sql = f"DELETE FROM {table_data_repo.pg_table_name(vault_name, table_name)} WHERE {where_sql}{returning_sql}"
+    return _CompiledMutation(
+        sql=sql,
+        params=params,
+        fetch=fetch,
+        status_code=200 if fetch else 204,
+        projections=projections,
+    )
+
+
+def _compile_delete_ast(
+    *,
+    vault_name: str,
+    table_name: str,
+    columns: list[dict],
+    ast: Mapping[str, Any],
+    returning: str | None,
+    prefer_header: str | None,
+) -> _CompiledMutation | dict[str, Any]:
+    column_meta = _column_meta(columns)
+    params: list[Any] = []
+    where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
+    if isinstance(where_or_error, dict):
+        return where_or_error
+    fetch = _prefer_return_representation(prefer_header)
+    projections: list[Any] = []
+    returning_sql = ""
+    if fetch:
+        returning_or_error = _compile_returning(returning, column_meta, params)
+        if isinstance(returning_or_error, dict):
+            return returning_or_error
+        returning_sql, projections = returning_or_error
+    sql = f"DELETE FROM {table_data_repo.pg_table_name(vault_name, table_name)} WHERE {where_or_error}{returning_sql}"
     return _CompiledMutation(
         sql=sql,
         params=params,
@@ -440,6 +603,28 @@ def _insert_columns(
     return ordered
 
 
+def _compile_update_set_parts(
+    body: Mapping[str, Any],
+    column_meta: dict[str, str],
+    params: list[Any],
+) -> list[str] | dict[str, Any]:
+    set_parts: list[str] = []
+    for raw_col, value in body.items():
+        if not isinstance(raw_col, str) or not raw_col:
+            return err("PATCH column names must be non-empty strings.", code=INVALID_ARGUMENT)
+        if raw_col in UPDATE_IMMUTABLE:
+            continue
+        if raw_col not in column_meta:
+            return _unknown_column(raw_col, column_meta)
+        set_parts.append(
+            f"{table_data_repo.safe_ident(raw_col)} = "
+            f"{_add_param(params, _normalize_value(value, column_meta[raw_col]))}"
+        )
+    if not set_parts:
+        return err("PATCH body must include at least one mutable column.", code=INVALID_ARGUMENT)
+    return set_parts
+
+
 def _compile_mutation_where(
     query_params: Sequence[tuple[str, str]],
     column_meta: dict[str, str],
@@ -461,6 +646,31 @@ def _compile_mutation_where(
     return where_or_error or "TRUE"
 
 
+def _compile_ast_mutation_where(
+    ast: Mapping[str, Any],
+    column_meta: dict[str, str],
+    params: list[Any],
+) -> str | dict[str, Any]:
+    node = None
+    for key in ("where", "filter"):
+        if key in ast:
+            node = ast[key]
+            break
+    if node is None and any(key in ast for key in ("and", "or", "col", "jsonb")):
+        node = ast
+    if node is None:
+        if _ast_all_rows_enabled(ast):
+            return "TRUE"
+        return err(
+            "PATCH and DELETE require a filter unless all=true is explicit.",
+            code=UNFILTERED_MUTATION,
+        )
+    where_or_error = _compile_ast_filter(node, column_meta, params, depth=1)
+    if isinstance(where_or_error, dict):
+        return where_or_error
+    return where_or_error or "TRUE"
+
+
 def _compile_returning(
     select_value: str | None,
     column_meta: dict[str, str],
@@ -470,6 +680,38 @@ def _compile_returning(
     if isinstance(projections_or_error, dict):
         return projections_or_error
     return f" RETURNING {', '.join(p.sql for p in projections_or_error)}", projections_or_error
+
+
+def _ast_returning_select(ast: Mapping[str, Any]) -> str | None | dict[str, Any]:
+    value = ast.get("returning", ast.get("select"))
+    if value is None:
+        return None
+    if value is True:
+        return "*"
+    if value is False:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        out: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                return err("AST returning entries must be strings.", code=INVALID_ARGUMENT)
+            out.append(item)
+        return ",".join(out)
+    return err("AST returning must be a string, string array, or boolean.", code=INVALID_ARGUMENT)
+
+
+def _ast_prefer_header(ast: Mapping[str, Any], prefer_header: str | None) -> str | None:
+    parts = [prefer_header] if prefer_header else []
+    if ast.get("returning") is not None or ast.get("select") is not None:
+        parts.append("return=representation")
+    resolution = ast.get("resolution")
+    if resolution is not None:
+        if not isinstance(resolution, str):
+            return prefer_header
+        parts.append(f"resolution={resolution}")
+    return ", ".join(parts) if parts else None
 
 
 def _compile_on_conflict(
@@ -543,6 +785,13 @@ def _prefer_ignore_duplicates(prefer_header: str | None) -> bool:
 def _all_rows_enabled(query_params: Sequence[tuple[str, str]]) -> bool:
     value = _last_value(query_params, "all")
     return bool(value and value.lower() in {"1", "true", "yes"})
+
+
+def _ast_all_rows_enabled(ast: Mapping[str, Any]) -> bool:
+    value = ast.get("all")
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.lower() in {"1", "true", "yes"}
 
 
 def _last_value(query_params: Sequence[tuple[str, str]], key: str) -> str | None:
