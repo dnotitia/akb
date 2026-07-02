@@ -38,6 +38,7 @@ const requestResult = await client.request<TableQueryEnvelope>("/tables/reef/sql
   body: JSON.stringify({ sql: "SELECT id FROM incidents" }),
 });
 requestResult.throwOnError().data.kind satisfies "table_query";
+await client.vault("eng").from("tasks").select("id");
 
 const typedClient = createClient<AkbSchema>({ baseUrl: "https://akb.test/api/v1" });
 typedClient satisfies AkbClient<AkbSchema>;
@@ -50,6 +51,39 @@ typedClient.vault("eng").from("tasks").request("/rows");
 typedClient.docs.request("/eng/readme.md");
 const builderResult = await typedClient.vault("eng").from("tasks").select("title").eq("status", "todo");
 builderResult.throwOnError().data.items.at(0)?.title satisfies string | undefined;
+// @ts-expect-error metadata was not selected.
+builderResult.throwOnError().data.items.at(0)?.metadata;
+const selectedColumns = await typedClient.vault("eng").from("tasks").select("title,status");
+selectedColumns.throwOnError().data.items.at(0)?.status satisfies "todo" | "done" | undefined;
+// @ts-expect-error unknown columns are rejected in select strings.
+typedClient.vault("eng").from("tasks").select("titel");
+const jsonPathResult = await typedClient.vault("eng").from("tasks").select("metadata->>tier");
+jsonPathResult.throwOnError().data.items.at(0)?.["metadata->>tier"] satisfies string | null | undefined;
+const jsonPathListResult = await typedClient.vault("eng").from("tasks").select("metadata#>>{stats,count}");
+jsonPathListResult.throwOnError().data.items.at(0)?.["metadata#>>{stats,count}"] satisfies string | null | undefined;
+const jsonPathCastResult = await typedClient.vault("eng").from("tasks").select("metadata#>>{stats,count}::int");
+jsonPathCastResult.throwOnError().data.items.at(0)?.["metadata#>>{stats,count}::int"] satisfies string | null | undefined;
+const mixedJsonPathCast = await typedClient.vault("eng").from("tasks").select("title,metadata->>tier::text");
+mixedJsonPathCast.throwOnError().data.items.at(0)?.title satisfies string | undefined;
+mixedJsonPathCast.throwOnError().data.items.at(0)?.["metadata->>tier::text"] satisfies string | null | undefined;
+const mixedJsonPathList = await typedClient.vault("eng").from("tasks").select("title,metadata#>>{stats,count}");
+mixedJsonPathList.throwOnError().data.items.at(0)?.["metadata#>>{stats,count}"] satisfies string | null | undefined;
+// @ts-expect-error casts must not turn the whole select string into an alias-shaped wide boundary.
+typedClient.vault("eng").from("tasks").select("titel,metadata->>tier::text");
+// @ts-expect-error a leading JSON path must not hide sibling column typos.
+typedClient.vault("eng").from("tasks").select("metadata->>tier,titel");
+const starAndJsonPath = await typedClient.vault("eng").from("tasks").select("*,metadata->>tier");
+starAndJsonPath.throwOnError().data.items.at(0)?.metadata satisfies import("./fixtures/akb.types.ts").Json | null | undefined;
+starAndJsonPath.throwOnError().data.items.at(0)?.["metadata->>tier"] satisfies string | null | undefined;
+const wideJoinBoundary = await typedClient.vault("eng").from("tasks").select("owner:users(id)");
+wideJoinBoundary.throwOnError().data.items.at(0)?.metadata satisfies import("./fixtures/akb.types.ts").Json | null | undefined;
+const wideJoinWithInnerComma = await typedClient.vault("eng").from("tasks").select("owner:users(id,name)");
+wideJoinWithInnerComma.throwOnError().data.items.at(0)?.metadata satisfies import("./fixtures/akb.types.ts").Json | null | undefined;
+// @ts-expect-error wide join tokens must not hide sibling column typos.
+typedClient.vault("eng").from("tasks").select("titel,owner:users(id)");
+const dynamicColumns: string = "title,status";
+const dynamicSelect = await typedClient.vault("eng").from("tasks").select(dynamicColumns);
+dynamicSelect.throwOnError().data.items.at(0)?.metadata satisfies import("./fixtures/akb.types.ts").Json | null | undefined;
 const writeResult = await typedClient
   .vault("eng")
   .from("tasks")
@@ -63,6 +97,8 @@ const singleWriteResult = await typedClient
   .select("title")
   .single();
 singleWriteResult.throwOnError().data.title satisfies string;
+// @ts-expect-error status was not selected before single().
+singleWriteResult.throwOnError().data.status;
 const maybeDeleted = await typedClient.vault("eng").from("tasks").delete().eq("status", "done").select("*").maybeSingle();
 maybeDeleted.throwOnError().data?.status satisfies "todo" | "done" | undefined;
 // @ts-expect-error generated Update restricts status to the table enum.

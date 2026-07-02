@@ -95,10 +95,111 @@ export type AkbTableUpdate<Schema, TableName extends string> =
   AkbTableMap<Schema> extends Record<TableName, { Update: infer Update }> ? Update : Partial<AkbTableRow<Schema, TableName>>;
 
 export type AkbSingleResult<Row, Result> =
-  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>] ? Row : Result;
+  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<infer Selected>] ? Selected : Result;
 
 export type AkbMaybeSingleResult<Row, Result> =
-  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>] ? Row | null : Result;
+  [Result] extends [import("./core/schema.gen.js").AkbTableQueryEnvelope<infer Selected>] ? Selected | null : Result;
+
+export type AkbTrim<S extends string> =
+  S extends ` ${infer R}` ? AkbTrim<R> :
+  S extends `${infer R} ` ? AkbTrim<R> :
+  S;
+
+export type AkbPopDepth<T extends unknown[]> = T extends [unknown, ...infer Rest] ? Rest : [];
+
+export type AkbSplitSelect<
+  S extends string,
+  Current extends string = "",
+  Parts extends string[] = [],
+  ParenDepth extends unknown[] = [],
+  BraceDepth extends unknown[] = [],
+> =
+  S extends `${infer Ch}${infer Rest}`
+    ? Ch extends ","
+      ? ParenDepth extends []
+        ? BraceDepth extends []
+          ? AkbSplitSelect<Rest, "", [...Parts, AkbTrim<Current>], ParenDepth, BraceDepth>
+          : AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, ParenDepth, BraceDepth>
+        : AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, ParenDepth, BraceDepth>
+      : Ch extends "("
+        ? AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, [unknown, ...ParenDepth], BraceDepth>
+        : Ch extends ")"
+          ? AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, AkbPopDepth<ParenDepth>, BraceDepth>
+          : Ch extends "{"
+            ? AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, ParenDepth, [unknown, ...BraceDepth]>
+            : Ch extends "}"
+              ? AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, ParenDepth, AkbPopDepth<BraceDepth>>
+              : AkbSplitSelect<Rest, `${Current}${Ch}`, Parts, ParenDepth, BraceDepth>
+    : [...Parts, AkbTrim<Current>];
+
+export type AkbSelectTokenIsWide<Token extends string> =
+  Token extends `${string}(${string}` ? true :
+  Token extends `${string}:${string}` ? Token extends `${string}::${string}` ? false : true :
+  false;
+
+export type AkbJsonPathBase<Token extends string> =
+  Token extends `${infer Base}->>${string}` ? Base :
+  Token extends `${infer Base}#>>${string}` ? Base :
+  never;
+
+export type AkbSelectTokenIsJsonPath<Row, Token extends string> =
+  [AkbJsonPathBase<Token>] extends [never] ? false :
+  AkbJsonPathBase<Token> extends keyof Row ? true : false;
+
+export type AkbInvalidSelectToken<Row, Token extends string> =
+  Token extends "" | "*" ? never :
+  AkbSelectTokenIsWide<Token> extends true ? never :
+  AkbSelectTokenIsJsonPath<Row, Token> extends true ? never :
+  Token extends keyof Row ? never :
+  Token;
+
+export type AkbInvalidSelectTokens<Row, Columns extends string> =
+  AkbSplitSelect<Columns>[number] extends infer Token
+    ? Token extends string ? AkbInvalidSelectToken<Row, Token> : never
+    : never;
+
+export type AkbSelectStringIsWide<Columns extends string> =
+  true extends AkbSelectHasWideToken<Columns> ? true : false;
+
+export type AkbSelectStringIsSingleJsonPath<Row, Columns extends string> =
+  AkbSelectTokenIsJsonPath<Row, AkbTrim<Columns>> extends true ? true : false;
+
+export type AkbSelectString<Row, Columns extends string> =
+  [keyof Row] extends [never] ? Columns :
+  string extends Columns ? Columns :
+  AkbInvalidSelectTokens<Row, Columns> extends never ? Columns : never;
+
+export type AkbSelectHasWideToken<Columns extends string> =
+  AkbSplitSelect<Columns>[number] extends infer Token
+    ? Token extends string ? AkbSelectTokenIsWide<Token> : never
+    : never;
+
+export type AkbPlainSelectKeys<Row, Columns extends string> =
+  Extract<AkbSplitSelect<Columns>[number], keyof Row>;
+
+export type AkbSelectHasStar<Columns extends string> =
+  "*" extends AkbSplitSelect<Columns>[number] ? true : false;
+
+export type AkbJsonSelectShape<Row, Columns extends string> = {
+  [Token in AkbSplitSelect<Columns>[number] as
+    Token extends string
+      ? AkbSelectTokenIsJsonPath<Row, Token> extends true ? Token : never
+      : never
+  ]: string | null;
+};
+
+export type AkbJsonSelectTokenShape<Row, Token extends string> = {
+  [Key in AkbTrim<Token> as AkbSelectTokenIsJsonPath<Row, Key> extends true ? Key : never]: string | null;
+};
+
+export type AkbSelectResult<Row, Columns extends string> =
+  [keyof Row] extends [never] ? Row :
+  string extends Columns ? Row :
+  AkbTrim<Columns> extends "" | "*" ? Row :
+  AkbSelectStringIsWide<Columns> extends true ? Row :
+  AkbSelectHasStar<Columns> extends true ? Row & AkbJsonSelectShape<Row, Columns> :
+  true extends AkbSelectHasWideToken<Columns> ? Row :
+  Pick<Row, AkbPlainSelectKeys<Row, Columns>> & AkbJsonSelectShape<Row, Columns>;
 
 export interface AkbClaims {
   sub: string;
@@ -129,7 +230,9 @@ export interface AkbTableStub<
   readonly table: string;
   readonly vault: string | null;
   request<T = AkbSuccessEnvelope>(path?: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
-  select(columns?: string): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>, Insert, Update>;
+  select<const Columns extends string = "*">(
+    columns?: Columns & AkbSelectString<Row, Columns>,
+  ): AkbTableStub<Row, import("./core/schema.gen.js").AkbTableQueryEnvelope<AkbSelectResult<Row, Columns>>, Insert, Update>;
   filter(column: string, operator: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
   eq(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
   neq(column: string, value: unknown): AkbTableStub<Row, Result, Insert, Update>;
