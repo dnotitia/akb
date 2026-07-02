@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import asyncpg
 from pathlib import Path
 
@@ -10,15 +11,45 @@ logger = logging.getLogger(__name__)
 _pool: asyncpg.Pool | None = None
 
 
+def _pool_sizes() -> tuple[int, int]:
+    """Resolve main-pool sizing: env > app.yaml > defaults.
+
+    AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE are the one deliberate
+    env-var exception to the YAML-only config rule (see app.config): the
+    akb-platform operator and k8s operators tune pool size per deployment
+    without re-rendering config files. Invalid values fail startup loudly
+    rather than silently falling back — same philosophy as Settings'
+    extra="forbid".
+    """
+    def resolve(env_key: str, fallback: int) -> int:
+        raw = os.getenv(env_key)
+        if raw is None or raw.strip() == "":
+            return fallback
+        try:
+            return int(raw)
+        except ValueError:
+            raise RuntimeError(f"{env_key} must be an integer, got {raw!r}") from None
+
+    min_size = resolve("AKB_PG_POOL_MIN_SIZE", settings.pg_pool_min_size)
+    max_size = resolve("AKB_PG_POOL_MAX_SIZE", settings.pg_pool_max_size)
+    if min_size < 0 or max_size < 1 or min_size > max_size:
+        raise RuntimeError(
+            f"invalid PG pool sizing: min_size={min_size}, max_size={max_size} "
+            "(need 0 <= min_size <= max_size and max_size >= 1)"
+        )
+    return min_size, max_size
+
+
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
+        min_size, max_size = _pool_sizes()
         for attempt in range(10):
             try:
                 _pool = await asyncpg.create_pool(
                     dsn=settings.asyncpg_dsn,
-                    min_size=2,
-                    max_size=20,
+                    min_size=min_size,
+                    max_size=max_size,
                     # Per-statement timeout. Without this a hung query holds
                     # its pool slot forever; an upstream service freeze can
                     # drain the pool in minutes (observed 2026-04-16).
