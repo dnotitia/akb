@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AkbError, createClient, unwrapAkbResponse } from "../src/index.js";
+import { AkbError, createClient, createTypedFetch, unwrapAkbResponse } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
 
 test("unwrapAkbResponse keeps successful kind envelope as data", () => {
@@ -112,6 +112,38 @@ test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
     () => client.actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1" } }),
     /app_metadata\.role/,
   );
+});
+
+test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary", async () => {
+  let seenUrl = "";
+  let seenInit = {};
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: "service-key",
+    fetch: async (input, init) => {
+      seenUrl = String(input);
+      seenInit = init ?? {};
+      return new Response(
+        JSON.stringify({ kind: "vault_table_schema", vault: "eng", tables: [], total: 0 }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  }).actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const typedFetch = createTypedFetch(client);
+  const result = await typedFetch("get", "/api/v1/tables/{vault}/schema", {
+    path: { vault: "eng" },
+    query: { fresh: true },
+  });
+  const headers = Object.fromEntries(new Headers(seenInit.headers));
+
+  assert.equal(seenUrl, "https://akb.test/api/v1/tables/eng/schema?fresh=true");
+  assert.equal(seenInit.method, "GET");
+  assert.equal(headers.authorization, "Bearer service-key");
+  assert.deepEqual(JSON.parse(headers["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.equal(result.throwOnError().data.kind, "vault_table_schema");
 });
 
 test("lite subpath exposes the client boundary without a separate runtime", () => {

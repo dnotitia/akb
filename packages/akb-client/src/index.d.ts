@@ -6,6 +6,29 @@ export type AkbJsonValue =
   | AkbJsonValue[]
   | { [key: string]: AkbJsonValue };
 
+export type {
+  AkbOperation,
+  AkbOperationResponse,
+  AkbPath,
+  AkbPathMethod,
+  AkbTypedFetch,
+  AkbTypedFetchInit,
+} from "./core/fetch.js";
+export { createTypedFetch } from "./core/fetch.js";
+export type {
+  AkbFileEnvelope,
+  AkbSqlEnvelope,
+  AkbTableEnvelope,
+  AkbTableMigrationEnvelope,
+  AkbTableQueryEnvelope,
+  AkbTableSchemaEnvelope,
+  AkbTableSqlEnvelope,
+  AkbVaultTableSchemaEnvelope,
+  components,
+  operations,
+  paths,
+} from "./core/schema.gen.js";
+
 export interface AkbSuccessEnvelope {
   kind: string;
   [key: string]: AkbJsonValue | undefined;
@@ -55,6 +78,15 @@ export interface AkbClientConfig {
 
 export interface AkbClientOptions extends Omit<AkbClientConfig, "baseUrl"> {}
 
+export type AkbTableMap<Schema> = Schema extends { public: { Tables: infer Tables } }
+  ? Tables
+  : Record<string, { Row: unknown; Insert: unknown; Update: unknown }>;
+
+export type AkbTableNames<Schema> = string & keyof AkbTableMap<Schema>;
+
+export type AkbTableRow<Schema, TableName extends string> =
+  AkbTableMap<Schema> extends Record<TableName, { Row: infer Row }> ? Row : unknown;
+
 export interface AkbClaims {
   sub: string;
   app_metadata: {
@@ -87,7 +119,7 @@ export interface AkbClient<Schema = unknown> {
   request<T = AkbSuccessEnvelope>(path: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
   vault(vault: string): AkbClient<Schema>;
   actingAs(claims: AkbClaims): AkbClient<Schema>;
-  from<TableName extends string>(table: TableName): AkbTableStub;
+  from<TableName extends AkbTableNames<Schema>>(table: TableName): AkbTableStub<AkbTableRow<Schema, TableName>>;
   readonly search: AkbNamespaceStub;
   readonly graph: AkbNamespaceStub;
   readonly docs: AkbNamespaceStub;

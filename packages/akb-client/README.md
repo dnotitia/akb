@@ -71,3 +71,10 @@ For CI drift checks, regenerate and compare the committed file:
 ```bash
 akb gen types --vault eng --url "$AKB_URL" --check akb.types.ts
 ```
+
+## Internal OpenAPI Core
+
+`src/core/schema.gen.d.ts` is the generated low-level REST operation map used
+by `createTypedFetch`. It stays separate from runtime table types: OpenAPI
+types describe AKB endpoints, while `akb gen types` describes user tables inside
+a vault.

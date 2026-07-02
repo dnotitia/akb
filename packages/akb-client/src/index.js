@@ -21,6 +21,8 @@ export class AkbError extends Error {
   }
 }
 
+export { createTypedFetch } from "./core/fetch.js";
+
 /**
  * Convert one parsed HTTP response body into a `{data,error}` result.
  *
