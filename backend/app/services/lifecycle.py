@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder, vault_backfill
+from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder, vault_backfill, write_lane
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -134,7 +134,11 @@ def start_workers() -> None:
     # also depends on it — move to the always-run path if API/worker tiers split.)
     sparse_encoder.start_tokenizer_pool()
     sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
-    started = ["tokenizer_pool", "embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
+    # Dedicated git-commit executor (write-lane, command-lane round-05).
+    # Git mutations run here so blocked/slow commits can never crowd git
+    # READS out of asyncio.to_thread's shared default executor.
+    write_lane.start_commit_pool()
+    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -196,6 +200,7 @@ async def stop_workers() -> None:
     await vault_backfill.stop()
     await sparse_encoder.stop_stats_refresher()
     sparse_encoder.stop_tokenizer_pool()
+    write_lane.stop_commit_pool()
 
 
 async def shutdown_storage() -> None:

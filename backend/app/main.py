@@ -52,9 +52,17 @@ app = FastAPI(
 # Global exception handler
 @app.exception_handler(AKBError)
 async def akb_error_handler(request: Request, exc: AKBError):
+    # WriteBusyError (429) carries a retry hint; RFC 6585 wants it as a
+    # Retry-After header so well-behaved clients back off without parsing
+    # the body.
+    headers = None
+    retry_after = getattr(exc, "retry_after_secs", None)
+    if retry_after is not None:
+        headers = {"Retry-After": str(int(retry_after))}
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.message},
+        headers=headers,
     )
 
 

@@ -36,6 +36,7 @@ from app.exceptions import (
     ForbiddenError,
     NotFoundError,
     ValidationError,
+    WriteBusyError,
 )
 
 
@@ -64,6 +65,7 @@ INVALID_PATH = "invalid_path"              # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"                      # version / expected-state mismatch
+WRITE_BUSY = "write_busy"                  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"      # PG 23505 — INSERT/UPDATE breaks a unique key
 NO_OP = "no_op"                            # nothing to update / already in state
 EDIT_FAILED = "edit_failed"                # akb_edit: old_string match / uniqueness failure
@@ -135,6 +137,12 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
         return err(str(e), code=CONFLICT)
+    if isinstance(e, WriteBusyError):
+        return err(
+            str(e), code=WRITE_BUSY,
+            hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
+            retry_after_secs=e.retry_after_secs,
+        )
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
     return err(str(e), code=INTERNAL)

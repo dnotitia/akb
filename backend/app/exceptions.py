@@ -33,6 +33,25 @@ class ForbiddenError(AKBError):
         super().__init__(message, status_code=403)
 
 
+class WriteBusyError(AKBError):
+    """Write admission timed out → HTTP 429.
+
+    Raised by the write lane (services/write_lane.py) when a git-committing
+    write waited out its queue deadline (per-vault gate + global lane), or
+    when the global waiter backstop is full. The request performed no work —
+    retrying after a short backoff is always safe. ``retry_after_secs`` is
+    surfaced as the HTTP ``Retry-After`` header and in the MCP error envelope.
+    """
+
+    def __init__(self, vault: str, waited_secs: float, retry_after_secs: int = 5):
+        self.retry_after_secs = retry_after_secs
+        super().__init__(
+            f"Write queue for vault '{vault}' is saturated "
+            f"(gave up after {waited_secs:.0f}s); retry shortly",
+            status_code=429,
+        )
+
+
 class ValidationError(AKBError, ValueError):
     """Client-input error → HTTP 422.
 

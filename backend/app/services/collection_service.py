@@ -9,7 +9,6 @@ and emits `collection.delete`. Anything that would mutate git happens
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 
@@ -26,6 +25,7 @@ from app.services.index_service import (
 from app.services.kg_service import delete_document_relations
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri, table_uri
+from app.services.write_lane import run_git_write, write_lane
 
 logger = logging.getLogger("akb.collections")
 
@@ -397,12 +397,19 @@ class CollectionService:
         # correct. Logged loudly so an operator can reconcile.
         if doc_paths_for_git:
             try:
-                await asyncio.to_thread(
-                    self.git.delete_paths_bulk,
-                    vault_name=vault,
-                    file_paths=doc_paths_for_git,
-                    message=commit_msg_for_git,
-                )
+                # Write-lane gate + commit executor: this commit contends on
+                # the vault git lock like any writer, and must never wait for
+                # it inside a shared executor thread. It holds no PG
+                # connection here (TX already committed), so a lane timeout
+                # (WriteBusyError) simply falls into the operator-reconcile
+                # path below — the API call still succeeds.
+                async with write_lane(vault):
+                    await run_git_write(
+                        self.git.delete_paths_bulk,
+                        vault_name=vault,
+                        file_paths=doc_paths_for_git,
+                        message=commit_msg_for_git,
+                    )
             except FileNotFoundError:
                 # No bare repo (test fixtures, fresh vault) — DB is
                 # already consistent, nothing to clean up.
