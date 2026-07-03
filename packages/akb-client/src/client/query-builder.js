@@ -1,54 +1,12 @@
 import { AkbError } from "../errors.js";
+import { compileMutation, compileQuery, unsupportedMutationModifiers } from "./query-compiler.js";
+import { applyResultMode, clientResult } from "./query-result.js";
 
-const NAMED_OPERATORS = new Set([
-  "cs",
-  "eq",
-  "gt",
-  "gte",
-  "ilike",
-  "in",
-  "is",
-  "like",
-  "lt",
-  "lte",
-  "neq",
-]);
+/** @typedef {import("./query-types.js").QueryBuilderOptions} QueryBuilderOptions */
+/** @typedef {import("./query-types.js").QueryState} QueryState */
+/** @typedef {import("./query-types.js").QueryNode} QueryNode */
 
 const MAX_BOOLEAN_DEPTH = 3;
-const JSON_PATH_COLUMN_RE = /^([a-z][a-z0-9_]*)(?:(->>|#>>)([^:]+))?(?:::([a-z]+))?$/;
-
-/**
- * @typedef {{
- *   baseUrl: string,
- *   table: string,
- *   vault: string | null,
- *   request: import("../index.js").AkbClient["request"],
- *   maxUrlBytes: number,
- * }} QueryBuilderOptions
- *
- * @typedef {{ type: "filter", column: string, operator: string, value: unknown }} FilterNode
- * @typedef {{ type: "group", op: "and" | "or", expression?: string, nodes?: QueryNode[] }} GroupNode
- * @typedef {FilterNode | GroupNode} QueryNode
- * @typedef {{ column: string, ascending: boolean }} OrderNode
- * @typedef {{
- *   type: "insert" | "update" | "upsert" | "delete",
- *   body?: unknown,
- *   onConflict?: string | null,
- *   ignoreDuplicates?: boolean,
- * }} MutationState
- * @typedef {{
- *   select: string | null,
- *   nodes: QueryNode[],
- *   order: OrderNode[],
- *   limit: number | null,
- *   offset: number | null,
- *   range: { from: number, to: number } | null,
- *   count: "exact" | "planned" | "estimated" | null,
- *   mutation: MutationState | null,
- *   all: boolean,
- *   resultMode: "rows" | "single" | "maybeSingle",
- * }} QueryState
- */
 
 /**
  * @param {QueryBuilderOptions} options
@@ -58,7 +16,54 @@ export function createQueryBuilder(options) {
   return /** @type {import("../index.js").AkbTableStub} */ (new QueryBuilder(options, emptyState()));
 }
 
-class QueryBuilder {
+/**
+ * Named-operator shortcuts shared by {@link QueryBuilder} and {@link GroupBuilder}.
+ *
+ * Each shortcut delegates to `filter()`, which the two subclasses implement with
+ * different semantics (immutable clone vs. mutable push). The base class stays
+ * abstract: `filter()` must be overridden.
+ */
+class FilterBuilder {
+  /**
+   * @param {string} column
+   * @param {string} operator
+   * @param {unknown} value
+   * @returns {this}
+   */
+  filter(column, operator, value) {
+    throw new Error("filter() must be implemented by a subclass.");
+  }
+
+  /** @param {string} column @param {unknown} value @returns {this} */
+  eq(column, value) { return this.filter(column, "eq", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  neq(column, value) { return this.filter(column, "neq", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  gt(column, value) { return this.filter(column, "gt", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  gte(column, value) { return this.filter(column, "gte", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  lt(column, value) { return this.filter(column, "lt", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  lte(column, value) { return this.filter(column, "lte", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  like(column, value) { return this.filter(column, "like", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  ilike(column, value) { return this.filter(column, "ilike", value); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  is(column, value) { return this.filter(column, "is", value); }
+  /** @param {string} column @param {readonly unknown[]} value @returns {this} */
+  in(column, value) { return this.filter(column, "in", Array.from(value)); }
+  /** @param {string} column @param {unknown} value @returns {this} */
+  cs(column, value) { return this.filter(column, "cs", value); }
+
+  /** @param {string} column @param {string} operator @param {unknown} value @returns {this} */
+  not(column, operator, value) {
+    return this.filter(column, `not.${operator}`, value);
+  }
+}
+
+class QueryBuilder extends FilterBuilder {
   /** @type {Promise<import("../index.js").AkbResult<unknown>> | null} */
   #promise = null;
 
@@ -67,6 +72,7 @@ class QueryBuilder {
    * @param {QueryState} state
    */
   constructor(options, state) {
+    super();
     this.table = options.table;
     this.vault = options.vault;
     this.#options = options;
@@ -104,43 +110,10 @@ class QueryBuilder {
    * @param {string} column
    * @param {string} operator
    * @param {unknown} value
-   * @returns {QueryBuilder}
+   * @returns {this}
    */
   filter(column, operator, value) {
-    return this.#appendNode(filterNode(column, operator, value));
-  }
-
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  eq(column, value) { return this.filter(column, "eq", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  neq(column, value) { return this.filter(column, "neq", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  gt(column, value) { return this.filter(column, "gt", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  gte(column, value) { return this.filter(column, "gte", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  lt(column, value) { return this.filter(column, "lt", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  lte(column, value) { return this.filter(column, "lte", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  like(column, value) { return this.filter(column, "like", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  ilike(column, value) { return this.filter(column, "ilike", value); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  is(column, value) { return this.filter(column, "is", value); }
-  /** @param {string} column @param {readonly unknown[]} value @returns {QueryBuilder} */
-  in(column, value) { return this.filter(column, "in", Array.from(value)); }
-  /** @param {string} column @param {unknown} value @returns {QueryBuilder} */
-  cs(column, value) { return this.filter(column, "cs", value); }
-
-  /**
-   * @param {string} column
-   * @param {string} operator
-   * @param {unknown} value
-   * @returns {QueryBuilder}
-   */
-  not(column, operator, value) {
-    return this.filter(column, `not.${operator}`, value);
+    return /** @type {this} */ (this.#appendNode(filterNode(column, operator, value)));
   }
 
   /**
@@ -378,47 +351,21 @@ class QueryBuilder {
   }
 }
 
-class GroupBuilder {
+class GroupBuilder extends FilterBuilder {
   /**
    * @param {number} depth
    */
   constructor(depth = 1) {
+    super();
     this.depth = depth;
     /** @type {QueryNode[]} */
     this.nodes = [];
   }
 
-  /** @param {string} column @param {string} operator @param {unknown} value @returns {GroupBuilder} */
+  /** @param {string} column @param {string} operator @param {unknown} value @returns {this} */
   filter(column, operator, value) {
     this.nodes.push(filterNode(column, operator, value));
     return this;
-  }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  eq(column, value) { return this.filter(column, "eq", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  neq(column, value) { return this.filter(column, "neq", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  gt(column, value) { return this.filter(column, "gt", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  gte(column, value) { return this.filter(column, "gte", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  lt(column, value) { return this.filter(column, "lt", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  lte(column, value) { return this.filter(column, "lte", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  like(column, value) { return this.filter(column, "like", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  ilike(column, value) { return this.filter(column, "ilike", value); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  is(column, value) { return this.filter(column, "is", value); }
-  /** @param {string} column @param {readonly unknown[]} value @returns {GroupBuilder} */
-  in(column, value) { return this.filter(column, "in", Array.from(value)); }
-  /** @param {string} column @param {unknown} value @returns {GroupBuilder} */
-  cs(column, value) { return this.filter(column, "cs", value); }
-
-  /** @param {string} column @param {string} operator @param {unknown} value @returns {GroupBuilder} */
-  not(column, operator, value) {
-    return this.filter(column, `not.${operator}`, value);
   }
 
   /** @param {string | import("../index.js").AkbFilterGroupCallback} group @returns {GroupBuilder} */
@@ -456,7 +403,7 @@ function emptyState() {
  * @param {string} column
  * @param {string} operator
  * @param {unknown} value
- * @returns {FilterNode}
+ * @returns {import("./query-types.js").FilterNode}
  */
 function filterNode(column, operator, value) {
   if (!column) throw new TypeError("filter column is required.");
@@ -468,7 +415,7 @@ function filterNode(column, operator, value) {
  * @param {"and" | "or"} op
  * @param {string | import("../index.js").AkbFilterGroupCallback} group
  * @param {number} [depth]
- * @returns {GroupNode}
+ * @returns {import("./query-types.js").GroupNode}
  */
 function groupNode(op, group, depth = 1) {
   if (typeof group === "string") return { type: "group", op, expression: group };
@@ -479,498 +426,6 @@ function groupNode(op, group, depth = 1) {
   const returned = group(builder);
   const resolved = returned instanceof GroupBuilder ? returned : builder;
   return { type: "group", op, nodes: resolved.nodes };
-}
-
-/**
- * @param {QueryState} state
- * @param {number} maxUrlBytes
- * @param {string} rowsUrlPrefix
- * @returns {{ method: "GET", query: string, headers: Headers } | { method: "POST", body: object, headers: Headers }}
- */
-function compileQuery(state, maxUrlBytes, rowsUrlPrefix) {
-  const headers = new Headers();
-  if (state.count) headers.set("prefer", `count=${state.count}`);
-  if (state.range) headers.set("range", `${state.range.from}-${state.range.to}`);
-  const query = serializeUrl(state);
-  const canUseUrl = byteLength(`${rowsUrlPrefix}${query}`) <= maxUrlBytes
-    && !containsNestedGroup(state.nodes)
-    && !containsUrlUnsafeArrayValue(state.nodes)
-    && !containsUrlUnsafeBooleanValue(state.nodes);
-  if (canUseUrl) {
-    return { method: "GET", query, headers };
-  }
-  return { method: "POST", body: serializeAst(state), headers };
-}
-
-/**
- * @param {QueryState} state
- * @param {MutationState} mutation
- * @param {number} maxUrlBytes
- * @param {string} rowsPath
- * @param {string} rowsUrlPrefix
- * @returns {{ method: "POST" | "PATCH" | "DELETE", path: string, headers: Headers, body?: object | unknown }}
- */
-function compileMutation(state, mutation, maxUrlBytes, rowsPath, rowsUrlPrefix) {
-  const headers = new Headers();
-  headers.set("prefer", mutationPreferHeader(state, mutation));
-  const query = serializeMutationUrl(state, mutation);
-  const canUseRows = byteLength(`${rowsUrlPrefix}${query}`) <= maxUrlBytes
-    && !containsNestedGroup(state.nodes)
-    && !containsUrlUnsafeArrayValue(state.nodes)
-    && !containsUrlUnsafeBooleanValue(state.nodes);
-
-  if (canUseRows) {
-    return {
-      method: mutationMethod(mutation),
-      path: `${rowsPath}${query}`,
-      headers,
-      ...(mutation.body === undefined ? {} : { body: mutation.body }),
-    };
-  }
-
-  return {
-    method: "POST",
-    path: `${rowsPath.slice(0, -"/rows".length)}/query`,
-    headers,
-    body: serializeMutationAst(state, mutation),
-  };
-}
-
-/**
- * @param {QueryState} state
- * @returns {string[]}
- */
-function unsupportedMutationModifiers(state) {
-  /** @type {string[]} */
-  const modifiers = [];
-  if (state.order.length > 0) modifiers.push("order");
-  if (state.limit !== null) modifiers.push("limit");
-  if (state.range) modifiers.push("range");
-  if (state.count) modifiers.push("count");
-  return modifiers;
-}
-
-/**
- * @param {QueryState} state
- * @returns {string}
- */
-function serializeUrl(state) {
-  const params = new URLSearchParams();
-  if (state.select) params.set("select", state.select);
-  for (const node of state.nodes) appendNodeParam(params, node);
-  if (state.order.length > 0) {
-    params.set("order", state.order.map(serializeOrder).join(","));
-  }
-  if (state.limit !== null) params.set("limit", String(state.limit));
-  if (state.offset !== null) params.set("offset", String(state.offset));
-  const suffix = params.toString();
-  return suffix ? `?${suffix}` : "";
-}
-
-/**
- * @param {QueryState} state
- * @param {MutationState} mutation
- * @returns {string}
- */
-function serializeMutationUrl(state, mutation) {
-  const params = new URLSearchParams();
-  if (state.select) params.set("select", state.select);
-  if (mutation.type === "upsert") params.set("on_conflict", mutation.onConflict || "id");
-  if ((mutation.type === "update" || mutation.type === "delete") && state.all) {
-    params.set("all", "true");
-  }
-  if (mutation.type === "update" || mutation.type === "delete") {
-    for (const node of state.nodes) appendNodeParam(params, node);
-  }
-  const suffix = params.toString();
-  return suffix ? `?${suffix}` : "";
-}
-
-/**
- * @param {QueryState} state
- * @param {MutationState} mutation
- * @returns {object}
- */
-function serializeMutationAst(state, mutation) {
-  const filter = serializeAstFilterRoot(state.nodes);
-  return {
-    ...(mutation.type === "insert" ? { insert: mutation.body } : {}),
-    ...(mutation.type === "upsert" ? { insert: mutation.body, on_conflict: mutation.onConflict || "id" } : {}),
-    ...(mutation.type === "update" ? { update: mutation.body } : {}),
-    ...(mutation.type === "delete" ? { delete: true } : {}),
-    ...(filter ? { filter } : {}),
-    ...(state.all ? { all: true } : {}),
-    ...(state.select ? { returning: state.select } : {}),
-    ...(mutation.type === "upsert" && mutation.ignoreDuplicates ? { resolution: "ignore-duplicates" } : {}),
-  };
-}
-
-/**
- * @param {MutationState} mutation
- * @returns {"POST" | "PATCH" | "DELETE"}
- */
-function mutationMethod(mutation) {
-  if (mutation.type === "update") return "PATCH";
-  if (mutation.type === "delete") return "DELETE";
-  return "POST";
-}
-
-/**
- * @param {QueryState} state
- * @param {MutationState} mutation
- * @returns {string}
- */
-function mutationPreferHeader(state, mutation) {
-  const parts = [state.select ? "return=representation" : "return=minimal"];
-  if (mutation.type === "upsert" && mutation.ignoreDuplicates) {
-    parts.unshift("resolution=ignore-duplicates");
-  }
-  return parts.join(", ");
-}
-
-/**
- * @param {URLSearchParams} params
- * @param {QueryNode} node
- * @returns {void}
- */
-function appendNodeParam(params, node) {
-  if (node.type === "filter") {
-    params.append(node.column, `${node.operator}.${formatFilterValue(node.operator, node.value)}`);
-    return;
-  }
-  params.append(node.op, `(${node.expression ?? node.nodes?.map(serializeGroupNode).join(",") ?? ""})`);
-}
-
-/**
- * @param {QueryNode} node
- * @returns {string}
- */
-function serializeGroupNode(node) {
-  if (node.type === "filter") {
-    return `${node.column}.${node.operator}.${formatFilterValue(node.operator, node.value)}`;
-  }
-  return `${node.op}(${node.expression ?? node.nodes?.map(serializeGroupNode).join(",") ?? ""})`;
-}
-
-/**
- * @param {OrderNode} order
- * @returns {string}
- */
-function serializeOrder(order) {
-  return `${order.column}.${order.ascending ? "asc" : "desc"}`;
-}
-
-/**
- * @param {QueryState} state
- * @returns {object}
- */
-function serializeAst(state) {
-  const filter = serializeAstFilterRoot(state.nodes);
-  return {
-    ...(state.select ? { select: state.select } : {}),
-    ...(filter ? { filter } : {}),
-    ...(state.order.length > 0 ? { order: state.order.map(serializeAstOrder) } : {}),
-    ...(state.limit !== null ? { limit: state.limit } : {}),
-    ...(state.offset !== null ? { offset: state.offset } : {}),
-    ...(state.count ? { count: state.count } : {}),
-  };
-}
-
-/**
- * @param {QueryNode[]} nodes
- * @returns {object | null}
- */
-function serializeAstFilterRoot(nodes) {
-  if (nodes.length === 0) return null;
-  const astNodes = nodes.map(serializeAstNode);
-  return astNodes.length === 1 ? astNodes[0] : { and: astNodes };
-}
-
-/**
- * @param {QueryNode} node
- * @returns {object}
- */
-function serializeAstNode(node) {
-  if (node.type === "filter") {
-    return serializeAstCondition(node.column, node.operator, node.value);
-  }
-  return {
-    [node.op]: node.expression ? parseGroupExpression(node.expression) : node.nodes?.map(serializeAstNode) ?? [],
-  };
-}
-
-/**
- * @param {OrderNode} order
- * @returns {object}
- */
-function serializeAstOrder(order) {
-  return {
-    ...serializeAstOperand(order.column),
-    dir: order.ascending ? "asc" : "desc",
-  };
-}
-
-/**
- * @param {string} column
- * @param {string} operator
- * @param {unknown} value
- * @returns {object}
- */
-function serializeAstCondition(column, operator, value) {
-  return {
-    ...serializeAstOperand(column),
-    op: operator,
-    val: formatAstValue(operator, value),
-  };
-}
-
-/**
- * @param {string} column
- * @returns {{ col: string } | { jsonb: { col: string, path: string[], cast?: string } }}
- */
-function serializeAstOperand(column) {
-  const match = JSON_PATH_COLUMN_RE.exec(column.trim());
-  if (!match || !match[2]) return { col: column };
-  const [, base, arrow, rawPath, cast] = match;
-  const path = arrow === "#>>" ? parseJsonPathList(rawPath) : [rawPath];
-  return { jsonb: { col: base, path, ...(cast ? { cast } : {}) } };
-}
-
-/**
- * @param {string} expression
- * @returns {object[]}
- */
-function parseGroupExpression(expression) {
-  return splitTopLevel(expression).map((part) => parseGroupPart(part.trim())).filter(Boolean);
-}
-
-/**
- * @param {string} part
- * @returns {object}
- */
-function parseGroupPart(part) {
-  const nested = parseNestedGroup(part);
-  if (nested) return { [nested.op]: parseGroupExpression(nested.expression) };
-  const split = splitBoolCondition(part);
-  if (!split) throw new TypeError(`Invalid boolean filter expression: ${part}`);
-  return serializeAstCondition(split.column, split.operator, parseRawFilterValue(split.operator, split.value));
-}
-
-/**
- * @param {string} part
- * @returns {{ op: "and" | "or", expression: string } | null}
- */
-function parseNestedGroup(part) {
-  for (const op of /** @type {const} */ (["and", "or"])) {
-    const prefix = `${op}(`;
-    if (part.startsWith(prefix) && part.endsWith(")")) {
-      return { op, expression: part.slice(prefix.length, -1) };
-    }
-  }
-  return null;
-}
-
-/**
- * @param {string} part
- * @returns {{ column: string, operator: string, value: string } | null}
- */
-function splitBoolCondition(part) {
-  const first = part.indexOf(".");
-  if (first === -1) return null;
-  const column = part.slice(0, first);
-  const opAndValue = part.slice(first + 1);
-  const second = opAndValue.indexOf(".");
-  if (second === -1) return null;
-  const operator = opAndValue.slice(0, second);
-  const value = opAndValue.slice(second + 1);
-  if (operator === "not") {
-    const nested = splitOperatorValue(value);
-    if (!nested) return null;
-    return { column, operator: `not.${nested.operator}`, value: nested.value };
-  }
-  return { column, operator, value };
-}
-
-/**
- * @param {string} value
- * @returns {{ operator: string, value: string } | null}
- */
-function splitOperatorValue(value) {
-  const dot = value.indexOf(".");
-  if (dot === -1) return null;
-  return { operator: value.slice(0, dot), value: value.slice(dot + 1) };
-}
-
-/**
- * @param {string} value
- * @returns {string[]}
- */
-function splitTopLevel(value) {
-  /** @type {string[]} */
-  const parts = [];
-  /** @type {string[]} */
-  let buffer = [];
-  let depth = 0;
-  let braceDepth = 0;
-  for (const ch of value) {
-    if (ch === "(") depth += 1;
-    else if (ch === ")") depth = Math.max(0, depth - 1);
-    else if (ch === "{") braceDepth += 1;
-    else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
-    if (ch === "," && depth === 0 && braceDepth === 0) {
-      parts.push(buffer.join(""));
-      buffer = [];
-    } else {
-      buffer.push(ch);
-    }
-  }
-  parts.push(buffer.join(""));
-  return parts;
-}
-
-/**
- * @param {string} raw
- * @returns {string[]}
- */
-function parseJsonPathList(raw) {
-  const text = raw.trim();
-  if (!text.startsWith("{") || !text.endsWith("}")) return [text];
-  return text.slice(1, -1).split(",").map((part) => part.trim()).filter(Boolean);
-}
-
-/**
- * @param {QueryNode[]} nodes
- * @returns {boolean}
- */
-function containsNestedGroup(nodes) {
-  return nodes.some((node) => {
-    if (node.type !== "group" || !node.nodes) return false;
-    return node.nodes.some((child) => child.type === "group") || containsNestedGroup(node.nodes);
-  });
-}
-
-/**
- * @param {QueryNode[]} nodes
- * @returns {boolean}
- */
-function containsUrlUnsafeArrayValue(nodes) {
-  return nodes.some((node) => {
-    if (node.type === "group") return node.nodes ? containsUrlUnsafeArrayValue(node.nodes) : false;
-    return Array.isArray(node.value) && arrayNeedsAstFallback(node.operator, node.value);
-  });
-}
-
-/**
- * @param {QueryNode[]} nodes
- * @param {boolean} [insideGroup]
- * @returns {boolean}
- */
-function containsUrlUnsafeBooleanValue(nodes, insideGroup = false) {
-  return nodes.some((node) => {
-    if (node.type === "group") {
-      return node.nodes ? containsUrlUnsafeBooleanValue(node.nodes, true) : false;
-    }
-    return insideGroup && scalarNeedsBooleanAstFallback(node.value);
-  });
-}
-
-/**
- * @param {string} operator
- * @param {unknown} value
- * @returns {string}
- */
-function formatFilterValue(operator, value) {
-  const op = baseOperator(operator);
-  if (Array.isArray(value)) {
-    const inner = value.map(formatScalar).join(",");
-    return op === "cs" ? `{${inner}}` : `(${inner})`;
-  }
-  if (value && typeof value === "object") return JSON.stringify(value);
-  return formatScalar(value);
-}
-
-/**
- * @param {string} operator
- * @param {unknown} value
- * @returns {unknown}
- */
-function formatAstValue(operator, value) {
-  const op = baseOperator(operator);
-  if ((op === "like" || op === "ilike") && typeof value === "string") {
-    return value.replaceAll("*", "%");
-  }
-  return value;
-}
-
-/**
- * @param {string} operator
- * @param {string} value
- * @returns {unknown}
- */
-function parseRawFilterValue(operator, value) {
-  const op = baseOperator(operator);
-  if (op === "is") {
-    const lowered = value.toLowerCase();
-    if (lowered === "null") return null;
-    if (lowered === "true") return true;
-    if (lowered === "false") return false;
-  }
-  if (op === "in") {
-    const text = value.trim();
-    if (text.startsWith("(") && text.endsWith(")")) {
-      return splitTopLevel(text.slice(1, -1)).map((part) => part.trim());
-    }
-  }
-  if (op === "cs") {
-    const text = value.trim();
-    if (text.startsWith("{") && text.endsWith("}") && !text.includes(":")) {
-      return text.slice(1, -1).split(",").map((part) => part.trim()).filter(Boolean);
-    }
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-  return formatAstValue(operator, value);
-}
-
-/**
- * @param {string} operator
- * @returns {string}
- */
-function baseOperator(operator) {
-  return operator.startsWith("not.") ? operator.slice(4) : operator;
-}
-
-/**
- * @param {string} operator
- * @param {readonly unknown[]} value
- * @returns {boolean}
- */
-function arrayNeedsAstFallback(operator, value) {
-  const op = baseOperator(operator);
-  if (op !== "in" && op !== "cs") return false;
-  if (op === "cs" && value.some((item) => typeof item !== "string")) return true;
-  return value.some((item) => typeof item === "string" && /[(),{}]/.test(item));
-}
-
-/**
- * @param {unknown} value
- * @returns {boolean}
- */
-function scalarNeedsBooleanAstFallback(value) {
-  return typeof value === "string" && /[(),{}]/.test(value);
-}
-
-/**
- * @param {unknown} value
- * @returns {string}
- */
-function formatScalar(value) {
-  if (value === null) return "null";
-  if (typeof value === "boolean" || typeof value === "number") return String(value);
-  return String(value);
 }
 
 /**
@@ -985,14 +440,6 @@ function assertNonNegativeInteger(value, label) {
 }
 
 /**
- * @param {string} value
- * @returns {number}
- */
-function byteLength(value) {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-/**
  * @param {string} prefix
  * @param {string | URL} path
  * @returns {string}
@@ -1001,70 +448,4 @@ function joinPath(prefix, path) {
   const suffix = String(path);
   if (!suffix) return prefix;
   return `${prefix}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
-}
-
-/**
- * @param {import("../index.js").AkbResult<unknown>} result
- * @param {"rows" | "single" | "maybeSingle"} mode
- * @returns {import("../index.js").AkbResult<unknown>}
- */
-function applyResultMode(result, mode) {
-  if (mode === "rows") return result;
-  if (result.error) return result;
-  const tableQuery = tableQueryData(result.data);
-  if (!tableQuery) {
-    return clientResult(null, clientResultError("single() expects a table_query result.", "invalid_single_result"), result.response);
-  }
-  const total = typeof tableQuery.total === "number" ? tableQuery.total : tableQuery.items.length;
-  if (total === 1 && tableQuery.items.length === 1) {
-    return clientResult(tableQuery.items[0], null, result.response);
-  }
-  if (mode === "maybeSingle" && total === 0) {
-    return clientResult(null, null, result.response);
-  }
-  const label = mode === "single" ? "single()" : "maybeSingle()";
-  return clientResult(
-    null,
-    clientResultError(`${label} expected ${mode === "single" ? "exactly one row" : "zero or one rows"} but received ${total}.`, "invalid_single_result"),
-    result.response,
-  );
-}
-
-/**
- * @param {unknown} data
- * @returns {{ items: unknown[], total?: number } | null}
- */
-function tableQueryData(data) {
-  if (!data || typeof data !== "object") return null;
-  const items = /** @type {{ items?: unknown }} */ (data).items;
-  if (!Array.isArray(items)) return null;
-  const total = /** @type {{ total?: unknown }} */ (data).total;
-  return { items, ...(typeof total === "number" ? { total } : {}) };
-}
-
-/**
- * @param {unknown} data
- * @param {Error | null} error
- * @param {Pick<Response, "ok" | "status" | "statusText"> | null} response
- * @returns {import("../index.js").AkbResult<unknown>}
- */
-function clientResult(data, error, response) {
-  return {
-    data,
-    error: /** @type {import("../index.js").AkbError | null} */ (error),
-    response,
-    throwOnError() {
-      if (error) throw error;
-      return /** @type {import("../index.js").AkbThrowingResult<unknown>} */ (this);
-    },
-  };
-}
-
-/**
- * @param {string} message
- * @param {string} code
- * @returns {Error}
- */
-function clientResultError(message, code) {
-  return new AkbError({ message, code });
 }
