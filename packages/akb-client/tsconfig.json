@@ -1,15 +1,15 @@
 {
   "compilerOptions": {
-    "allowJs": true,
-    "allowImportingTsExtensions": true,
-    "checkJs": true,
-    "declaration": false,
+    "target": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "noEmit": true,
     "strict": true,
-    "target": "ES2022"
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
-  "include": ["src/**/*.js", "src/**/*.d.ts", "test/types.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }

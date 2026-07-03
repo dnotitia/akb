@@ -46,15 +46,23 @@ step "eslint (frontend)"
 step "tsc (frontend)"
 (cd frontend && npx --no-install tsc --noEmit)
 
-# ─── @akb/client: node tests + generated-type drift ─────────────
-step "node tests (@akb/client)"
-(cd packages/akb-client && npm test)
+# ─── @akb/client: build + typecheck + vitest + generated-type drift ──
+# `packages/akb-client` now carries its own pnpm install, tsc, and vitest —
+# it no longer borrows frontend's tsc binary. `pnpm run build` emits dist/,
+# which both the drift-check scripts and the published package consume, so
+# it must run before vitest (whose codegen guards spawn against dist/) and
+# before the drift check.
+step "build (@akb/client)"
+(cd packages/akb-client && pnpm run build)
 
-step "tsc (@akb/client)"
-(cd packages/akb-client && ../../frontend/node_modules/.bin/tsc -p tsconfig.json --noEmit)
+step "typecheck (@akb/client)"
+(cd packages/akb-client && pnpm run typecheck)
+
+step "vitest (@akb/client)"
+(cd packages/akb-client && pnpm exec vitest run)
 
 step "generated type drift (@akb/client)"
-(cd packages/akb-client && node scripts/check-generated-types.mjs)
+(cd packages/akb-client && pnpm run codegen:check)
 
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge
@@ -74,9 +82,9 @@ step "detect-secrets (tracked files)"
 if command -v detect-secrets-hook >/dev/null 2>&1; then
   # Scope: git-tracked files only — skips node_modules, .venv, dist, etc.
   # for free, and prevents the scan from drowning in third-party noise.
-  # pnpm-lock.yaml is excluded because package integrity hashes are expected
-  # high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' |
+  # Both pnpm-lock.yaml files are excluded because package integrity hashes
+  # (sha512-… base64) are expected high-entropy data, not secrets.
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2

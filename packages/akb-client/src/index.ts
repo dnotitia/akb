@@ -1,10 +1,8 @@
-export type AkbJsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | AkbJsonValue[]
-  | { [key: string]: AkbJsonValue };
+import { AkbError } from "./errors.js";
+import { createQueryBuilder } from "./client/query-builder.js";
+
+export { AkbError } from "./errors.js";
+export { createTypedFetch } from "./core/fetch.js";
 
 export type {
   AkbOperation,
@@ -14,7 +12,6 @@ export type {
   AkbTypedFetch,
   AkbTypedFetchInit,
 } from "./core/fetch.js";
-export { createTypedFetch } from "./core/fetch.js";
 export type {
   AkbFileEnvelope,
   AkbSqlEnvelope,
@@ -28,6 +25,14 @@ export type {
   operations,
   paths,
 } from "./core/schema.gen.js";
+
+export type AkbJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | AkbJsonValue[]
+  | { [key: string]: AkbJsonValue };
 
 export interface AkbSuccessEnvelope {
   kind: string;
@@ -44,16 +49,6 @@ export interface AkbErrorPayload {
   password_required?: boolean;
   slug?: string;
   [key: string]: unknown;
-}
-
-export class AkbError extends Error {
-  code: string;
-  details: unknown;
-  hint: string | null;
-  status: number;
-  payload: Record<string, unknown>;
-  response: Pick<Response, "ok" | "status" | "statusText"> | null;
-  constructor(payload: unknown, response?: Pick<Response, "ok" | "status" | "statusText"> | null);
 }
 
 export interface AkbResult<T, E extends AkbError = AkbError> {
@@ -324,16 +319,262 @@ export interface AkbClient<Schema = unknown> {
   readonly storage: AkbNamespaceStub;
 }
 
+/**
+ * Convert one parsed HTTP response body into a `{data,error}` result.
+ */
 export function unwrapAkbResponse<T = unknown>(
   response: Pick<Response, "ok" | "status" | "statusText"> | null,
   body: T | AkbErrorPayload | unknown,
-): AkbResult<T>;
+): AkbResult<T> {
+  if (response?.ok) {
+    return makeResult<T>(body as T, null, response);
+  }
+  return makeResult<T>(null, new AkbError(body, asResponse(response)), response);
+}
 
-export function akbFetch<T = unknown>(
+/**
+ * Fetch an AKB REST endpoint and unwrap the HTTP boundary.
+ */
+export async function akbFetch<T = unknown>(
   input: RequestInfo | URL,
-  init?: RequestInit,
-  fetchImpl?: typeof fetch,
-): Promise<AkbResult<T>>;
+  init: RequestInit | undefined = undefined,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<AkbResult<T>> {
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("A fetch implementation is required.");
+  }
+  const response = await fetchImpl(input, init);
+  const body = await readBody(response);
+  return unwrapAkbResponse<T>(response, body);
+}
 
+/**
+ * Create a scoped AKB REST client. The namespace helpers are intentionally thin
+ * request facades; fluent table/storage helpers can build on this contract.
+ */
 export function createClient<Schema = unknown>(baseUrl: string | URL, options?: AkbClientOptions): AkbClient<Schema>;
 export function createClient<Schema = unknown>(config: AkbClientConfig): AkbClient<Schema>;
+export function createClient<Schema = unknown>(
+  configOrUrl: AkbClientConfig | string | URL,
+  options: AkbClientOptions = {},
+): AkbClient<Schema> {
+  const config = normalizeClientConfig(configOrUrl, options);
+  return makeClient(config, {
+    defaultVault: config.defaultVault ?? null,
+    claims: null,
+  }) as AkbClient<Schema>;
+}
+
+function makeResult<T>(
+  data: T | null,
+  error: AkbError | null,
+  response: Pick<Response, "ok" | "status" | "statusText"> | null,
+): AkbResult<T> {
+  return {
+    data,
+    error,
+    response,
+    throwOnError() {
+      if (error) throw error;
+      return this as AkbThrowingResult<T>;
+    },
+  };
+}
+
+async function readBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return null;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    return JSON.parse(text);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function asResponse(
+  response: Pick<Response, "ok" | "status" | "statusText"> | null | undefined,
+): Pick<Response, "ok" | "status" | "statusText"> | null {
+  return response ?? null;
+}
+
+function trimTrailingSlash(url: string): string {
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+function resolveRequestUrl(baseUrl: string, path: string | URL): string {
+  const value = String(path);
+  if (/^https?:\/\//i.test(value)) {
+    const baseOrigin = httpOrigin(baseUrl);
+    const targetOrigin = httpOrigin(value);
+    if (baseOrigin && targetOrigin === baseOrigin) return value;
+    throw new TypeError("Refusing to send an AKB bearer token to a different origin.");
+  }
+  return `${baseUrl}${value.startsWith("/") ? value : `/${value}`}`;
+}
+
+function httpOrigin(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeClientConfig(
+  configOrUrl: AkbClientConfig | string | URL,
+  options: AkbClientOptions,
+): Required<Pick<AkbClientConfig, "baseUrl">> & AkbClientOptions {
+  if (typeof configOrUrl === "string" || configOrUrl instanceof URL) {
+    return {
+      ...options,
+      baseUrl: trimTrailingSlash(String(configOrUrl)),
+      token: options.token ?? options.apiKey ?? null,
+    };
+  }
+
+  if (!configOrUrl || typeof configOrUrl !== "object") {
+    throw new TypeError("createClient requires a base URL string or config object.");
+  }
+
+  return {
+    ...configOrUrl,
+    baseUrl: trimTrailingSlash(configOrUrl.baseUrl),
+    token: configOrUrl.token ?? configOrUrl.apiKey ?? null,
+  };
+}
+
+function makeClient(
+  config: Required<Pick<AkbClientConfig, "baseUrl">> & AkbClientOptions,
+  scope: AkbClientScope,
+): AkbClient {
+  const fetchImpl = config.fetch ?? globalThis.fetch;
+
+  const request = (async (path: string | URL, init: RequestInit = {}): Promise<AkbResult<unknown>> => {
+    const requestUrl = resolveRequestUrl(config.baseUrl, path);
+    const headers = new Headers(init.headers);
+    if (!headers.has("content-type") && init.body !== undefined) {
+      headers.set("content-type", "application/json");
+    }
+    const token = resolveToken(config.token ?? config.apiKey ?? null);
+    if (token && !headers.has("authorization")) {
+      headers.set("authorization", `Bearer ${token}`);
+    }
+    if (scope.claims && !headers.has("x-akb-claims")) {
+      headers.set("x-akb-claims", JSON.stringify(scope.claims));
+    }
+    return await akbFetch(requestUrl, { ...init, headers }, fetchImpl);
+  }) as AkbClient["request"];
+
+  const client = {
+    request,
+    vault(vault: string) {
+      return makeClient(config, { ...scope, defaultVault: vault });
+    },
+    actingAs(claims: AkbClaims) {
+      return makeClient(config, { ...scope, claims: normalizeClaims(claims) });
+    },
+    sql(strings: TemplateStringsArray, ...values: unknown[]) {
+      if (!scope.defaultVault) {
+        throw new TypeError("Select a vault before using raw SQL: client.vault(\"...\").sql`...`.");
+      }
+      const compiled = compileSqlTemplate(strings, values);
+      return request(`/tables/${encodeURIComponent(scope.defaultVault)}/sql`, {
+        method: "POST",
+        body: JSON.stringify({ sql: compiled.text, params: compiled.params }),
+      });
+    },
+    from(table: string) {
+      return createQueryBuilder({
+        baseUrl: config.baseUrl,
+        table,
+        vault: scope.defaultVault,
+        request,
+        maxUrlBytes: config.maxUrlBytes ?? 8192,
+      });
+    },
+    search: makeNamespaceStub("search", "/search", request),
+    graph: makeNamespaceStub("graph", "/graph", request),
+    docs: makeNamespaceStub("docs", "/documents", request),
+    storage: makeNamespaceStub("storage", "/files", request),
+  };
+  return Object.freeze(client) as unknown as AkbClient;
+}
+
+function resolveToken(
+  token: string | null | undefined | (() => string | null | undefined),
+): string | null {
+  const value = typeof token === "function" ? token() : token;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function normalizeClaims(claims: AkbClaims): AkbClaims {
+  if (!claims || typeof claims !== "object" || Array.isArray(claims)) {
+    throw new TypeError("actingAs requires a claims object.");
+  }
+  if (typeof claims.sub !== "string" || claims.sub.length === 0) {
+    throw new TypeError("actingAs claims require a non-empty sub.");
+  }
+  if (!claims.app_metadata || typeof claims.app_metadata !== "object" || Array.isArray(claims.app_metadata)) {
+    throw new TypeError("actingAs claims require an app_metadata object.");
+  }
+  if (typeof claims.app_metadata.org_id !== "string" || claims.app_metadata.org_id.length === 0) {
+    throw new TypeError("actingAs claims require a non-empty app_metadata.org_id.");
+  }
+  if (typeof claims.app_metadata.role !== "string" || claims.app_metadata.role.length === 0) {
+    throw new TypeError("actingAs claims require a non-empty app_metadata.role.");
+  }
+  return claims;
+}
+
+function compileSqlTemplate(
+  strings: TemplateStringsArray,
+  values: unknown[],
+): { text: string; params: unknown[] } {
+  if (!isTemplateStringsArray(strings)) {
+    throw new TypeError("client.sql must be used as a tagged template.");
+  }
+  if (values.length !== strings.length - 1) {
+    throw new TypeError("Tagged SQL template interpolation count is invalid.");
+  }
+
+  let text = "";
+  for (let index = 0; index < strings.length; index += 1) {
+    text += strings[index];
+    if (index < values.length) {
+      text += `$${index + 1}`;
+    }
+  }
+  return { text, params: Array.from(values) };
+}
+
+function isTemplateStringsArray(value: unknown): value is TemplateStringsArray {
+  if (!Array.isArray(value)) return false;
+  const raw = (value as { raw?: unknown }).raw;
+  return Array.isArray(raw)
+    && Object.isFrozen(value)
+    && Object.isFrozen(raw)
+    && value.length === raw.length;
+}
+
+function makeNamespaceStub(
+  name: string,
+  prefix: string,
+  request: AkbClient["request"],
+): AkbNamespaceStub {
+  return Object.freeze({
+    name,
+    request(path: string | URL = "", init: RequestInit = {}) {
+      return request(joinPath(prefix, path), init);
+    },
+  }) as AkbNamespaceStub;
+}
+
+function joinPath(prefix: string, path: string | URL): string {
+  const suffix = String(path);
+  if (!suffix) return prefix;
+  return `${prefix}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+}

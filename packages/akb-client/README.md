@@ -74,7 +74,7 @@ akb gen types --vault eng --url "$AKB_URL" --check akb.types.ts
 
 ## Internal OpenAPI Core
 
-`src/core/schema.gen.d.ts` is the generated low-level REST operation map used
-by `createTypedFetch`. It stays separate from runtime table types: OpenAPI
-types describe AKB endpoints, while `akb gen types` describes user tables inside
-a vault.
+`src/core/schema.gen.ts` is the generated low-level REST operation map used
+by `createTypedFetch` (compiled to `dist/core/schema.gen.{js,d.ts}`). It stays
+separate from runtime table types: OpenAPI types describe AKB endpoints, while
+`akb gen types` describes user tables inside a vault.

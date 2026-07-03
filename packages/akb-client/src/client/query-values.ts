@@ -5,12 +5,7 @@
  * they hold no query state and depend on nothing else in the client.
  */
 
-/**
- * @param {string} operator
- * @param {unknown} value
- * @returns {string}
- */
-export function formatFilterValue(operator, value) {
+export function formatFilterValue(operator: string, value: unknown): string {
   const op = baseOperator(operator);
   if (Array.isArray(value)) {
     const inner = value.map(formatScalar).join(",");
@@ -20,12 +15,7 @@ export function formatFilterValue(operator, value) {
   return formatScalar(value);
 }
 
-/**
- * @param {string} operator
- * @param {unknown} value
- * @returns {unknown}
- */
-export function formatAstValue(operator, value) {
+export function formatAstValue(operator: string, value: unknown): unknown {
   const op = baseOperator(operator);
   if ((op === "like" || op === "ilike") && typeof value === "string") {
     return value.replaceAll("*", "%");
@@ -33,19 +23,11 @@ export function formatAstValue(operator, value) {
   return value;
 }
 
-/**
- * @param {string} operator
- * @returns {string}
- */
-export function baseOperator(operator) {
+export function baseOperator(operator: string): string {
   return operator.startsWith("not.") ? operator.slice(4) : operator;
 }
 
-/**
- * @param {unknown} value
- * @returns {string}
- */
-function formatScalar(value) {
+function formatScalar(value: unknown): string {
   if (value === null) return "null";
   if (typeof value === "boolean" || typeof value === "number") return String(value);
   return String(value);

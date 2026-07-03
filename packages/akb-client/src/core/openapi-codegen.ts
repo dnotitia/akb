@@ -1,6 +1,6 @@
-/** @typedef {Record<string, unknown>} JsonObject */
+type JsonObject = Record<string, unknown>;
 
-const RESPONSE_TYPE_BY_SCHEMA = new Map([
+const RESPONSE_TYPE_BY_SCHEMA = new Map<string, string>([
   ["AkbTableEnvelope", "AkbTableEnvelope"],
   ["AkbTableMigrationEnvelope", "AkbTableMigrationEnvelope"],
   ["AkbTableSchemaEnvelope", "AkbTableSchemaEnvelope"],
@@ -11,11 +11,7 @@ const RESPONSE_TYPE_BY_SCHEMA = new Map([
   ["AkbFileEnvelope", "AkbFileEnvelope"],
 ]);
 
-/**
- * @param {unknown} openapi
- * @returns {string}
- */
-export function generateCoreTypes(openapi) {
+export function generateCoreTypes(openapi: unknown): string {
   const spec = expectObject(openapi, "openapi");
   const operations = collectOperations(spec);
   return [
@@ -57,14 +53,11 @@ export function generateCoreTypes(openapi) {
   ].join("\n");
 }
 
-/**
- * @param {JsonObject} spec
- * @returns {Array<{path: string, method: string, operationId: string, responseType: string}>}
- */
-function collectOperations(spec) {
+function collectOperations(
+  spec: JsonObject,
+): Array<{ path: string; method: string; operationId: string; responseType: string }> {
   const paths = expectObject(spec.paths, "paths");
-  /** @type {Array<{path: string, method: string, operationId: string, responseType: string}>} */
-  const out = [];
+  const out: Array<{ path: string; method: string; operationId: string; responseType: string }> = [];
   for (const path of Object.keys(paths).sort()) {
     const pathItem = expectObject(paths[path], `paths.${path}`);
     for (const method of Object.keys(pathItem).sort()) {
@@ -82,21 +75,17 @@ function collectOperations(spec) {
   return out;
 }
 
-/**
- * @param {Array<{path: string, method: string, responseType: string}>} operations
- * @returns {string[]}
- */
-function renderPathOperations(operations) {
-  /** @type {Map<string, Array<{method: string, responseType: string}>>} */
-  const byPath = new Map();
+function renderPathOperations(
+  operations: Array<{ path: string; method: string; responseType: string }>,
+): string[] {
+  const byPath = new Map<string, Array<{ method: string; responseType: string }>>();
   for (const operation of operations) {
     const methods = byPath.get(operation.path) ?? [];
     methods.push({ method: operation.method, responseType: operation.responseType });
     byPath.set(operation.path, methods);
   }
 
-  /** @type {string[]} */
-  const lines = [];
+  const lines: string[] = [];
   for (const [path, methods] of byPath) {
     lines.push(`  ${tsLiteral(path)}: {`);
     for (const method of methods) {
@@ -109,15 +98,10 @@ function renderPathOperations(operations) {
   return lines;
 }
 
-/**
- * @param {JsonObject} operation
- * @returns {string}
- */
-function responseType(operation) {
+function responseType(operation: JsonObject): string {
   const responses = expectObject(operation.responses, "responses");
   const hasNoContent = Boolean(responses["204"]);
-  /** @type {string | null} */
-  let jsonType = null;
+  let jsonType: string | null = null;
   for (const status of ["200", "201", "202"]) {
     const response = responses[status];
     if (!response) continue;
@@ -134,28 +118,17 @@ function responseType(operation) {
   return jsonType ?? "AkbSuccessEnvelope";
 }
 
-/**
- * @param {string} path
- * @returns {string}
- */
-function pathParameterType(path) {
+function pathParameterType(path: string): string {
   const names = Array.from(path.matchAll(/\{([^}]+)\}/g), (match) => match[1]);
   if (names.length === 0) return "never";
   return `{ path: { ${names.map((name) => `${tsKey(name)}: string`).join("; ")} } }`;
 }
 
-/**
- * @param {string} method
- * @returns {string}
- */
-function requestBodyType(method) {
+function requestBodyType(method: string): string {
   return method === "get" || method === "delete" ? "never" : "unknown";
 }
 
-/**
- * @returns {string[]}
- */
-function schemaLines() {
+function schemaLines(): string[] {
   return [
     "export interface AkbTableEnvelope {",
     "  kind: \"table\";",
@@ -262,62 +235,35 @@ function schemaLines() {
   ];
 }
 
-/**
- * @param {unknown} value
- * @param {string} label
- * @returns {JsonObject}
- */
-function expectObject(value, label) {
+function expectObject(value: unknown, label: string): JsonObject {
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    return /** @type {JsonObject} */ (value);
+    return value as JsonObject;
   }
   throw new TypeError(`${label} must be an object.`);
 }
 
-/**
- * @param {unknown} value
- * @returns {JsonObject | null}
- */
-function expectOptionalObject(value) {
+function expectOptionalObject(value: unknown): JsonObject | null {
   if (value === null || value === undefined) return null;
   return value && typeof value === "object" && !Array.isArray(value)
-    ? /** @type {JsonObject} */ (value)
+    ? (value as JsonObject)
     : null;
 }
 
-/**
- * @param {JsonObject | null} object
- * @param {string} key
- * @returns {string | null}
- */
-function stringProp(object, key) {
+function stringProp(object: JsonObject | null, key: string): string | null {
   const value = object?.[key];
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-/**
- * @param {string} path
- * @param {string} method
- * @returns {string}
- */
-function operationIdFrom(path, method) {
+function operationIdFrom(path: string, method: string): string {
   const words = path.replace(/^\/api\/v1\//, "").match(/[A-Za-z0-9]+/g) ?? ["api"];
   const pascal = words.map((word) => word[0].toUpperCase() + word.slice(1)).join("");
   return `${method}${pascal}`;
 }
 
-/**
- * @param {string} value
- * @returns {string}
- */
-function tsLiteral(value) {
+function tsLiteral(value: string): string {
   return JSON.stringify(value);
 }
 
-/**
- * @param {string} key
- * @returns {string}
- */
-function tsKey(key) {
+function tsKey(key: string): string {
   return /^[A-Za-z_$][\w$]*$/.test(key) ? key : tsLiteral(key);
 }
