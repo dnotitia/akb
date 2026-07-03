@@ -111,7 +111,7 @@ maybeDeleted.throwOnError().data?.status satisfies "todo" | "done" | undefined;
 // @ts-expect-error generated Update restricts status to the table enum.
 typedClient.vault("eng").from("tasks").update({ status: "blocked" });
 
-const liteClient = createLiteClient<AkbSchema>("https://akb.test", { apiKey: "service-key" });
+const liteClient = createLiteClient<AkbSchema>("https://akb.test", { apiKey: "service-key" }); // pragma: allowlist secret — test fixture, not a real key
 liteClient satisfies AkbClient<AkbSchema>;
 
 const typedFetch = createTypedFetch(typedClient);
