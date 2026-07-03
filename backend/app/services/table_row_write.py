@@ -12,15 +12,15 @@ import asyncpg
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
 from app.repositories import table_data_repo, table_registry_repo
-from app.services.table_row_query import (
+from app.services.row_query_ast import _compile_ast_filter
+from app.services.row_query_base import (
     _add_param,
     _column_meta,
-    _compile_ast_filter,
-    _compile_filters,
     _compile_select,
-    _shape_result,
     _unknown_column,
 )
+from app.services.row_query_shape import _shape_result
+from app.services.row_query_string import _compile_filters
 from app.services.user_sql_executor import (
     PermissionDeniedError,
     UniqueViolationError,

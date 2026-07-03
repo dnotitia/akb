@@ -1,10 +1,10 @@
 """Unit coverage for merged registry/live table schema introspection."""
 
-from app.services import table_service
+from app.services import table_schema_service
 
 
 def test_build_table_schema_serializes_rich_constraints_and_drift() -> None:
-    schema = table_service._build_table_schema(
+    schema = table_schema_service._build_table_schema(
         "demo-vault",
         {
             "name": "incidents",

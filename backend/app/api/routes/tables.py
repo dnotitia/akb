@@ -8,7 +8,13 @@ from pydantic import ConfigDict
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services import table_row_query, table_row_write, table_service
+from app.services import (
+    table_migration_service,
+    table_row_query,
+    table_row_write,
+    table_schema_service,
+    table_service,
+)
 from app.util.errors import (
     BULK_TOO_LARGE,
     CONFLICT,
@@ -125,7 +131,7 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
 )
 async def get_vault_schema(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    return await table_service.get_vault_schema(access["vault_id"])
+    return await table_schema_service.get_vault_schema(access["vault_id"])
 
 
 @router.post(
@@ -140,7 +146,7 @@ async def apply_table_migration(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
-    return await table_service.apply_table_migration(
+    return await table_migration_service.apply_table_migration(
         access["vault_id"],
         actor_id=user.username,
         idempotency_key=idempotency_key,
@@ -159,7 +165,7 @@ async def get_table_schema(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    return await table_service.get_table_schema(access["vault_id"], table)
+    return await table_schema_service.get_table_schema(access["vault_id"], table)
 
 
 @router.patch(
