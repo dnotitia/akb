@@ -1,7 +1,7 @@
 # Command-lane 쓰기 경로: 문서별 lane + PG-first git + overflow 프로토콜
 
-**상태**: Proposal (round-04까지 반영)
-**날짜**: 2026-06-10
+**상태**: Proposal — 단, **round-05의 admission 게이트(Phase 0 대체)는 PM 승인·구현 완료, codex 10라운드 리뷰 종결(NO OBJECTIONS)** (2026-07-03). Phase 2·3은 미결.
+**날짜**: 2026-06-10 (갱신 2026-07-03)
 **목표**: 동시 ~1000 에이전트. 특정 문서에 쓰기가 몰리는 폭주(~80 writes/s)
 에서도 피해가 **그 문서 하나로 한정**되어야 한다 — 지금은 서비스 전체가 멈춘다.
 
@@ -231,8 +231,8 @@ SKIP LOCKED` — 기존 관용구). write-behind 자체가 확장의 열쇠: 읽
 
 | Phase | 내용 | 비고 |
 |---|---|---|
-| **0** | try-lock + 429(Retry-After) — 풀 중독만 즉시 차단 | ~1일, 스키마 변경 없음, 단독 출하 |
-| **1** | 인메모리 lane (락 대기 → 큐 대기) | lane 수명주기·graceful shutdown. 단일 프로세스 확인됨 |
+| **0 (개정)** | ~~try-lock 즉시 429~~ → **2단 admission 게이트**: per-vault(1) + 글로벌 write lane(M=8), 코루틴 대기 10s 후 429, 전용 커밋 executor, git write kill-timeout | **round-05로 대체·승인·구현** — executor 기아(제2 전염 경로) 발견이 계기. 스키마 변경 없음 |
+| **1** | 인메모리 lane의 per-document 세분화 | **연기** (round-05) — git이 동기 경로에 있는 한 vault 게이트 대비 처리량 이득 없음. Phase 2 이후 재평가 |
 | **2** | PG-first git: `documents.content` + outbox + 아카이버(inline/deferred), 읽기 이전 전수(§2.4-4), 토큰 마이그레이션, 미러 제외, bulk 톰스톤, parentless 커밋, pending 오버레이 | **최대 공사**. source-of-truth 재정의 승인 필요 |
 | **3** | 큐 상한 + coalescing + 202 + 상태 조회 툴 + MCP description | additive 계약 변경 |
 

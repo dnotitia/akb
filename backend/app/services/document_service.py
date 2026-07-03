@@ -105,7 +105,7 @@ def _safe_remote_host(url: str) -> str:
 import frontmatter
 
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.models.document import (
     DOC_STATUSES,
     BrowseItem,
@@ -129,16 +129,35 @@ from app.services.index_service import (
     chunk_markdown,
     write_source_chunks,
     delete_document_chunks,
+    delete_vault_chunks,
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
 from app.services.user_directory import resolve_display_names
+from app.services.write_lane import run_compensation, run_git_write, write_lane
 from app.repositories import table_data_repo
 from app.utils import ensure_list
 
 logger = logging.getLogger("akb.documents")
+
+# Serializes create_vault attempts per vault name — including their rollback
+# — so the rollback's "did THIS request create the on-disk repo?" ownership
+# probe can't misfire on a concurrent same-name create (which would delete
+# the winner's repo). Deliberately separate from write_lane's vault gates:
+# the seed put() inside create_vault takes the lane gate, and this lock
+# nests outside it. Entries are never reaped (same precedent as
+# git_service._VAULT_LOCKS — a few idle bytes per name ever created here).
+_CREATE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _create_lock(name: str) -> asyncio.Lock:
+    lock = _CREATE_LOCKS.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CREATE_LOCKS[name] = lock
+    return lock
 
 
 class EditError(AKBError):
@@ -268,7 +287,7 @@ class DocumentService:
         return content_hash, HASH_ALGORITHM
 
     @asynccontextmanager
-    async def _path_lock(self, vault_id: uuid.UUID, file_path: str):
+    async def _path_lock(self, vault_id: uuid.UUID, file_path: str, *, vault_name: str):
         """Hold an exclusive (vault_id, path) advisory lock for the duration
         of the with-block. Serializes concurrent put/update/edit/delete on
         the same logical document path so git HEAD never diverges from
@@ -284,23 +303,33 @@ class DocumentService:
         (and any read needing the pool) stalled until PG's 60s
         ``idle_in_transaction_session_timeout`` killed the lock transactions.
         One connection per writer makes the pool a clean backpressure queue.
+
+        Write-lane admission (``vault_name``) comes FIRST — before the pool
+        connection is even requested. Waiting for a busy vault happens as a
+        suspended coroutine, so a same-vault backlog holds zero connections
+        and zero executor threads; the connection is only occupied for the
+        actual work span. Deadline exceeded → WriteBusyError (429), with no
+        resources acquired. See services/write_lane.py (round-05).
         """
-        pool = await get_pool()
-        async with pool.acquire() as lock_conn:
-            async with lock_conn.transaction():
-                await acquire_path_lock(lock_conn, vault_id, file_path)
-                yield lock_conn
+        async with write_lane(vault_name):
+            pool = await get_pool()
+            async with pool.acquire() as lock_conn:
+                async with lock_conn.transaction():
+                    await acquire_path_lock(lock_conn, vault_id, file_path)
+                    yield lock_conn
 
     @asynccontextmanager
-    async def _move_lock(self, vault_id: uuid.UUID, path_a: str, path_b: str):
+    async def _move_lock(self, vault_id: uuid.UUID, path_a: str, path_b: str, *, vault_name: str):
         """Lock BOTH the source and destination paths for a move, in a stable
-        (sorted) order so two concurrent moves can't deadlock on each other."""
-        pool = await get_pool()
-        async with pool.acquire() as lock_conn:
-            async with lock_conn.transaction():
-                for p in sorted({path_a, path_b}):
-                    await acquire_path_lock(lock_conn, vault_id, p)
-                yield lock_conn
+        (sorted) order so two concurrent moves can't deadlock on each other.
+        Same write-lane admission discipline as ``_path_lock``."""
+        async with write_lane(vault_name):
+            pool = await get_pool()
+            async with pool.acquire() as lock_conn:
+                async with lock_conn.transaction():
+                    for p in sorted({path_a, path_b}):
+                        await acquire_path_lock(lock_conn, vault_id, p)
+                    yield lock_conn
 
     async def _resolve_free_path(
         self, doc_repo, vault_id: uuid.UUID, base_path: str,
@@ -387,7 +416,7 @@ class DocumentService:
         normalized_collection = _normalize_collection(req.collection)
         base_path = _doc_path(normalized_collection, base_slug)
 
-        async with self._path_lock(vault_id, base_path) as conn:
+        async with self._path_lock(vault_id, base_path, vault_name=req.vault) as conn:
             return await self._put_locked(
                 req=req, agent_id=agent_id, vault_id=vault_id, doc_id=doc_id,
                 base_path=base_path, base_slug=base_slug,
@@ -435,7 +464,7 @@ class DocumentService:
 
         # Git commit
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
-        commit_hash = await asyncio.to_thread(
+        commit_hash = await run_git_write(
             self.git.commit_file,
             vault_name=req.vault, file_path=file_path,
             content=md_content, message=commit_msg,
@@ -729,7 +758,7 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path) as conn:
+        async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-read under the lock so we observe any commit that landed
             # between the initial resolution and lock acquisition. Uses the
             # lock connection so the whole update holds one pool connection.
@@ -794,7 +823,7 @@ class DocumentService:
 
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
-        commit_hash = await asyncio.to_thread(
+        commit_hash = await run_git_write(
             self.git.commit_file,
             vault_name=vault, file_path=file_path,
             content=new_md, message=commit_msg,
@@ -917,7 +946,7 @@ class DocumentService:
 
         _, _, est_new_path = _target(old_path, row["id"])
 
-        async with self._move_lock(vault_id, old_path, est_new_path) as conn:
+        async with self._move_lock(vault_id, old_path, est_new_path, vault_name=vault) as conn:
             # Re-read under the lock and recompute the target from fresh state.
             row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
@@ -957,7 +986,7 @@ class DocumentService:
                 f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
             )
             try:
-                commit_hash = await asyncio.to_thread(
+                commit_hash = await run_git_write(
                     self.git.move_file,
                     vault_name=vault, old_path=old_path, new_path=new_path,
                     message=commit_msg, author_name=agent_id or "AKB System",
@@ -1098,7 +1127,7 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path) as conn:
+        async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
                 raise NotFoundError("Document", doc_ref)
@@ -1169,7 +1198,7 @@ class DocumentService:
 
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
-        commit_hash = await asyncio.to_thread(
+        commit_hash = await run_git_write(
             self.git.commit_file,
             vault_name=vault, file_path=file_path,
             content=new_md, message=commit_msg,
@@ -1251,7 +1280,7 @@ class DocumentService:
             raise NotFoundError("Document", doc_ref)
         file_path = row["path"]
 
-        async with self._path_lock(vault_id, file_path) as conn:
+        async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
             row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not row:
@@ -1272,7 +1301,7 @@ class DocumentService:
         # Without this, a partial-delete leaves an undeletable document
         # row that needs operator intervention.
         try:
-            await asyncio.to_thread(
+            await run_git_write(
                 self.git.delete_file, vault_name=vault, file_path=file_path, message=commit_msg,
             )
         except FileNotFoundError:
@@ -1645,19 +1674,56 @@ class DocumentService:
             return str(vault_id)
 
         # Standard path: init_vault writes a bare directory to disk
-        # *before* the DB INSERT. If anything fails between the two
+        # *before* the DB INSERT. If anything fails in between
         # (commit_file crashes, request gets cancelled mid-flight, DB
-        # write hits a constraint), the bare directory orphans and
+        # write hits a constraint, the seed put() is rejected by a
+        # saturated write lane), the bare directory orphans and
         # init_vault's existence check permanently blocks the same
-        # name. Wrap as a transaction; cleanup_vault_dirs is the
-        # rollback. BaseException so SIGTERM and KeyboardInterrupt
-        # also unwind cleanly.
-        git_path = await asyncio.to_thread(self.git.init_vault, name)
+        # name. Wrap as a transaction: cleanup_vault_dirs undoes the
+        # disk side, _rollback_vault_rows undoes the DB side once the
+        # vaults row exists. BaseException so SIGTERM and
+        # KeyboardInterrupt also unwind cleanly.
+        #
+        # `_create_lock(name)` serializes same-name creates in-process for
+        # the WHOLE section including rollback. Without it the ownership
+        # probe below is unsound: A and B race the same name, A's init
+        # wins, B's fails, and B's rollback would see the dir "appear
+        # during its attempt" and delete A's repo. (Distinct from the
+        # write-lane vault gate on purpose — the seed put() below takes
+        # that gate, and this lock nests outside it.)
+        #
+        # `existed_before` guards the cancellation edge: an absorbed
+        # cancel inside run_git_write discards init_vault's outcome —
+        # including a FileExistsError for a name that already has a
+        # vault. Cleaning up in that state would delete the EXISTING
+        # vault's repo. Only ever clean up a directory this request
+        # itself brought into existence — and under the create lock,
+        # "appeared during this section and wasn't there before" implies
+        # exactly that.
+        async with _create_lock(name):
+            return await self._create_vault_standard(
+                name=name, description=description, template=template,
+                public_access=public_access, owner_id=owner_id, uid=uid,
+                external_git=external_git, vault_repo=vault_repo,
+                coll_repo=coll_repo,
+            )
+
+    async def _create_vault_standard(
+        self, *, name, description, template, public_access, owner_id, uid,
+        external_git, vault_repo, coll_repo,
+    ) -> str:
+        existed_before = self.git.vault_exists(name)
+        git_path: str | None = None
+        created_vault_id: uuid.UUID | None = None
         try:
+            git_path = await run_git_write(self.git.init_vault, name)
             vault_yaml = f"name: {name}\ndescription: {description}\n"
             if template:
                 vault_yaml += f"template: {template}\n"
-            await asyncio.to_thread(
+            # Commit executor (not the shared to_thread pool), but NO write-
+            # lane gate: the vault is mid-creation so nobody can contend, and
+            # gating would let a saturated lane fail vault creation with 429.
+            await run_git_write(
                 self.git.commit_file,
                 vault_name=name, file_path=".vault.yaml",
                 content=vault_yaml,
@@ -1666,6 +1732,7 @@ class DocumentService:
             vault_id = await vault_repo.create(
                 name, description, git_path, owner_id=uid, public_access=public_access,
             )
+            created_vault_id = vault_id
             # PG-native RBAC: create vault group roles + grant admin to owner,
             # then mirror public_access (no-op if 'none'). Done before template
             # application so any tables the template creates inherit grants
@@ -1701,17 +1768,211 @@ class DocumentService:
                 )
                 await self.put(seed_req, agent_id=str(owner_id) if owner_id else None)
         except BaseException:
+            # run_compensation: the whole rollback runs to COMPLETION even
+            # if the cancellation that may be unwinding us keeps firing;
+            # the cancel is re-delivered afterwards. Any rollback-internal
+            # failure is logged inside, never masks the original error.
             try:
-                await asyncio.to_thread(self.git.cleanup_vault_dirs, name)
-            except Exception as cleanup_err:  # noqa: BLE001
-                logger.warning(
-                    "create_vault rollback cleanup failed for %s: %s — operator must "
-                    "rm -rf the orphan bare/worktree dir manually before retrying",
-                    name, cleanup_err,
-                )
+                await run_compensation(self._rollback_vault_create(
+                    name=name,
+                    existed_before=existed_before,
+                    git_path=git_path,
+                    created_vault_id=created_vault_id,
+                    template=template,
+                ))
+            except asyncio.CancelledError:
+                raise
+            except Exception as rb_err:  # noqa: BLE001 — defense in depth; _rollback logs its own failures
+                logger.error("create_vault rollback itself failed for %s: %s", name, rb_err)
             raise
         logger.info("Vault created: %s (owner: %s, template: %s)", name, owner_id, template)
         return str(vault_id)
+
+    async def _rollback_vault_create(
+        self, *, name: str, existed_before: bool,
+        git_path: str | None, created_vault_id: uuid.UUID | None,
+        template: str | None,
+    ) -> None:
+        """Compensation for a failed create_vault.
+
+        SAFETY RULE — never destroy foreign data: the vaults row becomes
+        visible the moment it commits, so the owner can already be writing
+        documents to the new vault while creation is still seeding. If any
+        such write is detected, the destructive rollback is ABORTED and the
+        (functional, partially-seeded) vault is left in place; the creation
+        error still surfaces to the caller. Enforced by taking the vault's
+        write-lane gate — in-flight foreign writers drain first (they hold
+        the gate), new ones are excluded while we check and purge.
+
+        Runs under `_create_lock(name)` (caller holds it) and inside
+        run_compensation (no cancellation lands here). Order: DB purge
+        BEFORE disk — "orphan dirs blocking a recreate" (logged, operator
+        rm -rf) beats "live vaults row whose repo is gone" (500 on every
+        write).
+        """
+        if created_vault_id is None:
+            # Nothing visible yet — at most an on-disk dir we own.
+            await self._rollback_vault_disk(name, existed_before, git_path)
+            return
+        # Collection paths this creation owns: the seed's 'overview' plus
+        # whatever the template declares. Anything else is a foreign
+        # akb_create_collection and vetoes the purge.
+        from app.services import template_registry
+        owned_paths = {"overview"}
+        if template:
+            tmpl = template_registry.get(template) or {}
+            owned_paths.update(
+                c["path"] for c in tmpl.get("collections", []) if c.get("path")
+            )
+        try:
+            async with write_lane(name):
+                # The lane gate drains in-flight DOCUMENT writers before the
+                # repo dirs get removed below; row-level exclusion against
+                # ALL writers (tables/files don't take the lane) happens
+                # inside the purge transaction via FOR UPDATE.
+                purged = await self._rollback_vault_rows(
+                    created_vault_id, name, owned_paths=owned_paths,
+                )
+                if purged:
+                    await self._rollback_vault_disk(name, existed_before, git_path)
+        except WriteBusyError:
+            logger.error(
+                "create_vault rollback for %s SKIPPED: write lane saturated — "
+                "the half-created vault is left in place; delete it manually.",
+                name,
+            )
+
+    async def _rollback_vault_disk(
+        self, name: str, existed_before: bool, git_path: str | None,
+    ) -> None:
+        """Disk rollback — only for a directory THIS request created.
+        `git_path is not None` covers the normal case; the extra
+        vault_exists() probe covers an absorbed-cancel during init where
+        the thread completed but the coroutine never received git_path —
+        sound only because `_create_lock(name)` excludes concurrent
+        same-name creates.
+        """
+        if existed_before or (git_path is None and not self.git.vault_exists(name)):
+            return
+        try:
+            # Commit executor: cleanup blocks on the vault threading.Lock
+            # and rmtree's the repo — keep it off the shared read pool.
+            await run_git_write(self.git.cleanup_vault_dirs, name, must_complete=True)
+        except Exception as cleanup_err:  # noqa: BLE001
+            logger.warning(
+                "create_vault rollback cleanup failed for %s: %s — operator must "
+                "rm -rf the orphan bare/worktree dir manually before retrying",
+                name, cleanup_err,
+            )
+
+    async def _rollback_vault_rows(
+        self, vault_id: uuid.UUID, name: str, *, owned_paths: set[str],
+    ) -> bool:
+        """Best-effort DB purge for a failed create_vault. Returns True when
+        the purge ran (safe to remove the repo dirs too), False when it was
+        aborted or failed (the vault must be LEFT IN PLACE).
+
+        TOCTOU-free foreign-write detection: the transaction first locks the
+        vaults row with SELECT ... FOR UPDATE. Every FK writer — documents,
+        vault_tables (akb_create_table takes no write lane), vault_files —
+        holds FOR KEY SHARE on that row until its transaction ends, which
+        conflicts with FOR UPDATE. So in-flight foreign writes commit BEFORE
+        our lock is granted (the re-check below then sees them and aborts),
+        and later ones block until this transaction ends and then fail their
+        FK cleanly against the deleted row — the ON DELETE CASCADE on
+        vault_tables can never swallow an acknowledged foreign row.
+
+        Foreign = any document off the pinned seed path; any file / table /
+        publication / todo (creation makes none of those); any OTHER vault's
+        table_query publication referencing this vault by name
+        (query_vault_names); any collection outside ``owned_paths`` (seed
+        'overview' + template paths). The remaining vaults-FK tables are
+        creation-derived or consistent to purge: chunks (derived from the
+        seed), edges/resource_aliases (endpoints can only be the seed doc
+        once the doc guard passes), vault_access (access metadata shares
+        the vault's fate — round-8 disposition). Accepted residual
+        ambiguity: a foreign write landing exactly at
+        overview/vault-skill.md inside the creation window is
+        indistinguishable from our seed.
+
+        Never raises: the original create failure must stay the surfaced
+        error; a failed purge is logged for operator follow-up.
+        """
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    locked = await conn.fetchrow(
+                        "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault_id,
+                    )
+                    if locked is None:
+                        # Row already gone (competing manual delete) — the
+                        # disk dirs are still ours to clean.
+                        return True
+                    # xvault_pubs: table_query publications OWNED BY OTHER
+                    # vaults can reference this vault by NAME via
+                    # query_vault_names (TEXT[], no FK) — purging the vault
+                    # would break their already-shared public URLs at
+                    # resolution time. Name-based, so the FOR UPDATE
+                    # serialization does NOT cover it: a publish committing
+                    # inside the check→purge window still dangles. Accepted
+                    # residual — the window is microseconds and delete_vault
+                    # has the identical (pre-existing) dangling hazard.
+                    foreign = await conn.fetchrow(
+                        """
+                        SELECT
+                          (SELECT COUNT(*) FROM documents
+                            WHERE vault_id = $1 AND path <> 'overview/vault-skill.md') AS docs,
+                          (SELECT COUNT(*) FROM vault_files WHERE vault_id = $1) AS files,
+                          (SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1) AS tables,
+                          (SELECT COUNT(*) FROM publications WHERE vault_id = $1) AS pubs,
+                          (SELECT COUNT(*) FROM publications
+                            WHERE $3 = ANY(query_vault_names)) AS xvault_pubs,
+                          (SELECT COUNT(*) FROM todos WHERE vault_id = $1) AS todos,
+                          (SELECT COUNT(*) FROM collections
+                            WHERE vault_id = $1 AND path <> ALL($2::text[])) AS colls
+                        """,
+                        vault_id, list(owned_paths), name,
+                    )
+                    foreign_keys = ("docs", "files", "tables", "pubs", "xvault_pubs", "todos", "colls")
+                    if any(foreign[k] for k in foreign_keys):
+                        logger.error(
+                            "create_vault rollback for %s ABORTED: the vault already "
+                            "accepted writes from other requests (%s) — leaving it in "
+                            "place (partially seeded). The creation error still "
+                            "propagates; delete the vault manually if it is unwanted.",
+                            name,
+                            ", ".join(f"{k}={foreign[k]}" for k in foreign_keys),
+                        )
+                        return False
+                    # events first: the seed put() emitted document.put rows
+                    # (events has no vault FK cascade) — leaving them would
+                    # feed consumers an event for a vault this rollback is
+                    # about to erase.
+                    await conn.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
+                    await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
+                    await delete_vault_chunks(conn, vault_id)
+                    await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
+                    await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
+                    await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
+                    await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
+                    await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "create_vault rollback: DB purge failed for vault %s (%s): %s — "
+                "the half-created vault (rows AND repo) is left in place; "
+                "delete the vault manually",
+                name, vault_id, e,
+            )
+            return False
+        try:
+            await get_role_sync().on_vault_delete(vault_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "create_vault rollback: role cleanup failed for vault %s (%s): %s",
+                name, vault_id, e,
+            )
+        return True
 
     async def _apply_template(self, vault_name: str, vault_id: uuid.UUID, template: str, coll_repo) -> None:
         """Apply a vault template via the shared TemplateRegistry."""
@@ -1746,7 +2007,7 @@ class DocumentService:
                 if suggested:
                     guide_content += f"\n\nSuggested document types: {', '.join(suggested)}"
 
-                await asyncio.to_thread(
+                await run_git_write(
                     self.git.commit_file,
                     vault_name=vault_name,
                     file_path=f"{path}/_guide.md",

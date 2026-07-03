@@ -391,6 +391,34 @@ class Settings(BaseModel):
     # legacy single-task behavior; 4-8 is the typical production knob.
     indexing_concurrency: int = 1
 
+    # ── Write-lane admission (design/proposal/command-lane-write-path,
+    # round-05). Git-committing writes pass a two-stage gate BEFORE
+    # acquiring any scarce resource (pool connection, executor thread):
+    # per-vault gate (hardwired to 1 — git serializes per vault anyway)
+    # then a global lane semaphore. Waiting happens as suspended
+    # coroutines, so a hot vault's backlog costs memory only and cannot
+    # starve reads or other vaults.
+    #
+    # Global concurrency for git-committing writes. Also sizes the
+    # dedicated commit ThreadPoolExecutor. Bounds the pool connections
+    # writes can hold at once — keep well under pg_pool_max_size (30) so
+    # reads always have headroom.
+    write_lane_concurrency: int = 8
+    # Total admission deadline (both gate stages). Exceeded → 429 with
+    # Retry-After; the request performed no work. Sized so a normal
+    # multi-file ingest burst (commits are ~50-200ms) rides it out,
+    # while nothing ever reaches the ingress 120s proxy timeout.
+    write_lane_queue_timeout_secs: float = 10.0
+    # Global cap on concurrently-waiting writers — a memory/socket
+    # backstop, not a policy knob. Normal operation never reaches it;
+    # arrivals beyond it fail fast instead of accumulating state.
+    write_lane_max_waiters: int = 512
+    # kill_after_timeout for git commands on the write path (reset/add/
+    # rm/mv/write-tree/commit-tree/update-ref). A wedged git process
+    # otherwise pins a lane slot + commit thread + pool connection until
+    # the 60s idle-in-transaction reaper fires.
+    git_write_timeout_secs: float = 30.0
+
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
     bm25_b: float = 0.75
