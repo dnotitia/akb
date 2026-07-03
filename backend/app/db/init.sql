@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     token_prefix TEXT NOT NULL,        -- first 8 chars for identification (akb_xxxx)
     scopes TEXT[] DEFAULT '{read,write}',  -- read, write, admin
     vault_scope JSONB,                     -- per-PAT vault scope {prefixes, extra_vaults}; NULL = unscoped (full user ACL). See migration 040.
+    key_class TEXT NOT NULL DEFAULT 'pat' CHECK (key_class IN ('pat', 'service', 'publishable')),
     expires_at TIMESTAMPTZ,
     last_used_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -238,10 +239,21 @@ CREATE TABLE IF NOT EXISTS vault_table_rows (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS vault_migrations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    checksum TEXT NOT NULL,
+    UNIQUE(vault_id, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_vault_tables_vault ON vault_tables(vault_id);
 CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_table ON vault_table_rows(table_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_data ON vault_table_rows USING gin(data);
+CREATE INDEX IF NOT EXISTS idx_vault_migrations_vault_applied
+    ON vault_migrations(vault_id, applied_at DESC);
 
 -- ============================================================
 -- Edges (unified cross-type relation graph via URI scheme)

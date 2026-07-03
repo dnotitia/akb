@@ -892,7 +892,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                     conn, "table", str(vt["id"]),
                 )
                 pg_name = table_data_repo.pg_table_name(vault_name, vt["name"])
-                await conn.execute(f"DROP TABLE IF EXISTS {pg_name}")
+                await conn.execute(f"DROP TABLE IF EXISTS {pg_name} CASCADE")
             await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
 
             await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)

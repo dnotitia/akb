@@ -1345,7 +1345,8 @@ The `confirm` parameter must match the vault name. Owner only.""",
 | Param | Required | Description |
 |-------|----------|-------------|
 | uri | ✓ | Table AKB URI — `akb://{vault}[/coll/{coll_path}]/table/{name}` |
-| add_columns | | Columns to add: [{"name": "col", "type": "text"}] |
+| add_columns | | Columns to add, including rich specs: [{"name": "col", "type": "text", "default": "...", "check": {...}, "references": {...}}] |
+| alter_columns | | Rich column ops: [{"name": "col", "set_default": "...", "drop_default": true, "set_check": {...}, "drop_check": true, "set_not_null": true, "drop_not_null": true, "set_enum": [...]}] |
 | drop_columns | | Column names to remove: ["old_col"] |
 | rename_columns | | Rename map: {"old_name": "new_name"} |
 | add_unique_keys | | UNIQUE keys to add: [{name?, columns}] |
@@ -1365,7 +1366,8 @@ The `confirm` parameter must match the vault name. Owner only.""",
 ## Example
 ```
 akb_alter_table(uri="akb://eng/table/tasks",
-  add_columns=[{"name": "priority", "type": "number"}],
+  add_columns=[{"name": "priority", "type": "number", "default": 0}],
+  alter_columns=[{"name": "priority", "set_check": {"op": "gte", "value": 0}}],
   drop_columns=["old_field"],
   rename_columns={"desc": "description"},
   add_unique_keys=[{"name": "uq_slug", "columns": ["slug"]}],

@@ -12,8 +12,10 @@ from __future__ import annotations
 import logging
 import uuid
 
+import asyncpg
+
 from app.db.postgres import get_pool
-from app.exceptions import NotFoundError
+from app.exceptions import ConflictError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -338,7 +340,14 @@ class CollectionService:
                 # table either disappears completely or not at all.
                 for t in tables:
                     pg_name = table_data_repo.pg_table_name(vault, t["name"])
-                    await table_data_repo.drop_dynamic_table(conn, pg_name)
+                    try:
+                        await table_data_repo.drop_dynamic_table(conn, pg_name)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot delete collection {path!r}: table {t['name']!r} "
+                            "is referenced by another vault table. Drop dependent "
+                            "tables or columns first."
+                        ) from e
                     await delete_table_chunks(conn, str(t["id"]))
                     await table_registry_repo.delete(conn, t["id"])
                     t_uri = table_uri(vault, t["name"], collection=t.get("collection"))

@@ -23,7 +23,12 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from app.repositories.table_data_repo import count_statement_separators
+from app.repositories.table_data_repo import (
+    contains_pg_settings_identifier,
+    contains_set_config_call,
+    contains_unicode_escaped_identifier,
+    count_statement_separators,
+)
 
 
 # ── 1. separator counting is literal-aware ──────────────────────
@@ -71,6 +76,55 @@ def test_trailing_separator_is_still_counted_by_the_pure_helper():
     assert count_statement_separators("SELECT 1;".rstrip(";").strip()) == 0
 
 
+def test_set_config_call_is_detected_outside_literals():
+    assert contains_set_config_call(
+        "WITH _ AS (SELECT set_config('request.jwt.claims', '{}', true)) SELECT 1"
+    )
+    assert contains_set_config_call(
+        "SELECT pg_catalog.set_config('request.jwt.claims', '{}', true)"
+    )
+    assert contains_set_config_call('SELECT "set_config" (\'x\', \'y\', true)')
+
+
+def test_set_config_detector_keeps_scanning_after_non_call_identifier():
+    assert contains_set_config_call(
+        "WITH x(set_config) AS (VALUES (1)) "
+        "SELECT set_config, set_config('request.jwt.claims', '{}', true) FROM x"
+    )
+
+
+def test_set_config_detector_ignores_literals_comments_and_identifiers():
+    assert not contains_set_config_call("SELECT 'set_config(' AS note")
+    assert not contains_set_config_call("SELECT 1 -- set_config('x', 'y', true)")
+    assert not contains_set_config_call("SELECT /* set_config('x') */ 1")
+    assert not contains_set_config_call("SELECT set_config_value FROM metrics")
+
+
+def test_unicode_escaped_identifier_detector_blocks_alternate_spellings():
+    assert contains_unicode_escaped_identifier(r'SELECT U&"set\005fconfig"()')
+    assert contains_unicode_escaped_identifier(r'SELECT u&"set\005fconfig"()')
+
+
+def test_unicode_escaped_identifier_detector_ignores_literals_and_normal_quotes():
+    assert not contains_unicode_escaped_identifier(r"SELECT 'U&\"set\005fconfig\"'")
+    assert not contains_unicode_escaped_identifier(r'SELECT "set_config"()')
+    assert not contains_unicode_escaped_identifier('SELECT u & "set_config"')
+
+
+def test_pg_settings_identifier_detector_blocks_catalog_reference():
+    assert contains_pg_settings_identifier(
+        "WITH _ AS (UPDATE pg_catalog.pg_settings SET setting = '{}' "
+        "WHERE name = 'request.jwt.claims') SELECT 1"
+    )
+    assert contains_pg_settings_identifier('SELECT * FROM "pg_settings"')
+
+
+def test_pg_settings_identifier_detector_ignores_literals_comments_and_prefixes():
+    assert not contains_pg_settings_identifier("SELECT 'pg_settings' AS note")
+    assert not contains_pg_settings_identifier("SELECT 1 -- pg_settings")
+    assert not contains_pg_settings_identifier("SELECT pg_settings_value FROM metrics")
+
+
 # ── 2. execute_sql wiring (AST; no heavy imports) ───────────────
 
 _TABLE_SERVICE = (
@@ -81,10 +135,7 @@ _TABLE_SERVICE = (
 def _execute_sql_fn() -> ast.AsyncFunctionDef:
     tree = ast.parse(_TABLE_SERVICE.read_text())
     for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
-            and node.name == "execute_sql"
-        ):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "execute_sql":
             return node
     raise AssertionError("execute_sql not found in table_service.py")
 

@@ -34,6 +34,7 @@ from typing import Any
 from app.exceptions import (
     ConflictError,
     ForbiddenError,
+    InvalidColumnTypeError,
     NotFoundError,
     ValidationError,
     WriteBusyError,
@@ -60,6 +61,7 @@ INSUFFICIENT_SCOPE = "insufficient_scope"
 
 # Caller-side input
 INVALID_ARGUMENT = "invalid_argument"      # generic argument shape problem
+INVALID_COLUMN_TYPE = "invalid_column_type"
 INVALID_URI = "invalid_uri"                # akb:// URI parse failure
 INVALID_PATH = "invalid_path"              # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"      # arg key not in tool schema (0.5.4)
@@ -76,6 +78,19 @@ METHOD_NOT_ALLOWED = "method_not_allowed"  # DDL via akb_sql, etc.
 SQL_ERROR = "sql_error"                    # generic PG error after enrichment
 UNDEFINED_COLUMN = "undefined_column"
 UNDEFINED_TABLE = "undefined_table"
+UNFILTERED_MUTATION = "unfiltered_mutation"
+BULK_TOO_LARGE = "bulk_too_large"
+NO_UNIQUE_CONSTRAINT = "no_unique_constraint"
+
+# Row-read / row-write REST surface — PostgREST-style URL/AST compiler
+# (`table_row_query`). These sit alongside the generic INVALID_ARGUMENT
+# for shape errors, but carry a more specific code so SDK/codegen
+# clients can branch on the exact compiler rejection.
+INVALID_FILTER = "invalid_filter"          # malformed filter operand / op.value grammar
+INVALID_OPERATOR = "invalid_operator"      # unknown or unsupported row-read operator
+INVALID_CAST = "invalid_cast"              # unsupported / malformed JSON-path cast
+FILTER_TOO_DEEP = "filter_too_deep"        # boolean filter nesting past MAX_BOOL_DEPTH
+NOT_IMPLEMENTED = "not_implemented"        # recognized-but-unsupported request shape
 
 # Knowledge-graph linking
 SELF_LINK = "self_link"
@@ -137,6 +152,13 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):
         return err(str(e), code=CONFLICT)
+    if isinstance(e, InvalidColumnTypeError):
+        return err(
+            str(e),
+            code=INVALID_COLUMN_TYPE,
+            hint=e.hint,
+            **(e.details or {}),
+        )
     if isinstance(e, WriteBusyError):
         return err(
             str(e), code=WRITE_BUSY,

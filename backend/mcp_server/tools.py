@@ -753,10 +753,34 @@ TOOLS = [
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
-                            "type": {"type": "string", "enum": ["text", "number", "boolean", "date", "json"]},
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "text", "int", "float", "numeric", "number",
+                                    "boolean", "uuid", "date", "timestamp",
+                                    "jsonb", "json", "text[]", "enum",
+                                ],
+                            },
+                            "default": {},
+                            "check": {"type": "object"},
+                            "enum": {"type": "array"},
+                            "references": {"type": "object"},
+                            "on_delete": {"type": "string"},
+                            "required": {"type": "boolean"},
+                            "unique": {"type": "boolean"},
+                            "index": {"type": "boolean"},
                         },
                         "required": ["name", "type"],
                     },
+                },
+                "alter_columns": {
+                    "type": "array",
+                    "description": (
+                        "Rich column ops: [{name, set_default?, drop_default?, "
+                        "set_check?, drop_check?, set_not_null?, drop_not_null?, "
+                        "set_enum?/enum?, rename_enum_values?}]"
+                    ),
+                    "items": {"type": "object"},
                 },
                 "drop_columns": {
                     "type": "array",

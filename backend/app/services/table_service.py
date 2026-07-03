@@ -17,12 +17,15 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -38,6 +41,7 @@ from app.services.user_sql_executor import (
 )
 from app.util.errors import (
     err,
+    INVALID_ARGUMENT,
     METHOD_NOT_ALLOWED,
     MULTI_STATEMENT,
     PERMISSION_DENIED,
@@ -54,6 +58,9 @@ from app.util.text import fuzzy_hint
 # `table_data_repo`.
 from app.repositories.table_data_repo import (  # noqa: F401
     build_table_name_map,
+    contains_pg_settings_identifier,
+    contains_set_config_call,
+    contains_unicode_escaped_identifier,
     count_statement_separators,
     rewrite_table_names,
 )
@@ -67,6 +74,25 @@ _RESERVED = {"id", "created_at", "updated_at", "created_by"}
 # create AND alter so the value stored in the registry cannot diverge
 # from `safe_ident(name)` (which silently maps punctuation to `_`).
 _COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+@asynccontextmanager
+async def _existing_or_pooled_conn(existing_conn: Any | None) -> AsyncIterator[Any]:
+    if existing_conn is not None:
+        yield existing_conn
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        yield conn
+
+
+@asynccontextmanager
+async def _transaction_if_needed(conn: Any, enabled: bool) -> AsyncIterator[None]:
+    if enabled:
+        async with conn.transaction():
+            yield
+        return
+    yield
 
 
 def _validate_column_name(name) -> None:
@@ -271,6 +297,191 @@ def _resolve_indexes(
     return resolved
 
 
+def _normalize_column_spec(col: dict) -> dict:
+    for flag in ("required", "unique", "index"):
+        if flag in col and not isinstance(col[flag], bool):
+            raise ValidationError(f"Column {col.get('name')!r}: {flag} must be a boolean.")
+    return table_data_repo.normalize_column_spec(col)
+
+
+def _inline_unique_keys(columns: list[dict], pg_name: str) -> list[dict]:
+    return [
+        {
+            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="uk"),
+            "columns": [col["name"]],
+        }
+        for col in columns
+        if col.get("unique") is True
+    ]
+
+
+def _inline_indexes(columns: list[dict], pg_name: str) -> list[dict]:
+    return [
+        {
+            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="idx"),
+            "columns": [{"name": col["name"], "order": "asc"}],
+        }
+        for col in columns
+        if col.get("index") is True
+    ]
+
+
+def _reject_duplicate_meta_names(items: list[dict], *, label: str) -> None:
+    seen: set[str] = set()
+    for item in items:
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        if name in seen:
+            raise ValidationError(f"Duplicate {label} name {name!r}.")
+        seen.add(name)
+
+
+def _normalize_enum_renames(spec: dict, old_values: list, new_values: list[str]) -> dict[str, str]:
+    raw = spec.get("rename_enum_values") or spec.get("enum_renames") or {}
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValidationError("rename_enum_values must be an object mapping old enum values to new values.")
+    old_set = {v for v in old_values if isinstance(v, str)}
+    new_set = set(new_values)
+    renames: dict[str, str] = {}
+    for old, new in raw.items():
+        if not isinstance(old, str) or not isinstance(new, str) or not old or not new:
+            raise ValidationError("Enum rename mappings must use non-empty string values.")
+        if old not in old_set:
+            raise ValidationError(f"Cannot rename missing enum value {old!r}.")
+        if new not in new_set:
+            raise ValidationError(f"Renamed enum value {new!r} must appear in the new enum list.")
+        renames[old] = new
+    return renames
+
+
+def _single_column_unique_names(unique_keys: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for unique_key in unique_keys:
+        cols = unique_key.get("columns", [])
+        if len(cols) == 1 and isinstance(cols[0], str):
+            names.add(cols[0].lower())
+    return names
+
+
+async def _validate_column_references(
+    conn,
+    vault_id: uuid.UUID,
+    columns: list[dict],
+) -> None:
+    """Validate same-vault FK references before any DDL reaches PostgreSQL."""
+    for col in columns:
+        refs = col.get("references")
+        if refs is None:
+            continue
+        refs, on_delete = table_data_repo.normalize_reference_spec(refs, col.get("on_delete"))
+        col["references"] = refs
+        col["on_delete"] = on_delete
+        if on_delete == "set null" and col.get("required") is True:
+            raise ValidationError(
+                f"Column {col['name']!r}: ON DELETE SET NULL requires a nullable source column."
+            )
+
+        target_table = await table_registry_repo.find_by_name(conn, vault_id, refs["table"])
+        if not target_table:
+            raise AKBError(
+                f"Column {col['name']!r}: references target table {refs['table']!r} "
+                "must exist in the same vault.",
+                status_code=400,
+                code=INVALID_ARGUMENT,
+            )
+
+        target_column = refs["column"]
+        if target_column == "id":
+            target_type = "uuid"
+            target_is_unique = True
+        else:
+            target_columns = table_registry_repo.parse_columns(target_table["columns"])
+            lookup = _declared_column_lookup(target_columns)
+            target_key = target_column.lower()
+            if target_key not in lookup:
+                raise ValidationError(
+                    f"Column {col['name']!r}: references target column "
+                    f"{target_column!r} does not exist on table {refs['table']!r}."
+                )
+            canonical_target = lookup[target_key]
+            refs["column"] = canonical_target
+            target_meta = next(c for c in target_columns if c["name"] == canonical_target)
+            target_type = table_data_repo.normalize_column_type(target_meta.get("type", "text"))
+            target_unique_names = _single_column_unique_names(
+                table_registry_repo.parse_json_list(target_table.get("unique_keys"))
+            )
+            target_is_unique = bool(
+                target_meta.get("unique") is True or canonical_target.lower() in target_unique_names
+            )
+        if not target_is_unique:
+            raise ValidationError(
+                f"Column {col['name']!r}: references target "
+                f"{refs['table']!r}.{refs['column']!r} must be a primary key or single-column UNIQUE key."
+            )
+
+        source_pg_type = _canonical_pg_type(table_data_repo.normalize_column_type(col.get("type", "text")))
+        target_pg_type = _canonical_pg_type(target_type)
+        if source_pg_type != target_pg_type:
+            raise ValidationError(
+                f"Column {col['name']!r}: references type mismatch; source "
+                f"{source_pg_type} cannot reference {refs['table']}.{refs['column']} "
+                f"({target_pg_type})."
+            )
+
+
+async def _referencing_columns(
+    conn,
+    vault_id: uuid.UUID,
+    target_table_name: str,
+    target_columns: set[str],
+) -> list[str]:
+    refs: list[str] = []
+    targets = {c.lower() for c in target_columns}
+    for table in await table_registry_repo.list_for_vault(conn, vault_id):
+        for col in table_registry_repo.parse_columns(table.get("columns")):
+            reference = col.get("references")
+            if not isinstance(reference, dict):
+                continue
+            ref_table = reference.get("table")
+            ref_column = reference.get("column") or "id"
+            if (
+                isinstance(ref_table, str)
+                and isinstance(ref_column, str)
+                and ref_table.lower() == target_table_name.lower()
+                and ref_column.lower() in targets
+            ):
+                refs.append(f"{table['name']}.{col.get('name')}")
+    return sorted(refs)
+
+
+async def _reject_referenced_target_columns(
+    conn,
+    vault_id: uuid.UUID,
+    table_name: str,
+    column_names: set[str],
+    *,
+    action: str,
+) -> None:
+    refs = await _referencing_columns(conn, vault_id, table_name, column_names)
+    if refs:
+        raise ConflictError(
+            f"Cannot {action} referenced column(s) on table {table_name!r}: "
+            f"{sorted(column_names)} are referenced by {refs}. Drop dependent "
+            "tables or columns first."
+        )
+
+
+def _foreign_key_validation_message(table_name: str, e: Exception) -> str:
+    return (
+        f"Foreign-key constraint for table {table_name!r} is invalid: {e}. "
+        "references must target a same-vault table column backed by a primary "
+        "key or single-column UNIQUE key, with compatible column types."
+    )
+
+
 # ── Indexing helpers ─────────────────────────────────────────────
 
 
@@ -352,6 +563,7 @@ async def create_table(
                 raise ConflictError(f"Table already exists: {name}")
 
             seen: set[str] = set()
+            normalized_columns: list[dict] = []
             for col in columns:
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
@@ -367,6 +579,8 @@ async def create_table(
                         f"reserved names {sorted(_RESERVED)}."
                     )
                 seen.add(key)
+                normalized_columns.append(_normalize_column_spec(col))
+            columns = normalized_columns
 
             collection_id = None
             if collection_path:
@@ -393,11 +607,20 @@ async def create_table(
             # DDL so a bad spec rolls back with zero schema change. On a
             # freshly-created (empty) table there is no duplicate-preflight
             # to run — a later duplicate INSERT surfaces PG 23505 via akb_sql.
-            resolved_uks = _resolve_unique_keys(unique_keys, columns, pg_name)
-            resolved_idxs = _resolve_indexes(indexes, columns, pg_name)
+            resolved_uks = _inline_unique_keys(columns, pg_name) + _resolve_unique_keys(
+                unique_keys, columns, pg_name,
+            )
+            resolved_idxs = _inline_indexes(columns, pg_name) + _resolve_indexes(
+                indexes, columns, pg_name,
+            )
+            _reject_duplicate_meta_names(resolved_uks, label="unique-key")
+            _reject_duplicate_meta_names(resolved_idxs, label="index")
+            await _validate_column_references(conn, vault_id, columns)
 
             try:
-                await table_data_repo.create_dynamic_table(conn, pg_name, columns)
+                await table_data_repo.create_dynamic_table(
+                    conn, pg_name, columns, vault_name=vault["name"],
+                )
                 for uk in resolved_uks:
                     await table_data_repo.create_unique_constraint(
                         conn, pg_name, uk["name"], uk["columns"],
@@ -435,6 +658,13 @@ async def create_table(
                     f"shared schema-wide — choose a different name (or omit it "
                     f"to let AKB generate a collision-safe one)."
                 ) from e
+            except (
+                asyncpg.ForeignKeyViolationError,
+                asyncpg.InvalidForeignKeyError,
+                asyncpg.UndefinedTableError,
+                asyncpg.UndefinedColumnError,
+            ) as e:
+                raise ValidationError(_foreign_key_validation_message(name, e)) from e
             except asyncpg.UniqueViolationError as e:
                 # Concurrent create past the find_by_name check races on
                 # UNIQUE(vault_tables) or pg_type. Surface as 409.
@@ -526,6 +756,11 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
     return results
 
 
+def _canonical_pg_type(logical_type: str | None) -> str:
+    pg_type = table_data_repo.TYPE_MAP.get(logical_type or "text", "TEXT")
+    return " ".join(pg_type.lower().split())
+
+
 async def drop_table(
     vault_id: uuid.UUID,
     table_name: str,
@@ -547,7 +782,13 @@ async def drop_table(
 
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
-            await table_data_repo.drop_dynamic_table(conn, pg_name)
+            try:
+                await table_data_repo.drop_dynamic_table(conn, pg_name)
+            except asyncpg.DependentObjectsStillExistError as e:
+                raise ConflictError(
+                    f"Cannot drop table {table_name!r}: other vault tables reference it. "
+                    "Drop dependent tables or columns first."
+                ) from e
             # Chunks + vector outbox enqueue must commit with the DDL/registry
             # delete so a crash mid-drop can't leave orphan chunks.
             from app.services.index_service import delete_table_chunks
@@ -593,15 +834,19 @@ async def alter_table(
     *,
     actor_id: str,
     add_columns: list[dict] | None = None,
+    alter_columns: list[dict] | None = None,
     drop_columns: list[str] | None = None,
     rename_columns: dict[str, str] | None = None,
     add_unique_keys: list[dict] | None = None,
     drop_unique_keys: list[str] | None = None,
     add_indexes: list[dict] | None = None,
     drop_indexes: list[str] | None = None,
+    _conn: Any | None = None,
+    _defer_index: bool = False,
 ) -> dict:
     """Apply schema changes to a vault table:
        - add_columns: [{name, type}, ...]
+       - alter_columns: [{name, enum, rename_enum_values?}, ...]
        - drop_columns: ["name", ...]
        - rename_columns: {"old": "new", ...}
        - add_unique_keys: [{name?, columns}, ...]
@@ -614,9 +859,8 @@ async def alter_table(
     violation the whole alter rolls back (physical schema + registry
     unchanged). Emits `table.alter` after the writes commit.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
+    async with _existing_or_pooled_conn(_conn) as conn:
+        async with _transaction_if_needed(conn, _conn is None):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
@@ -636,6 +880,10 @@ async def alter_table(
 
             columns = table_registry_repo.parse_columns(table["columns"])
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+            existing_uks = table_registry_repo.parse_json_list(table.get("unique_keys"))
+            existing_idxs = table_registry_repo.parse_json_list(table.get("indexes"))
+            uk_changed = False
+            idx_changed = False
 
             # ── Guard rails (mirror create_table) ───────────────────
             # Reject reserved/malformed names BEFORE any DDL so the whole
@@ -644,12 +892,24 @@ async def alter_table(
             # bookkeeping columns (id/created_at/updated_at/created_by) —
             # those are exactly the _RESERVED set — so a client can no
             # longer drop the PK or shadow a reserved name.
+            normalized_add_columns: list[dict] = []
             for col in (add_columns or []):
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
                         f"Each added column must be an object with a 'name' field; got {col!r}."
                     )
                 _validate_column_name(col["name"])
+                normalized_add_columns.append(_normalize_column_spec(col))
+            add_columns = normalized_add_columns
+            normalized_alter_columns: list[dict] = []
+            for col in (alter_columns or []):
+                if not isinstance(col, dict) or "name" not in col:
+                    raise ValidationError(
+                        f"Each altered column must be an object with a 'name' field; got {col!r}."
+                    )
+                _validate_column_name(col["name"])
+                normalized_alter_columns.append(dict(col))
+            alter_columns = normalized_alter_columns
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
                     raise ValidationError("Drop column name must be a non-empty string.")
@@ -661,52 +921,177 @@ async def alter_table(
             for old_name, new_name in (rename_columns or {}).items():
                 if not isinstance(old_name, str) or not old_name:
                     raise ValidationError("Rename source column must be a non-empty string.")
-                if old_name.lower() in _RESERVED:
-                    raise ValidationError(
-                        f"Column '{old_name}' is a reserved bookkeeping column "
-                        f"and cannot be renamed. Reserved: {sorted(_RESERVED)}."
-                    )
+                _validate_column_name(old_name)
                 _validate_column_name(new_name)
 
             added: list[str] = []
+            altered: list[str] = []
             dropped: list[str] = []
             renamed: dict[str, str] = {}
 
             if add_columns:
+                await _validate_column_references(conn, vault_id, add_columns)
+                taken_uk_names = {uk["name"] for uk in existing_uks}
+                taken_idx_names = {idx["name"] for idx in existing_idxs}
                 for col in add_columns:
                     if any(c["name"] == col["name"] for c in columns):
                         continue
-                    col_type = table_data_repo.TYPE_MAP.get(col.get("type", "text"), "TEXT")
-                    safe_name = table_data_repo.safe_ident(col["name"])
-                    await table_data_repo.add_column(conn, pg_name, safe_name, col_type)
+                    try:
+                        await table_data_repo.add_column(
+                            conn, pg_name, col, vault_name=vault["name"],
+                        )
+                    except asyncpg.NotNullViolationError as e:
+                        raise ValidationError(
+                            f"Cannot add required column {col['name']!r} without a default: "
+                            f"existing rows would receive NULL. Provide a default or add the "
+                            f"column as optional first."
+                        ) from e
+                    except (
+                        asyncpg.ForeignKeyViolationError,
+                        asyncpg.InvalidForeignKeyError,
+                        asyncpg.UndefinedTableError,
+                        asyncpg.UndefinedColumnError,
+                    ) as e:
+                        raise ValidationError(_foreign_key_validation_message(table_name, e)) from e
                     columns.append(col)
                     added.append(col["name"])
+                    if col.get("unique") is True:
+                        uk = _inline_unique_keys([col], pg_name)[0]
+                        if uk["name"] in taken_uk_names:
+                            raise ValidationError(
+                                f"Unique-key name {uk['name']!r} already exists on this table."
+                            )
+                        try:
+                            await table_data_repo.create_unique_constraint(
+                                conn, pg_name, uk["name"], uk["columns"],
+                            )
+                        except asyncpg.UniqueViolationError as e:
+                            raise ValidationError(
+                                f"Cannot add unique column {col['name']!r}: existing rows "
+                                f"already violate uniqueness. De-duplicate the data first, "
+                                f"then retry."
+                            ) from e
+                        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                            raise ValidationError(
+                                f"Unique-key name {uk['name']!r} already exists in the "
+                                f"database: {e}. Names are shared schema-wide — choose a "
+                                f"different table or column name."
+                            ) from e
+                        taken_uk_names.add(uk["name"])
+                        existing_uks.append(uk)
+                        uk_changed = True
+                    if col.get("index") is True:
+                        idx = _inline_indexes([col], pg_name)[0]
+                        if idx["name"] in taken_idx_names:
+                            raise ValidationError(
+                                f"Index name {idx['name']!r} already exists on this table."
+                            )
+                        try:
+                            await table_data_repo.create_index(
+                                conn, pg_name, idx["name"],
+                                [(c["name"], c["order"]) for c in idx["columns"]],
+                            )
+                        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                            raise ValidationError(
+                                f"Index name {idx['name']!r} already exists in the database: "
+                                f"{e}. Names are shared schema-wide — choose a different "
+                                f"table or column name."
+                            ) from e
+                        taken_idx_names.add(idx["name"])
+                        existing_idxs.append(idx)
+                        idx_changed = True
 
             if drop_columns:
+                await _reject_referenced_target_columns(
+                    conn,
+                    vault_id,
+                    table_name,
+                    {c for c in drop_columns if isinstance(c, str)},
+                    action="drop",
+                )
                 for col_name in drop_columns:
                     safe_name = table_data_repo.safe_ident(col_name)
-                    await table_data_repo.drop_column(conn, pg_name, safe_name)
+                    try:
+                        await table_data_repo.drop_column(conn, pg_name, safe_name)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot drop column {col_name!r} on table {table_name!r}: "
+                            "other vault tables reference it. Drop dependent tables "
+                            "or columns first."
+                        ) from e
                     dropped.append(col_name)
                 columns = [c for c in columns if c["name"] not in drop_columns]
 
             if rename_columns:
+                lookup = _declared_column_lookup(columns)
+                rename_targets: set[str] = set()
                 for old_name, new_name in rename_columns.items():
+                    old_key = old_name.lower()
+                    new_key = new_name.lower()
+                    if old_key not in lookup:
+                        raise ValidationError(
+                            f"Cannot rename missing column {old_name!r} on table {table_name!r}."
+                        )
+                    if new_key != old_key and new_key in lookup:
+                        raise ValidationError(
+                            f"Cannot rename column {old_name!r} to {new_name!r} "
+                            f"on table {table_name!r}: target column already exists."
+                        )
+                    if new_key in rename_targets:
+                        raise ValidationError(
+                            f"Cannot rename multiple columns to {new_name!r} on table {table_name!r}."
+                        )
+                    rename_targets.add(new_key)
+                await _reject_referenced_target_columns(
+                    conn,
+                    vault_id,
+                    table_name,
+                    {old for old in rename_columns if isinstance(old, str)},
+                    action="rename",
+                )
+                for old_name, new_name in rename_columns.items():
+                    old_col = next((dict(c) for c in columns if c["name"] == old_name), None)
                     old_safe = table_data_repo.safe_ident(old_name)
                     new_safe = table_data_repo.safe_ident(new_name)
-                    await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    old_has_scalar_check = bool(
+                        old_col
+                        and old_col.get("check") is not None
+                        and old_col.get("type") != "enum"
+                    )
+                    try:
+                        if old_has_scalar_check:
+                            await table_data_repo.drop_column_check_constraints(
+                                conn, pg_name, old_name,
+                            )
+                        await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot rename column {old_name!r} on table {table_name!r}: "
+                            "other vault tables reference it. Drop dependent tables "
+                            "or columns first."
+                        ) from e
+                    updated_col = None
                     for c in columns:
                         if c["name"] == old_name:
                             c["name"] = new_name
+                            updated_col = c
                     renamed[old_name] = new_name
+                    if old_col and old_col.get("type") == "enum" and updated_col:
+                        await table_data_repo.drop_constraint(
+                            conn, pg_name,
+                            table_data_repo.enum_constraint_name(pg_name, old_name),
+                        )
+                        await table_data_repo.create_enum_constraint(conn, pg_name, updated_col)
+                    if old_has_scalar_check and updated_col:
+                        await table_data_repo.create_check_constraint(conn, pg_name, updated_col)
+                    if old_col and old_col.get("references") is not None and updated_col:
+                        await table_data_repo.replace_foreign_key_constraint(
+                            conn, pg_name, old_name, updated_col, vault_name=vault["name"],
+                        )
 
             # ── Declarative unique keys / indexes (AKB #215) ─────────
             # Existing metadata from the registry row; the merged result
             # is persisted via update_schema_meta in the SAME TX.
-            existing_uks = table_registry_repo.parse_json_list(table.get("unique_keys"))
-            existing_idxs = table_registry_repo.parse_json_list(table.get("indexes"))
-            uk_changed = False
-            idx_changed = False
-
             # Keep declarative metadata consistent with column rename/drop done
             # in THIS alter, else the registry drifts from the physical schema:
             # a PG column rename leaves the constraint/index under the old
@@ -738,6 +1123,141 @@ async def alter_table(
                     existing_idxs = kept_idxs
                     idx_changed = True
 
+            if alter_columns:
+                column_lookup: dict[str, tuple[int, dict]] = {
+                    c["name"].lower(): (column_index, c)
+                    for column_index, c in enumerate(columns)
+                    if isinstance(c, dict) and isinstance(c.get("name"), str)
+                }
+                for spec in alter_columns:
+                    key = spec["name"].lower()
+                    if key not in column_lookup:
+                        raise ValidationError(
+                            f"Cannot alter missing column {spec['name']!r} on table {table_name!r}."
+                        )
+                    column_index, current = column_lookup[key]
+                    logical_type = table_data_repo.normalize_column_type(
+                        current.get("type", "text")
+                    )
+                    set_default = "set_default" in spec or "default" in spec
+                    drop_default = bool(spec.get("drop_default", False))
+                    if set_default and drop_default:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_default/default and "
+                            "drop_default are mutually exclusive."
+                        )
+                    set_check = "set_check" in spec or "check" in spec
+                    drop_check = bool(spec.get("drop_check", False))
+                    if set_check and drop_check:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_check/check and "
+                            "drop_check are mutually exclusive."
+                        )
+                    if logical_type == "enum" and (set_check or drop_check):
+                        raise ValidationError(
+                            f"Column {current['name']!r}: enum CHECK constraints are "
+                            "derived from enum values; use set_enum/enum."
+                        )
+                    set_not_null = bool(spec.get("set_not_null", False))
+                    drop_not_null = bool(spec.get("drop_not_null", False))
+                    if set_not_null and drop_not_null:
+                        raise ValidationError(
+                            f"Column {current['name']!r}: set_not_null and "
+                            "drop_not_null are mutually exclusive."
+                        )
+                    enum_requested = "set_enum" in spec or "enum" in spec
+                    if enum_requested and logical_type != "enum":
+                        raise ValidationError(
+                            f"Column {current['name']!r} is not an enum column."
+                        )
+                    if (spec.get("rename_enum_values") or spec.get("enum_renames")) and not enum_requested:
+                        raise ValidationError(
+                            f"Enum rename for {current['name']!r} requires set_enum/enum."
+                        )
+                    if not any([
+                        set_default,
+                        drop_default,
+                        set_check,
+                        drop_check,
+                        set_not_null,
+                        drop_not_null,
+                        enum_requested,
+                    ]):
+                        raise ValidationError(
+                            f"Column {current['name']!r}: alter_columns requires at "
+                            "least one operation."
+                        )
+                    next_col = dict(current)
+                    if logical_type == "enum":
+                        next_col.pop("check", None)
+                    if set_default:
+                        next_col["default"] = spec.get("set_default", spec.get("default"))
+                    if drop_default:
+                        next_col["default"] = None
+                    if set_check:
+                        next_col["check"] = spec.get("set_check", spec.get("check"))
+                    if drop_check:
+                        next_col.pop("check", None)
+                    if set_not_null:
+                        next_col["required"] = True
+                    if drop_not_null:
+                        next_col["required"] = False
+                    if enum_requested:
+                        next_col["enum"] = spec.get("set_enum", spec.get("enum"))
+                    next_col = _normalize_column_spec(next_col)
+                    current_enum = current.get("enum")
+                    old_enum_values = current_enum if isinstance(current_enum, list) else []
+                    renames = _normalize_enum_renames(
+                        spec,
+                        old_enum_values,
+                        next_col.get("enum", []),
+                    )
+                    try:
+                        if enum_requested:
+                            await table_data_repo.drop_constraint(
+                                conn, pg_name,
+                                table_data_repo.enum_constraint_name(pg_name, current["name"]),
+                            )
+                            if renames:
+                                await table_data_repo.rename_enum_values(
+                                    conn, pg_name, current["name"], renames,
+                                )
+                        if set_default or drop_default:
+                            await table_data_repo.alter_column_default(conn, pg_name, next_col)
+                        if set_check or drop_check:
+                            await table_data_repo.replace_check_constraint(
+                                conn, pg_name, next_col,
+                            )
+                        if set_not_null or drop_not_null:
+                            await table_data_repo.alter_column_required(
+                                conn, pg_name, current["name"], bool(next_col.get("required")),
+                            )
+                        if enum_requested:
+                            await table_data_repo.create_enum_constraint(conn, pg_name, next_col)
+                    except asyncpg.CheckViolationError as e:
+                        if enum_requested:
+                            raise ValidationError(
+                                f"Cannot alter enum column {current['name']!r}: existing rows "
+                                f"contain values outside the new enum list {next_col['enum']!r}."
+                            ) from e
+                        raise ValidationError(
+                            f"Cannot alter check constraint for column {current['name']!r}: "
+                            "existing rows violate the new check."
+                        ) from e
+                    except asyncpg.NotNullViolationError as e:
+                        raise ValidationError(
+                            f"Cannot set column {current['name']!r} NOT NULL: existing rows "
+                            "contain NULL values."
+                        ) from e
+                    except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
+                        raise ValidationError(
+                            f"Constraint for column {current['name']!r} already exists in "
+                            f"the database: {e}."
+                        ) from e
+                    columns[column_index] = next_col
+                    column_lookup[key] = (column_index, next_col)
+                    altered.append(current["name"])
+
             # Drops first so a drop+re-add of the same name in one alter
             # works, and so adds validate against the post-drop set.
             drop_uk_names = set(drop_unique_keys or [])
@@ -745,7 +1265,25 @@ async def alter_table(
                 remaining_uks = []
                 for uk in existing_uks:
                     if uk.get("name") in drop_uk_names:
-                        await table_data_repo.drop_constraint(conn, pg_name, uk["name"])
+                        uk_columns = {
+                            col for col in uk.get("columns", []) if isinstance(col, str)
+                        }
+                        if len(uk_columns) == 1:
+                            await _reject_referenced_target_columns(
+                                conn,
+                                vault_id,
+                                table_name,
+                                uk_columns,
+                                action=f"drop unique key {uk['name']!r} for",
+                            )
+                        try:
+                            await table_data_repo.drop_constraint(conn, pg_name, uk["name"])
+                        except asyncpg.DependentObjectsStillExistError as e:
+                            raise ConflictError(
+                                f"Cannot drop unique key {uk['name']!r} on table "
+                                f"{table_name!r}: other vault tables reference it. "
+                                "Drop dependent tables or columns first."
+                            ) from e
                         uk_changed = True
                     else:
                         remaining_uks.append(uk)
@@ -864,6 +1402,7 @@ async def alter_table(
                     "vault": vault["name"],
                     "table_name": table_name,
                     "added": added,
+                    "altered": altered,
                     "dropped": dropped,
                     "renamed": renamed,
                     "unique_keys_changed": uk_changed,
@@ -873,19 +1412,20 @@ async def alter_table(
 
     # Refresh the metadata chunk so search reflects the new schema —
     # otherwise the chunk drifts from the ALTER until the table is dropped.
-    try:
-        await index_table_metadata(
-            str(table["id"]),
-            vault_id=vault_id,
-            vault_name=vault["name"],
-            name=table_name,
-            description=table["description"] or "",
-            columns=columns,
-            unique_keys=existing_uks,
-            indexes=existing_idxs,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("alter_table chunk reindex failed for %s: %s", table_name, e)
+    if not _defer_index:
+        try:
+            await index_table_metadata(
+                str(table["id"]),
+                vault_id=vault_id,
+                vault_name=vault["name"],
+                name=table_name,
+                description=table["description"] or "",
+                columns=columns,
+                unique_keys=existing_uks,
+                indexes=existing_idxs,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("alter_table chunk reindex failed for %s: %s", table_name, e)
 
     return {
         "kind": "table",
@@ -912,6 +1452,7 @@ async def execute_sql(
     vault_names: list[str],
     user_id: str,
     sql: str,
+    params: list[Any] | None = None,
     is_admin: bool = False,
 ) -> dict:
     """Execute raw SQL scoped to vault tables.
@@ -955,6 +1496,23 @@ async def execute_sql(
                 "akb_drop_table for schema changes.",
                 code=METHOD_NOT_ALLOWED,
             )
+        if contains_set_config_call(rewritten):
+            return err(
+                "set_config() is not allowed via akb_sql because "
+                "request.jwt.claims is reserved for service-key claim injection.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_unicode_escaped_identifier(rewritten):
+            return err(
+                "Unicode-escaped quoted identifiers are not allowed via akb_sql.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_pg_settings_identifier(rewritten):
+            return err(
+                "pg_settings is not available via akb_sql because "
+                "request.jwt.claims is reserved for service-key claim injection.",
+                code=METHOD_NOT_ALLOWED,
+            )
 
         # Archived vaults are READ-ONLY. PG ACL has no archive concept
         # (write grants are intentionally preserved so unarchive is
@@ -979,6 +1537,7 @@ async def execute_sql(
         return await get_user_sql_executor().execute(
             user_id=user_id,
             sql=rewritten,
+            params=params,
             is_admin=is_admin,
             vault_names=vault_names,
         )

@@ -18,17 +18,90 @@ row-CRUD API is added later it will live in this module.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from datetime import date, datetime
+from typing import Any
+from uuid import UUID
 
-from app.exceptions import ValidationError
+from app.exceptions import InvalidColumnTypeError, ValidationError
+from app.util.text import fuzzy_hint
 
 
 TYPE_MAP = {
     "text": "TEXT",
+    "int": "BIGINT",
+    "float": "DOUBLE PRECISION",
+    "numeric": "NUMERIC",
     "number": "NUMERIC",
     "boolean": "BOOLEAN",
+    "uuid": "UUID",
     "date": "DATE",
+    "timestamp": "TIMESTAMPTZ",
+    "jsonb": "JSONB",
     "json": "JSONB",
+    "text[]": "TEXT[]",
+    "enum": "TEXT",
+}
+
+CANONICAL_TYPE_ALIASES = {
+    "text": "text",
+    "int": "int",
+    "float": "float",
+    "numeric": "numeric",
+    "number": "numeric",
+    "boolean": "boolean",
+    "uuid": "uuid",
+    "date": "date",
+    "timestamp": "timestamp",
+    "jsonb": "jsonb",
+    "json": "jsonb",
+    "text[]": "text[]",
+    "enum": "enum",
+}
+
+CANONICAL_TYPES = [
+    "text",
+    "int",
+    "float",
+    "numeric",
+    "boolean",
+    "uuid",
+    "date",
+    "timestamp",
+    "jsonb",
+    "text[]",
+    "enum",
+]
+
+_DEFAULT_FUNCTIONS = {
+    "timestamp": {"now()"},
+    "uuid": {"gen_random_uuid()"},
+}
+
+_CHECK_OPERATORS = {
+    "eq": "=",
+    "ne": "<>",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+}
+
+_LENGTH_CHECK_OPERATORS = {
+    "len_lt": "<",
+    "len_lte": "<=",
+    "len_gt": ">",
+    "len_gte": ">=",
+}
+
+_REFERENCE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+_FK_ON_DELETE_SQL = {
+    "cascade": "CASCADE",
+    "set null": "SET NULL",
+    "restrict": "RESTRICT",
+    "no action": "NO ACTION",
 }
 
 
@@ -82,18 +155,331 @@ def safe_ident(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
+def normalize_column_type(logical_type: Any) -> str:
+    """Return the canonical AKB logical column type or raise a stable error."""
+    raw = "text" if logical_type in (None, "") else logical_type
+    if not isinstance(raw, str):
+        raise InvalidColumnTypeError(
+            f"Invalid column type {raw!r}: type must be a string.",
+            hint=f"Available column types: {', '.join(CANONICAL_TYPES)}",
+            details={"available_types": CANONICAL_TYPES},
+        )
+    key = raw.strip().lower()
+    canonical = CANONICAL_TYPE_ALIASES.get(key)
+    if canonical is None:
+        raise InvalidColumnTypeError(
+            f"Unsupported column type {raw!r}.",
+            hint=fuzzy_hint(key, CANONICAL_TYPES + ["number", "json"], label="column types"),
+            details={"available_types": CANONICAL_TYPES, "aliases": {"number": "numeric", "json": "jsonb"}},
+        )
+    return canonical
+
+
+def normalize_column_spec(col: dict) -> dict:
+    """Copy a caller column spec and normalize its logical type."""
+    out = dict(col)
+    out["type"] = normalize_column_type(out.get("type", "text"))
+    if out.get("references") is not None:
+        refs, on_delete = normalize_reference_spec(out["references"], out.get("on_delete"))
+        out["references"] = refs
+        out["on_delete"] = on_delete
+    if out["type"] == "enum":
+        values = _normalize_enum_values(out.get("enum"))
+        if out.get("check") is not None:
+            raise ValidationError(
+                "Enum columns derive their CHECK constraint from `enum`; omit `check`."
+            )
+        out["enum"] = values
+        out["check"] = {"op": "in", "values": values}
+        if "default" in out and out.get("default") is not None and out["default"] not in values:
+            raise ValidationError(
+                f"Default {out['default']!r} is not one of enum values {values!r}."
+            )
+    # Compile once here so invalid default/check specs fail before any DDL.
+    _column_default_sql(out)
+    _column_check_sql(out)
+    return out
+
+
+def column_type_sql(logical_type: Any) -> str:
+    return TYPE_MAP[normalize_column_type(logical_type)]
+
+
+def column_definition(col: dict, *, include_check: bool = True) -> str:
+    """Build one validated user-column definition for CREATE/ALTER TABLE."""
+    col_name = safe_ident(col["name"])
+    logical_type = normalize_column_type(col.get("type", "text"))
+    parts = [col_name, TYPE_MAP[logical_type]]
+    if col.get("required"):
+        parts.append("NOT NULL")
+    if default_sql := _column_default_sql(col):
+        parts.append(f"DEFAULT {default_sql}")
+    if include_check and logical_type != "enum" and (check_sql := _column_check_sql(col)):
+        parts.append(f"CHECK ({check_sql})")
+    return " ".join(parts)
+
+
+def _column_default_sql(col: dict) -> str | None:
+    if "default" not in col or col.get("default") is None:
+        return None
+    logical_type = normalize_column_type(col.get("type", "text"))
+    value = col["default"]
+    if isinstance(value, str) and value.strip().lower() in {"now()", "gen_random_uuid()"}:
+        func = value.strip().lower()
+        if func not in _DEFAULT_FUNCTIONS.get(logical_type, set()):
+            raise ValidationError(
+                f"Default function {func!r} is not allowed for {logical_type} columns."
+            )
+        return func
+    return _literal_sql(value, logical_type, ctx="default")
+
+
+def _column_check_sql(col: dict) -> str | None:
+    spec = col.get("check")
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise ValidationError("check must be an object like {op, value}; raw SQL is not allowed.")
+    op = spec.get("op")
+    if not isinstance(op, str):
+        raise ValidationError("check.op must be a string.")
+    op = op.lower()
+    col_name = safe_ident(col["name"])
+    logical_type = normalize_column_type(col.get("type", "text"))
+    if op in _CHECK_OPERATORS:
+        if "value" not in spec:
+            raise ValidationError(f"check.{op} requires a value.")
+        return f"{col_name} {_CHECK_OPERATORS[op]} {_literal_sql(spec['value'], logical_type, ctx='check.value')}"
+    if op in {"in", "not_in"}:
+        values = spec.get("value", spec.get("values"))
+        if not isinstance(values, list) or not values:
+            raise ValidationError(f"check.{op} requires a non-empty value list.")
+        literals = ", ".join(_literal_sql(v, logical_type, ctx="check.value") for v in values)
+        neg = "NOT " if op == "not_in" else ""
+        return f"{col_name} {neg}IN ({literals})"
+    if op in _LENGTH_CHECK_OPERATORS:
+        if logical_type != "text":
+            raise ValidationError(f"check.{op} is only supported for text columns.")
+        value = spec.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"check.{op} requires a non-negative integer value.")
+        return f"char_length({col_name}) {_LENGTH_CHECK_OPERATORS[op]} {value}"
+    raise ValidationError(
+        "Unsupported check.op "
+        f"{op!r}. Available ops: {sorted([*_CHECK_OPERATORS, 'in', 'not_in', *_LENGTH_CHECK_OPERATORS])}."
+    )
+
+
+def _literal_sql(value: Any, logical_type: str, *, ctx: str) -> str:
+    if logical_type in {"text", "enum"}:
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for {logical_type} columns must be a string literal.")
+        return _quote(value)
+    if logical_type == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValidationError(f"{ctx} for int columns must be an integer literal.")
+        return str(value)
+    if logical_type in {"float", "numeric"}:
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            raise ValidationError(f"{ctx} for {logical_type} columns must be a numeric literal.")
+        return repr(value)
+    if logical_type == "boolean":
+        if not isinstance(value, bool):
+            raise ValidationError(f"{ctx} for boolean columns must be a boolean literal.")
+        return "TRUE" if value else "FALSE"
+    if logical_type == "uuid":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for uuid columns must be a UUID string literal.")
+        try:
+            UUID(value)
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for uuid columns must be a valid UUID string.") from e
+        return _quote(value)
+    if logical_type == "date":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for date columns must be an ISO date string.")
+        try:
+            date.fromisoformat(value)
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for date columns must be an ISO date string.") from e
+        return _quote(value)
+    if logical_type == "timestamp":
+        if not isinstance(value, str):
+            raise ValidationError(f"{ctx} for timestamp columns must be an ISO timestamp string.")
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValidationError(f"{ctx} for timestamp columns must be an ISO timestamp string.") from e
+        return _quote(value)
+    if logical_type == "jsonb":
+        return f"{_quote(json.dumps(value, ensure_ascii=False, separators=(',', ':')))}::jsonb"
+    if logical_type == "text[]":
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValidationError(f"{ctx} for text[] columns must be a list of string literals.")
+        return "ARRAY[" + ", ".join(_quote(v) for v in value) + "]::TEXT[]"
+    raise InvalidColumnTypeError(
+        f"Unsupported column type {logical_type!r}.",
+        hint=fuzzy_hint(logical_type, CANONICAL_TYPES, label="column types"),
+        details={"available_types": CANONICAL_TYPES},
+    )
+
+
+def _quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _normalize_enum_values(values: Any) -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise ValidationError("Enum columns require a non-empty `enum` value list.")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValidationError("Enum values must be non-empty strings.")
+        if value in seen:
+            raise ValidationError(f"Duplicate enum value {value!r}.")
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def normalize_on_delete(value: Any) -> str:
+    if value is None or value == "":
+        return "no action"
+    if not isinstance(value, str):
+        raise ValidationError("references.on_delete must be a string when provided.")
+    key = value.strip().lower().replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+    if key not in _FK_ON_DELETE_SQL:
+        raise ValidationError(
+            "references.on_delete must be one of "
+            f"{sorted(_FK_ON_DELETE_SQL)}; got {value!r}."
+        )
+    return key
+
+
+def normalize_reference_spec(refs: Any, on_delete: Any = None) -> tuple[dict, str]:
+    if not isinstance(refs, dict):
+        raise ValidationError("references must be an object like {table, column?, on_delete?}.")
+    table = refs.get("table") or refs.get("referenced_table")
+    if not isinstance(table, str) or not table:
+        raise ValidationError("references.table must be a non-empty table name.")
+    if not _REFERENCE_NAME_RE.fullmatch(table):
+        raise ValidationError(
+            f"Invalid references.table {table!r}: must match {_REFERENCE_NAME_RE.pattern}."
+        )
+    column = refs.get("column") or refs.get("referenced_column") or "id"
+    if not isinstance(column, str) or not column:
+        raise ValidationError("references.column must be a non-empty column name.")
+    if column != "id" and not _REFERENCE_NAME_RE.fullmatch(column):
+        raise ValidationError(
+            f"Invalid references.column {column!r}: must be 'id' or match "
+            f"{_REFERENCE_NAME_RE.pattern}."
+        )
+    nested_on_delete = refs.get("on_delete")
+    if nested_on_delete is not None and on_delete is not None:
+        nested = normalize_on_delete(nested_on_delete)
+        top_level = normalize_on_delete(on_delete)
+        if nested != top_level:
+            raise ValidationError(
+                "references.on_delete and column on_delete disagree; provide only one value."
+            )
+        normalized_on_delete = nested
+    else:
+        normalized_on_delete = normalize_on_delete(
+            nested_on_delete if nested_on_delete is not None else on_delete
+        )
+    return {"table": table, "column": column}, normalized_on_delete
+
+
+def reference_on_delete_sql(value: Any) -> str:
+    return _FK_ON_DELETE_SQL[normalize_on_delete(value)]
+
+
+def enum_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="enum")
+
+
+def check_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="check")
+
+
+def check_constraint_definition(pg_name: str, col: dict) -> str:
+    if normalize_column_type(col.get("type", "text")) == "enum":
+        raise ValidationError("Enum columns derive their CHECK constraint from `enum`.")
+    check_sql = _column_check_sql(col)
+    if not check_sql:
+        raise ValidationError(f"Column {col.get('name')!r} has no check spec.")
+    name = safe_ident(check_constraint_name(pg_name, col["name"]))
+    return f"CONSTRAINT {name} CHECK ({check_sql})"
+
+
+def enum_check_sql(col: dict) -> str:
+    if normalize_column_type(col.get("type", "text")) != "enum":
+        raise ValidationError(f"Column {col.get('name')!r} is not an enum column.")
+    return _column_check_sql(col) or "TRUE"
+
+
+def enum_constraint_definition(pg_name: str, col: dict) -> str:
+    name = safe_ident(enum_constraint_name(pg_name, col["name"]))
+    return f"CONSTRAINT {name} CHECK ({enum_check_sql(col)})"
+
+
+def foreign_key_constraint_name(pg_name: str, col_name: str) -> str:
+    return generate_constraint_name(pg_name, [col_name], kind="fkey")
+
+
+def _same_vault_reference_pg_name(pg_name: str, table_name: str) -> str:
+    vault_prefix, _sep, _table_part = pg_name.rpartition("__")
+    if not vault_prefix:
+        raise ValidationError(f"Invalid dynamic table name {pg_name!r}.")
+    return f"{vault_prefix}__{pg_short_name(table_name)}"
+
+
+def foreign_key_constraint_definition(
+    pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> str:
+    refs = col.get("references")
+    if refs is None:
+        raise ValidationError(f"Column {col.get('name')!r} has no references spec.")
+    refs, on_delete = normalize_reference_spec(refs, col.get("on_delete"))
+    name = safe_ident(foreign_key_constraint_name(pg_name, col["name"]))
+    source_col = safe_ident(col["name"])
+    target_table = (
+        pg_table_name(vault_name, refs["table"])
+        if vault_name is not None
+        else _same_vault_reference_pg_name(pg_name, refs["table"])
+    )
+    target_col = safe_ident(refs["column"])
+    return (
+        f"CONSTRAINT {name} FOREIGN KEY ({source_col}) "
+        f"REFERENCES {target_table} ({target_col}) "
+        f"ON DELETE {reference_on_delete_sql(on_delete)}"
+    )
+
+
 # ── DDL ──────────────────────────────────────────────────────────
 
 
-async def create_dynamic_table(conn, pg_name: str, columns: list[dict]) -> None:
+async def create_dynamic_table(
+    conn, pg_name: str, columns: list[dict], *, vault_name: str | None = None,
+) -> None:
     """Create the data-bearing PG table for a vault table. Caller is
     responsible for sanitising `pg_name` (use `pg_table_name`)."""
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
     for col in columns:
-        col_name = safe_ident(col["name"])
-        col_type = TYPE_MAP.get(col.get("type", "text"), "TEXT")
-        not_null = " NOT NULL" if col.get("required") else ""
-        col_defs.append(f"{col_name} {col_type}{not_null}")
+        col_defs.append(column_definition(col, include_check=False))
+    for col in columns:
+        if col.get("check") is not None and normalize_column_type(col.get("type", "text")) != "enum":
+            col_defs.append(check_constraint_definition(pg_name, col))
+    for col in columns:
+        if normalize_column_type(col.get("type", "text")) == "enum":
+            col_defs.append(enum_constraint_definition(pg_name, col))
+    for col in columns:
+        if col.get("references") is not None:
+            col_defs.append(
+                foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)
+            )
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
@@ -124,11 +510,20 @@ async def count_rows(conn, pg_name: str) -> int:
         return 0
 
 
-async def add_column(conn, pg_name: str, col_name: str, col_type: str) -> None:
-    """Add a column to the dynamic table. Caller sanitises name/type."""
+async def add_column(
+    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> None:
+    """Add a column to the dynamic table. Column DDL is validated here."""
     await conn.execute(
-        f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+        f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS "
+        f"{column_definition(col, include_check=False)}"
     )
+    if col.get("check") is not None and normalize_column_type(col.get("type", "text")) != "enum":
+        await create_check_constraint(conn, pg_name, col)
+    if normalize_column_type(col.get("type", "text")) == "enum":
+        await create_enum_constraint(conn, pg_name, col)
+    if col.get("references") is not None:
+        await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
 
 
 async def drop_column(conn, pg_name: str, col_name: str) -> None:
@@ -207,6 +602,114 @@ async def drop_constraint(conn, pg_name: str, name: str) -> None:
     safe_name = safe_ident(name)
     await conn.execute(
         f"ALTER TABLE {pg_name} DROP CONSTRAINT IF EXISTS {safe_name}"
+    )
+
+
+async def create_enum_constraint(conn, pg_name: str, col: dict) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD {enum_constraint_definition(pg_name, col)}"
+    )
+
+
+async def create_check_constraint(conn, pg_name: str, col: dict) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD {check_constraint_definition(pg_name, col)}"
+    )
+
+
+async def drop_column_check_constraints(conn, pg_name: str, col_name: str) -> None:
+    """Drop all CHECK constraints on a column.
+
+    AKB now creates deterministic named checks, but older scalar checks were
+    emitted inline and PostgreSQL assigned auto names. Discovering by conkey
+    lets set_check/drop_check migrate those legacy constraints cleanly.
+    """
+    safe_col = safe_ident(col_name)
+    rows = await conn.fetch(
+        """
+        SELECT con.conname AS name
+          FROM pg_constraint con
+          JOIN pg_class cls ON cls.oid = con.conrelid
+          JOIN pg_attribute att
+            ON att.attrelid = con.conrelid
+           AND att.attnum = ANY(con.conkey)
+         WHERE cls.relname = $1
+           AND con.contype = 'c'
+           AND att.attname = $2
+        """,
+        pg_name,
+        safe_col,
+    )
+    for row in rows:
+        await drop_constraint(conn, pg_name, row["name"])
+
+
+async def replace_check_constraint(conn, pg_name: str, col: dict) -> None:
+    await drop_column_check_constraints(conn, pg_name, col["name"])
+    if col.get("check") is not None:
+        await create_check_constraint(conn, pg_name, col)
+
+
+async def replace_enum_constraint(conn, pg_name: str, col: dict) -> None:
+    await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, col["name"]))
+    await create_enum_constraint(conn, pg_name, col)
+
+
+async def create_foreign_key_constraint(
+    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+) -> None:
+    await conn.execute(
+        f"ALTER TABLE {pg_name} ADD "
+        f"{foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)}"
+    )
+
+
+async def replace_foreign_key_constraint(
+    conn,
+    pg_name: str,
+    old_col_name: str,
+    col: dict,
+    *,
+    vault_name: str | None = None,
+) -> None:
+    await drop_constraint(conn, pg_name, foreign_key_constraint_name(pg_name, old_col_name))
+    await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
+
+
+async def alter_column_default(conn, pg_name: str, col: dict) -> None:
+    safe_col = safe_ident(col["name"])
+    default_sql = _column_default_sql(col)
+    if default_sql is None:
+        await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} DROP DEFAULT")
+    else:
+        await conn.execute(
+            f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} SET DEFAULT {default_sql}"
+        )
+
+
+async def alter_column_required(conn, pg_name: str, col_name: str, required: bool) -> None:
+    safe_col = safe_ident(col_name)
+    op = "SET NOT NULL" if required else "DROP NOT NULL"
+    await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} {op}")
+
+
+async def rename_enum_values(
+    conn, pg_name: str, col_name: str, renames: dict[str, str],
+) -> None:
+    if not renames:
+        return
+    safe_col = safe_ident(col_name)
+    params: list[Any] = []
+    cases: list[str] = []
+    for old_value, new_value in renames.items():
+        params.extend([old_value, new_value])
+        cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+    params.append(list(renames))
+    await conn.execute(
+        f"UPDATE {pg_name} "
+        f"SET {safe_col} = CASE {safe_col} {' '.join(cases)} ELSE {safe_col} END "
+        f"WHERE {safe_col} = ANY(${len(params)}::text[])",
+        *params,
     )
 
 
@@ -382,6 +885,108 @@ def count_statement_separators(sql: str) -> int:
             count += 1
         pos = m.end()
     return count
+
+
+def contains_set_config_call(sql: str) -> bool:
+    """Return True when SQL calls PostgreSQL's ``set_config`` function.
+
+    ``request.jwt.claims`` is reserved for service-key claim injection. Since
+    callers can otherwise spoof that custom GUC from inside their own SQL,
+    ``akb_sql`` rejects all user-authored ``set_config(...)`` calls. The scan
+    is token-aware so string literals, comments, quoted identifiers, and
+    dollar-quoted bodies do not create false positives.
+    """
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if _token_identifier_name(m.lastgroup, m.group()) == "set_config":
+            if _next_significant_token_is_open_paren(sql, m.end()):
+                return True
+        pos = m.end()
+    return False
+
+
+def contains_unicode_escaped_identifier(sql: str) -> bool:
+    """Return True when SQL uses PostgreSQL ``U&"..."`` identifiers.
+
+    Dynamic table identifiers exposed by AKB are already sanitized ASCII names,
+    and Unicode-escaped identifiers create a second spelling for protected
+    function names such as ``set_config``. Keep this raw SQL surface simple:
+    callers may use normal quoted identifiers, but not ``U&`` escapes.
+    """
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if (
+            m.lastgroup == "ident"
+            and m.group().lower() == "u"
+            and m.end() + 1 < n
+            and sql[m.end()] == "&"
+            and sql[m.end() + 1] == '"'
+        ):
+            return True
+        pos = m.end()
+    return False
+
+
+def contains_pg_settings_identifier(sql: str) -> bool:
+    """Return True when SQL references PostgreSQL's ``pg_settings`` view."""
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if _token_identifier_name(m.lastgroup, m.group()) == "pg_settings":
+            return True
+        pos = m.end()
+    return False
+
+
+def _token_identifier_name(kind: str | None, text: str) -> str | None:
+    if kind == "ident":
+        return text.lower()
+    if kind == "qid":
+        return text[1:-1].replace('""', '"').lower()
+    return None
+
+
+def _next_significant_token_is_open_paren(sql: str, pos: int) -> bool:
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            return False
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        if m.lastgroup in {"ws", "line_comment", "block_comment"}:
+            pos = m.end()
+            continue
+        return m.lastgroup == "sym" and m.group() == "("
+    return False
 
 
 # PostgreSQL keywords must not be rewritten as bare table aliases. The

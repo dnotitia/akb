@@ -16,10 +16,12 @@ no pool, no live PG.
 from __future__ import annotations
 
 import hashlib
+import uuid
 
+import asyncpg
 import pytest
 
-from app.exceptions import ValidationError
+from app.exceptions import AKBError, ConflictError, InvalidColumnTypeError, ValidationError
 from app.repositories import table_data_repo
 from app.repositories.table_registry_repo import parse_json_list
 
@@ -102,6 +104,172 @@ def test_generated_name_hash_is_pure_hashlib():
 
 
 # ── preflight duplicate-detection query shape ─────────────────────
+
+
+def test_column_type_allowlist_and_aliases_are_canonical():
+    assert table_data_repo.normalize_column_type("number") == "numeric"
+    assert table_data_repo.normalize_column_type("json") == "jsonb"
+    assert table_data_repo.normalize_column_type("int") == "int"
+    assert table_data_repo.column_type_sql("text[]") == "TEXT[]"
+    assert table_data_repo.column_type_sql("enum") == "TEXT"
+
+    with pytest.raises(InvalidColumnTypeError) as exc:
+        table_data_repo.normalize_column_type("varchar(255)")
+    assert exc.value.code == "invalid_column_type"
+    assert "Available" in (exc.value.hint or "")
+
+
+def test_enum_column_compiles_text_with_named_check_constraint():
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active"],
+        "default": "draft",
+    })
+
+    assert col["type"] == "enum"
+    assert col["check"] == {"op": "in", "values": ["draft", "active"]}
+    assert table_data_repo.column_definition(col) == "status TEXT DEFAULT 'draft'"
+    constraint = table_data_repo.enum_constraint_definition("vt_demo__tasks", col)
+    assert constraint.startswith("CONSTRAINT vt_demo__tasks")
+    assert "CHECK (status IN ('draft', 'active'))" in constraint
+
+
+def test_enum_column_rejects_invalid_values_default_and_raw_check():
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({"name": "status", "type": "enum"})
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft", "draft"],
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft"],
+            "default": "active",
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "status",
+            "type": "enum",
+            "enum": ["draft"],
+            "check": {"op": "in", "values": ["draft"]},
+        })
+
+
+def test_foreign_key_column_normalizes_references_and_on_delete():
+    col = table_data_repo.normalize_column_spec({
+        "name": "owner_id",
+        "type": "uuid",
+        "references": {"table": "users", "on_delete": "CASCADE"},
+    })
+
+    assert col["references"] == {"table": "users", "column": "id"}
+    assert col["on_delete"] == "cascade"
+    constraint = table_data_repo.foreign_key_constraint_definition("vt_demo__tasks", col)
+    assert constraint.startswith("CONSTRAINT vt_demo__tasks")
+    assert "FOREIGN KEY (owner_id)" in constraint
+    assert "REFERENCES vt_demo__users (id)" in constraint
+    assert constraint.endswith("ON DELETE CASCADE")
+
+
+def test_foreign_key_definition_uses_vault_name_for_double_underscore_tables():
+    col = table_data_repo.normalize_column_spec({
+        "name": "parent_code",
+        "type": "text",
+        "references": {"table": "parents", "column": "code"},
+    })
+
+    constraint = table_data_repo.foreign_key_constraint_definition(
+        "vt_demo__foo__child",
+        col,
+        vault_name="demo",
+    )
+
+    assert "REFERENCES vt_demo__parents (code)" in constraint
+    assert "vt_demo__foo__parents" not in constraint
+
+
+def test_foreign_key_column_rejects_bad_reference_shape():
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "other-vault.users"},
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "users", "on_delete": "drop table"},
+        })
+    with pytest.raises(ValidationError):
+        table_data_repo.normalize_column_spec({
+            "name": "owner_id",
+            "type": "uuid",
+            "references": {"table": "users", "on_delete": "cascade"},
+            "on_delete": "restrict",
+        })
+
+
+def test_column_definition_compiles_default_check_and_not_null():
+    definition = table_data_repo.column_definition({
+        "name": "qty",
+        "type": "int",
+        "required": True,
+        "default": 1,
+        "check": {"op": "gte", "value": 0},
+    })
+
+    assert definition == "qty BIGINT NOT NULL DEFAULT 1 CHECK (qty >= 0)"
+
+
+def test_column_definition_compiles_structured_scalar_properties():
+    assert table_data_repo.column_definition({
+        "name": "status",
+        "type": "text",
+        "default": "todo",
+        "check": {"op": "in", "values": ["todo", "done"]},
+    }) == "status TEXT DEFAULT 'todo' CHECK (status IN ('todo', 'done'))"
+    assert table_data_repo.column_definition({
+        "name": "slug",
+        "type": "text",
+        "check": {"op": "len_lte", "value": 80},
+    }) == "slug TEXT CHECK (char_length(slug) <= 80)"
+    assert table_data_repo.column_definition({
+        "name": "payload",
+        "type": "jsonb",
+        "default": {"ok": True},
+    }) == "payload JSONB DEFAULT '{\"ok\":true}'::jsonb"
+    assert table_data_repo.column_definition({
+        "name": "tags",
+        "type": "text[]",
+        "default": ["a", "b"],
+    }) == "tags TEXT[] DEFAULT ARRAY['a', 'b']::TEXT[]"
+    assert table_data_repo.column_definition({
+        "name": "created_at",
+        "type": "timestamp",
+        "default": "now()",
+    }) == "created_at TIMESTAMPTZ DEFAULT now()"
+    assert table_data_repo.column_definition({
+        "name": "public_id",
+        "type": "uuid",
+        "default": "gen_random_uuid()",
+    }) == "public_id UUID DEFAULT gen_random_uuid()"
+
+
+def test_column_definition_rejects_raw_type_default_and_check():
+    with pytest.raises(InvalidColumnTypeError):
+        table_data_repo.column_definition({"name": "x", "type": "TEXT; DROP TABLE users"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "timestamp", "default": "now(); DROP"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "text", "check": "x <> ''"})
+    with pytest.raises(ValidationError):
+        table_data_repo.column_definition({"name": "x", "type": "numeric", "check": {"op": "raw", "value": "x > 0"}})
 
 
 class _RecordingConn:
@@ -200,6 +368,132 @@ async def test_drop_constraint_and_index_are_if_exists():
     assert "DROP INDEX IF EXISTS" in conn.sql.upper()
 
 
+@pytest.mark.asyncio
+async def test_replace_enum_constraint_drops_and_readds_named_check():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active", "archived"],
+    })
+
+    await table_data_repo.replace_enum_constraint(conn, "vt_demo__tasks", col)
+
+    assert "DROP CONSTRAINT IF EXISTS" in conn.sqls[0][0].upper()
+    assert "ADD CONSTRAINT" in conn.sqls[1][0].upper()
+    assert "CHECK (status IN ('draft', 'active', 'archived'))" in conn.sqls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_create_foreign_key_constraint_shape():
+    conn = _ExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "owner_id",
+        "type": "uuid",
+        "references": {"table": "users", "column": "id"},
+        "on_delete": "restrict",
+    })
+
+    await table_data_repo.create_foreign_key_constraint(conn, "vt_demo__tasks", col)
+
+    assert "ADD CONSTRAINT" in conn.sql.upper()
+    assert "FOREIGN KEY (owner_id)" in conn.sql
+    assert "REFERENCES vt_demo__users (id)" in conn.sql
+    assert "ON DELETE RESTRICT" in conn.sql
+
+
+@pytest.mark.asyncio
+async def test_replace_check_constraint_drops_legacy_column_checks():
+    class _CheckConn:
+        def __init__(self):
+            self.fetch_params = None
+            self.sqls = []
+
+        async def fetch(self, sql, *params):
+            self.fetch_params = (sql, params)
+            return [{"name": "legacy_inline_check"}, {"name": "vt_demo__tasks__prio__check"}]
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _CheckConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "priority",
+        "type": "text",
+        "check": {"op": "in", "values": ["low", "high"]},
+    })
+
+    await table_data_repo.replace_check_constraint(conn, "vt_demo__tasks", col)
+
+    assert conn.fetch_params[1] == ("vt_demo__tasks", "priority")
+    assert "DROP CONSTRAINT IF EXISTS legacy_inline_check" in conn.sqls[0][0]
+    assert "DROP CONSTRAINT IF EXISTS vt_demo__tasks__prio__check" in conn.sqls[1][0]
+    assert "ADD CONSTRAINT" in conn.sqls[2][0]
+    assert "CHECK (priority IN ('low', 'high'))" in conn.sqls[2][0]
+
+
+@pytest.mark.asyncio
+async def test_alter_column_default_sets_and_drops_validated_default():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+    col = table_data_repo.normalize_column_spec({
+        "name": "status",
+        "type": "enum",
+        "enum": ["draft", "active"],
+        "default": "active",
+    })
+    await table_data_repo.alter_column_default(conn, "vt_demo__tasks", col)
+    assert conn.sqls[-1] == (
+        "ALTER TABLE vt_demo__tasks ALTER COLUMN status SET DEFAULT 'active'",
+        (),
+    )
+
+    col["default"] = None
+    await table_data_repo.alter_column_default(conn, "vt_demo__tasks", col)
+    assert conn.sqls[-1] == (
+        "ALTER TABLE vt_demo__tasks ALTER COLUMN status DROP DEFAULT",
+        (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_enum_values_uses_one_case_update_for_chained_mappings():
+    class _ManyExecConn:
+        def __init__(self):
+            self.sqls = []
+
+        async def execute(self, sql, *params):
+            self.sqls.append((sql, params))
+
+    conn = _ManyExecConn()
+
+    await table_data_repo.rename_enum_values(
+        conn,
+        "vt_demo__tasks",
+        "status",
+        {"draft": "active", "active": "closed"},
+    )
+
+    assert len(conn.sqls) == 1
+    sql, params = conn.sqls[0]
+    assert "CASE status WHEN $1 THEN $2 WHEN $3 THEN $4 ELSE status END" in sql
+    assert "WHERE status = ANY($5::text[])" in sql
+    assert params == ("draft", "active", "active", "closed", ["draft", "active"])
+
+
 # ── service-layer validation/resolution ───────────────────────────
 
 from app.services import table_service  # noqa: E402
@@ -215,6 +509,140 @@ def test_resolve_unique_keys_generates_stable_name():
     assert len(resolved) == 1
     assert resolved[0]["columns"] == ["actor", "ts"]
     assert resolved[0]["name"].endswith("__uk")
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_accepts_same_vault_unique_target(monkeypatch):
+    async def fake_find_by_name(conn, vault_id, name):
+        assert name == "parents"
+        return {
+            "columns": [{"name": "code", "type": "text", "unique": True}],
+            "unique_keys": [],
+        }
+
+    monkeypatch.setattr(
+        table_service.table_registry_repo,
+        "find_by_name",
+        fake_find_by_name,
+    )
+    cols = [
+        table_data_repo.normalize_column_spec({
+            "name": "parent_code",
+            "type": "text",
+            "references": {"table": "parents", "column": "code", "on_delete": "cascade"},
+        })
+    ]
+
+    await table_service._validate_column_references(object(), uuid.uuid4(), cols)
+
+    assert cols[0]["references"] == {"table": "parents", "column": "code"}
+    assert cols[0]["on_delete"] == "cascade"
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_rejects_missing_nonunique_and_type_mismatch(monkeypatch):
+    async def missing_find_by_name(conn, vault_id, name):
+        return None
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", missing_find_by_name)
+    with pytest.raises(AKBError) as exc:
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "uuid",
+                "references": {"table": "parents"},
+            })],
+        )
+    assert exc.value.status_code == 400
+
+    async def nonunique_find_by_name(conn, vault_id, name):
+        return {
+            "columns": [{"name": "code", "type": "text"}],
+            "unique_keys": [],
+        }
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", nonunique_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_code",
+                "type": "text",
+                "references": {"table": "parents", "column": "code"},
+            })],
+        )
+
+    async def id_find_by_name(conn, vault_id, name):
+        return {"columns": [], "unique_keys": []}
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", id_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "text",
+                "references": {"table": "parents"},
+            })],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_column_references_rejects_set_null_required(monkeypatch):
+    async def fake_find_by_name(conn, vault_id, name):
+        return {"columns": [], "unique_keys": []}
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", fake_find_by_name)
+    with pytest.raises(ValidationError):
+        await table_service._validate_column_references(
+            object(),
+            uuid.uuid4(),
+            [table_data_repo.normalize_column_spec({
+                "name": "parent_id",
+                "type": "uuid",
+                "required": True,
+                "references": {"table": "parents", "on_delete": "set null"},
+            })],
+        )
+
+
+@pytest.mark.asyncio
+async def test_reject_referenced_target_columns_blocks_drop_or_rename(monkeypatch):
+    async def fake_list_for_vault(conn, vault_id):
+        return [
+            {
+                "name": "parents",
+                "columns": [{"name": "code", "type": "text", "unique": True}],
+            },
+            {
+                "name": "children",
+                "columns": [
+                    {
+                        "name": "parent_code",
+                        "type": "text",
+                        "references": {"table": "parents", "column": "code"},
+                    }
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(table_service.table_registry_repo, "list_for_vault", fake_list_for_vault)
+
+    with pytest.raises(ConflictError) as exc:
+        await table_service._reject_referenced_target_columns(
+            object(),
+            uuid.uuid4(),
+            "parents",
+            {"code"},
+            action="drop",
+        )
+
+    assert exc.value.status_code == 409
+    assert "children.parent_code" in exc.value.message
 
 
 def test_resolve_unique_keys_uses_caller_name_verbatim():
@@ -324,6 +752,83 @@ def test_resolve_indexes_rejects_reserved_column():
     with pytest.raises(ValidationError):
         table_service._resolve_indexes(
             [{"columns": ["id"]}], _DECLARED, "vt_demo__events",
+        )
+
+
+def test_inline_unique_and_index_column_properties_resolve_to_metadata():
+    columns = [
+        table_service._normalize_column_spec({"name": "email", "type": "text", "unique": True}),
+        table_service._normalize_column_spec({"name": "status", "type": "text", "index": True}),
+    ]
+
+    unique_keys = table_service._inline_unique_keys(columns, "vt_demo__contacts")
+    indexes = table_service._inline_indexes(columns, "vt_demo__contacts")
+
+    assert unique_keys == [{
+        "name": table_service.table_data_repo.generate_constraint_name(
+            "vt_demo__contacts", ["email"], kind="uk",
+        ),
+        "columns": ["email"],
+    }]
+    assert indexes == [{
+        "name": table_service.table_data_repo.generate_constraint_name(
+            "vt_demo__contacts", ["status"], kind="idx",
+        ),
+        "columns": [{"name": "status", "order": "asc"}],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_alter_required_column_without_default_is_clean_validation(monkeypatch):
+    class _Tx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Conn:
+        def transaction(self):
+            return _Tx()
+
+        async def fetchrow(self, sql, *_params):
+            if "FROM vaults" in sql:
+                return {"name": "demo"}
+            return {
+                "id": uuid.uuid4(),
+                "name": "items",
+                "columns": [{"name": "label", "type": "text"}],
+                "unique_keys": [],
+                "indexes": [],
+                "collection": None,
+            }
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def _fake_get_pool():
+        return _Pool()
+
+    async def _raise_not_null(_conn, _pg_name, _col, **_kwargs):
+        raise asyncpg.NotNullViolationError("column contains null values")
+
+    monkeypatch.setattr(table_service, "get_pool", _fake_get_pool)
+    monkeypatch.setattr(table_service.table_data_repo, "add_column", _raise_not_null)
+
+    with pytest.raises(ValidationError, match="Cannot add required column"):
+        await table_service.alter_table(
+            uuid.uuid4(),
+            "items",
+            actor_id="tester",
+            add_columns=[{"name": "code", "type": "text", "required": True}],
         )
 
 

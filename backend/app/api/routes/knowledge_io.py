@@ -15,7 +15,26 @@ router = APIRouter()
 doc_service = DocumentService()
 
 
-@router.get("/vaults/{vault}/export", summary="Export a vault as a knowledge bundle")
+@router.get(
+    "/vaults/{vault}/export",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    }
+                },
+                "application/zip": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+            },
+            "description": "Knowledge bundle as JSON or zip archive",
+        }
+    },
+    summary="Export a vault as a knowledge bundle",
+)
 async def export_vault(
     vault: str,
     format: str = Query("okf", description="Bundle format (currently: okf)"),

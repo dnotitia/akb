@@ -1,0 +1,49 @@
+{
+  "name": "@akb/client",
+  "version": "0.1.0",
+  "description": "Reference AKB REST client boundary for kind envelopes and {data,error} results.",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "akb": "./bin/akb.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./lite": {
+      "types": "./dist/lite.d.ts",
+      "import": "./dist/lite.js"
+    }
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "README.md",
+    "scripts/"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "codegen:check": "node scripts/check-generated-types.mjs && node scripts/check-core-types.mjs",
+    "codegen:core:check": "node scripts/check-core-types.mjs",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "pnpm run clean && pnpm run build"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.4"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dnotitia/akb.git",
+    "directory": "packages/akb-client"
+  }
+}

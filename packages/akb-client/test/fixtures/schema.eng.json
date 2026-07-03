@@ -1,0 +1,70 @@
+{
+  "kind": "vault_table_schema",
+  "vault": "eng",
+  "tables": [
+    {
+      "kind": "table_schema",
+      "vault": "eng",
+      "name": "tasks",
+      "table": "tasks",
+      "sql_name": "tasks",
+      "columns": [
+        {
+          "name": "title",
+          "type": "text",
+          "required": true,
+          "default": null,
+          "enum": null,
+          "references": null,
+          "on_delete": null,
+          "pg_type": "text",
+          "drift": { "missing": false, "type_mismatch": false }
+        },
+        {
+          "name": "status",
+          "type": "enum",
+          "required": true,
+          "default": "todo",
+          "enum": ["todo", "done"],
+          "references": null,
+          "on_delete": null,
+          "pg_type": "text",
+          "drift": { "missing": false, "type_mismatch": false }
+        },
+        {
+          "name": "owner_id",
+          "type": "text",
+          "required": false,
+          "default": null,
+          "enum": null,
+          "references": { "table": "users", "column": "id" },
+          "on_delete": "set null",
+          "pg_type": "text",
+          "drift": { "missing": false, "type_mismatch": false }
+        },
+        {
+          "name": "metadata",
+          "type": "jsonb",
+          "required": false,
+          "default": null,
+          "enum": null,
+          "references": null,
+          "on_delete": null,
+          "pg_type": "jsonb",
+          "drift": { "missing": false, "type_mismatch": false }
+        }
+      ],
+      "unique_keys": [{ "name": "tasks_title_key", "columns": ["title"] }],
+      "indexes": [{ "name": "tasks_status_idx", "columns": [{ "name": "status", "order": "asc" }] }],
+      "pg_types": {
+        "title": "text",
+        "status": "text",
+        "owner_id": "text",
+        "metadata": "jsonb"
+      },
+      "system_columns": ["created_at", "created_by", "id", "updated_at"],
+      "drift": { "has_drift": false, "missing_columns": [], "extra_columns": [], "type_mismatches": [] }
+    }
+  ],
+  "total": 1
+}

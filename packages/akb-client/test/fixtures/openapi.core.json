@@ -1,0 +1,229 @@
+{
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/files/{vault}": {
+      "get": {
+        "operationId": "filesGetVault",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/upload": {
+      "post": {
+        "operationId": "filesPostUpload",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}": {
+      "get": {
+        "operationId": "tablesGetVault",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "tablesPostVault",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/migrations": {
+      "post": {
+        "operationId": "tablesApplyMigration",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableMigrationEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/schema": {
+      "get": {
+        "operationId": "tablesGetVaultSchema",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbVaultTableSchemaEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/sql": {
+      "post": {
+        "operationId": "tablesPostSql",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbSqlEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/{table}/query": {
+      "post": {
+        "operationId": "tablesQueryRows",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          },
+          "204": { "description": "No Content" }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/{table}/rows": {
+      "delete": {
+        "operationId": "tablesDeleteRows",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          },
+          "204": { "description": "No Content" }
+        }
+      },
+      "get": {
+        "operationId": "tablesSelectRows",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "tablesUpdateRows",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          },
+          "204": { "description": "No Content" }
+        }
+      },
+      "post": {
+        "operationId": "tablesInsertRows",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableQueryEnvelope" }
+              }
+            }
+          },
+          "204": { "description": "No Content" }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/{table}/schema": {
+      "get": {
+        "operationId": "tablesGetTableSchema",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableSchemaEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tables/{vault}/{table_name}": {
+      "delete": {
+        "operationId": "tablesDeleteTableName",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "tablesAlterTable",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbTableEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AkbError": {},
+      "AkbFileEnvelope": {},
+      "AkbSqlEnvelope": {},
+      "AkbTableEnvelope": {},
+      "AkbTableMigrationEnvelope": {},
+      "AkbTableQueryEnvelope": {},
+      "AkbTableSchemaEnvelope": {},
+      "AkbTableSqlEnvelope": {},
+      "AkbVaultTableSchemaEnvelope": {}
+    }
+  }
+}

@@ -1,14 +1,56 @@
 """REST API routes for vault tables (structured data)."""
 
-from fastapi import APIRouter, Depends
+from typing import Any, Literal
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
+from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services import table_service
+from app.services import (
+    table_migration_service,
+    table_row_query,
+    table_row_write,
+    table_schema_service,
+    table_service,
+)
+from app.util.errors import (
+    BULK_TOO_LARGE,
+    CONFLICT,
+    INVALID_COLUMN_TYPE,
+    INVALID_ARGUMENT,
+    METHOD_NOT_ALLOWED,
+    MULTI_STATEMENT,
+    NO_UNIQUE_CONSTRAINT,
+    PERMISSION_DENIED,
+    SQL_ERROR,
+    UNFILTERED_MUTATION,
+    UNDEFINED_COLUMN,
+    UNDEFINED_TABLE,
+    UNIQUE_VIOLATION,
+    VAULT_ARCHIVED,
+)
 from app.util.text import NFCModel
 
 router = APIRouter()
+
+_SERVICE_ERROR_STATUS = {
+    INVALID_ARGUMENT: 400,
+    METHOD_NOT_ALLOWED: 400,
+    MULTI_STATEMENT: 400,
+    SQL_ERROR: 400,
+    INVALID_COLUMN_TYPE: 400,
+    BULK_TOO_LARGE: 400,
+    NO_UNIQUE_CONSTRAINT: 400,
+    UNFILTERED_MUTATION: 400,
+    UNDEFINED_COLUMN: 400,
+    UNDEFINED_TABLE: 400,
+    PERMISSION_DENIED: 403,
+    CONFLICT: 409,
+    UNIQUE_VIOLATION: 409,
+    VAULT_ARCHIVED: 409,
+}
 
 
 class CreateTableRequest(NFCModel):
@@ -24,9 +66,44 @@ class CreateTableRequest(NFCModel):
     indexes: list[dict] | None = None
 
 
+class AlterTableRequest(NFCModel):
+    add_columns: list[dict] | None = None
+    alter_columns: list[dict] | None = None
+    drop_columns: list[str] | None = None
+    rename_columns: dict[str, str] | None = None
+    add_unique_keys: list[dict] | None = None
+    drop_unique_keys: list[str] | None = None
+    add_indexes: list[dict] | None = None
+    drop_indexes: list[str] | None = None
+
+
 class SqlRequest(NFCModel):
     sql: str
+    params: list[Any] | None = None
     vaults: list[str] | None = None
+
+
+class QueryRowsRequest(NFCModel):
+    model_config = ConfigDict(extra="allow")
+
+    select: Any | None = None
+    filter: Any | None = None
+    where: Any | None = None
+    order: Any | None = None
+    limit: int | None = None
+    offset: int | None = None
+    page: dict[str, Any] | None = None
+    count: bool | str | None = None
+
+
+class TableQueryResponse(NFCModel):
+    kind: Literal["table_query"]
+    vault: str | None = None
+    table: str | None = None
+    vaults: list[str] | None = None
+    columns: list[str]
+    items: list[dict[str, Any]]
+    total: int
 
 
 @router.post("/tables/{vault}", summary="Create a table in a vault")
@@ -47,6 +124,78 @@ async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_
     return {"kind": "table", "vault": vault, "items": tables, "total": len(tables)}
 
 
+@router.get(
+    "/tables/{vault}/schema",
+    summary="Inspect all table schemas in a vault",
+    operation_id="tablesGetVaultSchema",
+)
+async def get_vault_schema(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await table_schema_service.get_vault_schema(access["vault_id"])
+
+
+@router.post(
+    "/tables/{vault}/migrations",
+    summary="Apply an idempotent table schema migration",
+    operation_id="tablesApplyMigration",
+)
+async def apply_table_migration(
+    vault: str,
+    operations: list[dict] = Body(...),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    return await table_migration_service.apply_table_migration(
+        access["vault_id"],
+        actor_id=user.username,
+        idempotency_key=idempotency_key,
+        operations=operations,
+    )
+
+
+@router.get(
+    "/tables/{vault}/{table}/schema",
+    summary="Inspect a table schema",
+    operation_id="tablesGetTableSchema",
+)
+async def get_table_schema(
+    vault: str,
+    table: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await table_schema_service.get_table_schema(access["vault_id"], table)
+
+
+@router.patch(
+    "/tables/{vault}/{table_name}",
+    summary="Alter a table schema",
+    operation_id="tablesAlterTable",
+)
+async def alter_table(
+    vault: str,
+    table_name: str,
+    req: AlterTableRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    # REST BaaS schema changes are a writer-level surface by AKB-034/067;
+    # the legacy MCP alter tool keeps its stricter admin gate.
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    return await table_service.alter_table(
+        access["vault_id"], table_name,
+        actor_id=user.username,
+        add_columns=req.add_columns,
+        alter_columns=req.alter_columns,
+        drop_columns=req.drop_columns,
+        rename_columns=req.rename_columns,
+        add_unique_keys=req.add_unique_keys,
+        drop_unique_keys=req.drop_unique_keys,
+        add_indexes=req.add_indexes,
+        drop_indexes=req.drop_indexes,
+    )
+
+
 @router.post("/tables/{vault}/sql", summary="Execute SQL on vault tables")
 async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Depends(get_current_user)):
     vaults = req.vaults or [vault]
@@ -60,11 +209,240 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     for v in vaults:
         await check_vault_access(user.user_id, v, required_role="reader")
 
-    return await table_service.execute_sql(
-        vault_names=vaults,
+    return _raise_service_error(
+        await table_service.execute_sql(
+            vault_names=vaults,
+            user_id=user.user_id,
+            sql=req.sql.strip(),
+            params=req.params,
+            is_admin=user.is_admin,
+        )
+    )
+
+
+@router.get(
+    "/tables/{vault}/{table}/rows",
+    summary="Select rows from a vault table",
+    operation_id="tablesSelectRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+)
+async def select_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    result = await table_row_query.select_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
         user_id=user.user_id,
-        sql=req.sql.strip(),
         is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        range_header=request.headers.get("range"),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_query.RowQueryResponse):
+        if result.content_range is not None:
+            response.headers["Content-Range"] = result.content_range
+        return result.body
+    return _raise_service_error(result)
+
+
+@router.post(
+    "/tables/{vault}/{table}/rows",
+    summary="Insert rows into a vault table",
+    operation_id="tablesInsertRows",
+    status_code=201,
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows inserted without a response body."},
+    },
+)
+async def insert_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    body: Any = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.insert_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        actor_id=user.username,
+        body=body,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.patch(
+    "/tables/{vault}/{table}/rows",
+    summary="Update rows in a vault table",
+    operation_id="tablesUpdateRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows updated without a response body."},
+    },
+)
+async def update_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    body: Any = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.update_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        body=body,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.delete(
+    "/tables/{vault}/{table}/rows",
+    summary="Delete rows from a vault table",
+    operation_id="tablesDeleteRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        204: {"description": "Rows deleted without a response body."},
+    },
+)
+async def delete_rows(
+    vault: str,
+    table: str,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    result = await table_row_write.delete_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        is_admin=user.is_admin,
+        query_params=list(request.query_params.multi_items()),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(result, table_row_write.RowMutationResponse):
+        return _apply_row_mutation_response(result, response)
+    return _raise_service_error(result)
+
+
+@router.post(
+    "/tables/{vault}/{table}/query",
+    summary="Select rows from a vault table using JSON AST",
+    operation_id="tablesQueryRows",
+    response_model=TableQueryResponse,
+    response_model_exclude_none=True,
+    responses={
+        201: {"model": TableQueryResponse, "description": "Rows inserted by a write AST."},
+        204: {"description": "Rows mutated by a write AST without a response body."},
+    },
+)
+async def query_rows(
+    vault: str,
+    table: str,
+    req: QueryRowsRequest,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    ast = req.model_dump(exclude_none=True)
+    if table_row_write.is_write_ast(ast):
+        access = await check_vault_access(user.user_id, vault, required_role="writer")
+        write_result = await table_row_write.query_rows(
+            vault_name=vault,
+            vault_id=access["vault_id"],
+            table_name=table,
+            user_id=user.user_id,
+            actor_id=user.username,
+            is_admin=user.is_admin,
+            ast=ast,
+            prefer_header=request.headers.get("prefer"),
+        )
+        if isinstance(write_result, table_row_write.RowMutationResponse):
+            return _apply_row_mutation_response(write_result, response)
+        return _raise_service_error(write_result)
+    read_result = await table_row_query.query_rows(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        table_name=table,
+        user_id=user.user_id,
+        is_admin=user.is_admin,
+        ast=ast,
+        range_header=request.headers.get("range"),
+        prefer_header=request.headers.get("prefer"),
+    )
+    if isinstance(read_result, table_row_query.RowQueryResponse):
+        if read_result.content_range is not None:
+            response.headers["Content-Range"] = read_result.content_range
+        return read_result.body
+    return _raise_service_error(read_result)
+
+
+def _apply_row_mutation_response(
+    result: table_row_write.RowMutationResponse,
+    response: Response,
+) -> Any:
+    headers = {}
+    if result.content_range is not None:
+        headers["Content-Range"] = result.content_range
+    if result.body is None:
+        return Response(status_code=result.status_code, headers=headers)
+    response.status_code = result.status_code
+    for key, value in headers.items():
+        response.headers[key] = value
+    return result.body
+
+
+def _raise_service_error(result: Any) -> Any:
+    """Translate legacy service err() dicts to HTTP AkbError responses.
+
+    The MCP surface still passes ``err(...)`` dictionaries through as tool
+    output. REST should expose errors through status codes so SDK boundary
+    code can map every non-2xx response to the single AkbError contract.
+    """
+    if not isinstance(result, dict) or "kind" in result:
+        return result
+    code = result.get("code")
+    message = result.get("message") or result.get("error")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return result
+    detail: dict[str, Any] = {"message": message, "code": code}
+    if isinstance(result.get("hint"), str):
+        detail["hint"] = result["hint"]
+    if "details" in result:
+        detail["details"] = result["details"]
+    raise HTTPException(
+        status_code=_SERVICE_ERROR_STATUS.get(code, 400),
+        detail=detail,
     )
 
 
