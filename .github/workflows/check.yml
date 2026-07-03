@@ -38,7 +38,9 @@ jobs:
         with:
           node-version: '22'
           cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            packages/akb-client/pnpm-lock.yaml
       - name: Install frontend deps
         working-directory: frontend
         # `--ignore-scripts` skips package postinstall hooks. We don't need
@@ -47,6 +49,12 @@ jobs:
         # exits non-zero on any unapproved build script even with
         # `pnpm.onlyBuiltDependencies` set when run via the action.
         run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install @akb/client deps
+        working-directory: packages/akb-client
+        # Its own pnpm store: typescript + vitest. No postinstall build
+        # scripts, so a plain frozen install is enough for `pnpm run build`
+        # (tsc emit) and `pnpm exec vitest run` in scripts/check.sh.
+        run: pnpm install --frozen-lockfile
 
       # ── Single entry point so CI and local pre-commit stay in sync ──
       - name: Run scripts/check.sh

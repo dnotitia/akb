@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 
-import { generateAkbSchema } from "../src/schema-codegen.js";
+import { generateAkbSchema } from "../dist/schema-codegen.js";
 
 main(process.argv.slice(2)).catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 
 import { AkbError, createClient, createTypedFetch, unwrapAkbResponse } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";

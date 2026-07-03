@@ -2,10 +2,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 
-import { generateCoreTypes } from "../src/core/openapi-codegen.js";
+import { generateCoreTypes } from "../dist/core/openapi-codegen.js";
 
 const DEFAULT_OPENAPI = new URL("../test/fixtures/openapi.core.json", import.meta.url);
-const DEFAULT_TYPES = new URL("../src/core/schema.gen.d.ts", import.meta.url);
+const DEFAULT_TYPES = new URL("../src/core/schema.gen.ts", import.meta.url);
 
 main(process.argv.slice(2)).catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));

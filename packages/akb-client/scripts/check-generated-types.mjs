@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 
-import { generateAkbSchema } from "../src/schema-codegen.js";
+import { generateAkbSchema } from "../dist/schema-codegen.js";
 
 const DEFAULT_SCHEMA = new URL("../test/fixtures/schema.eng.json", import.meta.url);
 const DEFAULT_TYPES = new URL("../test/fixtures/akb.types.ts", import.meta.url);
