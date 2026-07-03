@@ -17,8 +17,13 @@ from app.exceptions import NotFoundError
 from app.repositories import table_data_repo, table_registry_repo
 from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
 from app.util.errors import (
+    FILTER_TOO_DEEP,
     INVALID_ARGUMENT,
+    INVALID_CAST,
+    INVALID_FILTER,
+    INVALID_OPERATOR,
     METHOD_NOT_ALLOWED,
+    NOT_IMPLEMENTED,
     PERMISSION_DENIED,
     SQL_ERROR,
     UNDEFINED_COLUMN,
@@ -400,7 +405,7 @@ def _compile_ast_bool_group(
     depth: int,
 ) -> str | dict[str, Any]:
     if depth > MAX_BOOL_DEPTH:
-        return err("Boolean filter nesting is too deep.", code="filter_too_deep")
+        return err("Boolean filter nesting is too deep.", code=FILTER_TOO_DEEP)
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return err(f"AST {joiner} filter must be an array.", code=INVALID_ARGUMENT)
     clauses: list[str] = []
@@ -411,7 +416,7 @@ def _compile_ast_bool_group(
         if clause_or_error:
             clauses.append(clause_or_error)
     if not clauses:
-        return err(f"Invalid boolean filter: empty {joiner} group.", code="invalid_filter")
+        return err(f"Invalid boolean filter: empty {joiner} group.", code=INVALID_FILTER)
     glue = " OR " if joiner == "or" else " AND "
     return f"({glue.join(f'({c})' for c in clauses)})"
 
@@ -455,7 +460,7 @@ def _compile_ast_operand(node: Mapping[str, Any], column_meta: dict[str, str]) -
         path_items.append(item)
     cast = jsonb.get("cast")
     if cast is not None and (not isinstance(cast, str) or cast not in CAST_SQL):
-        return err(f"Invalid JSON cast {cast!r}.", code="invalid_cast", allowed_casts=sorted(CAST_SQL))
+        return err(f"Invalid JSON cast {cast!r}.", code=INVALID_CAST, allowed_casts=sorted(CAST_SQL))
     sql_base = table_data_repo.safe_ident(base)
     if len(path_items) == 1:
         expr = f"{sql_base} ->> ${{param}}::text"
@@ -496,7 +501,7 @@ def _compile_ast_operator(
             return f"{operand.sql} IS NULL"
         if lowered in {"true", "false"}:
             return f"{operand.sql} IS {lowered.upper()}"
-        return err("is operator only supports null, true, or false.", code="invalid_filter")
+        return err("is operator only supports null, true, or false.", code=INVALID_FILTER)
     if operator in {"eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike"}:
         sql_op = {
             "eq": "=",
@@ -526,12 +531,12 @@ def _compile_ast_operator(
         return f"{operand.sql} = ANY({_add_param(params, values)})"
     if operator == "cs":
         if not _is_json_type(operand.type_name):
-            return err("cs operator is only supported for JSON columns in this table API.", code="invalid_operator")
+            return err("cs operator is only supported for JSON columns in this table API.", code=INVALID_OPERATOR)
         contains_value = json.dumps(value) if isinstance(value, (Mapping, list)) else _parse_contains_value(str(value), "json")
         if isinstance(contains_value, dict):
             return contains_value
         return f"{operand.sql} @> {_add_param(params, contains_value)}::jsonb"
-    return err(f"Unknown row-read operator: {operator}", code="invalid_operator")
+    return err(f"Unknown row-read operator: {operator}", code=INVALID_OPERATOR)
 
 
 def _compile_ast_order(
@@ -602,7 +607,7 @@ def _compile_select(
         if not token:
             continue
         if re.search(r"(?<!:):(?!:)", token):
-            return err("Column aliases in select= are not implemented yet.", code="not_implemented")
+            return err("Column aliases in select= are not implemented yet.", code=NOT_IMPLEMENTED)
         if token == "*":
             projections.append(_Projection(sql="*", output_key="*", result_key="*"))
             continue
@@ -647,7 +652,7 @@ def _compile_bool_group(
     depth: int,
 ) -> str | dict[str, Any]:
     if depth > MAX_BOOL_DEPTH:
-        return err("Boolean filter nesting is too deep.", code="filter_too_deep")
+        return err("Boolean filter nesting is too deep.", code=FILTER_TOO_DEEP)
     inner = value.strip()
     if inner.startswith("(") and inner.endswith(")"):
         inner = inner[1:-1]
@@ -665,13 +670,13 @@ def _compile_bool_group(
         else:
             field, op_value = _split_bool_condition(part)
             if field is None or op_value is None:
-                return err(f"Invalid boolean filter: {part}", code="invalid_filter")
+                return err(f"Invalid boolean filter: {part}", code=INVALID_FILTER)
             clause_or_error = _compile_condition(field, op_value, column_meta, params)
         if isinstance(clause_or_error, dict):
             return clause_or_error
         clauses.append(clause_or_error)
     if not clauses:
-        return err(f"Invalid boolean filter: empty {joiner} group.", code="invalid_filter")
+        return err(f"Invalid boolean filter: empty {joiner} group.", code=INVALID_FILTER)
     glue = " OR " if joiner == "or" else " AND "
     return glue.join(f"({c})" for c in clauses)
 
@@ -688,7 +693,7 @@ def _compile_condition(
     operand = _bind_operand_params(operand_or_error, params)
     operator, value = _split_operator(raw_value)
     if operator is None:
-        return err(f"Invalid filter value for {field}: expected op.value", code="invalid_filter")
+        return err(f"Invalid filter value for {field}: expected op.value", code=INVALID_FILTER)
     return _compile_operator(operand, operator, value, params)
 
 
@@ -701,7 +706,7 @@ def _compile_operator(
     if operator == "not":
         inner_op, inner_value = _split_operator(value)
         if inner_op is None:
-            return err("Invalid not filter: expected not.op.value", code="invalid_filter")
+            return err("Invalid not filter: expected not.op.value", code=INVALID_FILTER)
         inner = _compile_operator(operand, inner_op, inner_value, params)
         if isinstance(inner, dict):
             return inner
@@ -712,7 +717,7 @@ def _compile_operator(
             return f"{operand.sql} IS NULL"
         if lowered in {"true", "false"}:
             return f"{operand.sql} IS {lowered.upper()}"
-        return err("is operator only supports null, true, or false.", code="invalid_filter")
+        return err("is operator only supports null, true, or false.", code=INVALID_FILTER)
     if operator in {"eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike"}:
         sql_op = {
             "eq": "=",
@@ -740,7 +745,7 @@ def _compile_operator(
             return contains_value
         cast = "::jsonb" if _is_json_type(operand.type_name) else ""
         return f"{operand.sql} @> {_add_param(params, contains_value)}{cast}"
-    return err(f"Unknown row-read operator: {operator}", code="invalid_operator")
+    return err(f"Unknown row-read operator: {operator}", code=INVALID_OPERATOR)
 
 
 def _compile_order(
@@ -776,17 +781,17 @@ def _compile_operand(raw: str, column_meta: dict[str, str]) -> _Operand | dict[s
     arrow = m.group("arrow")
     cast = m.group("cast")
     if cast and cast not in CAST_SQL:
-        return err(f"Invalid JSON cast {cast!r}.", code="invalid_cast", allowed_casts=sorted(CAST_SQL))
+        return err(f"Invalid JSON cast {cast!r}.", code=INVALID_CAST, allowed_casts=sorted(CAST_SQL))
     if not arrow:
         if cast:
-            return err("Casts are only supported for JSON path operands.", code="invalid_cast")
+            return err("Casts are only supported for JSON path operands.", code=INVALID_CAST)
         ident = table_data_repo.safe_ident(base)
         return _Operand(sql=ident, params=[], type_name=column_meta[base])
     if not _is_json_type(column_meta[base]):
         return err(f"Column {base!r} is not a JSON column.", code=UNDEFINED_COLUMN)
     path = (m.group("path") or "").strip()
     if not path:
-        return err(f"Invalid JSON path operand: {raw}", code="invalid_filter")
+        return err(f"Invalid JSON path operand: {raw}", code=INVALID_FILTER)
     sql_base = table_data_repo.safe_ident(base)
     if arrow == "->>":
         expr = f"{sql_base} ->> ${{param}}::text"
@@ -825,14 +830,14 @@ def _parse_page(query_params: Sequence[tuple[str, str]], range_header: str | Non
     if range_header:
         m = re.fullmatch(r"\s*(\d+)-(\d+)\s*", range_header)
         if not m:
-            return err("Invalid Range header; expected N-M.", code="invalid_argument")
+            return err("Invalid Range header; expected N-M.", code=INVALID_ARGUMENT)
         start, end = int(m.group(1)), int(m.group(2))
         if end < start:
-            return err("Invalid Range header; end must be >= start.", code="invalid_argument")
+            return err("Invalid Range header; end must be >= start.", code=INVALID_ARGUMENT)
         offset = start
         limit = end - start + 1
     if limit < 0 or offset < 0:
-        return err("limit and offset must be non-negative.", code="invalid_argument")
+        return err("limit and offset must be non-negative.", code=INVALID_ARGUMENT)
     return _Page(limit=min(limit, MAX_LIMIT), offset=offset)
 
 
@@ -842,7 +847,7 @@ def _parse_int(value: str | None, *, default: int) -> int | dict[str, Any]:
     try:
         return int(str(value))
     except ValueError:
-        return err(f"Expected integer, got {value!r}.", code="invalid_argument")
+        return err(f"Expected integer, got {value!r}.", code=INVALID_ARGUMENT)
 
 
 def _prefer_count_exact(prefer_header: str | None) -> bool:
@@ -902,14 +907,14 @@ def _split_top_level(value: str) -> list[str]:
 def _parse_json_path_list(raw: str) -> list[str] | dict[str, Any]:
     text = raw.strip()
     if not (text.startswith("{") and text.endswith("}")):
-        return err("#>> JSON path must use {a,b} syntax.", code="invalid_filter")
+        return err("#>> JSON path must use {a,b} syntax.", code=INVALID_FILTER)
     return [p.strip() for p in text[1:-1].split(",") if p.strip()]
 
 
 def _parse_in_values(raw: str, type_name: str) -> list[Any] | dict[str, Any]:
     text = raw.strip()
     if not (text.startswith("(") and text.endswith(")")):
-        return err("in operator expects parenthesized values, e.g. in.(a,b).", code="invalid_filter")
+        return err("in operator expects parenthesized values, e.g. in.(a,b).", code=INVALID_FILTER)
     out: list[Any] = []
     for item in _split_top_level(text[1:-1]):
         converted = _convert_value(item.strip(), type_name)
@@ -921,14 +926,14 @@ def _parse_in_values(raw: str, type_name: str) -> list[Any] | dict[str, Any]:
 
 def _parse_contains_value(raw: str, type_name: str) -> Any | dict[str, Any]:
     if not _is_json_type(type_name):
-        return err("cs operator is only supported for JSON columns in this table API.", code="invalid_operator")
+        return err("cs operator is only supported for JSON columns in this table API.", code=INVALID_OPERATOR)
     text = raw.strip()
     if text.startswith("{") and text.endswith("}") and ":" not in text:
         return json.dumps([p.strip() for p in text[1:-1].split(",") if p.strip()])
     try:
         return json.dumps(json.loads(text))
     except ValueError:
-        return err("cs on JSON columns expects JSON or {a,b} syntax.", code="invalid_filter")
+        return err("cs on JSON columns expects JSON or {a,b} syntax.", code=INVALID_FILTER)
 
 
 def _convert_value(raw: str, type_name: str) -> Any | dict[str, Any]:
@@ -955,7 +960,7 @@ def _convert_value(raw: str, type_name: str) -> Any | dict[str, Any]:
         if type_name == "uuid":
             return uuid.UUID(raw)
     except (ValueError, InvalidOperation):
-        return err(f"Could not convert {raw!r} to {type_name}.", code="invalid_argument")
+        return err(f"Could not convert {raw!r} to {type_name}.", code=INVALID_ARGUMENT)
     return raw
 
 

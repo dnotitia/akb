@@ -78,7 +78,7 @@ async def test_create_table_rejects_overlong_pg_name(monkeypatch):
         await table_service.create_table(
             uuid.uuid4(),
             table_name,
-            [{"name": "amount", "type": "integer"}],
+            [{"name": "amount", "type": "int"}],
             actor_id="tester",
         )
 
@@ -114,7 +114,7 @@ async def test_create_table_accepts_pg_name_at_limit(monkeypatch):
         await table_service.create_table(
             uuid.uuid4(),
             table_name,
-            [{"name": "amount", "type": "integer"}],
+            [{"name": "amount", "type": "int"}],
             actor_id="tester",
         )
     assert reached.get("ddl"), "the 63-char name was wrongly rejected by the length guard"
@@ -128,7 +128,7 @@ async def test_create_table_invalid_name_is_422_not_500():
         await table_service.create_table(
             uuid.uuid4(),
             "Bad Name!",  # spaces + caps + punctuation
-            [{"name": "amount", "type": "integer"}],
+            [{"name": "amount", "type": "int"}],
             actor_id="tester",
         )
     assert ei.value.status_code == 422

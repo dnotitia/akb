@@ -80,6 +80,16 @@ UNFILTERED_MUTATION = "unfiltered_mutation"
 BULK_TOO_LARGE = "bulk_too_large"
 NO_UNIQUE_CONSTRAINT = "no_unique_constraint"
 
+# Row-read / row-write REST surface — PostgREST-style URL/AST compiler
+# (`table_row_query`). These sit alongside the generic INVALID_ARGUMENT
+# for shape errors, but carry a more specific code so SDK/codegen
+# clients can branch on the exact compiler rejection.
+INVALID_FILTER = "invalid_filter"          # malformed filter operand / op.value grammar
+INVALID_OPERATOR = "invalid_operator"      # unknown or unsupported row-read operator
+INVALID_CAST = "invalid_cast"              # unsupported / malformed JSON-path cast
+FILTER_TOO_DEEP = "filter_too_deep"        # boolean filter nesting past MAX_BOOL_DEPTH
+NOT_IMPLEMENTED = "not_implemented"        # recognized-but-unsupported request shape
+
 # Knowledge-graph linking
 SELF_LINK = "self_link"
 
