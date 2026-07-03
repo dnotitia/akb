@@ -53,6 +53,18 @@ def _vault_lock(vault_name: str) -> threading.Lock:
         return lock
 
 
+def _write_kt() -> dict:
+    """`kill_after_timeout` kwarg for write-path git commands.
+
+    A wedged git process (disk stall, huge `reset --hard` stat sweep)
+    otherwise pins the vault lock + a commit-executor thread + the caller's
+    pool connection until PG's 60s idle-in-transaction reaper fires. Killing
+    the command fails just that one request (transaction rolls back; the
+    next write's `reset --hard` reconciles the worktree) and frees the lane.
+    """
+    return {"kill_after_timeout": settings.git_write_timeout_secs}
+
+
 
 class GitService:
     def __init__(self, storage_path: str | None = None):
@@ -98,10 +110,10 @@ class GitService:
         working directory instead, so writes remain safe across thread-pool
         workers and vaults.
         """
-        tree_sha = work_repo.git.write_tree()
+        tree_sha = work_repo.git.write_tree(**_write_kt())
         parent_args: list[str] = []
         if parent_required:
-            work_repo.git.rev_parse("--verify", "HEAD")
+            work_repo.git.rev_parse("--verify", "HEAD", **_write_kt())
             parent_args = ["-p", "HEAD"]
 
         with work_repo.git.custom_environment(**self._git_author_env(author_name, author_email)):
@@ -111,9 +123,10 @@ class GitService:
                 *parent_args,
                 "-m",
                 message,
+                **_write_kt(),
             ).strip()
-        work_repo.git.update_ref("HEAD", commit_sha)
-        return work_repo.git.rev_parse("HEAD").strip()
+        work_repo.git.update_ref("HEAD", commit_sha, **_write_kt())
+        return work_repo.git.rev_parse("HEAD", **_write_kt()).strip()
 
     def _ensure_worktree(self, vault_name: str) -> Path | None:
         """Create a persistent worktree for this vault if one doesn't exist.
@@ -135,7 +148,7 @@ class GitService:
             return None  # empty repo; caller falls back to the clone path
         wt.parent.mkdir(parents=True, exist_ok=True)
         try:
-            bare_repo.git.worktree("add", str(wt), branch_name)
+            bare_repo.git.worktree("add", str(wt), branch_name, **_write_kt())
         except GitError as e:
             # A previous `worktree add` killed mid-write (SIGKILL, OOM,
             # container restart) can leave the bare's
@@ -150,8 +163,8 @@ class GitService:
                 "worktree add for vault %s tripped stale registration; pruning and retrying: %s",
                 vault_name, msg,
             )
-            bare_repo.git.worktree("prune")
-            bare_repo.git.worktree("add", str(wt), branch_name)
+            bare_repo.git.worktree("prune", **_write_kt())
+            bare_repo.git.worktree("add", str(wt), branch_name, **_write_kt())
         logger.info("Worktree created for vault %s at %s (branch=%s)", vault_name, wt, branch_name)
         return wt
 
@@ -573,13 +586,13 @@ class GitService:
             # bare ref (e.g., a previous crash mid-commit), sync to HEAD
             # before writing. With a single writer this is a no-op in the
             # steady state.
-            work_repo.git.reset("--hard", "HEAD")
+            work_repo.git.reset("--hard", "HEAD", **_write_kt())
 
             full_path = wt / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
 
-            work_repo.git.add("--", file_path)
+            work_repo.git.add("--", file_path, **_write_kt())
             return self._stage_and_commit(
                 work_repo,
                 message,
@@ -603,13 +616,13 @@ class GitService:
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
 
             work_repo = Repo(str(wt))
-            work_repo.git.reset("--hard", "HEAD")
+            work_repo.git.reset("--hard", "HEAD", **_write_kt())
 
             full_path = wt / file_path
             if not full_path.exists():
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
 
-            work_repo.git.rm("--", file_path)
+            work_repo.git.rm("--", file_path, **_write_kt())
             return self._stage_and_commit(
                 work_repo,
                 message,
@@ -642,7 +655,7 @@ class GitService:
                 raise FileNotFoundError(f"File not found in vault: {old_path}")
 
             work_repo = Repo(str(wt))
-            work_repo.git.reset("--hard", "HEAD")
+            work_repo.git.reset("--hard", "HEAD", **_write_kt())
 
             src = wt / old_path
             if not src.exists():
@@ -656,7 +669,7 @@ class GitService:
                 raise FileExistsError(f"Destination already exists in vault: {new_path}")
             dst.parent.mkdir(parents=True, exist_ok=True)
 
-            work_repo.git.mv("--", old_path, new_path)
+            work_repo.git.mv("--", old_path, new_path, **_write_kt())
             return self._stage_and_commit(
                 work_repo,
                 message,
@@ -702,7 +715,7 @@ class GitService:
                 return None
 
             work_repo = Repo(str(wt))
-            work_repo.git.reset("--hard", "HEAD")
+            work_repo.git.reset("--hard", "HEAD", **_write_kt())
 
             # Dedupe while preserving caller order so log output is stable
             # and so a doubled path doesn't make `git rm` fail on
@@ -716,7 +729,7 @@ class GitService:
                 )
                 return None
 
-            work_repo.git.rm("--", *present)
+            work_repo.git.rm("--", *present, **_write_kt())
             return self._stage_and_commit(
                 work_repo,
                 message,
@@ -761,21 +774,22 @@ class GitService:
         # Stable parent for the tmp dir so we don't depend on the
         # process cwd to resolve a relative name. ``storage_path``
         # always exists on a healthy deploy.
+        clone_timeout = settings.git_write_timeout_secs
         with tempfile.TemporaryDirectory(dir=str(self.storage_path)) as tmp:
             try:
                 subprocess.run(
                     ["git", "clone", "--quiet", str(bare_path), tmp],
-                    check=True, cwd=tmp, timeout=60,
+                    check=True, cwd=tmp, timeout=clone_timeout,
                 )
             except subprocess.TimeoutExpired as e:
                 raise GitError(
-                    f"git clone timed out after 60s for vault {vault_name}"
+                    f"git clone timed out after {clone_timeout:.0f}s for vault {vault_name}"
                 ) from e
             work_repo = Repo(tmp)
             full_path = Path(tmp) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
-            work_repo.git.add("--", file_path)
+            work_repo.git.add("--", file_path, **_write_kt())
             commit_hash = self._stage_and_commit(
                 work_repo,
                 message,
@@ -783,11 +797,11 @@ class GitService:
                 author_email,
                 parent_required=False,
             )
-            # Push is local-to-local (bare repo on the same disk), so
-            # 60s is generous; if it hangs the timeout still releases
-            # the vault lock for the next caller.
+            # Push is local-to-local (bare repo on the same disk), so the
+            # standard write timeout is generous; if it hangs the timeout
+            # still releases the vault lock for the next caller.
             try:
-                work_repo.git.push("origin", kill_after_timeout=60)
+                work_repo.git.push("origin", **_write_kt())
             except GitError as e:
                 raise GitError(
                     f"git push failed for vault {vault_name}: {e}"

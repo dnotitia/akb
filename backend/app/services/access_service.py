@@ -15,6 +15,7 @@ from app.models.vault_scope import current_vault_scope
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
+from app.services.write_lane import run_compensation, run_git_write
 from app.util.errors import NOT_FOUND, err
 
 logger = logging.getLogger("akb.access")
@@ -903,13 +904,37 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     # On-disk cleanup: bare repo + persistent worktree. Both must go,
     # otherwise a same-named recreate hits stale state on its second
     # commit (the first that materialises the worktree).
-    GitService().cleanup_vault_dirs(vault_name)
+    #
+    # Commit executor, NOT inline: cleanup_vault_dirs blocks on the
+    # per-vault threading.Lock and then rmtree's the whole repo —
+    # running that on the event loop stalls every request (and /livez)
+    # for the duration; running it on the shared to_thread pool lets a
+    # lock wait eat a thread reads need. No write-lane gate on purpose:
+    # PG cascade above already committed, and a lane-timeout 429 here
+    # would strand orphan dirs that block a same-named recreate.
+    # must_complete: the DB rows are gone — if a client disconnect
+    # cancelled us while queueing for a slot, the dirs would otherwise
+    # survive as orphans this request can never come back to repair.
+    # A cancellation surfaced AFTER the cleanup completed must not skip
+    # the role cleanup below either — park it, finish, then re-raise.
+    pending_cancel: BaseException | None = None
+    try:
+        await run_git_write(GitService().cleanup_vault_dirs, vault_name, must_complete=True)
+    except asyncio.CancelledError as ce:
+        pending_cancel = ce  # cleanup DID complete (must_complete)
 
     # PG-native RBAC: drop the three vault group roles. Memberships
-    # auto-clean as part of DROP ROLE.
-    await get_role_sync().on_vault_delete(vault_id)
+    # auto-clean as part of DROP ROLE. run_compensation: a cancel mid-DDL
+    # is absorbed until the drop COMPLETES — a bare shield would detach it
+    # and strand the roles if shutdown closes the pool underneath.
+    try:
+        await run_compensation(get_role_sync().on_vault_delete(vault_id))
+    except asyncio.CancelledError as ce:
+        pending_cancel = ce
 
     logger.info("Deleted vault: %s", vault_name)
+    if pending_cancel is not None:
+        raise pending_cancel
     return {"deleted": True, "vault": vault_name}
 
 

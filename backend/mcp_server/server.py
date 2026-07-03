@@ -29,7 +29,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent
 
 from app.db.postgres import get_pool, init_db, close_pool
-from app.exceptions import ConflictError, NotFoundError, ValidationError
+from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.services.document_service import DocumentService, EditError
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
@@ -53,6 +53,7 @@ from app.util.errors import (
     NOT_FOUND,
     UNKNOWN_ARGUMENT,
     UNKNOWN_TOOL,
+    WRITE_BUSY,
 )
 from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
@@ -1459,7 +1460,18 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 available_arguments=sorted(allowed),
             )
 
-    return await handler(args, uid, user)
+    try:
+        return await handler(args, uid, user)
+    except WriteBusyError as e:
+        # Write-lane admission timed out (429-class). Precise code +
+        # machine-readable backoff so agents retry instead of treating
+        # it as an internal failure. No partial write occurred.
+        return err(
+            str(e),
+            code=WRITE_BUSY,
+            hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
+            retry_after_secs=e.retry_after_secs,
+        )
 
 
 # ── Entry point ──────────────────────────────────────────────
