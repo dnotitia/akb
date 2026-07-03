@@ -126,7 +126,7 @@ async def test_table_migration_route_forwards_key_ops_with_writer_gate(monkeypat
         }
 
     monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
-    monkeypatch.setattr(tables.table_service, "apply_table_migration", fake_apply_table_migration)
+    monkeypatch.setattr(tables.table_migration_service, "apply_table_migration", fake_apply_table_migration)
 
     ops = [{"op": "add_column", "table": "incidents", "name": "title", "type": "text"}]
     result = await tables.apply_table_migration(
@@ -166,8 +166,8 @@ async def test_table_schema_routes_use_reader_gate(monkeypatch) -> None:
         return {"kind": "vault_table_schema", "vault": "demo", "tables": [], "total": 0}
 
     monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
-    monkeypatch.setattr(tables.table_service, "get_table_schema", fake_get_table_schema)
-    monkeypatch.setattr(tables.table_service, "get_vault_schema", fake_get_vault_schema)
+    monkeypatch.setattr(tables.table_schema_service, "get_table_schema", fake_get_table_schema)
+    monkeypatch.setattr(tables.table_schema_service, "get_vault_schema", fake_get_vault_schema)
 
     table_schema = await tables.get_table_schema("demo", "incidents", _User())  # type: ignore[arg-type]
     vault_schema = await tables.get_vault_schema("demo", _User())  # type: ignore[arg-type]
