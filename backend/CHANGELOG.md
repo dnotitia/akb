@@ -5,6 +5,44 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.5 — 2026-07-03  *(feat — write-lane admission: coroutine queueing + 429 backpressure for git writes)*
+
+Every git-committing document write now passes a two-stage admission gate
+BEFORE acquiring any scarce resource: a per-vault gate (1 concurrent, FIFO)
+then a global write-lane semaphore (`write_lane_concurrency`, default 8) —
+only then does the request take a pool connection + advisory lock and run
+its git commit on a **dedicated** commit executor. Waiting happens as
+suspended coroutines; past the deadline (`write_lane_queue_timeout_secs`,
+default 10s) the request is rejected with **429 + Retry-After** (REST) /
+**`code=write_busy`** (MCP) having performed no work at all.
+
+This closes BOTH service-wide contagion paths a single hot vault had:
+pool poisoning (writers queueing for the vault git lock while holding a
+connection inside an open transaction) and executor starvation (that
+queueing previously happened inside the shared `asyncio.to_thread` pool
+that git READS also depend on — ~12 blocked waiters on an 8-core node
+froze document reads on every vault). Transaction boundaries are
+unchanged; the per-vault `threading.Lock` stays as the last-line guard.
+
+Hardening that came out of 10 adversarial review rounds (full trail in
+`docs/design/proposal/command-lane-write-path/feedback/`): cancellation
+is absorbed until the uninterruptible git thread finishes (lane
+accounting stays truthful; compensation writes are `must_complete`);
+the commit executor only ever runs global-slot holders (ContextVar
+discipline); `create_vault` rollback is complete (per-name create lock,
+DB purge + RBAC cleanup) and **never destroys foreign data** — a
+vaults-row `FOR UPDATE` + full-schema foreign-write guard (docs, files,
+tables, publications incl. cross-vault `query_vault_names` references,
+todos, non-owned collections) aborts the purge if anything landed in the
+vault meanwhile; every write-path git command gets
+`kill_after_timeout` (`git_write_timeout_secs`, default 30s).
+
+Measured live: ~17 commits/s per vault (≈170 writes per 10s window
+before 429s start); during a 180-writer hot-vault burst, other vaults'
+writes stayed at p50 69ms and `/livez` ≤ 7ms. Ops note: MCP client
+timeouts should be ≥ 15s so agents see the 429 (and its retry hint)
+instead of cancelling first.
+
 ## 0.9.4 — 2026-06-24  *(feat — search can be scoped to multiple vaults)*
 
 `GET /search` and `GET /grep` now accept a **repeatable** `vault` query param
