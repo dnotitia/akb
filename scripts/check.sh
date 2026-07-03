@@ -82,9 +82,9 @@ step "detect-secrets (tracked files)"
 if command -v detect-secrets-hook >/dev/null 2>&1; then
   # Scope: git-tracked files only — skips node_modules, .venv, dist, etc.
   # for free, and prevents the scan from drowning in third-party noise.
-  # pnpm-lock.yaml is excluded because package integrity hashes are expected
-  # high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' |
+  # Both pnpm-lock.yaml files are excluded because package integrity hashes
+  # (sha512-… base64) are expected high-entropy data, not secrets.
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2
