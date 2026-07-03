@@ -8,6 +8,11 @@ db_host: postgres
 db_port: 5432
 db_name: akb
 db_user: akb
+# Main asyncpg pool sizing (optional; defaults shown). The env vars
+# AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE take precedence over these
+# keys — the deployment-layer knob for k8s / akb-platform.
+# pg_pool_min_size: 2
+# pg_pool_max_size: 30
 
 # === Git storage (bare repos per vault live under this path) ===
 git_storage_path: /data/vaults

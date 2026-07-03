@@ -1,3 +1,10 @@
+---
+status: accepted
+stage: applied
+created: 2026-05-14
+updated: 2026-06-11
+---
+
 # AKB Help Skill Bootstrap — Design Spec
 
 > Brainstormed 2026-05-14. Supersedes the over-engineered 2026-05-06 design (which proposed `.akb/` local bundles, `akb_bootstrap` MCP tool, CLI materializer, and new REST endpoints — all removed here).

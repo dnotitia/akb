@@ -3069,6 +3069,17 @@ table rewrite).
 
 ## 0.3.0 — 2026-05-27
 
+### Follow-up patch: delete/read concurrency handling (2026-05-27)
+
+Fixed a document lifecycle race where a concurrent `GET` could resolve
+the `documents` row just before `DELETE` removed the Git blob, then
+return `200` with an empty `content` field. `akb_get` / REST document
+reads now treat a missing backing Git blob as `404`, so racing readers
+observe either the pre-delete body or an explicit not-found response.
+
+`test_concurrency_repro_e2e.sh` now includes a delete/read race check
+that fails any `200` response missing the seeded body marker.
+
 ### Follow-up patch: edge-extraction safety (PR #85, 2026-05-26)
 
 Found during the on-prem verification of 0.3.0. Two paired contract

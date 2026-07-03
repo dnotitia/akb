@@ -544,8 +544,9 @@ class DocumentService:
             self.git.read_file, vault, row["path"], row["current_commit"]
         )
         body = ""
-        if content:
-            _, body = _parse_markdown(content)
+        if content is None:
+            raise NotFoundError("Document", doc_ref)
+        _, body = _parse_markdown(content)
         content_hash, hash_algorithm = await self._ensure_document_hash(doc_repo, row, body)
 
         # Derive published state from the publications table. We pick the
