@@ -70,7 +70,7 @@ step "generated type drift (@akb/client)"
 # behind `npm run test:e2e` and needs a live docker-compose stack —
 # wire that into a separate e2e workflow when it's ready.
 step "vitest (frontend)"
-(cd frontend && npx --no-install vitest run)
+(cd frontend && pnpm run test)
 
 # ─── secrets: detect-secrets ──────────────────────────────────────
 # Catches accidental commits of API keys, JWTs, AWS credentials, etc.
