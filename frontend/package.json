@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "storybook": "storybook dev -p 6006",
     "design:check": "node scripts/design-check.mjs",
     "build": "node scripts/design-check.mjs && tsc && vite build",
+    "build-storybook": "storybook build",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run --project unit",
+    "test:storybook": "vitest run --project storybook",
     "test:watch": "vitest",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
@@ -17,6 +20,11 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.60.0",
+    "@storybook/addon-a11y": "10.4.6",
+    "@storybook/addon-docs": "10.4.6",
+    "@storybook/addon-themes": "10.4.6",
+    "@storybook/addon-vitest": "10.4.6",
+    "@storybook/react-vite": "10.4.6",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -24,6 +32,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/browser-playwright": "4.1.4",
     "@vitest/ui": "^4.1.4",
     "eslint": "^10.4.0",
     "eslint-plugin-react-hooks": "^7.1.1",
@@ -31,6 +40,8 @@
     "globals": "^17.6.0",
     "jsdom": "^29.0.2",
     "msw": "^2.14.6",
+    "msw-storybook-addon": "2.0.7",
+    "storybook": "10.4.6",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.59.3",
     "vite": "^8.0.1",
@@ -72,10 +83,5 @@
     "remark-math": "^6.0.0",
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.2"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "msw"
-    ]
   }
 }
