@@ -85,7 +85,7 @@ if command -v detect-secrets-hook >/dev/null 2>&1; then
   # The generated MSW worker also carries an integrity checksum.
   # Both pnpm-lock.yaml files are excluded because package integrity hashes
   # (sha512-… base64) are expected high-entropy data, not secrets.
-  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!frontend/public/mockServiceWorker.js' |
+  git ls-files -z -- . ':!frontend/pnpm-lock.yaml' ':!packages/akb-client/pnpm-lock.yaml' ':!frontend/.storybook/public/mockServiceWorker.js' |
     xargs -0 detect-secrets-hook --baseline .secrets.baseline
 else
   echo "  ! detect-secrets not installed — pipx install detect-secrets" >&2
