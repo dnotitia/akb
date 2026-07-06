@@ -322,14 +322,14 @@ export const ActivityTimeline: Story = {
             total: 2,
             activity: [
               {
-                hash: "9ad1204b67f2c",
+                hash: "story-skill",
                 author_name: "JY Kim",
                 subject: "Add Storybook route shell",
                 timestamp: "2026-07-06T04:12:00.000Z",
                 files: [{ path: "overview/vault-skill.md", change: "modified" }],
               },
               {
-                hash: "7cc091a5d1e30",
+                hash: "story-note",
                 agent: "codex",
                 subject: "Update release note",
                 timestamp: "2026-07-05T22:48:00.000Z",

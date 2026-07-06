@@ -27,13 +27,13 @@ type Story = StoryObj<typeof meta>;
 
 const history: HistoryEntry[] = [
   {
-    hash: "c0ffee1234567890",
+    hash: "story-a",
     agent: "codex",
     subject: "Add Storybook scenarios",
     timestamp: new Date(Date.now() - 8 * 60_000).toISOString(),
   },
   {
-    hash: "baddad9876543210",
+    hash: "story-b",
     author: "jylkim",
     subject: "Tune vault settings copy",
     timestamp: new Date(Date.now() - 4 * 60 * 60_000).toISOString(),
@@ -151,7 +151,7 @@ export const HistoryStates: Story = {
         <div className="p-4">
           <HistoryList
             entries={history}
-            selectedHash="baddad9876543210"
+            selectedHash="story-b"
             onSelect={() => undefined}
           />
         </div>
@@ -160,7 +160,7 @@ export const HistoryStates: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByRole("button", { name: /View document at commit c0ffee1/i }));
+    await userEvent.click(canvas.getByRole("button", { name: /View document at commit story-a/i }));
     await expect(canvas.getByText("codex")).toBeVisible();
   },
 };
