@@ -634,10 +634,15 @@ def _compile_mutation_where(
     column_meta: dict[str, str],
     params: list[Any],
 ) -> str | dict[str, Any]:
+    # A real column can share a name with a reserved control param (e.g. a
+    # table with a "count" or "order" column) — column identity wins so the
+    # caller's filter is never silently dropped from the WHERE clause. An
+    # UPDATE/DELETE that looks filtered must never quietly become broader
+    # than the caller intended.
     filter_params = [
         (key, value)
         for key, value in query_params
-        if key not in WRITE_CONTROL_PARAMS
+        if key not in WRITE_CONTROL_PARAMS or key in column_meta
     ]
     if not filter_params and not _all_rows_enabled(query_params):
         return err(

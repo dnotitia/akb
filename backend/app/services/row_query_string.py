@@ -87,7 +87,11 @@ def _compile_filters(
 ) -> str | dict[str, Any]:
     clauses: list[str] = []
     for key, value in query_params:
-        if key in {"select", "order", "limit", "offset"}:
+        # A real column can share a name with a reserved query-control param
+        # (e.g. a table with a "select"/"order"/"limit"/"offset" column) —
+        # column identity wins so the filter is never silently dropped from
+        # the WHERE clause. Shared by both row-read and row-write callers.
+        if key in {"select", "order", "limit", "offset"} and key not in column_meta:
             continue
         if key in {"or", "and"}:
             clause_or_error = _compile_bool_group(key, value, column_meta, params, depth=1)

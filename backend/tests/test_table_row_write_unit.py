@@ -344,3 +344,61 @@ def test_compile_delete_requires_filter_and_can_return_representation() -> None:
         "DELETE FROM vt_eng__incidents WHERE (severity = $1) RETURNING id, title"
     )
     assert compiled.params == ["low"]
+
+
+# A real column can share a name with a reserved write-control param
+# ("count", "order", "limit", "offset", "resolution", "select", "all",
+# "on_conflict"). Column identity must win so the filter is never silently
+# dropped, which would otherwise turn a scoped DELETE/UPDATE into one that
+# touches every row matching only the surviving conditions.
+COLUMNS_WITH_RESERVED_NAMES = [
+    {"name": "count", "type": "int"},
+    {"name": "order", "type": "text"},
+    {"name": "source", "type": "text"},
+]
+
+
+def test_compile_delete_does_not_drop_filter_on_reserved_word_column() -> None:
+    compiled = compile_delete_rows(
+        vault_name="eng",
+        table_name="events",
+        columns=COLUMNS_WITH_RESERVED_NAMES,
+        query_params=[("count", "eq.0"), ("source", "eq.test")],
+    )
+    assert not isinstance(compiled, dict)
+    assert compiled.sql == (
+        "DELETE FROM vt_eng__events WHERE (count = $1) AND (source = $2)"
+    )
+    assert compiled.params == [0, "test"]
+
+
+def test_compile_update_does_not_drop_filter_on_reserved_word_column() -> None:
+    compiled = compile_update_rows(
+        vault_name="eng",
+        table_name="events",
+        columns=COLUMNS_WITH_RESERVED_NAMES,
+        body={"source": "resolved"},
+        query_params=[("order", "eq.first")],
+    )
+    assert not isinstance(compiled, dict)
+    assert compiled.sql == (
+        "UPDATE vt_eng__events SET source = $1, updated_at = NOW() "
+        "WHERE (order = $2)"
+    )
+    assert compiled.params == ["resolved", "first"]
+
+
+def test_compile_delete_still_treats_reserved_word_as_control_when_no_such_column() -> None:
+    # Regression guard: when the table has no column by that name, the
+    # reserved word keeps meaning "control param, not a filter" exactly as
+    # before the fix (asserted already above for "limit"/"order" against
+    # `COLUMNS`, which has neither) — repeated here against the
+    # reserved-name fixture's sibling names to pin both directions.
+    unfiltered = compile_delete_rows(
+        vault_name="eng",
+        table_name="events",
+        columns=COLUMNS_WITH_RESERVED_NAMES,
+        query_params=[("limit", "1")],
+    )
+    assert isinstance(unfiltered, dict)
+    assert unfiltered["code"] == "unfiltered_mutation"
