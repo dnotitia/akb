@@ -241,11 +241,12 @@ an `sr-only` summary, never the only signal.
 
 - **Radius**: `--radius-sm .5rem` (chips, focus insets) · `-md .75` (buttons,
   inputs) · `-lg .875` (cards, panels, lists) · `-xl 1rem` (dialogs, hero) ·
-  `-full 9999px` (pills, avatars, dots). Always `rounded-[var(--radius-*)]`.
+  `-full 9999px` (pills, avatars, dots). Always reference the `--radius-*`
+  tokens through Tailwind arbitrary radius utilities.
 - **Elevation** (3-tier rule): `shadow-xs` hairline lift · `shadow-sm` resting
   cards · `shadow-md` popover/raised tile · `shadow-lg` modal/menu · `shadow-xl`
   hover peak. Cool-tinted in light, deeper alpha in dark.
-- **Z-index ladder** (reference via `z-[var(--z-*)]`): `base 0` · `raised 10` ·
+- **Z-index ladder** (reference via the `--z-*` tokens): `base 0` · `raised 10` ·
   `sticky 20` · `header 40` · `overlay 50` · `modal 55` · `popover 60` ·
   `tooltip 70` · `toast 80`. One ladder so a menu/tooltip opened inside a modal
   sits above it and toasts sit above everything.
@@ -289,7 +290,7 @@ Compose pages from these instead of re-writing patterns inline.
 | `CodeSnippet` | copyable code block with a soft header bar (insecure-origin safe). |
 | `Alert` | tinted notice banner — `destructive/warning/info/success` on the `-soft` quads; assertive `role=alert` for destructive/warning, polite `role=status` otherwise; icon + text always. |
 | `Badge` / `RoleBadge` / status badges | pill tags; outline + `*-solid` filled semantic variants; role/doc/system tones. |
-| `VaultChip` | flat tinted **monogram** tile for a vault — a quiet identity anchor, **not** a glossy avatar or a `feat-*` hero. Swatch is a deterministic `--color-cat-*` picked by `hashHue(name) % 6` (the shared FNV-1a from `lib/utils`, §7), so a vault wears **one color** wherever its name appears — Recent rows and the vault directory. Fill `color-mix(in srgb, <cat> 14%, transparent)`, `rounded-[var(--radius-sm)]`; `sm` (`h-5 w-5`) rides inline in a row, `md` (`h-7 w-7`) anchors a directory row. `aria-hidden` — the readable name always leads. |
+| `VaultChip` | flat tinted **monogram** tile for a vault — a quiet identity anchor, **not** a glossy avatar or a `feat-*` hero. Swatch is a deterministic `--color-cat-*` picked by `hashHue(name) % 6` (the shared FNV-1a from `lib/utils`, §7), so a vault wears **one color** wherever its name appears — Recent rows and the vault directory. Fill `color-mix(in srgb, <cat> 14%, transparent)`, use the small radius token; `sm` (`h-5 w-5`) rides inline in a row, `md` (`h-7 w-7`) anchors a directory row. `aria-hidden` — the readable name always leads. |
 | `Input` / `Textarea` / `Select` / `Label` / `TagInput` | form primitives — pre-rounded, teal focus ring, `aria-[invalid]` hooks. |
 | `Dialog` / `ConfirmDialog` | overlay primitives; `ConfirmDialog` surfaces a rejected `onConfirm` inline (`Alert`) and stays open for retry. |
 | `Tabs` / `Tooltip` / `Skeleton` | segmented control / hint / loading placeholder. |

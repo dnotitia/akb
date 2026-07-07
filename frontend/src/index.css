@@ -138,7 +138,7 @@
   --shadow-lg: 0 16px 40px rgba(16, 24, 40, 0.1), 0 6px 14px rgba(16, 24, 40, 0.06);
   --shadow-xl: 0 24px 60px rgba(16, 24, 40, 0.14), 0 10px 22px rgba(16, 24, 40, 0.08);
 
-  /* ── Z-index scale — reference via z-[var(--z-*)]; one ladder so overlays,
+  /* ── Z-index scale — reference via the z-index token variables; one ladder so overlays,
      menus, tooltips and toasts never collide. header < overlay < modal <
      popover < tooltip < toast (a menu/tooltip opened inside a modal sits
      above it; toasts sit above everything). */

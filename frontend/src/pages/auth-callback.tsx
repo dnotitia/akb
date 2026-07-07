@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { keycloakExchange, markSsoSession, setToken } from "@/lib/api";
 import { Logo } from "@/components/logo";
@@ -15,6 +15,7 @@ import { Logo } from "@/components/logo";
  */
 export default function AuthCallbackPage() {
   const navigate = useNavigate();
+  const routerLocation = useLocation();
   // StrictMode double-invokes effects in dev; the code is single-use, so
   // guard against a second redeem that would always 400.
   const ran = useRef(false);
@@ -24,7 +25,7 @@ export default function AuthCallbackPage() {
     ran.current = true;
     document.title = "Signing in… — AKB";
 
-    const params = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams(routerLocation.search);
     const code = params.get("code");
     const rawRedirect = params.get("redirect") || "/";
     // Same-site only: resolve against our origin and keep just path+query+hash
@@ -64,7 +65,7 @@ export default function AuthCallbackPage() {
         navigate(`/auth?sso_error=${reason}`, { replace: true });
       })
       .finally(() => clearTimeout(timer));
-  }, [navigate]);
+  }, [navigate, routerLocation.search]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
