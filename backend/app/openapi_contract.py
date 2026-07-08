@@ -71,6 +71,11 @@ ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 KIND_SUCCESS_RESPONSE_REFS = {
+    ("post", "/api/v1/documents"): "#/components/schemas/AkbDocumentWriteEnvelope",
+    ("get", "/api/v1/documents/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentEnvelope",
+    ("patch", "/api/v1/documents/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentWriteEnvelope",
+    ("delete", "/api/v1/documents/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentEnvelope",
+    ("get", "/api/v1/browse/{vault}"): "#/components/schemas/AkbDocumentEnvelope",
     ("get", "/api/v1/search"): "#/components/schemas/AkbSearchEnvelope",
     ("get", "/api/v1/drill-down"): "#/components/schemas/AkbDrillDownEnvelope",
     ("get", "/api/v1/grep"): "#/components/schemas/AkbGrepEnvelope",
@@ -107,6 +112,9 @@ KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS: dict[tuple[str, str], dict[str, str | Non
         "201": "#/components/schemas/AkbTableQueryEnvelope",
         "204": None,
     },
+}
+OPERATION_TAG_OVERRIDES = {
+    ("get", "/api/v1/browse/{vault}"): ["documents"],
 }
 
 
@@ -174,7 +182,10 @@ def _normalize_api_operations(schema: dict[str, Any]) -> None:
         for method, operation in path_item.items():
             if method not in HTTP_METHODS or not isinstance(operation, dict):
                 continue
-            operation.setdefault("tags", [_namespace_for_path(path)])
+            if tags := OPERATION_TAG_OVERRIDES.get((method, path)):
+                operation["tags"] = tags
+            else:
+                operation.setdefault("tags", [_namespace_for_path(path)])
             operation.setdefault("operationId", _operation_id_from_schema(path, method, operation))
             _ensure_success_response(path, method, operation)
             _ensure_error_responses(operation)
@@ -257,6 +268,8 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 {"$ref": "#/components/schemas/AkbTableQueryEnvelope"},
                 {"$ref": "#/components/schemas/AkbTableSqlEnvelope"},
                 {"$ref": "#/components/schemas/AkbFileEnvelope"},
+                {"$ref": "#/components/schemas/AkbDocumentEnvelope"},
+                {"$ref": "#/components/schemas/AkbDocumentWriteEnvelope"},
                 {"$ref": "#/components/schemas/AkbSearchEnvelope"},
                 {"$ref": "#/components/schemas/AkbDrillDownEnvelope"},
                 {"$ref": "#/components/schemas/AkbGrepEnvelope"},
@@ -271,6 +284,8 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     "table_query": "#/components/schemas/AkbTableQueryEnvelope",
                     "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
                     "file": "#/components/schemas/AkbFileEnvelope",
+                    "document": "#/components/schemas/AkbDocumentEnvelope",
+                    "document_write": "#/components/schemas/AkbDocumentWriteEnvelope",
                     "search": "#/components/schemas/AkbSearchEnvelope",
                     "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
                     "grep": "#/components/schemas/AkbGrepEnvelope",
@@ -463,6 +478,57 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "total": {"type": "integer"},
             },
             "File resource, list, upload, download, and delete success envelope.",
+        ),
+        "AkbDocumentEnvelope": _kind_schema(
+            "document",
+            {
+                "uri": {"type": "string"},
+                "vault": {"type": "string"},
+                "path": {"type": "string"},
+                "title": {"type": "string"},
+                "type": {"type": "string"},
+                "status": {"type": "string"},
+                "summary": _nullable_string(),
+                "domain": _nullable_string(),
+                "created_by": _nullable_string(),
+                "created_by_name": _nullable_string(),
+                "created_at": {"type": "string", "format": "date-time"},
+                "updated_at": {"type": "string", "format": "date-time"},
+                "current_commit": _nullable_string(),
+                "content_hash": _nullable_string(),
+                "hash_algorithm": _nullable_string(),
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "content": _nullable_string(),
+                "is_public": {"type": "boolean"},
+                "public_slug": _nullable_string(),
+                "metadata_is_current": {"type": "boolean"},
+                "items": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/BrowseItem"},
+                },
+                "hint": _nullable_string(),
+                "deleted": {"type": "boolean"},
+            },
+            "Document read, browse, and delete success envelope.",
+        ),
+        "AkbDocumentWriteEnvelope": _kind_schema(
+            "document_write",
+            {
+                "uri": {"type": "string"},
+                "vault": {"type": "string"},
+                "path": {"type": "string"},
+                "commit_hash": {"type": "string"},
+                "current_commit": _nullable_string(),
+                "previous_commit": _nullable_string(),
+                "content_hash": _nullable_string(),
+                "previous_content_hash": _nullable_string(),
+                "hash_algorithm": _nullable_string(),
+                "action": _nullable_string(),
+                "chunks_indexed": {"type": "integer"},
+                "entities_found": {"type": "integer"},
+            },
+            "Document put and update success envelope.",
+            required=("kind", "uri", "vault", "path", "commit_hash", "chunks_indexed", "entities_found"),
         ),
         "AkbSearchEnvelope": _kind_schema(
             "search",

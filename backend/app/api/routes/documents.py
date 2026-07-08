@@ -7,6 +7,7 @@ from app.api.deps import get_current_user
 from app.services import template_registry
 from app.services.access_service import check_vault_access, list_accessible_vaults
 from app.models.document import (
+    DocumentDeleteResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
@@ -74,13 +75,23 @@ async def list_vaults(user: AuthenticatedUser = Depends(get_current_user)):
     return {"vaults": await list_accessible_vaults(user.user_id)}
 
 
-@router.post("/documents", response_model=DocumentPutResponse, summary="Put a document")
+@router.post(
+    "/documents",
+    response_model=DocumentPutResponse,
+    summary="Put a document",
+    operation_id="documentsPutDocument",
+)
 async def put_document(req: DocumentPutRequest, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, req.vault, required_role="writer")
     return await doc_service.put(req, agent_id=user.username)
 
 
-@router.get("/documents/{vault}/{doc_id:path}", response_model=DocumentResponse, summary="Get a document")
+@router.get(
+    "/documents/{vault}/{doc_id:path}",
+    response_model=DocumentResponse,
+    summary="Get a document",
+    operation_id="documentsGetDocument",
+)
 async def get_document(
     vault: str,
     doc_id: str,
@@ -98,13 +109,23 @@ async def get_document(
     return await doc_service.get(vault, doc_id)
 
 
-@router.patch("/documents/{vault}/{doc_id:path}", response_model=DocumentPutResponse, summary="Update a document")
+@router.patch(
+    "/documents/{vault}/{doc_id:path}",
+    response_model=DocumentPutResponse,
+    summary="Update a document",
+    operation_id="documentsUpdateDocument",
+)
 async def update_document(vault: str, doc_id: str, req: DocumentUpdateRequest, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, vault, required_role="writer")
     return await doc_service.update(vault, doc_id, req, agent_id=user.username)
 
 
-@router.delete("/documents/{vault}/{doc_id:path}", summary="Delete a document")
+@router.delete(
+    "/documents/{vault}/{doc_id:path}",
+    response_model=DocumentDeleteResponse,
+    summary="Delete a document",
+    operation_id="documentsDeleteDocument",
+)
 async def delete_document(vault: str, doc_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, vault, required_role="writer")
     await doc_service.delete(vault, doc_id, agent_id=user.username)

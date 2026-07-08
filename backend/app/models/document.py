@@ -101,6 +101,7 @@ class DocumentResponse(BaseModel):
     """Response for a single document. Internal IDs are never exposed — `uri`
     is the sole identifier for the resource."""
 
+    kind: Literal["document"] = "document"
     uri: str  # canonical akb://{vault}/doc/{path} — single source of truth
     vault: str
     path: str
@@ -134,6 +135,7 @@ class DocumentResponse(BaseModel):
 class DocumentPutResponse(BaseModel):
     """Response after akb_put."""
 
+    kind: Literal["document_write"] = "document_write"
     uri: str  # canonical akb://{vault}/doc/{path}
     vault: str
     path: str
@@ -146,6 +148,13 @@ class DocumentPutResponse(BaseModel):
     action: str | None = None
     chunks_indexed: int
     entities_found: int
+
+
+class DocumentDeleteResponse(BaseModel):
+    """Response after deleting a document."""
+
+    kind: Literal["document"] = "document"
+    deleted: bool
 
 
 class BrowseItem(BaseModel):
@@ -195,6 +204,7 @@ class BrowseItem(BaseModel):
 class BrowseResponse(BaseModel):
     """Response for akb_browse."""
 
+    kind: Literal["document"] = "document"
     vault: str
     path: str
     items: list[BrowseItem]
