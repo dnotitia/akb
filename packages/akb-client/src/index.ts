@@ -258,6 +258,52 @@ export interface AkbGrepOptions {
   filesWithMatches?: boolean;
 }
 
+export type AkbDocumentStatus = "draft" | "active" | "archived";
+
+export interface AkbDocumentVaultOptions {
+  vault?: string | null;
+}
+
+export interface AkbDocumentGetOptions extends AkbDocumentVaultOptions {
+  version?: string | null;
+}
+
+export interface AkbDocumentBrowseOptions extends AkbDocumentVaultOptions {
+  collection?: string | null;
+  depth?: number;
+  includeHashes?: boolean;
+  includeArchived?: boolean;
+}
+
+export interface AkbDocumentPutInput extends AkbDocumentVaultOptions {
+  collection: string;
+  title: string;
+  content: string;
+  type?: string;
+  status?: AkbDocumentStatus;
+  tags?: readonly string[];
+  domain?: string | null;
+  summary?: string | null;
+  dependsOn?: readonly string[];
+  relatedTo?: readonly string[];
+  slug?: string | null;
+}
+
+export interface AkbDocumentUpdateInput {
+  content?: string | null;
+  title?: string | null;
+  type?: string | null;
+  status?: AkbDocumentStatus | null;
+  tags?: readonly string[] | null;
+  domain?: string | null;
+  summary?: string | null;
+  dependsOn?: readonly string[] | null;
+  relatedTo?: readonly string[] | null;
+  message?: string | null;
+  expectedCommit?: string | null;
+  expectedContentHash?: string | null;
+}
+
 export interface AkbSearchFacade extends AkbNamespaceStub {
   (
     query: string,
@@ -271,6 +317,28 @@ export interface AkbSearchFacade extends AkbNamespaceStub {
     pattern: string,
     options?: AkbGrepOptions,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbGrepEnvelope>>;
+}
+
+export interface AkbDocsFacade extends AkbNamespaceStub {
+  get(
+    docId: string,
+    options?: AkbDocumentGetOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
+  put(
+    input: AkbDocumentPutInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentWriteEnvelope>>;
+  update(
+    docId: string,
+    input: AkbDocumentUpdateInput,
+    options?: AkbDocumentVaultOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentWriteEnvelope>>;
+  delete(
+    docId: string,
+    options?: AkbDocumentVaultOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
+  browse(
+    options?: AkbDocumentBrowseOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
 }
 
 export interface AkbTableStub<
@@ -361,7 +429,7 @@ export interface AkbClient<Schema = unknown> {
   >;
   readonly search: AkbSearchFacade;
   readonly graph: AkbNamespaceStub;
-  readonly docs: AkbNamespaceStub;
+  readonly docs: AkbDocsFacade;
   readonly storage: AkbNamespaceStub;
 }
 
@@ -544,7 +612,7 @@ function makeClient(
     },
     search: makeSearchFacade(request, scope.defaultVault),
     graph: makeNamespaceStub("graph", "/graph", request),
-    docs: makeNamespaceStub("docs", "/documents", request),
+    docs: makeDocsFacade(request, scope.defaultVault),
     storage: makeNamespaceStub("storage", "/files", request),
   };
   return Object.freeze(client) as unknown as AkbClient;
@@ -617,6 +685,65 @@ function makeNamespaceStub(
       return request(joinPath(prefix, path), init);
     },
   }) as AkbNamespaceStub;
+}
+
+function makeDocsFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbDocsFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(path: string | URL = "", init: RequestInit = {}) => {
+    return request<T>(joinPath("/documents", path), init);
+  };
+  const facade = {
+    name: "docs",
+    request: rawRequest,
+    get(docId: string, options: AkbDocumentGetOptions = {}) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams();
+      appendOptional(params, "version", options.version);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbDocumentEnvelope>(
+        `/documents/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}${query}`,
+      );
+    },
+    put(input: AkbDocumentPutInput) {
+      const payload = documentPutPayload(input, defaultVault);
+      return request<import("./core/schema.gen.js").AkbDocumentWriteEnvelope>("/documents", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    },
+    update(docId: string, input: AkbDocumentUpdateInput, options: AkbDocumentVaultOptions = {}) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      return request<import("./core/schema.gen.js").AkbDocumentWriteEnvelope>(
+        `/documents/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(documentUpdatePayload(input)),
+        },
+      );
+    },
+    delete(docId: string, options: AkbDocumentVaultOptions = {}) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      return request<import("./core/schema.gen.js").AkbDocumentEnvelope>(
+        `/documents/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}`,
+        { method: "DELETE" },
+      );
+    },
+    browse(options: AkbDocumentBrowseOptions = {}) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams();
+      appendOptional(params, "collection", options.collection);
+      appendOptional(params, "depth", options.depth);
+      appendOptional(params, "include_hashes", options.includeHashes);
+      appendOptional(params, "include_archived", options.includeArchived);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbDocumentEnvelope>(
+        `/browse/${encodePathSegment(vault)}${query}`,
+      );
+    },
+  } satisfies AkbDocsFacade;
+  return Object.freeze(facade);
 }
 
 function makeSearchFacade(
@@ -695,6 +822,65 @@ function appendOptional(
 ): void {
   if (value === null || value === undefined) return;
   params.set(key, String(value));
+}
+
+function resolveDocumentVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError("Select a vault before using documents: client.vault(\"...\").docs.");
+}
+
+function encodePathSegment(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function encodeDocumentPath(path: string): string {
+  const cleaned = path.replace(/^\/+/, "");
+  if (!cleaned) {
+    throw new TypeError("Document path must be a non-empty string.");
+  }
+  return cleaned.split("/").map(encodePathSegment).join("/");
+}
+
+function documentPutPayload(
+  input: AkbDocumentPutInput,
+  defaultVault: string | null,
+): Record<string, unknown> {
+  const vault = resolveDocumentVault(input.vault ?? defaultVault);
+  return omitUndefined({
+    vault,
+    collection: input.collection,
+    title: input.title,
+    content: input.content,
+    type: input.type,
+    status: input.status,
+    tags: input.tags ? Array.from(input.tags) : undefined,
+    domain: input.domain,
+    summary: input.summary,
+    depends_on: input.dependsOn ? Array.from(input.dependsOn) : undefined,
+    related_to: input.relatedTo ? Array.from(input.relatedTo) : undefined,
+    slug: input.slug,
+  });
+}
+
+function documentUpdatePayload(input: AkbDocumentUpdateInput): Record<string, unknown> {
+  return omitUndefined({
+    content: input.content,
+    title: input.title,
+    type: input.type,
+    status: input.status,
+    tags: input.tags ? Array.from(input.tags) : input.tags,
+    domain: input.domain,
+    summary: input.summary,
+    depends_on: input.dependsOn ? Array.from(input.dependsOn) : input.dependsOn,
+    related_to: input.relatedTo ? Array.from(input.relatedTo) : input.relatedTo,
+    message: input.message,
+    expected_commit: input.expectedCommit,
+    expected_content_hash: input.expectedContentHash,
+  });
+}
+
+function omitUndefined(values: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
 }
 
 function joinPath(prefix: string, path: string | URL): string {

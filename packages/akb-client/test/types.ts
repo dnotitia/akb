@@ -6,6 +6,7 @@ import {
   type AkbSuccessEnvelope,
   type AkbClient,
   type AkbDocumentEnvelope,
+  type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
   type AkbOperationResponse,
   type operations,
@@ -82,6 +83,34 @@ const grepResult = await typedClient.vault("eng").search.grep("needle", {
 });
 grepResult.throwOnError().data.kind satisfies "grep";
 grepResult.throwOnError().data.files?.at(0) satisfies string | undefined;
+const docs = typedClient.vault("eng").docs;
+const documentPutInput: AkbDocumentPutInput = {
+  collection: "guides",
+  title: "Readme",
+  content: "# Readme",
+  status: "active",
+  tags: ["sdk"],
+  dependsOn: ["AKB-090"],
+  relatedTo: ["AKB-095"],
+};
+const browsedDocs = await docs.browse({ collection: "guides", depth: 0, includeHashes: true });
+browsedDocs.throwOnError().data.kind satisfies "document";
+const fetchedDoc = await docs.get("guides/readme.md", { version: "abc1234" });
+fetchedDoc.throwOnError().data.content satisfies string | null | undefined;
+const putDoc = await docs.put(documentPutInput);
+putDoc.throwOnError().data.kind satisfies "document_write";
+const updatedDoc = await docs.update("guides/readme.md", {
+  summary: "Fresh summary",
+  expectedCommit: "abc1234",
+  expectedContentHash: "hash1234",
+});
+updatedDoc.throwOnError().data.current_commit satisfies string | null | undefined;
+const deletedDoc = await docs.delete("guides/readme.md");
+deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
+// @ts-expect-error collection is required when putting a document.
+docs.put({ title: "Missing collection", content: "# Missing collection" });
+// @ts-expect-error document status is constrained to AKB document lifecycle values.
+docs.put({ collection: "guides", title: "Bad status", content: "# Bad status", status: "done" });
 // @ts-expect-error raw SQL is only exposed as a tagged template.
 typedClient.vault("eng").sql("SELECT title FROM tasks");
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
