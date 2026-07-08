@@ -101,6 +101,9 @@ def test_success_envelope_components_are_kind_discriminated():
             "table_query": "#/components/schemas/AkbTableQueryEnvelope",
             "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
             "file": "#/components/schemas/AkbFileEnvelope",
+            "search": "#/components/schemas/AkbSearchEnvelope",
+            "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
+            "grep": "#/components/schemas/AkbGrepEnvelope",
         },
     }
     for name, kind in (
@@ -111,6 +114,9 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbTableQueryEnvelope", "table_query"),
         ("AkbTableSqlEnvelope", "table_sql"),
         ("AkbFileEnvelope", "file"),
+        ("AkbSearchEnvelope", "search"),
+        ("AkbDrillDownEnvelope", "drill_down"),
+        ("AkbGrepEnvelope", "grep"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
@@ -120,6 +126,9 @@ def test_success_envelope_components_are_kind_discriminated():
 def test_kind_envelope_routes_reference_typed_success_schemas():
     schema = app.openapi()
     expected = {
+        ("/api/v1/search", "get", "200"): "AkbSearchEnvelope",
+        ("/api/v1/drill-down", "get", "200"): "AkbDrillDownEnvelope",
+        ("/api/v1/grep", "get", "200"): "AkbGrepEnvelope",
         ("/api/v1/tables/{vault}", "post", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}", "get", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}/schema", "get", "200"): "AkbVaultTableSchemaEnvelope",
@@ -145,6 +154,63 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
             ["content"]["application/json"]["schema"]
         )
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
+
+
+def test_search_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    search = paths["/api/v1/search"]["get"]
+    drill_down = paths["/api/v1/drill-down"]["get"]
+    grep = paths["/api/v1/grep"]["get"]
+
+    assert search["operationId"] == "searchSearchDocuments"
+    assert drill_down["operationId"] == "searchDrillDown"
+    assert grep["operationId"] == "searchGrepDocuments"
+
+    assert (
+        search["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbSearchEnvelope"}
+    )
+    assert (
+        drill_down["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbDrillDownEnvelope"}
+    )
+    assert (
+        grep["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbGrepEnvelope"}
+    )
+
+    search_params = {param["name"]: param for param in search["parameters"]}
+    for name in (
+        "q",
+        "mode",
+        "rerank",
+        "vault",
+        "collection",
+        "type",
+        "tags",
+        "limit",
+        "include_archived",
+        "source_uris",
+    ):
+        assert search_params[name]["in"] == "query"
+
+    mode_schema = search_params["mode"]["schema"]
+    assert mode_schema["type"] == "string"
+    assert mode_schema.get("enum", mode_schema.get("const")) in (["hybrid"], "hybrid")
+    rerank_schema = search_params["rerank"]["schema"]
+    assert rerank_schema.get("type") == "boolean" or {"type": "boolean"} in rerank_schema.get("anyOf", [])
+
+    grep_params = {param["name"]: param for param in grep["parameters"]}
+    for name in ("q", "vault", "collection", "regex", "case_sensitive", "limit", "count_only", "files_with_matches"):
+        assert grep_params[name]["in"] == "query"
+
+    schemas = schema["components"]["schemas"]
+    assert {"kind", "query", "total", "returned", "total_matches", "results"}.issubset(
+        schemas["AkbSearchEnvelope"]["required"]
+    )
+    assert {"kind", "uri", "sections"}.issubset(schemas["AkbDrillDownEnvelope"]["required"])
+    assert {"kind", "pattern", "regex"}.issubset(schemas["AkbGrepEnvelope"]["required"])
 
 
 def test_row_read_openapi_contract_is_codegen_typed():

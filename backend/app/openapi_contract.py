@@ -71,6 +71,9 @@ ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 KIND_SUCCESS_RESPONSE_REFS = {
+    ("get", "/api/v1/search"): "#/components/schemas/AkbSearchEnvelope",
+    ("get", "/api/v1/drill-down"): "#/components/schemas/AkbDrillDownEnvelope",
+    ("get", "/api/v1/grep"): "#/components/schemas/AkbGrepEnvelope",
     ("post", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("get", "/api/v1/tables/{vault}"): "#/components/schemas/AkbTableEnvelope",
     ("get", "/api/v1/tables/{vault}/schema"): "#/components/schemas/AkbVaultTableSchemaEnvelope",
@@ -254,6 +257,9 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 {"$ref": "#/components/schemas/AkbTableQueryEnvelope"},
                 {"$ref": "#/components/schemas/AkbTableSqlEnvelope"},
                 {"$ref": "#/components/schemas/AkbFileEnvelope"},
+                {"$ref": "#/components/schemas/AkbSearchEnvelope"},
+                {"$ref": "#/components/schemas/AkbDrillDownEnvelope"},
+                {"$ref": "#/components/schemas/AkbGrepEnvelope"},
             ],
             "discriminator": {
                 "propertyName": "kind",
@@ -265,6 +271,9 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     "table_query": "#/components/schemas/AkbTableQueryEnvelope",
                     "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
                     "file": "#/components/schemas/AkbFileEnvelope",
+                    "search": "#/components/schemas/AkbSearchEnvelope",
+                    "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
+                    "grep": "#/components/schemas/AkbGrepEnvelope",
                 },
             },
         },
@@ -455,6 +464,87 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             },
             "File resource, list, upload, download, and delete success envelope.",
         ),
+        "AkbSearchEnvelope": _kind_schema(
+            "search",
+            {
+                "query": {"type": "string"},
+                "total": {"type": "integer"},
+                "returned": {"type": "integer"},
+                "total_matches": {"type": "integer"},
+                "truncated": {"type": "boolean"},
+                "hint": _nullable_string(),
+                "degraded": {"type": "boolean"},
+                "degradation_reason": _nullable_string(),
+                "results": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/SearchResult"},
+                },
+            },
+            "Hybrid search success envelope.",
+            required=("kind", "query", "total", "returned", "total_matches", "results"),
+        ),
+        "AkbDrillDownEnvelope": _kind_schema(
+            "drill_down",
+            {
+                "uri": {"type": "string"},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["chunk_index"],
+                        "properties": {
+                            "section_path": _nullable_string(),
+                            "content": _nullable_string(),
+                            "chunk_index": {"type": "integer"},
+                        },
+                        "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+                    },
+                },
+            },
+            "Document drill-down success envelope.",
+            required=("kind", "uri", "sections"),
+        ),
+        "AkbGrepEnvelope": _kind_schema(
+            "grep",
+            {
+                "pattern": {"type": "string"},
+                "regex": {"type": "boolean"},
+                "error": _nullable_string(),
+                "returned_docs": _nullable_integer(),
+                "returned_matches": _nullable_integer(),
+                "total_docs": _nullable_integer(),
+                "total_matches": _nullable_integer(),
+                "truncated": _nullable_boolean(),
+                "hint": _nullable_string(),
+                "results": {
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/GrepResult"},
+                        },
+                        {"type": "null"},
+                    ],
+                },
+                "by_doc": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": {"type": "integer"},
+                        },
+                        {"type": "null"},
+                    ],
+                },
+                "n_files": _nullable_integer(),
+                "files": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                },
+            },
+            "Literal grep success envelope.",
+            required=("kind", "pattern", "regex"),
+        ),
     }
 
 
@@ -487,6 +577,14 @@ def _kind_property(kind: str) -> dict[str, Any]:
 
 def _nullable_string() -> dict[str, Any]:
     return {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+
+def _nullable_integer() -> dict[str, Any]:
+    return {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+
+
+def _nullable_boolean() -> dict[str, Any]:
+    return {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
 
 
 def _operation_id(route: APIRoute) -> str:
