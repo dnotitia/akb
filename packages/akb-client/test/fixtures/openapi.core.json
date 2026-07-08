@@ -95,6 +95,48 @@
         }
       }
     },
+    "/api/v1/files/{vault}/{file_id}/confirm": {
+      "post": {
+        "operationId": "filesPostFileIdConfirm",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/{file_id}/download": {
+      "get": {
+        "operationId": "filesGetFileIdDownload",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/{file_id}": {
+      "delete": {
+        "operationId": "filesDeleteFileId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/drill-down": {
       "get": {
         "operationId": "searchDrillDown",

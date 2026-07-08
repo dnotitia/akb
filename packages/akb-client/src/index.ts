@@ -304,6 +304,52 @@ export interface AkbDocumentUpdateInput {
   expectedContentHash?: string | null;
 }
 
+export interface AkbStorageVaultOptions {
+  vault?: string | null;
+}
+
+export interface AkbStoragePresignUploadOptions extends AkbStorageVaultOptions {
+  collection?: string | null;
+  description?: string | null;
+  mimeType?: string | null;
+}
+
+export interface AkbStorageUploadOptions extends AkbStoragePresignUploadOptions {
+  confirm?: boolean;
+  contentHash?: string | null;
+  hashAlgorithm?: string | null;
+  headers?: HeadersInit;
+}
+
+export interface AkbStorageConfirmOptions extends AkbStorageVaultOptions {
+  contentHash?: string | null;
+  hashAlgorithm?: string | null;
+}
+
+export interface AkbStorageListOptions extends AkbStorageVaultOptions {
+  collection?: string | null;
+  limit?: number;
+}
+
+export interface AkbStorageRefOptions extends AkbStorageVaultOptions {
+  lookupLimit?: number;
+}
+
+export interface AkbStorageDownloadUrlOptions extends AkbStorageRefOptions {
+  bytes?: false;
+}
+
+export interface AkbStorageDownloadBytesOptions extends AkbStorageRefOptions {
+  bytes: true;
+  fetchInit?: RequestInit;
+}
+
+export interface AkbStorageDownload {
+  kind: "file_download";
+  file: import("./core/schema.gen.js").AkbFileEnvelope;
+  bytes: ArrayBuffer;
+}
+
 export interface AkbSearchFacade extends AkbNamespaceStub {
   (
     query: string,
@@ -339,6 +385,37 @@ export interface AkbDocsFacade extends AkbNamespaceStub {
   browse(
     options?: AkbDocumentBrowseOptions,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
+}
+
+export interface AkbStorageFacade extends AkbNamespaceStub {
+  presignUpload(
+    path: string,
+    options?: AkbStoragePresignUploadOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  upload(
+    path: string,
+    file: BodyInit,
+    options?: AkbStorageUploadOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  confirm(
+    fileRef: string,
+    options?: AkbStorageConfirmOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  download(
+    fileRef: string,
+    options?: AkbStorageDownloadUrlOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  download(
+    fileRef: string,
+    options: AkbStorageDownloadBytesOptions,
+  ): Promise<AkbResult<AkbStorageDownload>>;
+  list(
+    options?: AkbStorageListOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  delete(
+    fileRef: string,
+    options?: AkbStorageRefOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
 }
 
 export interface AkbTableStub<
@@ -430,7 +507,7 @@ export interface AkbClient<Schema = unknown> {
   readonly search: AkbSearchFacade;
   readonly graph: AkbNamespaceStub;
   readonly docs: AkbDocsFacade;
-  readonly storage: AkbNamespaceStub;
+  readonly storage: AkbStorageFacade;
 }
 
 /**
@@ -613,7 +690,7 @@ function makeClient(
     search: makeSearchFacade(request, scope.defaultVault),
     graph: makeNamespaceStub("graph", "/graph", request),
     docs: makeDocsFacade(request, scope.defaultVault),
-    storage: makeNamespaceStub("storage", "/files", request),
+    storage: makeStorageFacade(request, scope.defaultVault, fetchImpl),
   };
   return Object.freeze(client) as unknown as AkbClient;
 }
@@ -746,6 +823,156 @@ function makeDocsFacade(
   return Object.freeze(facade);
 }
 
+function makeStorageFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+  fetchImpl: typeof fetch,
+): AkbStorageFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(path: string | URL = "", init: RequestInit = {}) => {
+    return request<T>(joinPath("/files", path), init);
+  };
+
+  const presignUpload = (
+    path: string,
+    options: AkbStoragePresignUploadOptions = {},
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>> => {
+    const vault = resolveStorageVault(options.vault ?? defaultVault);
+    const storagePath = splitStoragePath(path, options.collection);
+    const params = new URLSearchParams({ filename: storagePath.filename });
+    appendOptional(params, "collection", storagePath.collection);
+    appendOptional(params, "description", options.description);
+    appendOptional(params, "mime_type", options.mimeType ?? "application/octet-stream");
+    return request<import("./core/schema.gen.js").AkbFileEnvelope>(
+      `/files/${encodePathSegment(vault)}/upload?${params}`,
+      { method: "POST" },
+    );
+  };
+
+  const confirm = async (
+    fileRef: string,
+    options: AkbStorageConfirmOptions = {},
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>> => {
+    const vault = resolveStorageVault(options.vault ?? defaultVault);
+    const fileId = storageFileIdFromRef(fileRef);
+    if (!fileId) return fileRefNotFound(fileRef);
+    const params = new URLSearchParams();
+    appendOptional(params, "content_hash", options.contentHash);
+    appendOptional(params, "hash_algorithm", options.hashAlgorithm);
+    const query = params.size > 0 ? `?${params}` : "";
+    return request<import("./core/schema.gen.js").AkbFileEnvelope>(
+      `/files/${encodePathSegment(vault)}/${encodePathSegment(fileId)}/confirm${query}`,
+      { method: "POST" },
+    );
+  };
+
+  function download(
+    fileRef: string,
+    options?: AkbStorageDownloadUrlOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope>>;
+  function download(
+    fileRef: string,
+    options: AkbStorageDownloadBytesOptions,
+  ): Promise<AkbResult<AkbStorageDownload>>;
+  async function download(
+    fileRef: string,
+    options: AkbStorageDownloadUrlOptions | AkbStorageDownloadBytesOptions = {},
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>> {
+    const vault = resolveStorageVault(options.vault ?? defaultVault);
+    const resolved = await resolveStorageFileRef(request, vault, fileRef, options.lookupLimit);
+    if (resolved.error) return resolved.error;
+    const file = await request<import("./core/schema.gen.js").AkbFileEnvelope>(
+      `/files/${encodePathSegment(vault)}/${encodePathSegment(resolved.fileId)}/download`,
+    );
+    if (file.error || !options.bytes) return file;
+    if (!file.data) {
+      return errorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        "File metadata was not returned for the download.",
+        "missing_file_metadata",
+      );
+    }
+    const downloadUrl = file.data.download_url;
+    if (!downloadUrl) {
+      return errorResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        "Download URL was not returned for the file.",
+        "missing_download_url",
+      );
+    }
+    const response = await fetchImpl(downloadUrl, options.fetchInit);
+    if (!response.ok) {
+      return makeResult<import("./core/schema.gen.js").AkbFileEnvelope | AkbStorageDownload>(
+        null,
+        new AkbError(
+          { message: `Storage download failed: ${response.status} ${response.statusText}`, code: "storage_download_failed" },
+          response,
+        ),
+        response,
+      );
+    }
+    const bytes = await response.arrayBuffer();
+    return makeResult({ kind: "file_download", file: file.data, bytes }, null, response);
+  }
+
+  const facade = {
+    name: "storage",
+    request: rawRequest,
+    presignUpload,
+    async upload(path: string, file: BodyInit, options: AkbStorageUploadOptions = {}) {
+      const mimeType = storageMimeType(file, options.mimeType);
+      const presigned = await presignUpload(path, { ...options, mimeType });
+      if (presigned.error) return presigned;
+      const uploadUrl = presigned.data?.upload_url;
+      if (!uploadUrl) {
+        return errorResult("Upload URL was not returned for the file.", "missing_upload_url");
+      }
+      const response = await fetchImpl(uploadUrl, {
+        method: "PUT",
+        body: file,
+        headers: storageUploadHeaders(mimeType, options.headers),
+      });
+      if (!response.ok) {
+        return makeResult(
+          null,
+          new AkbError(
+            { message: `Storage upload failed: ${response.status} ${response.statusText}`, code: "storage_upload_failed" },
+            response,
+          ),
+          response,
+        );
+      }
+      if (options.confirm === false) return presigned;
+      const fileId = storageFileIdFromRef(presigned.data?.uri ?? presigned.data?.id ?? "");
+      if (!fileId) return errorResult("File id was not returned for the upload.", "missing_file_id");
+      return confirm(fileId, {
+        vault: options.vault,
+        contentHash: options.contentHash,
+        hashAlgorithm: options.hashAlgorithm,
+      });
+    },
+    confirm,
+    download,
+    list(options: AkbStorageListOptions = {}) {
+      const vault = resolveStorageVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams();
+      appendOptional(params, "collection", options.collection);
+      appendOptional(params, "limit", options.limit);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbFileEnvelope>(
+        `/files/${encodePathSegment(vault)}${query}`,
+      );
+    },
+    async delete(fileRef: string, options: AkbStorageRefOptions = {}) {
+      const vault = resolveStorageVault(options.vault ?? defaultVault);
+      const resolved = await resolveStorageFileRef(request, vault, fileRef, options.lookupLimit);
+      if (resolved.error) return resolved.error;
+      return request<import("./core/schema.gen.js").AkbFileEnvelope>(
+        `/files/${encodePathSegment(vault)}/${encodePathSegment(resolved.fileId)}`,
+        { method: "DELETE" },
+      );
+    },
+  } as AkbStorageFacade;
+  return Object.freeze(facade);
+}
+
 function makeSearchFacade(
   request: AkbClient["request"],
   defaultVault: string | null,
@@ -829,6 +1056,11 @@ function resolveDocumentVault(vault: string | null | undefined): string {
   throw new TypeError("Select a vault before using documents: client.vault(\"...\").docs.");
 }
 
+function resolveStorageVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError("Select a vault before using storage: client.vault(\"...\").storage.");
+}
+
 function encodePathSegment(value: string): string {
   return encodeURIComponent(value);
 }
@@ -881,6 +1113,102 @@ function documentUpdatePayload(input: AkbDocumentUpdateInput): Record<string, un
 
 function omitUndefined(values: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
+}
+
+function splitStoragePath(
+  path: string,
+  collectionOverride: string | null | undefined,
+): { collection: string; filename: string } {
+  const cleaned = path.replace(/^\/+|\/+$/g, "");
+  if (!cleaned) throw new TypeError("Storage path must be a non-empty string.");
+  const parts = cleaned.split("/").filter(Boolean);
+  const filename = parts.pop();
+  if (!filename) throw new TypeError("Storage path must include a filename.");
+  const collection = collectionOverride === undefined ? parts.join("/") : (collectionOverride ?? "");
+  return { collection, filename };
+}
+
+function storageMimeType(file: BodyInit, explicit: string | null | undefined): string {
+  if (explicit) return explicit;
+  if (typeof Blob !== "undefined" && file instanceof Blob && file.type) return file.type;
+  return "application/octet-stream";
+}
+
+function storageUploadHeaders(mimeType: string, headers: HeadersInit | undefined): Headers {
+  const out = new Headers(headers);
+  if (!out.has("content-type")) out.set("content-type", mimeType);
+  return out;
+}
+
+function storageFileIdFromRef(ref: string | null | undefined): string | null {
+  if (!ref) return null;
+  const fileUriMatch = ref.match(/^akb:\/\/[^/]+\/(?:coll\/.+\/)?file\/([^/?#]+)$/iu);
+  const uriFileId = fileUriMatch?.[1] ? decodeURIComponent(fileUriMatch[1]) : null;
+  if (uriFileId && isUuid(uriFileId)) return uriFileId;
+  return isUuid(ref) ? ref : null;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value);
+}
+
+async function resolveStorageFileRef(
+  request: AkbClient["request"],
+  vault: string,
+  fileRef: string,
+  lookupLimit: number | undefined,
+): Promise<{ fileId: string; error: null } | { fileId: null; error: AkbResult<import("./core/schema.gen.js").AkbFileEnvelope> }> {
+  const direct = storageFileIdFromRef(fileRef);
+  if (direct) return { fileId: direct, error: null };
+
+  const storagePath = splitStoragePath(fileRef, undefined);
+  const params = new URLSearchParams();
+  appendOptional(params, "collection", storagePath.collection);
+  appendOptional(params, "limit", lookupLimit ?? 200);
+  const listed = await request<import("./core/schema.gen.js").AkbFileEnvelope>(
+    `/files/${encodePathSegment(vault)}?${params}`,
+  );
+  if (listed.error) return { fileId: null, error: listed };
+
+  const matches = (listed.data?.items ?? []).filter((candidate) => {
+    return stringField(candidate, "name") === storagePath.filename
+      || stringField(candidate, "path") === fileRef
+      || stringField(candidate, "uri") === fileRef;
+  });
+  if (matches.length > 1) {
+    return {
+      fileId: null,
+      error: errorResult(
+        `File reference is ambiguous: ${fileRef}`,
+        "ambiguous_file_ref",
+        { ref: fileRef, matches: matches.map((item) => stringField(item, "uri") ?? stringField(item, "id")) },
+      ),
+    };
+  }
+  const item = matches[0];
+  const fileId = storageFileIdFromRef(stringField(item, "uri")) ?? stringField(item, "id");
+  if (!fileId) {
+    return { fileId: null, error: fileRefNotFound(fileRef) };
+  }
+  return { fileId, error: null };
+}
+
+function stringField(value: unknown, key: string): string | null {
+  if (!value || typeof value !== "object") return null;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "string" && field.length > 0 ? field : null;
+}
+
+function fileRefNotFound(ref: string): AkbResult<import("./core/schema.gen.js").AkbFileEnvelope> {
+  return errorResult(`File reference could not be resolved: ${ref}`, "file_not_found", { ref });
+}
+
+function errorResult<T>(
+  message: string,
+  code: string,
+  details?: unknown,
+): AkbResult<T> {
+  return makeResult<T>(null, new AkbError({ message, code, details }), null);
 }
 
 function joinPath(prefix: string, path: string | URL): string {

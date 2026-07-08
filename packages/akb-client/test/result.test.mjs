@@ -304,6 +304,190 @@ test("docs facade scopes document operations and maps typed payloads", async () 
   assert.equal(deleteResult.throwOnError().data.deleted, true);
 });
 
+test("storage facade performs presigned upload, download, list, and delete flows", async () => {
+  const fileId = "11111111-1111-4111-8111-111111111111";
+  const fileUri = `akb://reef/coll/media/file/${fileId}`;
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      seen.push({
+        url: String(input),
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+
+      if (url.origin === "https://storage.example.com" && url.pathname === "/upload") {
+        return new Response(null, { status: 200 });
+      }
+      if (url.origin === "https://storage.example.com" && url.pathname === "/download") {
+        return new Response("hello", { status: 200 });
+      }
+      if (url.pathname.endsWith("/files/reef/upload")) {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            uri: fileUri,
+            vault: "reef",
+            collection: "media",
+            upload_url: "https://storage.example.com/upload",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/confirm`)) {
+        return new Response(
+          JSON.stringify({ kind: "file", uri: fileUri, vault: "reef", name: "logo.txt", size_bytes: 5 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname === "/api/v1/files/reef" && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [{ kind: "file", uri: fileUri, collection: "media", name: "logo.txt" }],
+            total: 1,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/download`)) {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            uri: fileUri,
+            name: "logo.txt",
+            download_url: "https://storage.example.com/download",
+            size_bytes: 5,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}`) && method === "DELETE") {
+        return new Response(JSON.stringify({ kind: "file", uri: fileUri, deleted: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${method} ${url.href}`);
+    },
+  }).vault("reef");
+
+  const uploadResult = await client.storage.upload("media/logo.txt", new Blob(["hello"], { type: "text/plain" }), {
+    description: "Logo",
+    contentHash: "hash1234",
+    hashAlgorithm: "sha256",
+  });
+  const downloadUrlResult = await client.storage.download("media/logo.txt");
+  const downloadBytesResult = await client.storage.download("media/logo.txt", { bytes: true });
+  const listResult = await client.storage.list({ collection: "media", limit: 10 });
+  const deleteResult = await client.storage.delete("media/logo.txt");
+
+  const presignCall = seen.find((call) => new URL(call.url).pathname.endsWith("/files/reef/upload"));
+  const presignUrl = new URL(presignCall.url);
+  assert.equal(presignCall.method, "POST");
+  assert.equal(presignUrl.searchParams.get("filename"), "logo.txt");
+  assert.equal(presignUrl.searchParams.get("collection"), "media");
+  assert.equal(presignUrl.searchParams.get("description"), "Logo");
+  assert.equal(presignUrl.searchParams.get("mime_type"), "text/plain");
+
+  const uploadCall = seen.find((call) => call.url === "https://storage.example.com/upload");
+  assert.equal(uploadCall.method, "PUT");
+  assert.equal(uploadCall.headers["content-type"], "text/plain");
+  assert.equal(uploadCall.headers.authorization, undefined);
+
+  const confirmUrl = new URL(seen.find((call) => new URL(call.url).pathname.endsWith(`/${fileId}/confirm`)).url);
+  assert.equal(confirmUrl.searchParams.get("content_hash"), "hash1234");
+  assert.equal(confirmUrl.searchParams.get("hash_algorithm"), "sha256");
+  assert.equal(uploadResult.throwOnError().data.kind, "file");
+
+  const listCalls = seen.filter((call) => new URL(call.url).pathname === "/api/v1/files/reef");
+  assert.ok(listCalls.length >= 3);
+  assert.equal(new URL(listCalls[0].url).searchParams.get("collection"), "media");
+  assert.equal(new URL(listCalls[0].url).searchParams.get("limit"), "200");
+
+  assert.equal(downloadUrlResult.throwOnError().data.download_url, "https://storage.example.com/download");
+  assert.equal(downloadBytesResult.throwOnError().data.bytes.byteLength, 5);
+  assert.equal(new URL(listCalls.at(-1).url).searchParams.get("limit"), "200");
+  assert.equal(listResult.throwOnError().data.total, 1);
+  assert.equal(deleteResult.throwOnError().data.deleted, true);
+});
+
+test("storage facade resolves paths with a file collection segment through list lookup", async () => {
+  const fileId = "22222222-2222-4222-8222-222222222222";
+  const fileUri = `akb://reef/coll/media/file/file/${fileId}`;
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      seen.push({ url: String(input), method: init?.method ?? "GET" });
+      if (url.pathname === "/api/v1/files/reef") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [{ kind: "file", uri: fileUri, collection: "media/file", name: "logo.txt" }],
+            total: 1,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/download`)) {
+        return new Response(
+          JSON.stringify({ kind: "file", uri: fileUri, download_url: "https://storage.example.com/download" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url.href}`);
+    },
+  }).vault("reef");
+
+  const result = await client.storage.download("media/file/logo.txt");
+
+  const listUrl = new URL(seen[0].url);
+  assert.equal(listUrl.pathname, "/api/v1/files/reef");
+  assert.equal(listUrl.searchParams.get("collection"), "media/file");
+  assert.equal(new URL(seen[1].url).pathname, `/api/v1/files/reef/${fileId}/download`);
+  assert.equal(result.throwOnError().data.download_url, "https://storage.example.com/download");
+});
+
+test("storage facade rejects ambiguous path lookups instead of picking the first file", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      seen.push({ url: String(input), method: init?.method ?? "GET" });
+      if (url.pathname === "/api/v1/files/reef") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [
+              { kind: "file", uri: "akb://reef/coll/media/file/33333333-3333-4333-8333-333333333333", collection: "media", name: "logo.txt" },
+              { kind: "file", uri: "akb://reef/coll/media/file/44444444-4444-4444-8444-444444444444", collection: "media", name: "logo.txt" },
+            ],
+            total: 2,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url.href}`);
+    },
+  }).vault("reef");
+
+  const result = await client.storage.delete("media/logo.txt");
+
+  assert.equal(result.data, null);
+  assert.equal(result.error?.code, "ambiguous_file_ref");
+  assert.equal(seen.length, 1);
+  assert.equal(new URL(seen[0].url).searchParams.get("collection"), "media");
+});
+
 test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
   const client = createClient("https://akb.test/api/v1", { apiKey: fixtureApiKey });
 

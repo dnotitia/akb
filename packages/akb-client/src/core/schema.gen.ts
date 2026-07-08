@@ -257,6 +257,15 @@ export interface paths {
   "/api/v1/files/{vault}/upload": {
     post: AkbOperation<"post", "/api/v1/files/{vault}/upload", { path: { vault: string } }, unknown, AkbFileEnvelope>;
   };
+  "/api/v1/files/{vault}/{file_id}": {
+    delete: AkbOperation<"delete", "/api/v1/files/{vault}/{file_id}", { path: { vault: string; file_id: string } }, never, AkbFileEnvelope>;
+  };
+  "/api/v1/files/{vault}/{file_id}/confirm": {
+    post: AkbOperation<"post", "/api/v1/files/{vault}/{file_id}/confirm", { path: { vault: string; file_id: string } }, unknown, AkbFileEnvelope>;
+  };
+  "/api/v1/files/{vault}/{file_id}/download": {
+    get: AkbOperation<"get", "/api/v1/files/{vault}/{file_id}/download", { path: { vault: string; file_id: string } }, never, AkbFileEnvelope>;
+  };
   "/api/v1/grep": {
     get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
   };
@@ -303,6 +312,9 @@ export interface operations {
   searchDrillDown: paths["/api/v1/drill-down"]["get"];
   filesGetVault: paths["/api/v1/files/{vault}"]["get"];
   filesPostUpload: paths["/api/v1/files/{vault}/upload"]["post"];
+  filesDeleteFileId: paths["/api/v1/files/{vault}/{file_id}"]["delete"];
+  filesPostFileIdConfirm: paths["/api/v1/files/{vault}/{file_id}/confirm"]["post"];
+  filesGetFileIdDownload: paths["/api/v1/files/{vault}/{file_id}/download"]["get"];
   searchGrepDocuments: paths["/api/v1/grep"]["get"];
   searchSearchDocuments: paths["/api/v1/search"]["get"];
   tablesGetVault: paths["/api/v1/tables/{vault}"]["get"];

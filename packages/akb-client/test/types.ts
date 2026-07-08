@@ -9,6 +9,7 @@ import {
   type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
   type AkbOperationResponse,
+  type AkbStorageUploadOptions,
   type operations,
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
@@ -111,6 +112,29 @@ deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
 docs.put({ title: "Missing collection", content: "# Missing collection" });
 // @ts-expect-error document status is constrained to AKB document lifecycle values.
 docs.put({ collection: "guides", title: "Bad status", content: "# Bad status", status: "done" });
+const storage = typedClient.vault("eng").storage;
+const storageUploadOptions: AkbStorageUploadOptions = {
+  description: "Logo",
+  contentHash: "hash1234",
+  hashAlgorithm: "sha256",
+};
+const uploadedFile = await storage.upload("media/logo.txt", new Blob(["hello"], { type: "text/plain" }), storageUploadOptions);
+uploadedFile.throwOnError().data.kind satisfies "file";
+const presignedFile = await storage.presignUpload("media/logo.txt", { mimeType: "text/plain" });
+presignedFile.throwOnError().data.upload_url satisfies string | undefined;
+const confirmedFile = await storage.confirm("11111111-1111-4111-8111-111111111111", { contentHash: "hash1234" });
+confirmedFile.throwOnError().data.size_bytes satisfies number | undefined;
+const downloadFile = await storage.download("media/logo.txt");
+downloadFile.throwOnError().data.download_url satisfies string | undefined;
+const downloadedBytes = await storage.download("media/logo.txt", { bytes: true });
+downloadedBytes.throwOnError().data.kind satisfies "file_download";
+downloadedBytes.throwOnError().data.bytes.byteLength satisfies number;
+const listedFiles = await storage.list({ collection: "media", limit: 20 });
+listedFiles.throwOnError().data.items?.at(0)?.name satisfies import("../src/index.js").AkbJsonValue | undefined;
+const deletedFile = await storage.delete("media/logo.txt");
+deletedFile.throwOnError().data.deleted satisfies boolean | undefined;
+// @ts-expect-error upload body is required.
+storage.upload("media/logo.txt");
 // @ts-expect-error raw SQL is only exposed as a tagged template.
 typedClient.vault("eng").sql("SELECT title FROM tasks");
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
