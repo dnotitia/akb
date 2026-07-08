@@ -101,6 +101,127 @@ export interface AkbFileEnvelope {
   [key: string]: unknown;
 }
 
+export interface AkbDocumentEnvelope {
+  kind: "document";
+  uri?: string;
+  vault?: string;
+  path?: string;
+  title?: string;
+  type?: string;
+  status?: string;
+  summary?: string | null;
+  domain?: string | null;
+  created_by?: string | null;
+  created_by_name?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  current_commit?: string | null;
+  content_hash?: string | null;
+  hash_algorithm?: string | null;
+  tags?: string[];
+  content?: string | null;
+  is_public?: boolean;
+  public_slug?: string | null;
+  metadata_is_current?: boolean;
+  items?: AkbJsonObjectArray;
+  hint?: string | null;
+  deleted?: boolean;
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentWriteEnvelope {
+  kind: "document_write";
+  uri: string;
+  vault: string;
+  path: string;
+  commit_hash: string;
+  chunks_indexed: number;
+  entities_found: number;
+  current_commit?: string | null;
+  previous_commit?: string | null;
+  content_hash?: string | null;
+  previous_content_hash?: string | null;
+  hash_algorithm?: string | null;
+  action?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbSearchResult {
+  source_type: string;
+  uri: string;
+  vault: string;
+  path: string;
+  title: string;
+  collection?: string | null;
+  doc_type?: string | null;
+  summary?: string | null;
+  tags: string[];
+  score: number;
+  matched_section?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbSearchEnvelope {
+  kind: "search";
+  query: string;
+  total: number;
+  returned: number;
+  total_matches: number;
+  results: AkbSearchResult[];
+  truncated?: boolean;
+  hint?: string | null;
+  degraded?: boolean;
+  degradation_reason?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbDrillDownSection {
+  chunk_index: number;
+  section_path?: string | null;
+  content?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbDrillDownEnvelope {
+  kind: "drill_down";
+  uri: string;
+  sections: AkbDrillDownSection[];
+  [key: string]: unknown;
+}
+
+export interface AkbGrepMatch {
+  text: string;
+  section?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbGrepResult {
+  uri: string;
+  vault: string;
+  path: string;
+  title: string;
+  matches?: AkbGrepMatch[];
+  [key: string]: unknown;
+}
+
+export interface AkbGrepEnvelope {
+  kind: "grep";
+  pattern: string;
+  regex: boolean;
+  error?: string | null;
+  returned_docs?: number | null;
+  returned_matches?: number | null;
+  total_docs?: number | null;
+  total_matches?: number | null;
+  truncated?: boolean | null;
+  hint?: string | null;
+  results?: AkbGrepResult[] | null;
+  by_doc?: Record<string, number> | null;
+  n_files?: number | null;
+  files?: string[] | null;
+  [key: string]: unknown;
+}
+
 export type AkbSuccessEnvelope =
   | AkbTableEnvelope
   | AkbTableMigrationEnvelope
@@ -108,14 +229,39 @@ export type AkbSuccessEnvelope =
   | AkbVaultTableSchemaEnvelope
   | AkbTableQueryEnvelope
   | AkbTableSqlEnvelope
-  | AkbFileEnvelope;
+  | AkbFileEnvelope
+  | AkbDocumentEnvelope
+  | AkbDocumentWriteEnvelope
+  | AkbSearchEnvelope
+  | AkbDrillDownEnvelope
+  | AkbGrepEnvelope;
 
 export interface paths {
+  "/api/v1/browse/{vault}": {
+    get: AkbOperation<"get", "/api/v1/browse/{vault}", { path: { vault: string } }, never, AkbDocumentEnvelope>;
+  };
+  "/api/v1/documents": {
+    post: AkbOperation<"post", "/api/v1/documents", never, unknown, AkbDocumentWriteEnvelope>;
+  };
+  "/api/v1/documents/{vault}/{doc_id}": {
+    delete: AkbOperation<"delete", "/api/v1/documents/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentEnvelope>;
+    get: AkbOperation<"get", "/api/v1/documents/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentEnvelope>;
+    patch: AkbOperation<"patch", "/api/v1/documents/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, unknown, AkbDocumentWriteEnvelope>;
+  };
+  "/api/v1/drill-down": {
+    get: AkbOperation<"get", "/api/v1/drill-down", never, never, AkbDrillDownEnvelope>;
+  };
   "/api/v1/files/{vault}": {
     get: AkbOperation<"get", "/api/v1/files/{vault}", { path: { vault: string } }, never, AkbFileEnvelope>;
   };
   "/api/v1/files/{vault}/upload": {
     post: AkbOperation<"post", "/api/v1/files/{vault}/upload", { path: { vault: string } }, unknown, AkbFileEnvelope>;
+  };
+  "/api/v1/grep": {
+    get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
+  };
+  "/api/v1/search": {
+    get: AkbOperation<"get", "/api/v1/search", never, never, AkbSearchEnvelope>;
   };
   "/api/v1/tables/{vault}": {
     get: AkbOperation<"get", "/api/v1/tables/{vault}", { path: { vault: string } }, never, AkbTableEnvelope>;
@@ -149,8 +295,16 @@ export interface paths {
 }
 
 export interface operations {
+  documentsBrowseVault: paths["/api/v1/browse/{vault}"]["get"];
+  documentsPutDocument: paths["/api/v1/documents"]["post"];
+  documentsDeleteDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["delete"];
+  documentsGetDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["get"];
+  documentsUpdateDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["patch"];
+  searchDrillDown: paths["/api/v1/drill-down"]["get"];
   filesGetVault: paths["/api/v1/files/{vault}"]["get"];
   filesPostUpload: paths["/api/v1/files/{vault}/upload"]["post"];
+  searchGrepDocuments: paths["/api/v1/grep"]["get"];
+  searchSearchDocuments: paths["/api/v1/search"]["get"];
   tablesGetVault: paths["/api/v1/tables/{vault}"]["get"];
   tablesPostVault: paths["/api/v1/tables/{vault}"]["post"];
   tablesApplyMigration: paths["/api/v1/tables/{vault}/migrations"]["post"];
@@ -177,5 +331,10 @@ export interface components {
     AkbTableSqlEnvelope: AkbTableSqlEnvelope;
     AkbSqlEnvelope: AkbSqlEnvelope;
     AkbFileEnvelope: AkbFileEnvelope;
+    AkbDocumentEnvelope: AkbDocumentEnvelope;
+    AkbDocumentWriteEnvelope: AkbDocumentWriteEnvelope;
+    AkbSearchEnvelope: AkbSearchEnvelope;
+    AkbDrillDownEnvelope: AkbDrillDownEnvelope;
+    AkbGrepEnvelope: AkbGrepEnvelope;
   };
 }

@@ -105,6 +105,73 @@ test("createClient supports vault scoping, actingAs claims, and namespace stubs"
   assert.equal(result.error, null);
 });
 
+test("search facade scopes search, drill-down, grep, and forwards actingAs claims", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      seen.push({
+        url: String(input),
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/drill-down")) {
+        return new Response(
+          JSON.stringify({ kind: "drill_down", uri: url.searchParams.get("uri"), sections: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith("/grep")) {
+        return new Response(
+          JSON.stringify({ kind: "grep", pattern: url.searchParams.get("q"), regex: true, files: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ kind: "search", query: url.searchParams.get("q"), total: 0, returned: 0, total_matches: 0, results: [] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  }).vault("reef").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const searchResult = await client.search("typed search", {
+    rerank: false,
+    tags: ["sdk", "search"],
+    limit: 5,
+    sourceUris: ["akb://reef/doc/readme.md"],
+  });
+  const drillResult = await client.search.drillDown("akb://reef/doc/readme.md", { section: "Intro" });
+  const grepResult = await client.search.grep("needle", { regex: true, filesWithMatches: true });
+
+  const searchUrl = new URL(seen[0].url);
+  assert.equal(searchUrl.pathname, "/api/v1/search");
+  assert.equal(searchUrl.searchParams.get("q"), "typed search");
+  assert.deepEqual(searchUrl.searchParams.getAll("vault"), ["reef"]);
+  assert.equal(searchUrl.searchParams.get("rerank"), "false");
+  assert.deepEqual(searchUrl.searchParams.getAll("tags"), ["sdk", "search"]);
+  assert.equal(searchUrl.searchParams.get("limit"), "5");
+  assert.deepEqual(searchUrl.searchParams.getAll("source_uris"), ["akb://reef/doc/readme.md"]);
+  assert.deepEqual(JSON.parse(seen[0].headers["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.equal(searchResult.throwOnError().data.kind, "search");
+
+  const drillUrl = new URL(seen[1].url);
+  assert.equal(drillUrl.pathname, "/api/v1/drill-down");
+  assert.equal(drillUrl.searchParams.get("uri"), "akb://reef/doc/readme.md");
+  assert.equal(drillUrl.searchParams.get("section"), "Intro");
+  assert.equal(drillResult.throwOnError().data.kind, "drill_down");
+
+  const grepUrl = new URL(seen[2].url);
+  assert.equal(grepUrl.pathname, "/api/v1/grep");
+  assert.deepEqual(grepUrl.searchParams.getAll("vault"), ["reef"]);
+  assert.equal(grepUrl.searchParams.get("q"), "needle");
+  assert.equal(grepUrl.searchParams.get("regex"), "true");
+  assert.equal(grepUrl.searchParams.get("files_with_matches"), "true");
+  assert.equal(grepResult.throwOnError().data.kind, "grep");
+});
+
 test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
   const client = createClient("https://akb.test/api/v1", { apiKey: fixtureApiKey });
 

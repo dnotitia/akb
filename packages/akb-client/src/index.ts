@@ -13,7 +13,12 @@ export type {
   AkbTypedFetchInit,
 } from "./core/fetch.js";
 export type {
+  AkbDocumentEnvelope,
+  AkbDocumentWriteEnvelope,
   AkbFileEnvelope,
+  AkbDrillDownEnvelope,
+  AkbGrepEnvelope,
+  AkbSearchEnvelope,
   AkbSqlEnvelope,
   AkbTableEnvelope,
   AkbTableMigrationEnvelope,
@@ -227,6 +232,47 @@ export interface AkbNamespaceStub {
   request<T = AkbSuccessEnvelope>(path?: string | URL, init?: RequestInit): Promise<AkbResult<T>>;
 }
 
+export interface AkbSearchOptions {
+  mode?: "hybrid";
+  rerank?: boolean;
+  vault?: string | readonly string[];
+  collection?: string | null;
+  type?: string | null;
+  tags?: readonly string[] | null;
+  limit?: number;
+  includeArchived?: boolean;
+  sourceUris?: readonly string[] | null;
+}
+
+export interface AkbDrillDownOptions {
+  section?: string | null;
+}
+
+export interface AkbGrepOptions {
+  vault?: string | readonly string[];
+  collection?: string | null;
+  regex?: boolean;
+  caseSensitive?: boolean;
+  limit?: number;
+  countOnly?: boolean;
+  filesWithMatches?: boolean;
+}
+
+export interface AkbSearchFacade extends AkbNamespaceStub {
+  (
+    query: string,
+    options?: AkbSearchOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbSearchEnvelope>>;
+  drillDown(
+    uri: string,
+    options?: AkbDrillDownOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDrillDownEnvelope>>;
+  grep(
+    pattern: string,
+    options?: AkbGrepOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGrepEnvelope>>;
+}
+
 export interface AkbTableStub<
   Row = unknown,
   Result = import("./core/schema.gen.js").AkbTableQueryEnvelope<Row>,
@@ -313,7 +359,7 @@ export interface AkbClient<Schema = unknown> {
     AkbTableInsert<Schema, TableName>,
     AkbTableUpdate<Schema, TableName>
   >;
-  readonly search: AkbNamespaceStub;
+  readonly search: AkbSearchFacade;
   readonly graph: AkbNamespaceStub;
   readonly docs: AkbNamespaceStub;
   readonly storage: AkbNamespaceStub;
@@ -496,7 +542,7 @@ function makeClient(
         maxUrlBytes: config.maxUrlBytes ?? 8192,
       });
     },
-    search: makeNamespaceStub("search", "/search", request),
+    search: makeSearchFacade(request, scope.defaultVault),
     graph: makeNamespaceStub("graph", "/graph", request),
     docs: makeNamespaceStub("docs", "/documents", request),
     storage: makeNamespaceStub("storage", "/files", request),
@@ -571,6 +617,84 @@ function makeNamespaceStub(
       return request(joinPath(prefix, path), init);
     },
   }) as AkbNamespaceStub;
+}
+
+function makeSearchFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbSearchFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(path: string | URL = "", init: RequestInit = {}) => {
+    return request(joinPath("/search", path), init);
+  };
+  const facade = (async function search(query: string, options: AkbSearchOptions = {}) {
+    const params = new URLSearchParams({ q: query });
+    appendSearchScope(params, options.vault ?? defaultVault);
+    appendOptional(params, "mode", options.mode);
+    appendOptional(params, "rerank", options.rerank);
+    appendOptional(params, "collection", options.collection);
+    appendOptional(params, "type", options.type);
+    appendRepeated(params, "tags", options.tags);
+    appendOptional(params, "limit", options.limit);
+    appendOptional(params, "include_archived", options.includeArchived);
+    appendRepeated(params, "source_uris", options.sourceUris);
+    return request(`/search?${params}`);
+  }) as AkbSearchFacade;
+
+  Object.defineProperties(facade, {
+    request: {
+      value: rawRequest,
+      enumerable: true,
+    },
+    drillDown: {
+      value(uri: string, options: AkbDrillDownOptions = {}) {
+        const params = new URLSearchParams({ uri });
+        appendOptional(params, "section", options.section);
+        return request(`/drill-down?${params}`);
+      },
+      enumerable: true,
+    },
+    grep: {
+      value(pattern: string, options: AkbGrepOptions = {}) {
+        const params = new URLSearchParams({ q: pattern });
+        appendSearchScope(params, options.vault ?? defaultVault);
+        appendOptional(params, "collection", options.collection);
+        appendOptional(params, "regex", options.regex);
+        appendOptional(params, "case_sensitive", options.caseSensitive);
+        appendOptional(params, "limit", options.limit);
+        appendOptional(params, "count_only", options.countOnly);
+        appendOptional(params, "files_with_matches", options.filesWithMatches);
+        return request(`/grep?${params}`);
+      },
+      enumerable: true,
+    },
+  });
+  return Object.freeze(facade);
+}
+
+function appendSearchScope(
+  params: URLSearchParams,
+  vault: string | readonly string[] | null | undefined,
+): void {
+  appendRepeated(params, "vault", typeof vault === "string" ? [vault] : vault);
+}
+
+function appendRepeated(
+  params: URLSearchParams,
+  key: string,
+  values: readonly string[] | null | undefined,
+): void {
+  for (const value of values ?? []) {
+    if (value) params.append(key, value);
+  }
+}
+
+function appendOptional(
+  params: URLSearchParams,
+  key: string,
+  value: string | number | boolean | null | undefined,
+): void {
+  if (value === null || value === undefined) return;
+  params.set(key, String(value));
 }
 
 function joinPath(prefix: string, path: string | URL): string {

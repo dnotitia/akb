@@ -5,6 +5,8 @@ import {
   type AkbResult,
   type AkbSuccessEnvelope,
   type AkbClient,
+  type AkbDocumentEnvelope,
+  type AkbDocumentWriteEnvelope,
   type AkbOperationResponse,
   type operations,
 } from "../src/index.js";
@@ -38,6 +40,18 @@ const requestResult = await client.request<TableQueryEnvelope>("/tables/reef/sql
   body: JSON.stringify({ sql: "SELECT id FROM incidents" }),
 });
 requestResult.throwOnError().data.kind satisfies "table_query";
+const docEnvelope: AkbDocumentEnvelope = { kind: "document", uri: "akb://eng/doc/readme.md" };
+const docWriteEnvelope: AkbDocumentWriteEnvelope = {
+  kind: "document_write",
+  uri: "akb://eng/doc/readme.md",
+  vault: "eng",
+  path: "readme.md",
+  commit_hash: "abc1234",
+  chunks_indexed: 1,
+  entities_found: 0,
+};
+docEnvelope.kind satisfies "document";
+docWriteEnvelope.kind satisfies "document_write";
 await client.vault("eng").from("tasks").select("id");
 
 const typedClient = createClient<AkbSchema>({ baseUrl: "https://akb.test/api/v1" });
@@ -50,6 +64,24 @@ const rawSqlData = rawSqlResult.throwOnError().data;
 if (rawSqlData.kind === "table_query") {
   rawSqlData.items.at(0)?.title satisfies string | undefined;
 }
+const searchResult = await typedClient.vault("eng").search("postgres", {
+  rerank: false,
+  tags: ["sdk"],
+  limit: 3,
+});
+searchResult.throwOnError().data.kind satisfies "search";
+searchResult.throwOnError().data.results.at(0)?.uri satisfies string | undefined;
+const drillDownResult = await typedClient.vault("eng").search.drillDown("akb://eng/doc/readme.md", {
+  section: "Intro",
+});
+drillDownResult.throwOnError().data.kind satisfies "drill_down";
+drillDownResult.throwOnError().data.sections.at(0)?.content satisfies string | null | undefined;
+const grepResult = await typedClient.vault("eng").search.grep("needle", {
+  regex: true,
+  filesWithMatches: true,
+});
+grepResult.throwOnError().data.kind satisfies "grep";
+grepResult.throwOnError().data.files?.at(0) satisfies string | undefined;
 // @ts-expect-error raw SQL is only exposed as a tagged template.
 typedClient.vault("eng").sql("SELECT title FROM tasks");
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
@@ -130,6 +162,17 @@ const vaultSchema: VaultSchemaResponse = {
   total: 0,
 };
 vaultSchema.kind satisfies "vault_table_schema";
+
+type SearchResponse = AkbOperationResponse<operations["searchSearchDocuments"]>;
+const searchEnvelope: SearchResponse = {
+  kind: "search",
+  query: "postgres",
+  total: 1,
+  returned: 1,
+  total_matches: 1,
+  results: [{ source_type: "document", uri: "akb://eng/doc/readme.md", vault: "eng", path: "readme.md", title: "Readme", tags: [], score: 1 }],
+};
+searchEnvelope.kind satisfies "search";
 
 type InsertRowsResponse = AkbOperationResponse<operations["tablesInsertRows"]>;
 const insertRowsNoContent: InsertRowsResponse = null;
