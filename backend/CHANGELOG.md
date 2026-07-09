@@ -5,6 +5,19 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
+
+`GET /health` no longer holds the chunks stats pool connection while awaiting
+`delete_worker.delete_outbox_stats()`. Under concurrent dashboard/probe bursts,
+the old shape let every request hold one connection and then wait for a second
+one, exhausting the asyncpg pool even though Postgres only showed idle sessions.
+Once the pool was full, `/readyz` timed out on its DB ping, the backend was
+removed from the Service, and the AKB MCP ingress returned nginx 503s to Naut.
+
+`embed_worker.pending_stats()` now reads chunks stats, exits that acquire scope,
+then reads delete-outbox stats. A unit regression asserts the delete stats call is
+made only after the chunks connection has been released.
+
 ## 0.9.5 — 2026-07-03  *(feat — write-lane admission: coroutine queueing + 429 backpressure for git writes)*
 
 Every git-committing document write now passes a two-stage admission gate

@@ -305,33 +305,31 @@ async def pending_stats(vault_id=None) -> dict:
                 """,
                 MAX_RETRIES,
             )
-            return {
-                "upsert": {
-                    "pending":   int(chunk_row["pending"]),
-                    "retrying":  int(chunk_row["retrying"]),
-                    "abandoned": int(chunk_row["abandoned"]),
-                    "indexed":   int(chunk_row["indexed"]),
-                },
-                "delete": await delete_worker.delete_outbox_stats(),
-            }
-        chunk_row = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE vector_indexed_at IS NULL)                                          AS pending,
-                COUNT(*) FILTER (WHERE vector_indexed_at IS NULL
-                                 AND vector_retry_count > 0 AND vector_retry_count < $1)                    AS retrying,
-                COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_retry_count >= $1)             AS abandoned,
-                COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
-              FROM chunks
-             WHERE vault_id = $2
-            """,
-            MAX_RETRIES, vault_id,
-        )
-        return {
-            "upsert": {
-                "pending":   int(chunk_row["pending"]),
-                "retrying":  int(chunk_row["retrying"]),
-                "abandoned": int(chunk_row["abandoned"]),
-                "indexed":   int(chunk_row["indexed"]),
-            },
-        }
+        else:
+            chunk_row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL)                                          AS pending,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL
+                                     AND vector_retry_count > 0 AND vector_retry_count < $1)                    AS retrying,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_retry_count >= $1)             AS abandoned,
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
+                  FROM chunks
+                 WHERE vault_id = $2
+                """,
+                MAX_RETRIES, vault_id,
+            )
+
+    stats = {
+        "upsert": {
+            "pending":   int(chunk_row["pending"]),
+            "retrying":  int(chunk_row["retrying"]),
+            "abandoned": int(chunk_row["abandoned"]),
+            "indexed":   int(chunk_row["indexed"]),
+        },
+    }
+    if vault_id is None:
+        # Do this after releasing the chunks stats connection. Holding one pool
+        # slot while awaiting another can deadlock /health under concurrent probes.
+        stats["delete"] = await delete_worker.delete_outbox_stats()
+    return stats
