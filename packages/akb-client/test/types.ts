@@ -5,7 +5,11 @@ import {
   type AkbResult,
   type AkbSuccessEnvelope,
   type AkbClient,
+  type AkbDocumentEnvelope,
+  type AkbDocumentPutInput,
+  type AkbDocumentWriteEnvelope,
   type AkbOperationResponse,
+  type AkbStorageUploadOptions,
   type operations,
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
@@ -38,6 +42,18 @@ const requestResult = await client.request<TableQueryEnvelope>("/tables/reef/sql
   body: JSON.stringify({ sql: "SELECT id FROM incidents" }),
 });
 requestResult.throwOnError().data.kind satisfies "table_query";
+const docEnvelope: AkbDocumentEnvelope = { kind: "document", uri: "akb://eng/doc/readme.md" };
+const docWriteEnvelope: AkbDocumentWriteEnvelope = {
+  kind: "document_write",
+  uri: "akb://eng/doc/readme.md",
+  vault: "eng",
+  path: "readme.md",
+  commit_hash: "abc1234",
+  chunks_indexed: 1,
+  entities_found: 0,
+};
+docEnvelope.kind satisfies "document";
+docWriteEnvelope.kind satisfies "document_write";
 await client.vault("eng").from("tasks").select("id");
 
 const typedClient = createClient<AkbSchema>({ baseUrl: "https://akb.test/api/v1" });
@@ -50,6 +66,75 @@ const rawSqlData = rawSqlResult.throwOnError().data;
 if (rawSqlData.kind === "table_query") {
   rawSqlData.items.at(0)?.title satisfies string | undefined;
 }
+const searchResult = await typedClient.vault("eng").search("postgres", {
+  rerank: false,
+  tags: ["sdk"],
+  limit: 3,
+});
+searchResult.throwOnError().data.kind satisfies "search";
+searchResult.throwOnError().data.results.at(0)?.uri satisfies string | undefined;
+const drillDownResult = await typedClient.vault("eng").search.drillDown("akb://eng/doc/readme.md", {
+  section: "Intro",
+});
+drillDownResult.throwOnError().data.kind satisfies "drill_down";
+drillDownResult.throwOnError().data.sections.at(0)?.content satisfies string | null | undefined;
+const grepResult = await typedClient.vault("eng").search.grep("needle", {
+  regex: true,
+  filesWithMatches: true,
+});
+grepResult.throwOnError().data.kind satisfies "grep";
+grepResult.throwOnError().data.files?.at(0) satisfies string | undefined;
+const docs = typedClient.vault("eng").docs;
+const documentPutInput: AkbDocumentPutInput = {
+  collection: "guides",
+  title: "Readme",
+  content: "# Readme",
+  status: "active",
+  tags: ["sdk"],
+  dependsOn: ["AKB-090"],
+  relatedTo: ["AKB-095"],
+};
+const browsedDocs = await docs.browse({ collection: "guides", depth: 0, includeHashes: true });
+browsedDocs.throwOnError().data.kind satisfies "document";
+const fetchedDoc = await docs.get("guides/readme.md", { version: "abc1234" });
+fetchedDoc.throwOnError().data.content satisfies string | null | undefined;
+const putDoc = await docs.put(documentPutInput);
+putDoc.throwOnError().data.kind satisfies "document_write";
+const updatedDoc = await docs.update("guides/readme.md", {
+  summary: "Fresh summary",
+  expectedCommit: "abc1234",
+  expectedContentHash: "hash1234",
+});
+updatedDoc.throwOnError().data.current_commit satisfies string | null | undefined;
+const deletedDoc = await docs.delete("guides/readme.md");
+deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
+// @ts-expect-error collection is required when putting a document.
+docs.put({ title: "Missing collection", content: "# Missing collection" });
+// @ts-expect-error document status is constrained to AKB document lifecycle values.
+docs.put({ collection: "guides", title: "Bad status", content: "# Bad status", status: "done" });
+const storage = typedClient.vault("eng").storage;
+const storageUploadOptions: AkbStorageUploadOptions = {
+  description: "Logo",
+  contentHash: "hash1234",
+  hashAlgorithm: "sha256",
+};
+const uploadedFile = await storage.upload("media/logo.txt", new Blob(["hello"], { type: "text/plain" }), storageUploadOptions);
+uploadedFile.throwOnError().data.kind satisfies "file";
+const presignedFile = await storage.presignUpload("media/logo.txt", { mimeType: "text/plain" });
+presignedFile.throwOnError().data.upload_url satisfies string | undefined;
+const confirmedFile = await storage.confirm("11111111-1111-4111-8111-111111111111", { contentHash: "hash1234" });
+confirmedFile.throwOnError().data.size_bytes satisfies number | undefined;
+const downloadFile = await storage.download("media/logo.txt");
+downloadFile.throwOnError().data.download_url satisfies string | undefined;
+const downloadedBytes = await storage.download("media/logo.txt", { bytes: true });
+downloadedBytes.throwOnError().data.kind satisfies "file_download";
+downloadedBytes.throwOnError().data.bytes.byteLength satisfies number;
+const listedFiles = await storage.list({ collection: "media", limit: 20 });
+listedFiles.throwOnError().data.items?.at(0)?.name satisfies import("../src/index.js").AkbJsonValue | undefined;
+const deletedFile = await storage.delete("media/logo.txt");
+deletedFile.throwOnError().data.deleted satisfies boolean | undefined;
+// @ts-expect-error upload body is required.
+storage.upload("media/logo.txt");
 // @ts-expect-error raw SQL is only exposed as a tagged template.
 typedClient.vault("eng").sql("SELECT title FROM tasks");
 // @ts-expect-error AkbSchema only contains the tasks table fixture.
@@ -130,6 +215,17 @@ const vaultSchema: VaultSchemaResponse = {
   total: 0,
 };
 vaultSchema.kind satisfies "vault_table_schema";
+
+type SearchResponse = AkbOperationResponse<operations["searchSearchDocuments"]>;
+const searchEnvelope: SearchResponse = {
+  kind: "search",
+  query: "postgres",
+  total: 1,
+  returned: 1,
+  total_matches: 1,
+  results: [{ source_type: "document", uri: "akb://eng/doc/readme.md", vault: "eng", path: "readme.md", title: "Readme", tags: [], score: 1 }],
+};
+searchEnvelope.kind satisfies "search";
 
 type InsertRowsResponse = AkbOperationResponse<operations["tablesInsertRows"]>;
 const insertRowsNoContent: InsertRowsResponse = null;

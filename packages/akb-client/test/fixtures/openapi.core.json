@@ -1,6 +1,72 @@
 {
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/browse/{vault}": {
+      "get": {
+        "operationId": "documentsBrowseVault",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/documents": {
+      "post": {
+        "operationId": "documentsPutDocument",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentWriteEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/documents/{vault}/{doc_id}": {
+      "delete": {
+        "operationId": "documentsDeleteDocument",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "documentsGetDocument",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "documentsUpdateDocument",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentWriteEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/files/{vault}": {
       "get": {
         "operationId": "filesGetVault",
@@ -23,6 +89,90 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/{file_id}/confirm": {
+      "post": {
+        "operationId": "filesPostFileIdConfirm",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/{file_id}/download": {
+      "get": {
+        "operationId": "filesGetFileIdDownload",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/files/{vault}/{file_id}": {
+      "delete": {
+        "operationId": "filesDeleteFileId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbFileEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/drill-down": {
+      "get": {
+        "operationId": "searchDrillDown",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDrillDownEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/grep": {
+      "get": {
+        "operationId": "searchGrepDocuments",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbGrepEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "operationId": "searchSearchDocuments",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbSearchEnvelope" }
               }
             }
           }
@@ -215,8 +365,13 @@
   },
   "components": {
     "schemas": {
+      "AkbDocumentEnvelope": {},
+      "AkbDocumentWriteEnvelope": {},
+      "AkbDrillDownEnvelope": {},
       "AkbError": {},
       "AkbFileEnvelope": {},
+      "AkbGrepEnvelope": {},
+      "AkbSearchEnvelope": {},
       "AkbSqlEnvelope": {},
       "AkbTableEnvelope": {},
       "AkbTableMigrationEnvelope": {},

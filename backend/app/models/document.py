@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -100,6 +101,7 @@ class DocumentResponse(BaseModel):
     """Response for a single document. Internal IDs are never exposed — `uri`
     is the sole identifier for the resource."""
 
+    kind: Literal["document"] = "document"
     uri: str  # canonical akb://{vault}/doc/{path} — single source of truth
     vault: str
     path: str
@@ -133,6 +135,7 @@ class DocumentResponse(BaseModel):
 class DocumentPutResponse(BaseModel):
     """Response after akb_put."""
 
+    kind: Literal["document_write"] = "document_write"
     uri: str  # canonical akb://{vault}/doc/{path}
     vault: str
     path: str
@@ -145,6 +148,13 @@ class DocumentPutResponse(BaseModel):
     action: str | None = None
     chunks_indexed: int
     entities_found: int
+
+
+class DocumentDeleteResponse(BaseModel):
+    """Response after deleting a document."""
+
+    kind: Literal["document"] = "document"
+    deleted: bool
 
 
 class BrowseItem(BaseModel):
@@ -194,6 +204,7 @@ class BrowseItem(BaseModel):
 class BrowseResponse(BaseModel):
     """Response for akb_browse."""
 
+    kind: Literal["document"] = "document"
     vault: str
     path: str
     items: list[BrowseItem]
@@ -244,6 +255,7 @@ class SearchResponse(BaseModel):
     compatibility with existing UI / agent prompts.
     """
 
+    kind: Literal["search"] = "search"
     query: str
     total: int
     returned: int = 0
@@ -257,3 +269,73 @@ class SearchResponse(BaseModel):
     degraded: bool = False
     degradation_reason: str | None = None
     results: list[SearchResult]
+
+
+class DrillDownSection(BaseModel):
+    """Single indexed document section returned by drill-down."""
+
+    section_path: str | None = None
+    content: str | None = None
+    chunk_index: int
+
+
+class DrillDownResponse(BaseModel):
+    """Response for REST drill-down."""
+
+    kind: Literal["drill_down"] = "drill_down"
+    uri: str
+    sections: list[DrillDownSection]
+
+
+class GrepMatch(BaseModel):
+    """Single matched line within a grep result."""
+
+    section: str | None = None
+    text: str
+
+
+class GrepResult(BaseModel):
+    """Single document returned by grep."""
+
+    uri: str
+    vault: str
+    path: str
+    title: str
+    matches: list[GrepMatch] = Field(default_factory=list)
+
+
+class GrepReplacement(BaseModel):
+    """Single replacement result from grep replace."""
+
+    uri: str | None = None
+    path: str | None = None
+    title: str | None = None
+    commit: str | None = None
+    error: str | None = None
+
+
+class GrepResponse(BaseModel):
+    """Response for REST grep.
+
+    grep has mutually exclusive output modes (default, count-only,
+    files-with-matches, and replace); optional fields keep the REST contract
+    typed without forcing unrelated mode fields into every response body.
+    """
+
+    kind: Literal["grep"] = "grep"
+    pattern: str
+    regex: bool
+    error: str | None = None
+    returned_docs: int | None = None
+    returned_matches: int | None = None
+    total_docs: int | None = None
+    total_matches: int | None = None
+    truncated: bool | None = None
+    hint: str | None = None
+    results: list[GrepResult] | None = None
+    by_doc: dict[str, int] | None = None
+    n_files: int | None = None
+    files: list[str] | None = None
+    replace: str | None = None
+    replaced_docs: int | None = None
+    replacements: list[GrepReplacement] | None = None

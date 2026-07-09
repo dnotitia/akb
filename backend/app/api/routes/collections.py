@@ -25,7 +25,13 @@ class CreateCollectionRequest(BaseModel):
     summary: str | None = None
 
 
-@router.get("/browse/{vault}", response_model=BrowseResponse, summary="Browse vault collections and documents")
+@router.get(
+    "/browse/{vault}",
+    response_model=BrowseResponse,
+    summary="Browse vault collections and documents",
+    operation_id="documentsBrowseVault",
+    tags=["documents"],
+)
 async def browse_vault(
     vault: str,
     collection: str | None = Query(None),

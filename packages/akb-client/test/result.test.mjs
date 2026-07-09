@@ -105,6 +105,389 @@ test("createClient supports vault scoping, actingAs claims, and namespace stubs"
   assert.equal(result.error, null);
 });
 
+test("search facade scopes search, drill-down, grep, and forwards actingAs claims", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      seen.push({
+        url: String(input),
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/drill-down")) {
+        return new Response(
+          JSON.stringify({ kind: "drill_down", uri: url.searchParams.get("uri"), sections: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith("/grep")) {
+        return new Response(
+          JSON.stringify({ kind: "grep", pattern: url.searchParams.get("q"), regex: true, files: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ kind: "search", query: url.searchParams.get("q"), total: 0, returned: 0, total_matches: 0, results: [] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  }).vault("reef").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const searchResult = await client.search("typed search", {
+    rerank: false,
+    tags: ["sdk", "search"],
+    limit: 5,
+    sourceUris: ["akb://reef/doc/readme.md"],
+  });
+  const drillResult = await client.search.drillDown("akb://reef/doc/readme.md", { section: "Intro" });
+  const grepResult = await client.search.grep("needle", { regex: true, filesWithMatches: true });
+
+  const searchUrl = new URL(seen[0].url);
+  assert.equal(searchUrl.pathname, "/api/v1/search");
+  assert.equal(searchUrl.searchParams.get("q"), "typed search");
+  assert.deepEqual(searchUrl.searchParams.getAll("vault"), ["reef"]);
+  assert.equal(searchUrl.searchParams.get("rerank"), "false");
+  assert.deepEqual(searchUrl.searchParams.getAll("tags"), ["sdk", "search"]);
+  assert.equal(searchUrl.searchParams.get("limit"), "5");
+  assert.deepEqual(searchUrl.searchParams.getAll("source_uris"), ["akb://reef/doc/readme.md"]);
+  assert.deepEqual(JSON.parse(seen[0].headers["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.equal(searchResult.throwOnError().data.kind, "search");
+
+  const drillUrl = new URL(seen[1].url);
+  assert.equal(drillUrl.pathname, "/api/v1/drill-down");
+  assert.equal(drillUrl.searchParams.get("uri"), "akb://reef/doc/readme.md");
+  assert.equal(drillUrl.searchParams.get("section"), "Intro");
+  assert.equal(drillResult.throwOnError().data.kind, "drill_down");
+
+  const grepUrl = new URL(seen[2].url);
+  assert.equal(grepUrl.pathname, "/api/v1/grep");
+  assert.deepEqual(grepUrl.searchParams.getAll("vault"), ["reef"]);
+  assert.equal(grepUrl.searchParams.get("q"), "needle");
+  assert.equal(grepUrl.searchParams.get("regex"), "true");
+  assert.equal(grepUrl.searchParams.get("files_with_matches"), "true");
+  assert.equal(grepResult.throwOnError().data.kind, "grep");
+});
+
+test("docs facade scopes document operations and maps typed payloads", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      seen.push({
+        url: String(input),
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+
+      if (method === "POST" || method === "PATCH") {
+        return new Response(
+          JSON.stringify({
+            kind: "document_write",
+            uri: "akb://reef/doc/guides/readme.md",
+            vault: "reef",
+            path: "guides/readme.md",
+            commit_hash: "abc1234",
+            chunks_indexed: 1,
+            entities_found: 0,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (method === "DELETE") {
+        return new Response(JSON.stringify({ kind: "document", deleted: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname.endsWith("/browse/reef")) {
+        return new Response(
+          JSON.stringify({ kind: "document", vault: "reef", path: "guides", items: [] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          kind: "document",
+          uri: "akb://reef/doc/guides/read me.md",
+          vault: "reef",
+          path: "guides/read me.md",
+          title: "Readme",
+          type: "note",
+          status: "active",
+          tags: [],
+          content: "# Readme",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  }).vault("reef").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } });
+
+  const getResult = await client.docs.get("guides/read me.md", { version: "abc1234" });
+  const browseResult = await client.docs.browse({
+    collection: "guides",
+    depth: 0,
+    includeHashes: true,
+    includeArchived: true,
+  });
+  const putResult = await client.docs.put({
+    collection: "guides",
+    title: "Readme",
+    content: "# Readme",
+    type: "note",
+    status: "active",
+    tags: ["sdk"],
+    dependsOn: ["AKB-090"],
+    relatedTo: ["AKB-095"],
+    slug: "readme",
+  });
+  const updateResult = await client.docs.update("guides/readme.md", {
+    content: "# Updated",
+    expectedCommit: "abc1234",
+    expectedContentHash: "hash1234",
+    tags: ["sdk", "docs"],
+  });
+  const deleteResult = await client.docs.delete("guides/readme.md");
+
+  const getUrl = new URL(seen[0].url);
+  assert.equal(seen[0].method, "GET");
+  assert.equal(getUrl.pathname, "/api/v1/documents/reef/guides/read%20me.md");
+  assert.equal(getUrl.searchParams.get("version"), "abc1234");
+  assert.deepEqual(JSON.parse(seen[0].headers["x-akb-claims"]), {
+    sub: "end-user-1",
+    app_metadata: { org_id: "org-1", role: "member" },
+  });
+  assert.equal(getResult.throwOnError().data.kind, "document");
+
+  const browseUrl = new URL(seen[1].url);
+  assert.equal(browseUrl.pathname, "/api/v1/browse/reef");
+  assert.equal(browseUrl.searchParams.get("collection"), "guides");
+  assert.equal(browseUrl.searchParams.get("depth"), "0");
+  assert.equal(browseUrl.searchParams.get("include_hashes"), "true");
+  assert.equal(browseUrl.searchParams.get("include_archived"), "true");
+  assert.equal(browseResult.throwOnError().data.kind, "document");
+
+  assert.equal(seen[2].method, "POST");
+  assert.equal(new URL(seen[2].url).pathname, "/api/v1/documents");
+  assert.deepEqual(seen[2].body, {
+    vault: "reef",
+    collection: "guides",
+    title: "Readme",
+    content: "# Readme",
+    type: "note",
+    status: "active",
+    tags: ["sdk"],
+    depends_on: ["AKB-090"],
+    related_to: ["AKB-095"],
+    slug: "readme",
+  });
+  assert.equal(putResult.throwOnError().data.kind, "document_write");
+
+  assert.equal(seen[3].method, "PATCH");
+  assert.equal(new URL(seen[3].url).pathname, "/api/v1/documents/reef/guides/readme.md");
+  assert.deepEqual(seen[3].body, {
+    content: "# Updated",
+    tags: ["sdk", "docs"],
+    expected_commit: "abc1234",
+    expected_content_hash: "hash1234",
+  });
+  assert.equal(updateResult.throwOnError().data.kind, "document_write");
+
+  assert.equal(seen[4].method, "DELETE");
+  assert.equal(new URL(seen[4].url).pathname, "/api/v1/documents/reef/guides/readme.md");
+  assert.equal(deleteResult.throwOnError().data.deleted, true);
+});
+
+test("storage facade performs presigned upload, download, list, and delete flows", async () => {
+  const fileId = "11111111-1111-4111-8111-111111111111";
+  const fileUri = `akb://reef/coll/media/file/${fileId}`;
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      seen.push({
+        url: String(input),
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+
+      if (url.origin === "https://storage.example.com" && url.pathname === "/upload") {
+        return new Response(null, { status: 200 });
+      }
+      if (url.origin === "https://storage.example.com" && url.pathname === "/download") {
+        return new Response("hello", { status: 200 });
+      }
+      if (url.pathname.endsWith("/files/reef/upload")) {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            uri: fileUri,
+            vault: "reef",
+            collection: "media",
+            upload_url: "https://storage.example.com/upload",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/confirm`)) {
+        return new Response(
+          JSON.stringify({ kind: "file", uri: fileUri, vault: "reef", name: "logo.txt", size_bytes: 5 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname === "/api/v1/files/reef" && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [{ kind: "file", uri: fileUri, collection: "media", name: "logo.txt" }],
+            total: 1,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/download`)) {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            uri: fileUri,
+            name: "logo.txt",
+            download_url: "https://storage.example.com/download",
+            size_bytes: 5,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}`) && method === "DELETE") {
+        return new Response(JSON.stringify({ kind: "file", uri: fileUri, deleted: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${method} ${url.href}`);
+    },
+  }).vault("reef");
+
+  const uploadResult = await client.storage.upload("media/logo.txt", new Blob(["hello"], { type: "text/plain" }), {
+    description: "Logo",
+    contentHash: "hash1234",
+    hashAlgorithm: "sha256",
+  });
+  const downloadUrlResult = await client.storage.download("media/logo.txt");
+  const downloadBytesResult = await client.storage.download("media/logo.txt", { bytes: true });
+  const listResult = await client.storage.list({ collection: "media", limit: 10 });
+  const deleteResult = await client.storage.delete("media/logo.txt");
+
+  const presignCall = seen.find((call) => new URL(call.url).pathname.endsWith("/files/reef/upload"));
+  const presignUrl = new URL(presignCall.url);
+  assert.equal(presignCall.method, "POST");
+  assert.equal(presignUrl.searchParams.get("filename"), "logo.txt");
+  assert.equal(presignUrl.searchParams.get("collection"), "media");
+  assert.equal(presignUrl.searchParams.get("description"), "Logo");
+  assert.equal(presignUrl.searchParams.get("mime_type"), "text/plain");
+
+  const uploadCall = seen.find((call) => call.url === "https://storage.example.com/upload");
+  assert.equal(uploadCall.method, "PUT");
+  assert.equal(uploadCall.headers["content-type"], "text/plain");
+  assert.equal(uploadCall.headers.authorization, undefined);
+
+  const confirmUrl = new URL(seen.find((call) => new URL(call.url).pathname.endsWith(`/${fileId}/confirm`)).url);
+  assert.equal(confirmUrl.searchParams.get("content_hash"), "hash1234");
+  assert.equal(confirmUrl.searchParams.get("hash_algorithm"), "sha256");
+  assert.equal(uploadResult.throwOnError().data.kind, "file");
+
+  const listCalls = seen.filter((call) => new URL(call.url).pathname === "/api/v1/files/reef");
+  assert.ok(listCalls.length >= 3);
+  assert.equal(new URL(listCalls[0].url).searchParams.get("collection"), "media");
+  assert.equal(new URL(listCalls[0].url).searchParams.get("limit"), "200");
+
+  assert.equal(downloadUrlResult.throwOnError().data.download_url, "https://storage.example.com/download");
+  assert.equal(downloadBytesResult.throwOnError().data.bytes.byteLength, 5);
+  assert.equal(new URL(listCalls.at(-1).url).searchParams.get("limit"), "200");
+  assert.equal(listResult.throwOnError().data.total, 1);
+  assert.equal(deleteResult.throwOnError().data.deleted, true);
+});
+
+test("storage facade resolves paths with a file collection segment through list lookup", async () => {
+  const fileId = "22222222-2222-4222-8222-222222222222";
+  const fileUri = `akb://reef/coll/media/file/file/${fileId}`;
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      seen.push({ url: String(input), method: init?.method ?? "GET" });
+      if (url.pathname === "/api/v1/files/reef") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [{ kind: "file", uri: fileUri, collection: "media/file", name: "logo.txt" }],
+            total: 1,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname.endsWith(`/${fileId}/download`)) {
+        return new Response(
+          JSON.stringify({ kind: "file", uri: fileUri, download_url: "https://storage.example.com/download" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url.href}`);
+    },
+  }).vault("reef");
+
+  const result = await client.storage.download("media/file/logo.txt");
+
+  const listUrl = new URL(seen[0].url);
+  assert.equal(listUrl.pathname, "/api/v1/files/reef");
+  assert.equal(listUrl.searchParams.get("collection"), "media/file");
+  assert.equal(new URL(seen[1].url).pathname, `/api/v1/files/reef/${fileId}/download`);
+  assert.equal(result.throwOnError().data.download_url, "https://storage.example.com/download");
+});
+
+test("storage facade rejects ambiguous path lookups instead of picking the first file", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      seen.push({ url: String(input), method: init?.method ?? "GET" });
+      if (url.pathname === "/api/v1/files/reef") {
+        return new Response(
+          JSON.stringify({
+            kind: "file",
+            vault: "reef",
+            items: [
+              { kind: "file", uri: "akb://reef/coll/media/file/33333333-3333-4333-8333-333333333333", collection: "media", name: "logo.txt" },
+              { kind: "file", uri: "akb://reef/coll/media/file/44444444-4444-4444-8444-444444444444", collection: "media", name: "logo.txt" },
+            ],
+            total: 2,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url.href}`);
+    },
+  }).vault("reef");
+
+  const result = await client.storage.delete("media/logo.txt");
+
+  assert.equal(result.data, null);
+  assert.equal(result.error?.code, "ambiguous_file_ref");
+  assert.equal(seen.length, 1);
+  assert.equal(new URL(seen[0].url).searchParams.get("collection"), "media");
+});
+
 test("actingAs rejects claims that cannot satisfy the BFF parser", () => {
   const client = createClient("https://akb.test/api/v1", { apiKey: fixtureApiKey });
 

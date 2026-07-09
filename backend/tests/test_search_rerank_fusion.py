@@ -79,6 +79,7 @@ def test_search_response_defaults_truncated_false_no_hint():
     prefetch pool not filled). Mirrors how the empty-result paths in
     search_service.py:243 / :262 still construct SearchResponse."""
     r = SearchResponse(query="x", total=0, returned=0, total_matches=0, results=[])
+    assert r.kind == "search"
     assert r.truncated is False
     assert r.hint is None
 

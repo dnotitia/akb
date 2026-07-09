@@ -101,6 +101,11 @@ def test_success_envelope_components_are_kind_discriminated():
             "table_query": "#/components/schemas/AkbTableQueryEnvelope",
             "table_sql": "#/components/schemas/AkbTableSqlEnvelope",
             "file": "#/components/schemas/AkbFileEnvelope",
+            "document": "#/components/schemas/AkbDocumentEnvelope",
+            "document_write": "#/components/schemas/AkbDocumentWriteEnvelope",
+            "search": "#/components/schemas/AkbSearchEnvelope",
+            "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
+            "grep": "#/components/schemas/AkbGrepEnvelope",
         },
     }
     for name, kind in (
@@ -111,6 +116,11 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbTableQueryEnvelope", "table_query"),
         ("AkbTableSqlEnvelope", "table_sql"),
         ("AkbFileEnvelope", "file"),
+        ("AkbDocumentEnvelope", "document"),
+        ("AkbDocumentWriteEnvelope", "document_write"),
+        ("AkbSearchEnvelope", "search"),
+        ("AkbDrillDownEnvelope", "drill_down"),
+        ("AkbGrepEnvelope", "grep"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
@@ -120,6 +130,14 @@ def test_success_envelope_components_are_kind_discriminated():
 def test_kind_envelope_routes_reference_typed_success_schemas():
     schema = app.openapi()
     expected = {
+        ("/api/v1/documents", "post", "200"): "AkbDocumentWriteEnvelope",
+        ("/api/v1/documents/{vault}/{doc_id}", "get", "200"): "AkbDocumentEnvelope",
+        ("/api/v1/documents/{vault}/{doc_id}", "patch", "200"): "AkbDocumentWriteEnvelope",
+        ("/api/v1/documents/{vault}/{doc_id}", "delete", "200"): "AkbDocumentEnvelope",
+        ("/api/v1/browse/{vault}", "get", "200"): "AkbDocumentEnvelope",
+        ("/api/v1/search", "get", "200"): "AkbSearchEnvelope",
+        ("/api/v1/drill-down", "get", "200"): "AkbDrillDownEnvelope",
+        ("/api/v1/grep", "get", "200"): "AkbGrepEnvelope",
         ("/api/v1/tables/{vault}", "post", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}", "get", "200"): "AkbTableEnvelope",
         ("/api/v1/tables/{vault}/schema", "get", "200"): "AkbVaultTableSchemaEnvelope",
@@ -145,6 +163,104 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
             ["content"]["application/json"]["schema"]
         )
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
+
+
+def test_document_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    put = paths["/api/v1/documents"]["post"]
+    get = paths["/api/v1/documents/{vault}/{doc_id}"]["get"]
+    patch = paths["/api/v1/documents/{vault}/{doc_id}"]["patch"]
+    delete = paths["/api/v1/documents/{vault}/{doc_id}"]["delete"]
+    browse = paths["/api/v1/browse/{vault}"]["get"]
+
+    assert put["operationId"] == "documentsPutDocument"
+    assert get["operationId"] == "documentsGetDocument"
+    assert patch["operationId"] == "documentsUpdateDocument"
+    assert delete["operationId"] == "documentsDeleteDocument"
+    assert browse["operationId"] == "documentsBrowseVault"
+    assert browse["tags"] == ["documents"]
+
+    for operation in (get, delete, browse):
+        assert (
+            operation["responses"]["200"]["content"]["application/json"]["schema"]
+            == {"$ref": "#/components/schemas/AkbDocumentEnvelope"}
+        )
+    for operation in (put, patch):
+        assert (
+            operation["responses"]["200"]["content"]["application/json"]["schema"]
+            == {"$ref": "#/components/schemas/AkbDocumentWriteEnvelope"}
+        )
+
+    schemas = schema["components"]["schemas"]
+    document = schemas["AkbDocumentEnvelope"]
+    assert document["properties"]["kind"]["enum"] == ["document"]
+    assert "items" in document["properties"]
+    assert "deleted" in document["properties"]
+    assert "current_commit" in document["properties"]
+
+    write = schemas["AkbDocumentWriteEnvelope"]
+    assert write["properties"]["kind"]["enum"] == ["document_write"]
+    assert {"kind", "uri", "vault", "path", "commit_hash", "chunks_indexed", "entities_found"}.issubset(
+        write["required"]
+    )
+
+
+def test_search_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    search = paths["/api/v1/search"]["get"]
+    drill_down = paths["/api/v1/drill-down"]["get"]
+    grep = paths["/api/v1/grep"]["get"]
+
+    assert search["operationId"] == "searchSearchDocuments"
+    assert drill_down["operationId"] == "searchDrillDown"
+    assert grep["operationId"] == "searchGrepDocuments"
+
+    assert (
+        search["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbSearchEnvelope"}
+    )
+    assert (
+        drill_down["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbDrillDownEnvelope"}
+    )
+    assert (
+        grep["responses"]["200"]["content"]["application/json"]["schema"]
+        == {"$ref": "#/components/schemas/AkbGrepEnvelope"}
+    )
+
+    search_params = {param["name"]: param for param in search["parameters"]}
+    for name in (
+        "q",
+        "mode",
+        "rerank",
+        "vault",
+        "collection",
+        "type",
+        "tags",
+        "limit",
+        "include_archived",
+        "source_uris",
+    ):
+        assert search_params[name]["in"] == "query"
+
+    mode_schema = search_params["mode"]["schema"]
+    assert mode_schema["type"] == "string"
+    assert mode_schema.get("enum", mode_schema.get("const")) in (["hybrid"], "hybrid")
+    rerank_schema = search_params["rerank"]["schema"]
+    assert rerank_schema.get("type") == "boolean" or {"type": "boolean"} in rerank_schema.get("anyOf", [])
+
+    grep_params = {param["name"]: param for param in grep["parameters"]}
+    for name in ("q", "vault", "collection", "regex", "case_sensitive", "limit", "count_only", "files_with_matches"):
+        assert grep_params[name]["in"] == "query"
+
+    schemas = schema["components"]["schemas"]
+    assert {"kind", "query", "total", "returned", "total_matches", "results"}.issubset(
+        schemas["AkbSearchEnvelope"]["required"]
+    )
+    assert {"kind", "uri", "sections"}.issubset(schemas["AkbDrillDownEnvelope"]["required"])
+    assert {"kind", "pattern", "regex"}.issubset(schemas["AkbGrepEnvelope"]["required"])
 
 
 def test_row_read_openapi_contract_is_codegen_typed():

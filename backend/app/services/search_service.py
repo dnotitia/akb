@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from typing import Literal
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -154,6 +155,8 @@ class SearchService:
         self,
         query: str,
         vault: str | list[str] | None = None,
+        mode: Literal["hybrid"] = "hybrid",
+        rerank: bool | None = None,
         collection: str | None = None,
         doc_type: str | None = None,
         tags: list[str] | None = None,
@@ -169,6 +172,10 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
+        if mode != "hybrid":
+            raise ValidationError("unsupported search mode")
+
+        rerank_enabled = settings.rerank_enabled if rerank is None else settings.rerank_enabled and rerank
         vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
         # ACL guard mirroring `grep` below: when neither vault nor
         # user_id scopes the query, the prefilter block ends up
@@ -380,7 +387,7 @@ class SearchService:
 
         target_unique = resolve_first_stage_unique_limit(
             limit=limit,
-            rerank_enabled=settings.rerank_enabled,
+            rerank_enabled=rerank_enabled,
             rerank_prefetch=settings.rerank_prefetch,
             search_prefetch=settings.search_prefetch,
         )
@@ -425,7 +432,7 @@ class SearchService:
         total_matches = len(unique_hits)
         prefetch_capped = total_matches >= target_unique
 
-        if settings.rerank_enabled and len(unique_hits) > 1:
+        if rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
 
         unique_hits = unique_hits[:limit]
