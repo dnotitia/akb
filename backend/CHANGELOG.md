@@ -48,6 +48,38 @@ control plane can durably record it before the remote call and revoke that exact
 token after an ambiguous response. Older AKB images return 404 on this path
 instead of silently minting a token under an unrelated server-generated ID.
 
+A vault can now be marked **write-managed**: once marked, mutating calls
+(writer/admin/owner — REST, MCP, and `akb_sql`) are refused for every caller,
+including the vault owner and any JWT session, unless the request's PAT is on
+that vault's grant allowlist. This targets automation vaults (collector
+mirrors, gardener-compiled state) where an ordinary human edit is exactly the
+class of write that should be impossible without an explicit, auditable
+grant. An *unscoped* system administrator still gets through (a scoped admin
+PAT does not) so operators are never locked out, but every such bypass emits a
+loud `vault.write_policy_admin_bypass` audit event naming the vault, the
+managing owner, and the actor.
+
+New admin-only endpoints manage the policy: `PUT`/`DELETE
+/admin/vaults/{vault}/write-policy` mark/unmark a vault, and `PUT`/`DELETE
+/admin/vaults/{vault}/write-policy/grants/{token_id}` add/remove a token from
+the allowlist. Every call — including a no-op re-mark or an idempotent
+grant/unmark — emits `vault.write_policy_changed` (action, vault, managed_by,
+actor, and the token id for grant calls), so an unmark-write-remark
+break-glass sequence stays fully auditable. Marking requires the vault to
+exist; granting requires the vault to already be marked (409) and the token
+to exist (404); marking an external-git mirror vault is rejected (409) since
+that vault is already unconditionally read-only via its own poller and a
+grant there could never actually enable a write. Unmarking restores every
+caller to full pre-marking behavior immediately — there is no lingering
+restriction once a vault is unmarked.
+
+`GET /vaults/{vault}/info`, `GET /my/vaults`, and MCP `akb_vault_info` now
+report `managed_by: string | null` (the slim `akb_list_vaults` tool is
+unchanged — it stays `{name, description}` by design). Migration 044 (already
+shipped as pure substrate) adds the `vault_write_policy` /
+`vault_write_grants` tables; marking a vault has zero effect until an admin
+actually uses this new API.
+
 ## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
 
 `GET /health` no longer holds the chunks stats pool connection while awaiting

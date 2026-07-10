@@ -26,7 +26,9 @@ import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.models.vault_scope import current_token_uuid, current_vault_scope
 from app.repositories import table_data_repo, table_registry_repo
+from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services.index_service import (
@@ -50,6 +52,7 @@ from app.util.errors import (
     UNDEFINED_TABLE,
     UNIQUE_VIOLATION,
     VAULT_ARCHIVED,
+    VAULT_WRITE_MANAGED,
 )
 from app.util.text import fuzzy_hint
 
@@ -1531,6 +1534,52 @@ async def execute_sql(
                     f"Vault '{names}' is archived (read-only); writes via "
                     f"akb_sql are not allowed. Unarchive the vault first.",
                     code=VAULT_ARCHIVED,
+                )
+
+            # Vault write-policy dual enforcement (P0 S3): mirrors the
+            # archived-vault block just above. `access_service.
+            # check_vault_access`'s own write-policy guard never fires for
+            # akb_sql — the REST route (tables.py) only ever asks it for
+            # required_role="reader" per referenced vault (read access;
+            # akb_sql's own DML-vs-DDL gate lives here, not there) — so a
+            # MARKED vault has to be re-checked directly against the SQL
+            # about to run. Same allow-conditions as that guard: a granted
+            # token passes, an *unscoped* system admin bypasses (+ the same
+            # loud audit event), everyone else is blocked before the
+            # statement ever reaches PG. `is_admin` is the caller-supplied
+            # flag (already sourced from `users.is_admin` by the REST
+            # route) — reused as-is rather than re-queried, unlike the
+            # access_service guard which has no such flag in scope yet.
+            for vrow in await conn.fetch(
+                "SELECT id, name FROM vaults WHERE name = ANY($1::text[])",
+                vault_names,
+            ):
+                policy = await write_policy_repo.get_policy(vrow["id"], conn=conn)
+                if policy is None:
+                    continue
+                token_id = current_token_uuid()
+                if token_id is not None and await write_policy_repo.is_granted(
+                    vrow["id"], token_id, conn=conn,
+                ):
+                    continue
+                if is_admin and current_vault_scope.get() is None:
+                    # A3: bypass, but LOUDLY — same event as the guard.
+                    await emit_event(
+                        conn, "vault.write_policy_admin_bypass",
+                        vault_id=vrow["id"],
+                        actor_id=user_id,
+                        payload={
+                            "managed_by": policy["managed_by"],
+                            "required_role": "writer",
+                            "vault": vrow["name"],
+                        },
+                    )
+                    continue
+                return err(
+                    f"Vault '{vrow['name']}' is write-managed by "
+                    f"{policy['managed_by']}; writes require a granted "
+                    f"service token",
+                    code=VAULT_WRITE_MANAGED,
                 )
 
     try:

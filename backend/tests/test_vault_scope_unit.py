@@ -13,10 +13,17 @@ vault outside its declared sets" invariant.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from app.exceptions import ValidationError
-from app.models.vault_scope import VaultScope, current_vault_scope
+from app.models.vault_scope import (
+    VaultScope,
+    current_token_id,
+    current_token_uuid,
+    current_vault_scope,
+)
 
 
 class TestPermits:
@@ -140,6 +147,37 @@ class TestContextVar:
         finally:
             current_vault_scope.reset(token)
         assert current_vault_scope.get() is None
+
+
+class TestCurrentTokenUuid:
+    """``current_token_uuid()`` — the str→UUID accessor the
+    ``vault_write_policy`` guard (Task 9) uses. The ContextVar itself is
+    typed ``str | None`` (mirrors the ``tokens.id`` the DB hands back
+    stringified); the repo calls (`is_granted`) need a real
+    ``uuid.UUID``.
+    """
+
+    def test_default_is_none(self) -> None:
+        assert current_token_uuid() is None
+
+    def test_valid_uuid_string_parses(self) -> None:
+        real_id = uuid.uuid4()
+        token = current_token_id.set(str(real_id))
+        try:
+            assert current_token_uuid() == real_id
+        finally:
+            current_token_id.reset(token)
+
+    def test_malformed_string_is_none_not_a_raise(self) -> None:
+        # A2 fail-closed contract (Task 9 handoff): a consumer that
+        # treats "no token" as "deny" must never see a ValueError
+        # bubble up from a corrupt ContextVar value — malformed folds to
+        # None (deny), same as "no token at all".
+        token = current_token_id.set("not-a-uuid-at-all")
+        try:
+            assert current_token_uuid() is None
+        finally:
+            current_token_id.reset(token)
 
 
 class TestAdversarialNeverWiden:

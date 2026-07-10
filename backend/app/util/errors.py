@@ -53,6 +53,14 @@ NOT_FOUND = "not_found"
 # Authorization / permission
 PERMISSION_DENIED = "permission_denied"
 VAULT_ARCHIVED = "vault_archived"
+# A `vault_write_policy`-marked vault rejected a write because the
+# caller's token isn't on its `vault_write_grants` allowlist (P0 S3).
+# Mirrors VAULT_ARCHIVED's specificity — the akb_sql dual-enforcement
+# block in `table_service.execute_sql` returns this; the
+# `access_service.check_vault_access` guard raises a plain
+# `ForbiddenError` instead (like every other guard in that function),
+# which maps to the generic PERMISSION_DENIED at the HTTP/MCP envelope.
+VAULT_WRITE_MANAGED = "vault_write_managed"
 # RFC 6750 §3.1 — OAuth scope check failed at MCP tool dispatch
 # (caller is authenticated but the access token lacks the scope the
 # tool requires). PERMISSION_DENIED is for AKB-internal access (vault

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -134,6 +135,27 @@ current_vault_scope: ContextVar[VaultScope | None] = ContextVar(
 current_token_id: ContextVar[str | None] = ContextVar(
     "current_token_id", default=None
 )
+
+
+def current_token_uuid() -> uuid.UUID | None:
+    """``current_token_id`` parsed to a ``uuid.UUID``, or ``None``.
+
+    Covers both "no PAT on this request" (JWT/OAuth/tokenless — the
+    ContextVar's own default) and "the stored value isn't a well-formed
+    UUID". The latter cannot happen from ``_resolve_pat`` today (it
+    always sets a real, stringified ``tokens.id``), but a consumer that
+    treats "no token" as "deny" (``vault_write_policy``'s guard) must
+    fail toward that same deny branch rather than let a ``ValueError``
+    escape, so malformed folds into ``None`` here rather than raising.
+    """
+    raw = current_token_id.get()
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
 
 # Request-scoped token metadata, set by ``auth_service.resolve_token`` for
 # rows from the tokens table. JWT / OAuth / internal paths leave these as
