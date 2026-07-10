@@ -41,6 +41,13 @@ are revoked through the same durable cleanup path, and the account stays
 inaccessible until the control plane explicitly activates it after committing
 its own membership authority.
 
+Managed PAT issuance likewise has a distinct
+`/admin/users/{user_ref}/managed-tokens` endpoint that requires a
+caller-selected UUID. The UUID becomes the actual AKB token primary key, so a
+control plane can durably record it before the remote call and revoke that exact
+token after an ambiguous response. Older AKB images return 404 on this path
+instead of silently minting a token under an unrelated server-generated ID.
+
 ## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
 
 `GET /health` no longer holds the chunks stats pool connection while awaiting
