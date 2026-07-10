@@ -12,8 +12,10 @@ and self-skip if unreachable.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import asyncpg
@@ -34,31 +36,45 @@ async def pool(monkeypatch):
     except Exception:
         pytest.skip("Postgres unreachable at AKB_TEST_DSN")
 
-    # Fresh-DB bootstrap: init.sql already has every prior migration's
-    # schema folded forward (see backend/app/db/init.sql), so applying it
-    # once + migration 044 on top is equivalent to the full ledger chain.
+    # Fresh-DB bootstrap: init.sql folds forward MOST prior migrations'
+    # schema, but not all — notably NOT `vault_external_git` (010) or the
+    # `events` outbox (015). Task 8's tests never exercised
+    # `check_vault_access` or `emit_event`, so 044-only was sufficient
+    # then; Task 9's guard calls both (the pre-existing external-git
+    # mirror check in `check_vault_access` unconditionally queries
+    # `vault_external_git` for any writer-role check, and the guard's own
+    # audit event needs `events`), so those two are applied here too.
     async with pg_pool.acquire() as conn:
         await conn.execute(_INIT_SQL_PATH.read_text())
 
     from app.db.postgres import _load_migration
     from app.repositories import vault_write_policy_repo
-    from app.services import auth_service
+    from app.services import access_service, auth_service, table_service
 
-    migration = _load_migration("044_vault_write_policy.py")
-    assert migration is not None
-    async with pg_pool.acquire() as conn:
-        await migration.migrate(conn=conn)
+    for filename in (
+        "010_external_git_mirror.py",
+        "015_events_outbox.py",
+        "044_vault_write_policy.py",
+    ):
+        migration = _load_migration(filename)
+        assert migration is not None
+        async with pg_pool.acquire() as conn:
+            await migration.migrate(conn=conn)
 
     async def _get_pool():
         return pg_pool
 
-    # Both modules resolve `get_pool` as a name bound into their own
+    # Every module resolves `get_pool` as a name bound into its own
     # namespace at import time (`from app.db.postgres import get_pool`),
     # so each needs its own patch target — patching only one leaves the
-    # other's conn=None fallback hitting the real (unreachable-from-here)
-    # app.db.postgres singleton pool.
+    # others' conn=None fallback hitting the real (unreachable-from-here)
+    # app.db.postgres singleton pool. access_service/table_service are
+    # needed from Task 9 on (the write-policy guard + akb_sql dual
+    # enforcement live there).
     monkeypatch.setattr(auth_service, "get_pool", _get_pool)
     monkeypatch.setattr(vault_write_policy_repo, "get_pool", _get_pool)
+    monkeypatch.setattr(access_service, "get_pool", _get_pool)
+    monkeypatch.setattr(table_service, "get_pool", _get_pool)
     monkeypatch.setattr(
         settings, "jwt_secret", "vwp-test-secret-at-least-32-bytes-long", raising=False
     )
@@ -85,6 +101,20 @@ async def _create_user(pg_pool) -> uuid.UUID:
     return user_id
 
 
+async def _create_admin_user(pg_pool) -> uuid.UUID:
+    user_id = uuid.uuid4()
+    suffix = uuid.uuid4().hex[:12]
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, username, email, password_hash, is_admin) "
+            "VALUES ($1, $2, $3, 'x', TRUE)",
+            user_id,
+            f"vwp-admin-{suffix}",
+            f"vwp-admin-{suffix}@example.com",
+        )
+    return user_id
+
+
 async def _create_vault(pg_pool, owner_id: uuid.UUID) -> uuid.UUID:
     vault_id = uuid.uuid4()
     async with pg_pool.acquire() as conn:
@@ -96,6 +126,40 @@ async def _create_vault(pg_pool, owner_id: uuid.UUID) -> uuid.UUID:
             owner_id,
         )
     return vault_id
+
+
+async def _create_named_vault(pg_pool, owner_id: uuid.UUID) -> tuple[uuid.UUID, str]:
+    """Like `_create_vault` but also returns the vault name — the guard
+    tests key off the name (`check_vault_access`/`execute_sql` both take
+    vault names, not ids)."""
+    vault_id = await _create_vault(pg_pool, owner_id)
+    async with pg_pool.acquire() as conn:
+        name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    return vault_id, name
+
+
+@contextmanager
+def _auth_context(token_id: uuid.UUID | str | None = None, scope=None):
+    """Simulate the request-scoped ContextVars `auth_service.resolve_token`
+    sets per-request (`app/models/vault_scope.py`). A JWT session leaves
+    both at their defaults (``None``); a PAT sets ``current_token_id`` to
+    the token's id (stringified, per `_resolve_pat`) and
+    ``current_vault_scope`` to its scope (``None`` if unscoped).
+
+    Resets via ``.reset(...)`` in ``finally`` — pytest-asyncio tasks in
+    this suite do not get a fresh ``contextvars.Context`` per test (see
+    ``TestContextVar`` above, which relies on the same fact), so a stray
+    ``.set()`` would otherwise leak into a later test.
+    """
+    from app.models.vault_scope import current_token_id, current_vault_scope
+
+    t1 = current_token_id.set(str(token_id) if token_id is not None else None)
+    t2 = current_vault_scope.set(scope)
+    try:
+        yield
+    finally:
+        current_token_id.reset(t1)
+        current_vault_scope.reset(t2)
 
 
 async def _create_token(pg_pool, user_id: uuid.UUID) -> uuid.UUID:
@@ -376,3 +440,255 @@ class TestContextVar:
             assert current_token_id.get() is None
         finally:
             current_token_id.reset(marker)
+
+
+class TestWritePolicyGuard:
+    """Task 9 — the enforcement guard in
+    ``access_service.check_vault_access``. Fires only for mutating roles
+    (writer/admin/owner) on a MARKED vault (a ``vault_write_policy`` row
+    exists): a granted PAT passes, an *unscoped* system admin bypasses
+    (+ a loud audit event), and everyone else — including the vault
+    OWNER and a JWT session — is denied. An unmarked vault is a
+    guaranteed no-op (existing behaviour, zero change).
+    """
+
+    async def test_jwt_session_write_to_marked_vault_is_403(self, pool):
+        """A2 core: a plain member with a real 'writer' ACL role, but no
+        PAT at all (the JWT-session shape — ``current_token_id`` stays at
+        its ``None`` default), is denied on a marked vault."""
+        from app.exceptions import ForbiddenError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        member_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vault_access (vault_id, user_id, role) VALUES ($1, $2, 'writer')",
+                vault_id, member_id,
+            )
+
+        with _auth_context(token_id=None, scope=None):
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(str(member_id), vault_name, required_role="writer")
+
+    async def test_vault_owner_without_grant_is_403(self, pool):
+        """The owner's own PAT exists (so this exercises the "token
+        present but not on the allowlist" branch, complementing the
+        no-token branch above) but was never granted — still denied.
+        Proves ownership does not substitute for a grant on a marked
+        vault (§5.1a: PAT-write-only)."""
+        from app.exceptions import ForbiddenError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        owner_token = await _create_token(pool, owner_id)  # never granted
+
+        with _auth_context(token_id=owner_token, scope=None):
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(str(owner_id), vault_name, required_role="writer")
+
+    async def test_granted_pat_passes(self, pool):
+        """A token on the allowlist passes regardless of the underlying
+        user's ACL role — here a user with NO vault_access row and who
+        is not the owner, proving the grant alone is sufficient (the
+        "class-agnostic... collector, gardener, operator" allowlist
+        design, not a re-derivation of ordinary ACL)."""
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        service_user_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        token_id = await _create_token(pool, service_user_id)
+        await repo.add_grant(vault_id, token_id, "admin-user")
+
+        with _auth_context(token_id=token_id, scope=None):
+            result = await check_vault_access(
+                str(service_user_id), vault_name, required_role="writer",
+            )
+
+        assert result["vault_id"] == vault_id
+
+    async def test_unscoped_admin_bypasses_and_emits_audit(self, pool):
+        """A3: a system admin with no PAT vault scope bypasses a marked
+        vault's guard — but LOUDLY, via a `vault.write_policy_admin_bypass`
+        event carrying managed_by/required_role/actor."""
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        admin_id = await _create_admin_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        with _auth_context(token_id=None, scope=None):
+            result = await check_vault_access(str(admin_id), vault_name, required_role="writer")
+
+        assert result["vault_id"] == vault_id
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_admin_bypass' "
+                "AND vault_id = $1",
+                vault_id,
+            )
+        assert event is not None
+        assert event["actor_id"] == str(admin_id)
+        payload = (
+            json.loads(event["payload"])
+            if isinstance(event["payload"], str) else event["payload"]
+        )
+        assert payload["managed_by"] == "collector:acme"
+        assert payload["required_role"] == "writer"
+
+    async def test_scoped_admin_token_is_still_blocked(self, pool):
+        """A *scoped* admin PAT must NOT get the A3 bypass — mirrors the
+        Option B scope guard's own "a scope only ever subtracts" rule.
+        The scope explicitly permits this vault so the earlier scope
+        guard doesn't itself raise first; this isolates the write-policy
+        guard's own admin-bypass branch."""
+        from app.exceptions import ForbiddenError
+        from app.models.vault_scope import VaultScope
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        admin_id = await _create_admin_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        admin_token = await _create_token(pool, admin_id)  # never granted
+
+        scope = VaultScope(prefixes=(), extra_vaults=frozenset({vault_name}))
+
+        with _auth_context(token_id=admin_token, scope=scope):
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(str(admin_id), vault_name, required_role="writer")
+
+    async def test_unmarked_vault_unaffected(self, pool):
+        """No `vault_write_policy` row ⇒ the guard is a complete no-op:
+        historical owner-bypass behaviour, unchanged."""
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        # No set_policy call — vault stays ungoverned.
+
+        with _auth_context(token_id=None, scope=None):
+            result = await check_vault_access(str(owner_id), vault_name, required_role="writer")
+
+        assert result["vault_id"] == vault_id
+        assert result["role"] == "owner"
+
+
+class TestAkbSqlDualEnforcement:
+    """Task 9 — `akb_sql`'s only `check_vault_access` call (the REST
+    route in ``tables.py``) asks for ``required_role="reader"`` per
+    referenced vault, so the mutating-role guard above never fires for
+    it. ``table_service.execute_sql`` re-checks directly against the
+    same allow-conditions, mirroring the pre-existing archived-vault
+    dual block in the same function.
+    """
+
+    async def test_akb_sql_dual_enforcement_blocks_vt_write(self, pool, monkeypatch):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services import table_service
+        from app.util.errors import VAULT_WRITE_MANAGED
+
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        def _poison():
+            raise AssertionError("must not reach the real executor — block happens before execution")
+
+        monkeypatch.setattr(table_service, "get_user_sql_executor", _poison)
+
+        with _auth_context(token_id=None, scope=None):
+            result = await table_service.execute_sql(
+                vault_names=[vault_name],
+                user_id=str(owner_id),
+                sql="UPDATE t SET x = 1",
+                is_admin=False,
+            )
+
+        assert result["code"] == VAULT_WRITE_MANAGED
+
+    async def test_akb_sql_dual_enforcement_admin_bypass(self, pool, monkeypatch):
+        """Admin-bypass twin: an unscoped admin is NOT blocked (the SQL
+        reaches the (stubbed) real executor) and the same loud audit
+        event fires as the access_service guard's A3 branch."""
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services import table_service
+
+        owner_id = await _create_user(pool)
+        admin_id = await _create_admin_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        calls = []
+
+        class _StubExecutor:
+            async def execute(self, **kwargs):
+                calls.append(kwargs)
+                return {"kind": "table_sql", "vaults": [], "result": "UPDATE 0"}
+
+        monkeypatch.setattr(table_service, "get_user_sql_executor", lambda: _StubExecutor())
+
+        with _auth_context(token_id=None, scope=None):  # unscoped admin
+            result = await table_service.execute_sql(
+                vault_names=[vault_name],
+                user_id=str(admin_id),
+                sql="UPDATE t SET x = 1",
+                is_admin=True,
+            )
+
+        assert len(calls) == 1  # fell through to the (stubbed) real executor
+        assert "code" not in result
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_admin_bypass' "
+                "AND vault_id = $1",
+                vault_id,
+            )
+        assert event is not None
+
+    async def test_akb_sql_multi_vault_blocks_on_the_second_referenced_vault(
+        self, pool, monkeypatch,
+    ):
+        """The dual-enforcement loop must examine EVERY referenced vault,
+        not just the first — an unmarked (harmless) vault listed before a
+        marked-and-blocked one must not let the statement slip through."""
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services import table_service
+        from app.util.errors import VAULT_WRITE_MANAGED
+
+        ok_owner_id = await _create_user(pool)
+        _ok_vault_id, ok_vault_name = await _create_named_vault(pool, ok_owner_id)
+        # ok_vault stays ungoverned — no set_policy call.
+
+        blocked_owner_id = await _create_user(pool)
+        blocked_vault_id, blocked_vault_name = await _create_named_vault(pool, blocked_owner_id)
+        await repo.set_policy(blocked_vault_id, "collector:acme", "admin-user")
+
+        def _poison():
+            raise AssertionError("must not reach the real executor — blocked before execution")
+
+        monkeypatch.setattr(table_service, "get_user_sql_executor", _poison)
+
+        with _auth_context(token_id=None, scope=None):  # no PAT, not admin
+            result = await table_service.execute_sql(
+                vault_names=[ok_vault_name, blocked_vault_name],
+                user_id=str(blocked_owner_id),
+                sql="UPDATE t SET x = 1",
+                is_admin=False,
+            )
+
+        assert result["code"] == VAULT_WRITE_MANAGED

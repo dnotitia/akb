@@ -11,7 +11,8 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from app.models.vault_scope import current_vault_scope
+from app.models.vault_scope import current_token_uuid, current_vault_scope
+from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
@@ -52,6 +53,22 @@ def validate_public_access(level: str) -> str:
 
 # ── Permission checks ───────────────────────────────────────
 
+async def _is_unscoped_system_admin(uid: uuid.UUID, conn) -> bool:
+    """True iff `uid` is a system admin AND this request's PAT (if any)
+    carries no vault scope — the A3 bypass condition for the
+    write-policy guard below.
+
+    A *scoped* admin PAT must NOT get this bypass: same "a scope only
+    ever subtracts authority" rule the Option B scope guard enforces a
+    few lines up in `check_vault_access`. Re-queries `users.is_admin`
+    (rather than reusing the one a few lines below) because this runs
+    BEFORE that existing short-circuit computes it.
+    """
+    if current_vault_scope.get() is not None:
+        return False
+    return bool(await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid))
+
+
 async def check_vault_access(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False,
@@ -64,6 +81,17 @@ async def check_vault_access(
 
     `allow_archived` lets a destructive lifecycle op (delete_vault) run
     on an archived vault; every normal mutating caller leaves it False.
+
+    Vault write-policy (P0 S3, design §5.1a): a MARKED vault (a
+    `vault_write_policy` row exists) accepts a mutating call
+    (writer/admin/owner) ONLY from a PAT on its `vault_write_grants`
+    allowlist — this denies even the vault OWNER and a JWT session. The
+    one escape hatch is an *unscoped* system admin, which bypasses with
+    a loud `vault.write_policy_admin_bypass` audit event (a *scoped*
+    admin PAT does not bypass). Consequence: `delete_vault` requests
+    required_role="admin", one of the guarded roles, so deleting a
+    MARKED vault also requires a grant or the admin bypass — the owner
+    alone cannot delete it.
     """
     pool = await get_pool()
     uid = uuid.UUID(user_id)
@@ -121,6 +149,51 @@ async def check_vault_access(
             raise ForbiddenError(
                 f"Token scope does not permit '{required_role}' on vault '{vault_name}'"
             )
+
+        # Vault write-policy guard (P0 S3, A2/A3 — see the docstring
+        # above). Sits BEFORE the is_admin / owner short-circuits below,
+        # same placement as the Option B scope guard above, so a MARKED
+        # vault denies every caller class unless granted — fail-CLOSED
+        # on absence, the opposite of the scope guard's "NULL scope ⇒
+        # unrestricted" fail-OPEN idiom above. Only fires for the same
+        # mutating roles as that guard.
+        if required_role in _MUTATING_ROLES:
+            policy = await write_policy_repo.get_policy(vault["id"], conn=conn)
+            if policy is not None:
+                token_id = current_token_uuid()
+                granted = token_id is not None and await write_policy_repo.is_granted(
+                    vault["id"], token_id, conn=conn,
+                )
+                if granted:
+                    return {
+                        "vault_id": vault["id"],
+                        "role": required_role,
+                        "status": vault["status"],
+                        "role_source": "write_policy_grant",
+                    }
+                if await _is_unscoped_system_admin(uid, conn):
+                    # A3: bypass, but LOUDLY — never a silent escape hatch.
+                    await emit_event(
+                        conn, "vault.write_policy_admin_bypass",
+                        vault_id=vault["id"],
+                        actor_id=str(uid),
+                        payload={
+                            "managed_by": policy["managed_by"],
+                            "required_role": required_role,
+                            "vault": vault_name,
+                        },
+                    )
+                    return {
+                        "vault_id": vault["id"],
+                        "role": "owner",
+                        "status": vault["status"],
+                        "role_source": "write_policy_admin_bypass",
+                    }
+                raise ForbiddenError(
+                    f"Vault '{vault_name}' is write-managed by "
+                    f"{policy['managed_by']}; writes require a granted "
+                    f"service token"
+                )
 
         # System admin bypasses all vault ACL
         is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
