@@ -17,6 +17,7 @@ from app.exceptions import (
 from app.repositories.events_repo import emit_event
 from app.services.auth_service import (
     REVOKE_REASON_ADMIN,
+    _hash_token,
     _revoke_sessions_in_conn,
     _unique_username,
 )
@@ -581,3 +582,35 @@ async def revoke_user_token(user_id: str, token_id: str, *, actor_id: str) -> di
     if needs_cleanup:
         await _cleanup_token_roles(pool, user_uuid, [token_uuid])
     return {"user_id": user_id, "token_id": token_id, "revoked": True}
+
+
+async def identify_user_token(raw_token: str, *, actor_id: str) -> dict:
+    """Map a presented token to exact ownership without authenticating it.
+
+    Legacy cleanup must also identify expired credentials and credentials owned
+    by suspended users. This path therefore performs a fingerprint lookup only;
+    it does not update last_used_at or apply the normal authentication filters.
+    """
+    token = _required(raw_token, "token")
+    if len(token) > 4096:
+        raise ValidationError("token is too long")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id, user_id FROM tokens WHERE token_hash = $1",
+                _hash_token(token),
+            )
+            if row is None:
+                raise NotFoundError("Token", "presented credential")
+            result = {
+                "user_id": str(row["user_id"]),
+                "token_id": str(row["id"]),
+            }
+            await emit_event(
+                conn,
+                "auth.token_identified",
+                actor_id=actor_id,
+                payload=result,
+            )
+            return result

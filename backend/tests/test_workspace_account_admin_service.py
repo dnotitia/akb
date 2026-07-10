@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import uuid
 
@@ -530,3 +531,64 @@ async def test_exact_owned_token_revocation_is_strict_and_cross_user_safe(servic
     )
     assert revoked == {"user_id": owner["user_id"], "token_id": str(token_id), "revoked": True}
     assert token_id in role_sync.revoked_tokens
+
+
+async def test_admin_identifies_expired_suspended_legacy_token_without_secret_leak(services):
+    pool, _, service = services
+    owner = await service.ensure_service_user(
+        username=f"governance-token-identify-{uuid.uuid4().hex[:8]}",
+        email=f"governance-token-identify-{uuid.uuid4().hex[:8]}@service.akb.invalid",
+        display_name=None,
+        actor_id="platform-service",
+    )
+    owner_id = uuid.UUID(owner["user_id"])
+    raw_token = "akb_legacy-secret-material-" + uuid.uuid4().hex
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    async with pool.acquire() as conn:
+        token_id = await conn.fetchval(
+            """
+            INSERT INTO tokens (
+                user_id, name, token_hash, token_prefix, key_class, expires_at
+            ) VALUES ($1, 'legacy-platform-bridge', $2, 'akb_legacy', 'pat', NOW() - INTERVAL '1 day')
+            RETURNING id
+            """,
+            owner_id,
+            token_hash,
+        )
+        await conn.execute(
+            "UPDATE users SET account_status = 'suspended' WHERE id = $1",
+            owner_id,
+        )
+
+    identified = await service.identify_user_token(
+        raw_token,
+        actor_id="platform-service",
+    )
+    assert identified == {
+        "user_id": owner["user_id"],
+        "token_id": str(token_id),
+    }
+    async with pool.acquire() as conn:
+        event = await conn.fetchrow(
+            """
+            SELECT actor_id, payload::text
+              FROM events
+             WHERE kind = 'auth.token_identified'
+               AND payload->>'token_id' = $1
+             ORDER BY id DESC LIMIT 1
+            """,
+            str(token_id),
+        )
+    assert event["actor_id"] == "platform-service"
+    assert raw_token not in event["payload"]
+    assert token_hash not in event["payload"]
+
+    from app.exceptions import NotFoundError
+
+    with pytest.raises(NotFoundError) as exc_info:
+        await service.identify_user_token(
+            raw_token + "-unknown",
+            actor_id="platform-service",
+        )
+    assert raw_token not in str(exc_info.value)
+    assert token_hash not in str(exc_info.value)

@@ -72,6 +72,32 @@ async def test_ensure_external_identity_forwards_verified_actor(monkeypatch):
     }
 
 
+async def test_token_identification_is_admin_only_and_never_returns_raw_token(monkeypatch):
+    from app.api.routes import access
+
+    raw_token = "akb_legacy-secret-material"
+    observed = {}
+
+    async def _identify(token, *, actor_id):
+        observed.update(token=token, actor_id=actor_id)
+        return {"user_id": "owner-id", "token_id": "token-id"}
+
+    monkeypatch.setattr(access, "identify_user_token", _identify)
+    request = access.IdentifyTokenRequest(token=raw_token)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await access.admin_identify_token(request, _user(admin=False))
+    assert exc_info.value.status_code == 403
+    assert observed == {}
+
+    admin = _user(admin=True)
+    result = await access.admin_identify_token(request, admin)
+    assert result == {"user_id": "owner-id", "token_id": "token-id"}
+    assert raw_token not in repr(request)
+    assert raw_token not in repr(result)
+    assert observed == {"token": raw_token, "actor_id": admin.user_id}
+
+
 async def test_governance_routes_are_explicit_in_openapi():
     from app.main import app
 
@@ -85,6 +111,7 @@ async def test_governance_routes_are_explicit_in_openapi():
         "/api/v1/admin/users/{user_id}/suspend",
         "/api/v1/admin/users/{user_id}/activate",
         "/api/v1/admin/users/{user_id}/tokens/{token_id}",
+        "/api/v1/admin/tokens/identify",
     }
     assert expected <= set(paths)
     assert "/api/v1/admin/users/proxy" not in paths
