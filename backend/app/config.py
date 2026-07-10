@@ -175,13 +175,21 @@ class Settings(BaseModel):
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
 
+    # Server-side gate for every username/password lifecycle operation.
+    # Defaults true so standalone OSS deployments retain registration,
+    # login, password change, and administrator/CLI reset behavior. Managed
+    # SSO-only tenants set false; this is independent from the SPA-only
+    # keycloak_sso_only redirect hint below.
+    local_auth_enabled: bool = True
+
     # Auth — Keycloak OIDC (OPTIONAL external IdP). Disabled by default.
     #
     # When `keycloak_enabled` is false NONE of these are read and AKB uses
     # local username/password + PAT exactly as before — the SSO routes
     # return 404 and zero Keycloak code runs. Enabling adds an SSO login
-    # path that, on success, JIT-provisions an AKB user (keyed by email)
-    # and issues a normal AKB JWT; the internal user model, PG-native
+    # path that, on success, resolves an exact issuer/subject binding. The
+    # default open mode may JIT-provision by verified email once and then
+    # persists that binding. It issues a normal AKB JWT; the internal user model, PG-native
     # RBAC, and PATs are all unchanged. Keycloak is authentication only —
     # it never drives AKB authorization.
     #
@@ -198,9 +206,9 @@ class Settings(BaseModel):
     # deployments where every account is provisioned through SSO and the
     # local form is more confusing than useful.
     #
-    # The login page still honours `?local=1` as an escape hatch so a
-    # local administrator can recover if the IdP is down. The /auth/login
-    # API remains live either way — the gate is purely a UX one.
+    # The login page still honours `?local=1` as a presentation escape hatch.
+    # It cannot bypass `local_auth_enabled=false`; keycloak_sso_only is never
+    # an authorization control.
     #
     # Ignored when `keycloak_enabled = false`.
     keycloak_sso_only: bool = False
@@ -218,13 +226,18 @@ class Settings(BaseModel):
     keycloak_client_secret: str = ""       # secret.yaml — blank for public (PKCE) clients
     keycloak_public_client: bool = False   # true → PKCE (no client_secret); false → confidential
     keycloak_verify_ssl: bool = True       # set false only for local self-signed Keycloak
-    # Identity is keyed on the verified email. By default we REQUIRE the
-    # id_token's `email_verified` claim to be true before provisioning /
-    # adopting an AKB user — otherwise an IdP that allows unverified or
+    # Exact identity is issuer/subject and does not require email. During the
+    # open-mode JIT/link fallback we REQUIRE the id_token's `email_verified`
+    # claim to be true before provisioning / adopting an AKB user — otherwise
+    # an IdP that allows unverified or
     # self-asserted emails (open self-registration, social federation)
     # becomes an account-spoofing vector. Set false ONLY for a trusted
     # realm where every account's email is controlled out-of-band.
     keycloak_require_verified_email: bool = True
+    # OIDC account admission policy. `open` preserves historical verified-email
+    # JIT/link behavior. `invite_only` accepts only an exact pre-provisioned
+    # (issuer, subject) binding. `disabled` rejects external login entirely.
+    keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
     # Link an SSO login to a pre-existing AKB account that has the SAME
     # email but a different auth_provider (e.g. a local/password account).
     #

@@ -45,8 +45,48 @@ CREATE TABLE IF NOT EXISTS users (
     -- password_hash is an unusable sentinel. Advisory only — Keycloak
     -- itself is gated by keycloak_enabled in config; when SSO is off this
     -- column is never read. See migration 033.
-    auth_provider TEXT NOT NULL DEFAULT 'local'
+    auth_provider TEXT NOT NULL DEFAULT 'local',
+    -- Account-state and principal-kind guards are additive. Compatibility
+    -- defaults preserve every pre-governance user as an active human.
+    account_status TEXT NOT NULL DEFAULT 'active'
+        CONSTRAINT users_account_status_check
+        CHECK (account_status IN ('active', 'suspended')),
+    account_kind TEXT NOT NULL DEFAULT 'human'
+        CONSTRAINT users_account_kind_check
+        CHECK (account_kind IN ('human', 'service'))
 );
+
+-- Stable external identity binding. Email is a mutable snapshot; verified
+-- OIDC issuer + subject is the permanent key.
+CREATE TABLE IF NOT EXISTS external_identities (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    email_snapshot TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT external_identities_issuer_subject_key UNIQUE (issuer, subject)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_identities_user
+    ON external_identities(user_id);
+
+-- Durable post-commit cleanup ledger. Token rows are deleted in the same
+-- transaction that suspends an account; PG token roles are DDL and are
+-- cleaned afterward. Failed DDL remains retryable without restoring a token.
+CREATE TABLE IF NOT EXISTS account_token_cleanup (
+    token_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_token_cleanup_pending
+    ON account_token_cleanup(user_id, requested_at)
+    WHERE completed_at IS NULL;
 
 -- ============================================================
 -- Personal Access Tokens (PAT)

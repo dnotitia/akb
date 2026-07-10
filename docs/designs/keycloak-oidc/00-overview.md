@@ -1,5 +1,13 @@
 # Keycloak OIDC login (optional external IdP) — Design
 
+> **2026-07-10 account-resolution amendment:**
+> [Workspace Account Governance](../../design/accepted/2026-07-10-workspace-account-governance/README.md)
+> supersedes this document's email-keyed identity and unconditional JIT model.
+> Exact verified `(issuer, subject)` is now resolved first. The standalone
+> default `keycloak_enrollment_mode=open` preserves the verified-email JIT/link
+> flow described below only as a first-binding compatibility fallback;
+> `invite_only` disables that fallback.
+
 **Status**: implemented + locally validated (real Keycloak 26 + browser e2e), awaiting review
 **Started**: 2026-06-07
 **Reference impl**: `seahorse-mcp-agent-server` (`app/auth.py`, `app/routers/auth.py`)

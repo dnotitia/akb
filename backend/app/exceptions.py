@@ -44,6 +44,95 @@ class ForbiddenError(AKBError):
         super().__init__(message, status_code=403)
 
 
+class LocalAuthDisabledError(AKBError):
+    """Stable, non-sensitive denial for disabled password authentication."""
+
+    def __init__(self):
+        super().__init__(
+            "Local password authentication is disabled",
+            status_code=403,
+            code="local_auth_disabled",
+        )
+
+
+class MembershipRequiredError(AKBError):
+    """A verified external user has no pre-provisioned AKB membership."""
+
+    def __init__(self):
+        super().__init__(
+            "This account is not provisioned for this AKB workspace",
+            status_code=403,
+            code="membership_required",
+        )
+
+
+class AccountSuspendedError(AKBError):
+    """The AKB-local account exists but is administratively suspended."""
+
+    def __init__(self):
+        super().__init__(
+            "This AKB account is suspended",
+            status_code=403,
+            code="account_suspended",
+        )
+
+
+class ExternalIdentityConflictError(AKBError):
+    """Verified external claims conflict with an existing stable binding."""
+
+    def __init__(self):
+        super().__init__(
+            "External identity conflicts with an existing AKB account",
+            status_code=409,
+            code="identity_conflict",
+        )
+
+
+class ExternalAuthDisabledError(AKBError):
+    """External authentication is disabled by deployment policy."""
+
+    def __init__(self):
+        super().__init__(
+            "External authentication is disabled",
+            status_code=403,
+            code="external_auth_disabled",
+        )
+
+
+class CredentialCleanupIncompleteError(AKBError):
+    """Credential denial landed, but strict derived-role cleanup is pending."""
+
+    def __init__(self, token_ids: list[str]):
+        super().__init__(
+            "Credential revocation is active but derived-role cleanup is incomplete",
+            status_code=503,
+            code="credential_cleanup_incomplete",
+            details={"token_ids": token_ids},
+        )
+
+
+class PasswordLifecycleUnavailableError(AKBError):
+    """The account intentionally has no local password lifecycle."""
+
+    def __init__(self):
+        super().__init__(
+            "Local password management is unavailable for this account",
+            status_code=409,
+            code="password_lifecycle_unavailable",
+        )
+
+
+class ExternalProfileReadOnlyError(AKBError):
+    """OIDC/service profile identity fields are controlled externally."""
+
+    def __init__(self):
+        super().__init__(
+            "Profile identity fields are managed by the external identity provider",
+            status_code=409,
+            code="external_profile_read_only",
+        )
+
+
 class WriteBusyError(AKBError):
     """Write admission timed out → HTTP 429.
 

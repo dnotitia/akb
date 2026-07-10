@@ -8,6 +8,16 @@ from app.services.auth_service import (
     REVOKE_REASON_ADMIN,
     revoke_all_sessions,
 )
+from app.services.account_service import (
+    activate_user,
+    ensure_human_external_identity,
+    ensure_service_user,
+    get_user,
+    get_user_by_external_identity,
+    revoke_user_token,
+    set_user_admin,
+    suspend_user,
+)
 from app.services.access_service import (
     archive_vault,
     delete_user_account,
@@ -49,6 +59,24 @@ class TransferRequest(NFCModel):
 class VaultPatchRequest(NFCModel):
     description: str | None = None
     public_access: str | None = None
+
+
+class EnsureExternalIdentityRequest(NFCModel):
+    issuer: str
+    subject: str
+    email: str
+    display_name: str | None = None
+    existing_user_id: str | None = None
+
+
+class EnsureServiceUserRequest(NFCModel):
+    username: str
+    email: str
+    display_name: str | None = None
+
+
+class SetUserRoleRequest(NFCModel):
+    is_admin: bool
 
 
 @router.get("/my/vaults", summary="List vaults accessible to me")
@@ -143,6 +171,125 @@ async def user_search(
 async def admin_list_users(user: AuthenticatedUser = Depends(get_current_user)):
     _require_admin(user)
     return {"users": await list_all_users_admin()}
+
+
+@router.post(
+    "/admin/users/ensure-external-identity",
+    summary="[admin] Ensure a human user and stable OIDC binding",
+)
+async def admin_ensure_external_identity(
+    req: EnsureExternalIdentityRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await ensure_human_external_identity(
+        issuer=req.issuer,
+        subject=req.subject,
+        email=req.email,
+        display_name=req.display_name,
+        existing_user_id=req.existing_user_id,
+        actor_id=user.user_id,
+    )
+
+
+@router.get(
+    "/admin/users/by-external-identity",
+    summary="[admin] Resolve a user by exact OIDC issuer and subject",
+)
+async def admin_get_user_by_external_identity(
+    issuer: str = Query(...),
+    subject: str = Query(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await get_user_by_external_identity(issuer, subject)
+
+
+@router.get(
+    "/admin/users/{user_id}/governance",
+    summary="[admin] Read account governance state by AKB user ID",
+)
+async def admin_get_governed_user(
+    user_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await get_user(user_id)
+
+
+@router.post(
+    "/admin/service-users/ensure",
+    summary="[admin] Ensure a non-interactive service user",
+)
+async def admin_ensure_service_user(
+    req: EnsureServiceUserRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await ensure_service_user(
+        username=req.username,
+        email=req.email,
+        display_name=req.display_name,
+        actor_id=user.user_id,
+    )
+
+
+@router.put(
+    "/admin/users/{user_id}/role",
+    summary="[admin] Project a human user's AKB administrator role",
+)
+async def admin_set_user_role(
+    user_id: str,
+    req: SetUserRoleRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await set_user_admin(
+        user_id,
+        is_admin=req.is_admin,
+        actor_id=user.user_id,
+    )
+
+
+@router.post(
+    "/admin/users/{user_id}/suspend",
+    summary="[admin] Suspend an account and revoke all credentials",
+)
+async def admin_suspend_user(
+    user_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await suspend_user(user_id, actor_id=user.user_id)
+
+
+@router.post(
+    "/admin/users/{user_id}/activate",
+    summary="[admin] Reactivate an account without restoring credentials",
+)
+async def admin_activate_user(
+    user_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await activate_user(user_id, actor_id=user.user_id)
+
+
+@router.delete(
+    "/admin/users/{user_id}/tokens/{token_id}",
+    summary="[admin] Revoke one exact user-owned token",
+)
+async def admin_revoke_user_token(
+    user_id: str,
+    token_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await revoke_user_token(
+        user_id,
+        token_id,
+        actor_id=user.user_id,
+    )
 
 
 @router.delete("/admin/users/{user_id}", summary="[admin] Delete a user + owned vaults")

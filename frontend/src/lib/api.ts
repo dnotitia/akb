@@ -154,14 +154,17 @@ export const authLogin = (username: string, password: string) =>
   }).then(parseAuthResponse);
 
 export interface AuthConfig {
+  // Optional for compatibility with AKB versions that predate the explicit
+  // server-side local-auth policy. Missing means the legacy enabled default.
+  local_auth?: { enabled: boolean };
   keycloak: {
     enabled: boolean;
     login_url: string | null;
-    // Optional — present on newer backends. When true the SPA
-    // bypasses the local form and redirects straight to Keycloak. A
-    // `?local=1` query param on the auth page is the escape hatch
-    // for local admins.
+    // UX preference only. `local_auth.enabled` remains the authoritative
+    // policy; `?local=1` may suppress automatic SSO navigation but cannot
+    // restore a server-disabled local form.
     sso_only?: boolean;
+    enrollment_mode?: "open" | "invite_only" | "disabled";
   };
   // Optional — present on newer backends. Tells the connect-snippet UI
   // whether the OAuth Resource Server path is live so it can offer
@@ -171,6 +174,7 @@ export interface AuthConfig {
 }
 
 const _AUTH_CONFIG_FALLBACK: AuthConfig = {
+  local_auth: { enabled: true },
   keycloak: { enabled: false, login_url: null, sso_only: false },
   mcp_oauth: { enabled: false },
 };

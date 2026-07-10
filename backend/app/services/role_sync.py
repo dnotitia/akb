@@ -425,6 +425,17 @@ class RoleSync:
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_token_revoke", e, token_id)
 
+    async def revoke_token_role_strict(self, token_id: uuid.UUID | str) -> None:
+        """Drop one token role and propagate failure to a control-plane caller.
+
+        Ordinary self-service revocation keeps the best-effort hook above. Managed
+        account suspension needs an explicit completion signal and persists failed
+        token IDs in ``account_token_cleanup`` for retry.
+        """
+        role = token_role_name(token_id)
+        async with self.pool.acquire() as conn:
+            await self._drop_role_if_present(conn, role)
+
     async def on_vault_create(
         self,
         vault_id: uuid.UUID | str,

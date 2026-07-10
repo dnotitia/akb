@@ -663,7 +663,8 @@ async def list_all_users_admin() -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT u.id, u.username, u.display_name, u.email, u.is_admin, u.created_at,
+            SELECT u.id, u.username, u.display_name, u.email, u.is_admin,
+                   u.auth_provider, u.account_status, u.account_kind, u.created_at,
                    (SELECT COUNT(*) FROM vaults v WHERE v.owner_id = u.id) AS owned_vaults
             FROM users u
             ORDER BY u.created_at
@@ -676,6 +677,9 @@ async def list_all_users_admin() -> list[dict]:
             "display_name": r["display_name"],
             "email": r["email"],
             "is_admin": r["is_admin"],
+            "auth_provider": r["auth_provider"],
+            "account_status": r["account_status"],
+            "account_kind": r["account_kind"],
             "created_at": r["created_at"].isoformat(),
             "owned_vaults": r["owned_vaults"],
         }

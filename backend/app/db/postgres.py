@@ -212,6 +212,7 @@ async def _apply_migrations() -> None:
         "040_tokens_vault_scope.py",            # tokens.vault_scope JSONB (per-PAT vault scope; NULL = unscoped)
         "041_tokens_key_class.py",              # tokens.key_class ('pat' default, 'service' BFF key, 'publishable' reserved seam)
         "042_vault_migrations.py",              # vault_migrations catalog for table migration idempotency/checksum replay
+        "043_workspace_account_governance.py",  # users account status/kind + stable external OIDC identities
     ):
         if filename in applied:
             continue

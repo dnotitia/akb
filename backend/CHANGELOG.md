@@ -5,6 +5,26 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
+
+AKB now preserves its existing local user UUID while binding verified OIDC
+identities by exact `(issuer, subject)`. The default remains standalone-safe:
+local authentication is enabled and OIDC enrollment is `open`. Managed
+deployments can opt into `invite_only` admission and disable registration,
+login, password change, and password reset at one server-side service boundary;
+the existing `keycloak_sso_only` flag remains a presentation hint only.
+
+Migration 043 adds compatibility-defaulted account status/kind columns, stable
+external identities, and a durable token-role cleanup ledger. New explicit
+administrator operations ensure human/service users, project administrator
+state, query bindings, suspend/reactivate accounts, and revoke exact owned
+tokens. Suspension atomically denies the account, invalidates JWTs, deletes all
+token classes, and then strictly cleans scoped PG roles with durable retry.
+
+Existing user IDs, JWT/PAT formats, Vault ownership, grants, and PG role names
+are unchanged. The pre-0.10 backend's register/login/PAT flow is verified
+against the expanded schema, and standalone local/open behavior remains covered.
+
 ## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
 
 `GET /health` no longer holds the chunks stats pool connection while awaiting

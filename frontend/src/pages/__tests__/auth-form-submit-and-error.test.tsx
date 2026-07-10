@@ -70,7 +70,7 @@ describe("AuthPage · login happy path", () => {
     mockedLogin.mockResolvedValue({ token: "tok-xyz" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(screen.getByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "pw-1234");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await waitFor(() =>
@@ -90,7 +90,7 @@ describe("AuthPage · register flow", () => {
     // Radix TabsTrigger renders as a button — getByText is the
     // narrowest selector that works in jsdom (Radix's tab role
     // assignment doesn't surface here consistently).
-    await u.click(screen.getByText("Register"));
+    await u.click(await screen.findByText("Register"));
     await u.type(screen.getByLabelText("Username"), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
     // 8+ chars — register now enforces a client-side minimum (matching the
@@ -117,7 +117,7 @@ describe("AuthPage · error surface", () => {
     mockedLogin.mockResolvedValue({ error: "Bad credentials" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(screen.getByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");
@@ -130,7 +130,7 @@ describe("AuthPage · error surface", () => {
     mockedLogin.mockResolvedValue({ error: "Bad credentials" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(screen.getByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await screen.findByRole("alert");
@@ -154,7 +154,7 @@ describe("AuthPage · guards & validation", () => {
   it("rejects a register password under 8 chars without calling the API", async () => {
     const u = userEvent.setup();
     renderAuth();
-    await u.click(screen.getByText("Register"));
+    await u.click(await screen.findByText("Register"));
     await u.type(screen.getByLabelText("Username"), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
     await u.type(screen.getByLabelText("Password"), "short");
@@ -168,7 +168,7 @@ describe("AuthPage · guards & validation", () => {
     mockedLogin.mockResolvedValue({});
     const u = userEvent.setup();
     renderAuth();
-    await u.type(screen.getByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText("Username"), "alice");
     await u.type(screen.getByLabelText("Password"), "pw-1234");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");
