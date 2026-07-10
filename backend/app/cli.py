@@ -28,7 +28,7 @@ REPAIR_RESOURCE_HASHES_USAGE = (
 
 
 async def _reset_password(username: str) -> int:
-    from app.exceptions import NotFoundError
+    from app.exceptions import AKBError, NotFoundError
     from app.services.password_service import reset_password
 
     try:
@@ -37,6 +37,10 @@ async def _reset_password(username: str) -> int:
         )
     except NotFoundError:
         print(f"User not found: {username}", file=sys.stderr)
+        return 1
+    except AKBError as error:
+        code = error.code or "reset_password_failed"
+        print(f"{code}: {error.message}", file=sys.stderr)
         return 1
     print(f"Temporary password for {uname}: {temp}")
     print("Share this with the user out-of-band. It cannot be retrieved again.")

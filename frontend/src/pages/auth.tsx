@@ -33,14 +33,16 @@ export default function AuthPage() {
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  // Unknown until the public server policy arrives. Keeping the form hidden
+  // during this short interval prevents a disabled login path from flashing.
+  const [localAuthEnabled, setLocalAuthEnabled] = useState<boolean | null>(null);
   const [ssoLoginUrl, setSsoLoginUrl] = useState<string | null>(null);
   // True while we're navigating away to Keycloak in sso_only mode — used
   // to suppress the form flash that would otherwise render between the
   // useEffect dispatching the redirect and the browser actually leaving.
   const [redirectingToSso, setRedirectingToSso] = useState(false);
-  // The escape hatch — `?local=1` forces the local form even when the
-  // backend has SSO-only mode on. Evaluated once at mount so a stale
-  // tab doesn't lose its escape after a config reload.
+  // `?local=1` suppresses automatic SSO navigation for recovery/debugging.
+  // It never overrides the server's local-auth policy.
   const localEscape = new URLSearchParams(window.location.search).has("local");
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
 
@@ -64,6 +66,10 @@ export default function AuthPage() {
     }
     // Optional Keycloak SSO: show the button only if the backend reports it on.
     getAuthConfig().then((cfg) => {
+      const localEnabled = cfg.local_auth?.enabled ?? true;
+      setLocalAuthEnabled(localEnabled);
+      if (!localEnabled) setMode("login");
+
       if (!cfg.keycloak.enabled || !cfg.keycloak.login_url) return;
       setSsoLoginUrl(cfg.keycloak.login_url);
       // SSO-only mode — every account goes through Keycloak, so skip
@@ -90,6 +96,7 @@ export default function AuthPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (localAuthEnabled !== true) return;
     setError("");
     // Backend change_password() enforces 8 chars but register() does not —
     // catch it here so a user can't create a password they can never change.
@@ -139,8 +146,8 @@ export default function AuthPage() {
 
   // SSO-only redirect in flight — suppress the form flash. The browser
   // is leaving in milliseconds; rendering the form would show it for a
-  // beat and look like a UI glitch. Local-escape (?local=1) bypasses
-  // this block via `redirectingToSso` staying false.
+  // beat and look like a UI glitch. `?local=1` may bypass this redirect,
+  // but the server policy still decides whether the local form exists.
   if (redirectingToSso) {
     return (
       <div className="relative flex min-h-screen items-center justify-center bg-background text-foreground">
@@ -195,45 +202,67 @@ export default function AuthPage() {
             <Logo size={40} subtitle />
           </div>
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-            <Tabs
-              value={mode}
-              onValueChange={(v) => {
-                setMode(v as Mode);
-                setError("");
-              }}
-            >
-              <TabsList className="mb-6 grid w-full grid-cols-2">
-                <TabsTrigger value="login" className="justify-center">Log in</TabsTrigger>
-                <TabsTrigger value="register" className="justify-center">Register</TabsTrigger>
-              </TabsList>
+            {localAuthEnabled === null && (
+              <div className="py-8 text-center coord" role="status" aria-live="polite">
+                Loading sign-in options…
+              </div>
+            )}
 
-              <TabsContent value="login">
-                <AuthForm
-                  mode="login"
-                  username={username} setUsername={setUsername}
-                  password={password} setPassword={setPassword}
-                  error={error} loading={loading} onSubmit={handleSubmit}
-                />
-              </TabsContent>
-              <TabsContent value="register">
-                <AuthForm
-                  mode="register"
-                  username={username} setUsername={setUsername}
-                  email={email} setEmail={setEmail}
-                  displayName={displayName} setDisplayName={setDisplayName}
-                  password={password} setPassword={setPassword}
-                  error={error} loading={loading} onSubmit={handleSubmit}
-                />
-              </TabsContent>
-            </Tabs>
+            {localAuthEnabled && (
+              <Tabs
+                value={mode}
+                onValueChange={(v) => {
+                  setMode(v as Mode);
+                  setError("");
+                }}
+              >
+                <TabsList className="mb-6 grid w-full grid-cols-2">
+                  <TabsTrigger value="login" className="justify-center">Log in</TabsTrigger>
+                  <TabsTrigger value="register" className="justify-center">Register</TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="login">
+                  <AuthForm
+                    mode="login"
+                    username={username} setUsername={setUsername}
+                    password={password} setPassword={setPassword}
+                    error={error} loading={loading} onSubmit={handleSubmit}
+                  />
+                </TabsContent>
+                <TabsContent value="register">
+                  <AuthForm
+                    mode="register"
+                    username={username} setUsername={setUsername}
+                    email={email} setEmail={setEmail}
+                    displayName={displayName} setDisplayName={setDisplayName}
+                    password={password} setPassword={setPassword}
+                    error={error} loading={loading} onSubmit={handleSubmit}
+                  />
+                </TabsContent>
+              </Tabs>
+            )}
+
+            {localAuthEnabled === false && error && (
+              <Alert variant="destructive" id="auth-error">
+                {error}
+              </Alert>
+            )}
+
+            {localAuthEnabled === false && !ssoLoginUrl && (
+              <Alert variant="destructive">
+                No sign-in method is available. Contact your administrator.
+              </Alert>
+            )}
 
             {ssoLoginUrl && (
-              <div className="mt-6">
-                <div className="mb-4 flex items-center gap-3">
-                  <div className="h-px flex-1 bg-border" aria-hidden />
-                  <span className="text-xs text-foreground-muted">or</span>
-                  <div className="h-px flex-1 bg-border" aria-hidden />
-                </div>
+              <div className={localAuthEnabled ? "mt-6" : error ? "mt-4" : ""}>
+                {localAuthEnabled && (
+                  <div className="mb-4 flex items-center gap-3">
+                    <div className="h-px flex-1 bg-border" aria-hidden />
+                    <span className="text-xs text-foreground-muted">or</span>
+                    <div className="h-px flex-1 bg-border" aria-hidden />
+                  </div>
+                )}
                 <Button type="button" variant="outline" size="lg" className="w-full" onClick={startSso}>
                   Sign in with SSO
                 </Button>

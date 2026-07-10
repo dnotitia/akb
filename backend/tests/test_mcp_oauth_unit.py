@@ -282,6 +282,36 @@ async def test_resolve_token_routes_rs256_to_keycloak_path(monkeypatch, rsa_keyp
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_maps_suspended_external_account_to_auth_failure(monkeypatch):
+    from app.exceptions import AccountSuspendedError
+    from app.services import auth_service, keycloak_oidc
+
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+    monkeypatch.setattr(
+        settings,
+        "mcp_oauth_audience",
+        "https://akb.example.com/mcp",
+        raising=False,
+    )
+
+    class StubOIDC:
+        async def verify_access_token(self, _token, _audience):
+            return {
+                "iss": "https://kc.example.com/realms/akb",
+                "sub": "suspended-subject",
+            }
+
+    async def _suspended(_claims):
+        raise AccountSuspendedError()
+
+    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: StubOIDC())
+    monkeypatch.setattr(auth_service, "_resolve_or_provision_keycloak_user", _suspended)
+
+    assert await auth_service.resolve_keycloak_access_token("signed-token") is None
+
+
+@pytest.mark.asyncio
 async def test_resolve_token_pat_unchanged(monkeypatch):
     """The PAT prefix path must not be perturbed by the new RS256 branch."""
     from app.services import auth_service
@@ -479,8 +509,8 @@ def test_metadata_route_full_shape_when_enabled(monkeypatch):
     assert "offline_access" in body["scopes_supported"]
     # OIDC base scopes are also advertised so spec-compliant MCP
     # clients (which request exactly scopes_supported) include them in
-    # DCR + authorize. Without these the access token carries `sub`
-    # only and AKB's email-keyed user matching falls through.
+    # DCR + authorize. Open-mode first-login fallback still needs email;
+    # exact issuer/subject bindings do not.
     assert "openid" in body["scopes_supported"]
     assert "profile" in body["scopes_supported"]
     assert "email" in body["scopes_supported"]

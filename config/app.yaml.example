@@ -98,23 +98,31 @@ jwt_algorithm: HS256
 jwt_expire_hours: 24
 
 # === Auth — Keycloak OIDC (OPTIONAL external IdP; OFF by default) ===
+# Local username/password lifecycle remains enabled by default. Managed SSO-only
+# deployments set this false; keycloak_sso_only alone only changes the login UI.
+# local_auth_enabled: true
+#
 # Leave keycloak_enabled false and AKB uses local username/password + PAT
 # exactly as before — none of the keys below are read and the SSO routes
-# return 404. Turn it on to add an SSO login button; on success AKB
-# JIT-provisions a user (by email) and issues a normal AKB JWT. Keycloak
-# is authentication only — it never drives AKB authorization.
-# Full design: docs/designs/keycloak-oidc/00-overview.md
+# return 404. Turn it on to add an SSO login button; on success AKB resolves
+# an exact (issuer, subject) binding. The default `open` mode preserves the
+# verified-email JIT/link fallback once, then persists that stable binding.
+# Keycloak is authentication only — it never drives AKB authorization.
+# Full designs: docs/designs/keycloak-oidc/00-overview.md and
+# docs/design/accepted/2026-07-10-workspace-account-governance/README.md
 #
 # keycloak_enabled: false
+# keycloak_enrollment_mode: open           # open | invite_only | disabled
 # keycloak_server_url: "https://auth.example.com"   # no /realms suffix (browser-facing; sets the issuer)
 # keycloak_internal_url: ""          # optional backchannel URL (server→Keycloak); blank → use server_url
 # keycloak_realm: "akb"
 # keycloak_client_id: "akb-web"
 # keycloak_public_client: false      # true → PKCE (no client_secret needed)
 # keycloak_verify_ssl: true          # false only for local self-signed Keycloak
-# keycloak_require_verified_email: true   # refuse id_tokens whose email_verified≠true
-#                                         # (identity is keyed on email). Set false ONLY
-#                                         # for a trusted realm with controlled emails.
+# keycloak_require_verified_email: true   # refuse unverified email for open-mode JIT/link.
+#                                         # Exact subject bindings need no email claim.
+#                                         # Set false ONLY for a trusted realm with
+#                                         # controlled emails.
 # keycloak_link_by_email: false           # link SSO to a pre-existing same-email account
 #                                         # (e.g. one the managed control plane provisioned).
 #                                         # Keeps the user_id/PATs; only links VERIFIED emails.

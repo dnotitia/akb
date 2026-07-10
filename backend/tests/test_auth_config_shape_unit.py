@@ -21,12 +21,16 @@ def _call() -> dict:
 def test_sso_only_field_present_and_true_when_both_flags_on(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_sso_only", True, raising=False)
+    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
+    monkeypatch.setattr(settings, "local_auth_enabled", False, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
 
     cfg = _call()
+    assert cfg["local_auth"] == {"enabled": False}
     assert cfg["keycloak"]["enabled"] is True
     assert cfg["keycloak"]["sso_only"] is True
     assert cfg["keycloak"]["login_url"] == "/api/v1/auth/keycloak/login"
+    assert cfg["keycloak"]["enrollment_mode"] == "invite_only"
 
 
 def test_sso_only_forced_false_when_keycloak_disabled(monkeypatch):
@@ -36,19 +40,23 @@ def test_sso_only_forced_false_when_keycloak_disabled(monkeypatch):
     the SPA stays on the local form."""
     monkeypatch.setattr(settings, "keycloak_enabled", False, raising=False)
     monkeypatch.setattr(settings, "keycloak_sso_only", True, raising=False)
+    monkeypatch.setattr(settings, "local_auth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
 
     cfg = _call()
     assert cfg["keycloak"]["enabled"] is False
     assert cfg["keycloak"]["sso_only"] is False
     assert cfg["keycloak"]["login_url"] is None
+    assert cfg["local_auth"] == {"enabled": True}
 
 
 def test_sso_only_default_false_in_hybrid_mode(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_sso_only", False, raising=False)
+    monkeypatch.setattr(settings, "local_auth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
 
     cfg = _call()
     assert cfg["keycloak"]["enabled"] is True
     assert cfg["keycloak"]["sso_only"] is False
+    assert cfg["local_auth"] == {"enabled": True}

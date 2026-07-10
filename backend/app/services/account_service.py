@@ -1,0 +1,583 @@
+"""Administrative account projection for external control planes."""
+
+from __future__ import annotations
+
+import uuid
+
+import asyncpg
+
+from app.db.postgres import get_pool
+from app.exceptions import (
+    AccountSuspendedError,
+    CredentialCleanupIncompleteError,
+    ExternalIdentityConflictError,
+    NotFoundError,
+    ValidationError,
+)
+from app.repositories.events_repo import emit_event
+from app.services.auth_service import (
+    REVOKE_REASON_ADMIN,
+    _revoke_sessions_in_conn,
+    _unique_username,
+)
+from app.services.role_sync import get_role_sync
+
+
+_HUMAN_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
+_SERVICE_SENTINEL_HASH = "!service-account:no-local-login!"
+
+
+def _required(value: str, field: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValidationError(f"{field} is required")
+    return normalized
+
+
+def _uuid(value: str, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValidationError(f"{field} must be a UUID") from None
+
+
+def _user_result(row) -> dict:
+    return {
+        "user_id": str(row["id"]),
+        "username": row["username"],
+        "email": row["email"],
+        "display_name": row["display_name"],
+        "is_admin": row["is_admin"],
+        "account_status": row["account_status"],
+        "account_kind": row["account_kind"],
+        "auth_provider": row["auth_provider"],
+    }
+
+
+async def _fetch_user(conn, user_id: uuid.UUID):
+    return await conn.fetchrow(
+        """
+        SELECT id, username, email, display_name, is_admin,
+               auth_provider, account_status, account_kind
+          FROM users WHERE id = $1
+        """,
+        user_id,
+    )
+
+
+async def ensure_human_external_identity(
+    *,
+    issuer: str,
+    subject: str,
+    email: str,
+    display_name: str | None,
+    actor_id: str,
+    existing_user_id: str | None = None,
+) -> dict:
+    issuer = _required(issuer, "issuer")
+    subject = _required(subject, "subject")
+    email = _required(email, "email").lower()
+    existing_user_uuid = (
+        _uuid(existing_user_id, "existing_user_id")
+        if existing_user_id is not None
+        else None
+    )
+    pool = await get_pool()
+    new_user_id: uuid.UUID | None = None
+
+    async with pool.acquire() as conn:
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"external-identity:{len(issuer)}:{issuer}{subject}",
+                )
+                bound = await conn.fetchrow(
+                    """
+                    SELECT u.id, u.account_kind
+                      FROM external_identities e
+                      JOIN users u ON u.id = e.user_id
+                     WHERE e.issuer = $1 AND e.subject = $2
+                     FOR UPDATE OF u
+                    """,
+                    issuer,
+                    subject,
+                )
+                if bound is not None:
+                    if (
+                        bound["account_kind"] != "human"
+                        or (
+                            existing_user_uuid is not None
+                            and bound["id"] != existing_user_uuid
+                        )
+                    ):
+                        raise ExternalIdentityConflictError()
+                    user_id = bound["id"]
+                    await conn.execute(
+                        """
+                        UPDATE users
+                           SET email = $2,
+                               display_name = COALESCE($3, display_name),
+                               auth_provider = 'keycloak', updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        user_id,
+                        email,
+                        display_name,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE external_identities
+                           SET email_snapshot = $3, last_seen_at = NOW()
+                         WHERE user_id = $1 AND issuer = $2 AND subject = $4
+                        """,
+                        user_id,
+                        issuer,
+                        email,
+                        subject,
+                    )
+                else:
+                    if existing_user_uuid is not None:
+                        target = await conn.fetchrow(
+                            """
+                            SELECT id, account_kind
+                              FROM users WHERE id = $1
+                             FOR UPDATE
+                            """,
+                            existing_user_uuid,
+                        )
+                        if target is None:
+                            raise NotFoundError("User", str(existing_user_uuid))
+                        if target["account_kind"] != "human":
+                            raise ExternalIdentityConflictError()
+                        email_owner = await conn.fetchval(
+                            "SELECT id FROM users WHERE email = $1",
+                            email,
+                        )
+                        if email_owner is not None and email_owner != existing_user_uuid:
+                            raise ExternalIdentityConflictError()
+                        user_id = existing_user_uuid
+                        await conn.execute(
+                            """
+                            UPDATE users
+                               SET email = $2, auth_provider = 'keycloak',
+                                   display_name = COALESCE($3, display_name),
+                                   updated_at = NOW()
+                             WHERE id = $1
+                            """,
+                            user_id,
+                            email,
+                            display_name,
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, account_kind
+                              FROM users WHERE email = $1
+                             FOR UPDATE
+                            """,
+                            email,
+                        )
+                        if len(rows) > 1:
+                            raise ExternalIdentityConflictError()
+                        if rows:
+                            user_id = rows[0]["id"]
+                            if rows[0]["account_kind"] != "human":
+                                raise ExternalIdentityConflictError()
+                            has_identity = await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM external_identities WHERE user_id = $1)",
+                                user_id,
+                            )
+                            if has_identity:
+                                raise ExternalIdentityConflictError()
+                            await conn.execute(
+                                """
+                                UPDATE users
+                                   SET auth_provider = 'keycloak',
+                                       display_name = COALESCE($2, display_name),
+                                       updated_at = NOW()
+                                 WHERE id = $1
+                                """,
+                                user_id,
+                                display_name,
+                            )
+                        else:
+                            user_id = uuid.uuid4()
+                            username = await _unique_username(conn, email.split("@")[0])
+                            await conn.execute(
+                                """
+                                INSERT INTO users (
+                                    id, username, email, password_hash, display_name,
+                                    is_admin, auth_provider, account_status, account_kind
+                                ) VALUES ($1, $2, $3, $4, $5, false, 'keycloak',
+                                          'active', 'human')
+                                """,
+                                user_id,
+                                username,
+                                email,
+                                _HUMAN_SENTINEL_HASH,
+                                display_name,
+                            )
+                            new_user_id = user_id
+
+                    await conn.execute(
+                        """
+                        INSERT INTO external_identities (
+                            user_id, issuer, subject, email_snapshot
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        user_id,
+                        issuer,
+                        subject,
+                        email,
+                    )
+
+                await emit_event(
+                    conn,
+                    "auth.external_identity_ensured",
+                    actor_id=actor_id,
+                    payload={
+                        "user_id": str(user_id),
+                        "issuer": issuer,
+                        "subject": subject,
+                    },
+                )
+        except asyncpg.UniqueViolationError:
+            raise ExternalIdentityConflictError() from None
+
+        row = await _fetch_user(conn, user_id)
+
+    if new_user_id is not None:
+        await get_role_sync().on_user_create(new_user_id)
+    return _user_result(row)
+
+
+async def ensure_service_user(
+    *,
+    username: str,
+    email: str,
+    display_name: str | None,
+    actor_id: str,
+) -> dict:
+    username = _required(username, "username")
+    email = _required(email, "email").lower()
+    pool = await get_pool()
+    new_user_id: uuid.UUID | None = None
+
+    async with pool.acquire() as conn:
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"service-user:{len(username)}:{username}{email}",
+                )
+                rows = await conn.fetch(
+                    """
+                    SELECT id, username, email, account_kind
+                      FROM users
+                     WHERE username = $1 OR email = $2
+                     FOR UPDATE
+                    """,
+                    username,
+                    email,
+                )
+                if rows:
+                    if (
+                        len(rows) != 1
+                        or rows[0]["username"] != username
+                        or rows[0]["email"] != email
+                        or rows[0]["account_kind"] != "service"
+                    ):
+                        raise ExternalIdentityConflictError()
+                    user_id = rows[0]["id"]
+                    await conn.execute(
+                        """
+                        UPDATE users
+                           SET display_name = COALESCE($2, display_name),
+                               updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        user_id,
+                        display_name,
+                    )
+                else:
+                    user_id = uuid.uuid4()
+                    await conn.execute(
+                        """
+                        INSERT INTO users (
+                            id, username, email, password_hash, display_name,
+                            is_admin, auth_provider, account_status, account_kind
+                        ) VALUES ($1, $2, $3, $4, $5, false, 'service',
+                                  'active', 'service')
+                        """,
+                        user_id,
+                        username,
+                        email,
+                        _SERVICE_SENTINEL_HASH,
+                        display_name,
+                    )
+                    new_user_id = user_id
+
+                await emit_event(
+                    conn,
+                    "auth.service_user_ensured",
+                    actor_id=actor_id,
+                    payload={"user_id": str(user_id)},
+                )
+        except asyncpg.UniqueViolationError:
+            raise ExternalIdentityConflictError() from None
+
+        row = await _fetch_user(conn, user_id)
+
+    if new_user_id is not None:
+        await get_role_sync().on_user_create(new_user_id)
+    return _user_result(row)
+
+
+async def get_user(user_id: str) -> dict:
+    user_uuid = _uuid(user_id, "user_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await _fetch_user(conn, user_uuid)
+    if row is None:
+        raise NotFoundError("User", user_id)
+    return _user_result(row)
+
+
+async def get_user_by_external_identity(issuer: str, subject: str) -> dict:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
+                   u.auth_provider, u.account_status, u.account_kind
+              FROM external_identities e
+              JOIN users u ON u.id = e.user_id
+             WHERE e.issuer = $1 AND e.subject = $2
+            """,
+            _required(issuer, "issuer"),
+            _required(subject, "subject"),
+        )
+    if row is None:
+        raise NotFoundError("External identity", f"{issuer}#{subject}")
+    return _user_result(row)
+
+
+async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict:
+    user_uuid = _uuid(user_id, "user_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow(
+                """
+                SELECT account_status, account_kind
+                  FROM users WHERE id = $1
+                   FOR UPDATE
+                """,
+                user_uuid,
+            )
+            if current is None or current["account_kind"] != "human":
+                raise NotFoundError("Human user", user_id)
+            if is_admin and current["account_status"] != "active":
+                raise AccountSuspendedError()
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                   SET is_admin = $2, updated_at = NOW()
+                 WHERE id = $1
+             RETURNING id, username, email, display_name, is_admin,
+                       auth_provider, account_status, account_kind
+                """,
+                user_uuid,
+                is_admin,
+            )
+            await emit_event(
+                conn,
+                "auth.user_role_changed",
+                actor_id=actor_id,
+                payload={"user_id": user_id, "is_admin": is_admin},
+            )
+    return _user_result(row)
+
+
+async def _cleanup_token_roles(pool, user_id: uuid.UUID, token_ids: list[uuid.UUID]) -> None:
+    failed: list[str] = []
+    for token_id in token_ids:
+        try:
+            await get_role_sync().revoke_token_role_strict(token_id)
+        except Exception as error:  # noqa: BLE001
+            failed.append(str(token_id))
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE account_token_cleanup
+                       SET attempts = attempts + 1, last_error = $2
+                     WHERE token_id = $1 AND user_id = $3
+                    """,
+                    token_id,
+                    type(error).__name__,
+                    user_id,
+                )
+        else:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE account_token_cleanup
+                       SET attempts = attempts + 1, completed_at = NOW(),
+                           last_error = NULL
+                     WHERE token_id = $1 AND user_id = $2
+                    """,
+                    token_id,
+                    user_id,
+                )
+    if failed:
+        raise CredentialCleanupIncompleteError(failed)
+
+
+async def suspend_user(user_id: str, *, actor_id: str) -> dict:
+    user_uuid = _uuid(user_id, "user_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
+                user_uuid,
+            )
+            if row is None:
+                raise NotFoundError("User", user_id)
+
+            if row["account_status"] == "active":
+                await conn.execute(
+                    """
+                    UPDATE users
+                       SET account_status = 'suspended', updated_at = NOW()
+                     WHERE id = $1
+                    """,
+                    user_uuid,
+                )
+                await _revoke_sessions_in_conn(
+                    conn,
+                    user_uuid,
+                    actor_id=actor_id,
+                    reason=REVOKE_REASON_ADMIN,
+                )
+                deleted = await conn.fetch(
+                    "DELETE FROM tokens WHERE user_id = $1 RETURNING id",
+                    user_uuid,
+                )
+                token_ids = [record["id"] for record in deleted]
+                if token_ids:
+                    await conn.executemany(
+                        """
+                        INSERT INTO account_token_cleanup (token_id, user_id)
+                        VALUES ($1, $2)
+                        ON CONFLICT (token_id) DO NOTHING
+                        """,
+                        [(token_id, user_uuid) for token_id in token_ids],
+                    )
+                await emit_event(
+                    conn,
+                    "auth.account_suspended",
+                    actor_id=actor_id,
+                    payload={
+                        "user_id": user_id,
+                        "revoked_token_ids": [str(token_id) for token_id in token_ids],
+                    },
+                )
+            else:
+                pending = await conn.fetch(
+                    """
+                    SELECT token_id FROM account_token_cleanup
+                     WHERE user_id = $1 AND completed_at IS NULL
+                     ORDER BY requested_at, token_id
+                    """,
+                    user_uuid,
+                )
+                token_ids = [record["token_id"] for record in pending]
+
+    await _cleanup_token_roles(pool, user_uuid, token_ids)
+    return {
+        "user_id": user_id,
+        "account_status": "suspended",
+        "revoked_token_ids": [str(token_id) for token_id in token_ids],
+    }
+
+
+async def activate_user(user_id: str, *, actor_id: str) -> dict:
+    user_uuid = _uuid(user_id, "user_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                   SET account_status = 'active', updated_at = NOW()
+                 WHERE id = $1
+             RETURNING id, username, email, display_name, is_admin,
+                       auth_provider, account_status, account_kind
+                """,
+                user_uuid,
+            )
+            if row is None:
+                raise NotFoundError("User", user_id)
+            await emit_event(
+                conn,
+                "auth.account_activated",
+                actor_id=actor_id,
+                payload={"user_id": user_id},
+            )
+    return _user_result(row)
+
+
+async def revoke_user_token(user_id: str, token_id: str, *, actor_id: str) -> dict:
+    """Revoke one exact user-owned token and strictly drop its derived role."""
+    user_uuid = _uuid(user_id, "user_id")
+    token_uuid = _uuid(token_id, "token_id")
+    pool = await get_pool()
+    needs_cleanup = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            locked_user_id = await conn.fetchval(
+                "SELECT id FROM users WHERE id = $1 FOR UPDATE",
+                user_uuid,
+            )
+            if locked_user_id is None:
+                raise NotFoundError("User", user_id)
+            deleted = await conn.fetchval(
+                "DELETE FROM tokens WHERE id = $1 AND user_id = $2 RETURNING id",
+                token_uuid,
+                user_uuid,
+            )
+            cleanup = await conn.fetchrow(
+                """
+                SELECT completed_at FROM account_token_cleanup
+                 WHERE token_id = $1 AND user_id = $2
+                """,
+                token_uuid,
+                user_uuid,
+            )
+            if deleted is None and cleanup is None:
+                raise NotFoundError("Token", token_id)
+            if deleted is not None:
+                await conn.execute(
+                    """
+                    INSERT INTO account_token_cleanup (token_id, user_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT (token_id) DO NOTHING
+                    """,
+                    token_uuid,
+                    user_uuid,
+                )
+                needs_cleanup = True
+                await emit_event(
+                    conn,
+                    "auth.token_revoked",
+                    actor_id=actor_id,
+                    payload={"user_id": user_id, "token_id": token_id},
+                )
+            elif cleanup["completed_at"] is None:
+                needs_cleanup = True
+
+    if needs_cleanup:
+        await _cleanup_token_roles(pool, user_uuid, [token_uuid])
+    return {"user_id": user_id, "token_id": token_id, "revoked": True}

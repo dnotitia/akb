@@ -1,7 +1,8 @@
 // RTL coverage for the AuthPage `sso_only` mode: when the backend
 // advertises `keycloak.sso_only = true`, the page must redirect to
 // Keycloak immediately without rendering the local username/password
-// form. `?local=1` is the escape hatch that keeps the form alive.
+// form. `?local=1` suppresses automatic navigation, but only keeps the
+// form alive when the server has not disabled local authentication.
 //
 // Both checks pin down the documented contract — drift here would
 // either trap admins (no escape) or strand SSO-only deployments with
@@ -124,6 +125,26 @@ describe("AuthPage — SSO-only mode", () => {
     ).toBeInTheDocument();
     // No redirect dispatched.
     expect(hrefAssignments).toEqual([]);
+  });
+
+  it("`?local=1` cannot restore a server-disabled local auth form", async () => {
+    stubbedSearch = "?local=1";
+    vi.mocked(getAuthConfig).mockResolvedValue({
+      local_auth: { enabled: false },
+      keycloak: {
+        enabled: true,
+        login_url: "/api/v1/auth/keycloak/login",
+        sso_only: true,
+        enrollment_mode: "invite_only",
+      },
+    });
+
+    renderAuth();
+
+    expect(
+      await screen.findByRole("button", { name: /Sign in with SSO/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Username/i)).toBeNull();
   });
 
   it("`?sso_error=…` suppresses the auto-redirect even in sso_only mode", async () => {

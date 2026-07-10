@@ -15,8 +15,13 @@ import secrets
 from typing import Literal
 
 from app.db.postgres import get_pool
-from app.exceptions import NotFoundError
+from app.exceptions import (
+    AccountSuspendedError,
+    NotFoundError,
+    PasswordLifecycleUnavailableError,
+)
 from app.repositories.events_repo import emit_event
+from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_service import (
     REVOKE_REASON_PASSWORD_RESET,
     _revoke_sessions_in_conn,
@@ -46,15 +51,24 @@ async def reset_password(
     Returns (temp_password, username). `actor_id` is None for CLI invocations
     (no authenticated principal); audit event carries `method` to distinguish.
     """
+    require_local_auth_enabled()
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT id, username FROM users WHERE username = $1",
+                """
+                SELECT id, username, auth_provider, account_status, account_kind
+                  FROM users WHERE username = $1
+                   FOR UPDATE
+                """,
                 username,
             )
             if row is None:
                 raise NotFoundError("User", username)
+            if row["account_status"] != "active":
+                raise AccountSuspendedError()
+            if row["auth_provider"] != "local" or row["account_kind"] != "human":
+                raise PasswordLifecycleUnavailableError()
 
             temp = generate_temp_password()
             await conn.execute(

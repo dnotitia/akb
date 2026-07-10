@@ -81,13 +81,18 @@ async def auth_config():
     optional MCP-OAuth path is live so connector UIs can offer the
     OAuth snippet alongside the PAT one. Reveals no secrets."""
     return {
+        "local_auth": {
+            "enabled": settings.local_auth_enabled,
+        },
         "keycloak": {
             "enabled": settings.keycloak_enabled,
+            "enrollment_mode": settings.keycloak_enrollment_mode,
             # SPA appends ?redirect=<path> when navigating here.
             "login_url": "/api/v1/auth/keycloak/login" if settings.keycloak_enabled else None,
             # SSO-only mode — when true the SPA skips the local login
-            # form and redirects straight to Keycloak (with `?local=1`
-            # as an escape hatch). Forced to false when SSO itself is
+            # form and redirects straight to Keycloak. `?local=1` changes
+            # presentation only and cannot bypass local_auth.enabled. Forced
+            # to false when SSO itself is
             # off so a mis-toggled deployment can't trap users at a
             # broken redirect.
             "sso_only": settings.keycloak_sso_only and settings.keycloak_enabled,
@@ -258,7 +263,7 @@ async def keycloak_callback(request: Request):
     except AKBError as e:
         # Don't leak detail into the URL; log server-side, show a code.
         logger.warning("Keycloak SSO callback failed: %s", e)
-        return _sso_error_redirect("auth_failed")
+        return _sso_error_redirect(_public_sso_error_reason(e))
 
     # Hand the SPA a one-time code; the token is delivered via POST /exchange.
     # Stash the Keycloak id_token too so the SPA can pass it back as
@@ -312,6 +317,12 @@ def _sso_error_redirect(reason: str) -> RedirectResponse:
         f"/auth?sso_error={urllib.parse.quote(reason, safe='')}",
         status_code=status.HTTP_302_FOUND,
     )
+
+
+def _public_sso_error_reason(error: AKBError) -> str:
+    """Expose only stable, non-sensitive membership/account reason codes."""
+    allowed = {"membership_required", "account_suspended", "identity_conflict"}
+    return error.code if error.code in allowed else "auth_failed"
 
 
 @router.get("/auth/me", summary="Get current user info")

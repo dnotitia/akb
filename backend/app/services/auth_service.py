@@ -21,9 +21,22 @@ import jwt
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AuthenticationError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import (
+    AKBError,
+    AccountSuspendedError,
+    AuthenticationError,
+    ConflictError,
+    ExternalAuthDisabledError,
+    ExternalIdentityConflictError,
+    ExternalProfileReadOnlyError,
+    MembershipRequiredError,
+    NotFoundError,
+    PasswordLifecycleUnavailableError,
+    ValidationError,
+)
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
+from app.services.auth_policy import require_local_auth_enabled
 from app.services.role_sync import get_role_sync
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
@@ -191,6 +204,7 @@ def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
 # ── User operations ─────────────────────────────────────────
 
 async def register(username: str, email: str, password: str, display_name: str | None = None) -> dict:
+    require_local_auth_enabled()
     pool = await get_pool()
     pw_hash = hash_password(password)
     user_id = uuid.uuid4()
@@ -234,42 +248,54 @@ async def register(username: str, email: str, password: str, display_name: str |
 
 
 async def login(username: str, password: str) -> dict:
+    require_local_auth_enabled()
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, username, email, password_hash, display_name, is_admin,
-                   tokens_revoked_before, auth_provider
-              FROM users WHERE username = $1 OR email = $1
-            """,
-            username,
-        )
-        # SSO-provisioned accounts have no usable local password. Reject
-        # the local-login path explicitly with the same generic message
-        # so we don't leak which accounts are SSO-backed.
-        if row and row["auth_provider"] != "local":
-            raise AuthenticationError("Invalid credentials")
-        if not row or not verify_password(password, row["password_hash"]):
-            raise AuthenticationError("Invalid credentials")
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, username, email, password_hash, display_name, is_admin,
+                       tokens_revoked_before, auth_provider,
+                       account_status, account_kind
+                  FROM users WHERE username = $1 OR email = $1
+                   FOR SHARE
+                """,
+                username,
+            )
+            if (
+                row
+                and row["account_status"] != "active"
+                and row["account_kind"] == "human"
+            ):
+                raise AccountSuspendedError()
+            # SSO-provisioned accounts have no usable local password. Reject
+            # the local-login path explicitly with the same generic message
+            # so we don't leak which accounts are SSO-backed.
+            if row and (
+                row["auth_provider"] != "local" or row["account_kind"] != "human"
+            ):
+                raise AuthenticationError("Invalid credentials")
+            if not row or not verify_password(password, row["password_hash"]):
+                raise AuthenticationError("Invalid credentials")
 
-        # Push iat past the revocation cutoff so a login in the same
-        # whole second as a revoke (admin reset, change_password) still
-        # yields a usable token. resolve_token compares against
-        # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
-        not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
-        token = create_jwt(
-            str(row["id"]), row["username"], not_before=not_before,
-        )
-        return {
-            "token": token,
-            "user": {
-                "id": str(row["id"]),
-                "username": row["username"],
-                "email": row["email"],
-                "display_name": row["display_name"],
-                "is_admin": row["is_admin"],
-            },
-        }
+            # Push iat past the revocation cutoff so a login in the same
+            # whole second as a revoke (admin reset, change_password) still
+            # yields a usable token. resolve_token compares against
+            # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
+            not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+            token = create_jwt(
+                str(row["id"]), row["username"], not_before=not_before,
+            )
+            return {
+                "token": token,
+                "user": {
+                    "id": str(row["id"]),
+                    "username": row["username"],
+                    "email": row["email"],
+                    "display_name": row["display_name"],
+                    "is_admin": row["is_admin"],
+                },
+            }
 
 
 # ── Keycloak SSO (optional external IdP) ─────────────────────────────
@@ -293,167 +319,262 @@ async def _unique_username(conn, base: str | None) -> str:
     return f"{base}-{secrets.token_hex(4)}"
 
 
-async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
-    """Map a verified Keycloak claim set (ID token *or* access token) to
-    an AKB user row, JIT-provisioning on first sight. Shared by the SSO
-    browser callback and the MCP OAuth Resource Server path.
+def _external_identity_key(claims: dict) -> tuple[str, str]:
+    issuer = str(claims.get("iss") or "").strip()
+    subject = str(claims.get("sub") or "").strip()
+    if not issuer or not subject:
+        raise AuthenticationError("Identity provider token has no issuer or subject")
+    return issuer, subject
 
-    Returns a dict with keys:
-        user_id, username, email, display_name, is_admin,
-        not_before (datetime | None — pin for AKB JWT iat when caller
-                    is minting one; ignored on the MCP path),
-        newly_provisioned (bool — caller must run RoleSync.on_user_create
-                           when True, outside the DB connection scope).
 
-    Raises ``AuthenticationError`` / ``ConflictError`` on the same
-    conditions the SSO callback does (missing email, unverified email
-    with strict policy on, cross-provider account conflict).
-    """
-    email = (claims.get("email") or "").strip().lower()
-    if not email:
-        # AKB keys identity on email; without it we cannot map to a user.
-        raise AuthenticationError("Keycloak account has no email claim")
-    # Identity is keyed on email — refuse unverified emails so a realm that
-    # permits self-asserted addresses can't be used to provision/adopt an
-    # AKB account under someone else's email. Gated so a trusted realm can
-    # opt out (keycloak_require_verified_email=false).
-    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
-        raise AuthenticationError("Identity provider has not verified this email address")
+def _assert_active_human(row) -> None:
+    if row["account_status"] != "active":
+        raise AccountSuspendedError()
+    if row["account_kind"] != "human":
+        raise ExternalIdentityConflictError()
+
+
+def _resolved_external_user(row, *, newly_provisioned: bool) -> dict:
+    return {
+        "user_id": row["id"],
+        "username": row["username"],
+        "email": row["email"],
+        "display_name": row["display_name"],
+        "is_admin": row["is_admin"],
+        "not_before": (
+            None
+            if newly_provisioned
+            else row["tokens_revoked_before"] + timedelta(seconds=1)
+        ),
+        "newly_provisioned": newly_provisioned,
+    }
+
+
+async def _bound_external_user(conn, issuer: str, subject: str):
+    return await conn.fetchrow(
+        """
+        SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
+               u.tokens_revoked_before, u.auth_provider,
+               u.account_status, u.account_kind,
+               e.id AS external_identity_id
+          FROM external_identities e
+          JOIN users u ON u.id = e.user_id
+         WHERE e.issuer = $1 AND e.subject = $2
+        """,
+        issuer,
+        subject,
+    )
+
+
+async def _refresh_bound_external_user(conn, row, claims: dict):
+    _assert_active_human(row)
+    claimed_email = (claims.get("email") or "").strip().lower() or None
+    email_is_trusted = (
+        claimed_email is not None
+        and (
+            claims.get("email_verified") is True
+            or not settings.keycloak_require_verified_email
+        )
+    )
+    email_snapshot = claimed_email if email_is_trusted else None
     display_name = claims.get("name") or claims.get("preferred_username")
-    preferred_username = claims.get("preferred_username") or email.split("@")[0]
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE external_identities
+                   SET email_snapshot = COALESCE($2, email_snapshot),
+                       last_seen_at = NOW()
+                 WHERE id = $1
+                """,
+                row["external_identity_id"],
+                email_snapshot,
+            )
+            refreshed = await conn.fetchrow(
+                """
+                UPDATE users
+                   SET email = COALESCE($2, email),
+                       display_name = COALESCE($3, display_name),
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND account_status = 'active'
+                   AND account_kind = 'human'
+             RETURNING id, username, email, display_name, is_admin,
+                       tokens_revoked_before, auth_provider,
+                       account_status, account_kind
+                """,
+                row["id"],
+                email_snapshot,
+                display_name,
+            )
+            if refreshed is None:
+                raise AccountSuspendedError()
+    except asyncpg.UniqueViolationError:
+        raise ExternalIdentityConflictError() from None
+    return refreshed
+
+
+async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
+    """Resolve verified OIDC claims by exact issuer/subject before open JIT.
+
+    `open` preserves the historical verified-email adoption path once, then
+    persists the stable binding. `invite_only` never creates or adopts a user.
+    `disabled` rejects all external authentication.
+    """
+    issuer, subject = _external_identity_key(claims)
+    if settings.keycloak_enrollment_mode == "disabled":
+        raise ExternalAuthDisabledError()
 
     pool = await get_pool()
-    new_user_id: uuid.UUID | None = None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, username, email, display_name, is_admin,
-                   tokens_revoked_before, auth_provider
-              FROM users WHERE email = $1
-            """,
-            email,
-        )
-        if row is not None:
-            if row["auth_provider"] != "keycloak":
-                # A different-provider account (e.g. a local/password user the
-                # managed control plane pre-provisioned) already owns this
-                # email. Link it to this SSO identity only when explicitly
-                # enabled AND the email is verified — otherwise fail loudly
-                # rather than silently merging / risking takeover.
-                if not settings.keycloak_link_by_email:
-                    raise ConflictError(
-                        "An account with this email already exists with password "
-                        "login; SSO linking is not enabled. Contact an admin."
-                    )
-                if claims.get("email_verified") is not True:
-                    raise AuthenticationError(
-                        "Cannot link SSO to the existing account: email is not "
-                        "verified by the identity provider"
-                    )
-                # Adopt: keep the existing user_id (and thus its PATs, vault
-                # ownership, grants). Flip auth_provider to 'keycloak' so the
-                # now-unused local password can no longer be used to log in.
-                await conn.execute(
-                    "UPDATE users SET auth_provider = 'keycloak' WHERE id = $1",
-                    row["id"],
+        bound = await _bound_external_user(conn, issuer, subject)
+        if bound is not None:
+            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            return _resolved_external_user(refreshed, newly_provisioned=False)
+
+        if settings.keycloak_enrollment_mode == "invite_only":
+            raise MembershipRequiredError()
+
+        email = (claims.get("email") or "").strip().lower()
+        if not email:
+            raise AuthenticationError("Identity provider account has no email claim")
+        if (
+            settings.keycloak_require_verified_email
+            and claims.get("email_verified") is not True
+        ):
+            raise AuthenticationError(
+                "Identity provider has not verified this email address"
+            )
+
+        display_name = claims.get("name") or claims.get("preferred_username")
+        preferred_username = claims.get("preferred_username") or email.split("@")[0]
+        user_id = uuid.uuid4()
+        newly_provisioned = False
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, username, email, display_name, is_admin,
+                           tokens_revoked_before, auth_provider,
+                           account_status, account_kind
+                      FROM users WHERE email = $1
+                       FOR UPDATE
+                    """,
+                    email,
                 )
-            user_id = row["id"]
-            uname = row["username"]
-            not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
-            display_name_out = row["display_name"]
-            email_out = row["email"]
-            is_admin_out = row["is_admin"]
-        else:
-            user_id = uuid.uuid4()
-            uname = await _unique_username(conn, preferred_username)
-            try:
-                # INSERT + outbox event in one tx so a rollback drops both.
-                # First account in a fresh deployment becomes admin (same
-                # bootstrap rule as local register); NOT EXISTS sees the
-                # pre-insert table so only a truly empty users table grants it.
-                async with conn.transaction():
+                if row is not None:
+                    _assert_active_human(row)
+                    # Another first-login may have persisted this exact binding
+                    # while we waited for the existing user row lock. Re-check
+                    # the stable key before treating any binding as a conflict.
+                    late_bound = await _bound_external_user(conn, issuer, subject)
+                    if late_bound is not None:
+                        refreshed = await _refresh_bound_external_user(
+                            conn,
+                            late_bound,
+                            claims,
+                        )
+                        return _resolved_external_user(
+                            refreshed,
+                            newly_provisioned=False,
+                        )
+                    already_bound = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM external_identities WHERE user_id = $1)",
+                        row["id"],
+                    )
+                    if already_bound:
+                        raise ExternalIdentityConflictError()
+                    if row["auth_provider"] != "keycloak":
+                        if not settings.keycloak_link_by_email:
+                            raise ExternalIdentityConflictError()
+                        if claims.get("email_verified") is not True:
+                            raise AuthenticationError(
+                                "Cannot link SSO to the existing account: email is not "
+                                "verified by the identity provider"
+                            )
+                        await conn.execute(
+                            """
+                            UPDATE users
+                               SET auth_provider = 'keycloak', updated_at = NOW()
+                             WHERE id = $1
+                            """,
+                            row["id"],
+                        )
+                    user_id = row["id"]
+                else:
+                    uname = await _unique_username(conn, preferred_username)
                     is_admin = await conn.fetchval(
                         """
-                        INSERT INTO users (id, username, email, password_hash,
-                                           display_name, auth_provider, is_admin)
+                        INSERT INTO users (
+                            id, username, email, password_hash, display_name,
+                            auth_provider, is_admin, account_status, account_kind
+                        )
                         VALUES ($1, $2, $3, $4, $5, 'keycloak',
-                                NOT EXISTS (SELECT 1 FROM users))
+                                NOT EXISTS (SELECT 1 FROM users), 'active', 'human')
                         RETURNING is_admin
                         """,
-                        user_id, uname, email, _SSO_SENTINEL_HASH, display_name,
+                        user_id,
+                        uname,
+                        email,
+                        _SSO_SENTINEL_HASH,
+                        display_name,
                     )
                     await emit_event(
                         conn,
                         "auth.user_provisioned",
                         actor_id=str(user_id),
-                        payload={"auth_provider": "keycloak", "email": email},
+                        payload={
+                            "auth_provider": "keycloak",
+                            "email": email,
+                            "issuer": issuer,
+                        },
                     )
-                if is_admin:
-                    logging.getLogger("akb.auth").info(
-                        "Bootstrap: first user %r (SSO) provisioned — granted admin", uname
-                    )
-                new_user_id = user_id
-                not_before = None
-                display_name_out = display_name
-                email_out = email
-                is_admin_out = is_admin
-            except asyncpg.UniqueViolationError:
-                # Concurrent first-login for the same email won the race.
-                # Re-fetch and treat as the existing user (idempotent JIT)
-                # instead of bubbling a raw 500.
-                row = await conn.fetchrow(
+                    newly_provisioned = True
+                    if is_admin:
+                        logging.getLogger("akb.auth").info(
+                            "Bootstrap: first user %r (SSO) provisioned — granted admin",
+                            uname,
+                        )
+
+                await conn.execute(
                     """
-                    SELECT id, username, email, display_name, is_admin,
-                           tokens_revoked_before, auth_provider
-                      FROM users WHERE email = $1
+                    INSERT INTO external_identities (
+                        user_id, issuer, subject, email_snapshot
+                    ) VALUES ($1, $2, $3, $4)
                     """,
+                    user_id,
+                    issuer,
+                    subject,
                     email,
                 )
-                if row is None:
-                    raise ConflictError(
-                        "An account with this email already exists; "
-                        "SSO linking is not enabled. Contact an admin."
-                    )
-                if row["auth_provider"] != "keycloak":
-                    # Same link-by-email rule as the non-race path.
-                    if not settings.keycloak_link_by_email:
-                        raise ConflictError(
-                            "An account with this email already exists with "
-                            "password login; SSO linking is not enabled. "
-                            "Contact an admin."
-                        )
-                    if claims.get("email_verified") is not True:
-                        raise AuthenticationError(
-                            "Cannot link SSO to the existing account: email is "
-                            "not verified by the identity provider"
-                        )
-                    await conn.execute(
-                        "UPDATE users SET auth_provider = 'keycloak' WHERE id = $1",
-                        row["id"],
-                    )
-                user_id = row["id"]
-                uname = row["username"]
-                not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
-                display_name_out = row["display_name"]
-                email_out = row["email"]
-                is_admin_out = row["is_admin"]
+        except asyncpg.UniqueViolationError:
+            # Same-subject concurrent JIT is idempotent. Any other uniqueness
+            # collision needs explicit administrative resolution.
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is None:
+                raise ExternalIdentityConflictError() from None
+            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            return _resolved_external_user(refreshed, newly_provisioned=False)
 
-    return {
-        "user_id": user_id,
-        "username": uname,
-        "email": email_out,
-        "display_name": display_name_out,
-        "is_admin": is_admin_out,
-        "not_before": not_before,
-        "newly_provisioned": new_user_id is not None,
-    }
+        row = await conn.fetchrow(
+            """
+            SELECT id, username, email, display_name, is_admin,
+                   tokens_revoked_before, auth_provider,
+                   account_status, account_kind
+              FROM users WHERE id = $1
+            """,
+            user_id,
+        )
+        _assert_active_human(row)
+        return _resolved_external_user(row, newly_provisioned=newly_provisioned)
 
 
 async def login_with_keycloak_claims(claims: dict) -> dict:
     """Map a verified Keycloak ID token to an AKB session.
 
-    First login JIT-provisions an AKB user (keyed by email) and its
-    per-user PG role; subsequent logins reuse the row. Returns the same
+    Exact issuer/subject bindings reuse the AKB user. In `open` mode only,
+    a first login may JIT-provision by verified email and persist the binding.
+    New users receive their per-user PG role. Returns the same
     ``{token, user}`` shape as :func:`login` so the SSO callback path is
     indistinguishable downstream.
 
@@ -509,7 +630,7 @@ async def resolve_keycloak_access_token(token: str) -> AuthenticatedUser | None:
 
     try:
         resolved = await _resolve_or_provision_keycloak_user(claims)
-    except (AuthenticationError, ConflictError) as e:
+    except AKBError as e:
         # Refuse rather than crash — the caller maps this to 401.
         logging.getLogger("akb.auth").info(
             "MCP access token: user resolution rejected (%s)", e
@@ -548,22 +669,31 @@ class BadPasswordChange(Exception):
 
 async def change_password(user_id: str, current: str, new: str) -> None:
     """Change own password. Verifies current; rejects too-short or unchanged."""
+    require_local_auth_enabled()
     if len(new) < 8:
         raise BadPasswordChange("New password must be at least 8 characters")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT password_hash FROM users WHERE id = $1",
-            uuid.UUID(user_id),
-        )
-        if row is None:
-            raise NotFoundError("User", user_id)
-        if not verify_password(current, row["password_hash"]):
-            raise AuthenticationError("Current password is incorrect")
-        if verify_password(new, row["password_hash"]):
-            raise BadPasswordChange("New password must differ from current")
-
         async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT password_hash, auth_provider, account_status, account_kind
+                  FROM users WHERE id = $1
+                   FOR UPDATE
+                """,
+                uuid.UUID(user_id),
+            )
+            if row is None:
+                raise NotFoundError("User", user_id)
+            if row["account_status"] != "active":
+                raise AccountSuspendedError()
+            if row["auth_provider"] != "local" or row["account_kind"] != "human":
+                raise PasswordLifecycleUnavailableError()
+            if not verify_password(current, row["password_hash"]):
+                raise AuthenticationError("Current password is incorrect")
+            if verify_password(new, row["password_hash"]):
+                raise BadPasswordChange("New password must differ from current")
+
             await conn.execute(
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
                 hash_password(new),
@@ -620,22 +750,38 @@ async def update_profile(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        try:
-            row = await conn.fetchrow(
-                f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx} "
-                f"RETURNING username, display_name, email",
-                *params,
+        async with conn.transaction():
+            policy = await conn.fetchrow(
+                """
+                SELECT auth_provider, account_status, account_kind
+                  FROM users WHERE id = $1
+                   FOR UPDATE
+                """,
+                uuid.UUID(user_id),
             )
-        except asyncpg.UniqueViolationError:
-            raise ConflictError("Email already in use") from None
-        if row is None:
-            raise NotFoundError("User", user_id)
-        return {
-            "updated": True,
-            "username": row["username"],
-            "display_name": row["display_name"],
-            "email": row["email"],
-        }
+            if policy is None:
+                raise NotFoundError("User", user_id)
+            if policy["account_status"] != "active":
+                raise AccountSuspendedError()
+            if (
+                policy["auth_provider"] != "local"
+                or policy["account_kind"] != "human"
+            ):
+                raise ExternalProfileReadOnlyError()
+            try:
+                row = await conn.fetchrow(
+                    f"UPDATE users SET {', '.join(sets)} WHERE id = ${idx} "
+                    f"RETURNING username, display_name, email",
+                    *params,
+                )
+            except asyncpg.UniqueViolationError:
+                raise ConflictError("Email already in use") from None
+            return {
+                "updated": True,
+                "username": row["username"],
+                "display_name": row["display_name"],
+                "email": row["email"],
+            }
 
 
 # ── PAT operations ──────────────────────────────────────────
@@ -672,24 +818,33 @@ async def create_pat(
 
     async with pool.acquire() as conn:
         token_id = uuid.uuid4()
-        await conn.execute(
-            """
-            INSERT INTO tokens (
-                id, user_id, name, token_hash, token_prefix,
-                scopes, vault_scope, key_class, expires_at
+        async with conn.transaction():
+            user_row = await conn.fetchrow(
+                "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
+                uuid.UUID(user_id),
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            """,
-            token_id,
-            uuid.UUID(user_id),
-            name,
-            token_hash,
-            token_prefix,
-            token_scopes,
-            vault_scope_json,
-            key_class,
-            expires_at,
-        )
+            if user_row is None:
+                raise NotFoundError("User", user_id)
+            if user_row["account_status"] != "active":
+                raise AccountSuspendedError()
+            await conn.execute(
+                """
+                INSERT INTO tokens (
+                    id, user_id, name, token_hash, token_prefix,
+                    scopes, vault_scope, key_class, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                token_id,
+                uuid.UUID(user_id),
+                name,
+                token_hash,
+                token_prefix,
+                token_scopes,
+                vault_scope_json,
+                key_class,
+                expires_at,
+            )
 
     # PG-native RBAC (surface 2): provision the narrow akb_token_<tid> role for
     # a SCOPED PAT so akb_sql run under it is PG-confined to the scope. Best-
@@ -901,43 +1056,46 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, username, email, display_name, is_admin,
-                   CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
-                       AS revoked_epoch_ceil
-              FROM users WHERE id = $1
-            """,
-            uuid.UUID(payload["sub"]),
-        )
-        if not row:
-            return None
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, username, email, display_name, is_admin,
+                       CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
+                           AS revoked_epoch_ceil
+                  FROM users
+                 WHERE id = $1 AND account_status = 'active'
+                   FOR SHARE
+                """,
+                uuid.UUID(payload["sub"]),
+            )
+            if not row:
+                return None
 
-        # Server-side JWT revocation. The user can void every token
-        # they have by setting tokens_revoked_before = NOW(); any JWT
-        # whose iat predates that cutoff fails here even though the
-        # signature is valid and exp has not passed. This is the only
-        # mechanism to invalidate a leaked or stale JWT short of
-        # rotating the global jwt_secret (which would log every user
-        # out, not just one).
-        #
-        # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
-        # sub-second TIMESTAMPTZ. To make same-second writes safe we
-        # compare against CEIL(epoch) — a revoke at 100.5s yields
-        # revoked_epoch_ceil=101, so any iat≤100 fails (rejected) and
-        # iat≥101 passes (post-sleep re-login). Without CEIL, a JWT
-        # issued in the same second as revoke would survive.
-        if int(iat) < int(row["revoked_epoch_ceil"]):
-            return None
+            # Server-side JWT revocation. The user can void every token
+            # they have by setting tokens_revoked_before = NOW(); any JWT
+            # whose iat predates that cutoff fails here even though the
+            # signature is valid and exp has not passed. This is the only
+            # mechanism to invalidate a leaked or stale JWT short of
+            # rotating the global jwt_secret (which would log every user
+            # out, not just one).
+            #
+            # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
+            # sub-second TIMESTAMPTZ. To make same-second writes safe we
+            # compare against CEIL(epoch) — a revoke at 100.5s yields
+            # revoked_epoch_ceil=101, so any iat≤100 fails (rejected) and
+            # iat≥101 passes (post-sleep re-login). Without CEIL, a JWT
+            # issued in the same second as revoke would survive.
+            if int(iat) < int(row["revoked_epoch_ceil"]):
+                return None
 
-        return AuthenticatedUser(
-            user_id=str(row["id"]),
-            username=row["username"],
-            email=row["email"],
-            display_name=row["display_name"],
-            is_admin=row["is_admin"],
-            auth_method="jwt",
-        )
+            return AuthenticatedUser(
+                user_id=str(row["id"]),
+                username=row["username"],
+                email=row["email"],
+                display_name=row["display_name"],
+                is_admin=row["is_admin"],
+                auth_method="jwt",
+            )
 
 
 async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
@@ -959,6 +1117,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
              WHERE t.user_id = u.id
                AND t.token_hash = $1
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
+               AND u.account_status = 'active'
             RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
                       t.expires_at, u.username, u.email, u.display_name, u.is_admin
             """,

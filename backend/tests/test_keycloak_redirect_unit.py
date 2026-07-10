@@ -17,6 +17,21 @@ from app.api.routes import auth
 from app.config import settings
 
 
+def test_sso_error_reason_exposes_only_stable_account_codes():
+    from app.api.routes.auth import _public_sso_error_reason
+    from app.exceptions import (
+        AccountSuspendedError,
+        AKBError,
+        ExternalIdentityConflictError,
+        MembershipRequiredError,
+    )
+
+    assert _public_sso_error_reason(MembershipRequiredError()) == "membership_required"
+    assert _public_sso_error_reason(AccountSuspendedError()) == "account_suspended"
+    assert _public_sso_error_reason(ExternalIdentityConflictError()) == "identity_conflict"
+    assert _public_sso_error_reason(AKBError("provider detail")) == "auth_failed"
+
+
 @pytest.fixture
 def allow(monkeypatch):
     """Set the companion-origin allowlist for one test."""
