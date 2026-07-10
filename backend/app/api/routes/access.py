@@ -11,6 +11,7 @@ from app.services.auth_service import (
 )
 from app.services.account_service import (
     activate_user,
+    adopt_current_admin_as_service,
     ensure_human_external_identity,
     ensure_service_user,
     get_user,
@@ -75,6 +76,11 @@ class EnsureServiceUserRequest(NFCModel):
     username: str
     email: str
     display_name: str | None = None
+
+
+class AdoptCurrentServiceUserRequest(NFCModel):
+    expected_username: str
+    expected_email: str
 
 
 class SetUserRoleRequest(NFCModel):
@@ -236,6 +242,32 @@ async def admin_ensure_service_user(
         username=req.username,
         email=req.email,
         display_name=req.display_name,
+        actor_id=user.user_id,
+    )
+
+
+@router.post(
+    "/admin/service-users/adopt-current",
+    summary="[admin] Adopt the current bootstrap administrator as a service identity",
+)
+async def admin_adopt_current_service_user(
+    req: AdoptCurrentServiceUserRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    if user.auth_method != "pat" or user.token_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Service identity adoption requires the current administrator PAT",
+                "code": "service_identity_adoption_requires_pat",
+            },
+        )
+    return await adopt_current_admin_as_service(
+        user_id=user.user_id,
+        token_id=user.token_id,
+        expected_username=req.expected_username,
+        expected_email=req.expected_email,
         actor_id=user.user_id,
     )
 

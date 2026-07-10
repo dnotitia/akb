@@ -25,6 +25,13 @@ Existing user IDs, JWT/PAT formats, Vault ownership, grants, and PG role names
 are unchanged. The pre-0.10 backend's register/login/PAT flow is verified
 against the expanded schema, and standalone local/open behavior remains covered.
 
+The managed operator can now adopt its exact local bootstrap administrator and
+current PAT in place as a non-interactive service principal. The operation keeps
+the raw credential stable across controller crashes, disables its password and
+JWT lifecycle, converts the current token to a service key, and strictly revokes
+all sibling tokens without granting first-user administration to ordinary
+service-user creation.
+
 ## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
 
 `GET /health` no longer holds the chunks stats pool connection while awaiting
