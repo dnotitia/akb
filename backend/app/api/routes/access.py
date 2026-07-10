@@ -1,6 +1,7 @@
 """REST API routes for vault access management."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import SecretStr
 
 from app.api.deps import get_current_user
 from app.services.auth_service import (
@@ -14,6 +15,7 @@ from app.services.account_service import (
     ensure_service_user,
     get_user,
     get_user_by_external_identity,
+    identify_user_token,
     revoke_user_token,
     set_user_admin,
     suspend_user,
@@ -77,6 +79,10 @@ class EnsureServiceUserRequest(NFCModel):
 
 class SetUserRoleRequest(NFCModel):
     is_admin: bool
+
+
+class IdentifyTokenRequest(NFCModel):
+    token: SecretStr
 
 
 @router.get("/my/vaults", summary="List vaults accessible to me")
@@ -288,6 +294,27 @@ async def admin_revoke_user_token(
     return await revoke_user_token(
         user_id,
         token_id,
+        actor_id=user.user_id,
+    )
+
+
+@router.post(
+    "/admin/tokens/identify",
+    summary="[admin] Identify one presented token for exact migration revocation",
+)
+async def admin_identify_token(
+    req: IdentifyTokenRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Return only the owner and token IDs for an admin-presented raw token.
+
+    This migration endpoint deliberately ignores expiry and account status so
+    disabled legacy credentials can still be mapped to the exact owned revoke
+    route. The raw token and its fingerprint are never returned or audited.
+    """
+    _require_admin(user)
+    return await identify_user_token(
+        req.token.get_secret_value(),
         actor_id=user.user_id,
     )
 
