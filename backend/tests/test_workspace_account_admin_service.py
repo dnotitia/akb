@@ -274,6 +274,273 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
     assert password_hash.startswith("!service-account:")
 
 
+async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
+    services,
+):
+    pool, role_sync, service = services
+    from app.services import auth_service
+
+    user_id = uuid.uuid4()
+    current_token_id = uuid.uuid4()
+    stale_token_id = uuid.uuid4()
+    username = f"governance-platform-bot-{uuid.uuid4().hex[:8]}"
+    email = f"{username}@workspace.local"
+    raw_current = "akb_" + uuid.uuid4().hex
+    raw_stale = "akb_" + uuid.uuid4().hex
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, display_name, is_admin,
+                auth_provider, account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'Platform Bot', true,
+                      'local', 'active', 'human')
+            """,
+            user_id,
+            username,
+            email,
+            auth_service.hash_password("legacy-password"),
+        )
+        await conn.executemany(
+            """
+            INSERT INTO tokens (
+                id, user_id, name, token_hash, token_prefix, key_class
+            ) VALUES ($1, $2, $3, $4, $5, 'pat')
+            """,
+            [
+                (
+                    current_token_id,
+                    user_id,
+                    "platform",
+                    auth_service._hash_token(raw_current),
+                    raw_current[:12],
+                ),
+                (
+                    stale_token_id,
+                    user_id,
+                    "stale",
+                    auth_service._hash_token(raw_stale),
+                    raw_stale[:12],
+                ),
+            ],
+        )
+
+    adopted = await service.adopt_current_admin_as_service(
+        user_id=str(user_id),
+        token_id=str(current_token_id),
+        expected_username=username,
+        expected_email=email,
+        actor_id=str(user_id),
+    )
+    assert adopted["user_id"] == str(user_id)
+    assert adopted["account_kind"] == "service"
+    assert adopted["auth_provider"] == "service"
+    assert adopted["is_admin"] is True
+    assert adopted["token_id"] == str(current_token_id)
+    assert adopted["key_class"] == "service"
+    assert adopted["revoked_token_ids"] == [str(stale_token_id)]
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.password_hash, u.tokens_revoked_before,
+                   t.key_class, t.scopes,
+                   (SELECT count(*) FROM tokens WHERE user_id = u.id) AS token_count
+              FROM users u
+              JOIN tokens t ON t.user_id = u.id AND t.id = $2
+             WHERE u.id = $1
+            """,
+            user_id,
+            current_token_id,
+        )
+    assert row["password_hash"].startswith("!service-account:")
+    assert row["tokens_revoked_before"] is not None
+    assert row["key_class"] == "service"
+    assert list(row["scopes"]) == ["read", "write", "admin"]
+    assert row["token_count"] == 1
+    assert role_sync.revoked_tokens == [stale_token_id]
+
+    async with pool.acquire() as conn:
+        event_count = await conn.fetchval(
+            "SELECT count(*) FROM events WHERE kind = 'auth.bootstrap_service_adopted' AND actor_id = $1",
+            str(user_id),
+        )
+    assert event_count == 1
+
+    resolved = await auth_service.resolve_token(f"Bearer {raw_current}")
+    assert resolved is not None
+    assert resolved.user_id == str(user_id)
+    assert resolved.key_class == "service"
+    assert resolved.is_admin is True
+
+    retried = await service.adopt_current_admin_as_service(
+        user_id=str(user_id),
+        token_id=str(current_token_id),
+        expected_username=username,
+        expected_email=email,
+        actor_id=str(user_id),
+    )
+    assert retried["revoked_token_ids"] == []
+    assert role_sync.revoked_tokens == [stale_token_id]
+    async with pool.acquire() as conn:
+        retried_event_count = await conn.fetchval(
+            "SELECT count(*) FROM events WHERE kind = 'auth.bootstrap_service_adopted' AND actor_id = $1",
+            str(user_id),
+        )
+    assert retried_event_count == event_count
+
+
+async def test_adopt_bootstrap_admin_rejects_identity_mismatch_atomically(services):
+    pool, _, service = services
+    from app.services import auth_service
+    from app.exceptions import ServiceIdentityAdoptionError
+
+    user_id = uuid.uuid4()
+    token_id = uuid.uuid4()
+    username = f"governance-platform-bot-{uuid.uuid4().hex[:8]}"
+    email = f"{username}@workspace.local"
+    raw = "akb_" + uuid.uuid4().hex
+    password_hash = auth_service.hash_password("legacy-password")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, display_name, is_admin,
+                auth_provider, account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'Platform Bot', true,
+                      'local', 'active', 'human')
+            """,
+            user_id,
+            username,
+            email,
+            password_hash,
+        )
+        await conn.execute(
+            """
+            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, key_class)
+            VALUES ($1, $2, 'platform', $3, $4, 'pat')
+            """,
+            token_id,
+            user_id,
+            auth_service._hash_token(raw),
+            raw[:12],
+        )
+
+    with pytest.raises(ServiceIdentityAdoptionError):
+        await service.adopt_current_admin_as_service(
+            user_id=str(user_id),
+            token_id=str(token_id),
+            expected_username=username,
+            expected_email="wrong@example.com",
+            actor_id=str(user_id),
+        )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT account_kind, auth_provider, password_hash,
+                   (SELECT key_class FROM tokens WHERE id = $2) AS key_class
+              FROM users WHERE id = $1
+            """,
+            user_id,
+            token_id,
+        )
+    assert dict(row) == {
+        "account_kind": "human",
+        "auth_provider": "local",
+        "password_hash": password_hash,
+        "key_class": "pat",
+    }
+
+
+async def test_adopt_bootstrap_admin_keeps_denial_and_retries_role_cleanup(services):
+    pool, role_sync, service = services
+    from app.exceptions import CredentialCleanupIncompleteError
+    from app.services import auth_service
+
+    user_id = uuid.uuid4()
+    current_token_id = uuid.uuid4()
+    stale_token_id = uuid.uuid4()
+    username = f"governance-platform-bot-{uuid.uuid4().hex[:8]}"
+    email = f"{username}@workspace.local"
+    current_raw = "akb_" + uuid.uuid4().hex
+    stale_raw = "akb_" + uuid.uuid4().hex
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, display_name, is_admin,
+                auth_provider, account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'Platform Bot', true,
+                      'local', 'active', 'human')
+            """,
+            user_id,
+            username,
+            email,
+            auth_service.hash_password("legacy-password"),
+        )
+        await conn.executemany(
+            """
+            INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, key_class)
+            VALUES ($1, $2, $3, $4, $5, 'pat')
+            """,
+            [
+                (current_token_id, user_id, "platform", auth_service._hash_token(current_raw), current_raw[:12]),
+                (stale_token_id, user_id, "stale", auth_service._hash_token(stale_raw), stale_raw[:12]),
+            ],
+        )
+
+    role_sync.fail_token = stale_token_id
+    with pytest.raises(CredentialCleanupIncompleteError):
+        await service.adopt_current_admin_as_service(
+            user_id=str(user_id),
+            token_id=str(current_token_id),
+            expected_username=username,
+            expected_email=email,
+            actor_id=str(user_id),
+        )
+
+    async with pool.acquire() as conn:
+        state = await conn.fetchrow(
+            """
+            SELECT u.account_kind, u.auth_provider,
+                   EXISTS (SELECT 1 FROM tokens WHERE id = $2) AS current_exists,
+                   EXISTS (SELECT 1 FROM tokens WHERE id = $3) AS stale_exists,
+                   EXISTS (
+                       SELECT 1 FROM account_token_cleanup
+                        WHERE token_id = $3 AND completed_at IS NULL
+                   ) AS cleanup_pending
+              FROM users u WHERE u.id = $1
+            """,
+            user_id,
+            current_token_id,
+            stale_token_id,
+        )
+    assert dict(state) == {
+        "account_kind": "service",
+        "auth_provider": "service",
+        "current_exists": True,
+        "stale_exists": False,
+        "cleanup_pending": True,
+    }
+
+    role_sync.fail_token = None
+    retried = await service.adopt_current_admin_as_service(
+        user_id=str(user_id),
+        token_id=str(current_token_id),
+        expected_username=username,
+        expected_email=email,
+        actor_id=str(user_id),
+    )
+    assert retried["revoked_token_ids"] == [str(stale_token_id)]
+    async with pool.acquire() as conn:
+        completed = await conn.fetchval(
+            "SELECT completed_at IS NOT NULL FROM account_token_cleanup WHERE token_id = $1",
+            stale_token_id,
+        )
+    assert completed is True
+
+
 async def test_concurrent_service_user_ensure_converges_to_one_user(services):
     pool, _, service = services
     username = f"governance-concurrent-runtime-{uuid.uuid4().hex[:8]}"

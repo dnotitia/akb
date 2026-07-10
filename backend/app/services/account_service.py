@@ -12,6 +12,7 @@ from app.exceptions import (
     CredentialCleanupIncompleteError,
     ExternalIdentityConflictError,
     NotFoundError,
+    ServiceIdentityAdoptionError,
     ValidationError,
 )
 from app.repositories.events_repo import emit_event
@@ -333,6 +334,168 @@ async def ensure_service_user(
     if new_user_id is not None:
         await get_role_sync().on_user_create(new_user_id)
     return _user_result(row)
+
+
+async def adopt_current_admin_as_service(
+    *,
+    user_id: str,
+    token_id: str,
+    expected_username: str,
+    expected_email: str,
+    actor_id: str,
+) -> dict:
+    """Atomically adopt the current local bootstrap admin and its PAT.
+
+    The raw credential never changes, so a controller crash cannot strand the
+    workspace between AKB state and Secret delivery. Every other token is
+    denied in the transaction and its derived PG role is then cleaned strictly.
+    """
+
+    user_uuid = _uuid(user_id, "user_id")
+    token_uuid = _uuid(token_id, "token_id")
+    expected_username = _required(expected_username, "expected_username")
+    expected_email = _required(expected_email, "expected_email").lower()
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            current = await conn.fetchrow(
+                """
+                SELECT id, username, email, password_hash, display_name, is_admin,
+                       auth_provider, account_status, account_kind,
+                       EXISTS (
+                           SELECT 1 FROM external_identities e
+                            WHERE e.user_id = users.id
+                       ) AS has_external_identity
+                  FROM users
+                 WHERE id = $1
+                   FOR UPDATE
+                """,
+                user_uuid,
+            )
+            if (
+                current is None
+                or current["username"] != expected_username
+                or current["email"].lower() != expected_email
+                or current["account_status"] != "active"
+                or not current["is_admin"]
+                or current["has_external_identity"]
+                or current["account_kind"] not in {"human", "service"}
+                or (
+                    current["account_kind"] == "human"
+                    and current["auth_provider"] != "local"
+                )
+                or (
+                    current["account_kind"] == "service"
+                    and current["auth_provider"] != "service"
+                )
+            ):
+                raise ServiceIdentityAdoptionError()
+
+            token = await conn.fetchrow(
+                """
+                SELECT user_id, key_class, scopes, vault_scope, expires_at
+                  FROM tokens
+                 WHERE id = $1
+                   FOR UPDATE
+                """,
+                token_uuid,
+            )
+            if (
+                token is None
+                or token["user_id"] != user_uuid
+                or token["key_class"] not in {"pat", "service"}
+                or token["vault_scope"] is not None
+                or token["expires_at"] is not None
+            ):
+                raise ServiceIdentityAdoptionError()
+
+            user_changed = (
+                current["account_kind"] != "service"
+                or current["auth_provider"] != "service"
+                or current["password_hash"] != _SERVICE_SENTINEL_HASH
+            )
+            wanted_scopes = ["read", "write", "admin"]
+            token_changed = (
+                token["key_class"] != "service"
+                or list(token["scopes"] or []) != wanted_scopes
+            )
+            if user_changed:
+                await conn.execute(
+                    """
+                    UPDATE users
+                       SET account_kind = 'service',
+                           auth_provider = 'service',
+                           password_hash = $2,
+                           tokens_revoked_before = CASE
+                               WHEN account_kind = 'human' THEN NOW()
+                               ELSE tokens_revoked_before
+                           END,
+                           updated_at = NOW()
+                     WHERE id = $1
+                    """,
+                    user_uuid,
+                    _SERVICE_SENTINEL_HASH,
+                )
+            if token_changed:
+                await conn.execute(
+                    """
+                    UPDATE tokens
+                       SET key_class = 'service', scopes = $3::text[]
+                     WHERE id = $1 AND user_id = $2
+                    """,
+                    token_uuid,
+                    user_uuid,
+                    wanted_scopes,
+                )
+            deleted = await conn.fetch(
+                """
+                DELETE FROM tokens
+                 WHERE user_id = $1 AND id <> $2
+             RETURNING id
+                """,
+                user_uuid,
+                token_uuid,
+            )
+            if deleted:
+                await conn.executemany(
+                    """
+                    INSERT INTO account_token_cleanup (token_id, user_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT (token_id) DO NOTHING
+                    """,
+                    [(record["id"], user_uuid) for record in deleted],
+                )
+            pending = await conn.fetch(
+                """
+                SELECT token_id
+                  FROM account_token_cleanup
+                 WHERE user_id = $1 AND completed_at IS NULL
+                 ORDER BY requested_at, token_id
+                """,
+                user_uuid,
+            )
+            pending_token_ids = [record["token_id"] for record in pending]
+            if user_changed or token_changed or deleted:
+                await emit_event(
+                    conn,
+                    "auth.bootstrap_service_adopted",
+                    actor_id=actor_id,
+                    payload={
+                        "user_id": user_id,
+                        "token_id": token_id,
+                        "revoked_token_ids": [str(value) for value in pending_token_ids],
+                    },
+                )
+            adopted = await _fetch_user(conn, user_uuid)
+
+    await _cleanup_token_roles(pool, user_uuid, pending_token_ids)
+    return {
+        **_user_result(adopted),
+        "token_id": token_id,
+        "key_class": "service",
+        "revoked_token_ids": [str(value) for value in pending_token_ids],
+    }
 
 
 async def get_user(user_id: str) -> dict:

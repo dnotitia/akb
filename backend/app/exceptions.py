@@ -88,6 +88,17 @@ class ExternalIdentityConflictError(AKBError):
         )
 
 
+class ServiceIdentityAdoptionError(AKBError):
+    """A local bootstrap administrator cannot be safely adopted in place."""
+
+    def __init__(self):
+        super().__init__(
+            "Bootstrap administrator does not match the service identity adoption contract",
+            status_code=409,
+            code="service_identity_adoption_conflict",
+        )
+
+
 class ExternalAuthDisabledError(AKBError):
     """External authentication is disabled by deployment policy."""
 
