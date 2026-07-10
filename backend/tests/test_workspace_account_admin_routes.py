@@ -147,6 +147,16 @@ async def test_adopt_current_service_requires_exact_admin_pat_and_forwards_ids(m
     }
 
 
+async def test_auth_me_exposes_additive_current_key_class():
+    from app.api.routes import auth
+
+    actor = _bootstrap_user(token_id=str(uuid.uuid4()))
+    actor.key_class = "service"
+    result = await auth.me(actor)
+    assert result["user_id"] == actor.user_id
+    assert result["key_class"] == "service"
+
+
 async def test_governance_routes_are_explicit_in_openapi():
     from app.main import app
 

@@ -360,6 +360,13 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     assert row["token_count"] == 1
     assert role_sync.revoked_tokens == [stale_token_id]
 
+    async with pool.acquire() as conn:
+        event_count = await conn.fetchval(
+            "SELECT count(*) FROM events WHERE kind = 'auth.bootstrap_service_adopted' AND actor_id = $1",
+            str(user_id),
+        )
+    assert event_count == 1
+
     resolved = await auth_service.resolve_token(f"Bearer {raw_current}")
     assert resolved is not None
     assert resolved.user_id == str(user_id)
@@ -375,6 +382,12 @@ async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     )
     assert retried["revoked_token_ids"] == []
     assert role_sync.revoked_tokens == [stale_token_id]
+    async with pool.acquire() as conn:
+        retried_event_count = await conn.fetchval(
+            "SELECT count(*) FROM events WHERE kind = 'auth.bootstrap_service_adopted' AND actor_id = $1",
+            str(user_id),
+        )
+    assert retried_event_count == event_count
 
 
 async def test_adopt_bootstrap_admin_rejects_identity_mismatch_atomically(services):

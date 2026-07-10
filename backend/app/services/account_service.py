@@ -361,7 +361,7 @@ async def adopt_current_admin_as_service(
         async with conn.transaction():
             current = await conn.fetchrow(
                 """
-                SELECT id, username, email, display_name, is_admin,
+                SELECT id, username, email, password_hash, display_name, is_admin,
                        auth_provider, account_status, account_kind,
                        EXISTS (
                            SELECT 1 FROM external_identities e
@@ -394,7 +394,7 @@ async def adopt_current_admin_as_service(
 
             token = await conn.fetchrow(
                 """
-                SELECT user_id, key_class, vault_scope, expires_at
+                SELECT user_id, key_class, scopes, vault_scope, expires_at
                   FROM tokens
                  WHERE id = $1
                    FOR UPDATE
@@ -410,32 +410,44 @@ async def adopt_current_admin_as_service(
             ):
                 raise ServiceIdentityAdoptionError()
 
-            await conn.execute(
-                """
-                UPDATE users
-                   SET account_kind = 'service',
-                       auth_provider = 'service',
-                       password_hash = $2,
-                       tokens_revoked_before = CASE
-                           WHEN account_kind = 'human' THEN NOW()
-                           ELSE tokens_revoked_before
-                       END,
-                       updated_at = NOW()
-                 WHERE id = $1
-                """,
-                user_uuid,
-                _SERVICE_SENTINEL_HASH,
+            user_changed = (
+                current["account_kind"] != "service"
+                or current["auth_provider"] != "service"
+                or current["password_hash"] != _SERVICE_SENTINEL_HASH
             )
-            await conn.execute(
-                """
-                UPDATE tokens
-                   SET key_class = 'service',
-                       scopes = ARRAY['read', 'write', 'admin']::text[]
-                 WHERE id = $1 AND user_id = $2
-                """,
-                token_uuid,
-                user_uuid,
+            wanted_scopes = ["read", "write", "admin"]
+            token_changed = (
+                token["key_class"] != "service"
+                or list(token["scopes"] or []) != wanted_scopes
             )
+            if user_changed:
+                await conn.execute(
+                    """
+                    UPDATE users
+                       SET account_kind = 'service',
+                           auth_provider = 'service',
+                           password_hash = $2,
+                           tokens_revoked_before = CASE
+                               WHEN account_kind = 'human' THEN NOW()
+                               ELSE tokens_revoked_before
+                           END,
+                           updated_at = NOW()
+                     WHERE id = $1
+                    """,
+                    user_uuid,
+                    _SERVICE_SENTINEL_HASH,
+                )
+            if token_changed:
+                await conn.execute(
+                    """
+                    UPDATE tokens
+                       SET key_class = 'service', scopes = $3::text[]
+                     WHERE id = $1 AND user_id = $2
+                    """,
+                    token_uuid,
+                    user_uuid,
+                    wanted_scopes,
+                )
             deleted = await conn.fetch(
                 """
                 DELETE FROM tokens
@@ -464,16 +476,17 @@ async def adopt_current_admin_as_service(
                 user_uuid,
             )
             pending_token_ids = [record["token_id"] for record in pending]
-            await emit_event(
-                conn,
-                "auth.bootstrap_service_adopted",
-                actor_id=actor_id,
-                payload={
-                    "user_id": user_id,
-                    "token_id": token_id,
-                    "revoked_token_ids": [str(value) for value in pending_token_ids],
-                },
-            )
+            if user_changed or token_changed or deleted:
+                await emit_event(
+                    conn,
+                    "auth.bootstrap_service_adopted",
+                    actor_id=actor_id,
+                    payload={
+                        "user_id": user_id,
+                        "token_id": token_id,
+                        "revoked_token_ids": [str(value) for value in pending_token_ids],
+                    },
+                )
             adopted = await _fetch_user(conn, user_uuid)
 
     await _cleanup_token_roles(pool, user_uuid, pending_token_ids)
