@@ -85,6 +85,38 @@ async def test_ensure_external_identity_forwards_verified_actor(monkeypatch):
     }
 
 
+async def test_prepare_external_identity_uses_distinct_fail_closed_route(monkeypatch):
+    from app.api.routes import access
+
+    observed = {}
+
+    async def _ensure(**kwargs):
+        observed.update(kwargs)
+        return {"user_id": "prepared-user", "account_status": "suspended"}
+
+    monkeypatch.setattr(access, "ensure_human_external_identity", _ensure)
+    admin = _user(admin=True)
+    request = access.EnsureExternalIdentityRequest(
+        issuer="https://id.example.com/realms/akb",
+        subject="prepared-subject",
+        email="prepared@example.com",
+        display_name="Prepared member",
+    )
+
+    result = await access.admin_prepare_external_identity(request, admin)
+
+    assert result["account_status"] == "suspended"
+    assert observed == {
+        "issuer": request.issuer,
+        "subject": request.subject,
+        "email": request.email,
+        "display_name": request.display_name,
+        "existing_user_id": None,
+        "prepare_suspended": True,
+        "actor_id": admin.user_id,
+    }
+
+
 async def test_token_identification_is_admin_only_and_never_returns_raw_token(monkeypatch):
     from app.api.routes import access
 
@@ -163,6 +195,7 @@ async def test_governance_routes_are_explicit_in_openapi():
     paths = app.openapi()["paths"]
     expected = {
         "/api/v1/admin/users/ensure-external-identity",
+        "/api/v1/admin/users/prepare-external-identity",
         "/api/v1/admin/users/by-external-identity",
         "/api/v1/admin/users/{user_id}/governance",
         "/api/v1/admin/service-users/ensure",

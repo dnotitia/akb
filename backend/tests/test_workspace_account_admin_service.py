@@ -125,6 +125,49 @@ async def test_ensure_human_binding_is_idempotent_and_never_bootstrap_admin(serv
     }
 
 
+async def test_prepare_human_binding_is_suspended_atomically_and_not_reactivated_by_default(
+    services,
+):
+    pool, _, service = services
+    subject = f"prepared-human-{uuid.uuid4().hex}"
+    email = f"governance-prepared-human-{uuid.uuid4().hex[:10]}@example.com"
+
+    prepared = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=subject,
+        email=email,
+        display_name="Prepared member",
+        actor_id="platform-service",
+        prepare_suspended=True,
+    )
+    retried_without_prepare = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=subject,
+        email=email,
+        display_name="Prepared member",
+        actor_id="platform-service",
+    )
+
+    assert prepared["user_id"] == retried_without_prepare["user_id"]
+    assert prepared["account_status"] == "suspended"
+    assert retried_without_prepare["account_status"] == "suspended"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.account_status, e.issuer, e.subject
+              FROM users u
+              JOIN external_identities e ON e.user_id = u.id
+             WHERE u.id = $1
+            """,
+            uuid.UUID(prepared["user_id"]),
+        )
+    assert dict(row) == {
+        "account_status": "suspended",
+        "issuer": _ISSUER,
+        "subject": subject,
+    }
+
+
 async def test_concurrent_human_ensure_converges_to_one_user(services):
     pool, _, service = services
     subject = f"concurrent-human-{uuid.uuid4().hex}"
@@ -664,6 +707,58 @@ async def test_suspend_revokes_sessions_tokens_and_strict_token_roles(services):
     assert row["account_status"] == "suspended"
     assert row["tokens_revoked_before"] > before
     assert row["token_count"] == 0
+
+
+async def test_prepare_existing_human_suspends_and_strictly_revokes_tokens(services):
+    pool, role_sync, service = services
+    subject = f"prepared-existing-{uuid.uuid4().hex}"
+    email = f"governance-prepared-existing-{uuid.uuid4().hex[:10]}@example.com"
+    ensured = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=subject,
+        email=email,
+        display_name="Existing member",
+        actor_id="platform-service",
+    )
+    user_id = uuid.UUID(ensured["user_id"])
+    async with pool.acquire() as conn:
+        token_id = await conn.fetchval(
+            """
+            INSERT INTO tokens (user_id, name, token_hash, token_prefix, key_class)
+            VALUES ($1, 'governance-prepare', $2, 'akb_govern', 'pat')
+            RETURNING id
+            """,
+            user_id,
+            uuid.uuid4().hex,
+        )
+
+    prepared = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=subject,
+        email=email,
+        display_name="Existing member",
+        actor_id="platform-service",
+        prepare_suspended=True,
+    )
+
+    assert prepared["account_status"] == "suspended"
+    assert role_sync.revoked_tokens == [token_id]
+    async with pool.acquire() as conn:
+        token_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM tokens WHERE user_id = $1",
+            user_id,
+        )
+        cleanup_completed = await conn.fetchval(
+            """
+            SELECT completed_at IS NOT NULL
+              FROM account_token_cleanup
+             WHERE token_id = $1 AND user_id = $2
+            """,
+            token_id,
+            user_id,
+        )
+    assert token_count == 0
+    assert cleanup_completed is True
 
 
 async def test_failed_strict_cleanup_keeps_denial_and_retry_finishes(services):

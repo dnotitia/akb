@@ -32,6 +32,15 @@ JWT lifecycle, converts the current token to a service key, and strictly revokes
 all sibling tokens without granting first-user administration to ordinary
 service-user creation.
 
+Managed control planes may also use the distinct
+`/admin/users/prepare-external-identity` endpoint. Keeping this separate from the
+standalone ensure route makes mixed-version rollout fail closed: an older AKB
+returns 404 instead of ignoring a new option and creating an active account. The
+binding and denial are committed atomically, any existing sessions and tokens
+are revoked through the same durable cleanup path, and the account stays
+inaccessible until the control plane explicitly activates it after committing
+its own membership authority.
+
 ## 0.9.6 — 2026-07-09  *(fix — release /health pool slots before nested delete-outbox stats)*
 
 `GET /health` no longer holds the chunks stats pool connection while awaiting

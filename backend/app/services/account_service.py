@@ -75,6 +75,7 @@ async def ensure_human_external_identity(
     display_name: str | None,
     actor_id: str,
     existing_user_id: str | None = None,
+    prepare_suspended: bool = False,
 ) -> dict:
     issuer = _required(issuer, "issuer")
     subject = _required(subject, "subject")
@@ -86,6 +87,7 @@ async def ensure_human_external_identity(
     )
     pool = await get_pool()
     new_user_id: uuid.UUID | None = None
+    token_ids: list[uuid.UUID] = []
 
     async with pool.acquire() as conn:
         try:
@@ -244,6 +246,12 @@ async def ensure_human_external_identity(
                         "subject": subject,
                     },
                 )
+                if prepare_suspended:
+                    token_ids = await _suspend_user_in_conn(
+                        conn,
+                        user_id,
+                        actor_id=actor_id,
+                    )
         except asyncpg.UniqueViolationError:
             raise ExternalIdentityConflictError() from None
 
@@ -251,6 +259,8 @@ async def ensure_human_external_identity(
 
     if new_user_id is not None:
         await get_role_sync().on_user_create(new_user_id)
+    if prepare_suspended:
+        await _cleanup_token_roles(pool, user_id, token_ids)
     return _user_result(row)
 
 
@@ -598,66 +608,80 @@ async def _cleanup_token_roles(pool, user_id: uuid.UUID, token_ids: list[uuid.UU
         raise CredentialCleanupIncompleteError(failed)
 
 
+async def _suspend_user_in_conn(
+    conn,
+    user_id: uuid.UUID,
+    *,
+    actor_id: str,
+) -> list[uuid.UUID]:
+    row = await conn.fetchrow(
+        "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
+        user_id,
+    )
+    if row is None:
+        raise NotFoundError("User", str(user_id))
+
+    if row["account_status"] == "active":
+        await conn.execute(
+            """
+            UPDATE users
+               SET account_status = 'suspended', updated_at = NOW()
+             WHERE id = $1
+            """,
+            user_id,
+        )
+        await _revoke_sessions_in_conn(
+            conn,
+            user_id,
+            actor_id=actor_id,
+            reason=REVOKE_REASON_ADMIN,
+        )
+        deleted = await conn.fetch(
+            "DELETE FROM tokens WHERE user_id = $1 RETURNING id",
+            user_id,
+        )
+        token_ids = [record["id"] for record in deleted]
+        if token_ids:
+            await conn.executemany(
+                """
+                INSERT INTO account_token_cleanup (token_id, user_id)
+                VALUES ($1, $2)
+                ON CONFLICT (token_id) DO NOTHING
+                """,
+                [(token_id, user_id) for token_id in token_ids],
+            )
+        await emit_event(
+            conn,
+            "auth.account_suspended",
+            actor_id=actor_id,
+            payload={
+                "user_id": str(user_id),
+                "revoked_token_ids": [str(token_id) for token_id in token_ids],
+            },
+        )
+        return token_ids
+
+    pending = await conn.fetch(
+        """
+        SELECT token_id FROM account_token_cleanup
+         WHERE user_id = $1 AND completed_at IS NULL
+         ORDER BY requested_at, token_id
+        """,
+        user_id,
+    )
+    return [record["token_id"] for record in pending]
+
+
 async def suspend_user(user_id: str, *, actor_id: str) -> dict:
     user_uuid = _uuid(user_id, "user_id")
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
+            token_ids = await _suspend_user_in_conn(
+                conn,
                 user_uuid,
+                actor_id=actor_id,
             )
-            if row is None:
-                raise NotFoundError("User", user_id)
-
-            if row["account_status"] == "active":
-                await conn.execute(
-                    """
-                    UPDATE users
-                       SET account_status = 'suspended', updated_at = NOW()
-                     WHERE id = $1
-                    """,
-                    user_uuid,
-                )
-                await _revoke_sessions_in_conn(
-                    conn,
-                    user_uuid,
-                    actor_id=actor_id,
-                    reason=REVOKE_REASON_ADMIN,
-                )
-                deleted = await conn.fetch(
-                    "DELETE FROM tokens WHERE user_id = $1 RETURNING id",
-                    user_uuid,
-                )
-                token_ids = [record["id"] for record in deleted]
-                if token_ids:
-                    await conn.executemany(
-                        """
-                        INSERT INTO account_token_cleanup (token_id, user_id)
-                        VALUES ($1, $2)
-                        ON CONFLICT (token_id) DO NOTHING
-                        """,
-                        [(token_id, user_uuid) for token_id in token_ids],
-                    )
-                await emit_event(
-                    conn,
-                    "auth.account_suspended",
-                    actor_id=actor_id,
-                    payload={
-                        "user_id": user_id,
-                        "revoked_token_ids": [str(token_id) for token_id in token_ids],
-                    },
-                )
-            else:
-                pending = await conn.fetch(
-                    """
-                    SELECT token_id FROM account_token_cleanup
-                     WHERE user_id = $1 AND completed_at IS NULL
-                     ORDER BY requested_at, token_id
-                    """,
-                    user_uuid,
-                )
-                token_ids = [record["token_id"] for record in pending]
 
     await _cleanup_token_roles(pool, user_uuid, token_ids)
     return {
