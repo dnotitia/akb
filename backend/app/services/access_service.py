@@ -926,9 +926,9 @@ async def set_vault_write_policy(
     Once marked, `check_vault_access`'s write-policy guard rejects every
     mutating call (including the vault OWNER and any JWT session) unless
     the caller's PAT is on the vault's `vault_write_grants` allowlist. Idempotent
-    upsert: re-marking an already-marked vault updates `managed_by`/`note`
-    in place (`vault_write_policy_repo.set_policy` pins `created_at`/
-    `created_by` to the original mark).
+    upsert: re-marking an already-marked vault REPLACES managed_by and note
+    (note omitted ⇒ cleared); grants are preserved (`vault_write_policy_repo.set_policy`
+    pins `created_at`/`created_by` to the original mark).
 
     External-git mirror vaults are REJECTED (409), not silently accepted:
     see the comment at the mirror check below for the reasoning.

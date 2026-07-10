@@ -1,7 +1,7 @@
 """REST API routes for vault access management."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 
 from app.api.deps import get_current_user
 from app.services.auth_service import (
@@ -70,7 +70,10 @@ class VaultPatchRequest(NFCModel):
 
 class SetVaultWritePolicyRequest(NFCModel):
     managed_by: str
-    note: str | None = None
+    note: str | None = Field(
+        default=None,
+        description="Optional operator note. A re-mark REPLACES the whole policy row: omitting note clears any previously stored note (grants are preserved).",
+    )
 
 
 class EnsureExternalIdentityRequest(NFCModel):
@@ -209,6 +212,8 @@ async def admin_set_vault_write_policy(
     req: SetVaultWritePolicyRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    """Mark a vault as write-managed: re-marking REPLACES managed_by and note
+    (note omitted ⇒ cleared); grants are preserved."""
     _require_admin(user)
     return await set_vault_write_policy(user.user_id, vault, req.managed_by, note=req.note)
 
