@@ -143,6 +143,54 @@ async def test_token_identification_is_admin_only_and_never_returns_raw_token(mo
     assert observed == {"token": raw_token, "actor_id": admin.user_id}
 
 
+async def test_admin_mint_forwards_caller_selected_token_id(monkeypatch):
+    from app.api.routes import access
+    from app.db import postgres
+    from app.services import auth_service
+
+    user_id = uuid.uuid4()
+    token_id = uuid.uuid4()
+    observed = {}
+
+    class _Connection:
+        async def fetchrow(self, _query, resolved_user_id):
+            assert resolved_user_id == user_id
+            return {"id": user_id}
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def _get_pool():
+        return _Pool()
+
+    async def _create_pat(resolved_user_id, name, **kwargs):
+        observed.update(user_id=resolved_user_id, name=name, **kwargs)
+        return {"token_id": str(token_id), "token": "akb_once"}
+
+    monkeypatch.setattr(postgres, "get_pool", _get_pool)
+    monkeypatch.setattr(auth_service, "create_pat", _create_pat)
+    request = access.AdminManagedMintTokenRequest(
+        name="claude-code",
+        token_id=str(token_id),
+    )
+
+    result = await access.admin_mint_managed_user_token(
+        str(user_id), request, _user(admin=True)
+    )
+
+    assert result["token_id"] == str(token_id)
+    assert observed["token_id"] == str(token_id)
+    assert observed["user_id"] == str(user_id)
+
+
 async def test_adopt_current_service_requires_exact_admin_pat_and_forwards_ids(monkeypatch):
     from app.api.routes import access
 
@@ -204,6 +252,7 @@ async def test_governance_routes_are_explicit_in_openapi():
         "/api/v1/admin/users/{user_id}/suspend",
         "/api/v1/admin/users/{user_id}/activate",
         "/api/v1/admin/users/{user_id}/tokens/{token_id}",
+        "/api/v1/admin/users/{user_ref}/managed-tokens",
         "/api/v1/admin/tokens/identify",
     }
     assert expected <= set(paths)

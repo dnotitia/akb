@@ -790,6 +790,7 @@ async def create_pat(
     user_id: str,
     name: str,
     *,
+    token_id: str | None = None,
     expires_days: int | None = None,
     vault_scope: VaultScope | None = None,
     scopes: list[str] | None = None,
@@ -809,6 +810,13 @@ async def create_pat(
     key_class = _normalize_issuable_key_class(key_class)
     token_scopes = normalize_token_scopes(scopes)
     raw_token, token_hash, token_prefix = generate_pat(key_class)
+    if token_id is None:
+        resolved_token_id = uuid.uuid4()
+    else:
+        try:
+            resolved_token_id = uuid.UUID(token_id)
+        except (AttributeError, TypeError, ValueError):
+            raise ValidationError("token_id must be a UUID") from None
 
     expires_at = None
     if expires_days:
@@ -817,7 +825,6 @@ async def create_pat(
     vault_scope_json = json.dumps(vault_scope.to_db_json()) if vault_scope else None
 
     async with pool.acquire() as conn:
-        token_id = uuid.uuid4()
         async with conn.transaction():
             user_row = await conn.fetchrow(
                 "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
@@ -835,7 +842,7 @@ async def create_pat(
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
-                token_id,
+                resolved_token_id,
                 uuid.UUID(user_id),
                 name,
                 token_hash,
@@ -853,12 +860,12 @@ async def create_pat(
     # never falls back to the full akb_user_<uid>). Unscoped PATs need none.
     if vault_scope is not None:
         await get_role_sync().on_token_create(
-            token_id, uuid.UUID(user_id), vault_scope,
+            resolved_token_id, uuid.UUID(user_id), vault_scope,
         )
 
     return {
         "token": raw_token,
-        "token_id": str(token_id),
+        "token_id": str(resolved_token_id),
         "name": name,
         "prefix": token_prefix,
         "scopes": token_scopes,

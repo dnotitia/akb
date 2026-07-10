@@ -447,6 +447,10 @@ class AdminMintTokenRequest(NFCModel):
     vault_scope: dict[str, list[str]] | None = None
 
 
+class AdminManagedMintTokenRequest(AdminMintTokenRequest):
+    token_id: str
+
+
 @router.post(
     "/admin/users/{user_ref}/tokens",
     summary="[admin] Mint a PAT for a user (by id or email)",
@@ -466,6 +470,28 @@ async def admin_mint_user_token(
     token once, same shape as ``/auth/tokens``.
     """
     _require_admin(user)
+    return await _mint_admin_user_token(user_ref, req)
+
+
+@router.post(
+    "/admin/users/{user_ref}/managed-tokens",
+    summary="[admin] Mint a PAT with a caller-selected durable token ID",
+)
+async def admin_mint_managed_user_token(
+    user_ref: str,
+    req: AdminManagedMintTokenRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await _mint_admin_user_token(user_ref, req, token_id=req.token_id)
+
+
+async def _mint_admin_user_token(
+    user_ref: str,
+    req: AdminMintTokenRequest,
+    *,
+    token_id: str | None = None,
+):
     import uuid as _uuid
     from app.db.postgres import get_pool
     from app.models.vault_scope import VaultScope
@@ -486,6 +512,7 @@ async def admin_mint_user_token(
     return await create_pat(
         str(row["id"]),
         req.name,
+        token_id=token_id,
         expires_days=req.expires_days,
         vault_scope=VaultScope.parse_input(req.vault_scope),
         scopes=req.scopes,

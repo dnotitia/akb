@@ -317,6 +317,34 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
     assert password_hash.startswith("!service-account:")
 
 
+async def test_create_pat_uses_caller_selected_token_id(services):
+    pool, _, service = services
+    requested_token_id = uuid.uuid4()
+    ensured = await service.ensure_human_external_identity(
+        issuer=_ISSUER,
+        subject=f"selected-token-{uuid.uuid4().hex}",
+        email=f"governance-selected-token-{uuid.uuid4().hex[:10]}@example.com",
+        display_name="Selected token owner",
+        actor_id="platform-service",
+    )
+    from app.services.auth_service import create_pat
+
+    credential = await create_pat(
+        ensured["user_id"],
+        "platform-operation",
+        token_id=str(requested_token_id),
+    )
+
+    assert credential["token_id"] == str(requested_token_id)
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval(
+            "SELECT id FROM tokens WHERE id = $1 AND user_id = $2",
+            requested_token_id,
+            uuid.UUID(ensured["user_id"]),
+        )
+    assert stored == requested_token_id
+
+
 async def test_adopt_bootstrap_admin_preserves_current_token_and_revokes_others(
     services,
 ):
