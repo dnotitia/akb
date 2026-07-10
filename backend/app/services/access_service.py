@@ -424,12 +424,19 @@ async def list_accessible_vaults(user_id: str) -> list[dict]:
         # System admin sees all vaults
         is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
 
+        # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
+        # vault_write_policy sidecar in both branches — a vault has at
+        # most one policy row (vault_id is its PK) so this never fans out
+        # rows. NULL (no match) reads as ungoverned, same convention as
+        # `get_vault_info`.
         if is_admin:
             rows = await conn.fetch(
                 """
                 SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role
+                       COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
+                       vwp.managed_by
                 FROM vaults v
+                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
                 ORDER BY v.name
                 """,
                 uid,
@@ -438,9 +445,11 @@ async def list_accessible_vaults(user_id: str) -> list[dict]:
             rows = await conn.fetch(
                 """
                 SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role
+                       COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
+                       vwp.managed_by
                 FROM vaults v
                 LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
+                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
                 WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
                 ORDER BY v.name
                 """,
@@ -454,6 +463,7 @@ async def list_accessible_vaults(user_id: str) -> list[dict]:
                 "description": r["description"],
                 "status": r["status"],
                 "role": r["role"],
+                "managed_by": r["managed_by"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
             for r in rows
@@ -495,6 +505,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         edge_count,
         last_doc,
         is_external_git,
+        write_policy,
     ) = await asyncio.gather(
         _r("SELECT username, display_name FROM users WHERE id = $1", vault["owner_id"]),
         _q("SELECT COUNT(*) FROM vault_access WHERE vault_id = $1", vid),
@@ -511,6 +522,10 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
             vid,
         ),
         _q("SELECT 1 FROM vault_external_git WHERE vault_id = $1", vid),
+        # P0 S3: vault_write_policy is a 1:1 sidecar keyed on vault_id —
+        # reuse the repo (own pool-acquire, same fan-out style as the
+        # helpers above) rather than a bespoke query here.
+        write_policy_repo.get_policy(vid),
     )
 
     tables = await _list_tables_with_schema(vault_name, vid) if table_count else []
@@ -520,6 +535,11 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         "description": vault["description"],
         "status": vault["status"],
         "is_archived": vault["status"] == "archived",
+        # P0 S3 (design §5.1a): None when ungoverned; otherwise the
+        # write-policy owner label (e.g. "collector:acme-jira",
+        # "gardener:distill") — naut's `normalizeAkbVaultList` and any
+        # other consumer key routing decisions off this one field.
+        "managed_by": write_policy["managed_by"] if write_policy else None,
         "is_external_git": bool(is_external_git),
         "public_access": vault["public_access"],
         "role": caller_role,
@@ -880,6 +900,244 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
 
     logger.info("Set public_access for %s → %s", vault_name, level)
     return {"vault": vault_name, "public_access": level}
+
+
+# ── Vault write-policy admin (P0 S3, design §5.1a) ──────────
+#
+# System-admin-only surface (enforced at the route layer via
+# `_require_admin` in `api/routes/access.py` — same convention every other
+# `/admin/...` function in this module already uses, e.g.
+# `account_service.suspend_user`: this module trusts the caller and takes
+# `actor_id` purely for the audit trail, it never re-checks `users.is_admin`
+# itself). Every mutation here emits `vault.write_policy_changed`
+# UNCONDITIONALLY — even when the call is a no-op against current state
+# (re-marking with the same managed_by, unmarking an already-unmarked
+# vault, removing a grant that was never added) — because the point of the
+# audit trail is "an admin invoked this action", not "state changed since
+# last read". That is also what makes the unmark → write → re-mark
+# break-glass sequence (Task 8/9's handoff note) fully auditable: a smart
+# no-op dedup would hide exactly the events that sequence needs recorded.
+
+async def set_vault_write_policy(
+    actor_id: str, vault_name: str, managed_by: str, note: str | None = None,
+) -> dict:
+    """Admin-only: mark ``vault_name`` write-managed.
+
+    Once marked, `check_vault_access`'s write-policy guard rejects every
+    mutating call (including the vault OWNER and any JWT session) unless
+    the caller's PAT is on the vault's `vault_write_grants` allowlist. Idempotent
+    upsert: re-marking an already-marked vault updates `managed_by`/`note`
+    in place (`vault_write_policy_repo.set_policy` pins `created_at`/
+    `created_by` to the original mark).
+
+    External-git mirror vaults are REJECTED (409), not silently accepted:
+    see the comment at the mirror check below for the reasoning.
+    """
+    managed_by = managed_by.strip()
+    if not managed_by:
+        raise ValidationError("managed_by must not be empty")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+
+            # DECISION (task 10): an external-git mirror vault is ALREADY
+            # read-only to every caller via its own unconditional guard in
+            # `check_vault_access` (writer-role mirror check, above the
+            # write-policy guard in that same function) — mutations there
+            # come exclusively from the in-process poller, which bypasses
+            # `check_vault_access` entirely. A grant on such a vault could
+            # therefore never make a PAT write succeed: the mirror check
+            # fires first and unconditionally, regardless of any
+            # `vault_write_grants` row. Marking it anyway would be
+            # harmless in enforcement terms but actively misleading in
+            # practice — an operator reading `managed_by="collector:x"`
+            # would reasonably (and wrongly) conclude a granted token can
+            # write there. Reject with a clear message rather than ship a
+            # marking that can never do what it appears to promise.
+            is_mirror = await conn.fetchval(
+                "SELECT 1 FROM vault_external_git WHERE vault_id = $1", vault["id"],
+            )
+            if is_mirror:
+                raise ConflictError(
+                    f"Vault '{vault_name}' is an external-git mirror "
+                    f"(already read-only via its own poller); marking it "
+                    f"with a write policy would not change enforcement and "
+                    f"misleadingly implies a granted token could write here"
+                )
+
+            policy = await write_policy_repo.set_policy(
+                vault["id"], managed_by, created_by=actor_id, note=note, conn=conn,
+            )
+            await emit_event(
+                conn, "vault.write_policy_changed",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=actor_id,
+                payload={
+                    "action": "marked",
+                    "vault": vault_name,
+                    "managed_by": managed_by,
+                    "note": note,
+                },
+            )
+
+    logger.info("Marked vault %s write-managed by %s", vault_name, managed_by)
+    return {
+        "vault": vault_name,
+        "managed_by": policy["managed_by"],
+        "note": policy["note"],
+        "marked": True,
+    }
+
+
+async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
+    """Admin-only: unmark ``vault_name`` — restore ordinary ACL-gated writes.
+
+    Idempotent: unmarking a vault that isn't currently marked is a
+    harmless no-op (`was_marked: False` in the response distinguishes it
+    from a real transition, but it still emits the event — see this
+    section's module-level comment for why). Cascades away every grant
+    row for this vault too (`vault_write_policy_repo.remove_policy`'s
+    `ON DELETE CASCADE`).
+
+    ROLLBACK PROOF: this is the operation that restores every caller
+    (including a plain JWT session) to full pre-marking behaviour — the
+    e2e's final step calls this and then re-attempts an ungranted write to
+    prove the guard is a true no-op once unmarked, not a one-way ratchet.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+
+            existing = await write_policy_repo.get_policy(vault["id"], conn=conn)
+            await write_policy_repo.remove_policy(vault["id"], conn=conn)
+            await emit_event(
+                conn, "vault.write_policy_changed",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=actor_id,
+                payload={
+                    "action": "unmarked",
+                    "vault": vault_name,
+                    "managed_by": existing["managed_by"] if existing else None,
+                },
+            )
+
+    logger.info("Unmarked vault %s (write-policy removed)", vault_name)
+    return {"vault": vault_name, "unmarked": True, "was_marked": existing is not None}
+
+
+async def add_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -> dict:
+    """Admin-only: grant ``token_id`` write access to a MARKED vault.
+
+    Requires the vault to already be marked (409 `ConflictError` — a grant
+    on an ungoverned vault has no allowlist to join and almost certainly
+    means the caller meant to mark first) and `token_id` to exist (404).
+    The design is class-agnostic (collector/gardener/operator/human PATs
+    are all just rows on the allowlist — see `vault_write_policy_repo`'s
+    module docstring), so no further ownership/role check on the token is
+    performed here.
+    """
+    try:
+        tid = uuid.UUID(token_id)
+    except (AttributeError, TypeError, ValueError):
+        raise ValidationError(f"Invalid token_id: {token_id!r}") from None
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+
+            policy = await write_policy_repo.get_policy(vault["id"], conn=conn)
+            if policy is None:
+                raise ConflictError(
+                    f"Vault '{vault_name}' is not write-managed; mark it "
+                    f"first with PUT .../write-policy"
+                )
+
+            token_row = await conn.fetchrow("SELECT id FROM tokens WHERE id = $1", tid)
+            if not token_row:
+                raise NotFoundError("Token", token_id)
+
+            await write_policy_repo.add_grant(vault["id"], tid, actor_id, conn=conn)
+            await emit_event(
+                conn, "vault.write_policy_changed",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=actor_id,
+                payload={
+                    "action": "grant_added",
+                    "vault": vault_name,
+                    "managed_by": policy["managed_by"],
+                    "token_id": token_id,
+                },
+            )
+
+    logger.info("Granted token %s write access to vault %s", token_id, vault_name)
+    return {"vault": vault_name, "token_id": token_id, "granted": True}
+
+
+async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -> dict:
+    """Admin-only: revoke ``token_id``'s write grant on ``vault_name``.
+
+    Idempotent (a token that was never granted is a harmless no-op — same
+    "always audit the action" rationale as `remove_vault_write_policy`).
+    Does NOT require the vault to still be marked — unlike the grant-add
+    direction, there is nothing to protect here: if the vault was
+    unmarked, the CASCADE already removed every grant, so this is
+    naturally a no-op regardless. `token_id` must still exist (404) — same
+    operator-typo guard as the grant-add direction.
+    """
+    try:
+        tid = uuid.UUID(token_id)
+    except (AttributeError, TypeError, ValueError):
+        raise ValidationError(f"Invalid token_id: {token_id!r}") from None
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+
+            token_row = await conn.fetchrow("SELECT id FROM tokens WHERE id = $1", tid)
+            if not token_row:
+                raise NotFoundError("Token", token_id)
+
+            policy = await write_policy_repo.get_policy(vault["id"], conn=conn)
+            await write_policy_repo.remove_grant(vault["id"], tid, conn=conn)
+            await emit_event(
+                conn, "vault.write_policy_changed",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=actor_id,
+                payload={
+                    "action": "grant_removed",
+                    "vault": vault_name,
+                    "managed_by": policy["managed_by"] if policy else None,
+                    "token_id": token_id,
+                },
+            )
+
+    logger.info("Revoked token %s write access to vault %s", token_id, vault_name)
+    return {"vault": vault_name, "token_id": token_id, "revoked": True}
 
 
 # ── Destructive: vault delete ───────────────────────────────

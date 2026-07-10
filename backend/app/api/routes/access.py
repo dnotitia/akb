@@ -22,6 +22,7 @@ from app.services.account_service import (
     suspend_user,
 )
 from app.services.access_service import (
+    add_vault_write_grant,
     archive_vault,
     delete_user_account,
     delete_vault,
@@ -30,8 +31,11 @@ from app.services.access_service import (
     list_accessible_vaults,
     list_all_users_admin,
     list_vault_members,
+    remove_vault_write_grant,
+    remove_vault_write_policy,
     revoke_access,
     search_users,
+    set_vault_write_policy,
     transfer_ownership,
     unarchive_vault,
     update_vault_metadata,
@@ -62,6 +66,11 @@ class TransferRequest(NFCModel):
 class VaultPatchRequest(NFCModel):
     description: str | None = None
     public_access: str | None = None
+
+
+class SetVaultWritePolicyRequest(NFCModel):
+    managed_by: str
+    note: str | None = None
 
 
 class EnsureExternalIdentityRequest(NFCModel):
@@ -177,6 +186,69 @@ async def user_search(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     return {"users": await search_users(q, limit)}
+
+
+#
+# ── Vault write-policy admin (P0 S3) ─────────────────────────
+#
+# System-admin-only (`_require_admin`, same gate as every `/admin/...`
+# route below) — marking/granting is a platform-level decision, not a
+# vault-owner self-service one (a marked vault denies its OWNER too; see
+# `access_service.check_vault_access`'s write-policy guard). Business
+# logic + validation + the `vault.write_policy_changed` audit emission all
+# live in `access_service` (this module stays a thin adapter, same
+# convention as `admin_suspend_user` / `admin_ensure_service_user` below).
+#
+
+@router.put(
+    "/admin/vaults/{vault}/write-policy",
+    summary="[admin] Mark a vault as write-managed (PAT-grant-only writes)",
+)
+async def admin_set_vault_write_policy(
+    vault: str,
+    req: SetVaultWritePolicyRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await set_vault_write_policy(user.user_id, vault, req.managed_by, note=req.note)
+
+
+@router.delete(
+    "/admin/vaults/{vault}/write-policy",
+    summary="[admin] Unmark a vault (restore ordinary ACL-gated writes)",
+)
+async def admin_remove_vault_write_policy(
+    vault: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await remove_vault_write_policy(user.user_id, vault)
+
+
+@router.put(
+    "/admin/vaults/{vault}/write-policy/grants/{token_id}",
+    summary="[admin] Grant a token write access to a marked vault",
+)
+async def admin_add_vault_write_grant(
+    vault: str,
+    token_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await add_vault_write_grant(user.user_id, vault, token_id)
+
+
+@router.delete(
+    "/admin/vaults/{vault}/write-policy/grants/{token_id}",
+    summary="[admin] Revoke a token's write grant on a marked vault",
+)
+async def admin_remove_vault_write_grant(
+    vault: str,
+    token_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await remove_vault_write_grant(user.user_id, vault, token_id)
 
 
 @router.get("/admin/users", summary="[admin] List every user with stats")

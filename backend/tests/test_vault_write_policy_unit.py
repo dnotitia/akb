@@ -692,3 +692,393 @@ class TestAkbSqlDualEnforcement:
             )
 
         assert result["code"] == VAULT_WRITE_MANAGED
+
+
+class TestVaultInfoExposure:
+    """Task 10 — `managed_by` on `get_vault_info` / `list_accessible_vaults`."""
+
+    async def test_get_vault_info_managed_by_none_when_unmarked(self, pool):
+        from app.services.access_service import get_vault_info
+
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+
+        info = await get_vault_info(str(owner_id), vault_name)
+
+        assert info["managed_by"] is None
+
+    async def test_get_vault_info_managed_by_set_when_marked(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import get_vault_info
+
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        info = await get_vault_info(str(owner_id), vault_name)
+
+        assert info["managed_by"] == "collector:acme"
+
+    async def test_list_accessible_vaults_includes_managed_by(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import list_accessible_vaults
+
+        owner_id = await _create_user(pool)
+        marked_id, marked_name = await _create_named_vault(pool, owner_id)
+        _plain_id, plain_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(marked_id, "gardener:distill", "admin-user")
+
+        vaults = await list_accessible_vaults(str(owner_id))
+        by_name = {v["name"]: v for v in vaults}
+
+        assert by_name[marked_name]["managed_by"] == "gardener:distill"
+        assert by_name[plain_name]["managed_by"] is None
+
+    async def test_list_accessible_vaults_includes_managed_by_for_admin_viewer(self, pool):
+        """The admin branch of `list_accessible_vaults` (sees every vault,
+        not just owned/granted ones) has its own separate SQL — the JOIN
+        must be duplicated there too, not just in the member branch."""
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import list_accessible_vaults
+
+        owner_id = await _create_user(pool)
+        admin_id = await _create_admin_user(pool)
+        marked_id, marked_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(marked_id, "collector:acme", "admin-user")
+
+        vaults = await list_accessible_vaults(str(admin_id))
+        by_name = {v["name"]: v for v in vaults}
+
+        assert by_name[marked_name]["managed_by"] == "collector:acme"
+
+
+class TestAdminWritePolicyMarking:
+    """Task 10 — the admin-only marking service functions
+    (`access_service.set_vault_write_policy` / `remove_vault_write_policy`).
+
+    Called directly: route-level `_require_admin` gating is covered by
+    `test_vault_write_policy_routes_unit.py` (which mocks these functions
+    out) — the service layer itself trusts the caller, the same convention
+    every other admin-gated function in this module already uses (e.g.
+    `account_service.suspend_user` takes `actor_id` for audit only).
+    """
+
+    async def test_set_vault_write_policy_marks_and_emits_event(self, pool):
+        from app.services.access_service import get_vault_info, set_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+
+        result = await set_vault_write_policy(
+            str(admin_id), vault_name, "collector:acme", note="pilot vault",
+        )
+
+        assert result == {
+            "vault": vault_name,
+            "managed_by": "collector:acme",
+            "note": "pilot vault",
+            "marked": True,
+        }
+        info = await get_vault_info(str(owner_id), vault_name)
+        assert info["managed_by"] == "collector:acme"
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_changed' "
+                "AND vault_id = (SELECT id FROM vaults WHERE name = $1)",
+                vault_name,
+            )
+        assert event is not None
+        assert event["actor_id"] == str(admin_id)
+        payload = (
+            json.loads(event["payload"]) if isinstance(event["payload"], str) else event["payload"]
+        )
+        assert payload == {
+            "action": "marked",
+            "vault": vault_name,
+            "managed_by": "collector:acme",
+            "note": "pilot vault",
+        }
+
+    async def test_set_vault_write_policy_rejects_missing_vault(self, pool):
+        from app.exceptions import NotFoundError
+        from app.services.access_service import set_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+
+        with pytest.raises(NotFoundError):
+            await set_vault_write_policy(str(admin_id), "vwp-does-not-exist", "collector:acme")
+
+    async def test_set_vault_write_policy_rejects_empty_managed_by(self, pool):
+        from app.exceptions import ValidationError
+        from app.services.access_service import set_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+
+        with pytest.raises(ValidationError):
+            await set_vault_write_policy(str(admin_id), vault_name, "   ")
+
+    async def test_set_vault_write_policy_rejects_external_git_vault(self, pool):
+        """DECISION (task 10): marking an external-git mirror is REJECTED
+        rather than silently accepted as harmless overlap — see
+        `access_service.set_vault_write_policy`'s comment for the
+        rationale (a grant could never make a write succeed there, since
+        the mirror's own guard fires first and unconditionally; marking it
+        anyway would misleadingly imply otherwise)."""
+        from app.exceptions import ConflictError
+        from app.services.access_service import set_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vault_external_git (vault_id, remote_url) VALUES ($1, $2)",
+                vault_id, "https://example.com/repo.git",
+            )
+
+        with pytest.raises(ConflictError):
+            await set_vault_write_policy(str(admin_id), vault_name, "collector:acme")
+
+    async def test_set_vault_write_policy_upsert_remarks_and_emits_again(self, pool):
+        """Re-marking (upsert) audits AGAIN — every call is a real admin
+        ACTION worth recording, not deduped against prior state. This is
+        also what makes the unmark → write → re-mark break-glass sequence
+        fully auditable (task 8/9's handoff note)."""
+        from app.services.access_service import set_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+
+        await set_vault_write_policy(str(admin_id), vault_name, "collector:v1")
+        await set_vault_write_policy(str(admin_id), vault_name, "collector:v2", note="updated")
+
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM events WHERE kind = 'vault.write_policy_changed' "
+                "AND vault_id = (SELECT id FROM vaults WHERE name = $1)",
+                vault_name,
+            )
+            managed_by = await conn.fetchval(
+                "SELECT managed_by FROM vault_write_policy WHERE vault_id = "
+                "(SELECT id FROM vaults WHERE name = $1)",
+                vault_name,
+            )
+        assert count == 2
+        assert managed_by == "collector:v2"
+
+    async def test_remove_vault_write_policy_unmarks_and_emits_event(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import remove_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        result = await remove_vault_write_policy(str(admin_id), vault_name)
+
+        assert result == {"vault": vault_name, "unmarked": True, "was_marked": True}
+        assert await repo.get_policy(vault_id) is None
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_changed' "
+                "AND vault_id = $1 AND payload->>'action' = 'unmarked'",
+                vault_id,
+            )
+        assert event is not None
+        payload = (
+            json.loads(event["payload"]) if isinstance(event["payload"], str) else event["payload"]
+        )
+        assert payload["managed_by"] == "collector:acme"  # what it WAS managed by
+
+    async def test_remove_vault_write_policy_idempotent_on_unmarked_vault(self, pool):
+        from app.services.access_service import remove_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+
+        result = await remove_vault_write_policy(str(admin_id), vault_name)
+
+        assert result == {"vault": vault_name, "unmarked": True, "was_marked": False}
+
+    async def test_remove_vault_write_policy_rejects_missing_vault(self, pool):
+        from app.exceptions import NotFoundError
+        from app.services.access_service import remove_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+
+        with pytest.raises(NotFoundError):
+            await remove_vault_write_policy(str(admin_id), "vwp-does-not-exist")
+
+
+class TestAdminWritePolicyGrants:
+    """Task 10 — `add_vault_write_grant` / `remove_vault_write_grant`."""
+
+    async def test_add_vault_write_grant_success_and_emits_event(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        token_id = await _create_token(pool, owner_id)
+
+        result = await add_vault_write_grant(str(admin_id), vault_name, str(token_id))
+
+        assert result == {"vault": vault_name, "token_id": str(token_id), "granted": True}
+        assert await repo.is_granted(vault_id, token_id) is True
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_changed' "
+                "AND vault_id = $1 AND payload->>'action' = 'grant_added'",
+                vault_id,
+            )
+        assert event is not None
+        payload = (
+            json.loads(event["payload"]) if isinstance(event["payload"], str) else event["payload"]
+        )
+        assert payload["token_id"] == str(token_id)
+        assert payload["managed_by"] == "collector:acme"
+
+    async def test_add_vault_write_grant_rejects_unmarked_vault(self, pool):
+        from app.exceptions import ConflictError
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        _vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        token_id = await _create_token(pool, owner_id)
+        # vault stays ungoverned — no set_policy call
+
+        with pytest.raises(ConflictError):
+            await add_vault_write_grant(str(admin_id), vault_name, str(token_id))
+
+    async def test_add_vault_write_grant_rejects_missing_token(self, pool):
+        from app.exceptions import NotFoundError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        with pytest.raises(NotFoundError):
+            await add_vault_write_grant(str(admin_id), vault_name, str(uuid.uuid4()))
+
+    async def test_add_vault_write_grant_rejects_missing_vault(self, pool):
+        from app.exceptions import NotFoundError
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        token_id = await _create_token(pool, owner_id)
+
+        with pytest.raises(NotFoundError):
+            await add_vault_write_grant(str(admin_id), "vwp-does-not-exist", str(token_id))
+
+    async def test_remove_vault_write_grant_success_and_emits_event(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import remove_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        token_id = await _create_token(pool, owner_id)
+        await repo.add_grant(vault_id, token_id, "admin-user")
+
+        result = await remove_vault_write_grant(str(admin_id), vault_name, str(token_id))
+
+        assert result == {"vault": vault_name, "token_id": str(token_id), "revoked": True}
+        assert await repo.is_granted(vault_id, token_id) is False
+
+        async with pool.acquire() as conn:
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE kind = 'vault.write_policy_changed' "
+                "AND vault_id = $1 AND payload->>'action' = 'grant_removed'",
+                vault_id,
+            )
+        assert event is not None
+
+    async def test_remove_vault_write_grant_rejects_missing_token(self, pool):
+        from app.exceptions import NotFoundError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import remove_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        with pytest.raises(NotFoundError):
+            await remove_vault_write_grant(str(admin_id), vault_name, str(uuid.uuid4()))
+
+    async def test_remove_vault_write_grant_idempotent_when_not_granted(self, pool):
+        from app.services.access_service import remove_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        from app.repositories import vault_write_policy_repo as repo
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        token_id = await _create_token(pool, owner_id)
+        # never granted
+
+        result = await remove_vault_write_grant(str(admin_id), vault_name, str(token_id))
+
+        assert result == {"vault": vault_name, "token_id": str(token_id), "revoked": True}
+
+    async def test_remove_vault_write_grant_rejects_missing_vault(self, pool):
+        from app.exceptions import NotFoundError
+        from app.services.access_service import remove_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        token_id = await _create_token(pool, owner_id)
+
+        with pytest.raises(NotFoundError):
+            await remove_vault_write_grant(str(admin_id), "vwp-does-not-exist", str(token_id))
+
+    async def test_add_vault_write_grant_rejects_malformed_token_id(self, pool):
+        """Characterization/pinning, not RED-driven — caught by self-review
+        (code-review skill pass) as a real, reachable branch (an admin
+        fat-fingering the token_id path segment) with zero prior coverage;
+        the `try: uuid.UUID(token_id) except ...: raise ValidationError`
+        guard already existed and was already correct, this just pins it
+        so a future refactor can't silently let a raw ValueError leak out
+        as a 500 instead of a clean 422."""
+        from app.exceptions import ValidationError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        with pytest.raises(ValidationError):
+            await add_vault_write_grant(str(admin_id), vault_name, "not-a-uuid")
+
+    async def test_remove_vault_write_grant_rejects_malformed_token_id(self, pool):
+        """Same characterization rationale as the add-grant twin above."""
+        from app.exceptions import ValidationError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import remove_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+
+        with pytest.raises(ValidationError):
+            await remove_vault_write_grant(str(admin_id), vault_name, "not-a-uuid")
