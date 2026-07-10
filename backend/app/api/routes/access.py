@@ -204,6 +204,26 @@ async def admin_ensure_external_identity(
     )
 
 
+@router.post(
+    "/admin/users/prepare-external-identity",
+    summary="[admin] Prepare a suspended human user and stable OIDC binding",
+)
+async def admin_prepare_external_identity(
+    req: EnsureExternalIdentityRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await ensure_human_external_identity(
+        issuer=req.issuer,
+        subject=req.subject,
+        email=req.email,
+        display_name=req.display_name,
+        existing_user_id=req.existing_user_id,
+        prepare_suspended=True,
+        actor_id=user.user_id,
+    )
+
+
 @router.get(
     "/admin/users/by-external-identity",
     summary="[admin] Resolve a user by exact OIDC issuer and subject",
