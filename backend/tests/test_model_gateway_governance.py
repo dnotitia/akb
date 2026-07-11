@@ -43,9 +43,9 @@ def _set_hard_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         settings, "platform_gateway_base_url", "https://gateway.example/v1"
     )
     monkeypatch.setattr(settings, "embed_base_url", "https://gateway.example/v1")
-    monkeypatch.setattr(settings, "embed_api_key", "gw_test")
+    monkeypatch.setattr(settings, "embed_api_key", "gw_test")  # pragma: allowlist secret
     monkeypatch.setattr(settings, "llm_base_url", "https://gateway.example/v1")
-    monkeypatch.setattr(settings, "llm_api_key", "gw_test")
+    monkeypatch.setattr(settings, "llm_api_key", "gw_test")  # pragma: allowlist secret
     monkeypatch.setattr(settings, "rerank_enabled", True)
     monkeypatch.setattr(settings, "rerank_base_url", "")
     monkeypatch.setattr(settings, "rerank_api_key", "")
@@ -63,7 +63,7 @@ def test_platform_hard_config_rejects_direct_or_uncredentialed_model_routes():
             model_api_governance_mode="platform_hard",
             platform_gateway_base_url="https://gateway.example/v1",
             embed_base_url="https://api.openai.com/v1",
-            embed_api_key="gw_test",
+            embed_api_key="gw_test",  # pragma: allowlist secret
         )
 
     with pytest.raises(ValidationError, match="embed_api_key"):
@@ -77,9 +77,9 @@ def test_platform_hard_config_rejects_direct_or_uncredentialed_model_routes():
         model_api_governance_mode="platform_hard",
         platform_gateway_base_url="https://gateway.example/v1/",
         embed_base_url="https://gateway.example/v1",
-        embed_api_key="gw_test",
+        embed_api_key="gw_test",  # pragma: allowlist secret
         llm_base_url="https://gateway.example/v1",
-        llm_api_key="gw_test",
+        llm_api_key="gw_test",  # pragma: allowlist secret
         rerank_enabled=True,
     )
     assert configured.model_api_governance_mode == "platform_hard"
