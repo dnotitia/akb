@@ -31,6 +31,12 @@ embed_base_url: https://api.openai.com/v1
 embed_model: text-embedding-3-small
 embed_dimensions: 1536
 
+# Standalone default keeps direct-provider routing. A managed akb-platform
+# deployment sets platform_hard plus the exact gateway URL; startup then rejects
+# any active embed/LLM/rerank route that points elsewhere or lacks a credential.
+model_api_governance_mode: external_metering  # external_metering | platform_hard
+platform_gateway_base_url: ""
+
 # === LLM (optional) ===
 # Only used by metadata_worker to auto-tag external_git imports.
 # Leave empty to disable that worker; core CRUD/search keeps working.

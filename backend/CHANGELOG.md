@@ -5,6 +5,17 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## Unreleased
+
+Standalone model routing remains unchanged under the default
+`external_metering` profile. Managed deployments can opt into
+`platform_hard`, which fails startup unless every active embedding, chat, and
+rerank route exactly matches the declared platform gateway and has a workload
+credential. Each model call supplies a caller-generated idempotency UUID, and
+gateway authentication, policy, route, and budget denials no longer trigger
+embedding batch fan-out. Daily-budget chat denials remain deferred rather than
+permanently abandoning work that can succeed after the cap resets.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC

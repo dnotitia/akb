@@ -14,7 +14,7 @@ from typing import Any
 
 
 from app.config import settings
-from app.services import http_pool
+from app.services import http_pool, model_gateway
 
 logger = logging.getLogger("akb.llm")
 
@@ -66,9 +66,7 @@ async def chat_json(
     }
     if disable_reasoning:
         payload["reasoning"] = {"enabled": False}
-    headers = {}
-    if settings.llm_api_key:
-        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+    headers = model_gateway.request_headers(settings.llm_api_key)
 
     client = http_pool.get_client()
     resp = await client.post(
@@ -77,6 +75,13 @@ async def chat_json(
         timeout=timeout,
     )
     if resp.status_code >= 400:
+        hard_mode = settings.model_api_governance_mode == "platform_hard"
+        if hard_mode and 400 <= resp.status_code < 500 and resp.status_code not in (
+            402, 408, 409, 425, 429,
+        ):
+            raise LLMPermanentError(
+                f"LLM HTTP {resp.status_code}: {resp.text[:200]}"
+            )
         raise LLMError(f"LLM HTTP {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
 

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AuditSettings(BaseModel):
@@ -117,6 +117,15 @@ class Settings(BaseModel):
     # using larger models (Qwen3-embed-8b = 4096) override in app.yaml.
     embed_dimensions: int = 1536
 
+    # Model API governance. Standalone deployments retain direct-provider
+    # behavior by default. Managed platform deployments opt into the hard
+    # profile and declare the exact gateway base URL that every active model
+    # route must use; startup rejects a direct-provider escape.
+    model_api_governance_mode: Literal[
+        "external_metering", "platform_hard"
+    ] = "external_metering"
+    platform_gateway_base_url: str = ""
+
     # LLM — optional. Only consumed by metadata_worker (auto-tagging
     # external_git imports). When unset, metadata_worker stays disabled
     # and core CRUD/search keeps working.
@@ -140,6 +149,44 @@ class Settings(BaseModel):
     # the legacy behavior (prefetch only when rerank is enabled). Raising this
     # lets rerank-off searches dedup over a wider dense+BM25 candidate set.
     search_prefetch: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_model_api_governance(self) -> "Settings":
+        if self.model_api_governance_mode != "platform_hard":
+            return self
+
+        gateway = self.platform_gateway_base_url.strip().rstrip("/")
+        if not gateway:
+            raise ValueError(
+                "platform_gateway_base_url is required in platform_hard mode"
+            )
+
+        routes = [
+            ("embed_base_url", self.embed_base_url, "embed_api_key", self.embed_api_key),
+        ]
+        if self.llm_base_url:
+            routes.append(
+                ("llm_base_url", self.llm_base_url, "llm_api_key", self.llm_api_key)
+            )
+        if self.rerank_enabled:
+            routes.append(
+                (
+                    "rerank_base_url",
+                    self.rerank_base_url or self.llm_base_url,
+                    "rerank_api_key",
+                    self.rerank_api_key or self.llm_api_key,
+                )
+            )
+
+        for url_name, url, key_name, key in routes:
+            if not url or url.strip().rstrip("/") != gateway:
+                raise ValueError(
+                    f"{url_name} must exactly match platform_gateway_base_url "
+                    "in platform_hard mode"
+                )
+            if not key.strip():
+                raise ValueError(f"{key_name} is required in platform_hard mode")
+        return self
 
     # Hard server-side ceiling on a search/grep `limit`. The MCP tool schema
     # advertises max 50 but that is client-side only — a direct REST call or a
