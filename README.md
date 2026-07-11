@@ -338,6 +338,14 @@ LLM is only used by the `metadata_worker` to auto-tag documents imported via
 external git mirroring. Core CRUD/search works without it. To enable, set
 `llm_base_url` / `llm_model` in `app.yaml` and `llm_api_key` in `secret.yaml`.
 
+Standalone deployments default to `model_api_governance_mode: external_metering`
+and may point embedding, chat, and rerank at any compatible provider. A managed
+control plane can instead set `platform_hard` plus an exact
+`platform_gateway_base_url`. In that mode AKB fails startup if an active model
+route points anywhere else or lacks a credential, and every model call carries
+a caller-generated `Idempotency-Key` for durable gateway reservation/settlement.
+Gateway policy or budget denials are never fanned out into per-item retries.
+
 ### Event fanout (optional)
 
 The PG `events` outbox is always written. Set `redis_url` in `app.yaml` to

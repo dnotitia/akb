@@ -18,7 +18,7 @@ from typing import Literal
 import httpx
 
 from app.config import settings
-from app.services import http_pool
+from app.services import http_pool, model_gateway
 
 logger = logging.getLogger("akb.index")
 
@@ -342,16 +342,12 @@ async def _embed_call(
     Returns (status, embeddings, detail):
       - status='ok'        + embeddings filled
       - status='transient' + None: 5xx / network / timeout — retry later
-      - status='permanent' + None: 4xx — almost always one bad input in
-        the batch (oversize, wrong content type). Caller should fall
-        back to per-item to isolate the offender.
+      - status='permanent' + None: input-specific 4xx; caller may split.
+      - status='rejected'  + None: auth, policy, budget, or route denial;
+        caller must not fan the same denied batch out into per-item calls.
     `detail` is a short human-readable string suffix for logs/errors.
     """
-    headers = (
-        {"Authorization": f"Bearer {settings.embed_api_key}"}
-        if settings.embed_api_key
-        else {}
-    )
+    headers = model_gateway.request_headers(settings.embed_api_key)
     # Send `dimensions` so MRL-capable models (qwen3-embedding-8b native
     # 4096, text-embedding-3-* native 3072) truncate to the deployed
     # vector schema dim. Native-dim models (bge-m3@1024) accept it as a
@@ -371,10 +367,16 @@ async def _embed_call(
     except (httpx.ConnectError, httpx.TimeoutException, httpx.UnsupportedProtocol) as e:
         return "transient", None, f"{type(e).__name__}: {e}"
 
-    if resp.status_code >= 500:
+    hard_mode = settings.model_api_governance_mode == "platform_hard"
+    if resp.status_code >= 500 or (
+        hard_mode and resp.status_code in (408, 409, 425, 429)
+    ):
         return "transient", None, f"HTTP {resp.status_code}: {resp.text[:160]}"
     if resp.status_code >= 400:
-        return "permanent", None, f"HTTP {resp.status_code}: {resp.text[:160]}"
+        status = "permanent"
+        if hard_mode and resp.status_code not in (400, 413):
+            status = "rejected"
+        return status, None, f"HTTP {resp.status_code}: {resp.text[:160]}"
 
     try:
         data = resp.json()
@@ -419,10 +421,11 @@ async def generate_embeddings(
     indexing worker treats those as per-chunk failures and increments
     the per-row retry counter, instead of failing the whole batch.
 
-    On a 4xx batch failure the call falls back to per-item requests so
-    one oversize / malformed input can't poison its 31 batchmates. On a
-    transient (5xx / network / timeout) failure the whole batch is left
-    empty and the worker's normal retry/backoff handles it.
+    On an input-specific 400/413 batch failure (and legacy standalone 422)
+    the call falls back to per-item requests so one oversize / malformed input
+    can't poison its 31 batchmates. Managed authentication, policy, route,
+    price, and budget denials never fan out. On a transient failure the whole
+    batch is left empty and the worker's normal retry/backoff handles it.
     """
     if not texts:
         return []
@@ -439,15 +442,15 @@ async def generate_embeddings(
             out.extend(embs)
             continue
 
-        if status == "transient":
+        if status in ("transient", "rejected"):
             logger.warning(
-                "Embedding API transient failure on batch of %d: %s",
-                len(batch), detail,
+                "Embedding API %s failure on batch of %d: %s",
+                status, len(batch), detail,
             )
             out.extend([[] for _ in batch])
             continue
 
-        # Permanent (4xx) or shape mismatch — fall back to per-item so
+        # Input-specific permanent failure or shape mismatch — fall back so
         # only the truly bad input(s) get marked as failed.
         logger.warning(
             "Embedding API rejected batch of %d (%s); isolating per-item",
@@ -578,5 +581,3 @@ async def write_source_chunks(
             chunk.chunk_index, chunk.char_start, chunk.char_end,
         )
     return len(chunks)
-
-

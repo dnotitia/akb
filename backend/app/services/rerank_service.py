@@ -29,7 +29,7 @@ import httpx
 
 from app.config import settings
 from app.exceptions import AKBError
-from app.services import http_pool
+from app.services import http_pool, model_gateway
 
 logger = logging.getLogger("akb.rerank")
 
@@ -71,7 +71,7 @@ async def rerank(
         resp = await client.post(
             f"{base_url}/rerank",
             json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=model_gateway.request_headers(api_key),
             timeout=settings.rerank_timeout_seconds,
         )
         resp.raise_for_status()
