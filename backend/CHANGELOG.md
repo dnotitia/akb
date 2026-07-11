@@ -16,6 +16,11 @@ gateway authentication, policy, route, and budget denials no longer trigger
 embedding batch fan-out. Daily-budget chat denials remain deferred rather than
 permanently abandoning work that can succeed after the cap resets.
 
+Allowlisted companion applications now receive stable AKB account-denial and
+post-state SSO protocol codes on their original callback URL. The callback
+origin is revalidated before every error redirect; unlisted or stale targets
+still return only to AKB's own auth page.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC

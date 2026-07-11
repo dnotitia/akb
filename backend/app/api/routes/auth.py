@@ -207,6 +207,19 @@ def _post_login_target(redirect: str | None, one_time_code: str) -> str:
     )
 
 
+def _post_login_error_target(redirect: str | None, reason: str) -> str:
+    """Return a failed post-login navigation to its trusted companion.
+
+    Only a flow whose stored redirect still matches the current companion
+    allowlist may leave AKB's own origin. The stable reason is appended while
+    preserving the companion's state-bearing completion query. Everything else
+    returns to AKB's local auth page.
+    """
+    if _allowed_companion_origin(redirect) is not None:
+        return _with_query_param(redirect, "sso_error", reason)  # type: ignore[arg-type]
+    return f"/auth?sso_error={urllib.parse.quote(reason, safe='')}"
+
+
 @router.get(
     "/auth/keycloak/login",
     response_class=RedirectResponse,
@@ -257,13 +270,13 @@ async def keycloak_callback(request: Request):
         tokens = await svc.exchange_code_for_tokens(code, flow.get("code_verifier"))
         id_token = tokens.get("id_token")
         if not id_token:
-            return _sso_error_redirect("no_id_token")
+            return _sso_error_redirect("no_id_token", flow.get("redirect_path"))
         claims = await svc.verify_id_token(id_token)
         login_response = await login_with_keycloak_claims(claims)
     except AKBError as e:
         # Don't leak detail into the URL; log server-side, show a code.
         logger.warning("Keycloak SSO callback failed: %s", e)
-        return _sso_error_redirect(_public_sso_error_reason(e))
+        return _sso_error_redirect(_public_sso_error_reason(e), flow.get("redirect_path"))
 
     # Hand the SPA a one-time code; the token is delivered via POST /exchange.
     # Stash the Keycloak id_token too so the SPA can pass it back as
@@ -310,11 +323,11 @@ async def keycloak_exchange(req: KeycloakExchangeRequest):
     return result
 
 
-def _sso_error_redirect(reason: str) -> RedirectResponse:
+def _sso_error_redirect(reason: str, redirect: str | None = None) -> RedirectResponse:
     """Bounce a failed SSO browser navigation back to the login page with a
     short reason code the SPA can surface (avoids dumping JSON at the user)."""
     return RedirectResponse(
-        f"/auth?sso_error={urllib.parse.quote(reason, safe='')}",
+        _post_login_error_target(redirect, reason),
         status_code=status.HTTP_302_FOUND,
     )
 
