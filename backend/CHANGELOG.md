@@ -21,6 +21,12 @@ post-state SSO protocol codes on their original callback URL. The callback
 origin is revalidated before every error redirect; unlisted or stale targets
 still return only to AKB's own auth page.
 
+The compact MCP `akb_list_vaults` response now preserves each vault's effective
+`role` alongside its name and description. This aligns the implementation with
+the documented MCP contract and lets managed runtimes distinguish an explicit
+writer grant from legacy role-less access without expanding to full REST vault
+metadata.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC
