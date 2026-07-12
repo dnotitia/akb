@@ -63,6 +63,7 @@ from app.repositories.document_repo import DocumentRepository
 from mcp_server.tools import TOOLS
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
+from mcp_server.vault_contract import project_accessible_vault
 from app.services import audit_log
 
 
@@ -310,9 +311,9 @@ async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_list_vaults")
 async def _handle_list_vaults(args: dict, uid: str, user: _MCPUser) -> dict:
-    # Slim {name, description} only — full metadata bloats the payload
-    # past the agent client's truncate cap in large tenants. REST
-    # callers that need full rows use `GET /api/v1/vaults`.
+    # Keep the slim MCP shape so large tenants stay below the agent client's
+    # truncate cap, but preserve role because it is authorization metadata.
+    # REST callers that need full rows use `GET /api/v1/vaults`.
     vaults = await list_accessible_vaults(uid)
     include_archived = args.get("include_archived")
     needle = _filter_arg(args)
@@ -325,7 +326,7 @@ async def _handle_list_vaults(args: dict, uid: str, user: _MCPUser) -> dict:
         description = v.get("description") or ""
         if needle and needle not in name.lower() and needle not in description.lower():
             continue
-        slim.append({"name": name, "description": description})
+        slim.append(project_accessible_vault(v))
 
     return _paginate(slim, args, items_key="vaults")
 
