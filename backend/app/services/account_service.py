@@ -518,6 +518,27 @@ async def get_user(user_id: str) -> dict:
     return _user_result(row)
 
 
+async def get_human_user_by_email(email: str) -> dict:
+    normalized_email = _required(email, "email").lower()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
+                   u.auth_provider, u.account_status, u.account_kind,
+                   EXISTS (
+                       SELECT 1 FROM external_identities e WHERE e.user_id = u.id
+                   ) AS has_external_identity
+              FROM users u
+             WHERE u.email = $1 AND u.account_kind = 'human'
+            """,
+            normalized_email,
+        )
+    if row is None:
+        raise NotFoundError("Human user", normalized_email)
+    return {**_user_result(row), "has_external_identity": row["has_external_identity"]}
+
+
 async def get_user_by_external_identity(issuer: str, subject: str) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
