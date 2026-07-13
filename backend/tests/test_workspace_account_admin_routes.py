@@ -55,6 +55,51 @@ async def test_non_admin_is_rejected_before_account_service(monkeypatch):
     assert exc_info.value.status_code == 403
 
 
+async def test_managed_account_state_is_admin_only_and_forwards_exact_expectations(monkeypatch):
+    from app.api.routes import access
+
+    observed = {}
+
+    async def _state(**kwargs):
+        observed.update(kwargs)
+        return {
+            "ready": True,
+            "account_inventory_ready": True,
+            "managed_auth_profile_ready": True,
+            "expected_active_humans": 1,
+            "observed_active_humans": 1,
+            "issues": [],
+        }
+
+    monkeypatch.setattr(access, "get_managed_account_state", _state)
+    request = access.ManagedAccountStateRequest(
+        issuer="https://id.example.com/realms/akb-platform",
+        expected_humans=[
+            access.ExpectedManagedHuman(
+                user_id="11111111-1111-4111-8111-111111111111",
+                subject="subject-1",
+            )
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await access.admin_managed_account_state(request, _user(admin=False))
+    assert exc_info.value.status_code == 403
+    assert observed == {}
+
+    result = await access.admin_managed_account_state(request, _user(admin=True))
+    assert result["ready"] is True
+    assert observed == {
+        "issuer": request.issuer,
+        "expected_humans": [
+            {
+                "user_id": request.expected_humans[0].user_id,
+                "subject": request.expected_humans[0].subject,
+            }
+        ],
+    }
+
+
 async def test_ensure_external_identity_forwards_verified_actor(monkeypatch):
     from app.api.routes import access
 
@@ -266,7 +311,10 @@ async def test_auth_me_exposes_additive_current_key_class():
     assert result["key_class"] == "service"
 
 
-async def test_governance_routes_are_explicit_in_openapi():
+async def test_governance_routes_are_explicit_in_openapi(monkeypatch, tmp_path):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
     from app.main import app
 
     paths = app.openapi()["paths"]
@@ -283,6 +331,7 @@ async def test_governance_routes_are_explicit_in_openapi():
         "/api/v1/admin/users/{user_id}/activate",
         "/api/v1/admin/users/{user_id}/tokens/{token_id}",
         "/api/v1/admin/users/{user_ref}/managed-tokens",
+        "/api/v1/admin/managed-account-state",
         "/api/v1/admin/tokens/identify",
     }
     assert expected <= set(paths)

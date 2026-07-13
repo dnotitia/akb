@@ -16,6 +16,7 @@ from app.services.account_service import (
     ensure_service_user,
     get_user,
     get_human_user_by_email,
+    get_managed_account_state,
     get_user_by_external_identity,
     identify_user_token,
     revoke_user_token,
@@ -102,6 +103,16 @@ class SetUserRoleRequest(NFCModel):
 
 class IdentifyTokenRequest(NFCModel):
     token: SecretStr
+
+
+class ExpectedManagedHuman(NFCModel):
+    user_id: str
+    subject: str
+
+
+class ManagedAccountStateRequest(NFCModel):
+    issuer: str
+    expected_humans: list[ExpectedManagedHuman] = Field(min_length=1, max_length=10_000)
 
 
 @router.get("/my/vaults", summary="List vaults accessible to me")
@@ -261,6 +272,21 @@ async def admin_remove_vault_write_grant(
 async def admin_list_users(user: AuthenticatedUser = Depends(get_current_user)):
     _require_admin(user)
     return {"users": await list_all_users_admin()}
+
+
+@router.post(
+    "/admin/managed-account-state",
+    summary="[admin] Validate managed auth profile and exact active human inventory",
+)
+async def admin_managed_account_state(
+    req: ManagedAccountStateRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await get_managed_account_state(
+        issuer=req.issuer,
+        expected_humans=[item.model_dump() for item in req.expected_humans],
+    )
 
 
 @router.post(

@@ -34,6 +34,15 @@ and reports whether the human already has an external identity so the control
 plane can reject unsafe legacy joins and offboard a local-only member without
 inventing an IdP account.
 
+Managed orchestrators can now call the read-only administrator
+`/admin/managed-account-state` endpoint with their expected active AKB user IDs
+and configured-issuer subjects. AKB compares that intent with all active human
+accounts in one PostgreSQL snapshot and separately reports whether the running
+server has the complete invite-only/local-auth-disabled profile. The response
+contains only counts and stable issue codes; it never returns email, subject,
+password, token, or credential material. Standalone defaults and ordinary
+`/readyz` behavior are unchanged.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC

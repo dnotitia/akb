@@ -6,6 +6,7 @@ import uuid
 
 import asyncpg
 
+from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import (
     AccountSuspendedError,
@@ -556,6 +557,112 @@ async def get_user_by_external_identity(issuer: str, subject: str) -> dict:
     if row is None:
         raise NotFoundError("External identity", f"{issuer}#{subject}")
     return _user_result(row)
+
+
+def _expected_managed_humans(
+    expected_humans: list[dict[str, str]],
+) -> dict[uuid.UUID, str]:
+    if not isinstance(expected_humans, list) or not expected_humans:
+        raise ValidationError("expected_humans must contain at least one account")
+    if len(expected_humans) > 10_000:
+        raise ValidationError("expected_humans exceeds the managed account limit")
+
+    expected: dict[uuid.UUID, str] = {}
+    subjects: set[str] = set()
+    for item in expected_humans:
+        if not isinstance(item, dict):
+            raise ValidationError("expected_humans entries must be objects")
+        raw_user_id = _required(item.get("user_id", ""), "user_id")
+        user_id = _uuid(raw_user_id, "user_id")
+        if str(user_id) != raw_user_id:
+            raise ValidationError("user_id must be a canonical UUID")
+        subject = _required(item.get("subject", ""), "subject")
+        if user_id in expected:
+            raise ValidationError("expected_humans contains a duplicate user_id")
+        if subject in subjects:
+            raise ValidationError("expected_humans contains a duplicate subject")
+        expected[user_id] = subject
+        subjects.add(subject)
+    return expected
+
+
+async def get_managed_account_state(
+    *,
+    issuer: str,
+    expected_humans: list[dict[str, str]],
+) -> dict:
+    """Compare the running AKB profile and active humans with platform intent.
+
+    The response deliberately contains only counts and stable issue codes. It
+    never returns email, subject, password, token, or credential material.
+    """
+
+    issuer = _required(issuer, "issuer")
+    if issuer != settings.keycloak_issuer:
+        raise ValidationError("issuer does not match the running AKB configuration")
+    expected = _expected_managed_humans(expected_humans)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.id, u.auth_provider,
+                   COALESCE(
+                     array_agg(e.subject ORDER BY e.subject)
+                       FILTER (WHERE e.user_id IS NOT NULL),
+                     ARRAY[]::text[]
+                   ) AS subjects
+              FROM users u
+              LEFT JOIN external_identities e
+                ON e.user_id = u.id AND e.issuer = $1
+             WHERE u.account_kind = 'human'
+               AND u.account_status = 'active'
+             GROUP BY u.id, u.auth_provider
+             ORDER BY u.id
+            """,
+            issuer,
+        )
+
+    observed: dict[uuid.UUID, tuple[str, set[str]]] = {}
+    for row in rows:
+        user_id = uuid.UUID(str(row["id"]))
+        if user_id in observed:
+            raise RuntimeError("managed account query returned a duplicate user")
+        observed[user_id] = (
+            str(row["auth_provider"]),
+            {str(subject) for subject in row["subjects"]},
+        )
+
+    issues: set[str] = set()
+    if set(observed) != set(expected):
+        issues.add("active_human_set_mismatch")
+    if any(provider != "keycloak" for provider, _ in observed.values()):
+        issues.add("human_auth_provider_mismatch")
+    if any(
+        observed.get(user_id, ("", set()))[1] != {subject}
+        for user_id, subject in expected.items()
+    ):
+        issues.add("expected_identity_mismatch")
+
+    account_issues = set(issues)
+    profile_ready = (
+        settings.keycloak_enabled
+        and settings.keycloak_enrollment_mode == "invite_only"
+        and not settings.keycloak_link_by_email
+        and settings.keycloak_require_verified_email
+        and not settings.local_auth_enabled
+    )
+    if not profile_ready:
+        issues.add("managed_auth_profile_mismatch")
+
+    return {
+        "ready": not issues,
+        "account_inventory_ready": not account_issues,
+        "managed_auth_profile_ready": profile_ready,
+        "expected_active_humans": len(expected),
+        "observed_active_humans": len(observed),
+        "issues": sorted(issues),
+    }
 
 
 async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict:
