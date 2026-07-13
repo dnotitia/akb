@@ -15,6 +15,7 @@ from app.services.account_service import (
     ensure_human_external_identity,
     ensure_service_user,
     get_user,
+    get_human_user_by_email,
     get_user_by_external_identity,
     identify_user_token,
     revoke_user_token,
@@ -299,6 +300,18 @@ async def admin_prepare_external_identity(
         prepare_suspended=True,
         actor_id=user.user_id,
     )
+
+
+@router.get(
+    "/admin/users/by-email",
+    summary="[admin] Resolve one existing human user by exact email",
+)
+async def admin_get_human_user_by_email(
+    email: str = Query(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await get_human_user_by_email(email)
 
 
 @router.get(

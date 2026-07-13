@@ -27,6 +27,13 @@ the documented MCP contract and lets managed runtimes distinguish an explicit
 writer grant from legacy role-less access without expanding to full REST vault
 metadata.
 
+Managed account migration can now resolve one existing human user by exact
+normalized email through an explicit administrator read endpoint. The endpoint
+does not create, bind, activate, or mutate an account, excludes service users,
+and reports whether the human already has an external identity so the control
+plane can reject unsafe legacy joins and offboard a local-only member without
+inventing an IdP account.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC

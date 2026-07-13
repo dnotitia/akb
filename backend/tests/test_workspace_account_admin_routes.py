@@ -85,6 +85,35 @@ async def test_ensure_external_identity_forwards_verified_actor(monkeypatch):
     }
 
 
+async def test_exact_human_email_lookup_is_admin_only(monkeypatch):
+    from app.api.routes import access
+
+    observed = []
+
+    async def _resolve(email):
+        observed.append(email)
+        return {
+            "user_id": "legacy-user",
+            "email": "legacy@example.com",
+            "account_kind": "human",
+            "has_external_identity": False,
+        }
+
+    monkeypatch.setattr(access, "get_human_user_by_email", _resolve)
+    with pytest.raises(HTTPException) as exc_info:
+        await access.admin_get_human_user_by_email(
+            "legacy@example.com", _user(admin=False)
+        )
+    assert exc_info.value.status_code == 403
+    assert observed == []
+
+    result = await access.admin_get_human_user_by_email(
+        " Legacy@Example.com ", _user(admin=True)
+    )
+    assert result["user_id"] == "legacy-user"
+    assert observed == [" Legacy@Example.com "]
+
+
 async def test_prepare_external_identity_uses_distinct_fail_closed_route(monkeypatch):
     from app.api.routes import access
 
@@ -244,6 +273,7 @@ async def test_governance_routes_are_explicit_in_openapi():
     expected = {
         "/api/v1/admin/users/ensure-external-identity",
         "/api/v1/admin/users/prepare-external-identity",
+        "/api/v1/admin/users/by-email",
         "/api/v1/admin/users/by-external-identity",
         "/api/v1/admin/users/{user_id}/governance",
         "/api/v1/admin/service-users/ensure",

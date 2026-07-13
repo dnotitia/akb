@@ -125,6 +125,79 @@ async def test_ensure_human_binding_is_idempotent_and_never_bootstrap_admin(serv
     }
 
 
+async def test_exact_email_lookup_returns_only_existing_human(services):
+    pool, _, service = services
+    user_id = uuid.uuid4()
+    email = f"governance-legacy-{uuid.uuid4().hex[:10]}@example.com"
+    username = f"governance-{uuid.uuid4().hex}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, display_name,
+                is_admin, auth_provider, account_status, account_kind
+            ) VALUES ($1, $2, $3, '!legacy!', 'Legacy member',
+                      false, 'local', 'active', 'human')
+            """,
+            user_id,
+            username,
+            email,
+        )
+
+    resolved = await service.get_human_user_by_email(f"  {email.upper()}  ")
+
+    assert resolved == {
+        "user_id": str(user_id),
+        "username": username,
+        "email": email,
+        "display_name": "Legacy member",
+        "is_admin": False,
+        "account_status": "active",
+        "account_kind": "human",
+        "auth_provider": "local",
+        "has_external_identity": False,
+    }
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO external_identities (user_id, issuer, subject, email_snapshot)
+            VALUES ($1, $2, $3, $4)
+            """,
+            user_id,
+            "https://id.example.com/realms/akb",
+            f"subject-{uuid.uuid4()}",
+            email,
+        )
+
+    bound = await service.get_human_user_by_email(email)
+    assert bound["user_id"] == str(user_id)
+    assert bound["has_external_identity"] is True
+
+
+async def test_exact_email_lookup_does_not_return_service_identity(services):
+    pool, _, service = services
+    email = f"governance-service-{uuid.uuid4().hex[:10]}@example.com"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, display_name,
+                is_admin, auth_provider, account_status, account_kind
+            ) VALUES ($1, $2, $3, '!service!', 'Service',
+                      false, 'service', 'active', 'service')
+            """,
+            uuid.uuid4(),
+            f"governance-{uuid.uuid4().hex}",
+            email,
+        )
+
+    from app.exceptions import NotFoundError
+
+    with pytest.raises(NotFoundError):
+        await service.get_human_user_by_email(email)
+
+
 async def test_prepare_human_binding_is_suspended_atomically_and_not_reactivated_by_default(
     services,
 ):
