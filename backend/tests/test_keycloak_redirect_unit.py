@@ -43,6 +43,16 @@ def allow(monkeypatch):
     return _set
 
 
+@pytest.fixture
+def companion_clients(monkeypatch):
+    """Set the trusted companion-origin -> Keycloak client selector."""
+    def _set(mapping: dict[str, str]) -> None:
+        monkeypatch.setattr(
+            settings, "keycloak_companion_client_ids_by_origin", mapping, raising=False
+        )
+    return _set
+
+
 # ── _normalize_origin ────────────────────────────────────────────────
 
 @pytest.mark.parametrize(
@@ -103,6 +113,62 @@ def test_allowlist_entries_normalized(allow):
         auth._allowed_companion_origin("https://reef.example.com/cb")
         == "https://reef.example.com"
     )
+
+
+# ── _keycloak_client_id_for_redirect ───────────────────────────────
+
+
+def test_companion_client_selected_only_for_allowlisted_origin(
+    allow, companion_clients, monkeypatch
+):
+    monkeypatch.setattr(settings, "keycloak_client_id", "akb-web")
+    allow(["https://naut.example.com"])
+    companion_clients({"https://naut.example.com": "naut-web"})
+
+    assert auth._keycloak_client_id_for_redirect(
+        "https://naut.example.com/api/auth/akb/sso/callback"
+    ) == "naut-web"
+    assert auth._keycloak_client_id_for_redirect(
+        "https://evil.example.com/api/auth/akb/sso/callback"
+    ) == "akb-web"
+    assert auth._keycloak_client_id_for_redirect("/dashboard") == "akb-web"
+
+
+def test_companion_client_mapping_normalizes_origin(
+    allow, companion_clients, monkeypatch
+):
+    monkeypatch.setattr(settings, "keycloak_client_id", "akb-web")
+    allow(["https://Naut.Example.com/path"])
+    companion_clients({"https://NAUT.example.com/ignored": "naut-web"})
+
+    assert auth._keycloak_client_id_for_redirect(
+        "https://naut.example.com/callback"
+    ) == "naut-web"
+
+
+@pytest.mark.asyncio
+async def test_login_passes_selected_client_into_oidc_state(
+    allow, companion_clients, monkeypatch
+):
+    from app.services import keycloak_oidc
+
+    allow(["https://naut.example.com"])
+    companion_clients({"https://naut.example.com": "naut-web"})
+    monkeypatch.setattr(auth, "_require_keycloak", lambda: None)
+    captured: dict[str, str] = {}
+
+    class FakeOIDC:
+        async def begin_login(self, redirect_path, *, client_id=None):
+            captured.update(redirect_path=redirect_path, client_id=client_id)
+            return "https://auth.example.com/realms/akb/protocol/openid-connect/auth"
+
+    monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: FakeOIDC())
+    companion = "https://naut.example.com/api/auth/akb/sso/callback"
+
+    response = await auth.keycloak_login(companion)
+
+    assert response.status_code == 302
+    assert captured == {"redirect_path": companion, "client_id": "naut-web"}
 
 
 # ── _post_login_target ───────────────────────────────────────────────
@@ -196,14 +262,20 @@ async def test_callback_returns_account_error_to_allowed_companion(allow, monkey
     class FakeOIDC:
         async def consume_state(self, state):
             assert state == "state-1"
-            return {"code_verifier": "verifier", "redirect_path": companion}
+            return {
+                "code_verifier": "verifier",
+                "redirect_path": companion,
+                "client_id": "naut-web",
+            }
 
-        async def exchange_code_for_tokens(self, code, verifier):
+        async def exchange_code_for_tokens(self, code, verifier, *, client_id=None):
             assert (code, verifier) == ("code-1", "verifier")
+            assert client_id == "naut-web"
             return {"id_token": "id-token"}
 
-        async def verify_id_token(self, token):
+        async def verify_id_token(self, token, *, client_id=None):
             assert token == "id-token"
+            assert client_id == "naut-web"
             return {"sub": "subject-1"}
 
     async def reject_membership(_claims):
@@ -239,13 +311,24 @@ async def test_callback_returns_post_state_protocol_error_to_allowed_companion(
 
     companion = "https://reef.example.com/cb?redirect=%2Fdone"
     allow(["https://reef.example.com"])
+    monkeypatch.setattr(
+        settings,
+        "keycloak_companion_client_ids_by_origin",
+        {"https://reef.example.com": "naut-web"},
+        raising=False,
+    )
     monkeypatch.setattr(auth, "_require_keycloak", lambda: None)
 
     class FakeOIDC:
         async def consume_state(self, _state):
-            return {"code_verifier": "verifier", "redirect_path": companion}
+            return {
+                "code_verifier": "verifier",
+                "redirect_path": companion,
+                "client_id": "naut-web",
+            }
 
-        async def exchange_code_for_tokens(self, _code, _verifier):
+        async def exchange_code_for_tokens(self, _code, _verifier, *, client_id=None):
+            assert client_id == "naut-web"
             return {}
 
     monkeypatch.setattr(keycloak_oidc, "get_keycloak_oidc", lambda: FakeOIDC())

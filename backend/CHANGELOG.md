@@ -21,6 +21,13 @@ post-state SSO protocol codes on their original callback URL. The callback
 origin is revalidated before every error redirect; unlisted or stale targets
 still return only to AKB's own auth page.
 
+An already allowlisted companion origin may now select a dedicated Keycloak
+client through `keycloak_companion_client_ids_by_origin`. AKB stores that
+server-selected client in its single-use OIDC state and uses it consistently
+for authorization, code exchange, and ID-token audience verification. Empty
+configuration and every unlisted or malformed destination retain the existing
+global `keycloak_client_id` flow.
+
 The compact MCP `akb_list_vaults` response now preserves each vault's effective
 `role` alongside its name and description. This aligns the implementation with
 the documented MCP contract and lets managed runtimes distinguish an explicit

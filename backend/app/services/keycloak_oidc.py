@@ -130,7 +130,18 @@ class KeycloakOIDC:
         return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
     # ── Authorization request ────────────────────────────────────────
-    async def begin_login(self, redirect_path: str = "/") -> str:
+    @staticmethod
+    def _effective_client_id(client_id: str | None) -> str:
+        """Resolve an optional server-selected client to the legacy default."""
+        return (
+            client_id.strip()
+            if client_id and client_id.strip()
+            else settings.keycloak_client_id
+        )
+
+    async def begin_login(
+        self, redirect_path: str = "/", *, client_id: str | None = None
+    ) -> str:
         """Create CSRF state (+PKCE for public clients) and return the
         Keycloak authorization URL to redirect the browser to.
 
@@ -139,10 +150,14 @@ class KeycloakOIDC:
         be an allowlisted companion-app absolute URL (cross-origin SSO); the
         callback (`_post_login_target`) re-validates it before delivering the
         one-time code, so this layer just stores it verbatim."""
+        selected_client_id = self._effective_client_id(client_id)
         state = secrets.token_urlsafe(32)
-        payload: dict[str, str] = {"redirect_path": redirect_path}
+        payload: dict[str, str] = {
+            "redirect_path": redirect_path,
+            "client_id": selected_client_id,
+        }
         params: dict[str, str] = {
-            "client_id": settings.keycloak_client_id,
+            "client_id": selected_client_id,
             "redirect_uri": settings.keycloak_redirect_uri,
             "response_type": "code",
             "scope": _SCOPE,
@@ -166,13 +181,18 @@ class KeycloakOIDC:
 
     # ── Token exchange ───────────────────────────────────────────────
     async def exchange_code_for_tokens(
-        self, code: str, code_verifier: str | None
+        self,
+        code: str,
+        code_verifier: str | None,
+        *,
+        client_id: str | None = None,
     ) -> dict[str, Any]:
+        selected_client_id = self._effective_client_id(client_id)
         data: dict[str, str] = {
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": settings.keycloak_redirect_uri,
-            "client_id": settings.keycloak_client_id,
+            "client_id": selected_client_id,
         }
         if settings.keycloak_public_client:
             if code_verifier:
@@ -218,13 +238,16 @@ class KeycloakOIDC:
             (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
         )
 
-    async def verify_id_token(self, id_token: str) -> dict[str, Any]:
+    async def verify_id_token(
+        self, id_token: str, *, client_id: str | None = None
+    ) -> dict[str, Any]:
         """Verify a Keycloak ID token locally and return its claims.
 
         Validates signature (RS256), audience (client_id), issuer (realm),
         and expiry. Refetches JWKS once if the token's ``kid`` is unknown
         (key rotation) before giving up.
         """
+        selected_client_id = self._effective_client_id(client_id)
         try:
             header = jwt.get_unverified_header(id_token)
         except jwt.InvalidTokenError as e:
@@ -249,7 +272,7 @@ class KeycloakOIDC:
                 id_token,
                 cast(Any, public_key),
                 algorithms=["RS256"],
-                audience=settings.keycloak_client_id,
+                audience=selected_client_id,
                 issuer=settings.keycloak_issuer,
                 options={"require": ["exp", "iat", "aud", "iss", "sub"]},
             )
