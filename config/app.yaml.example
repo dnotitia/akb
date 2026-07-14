@@ -141,6 +141,10 @@ jwt_expire_hours: 24
 #                                           # client and get the one-time code or a stable account
 #                                           # error back on ITS origin. Empty =
 #                                           # akb's own SPA only (open-redirect-safe default).
+# keycloak_companion_client_ids_by_origin: {} # optional client-specific theme selector;
+#                                             # keys must also be allowlisted origins, e.g.
+#                                             # {"https://naut.example.com": "naut-web"}.
+#                                             # Empty preserves the global akb-web client.
 # keycloak_exchange_code_ttl_secs: 60
 # keycloak_client_secret lives in secret.yaml (never commit it)
 

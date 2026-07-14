@@ -330,6 +330,16 @@ class Settings(BaseModel):
     # full origin matched as scheme://host[:port], e.g.
     #   ["https://reef-acme.example.com"]
     keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
+    # Optional per-companion OIDC client selection. Keys are companion origins
+    # (normalized as scheme://host[:port]); values are Keycloak client ids.
+    # The mapping is consulted only after the origin passes the allowlist above,
+    # so adding a mapping can never grant a new redirect destination. The AKB
+    # backend remains the sole OIDC client and uses its backend-only secret for
+    # the selected confidential client. Empty preserves the historical single
+    # `keycloak_client_id` flow.
+    keycloak_companion_client_ids_by_origin: dict[str, str] = Field(
+        default_factory=dict
+    )
     # One-time exchange-code TTL (seconds). The callback hands the SPA a
     # short-lived opaque code; the SPA trades it for the AKB JWT over a
     # POST so the token never rides in a URL. Keep this small.

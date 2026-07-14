@@ -167,6 +167,31 @@ def _allowed_companion_origin(raw: str | None) -> str | None:
     return origin if origin in allowed else None
 
 
+def _keycloak_client_id_for_redirect(raw: str | None) -> str:
+    """Select a client only after ``raw`` passes the companion allowlist.
+
+    Client-specific Keycloak themes are useful for first-party products, but a
+    selector must not become a second, weaker trust boundary. We derive the
+    normalized origin with :func:`_allowed_companion_origin` first;
+    unlisted/relative/malformed URLs always retain the historical global
+    client. Mapping keys are normalized too so operator casing or a trailing
+    path cannot create surprising misses.
+    """
+    origin = _allowed_companion_origin(raw)
+    if origin is None:
+        return settings.keycloak_client_id
+    configured = {
+        normalized: client_id.strip()
+        for configured_origin, client_id in (
+            settings.keycloak_companion_client_ids_by_origin or {}
+        ).items()
+        if (normalized := _normalize_origin(configured_origin)) is not None
+        and isinstance(client_id, str)
+        and client_id.strip()
+    }
+    return configured.get(origin, settings.keycloak_client_id)
+
+
 def _with_query_param(url: str, key: str, value: str) -> str:
     """Append ``key=value`` to ``url``'s query, preserving existing query
     and fragment."""
@@ -237,7 +262,9 @@ async def keycloak_login(redirect: str = "/"):
         if _allowed_companion_origin(redirect) is not None
         else _safe_redirect_path(redirect)
     )
-    url = await get_keycloak_oidc().begin_login(dest)
+    url = await get_keycloak_oidc().begin_login(
+        dest, client_id=_keycloak_client_id_for_redirect(redirect)
+    )
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
@@ -267,11 +294,14 @@ async def keycloak_callback(request: Request):
         return _sso_error_redirect("invalid_state")
 
     try:
-        tokens = await svc.exchange_code_for_tokens(code, flow.get("code_verifier"))
+        client_id = flow.get("client_id")
+        tokens = await svc.exchange_code_for_tokens(
+            code, flow.get("code_verifier"), client_id=client_id
+        )
         id_token = tokens.get("id_token")
         if not id_token:
             return _sso_error_redirect("no_id_token", flow.get("redirect_path"))
-        claims = await svc.verify_id_token(id_token)
+        claims = await svc.verify_id_token(id_token, client_id=client_id)
         login_response = await login_with_keycloak_claims(claims)
     except AKBError as e:
         # Don't leak detail into the URL; log server-side, show a code.

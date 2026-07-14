@@ -225,6 +225,8 @@ keycloak_public_client: false          # true → PKCE, no client_secret
 keycloak_verify_ssl: true
 keycloak_redirect_uri: https://akb.example.com/api/v1/auth/keycloak/callback
 keycloak_post_login_path: /auth/callback
+keycloak_post_login_allowed_origins: []
+keycloak_companion_client_ids_by_origin: {}
 keycloak_exchange_code_ttl_secs: 60
 # config/secret.yaml
 keycloak_client_secret: "<from Keycloak client credentials>"
@@ -233,6 +235,12 @@ keycloak_client_secret: "<from Keycloak client credentials>"
 - `keycloak_client_secret` lives only in `secret.yaml` (gitignored) —
   matches `feedback_oss_no_secrets`. (AKB reads no env vars, so the
   seahorse `client_secret_env` indirection is replaced by secret.yaml.)
+- `keycloak_companion_client_ids_by_origin` may select a dedicated Keycloak
+  client (and therefore a client-specific login theme) for an already
+  allowlisted first-party companion origin. The selected client id is stored
+  in server-side single-use OIDC state and reused for authorization, code
+  exchange, and ID-token audience verification. Empty mapping, relative paths,
+  and unlisted origins always use `keycloak_client_id`.
 - **Split-horizon** `keycloak_internal_url`: when set, the **backchannel**
   calls (token + JWKS) use it while the **issuer** and browser-facing
   authorization/logout endpoints stay on `keycloak_server_url`. Solves
