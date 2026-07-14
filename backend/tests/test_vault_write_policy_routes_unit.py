@@ -76,6 +76,27 @@ async def test_non_admin_rejected_for_add_grant(monkeypatch):
     assert exc_info.value.status_code == 403
 
 
+async def test_non_admin_rejected_for_atomic_bootstrap(monkeypatch):
+    from app.api.routes import access
+
+    async def _must_not_run(*_a, **_k):
+        raise AssertionError("service must not run for a non-admin")
+
+    monkeypatch.setattr(access, "bootstrap_vault_write_policy", _must_not_run)
+    req = access.BootstrapVaultWritePolicyRequest(
+        managed_by="akb-platform:workspace-a",
+        grants=[
+            access.BootstrapVaultWriteGrantRequest(token_id=str(uuid.uuid4()))
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await access.admin_bootstrap_vault_write_policy(
+            "some-vault", req, _user(admin=False),
+        )
+    assert exc_info.value.status_code == 403
+
+
 async def test_non_admin_rejected_for_remove_grant(monkeypatch):
     from app.api.routes import access
 
@@ -193,6 +214,52 @@ async def test_admin_add_grant_forwards_action_limit(monkeypatch):
     }
 
 
+async def test_admin_atomic_bootstrap_forwards_complete_grant_set(monkeypatch):
+    from app.api.routes import access
+
+    observed = {}
+    wildcard_id = str(uuid.uuid4())
+    upload_id = str(uuid.uuid4())
+
+    async def _bootstrap(actor_id, vault_name, managed_by, grants, note=None):
+        observed.update(
+            actor_id=actor_id,
+            vault_name=vault_name,
+            managed_by=managed_by,
+            grants=grants,
+            note=note,
+        )
+        return {"vault": vault_name, "marked": True, "grants": grants}
+
+    monkeypatch.setattr(access, "bootstrap_vault_write_policy", _bootstrap)
+    admin = _user(admin=True)
+    req = access.BootstrapVaultWritePolicyRequest(
+        managed_by="akb-platform:workspace-a",
+        note="initial managed cutover",
+        grants=[
+            access.BootstrapVaultWriteGrantRequest(token_id=wildcard_id),
+            access.BootstrapVaultWriteGrantRequest(
+                token_id=upload_id,
+                actions=["file_upload"],
+            ),
+        ],
+    )
+
+    result = await access.admin_bootstrap_vault_write_policy("v1", req, admin)
+
+    assert result["marked"] is True
+    assert observed == {
+        "actor_id": admin.user_id,
+        "vault_name": "v1",
+        "managed_by": "akb-platform:workspace-a",
+        "grants": [
+            {"token_id": wildcard_id, "write_actions": None},
+            {"token_id": upload_id, "write_actions": ["file_upload"]},
+        ],
+        "note": "initial managed cutover",
+    }
+
+
 async def test_admin_remove_grant_forwards_args(monkeypatch):
     from app.api.routes import access
 
@@ -218,6 +285,7 @@ async def test_write_policy_routes_are_explicit_in_openapi():
     paths = app.openapi()["paths"]
     expected = {
         "/api/v1/admin/vaults/{vault}/write-policy",
+        "/api/v1/admin/vaults/{vault}/write-policy/bootstrap",
         "/api/v1/admin/vaults/{vault}/write-policy/grants/{token_id}",
     }
     assert expected <= set(paths)

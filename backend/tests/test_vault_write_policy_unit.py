@@ -1183,6 +1183,112 @@ class TestAdminWritePolicyGrants:
         assert payload["token_id"] == str(token_id)
         assert payload["managed_by"] == "collector:acme"
 
+    async def test_atomic_bootstrap_commits_policy_and_complete_grant_set(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import bootstrap_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        service_user_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        wildcard_id = await _create_token(pool, owner_id)
+        upload_id = await _create_upload_service_token(
+            pool, service_user_id, vault_name,
+        )
+
+        result = await bootstrap_vault_write_policy(
+            str(admin_id),
+            vault_name,
+            "akb-platform:workspace-a",
+            [
+                {"token_id": str(wildcard_id), "write_actions": None},
+                {
+                    "token_id": str(upload_id),
+                    "write_actions": ["file_upload"],
+                },
+            ],
+            note="initial managed cutover",
+        )
+
+        assert result == {
+            "vault": vault_name,
+            "managed_by": "akb-platform:workspace-a",
+            "note": "initial managed cutover",
+            "marked": True,
+            "grants": [
+                {"token_id": str(wildcard_id), "write_actions": ["*"]},
+                {"token_id": str(upload_id), "write_actions": ["file_upload"]},
+            ],
+        }
+        assert await repo.get_policy(vault_id) is not None
+        assert await repo.get_grant_actions(vault_id, wildcard_id) == frozenset({"*"})
+        assert await repo.get_grant_actions(vault_id, upload_id) == frozenset(
+            {"file_upload"}
+        )
+
+        async with pool.acquire() as conn:
+            events = await conn.fetch(
+                "SELECT payload FROM events "
+                "WHERE kind = 'vault.write_policy_changed' AND vault_id = $1",
+                vault_id,
+            )
+        assert len(events) == 1
+        payload = (
+            json.loads(events[0]["payload"])
+            if isinstance(events[0]["payload"], str)
+            else events[0]["payload"]
+        )
+        assert payload["action"] == "bootstrapped"
+        assert payload["grants"] == result["grants"]
+
+    async def test_atomic_bootstrap_rolls_back_policy_when_any_grant_fails(
+        self, pool, monkeypatch,
+    ):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import bootstrap_vault_write_policy
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        first_id = await _create_token(pool, owner_id)
+        second_id = await _create_token(pool, owner_id)
+        real_add_grant = repo.add_grant
+        calls = 0
+
+        async def _fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected second-grant failure")
+            await real_add_grant(*args, **kwargs)
+
+        monkeypatch.setattr(repo, "add_grant", _fail_second)
+
+        with pytest.raises(RuntimeError, match="second-grant failure"):
+            await bootstrap_vault_write_policy(
+                str(admin_id),
+                vault_name,
+                "akb-platform:workspace-a",
+                [
+                    {"token_id": str(first_id), "write_actions": None},
+                    {"token_id": str(second_id), "write_actions": None},
+                ],
+            )
+
+        assert await repo.get_policy(vault_id) is None
+        async with pool.acquire() as conn:
+            grant_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM vault_write_grants WHERE vault_id = $1",
+                vault_id,
+            )
+            event_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM events "
+                "WHERE kind = 'vault.write_policy_changed' AND vault_id = $1",
+                vault_id,
+            )
+        assert grant_count == 0
+        assert event_count == 0
+
     async def test_file_upload_grant_requires_exact_upload_service_profile(self, pool):
         from app.exceptions import ValidationError
         from app.repositories import vault_write_policy_repo as repo
