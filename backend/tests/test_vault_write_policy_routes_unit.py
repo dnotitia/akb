@@ -156,6 +156,43 @@ async def test_admin_add_grant_forwards_args(monkeypatch):
     assert observed == {"actor_id": admin.user_id, "vault_name": "v1", "token_id": token_id}
 
 
+async def test_admin_add_grant_forwards_action_limit(monkeypatch):
+    from app.api.routes import access
+
+    observed = {}
+    token_id = str(uuid.uuid4())
+
+    async def _add(actor_id, vault_name, tid, *, write_actions=None):
+        observed.update(
+            actor_id=actor_id,
+            vault_name=vault_name,
+            token_id=tid,
+            write_actions=write_actions,
+        )
+        return {
+            "vault": vault_name,
+            "token_id": tid,
+            "write_actions": write_actions,
+            "granted": True,
+        }
+
+    monkeypatch.setattr(access, "add_vault_write_grant", _add)
+    admin = _user(admin=True)
+    req = access.AddVaultWriteGrantRequest(actions=["file_upload"])
+
+    result = await access.admin_add_vault_write_grant(
+        "v1", token_id, admin, req=req,
+    )
+
+    assert result["write_actions"] == ["file_upload"]
+    assert observed == {
+        "actor_id": admin.user_id,
+        "vault_name": "v1",
+        "token_id": token_id,
+        "write_actions": ["file_upload"],
+    }
+
+
 async def test_admin_remove_grant_forwards_args(monkeypatch):
     from app.api.routes import access
 

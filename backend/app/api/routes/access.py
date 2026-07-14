@@ -78,6 +78,13 @@ class SetVaultWritePolicyRequest(NFCModel):
     )
 
 
+class AddVaultWriteGrantRequest(NFCModel):
+    actions: list[str] = Field(
+        min_length=1,
+        description="Managed write actions. Omit the body for the legacy wildcard grant.",
+    )
+
+
 class EnsureExternalIdentityRequest(NFCModel):
     issuer: str
     subject: str
@@ -250,9 +257,17 @@ async def admin_add_vault_write_grant(
     vault: str,
     token_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
+    req: AddVaultWriteGrantRequest | None = None,
 ):
     _require_admin(user)
-    return await add_vault_write_grant(user.user_id, vault, token_id)
+    if req is None:
+        return await add_vault_write_grant(user.user_id, vault, token_id)
+    return await add_vault_write_grant(
+        user.user_id,
+        vault,
+        token_id,
+        write_actions=req.actions,
+    )
 
 
 @router.delete(

@@ -55,6 +55,7 @@ async def pool(monkeypatch):
         "010_external_git_mirror.py",
         "015_events_outbox.py",
         "044_vault_write_policy.py",
+        "045_vault_write_grant_actions.py",
     ):
         migration = _load_migration(filename)
         assert migration is not None
@@ -178,6 +179,46 @@ async def _create_token(pg_pool, user_id: uuid.UUID) -> uuid.UUID:
     return token_id
 
 
+async def _create_upload_service_token(
+    pg_pool,
+    user_id: uuid.UUID,
+    vault_name: str,
+    *,
+    scopes: tuple[str, ...] = ("write",),
+    scoped_vault: str | None = None,
+    is_admin: bool = False,
+) -> uuid.UUID:
+    from app.services.auth_service import _hash_token
+
+    raw = f"akb_secret_vwp_{uuid.uuid4().hex}"
+    vault_scope = (
+        json.dumps({"prefixes": [], "extra_vaults": [scoped_vault or vault_name]})
+        if scoped_vault != ""
+        else None
+    )
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET account_kind = 'service', is_admin = $2 WHERE id = $1",
+            user_id,
+            is_admin,
+        )
+        return await conn.fetchval(
+            """
+            INSERT INTO tokens (
+                user_id, name, token_hash, token_prefix,
+                scopes, vault_scope, key_class
+            )
+            VALUES ($1, 'vwp-upload-token', $2, $3, $4, $5::jsonb, 'service')
+            RETURNING id
+            """,
+            user_id,
+            _hash_token(raw),
+            raw[:12],
+            list(scopes),
+            vault_scope,
+        )
+
+
 class TestMigrationIdempotent:
     async def test_migrate_applies_twice_without_error(self, pool):
         from app.db.postgres import _load_migration
@@ -221,6 +262,61 @@ class TestMigrationIdempotent:
 
 
 class TestRepoCrudRoundTrip:
+    async def test_migration_045_backfills_preexisting_grants_to_wildcard(self, pool):
+        from app.db.postgres import _load_migration
+
+        migration = _load_migration("045_vault_write_grant_actions.py")
+        assert migration is not None
+        schema = f"vwp_m045_{uuid.uuid4().hex}"
+        vault_id = uuid.uuid4()
+        token_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(f'CREATE SCHEMA "{schema}"')
+            await conn.execute(f'SET search_path TO "{schema}"')
+            try:
+                await conn.execute(
+                    """
+                    CREATE TABLE vault_write_grants (
+                        vault_id UUID NOT NULL,
+                        token_id UUID NOT NULL,
+                        granted_by TEXT NOT NULL,
+                        PRIMARY KEY (vault_id, token_id)
+                    )
+                    """
+                )
+                await conn.execute(
+                    "INSERT INTO vault_write_grants (vault_id, token_id, granted_by) "
+                    "VALUES ($1, $2, 'pre-045-admin')",
+                    vault_id,
+                    token_id,
+                )
+
+                await migration.migrate(conn=conn)
+
+                assert await conn.fetchval(
+                    "SELECT write_actions FROM vault_write_grants "
+                    "WHERE vault_id = $1 AND token_id = $2",
+                    vault_id,
+                    token_id,
+                ) == ["*"]
+                assert await conn.fetchval(
+                    "SELECT is_nullable = 'NO' FROM information_schema.columns "
+                    "WHERE table_schema = $1 "
+                    "AND table_name = 'vault_write_grants' "
+                    "AND column_name = 'write_actions'",
+                    schema,
+                ) is True
+                with pytest.raises(asyncpg.CheckViolationError):
+                    await conn.execute(
+                        "UPDATE vault_write_grants SET write_actions = ARRAY[]::TEXT[] "
+                        "WHERE vault_id = $1 AND token_id = $2",
+                        vault_id,
+                        token_id,
+                    )
+            finally:
+                await conn.execute("RESET search_path")
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
     async def test_get_policy_none_when_ungoverned(self, pool):
         from app.repositories import vault_write_policy_repo as repo
 
@@ -301,6 +397,59 @@ class TestRepoCrudRoundTrip:
         await repo.add_grant(vault_id, token_id, "admin-user")  # must not raise
 
         assert await repo.is_granted(vault_id, token_id) is True
+
+    async def test_action_limited_grant_only_matches_declared_action(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+
+        owner_id = await _create_user(pool)
+        vault_id = await _create_vault(pool, owner_id)
+        token_id = await _create_token(pool, owner_id)
+        await repo.set_policy(vault_id, "naut:upload", "admin-user")
+
+        await repo.add_grant(
+            vault_id,
+            token_id,
+            "admin-user",
+            write_actions=("file_upload",),
+        )
+
+        assert await repo.is_granted(vault_id, token_id, action="file_upload") is True
+        assert await repo.is_granted(vault_id, token_id, action="document_write") is False
+        assert await repo.is_granted(vault_id, token_id) is False
+        assert await repo.get_grant_actions(vault_id, token_id) == frozenset({"file_upload"})
+
+    async def test_regrant_replaces_wildcard_with_action_limit(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+
+        owner_id = await _create_user(pool)
+        vault_id = await _create_vault(pool, owner_id)
+        token_id = await _create_token(pool, owner_id)
+        await repo.set_policy(vault_id, "naut:upload", "admin-user")
+
+        await repo.add_grant(vault_id, token_id, "admin-user")
+        await repo.add_grant(
+            vault_id,
+            token_id,
+            "admin-user",
+            write_actions=("file_upload",),
+        )
+
+        assert await repo.get_grant_actions(vault_id, token_id) == frozenset({"file_upload"})
+        assert await repo.is_granted(vault_id, token_id) is False
+
+    async def test_existing_default_grant_is_wildcard_compatible(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+
+        owner_id = await _create_user(pool)
+        vault_id = await _create_vault(pool, owner_id)
+        token_id = await _create_token(pool, owner_id)
+        await repo.set_policy(vault_id, "collector:x", "admin-user")
+        await repo.add_grant(vault_id, token_id, "admin-user")
+
+        assert await repo.get_grant_actions(vault_id, token_id) == frozenset({"*"})
+        assert await repo.is_granted(vault_id, token_id) is True
+        assert await repo.is_granted(vault_id, token_id, action="file_upload") is True
+        assert await repo.is_granted(vault_id, token_id, action="anything") is True
 
     async def test_add_grant_without_policy_raises_fk_violation(self, pool):
         from app.repositories import vault_write_policy_repo as repo
@@ -515,6 +664,91 @@ class TestWritePolicyGuard:
             )
 
         assert result["vault_id"] == vault_id
+
+    async def test_action_limited_grant_passes_only_when_guard_declares_matching_action(self, pool):
+        from app.exceptions import ForbiddenError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import check_vault_access
+
+        owner_id = await _create_user(pool)
+        service_user_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "naut:upload", "admin-user")
+        token_id = await _create_token(pool, service_user_id)
+        await repo.add_grant(
+            vault_id,
+            token_id,
+            "admin-user",
+            write_actions=("file_upload",),
+        )
+
+        with _auth_context(token_id=token_id, scope=None):
+            allowed = await check_vault_access(
+                str(service_user_id),
+                vault_name,
+                required_role="writer",
+                write_action="file_upload",
+            )
+            assert allowed["write_grant_actions"] == ["file_upload"]
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(
+                    str(service_user_id), vault_name, required_role="writer",
+                )
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(
+                    str(service_user_id),
+                    vault_name,
+                    required_role="writer",
+                    write_action="document_write",
+                )
+
+    async def test_delegated_human_requires_explicit_writer_membership(self, pool):
+        from app.exceptions import ForbiddenError
+        from app.services.access_service import check_delegated_vault_writer
+
+        owner_id = await _create_user(pool)
+        writer_id = await _create_user(pool)
+        reader_id = await _create_user(pool)
+        stranger_id = await _create_user(pool)
+        service_writer_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        _other_vault_id, other_vault_name = await _create_named_vault(pool, owner_id)
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO vault_access (vault_id, user_id, role) VALUES ($1, $2, $3)",
+                [
+                    (vault_id, writer_id, "writer"),
+                    (vault_id, reader_id, "reader"),
+                    (vault_id, service_writer_id, "writer"),
+                ],
+            )
+            await conn.execute(
+                "UPDATE users SET account_kind = 'service' WHERE id = $1",
+                service_writer_id,
+            )
+            await conn.execute(
+                "INSERT INTO vault_access (vault_id, user_id, role) "
+                "SELECT id, $1, 'writer' FROM vaults WHERE name = $2",
+                stranger_id,
+                other_vault_name,
+            )
+
+        assert (await check_delegated_vault_writer(str(owner_id), vault_name))["role"] == "owner"
+        assert (await check_delegated_vault_writer(str(writer_id), vault_name))["role"] == "writer"
+        with pytest.raises(ForbiddenError):
+            await check_delegated_vault_writer(str(reader_id), vault_name)
+        with pytest.raises(ForbiddenError):
+            await check_delegated_vault_writer(str(stranger_id), vault_name)
+        with pytest.raises(ForbiddenError, match="human"):
+            await check_delegated_vault_writer(str(service_writer_id), vault_name)
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET account_status = 'suspended' WHERE id = $1",
+                writer_id,
+            )
+        with pytest.raises(ForbiddenError):
+            await check_delegated_vault_writer(str(writer_id), vault_name)
 
     async def test_unscoped_admin_bypasses_and_emits_audit(self, pool):
         """A3: a system admin with no PAT vault scope bypasses a marked
@@ -948,6 +1182,110 @@ class TestAdminWritePolicyGrants:
         )
         assert payload["token_id"] == str(token_id)
         assert payload["managed_by"] == "collector:acme"
+
+    async def test_file_upload_grant_requires_exact_upload_service_profile(self, pool):
+        from app.exceptions import ValidationError
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services.access_service import add_vault_write_grant
+
+        admin_id = await _create_admin_user(pool)
+        owner_id = await _create_user(pool)
+        service_user_id = await _create_user(pool)
+        vault_id, vault_name = await _create_named_vault(pool, owner_id)
+        await repo.set_policy(vault_id, "naut:upload", "admin-user")
+        token_id = await _create_upload_service_token(
+            pool, service_user_id, vault_name,
+        )
+
+        result = await add_vault_write_grant(
+            str(admin_id),
+            vault_name,
+            str(token_id),
+            write_actions=["file_upload"],
+        )
+
+        assert result["write_actions"] == ["file_upload"]
+        assert await repo.get_grant_actions(vault_id, token_id) == frozenset({"file_upload"})
+
+        pat_id = await _create_token(pool, owner_id)
+        with pytest.raises(ValidationError, match="service key"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(pat_id),
+                write_actions=["file_upload"],
+            )
+
+        broad_user_id = await _create_user(pool)
+        broad_id = await _create_upload_service_token(
+            pool,
+            broad_user_id,
+            vault_name,
+            scopes=("read", "write"),
+        )
+        with pytest.raises(ValidationError, match="coarse scope"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(broad_id),
+                write_actions=["file_upload"],
+            )
+
+        unscoped_user_id = await _create_user(pool)
+        unscoped_id = await _create_upload_service_token(
+            pool,
+            unscoped_user_id,
+            vault_name,
+            scoped_vault="",
+        )
+        with pytest.raises(ValidationError, match="exactly the target Vault"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(unscoped_id),
+                write_actions=["file_upload"],
+            )
+
+        admin_service_user_id = await _create_user(pool)
+        admin_service_id = await _create_upload_service_token(
+            pool,
+            admin_service_user_id,
+            vault_name,
+            is_admin=True,
+        )
+        with pytest.raises(ValidationError, match="non-admin service account"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(admin_service_id),
+                write_actions=["file_upload"],
+            )
+
+        suspended_user_id = await _create_user(pool)
+        suspended_id = await _create_upload_service_token(
+            pool,
+            suspended_user_id,
+            vault_name,
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET account_status = 'suspended' WHERE id = $1",
+                suspended_user_id,
+            )
+        with pytest.raises(ValidationError, match="active service account"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(suspended_id),
+                write_actions=["file_upload"],
+            )
+
+        expired_user_id = await _create_user(pool)
+        expired_id = await _create_upload_service_token(
+            pool,
+            expired_user_id,
+            vault_name,
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE tokens SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+                expired_id,
+            )
+        with pytest.raises(ValidationError, match="unexpired service key"):
+            await add_vault_write_grant(
+                str(admin_id), vault_name, str(expired_id),
+                write_actions=["file_upload"],
+            )
 
     async def test_add_vault_write_grant_rejects_unmarked_vault(self, pool):
         from app.exceptions import ConflictError

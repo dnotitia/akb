@@ -994,6 +994,32 @@ async def revoke_all_sessions(
 
 # ── Token resolution (JWT or PAT) ───────────────────────────
 
+def _jwt_algorithm(token: str) -> str | None:
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        return None
+    alg = header.get("alg")
+    return alg if isinstance(alg, str) else None
+
+
+async def resolve_akb_session_authorization(
+    authorization: str,
+) -> AuthenticatedUser | None:
+    """Resolve only an AKB-issued user-session JWT, without ContextVar writes.
+
+    Dual-principal endpoints call this after the primary service PAT has already
+    populated request ContextVars. Accepting PAT or Keycloak token shapes here
+    would either blur the human/session contract or overwrite the primary
+    authorization state, so both are rejected.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[7:]
+    if token.startswith("akb_") or _jwt_algorithm(token) != "HS256":
+        return None
+    return await _resolve_akb_session_jwt(token)
+
 async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     """Resolve an Authorization header to an authenticated user.
 
@@ -1036,11 +1062,7 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     # Keycloak access tokens are RS256. We pick the verifier from the
     # token's own header so a single Bearer surface accepts both without
     # an O(2) verify attempt per request.
-    try:
-        unverified_header = jwt.get_unverified_header(token)
-    except (jwt.InvalidTokenError, Exception):
-        return None
-    alg = unverified_header.get("alg")
+    alg = _jwt_algorithm(token)
 
     if alg == "RS256":
         # Keycloak access token. Gated on mcp_oauth_enabled inside.
@@ -1052,7 +1074,11 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
         # token and (correctly) refuse but only after burning CPU.
         return None
 
-    # AKB-issued session JWT (existing path)
+    return await _resolve_akb_session_jwt(token)
+
+
+async def _resolve_akb_session_jwt(token: str) -> AuthenticatedUser | None:
+    """Validate one AKB HS256 session token and return its active account."""
     payload = decode_jwt(token)
     if not payload:
         return None
