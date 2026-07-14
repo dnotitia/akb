@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -18,8 +20,28 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _activate_old_backend(backend: Path) -> None:
+    resolved = backend.resolve()
+    config_dir = resolved / "config"
+    archive_config = resolved.parent / "config"
+    for source_name, target_name in (
+        ("app.yaml.example", "app.yaml"),
+        ("secret.yaml.example", "secret.yaml"),
+    ):
+        target = config_dir / target_name
+        if target.exists():
+            continue
+        source = archive_config / source_name
+        if not source.is_file():
+            raise RuntimeError(f"archived compatibility config is missing: {source}")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    os.chdir(resolved)
+    sys.path.insert(0, str(resolved))
+
+
 def _configure_old_backend(backend: Path, dsn: str):
-    sys.path.insert(0, str(backend.resolve()))
+    _activate_old_backend(backend)
     from app.config import settings
 
     parsed = urlparse(dsn)
