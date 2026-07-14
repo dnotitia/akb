@@ -279,7 +279,10 @@ async def test_admin_remove_grant_forwards_args(monkeypatch):
     assert observed == {"actor_id": admin.user_id, "vault_name": "v1", "token_id": token_id}
 
 
-async def test_write_policy_routes_are_explicit_in_openapi():
+async def test_write_policy_routes_are_explicit_in_openapi(monkeypatch, tmp_path):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     from app.main import app
 
     paths = app.openapi()["paths"]
