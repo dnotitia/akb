@@ -53,6 +53,7 @@ cd "$BACKEND"
   tests/test_workspace_account_admin_service.py \
   tests/test_workspace_account_admin_routes.py \
   tests/test_keycloak_redirect_unit.py \
+  tests/test_old_image_schema_compat_unit.py \
   tests/old_image_schema_compat.py
 "$PYTHON_BIN" -m mypy \
   app/services/account_service.py \
@@ -71,11 +72,13 @@ cd "$BACKEND"
   tests/test_auth_change_password.py \
   tests/test_password_service.py \
   tests/test_mcp_oauth_unit.py \
+  tests/test_old_image_schema_compat_unit.py \
   -q
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/akb-governance-compat.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
-git -C "$ROOT" archive --format=tar --output="$tmp_dir/old-backend.tar" "$BASE_REF" backend
+git -C "$ROOT" archive --format=tar --output="$tmp_dir/old-backend.tar" \
+  "$BASE_REF" backend config
 tar -xf "$tmp_dir/old-backend.tar" -C "$tmp_dir"
 "$PYTHON_BIN" tests/old_image_schema_compat.py \
   --backend "$tmp_dir/backend" \
