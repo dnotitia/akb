@@ -11,7 +11,7 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from app.models.vault_scope import current_token_uuid, current_vault_scope
+from app.models.vault_scope import VaultScope, current_token_uuid, current_vault_scope
 from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
@@ -29,6 +29,71 @@ VALID_PUBLIC_ACCESS = {"none", "reader", "writer"}
 # for these (reads are never scope-restricted: a scoped agent still reads
 # broadly, the scope bounds WRITES).
 _MUTATING_ROLES = frozenset({"writer", "admin", "owner"})
+
+WRITE_ACTION_WILDCARD = "*"
+FILE_UPLOAD_WRITE_ACTION = "file_upload"
+VALID_WRITE_ACTIONS = frozenset({WRITE_ACTION_WILDCARD, FILE_UPLOAD_WRITE_ACTION})
+
+
+def normalize_write_actions(actions: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Validate the small managed-write capability vocabulary.
+
+    ``None`` preserves the pre-045 broad-grant API. Mixing wildcard and named
+    actions is rejected rather than silently widening a grant.
+    """
+    if actions is None:
+        return (WRITE_ACTION_WILDCARD,)
+    if not actions:
+        raise ValidationError("write actions must not be empty")
+    if any(not isinstance(action, str) or not action.strip() for action in actions):
+        raise ValidationError("write actions must be non-empty strings")
+    normalized = tuple(sorted({action.strip() for action in actions}))
+    unknown = set(normalized) - VALID_WRITE_ACTIONS
+    if unknown:
+        raise ValidationError(
+            f"Unknown write action(s): {sorted(unknown)}. "
+            f"Use: {sorted(VALID_WRITE_ACTIONS)}"
+        )
+    if WRITE_ACTION_WILDCARD in normalized and len(normalized) > 1:
+        raise ValidationError("wildcard write action cannot be combined with named actions")
+    return normalized
+
+
+def _validate_action_limited_grant_token(token: dict, vault_name: str) -> None:
+    """Fail closed unless a limited grant targets an upload-only credential."""
+    if token["key_class"] != "service":
+        raise ValidationError("action-limited write grants require a service key")
+    if token["account_kind"] != "service" or token["is_admin"]:
+        raise ValidationError(
+            "action-limited write grants require a non-admin service account"
+        )
+    if token["account_status"] != "active":
+        raise ValidationError(
+            "action-limited write grants require an active service account"
+        )
+    if not token["is_unexpired"]:
+        raise ValidationError(
+            "action-limited write grants require an unexpired service key"
+        )
+
+    scopes = frozenset(str(scope) for scope in (token["scopes"] or ()))
+    if scopes != {"write"}:
+        raise ValidationError(
+            "action-limited write grants require exactly the coarse scope ['write']"
+        )
+
+    try:
+        vault_scope = VaultScope.from_db_json(token["vault_scope"])
+    except ValueError as exc:
+        raise ValidationError(f"invalid token Vault scope: {exc}") from exc
+    if (
+        vault_scope is None
+        or vault_scope.prefixes
+        or vault_scope.extra_vaults != {vault_name}
+    ):
+        raise ValidationError(
+            "action-limited write grants require a token scoped to exactly the target Vault"
+        )
 
 
 def _role_level(role: str) -> int:
@@ -71,7 +136,7 @@ async def _is_unscoped_system_admin(uid: uuid.UUID, conn) -> bool:
 
 async def check_vault_access(
     user_id: str, vault_name: str, required_role: str = "reader",
-    *, allow_archived: bool = False,
+    *, allow_archived: bool = False, write_action: str | None = None,
 ) -> dict:
     """Check if user has at least the required role on a vault.
 
@@ -161,15 +226,22 @@ async def check_vault_access(
             policy = await write_policy_repo.get_policy(vault["id"], conn=conn)
             if policy is not None:
                 token_id = current_token_uuid()
-                granted = token_id is not None and await write_policy_repo.is_granted(
-                    vault["id"], token_id, conn=conn,
+                grant_actions = (
+                    await write_policy_repo.get_grant_actions(
+                        vault["id"], token_id, conn=conn,
+                    )
+                    if token_id is not None else None
                 )
-                if granted:
+                if grant_actions is not None and (
+                    WRITE_ACTION_WILDCARD in grant_actions
+                    or (write_action is not None and write_action in grant_actions)
+                ):
                     return {
                         "vault_id": vault["id"],
                         "role": required_role,
                         "status": vault["status"],
                         "role_source": "write_policy_grant",
+                        "write_grant_actions": sorted(grant_actions),
                     }
                 if await _is_unscoped_system_admin(uid, conn):
                     # A3: bypass, but LOUDLY — never a silent escape hatch.
@@ -192,7 +264,7 @@ async def check_vault_access(
                 raise ForbiddenError(
                     f"Vault '{vault_name}' is write-managed by "
                     f"{policy['managed_by']}; writes require a granted "
-                    f"service token"
+                    f"service token with the required write action"
                 )
 
         # System admin bypasses all vault ACL
@@ -220,6 +292,63 @@ async def check_vault_access(
             raise ForbiddenError(f"Requires '{required_role}' role on vault '{vault_name}'")
 
         return {"vault_id": vault["id"], "role": user_role, "status": vault["status"], "role_source": "member"}
+
+
+async def check_delegated_vault_writer(user_id: str, vault_name: str) -> dict:
+    """Authorize the human half of a dual-principal managed file upload.
+
+    This check deliberately ignores ``vault_write_policy`` because the primary
+    action-limited service token already satisfies that boundary. It does not
+    inherit public access: a delegated writer must be an active AKB account
+    explicitly bound to this Vault (or the owner/system admin).
+    """
+    pool = await get_pool()
+    uid = uuid.UUID(user_id)
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT is_admin, account_status, account_kind FROM users WHERE id = $1",
+            uid,
+        )
+        if not user or user["account_status"] != "active":
+            raise ForbiddenError("Delegated AKB account is not active")
+        if user["account_kind"] != "human":
+            raise ForbiddenError("Delegated AKB account must be a human account")
+
+        vault = await conn.fetchrow(
+            "SELECT id, owner_id, status FROM vaults WHERE name = $1", vault_name,
+        )
+        if not vault:
+            raise NotFoundError("Vault", vault_name)
+        if vault["status"] == "archived":
+            raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+        is_mirror = await conn.fetchval(
+            "SELECT 1 FROM vault_external_git WHERE vault_id = $1", vault["id"],
+        )
+        if is_mirror:
+            raise ForbiddenError(f"Vault '{vault_name}' is a read-only external git mirror")
+        if user["is_admin"] or vault["owner_id"] == uid:
+            return {
+                "vault_id": vault["id"],
+                "role": "owner",
+                "status": vault["status"],
+                "role_source": "member",
+            }
+
+        access = await conn.fetchrow(
+            "SELECT role FROM vault_access WHERE vault_id = $1 AND user_id = $2",
+            vault["id"], uid,
+        )
+        role = access["role"] if access else None
+        if role is None or _role_level(role) < _role_level("writer"):
+            raise ForbiddenError(
+                f"Delegated account requires explicit 'writer' role on vault '{vault_name}'"
+            )
+        return {
+            "vault_id": vault["id"],
+            "role": role,
+            "status": vault["status"],
+            "role_source": "member",
+        }
 
 
 async def get_user_role(user_id: str, vault_name: str) -> str | None:
@@ -996,6 +1125,132 @@ async def set_vault_write_policy(
     }
 
 
+async def bootstrap_vault_write_policy(
+    actor_id: str,
+    vault_name: str,
+    managed_by: str,
+    grants: list[dict[str, object]],
+    note: str | None = None,
+) -> dict:
+    """Atomically mark a Vault and install its complete initial writer set.
+
+    The ordinary set-policy and add-grant endpoints remain useful for updates,
+    but cannot safely perform an initial cutover: committing the policy first
+    creates a visible fail-closed interval before the grants arrive. This path
+    validates every token, writes the policy and all grants, and emits its audit
+    event in one PostgreSQL transaction. Any failure leaves the Vault unmarked.
+    Re-running it is idempotent for the supplied grants and preserves unrelated
+    grants already present on an existing policy.
+    """
+    managed_by = managed_by.strip()
+    if not managed_by:
+        raise ValidationError("managed_by must not be empty")
+    if not grants:
+        raise ValidationError("bootstrap grants must not be empty")
+
+    normalized_grants: list[tuple[uuid.UUID, str, tuple[str, ...]]] = []
+    seen_token_ids: set[uuid.UUID] = set()
+    for grant in grants:
+        token_id = grant.get("token_id")
+        try:
+            tid = uuid.UUID(str(token_id))
+        except (AttributeError, TypeError, ValueError):
+            raise ValidationError(f"Invalid token_id: {token_id!r}") from None
+        if tid in seen_token_ids:
+            raise ValidationError(f"Duplicate bootstrap token_id: {tid}")
+        seen_token_ids.add(tid)
+        write_actions = grant.get("write_actions")
+        if write_actions is not None and not isinstance(write_actions, (list, tuple)):
+            raise ValidationError("write_actions must be a list of strings")
+        actions = normalize_write_actions(write_actions)
+        normalized_grants.append((tid, str(tid), actions))
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            vault = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+
+            is_mirror = await conn.fetchval(
+                "SELECT 1 FROM vault_external_git WHERE vault_id = $1", vault["id"],
+            )
+            if is_mirror:
+                raise ConflictError(
+                    f"Vault '{vault_name}' is an external-git mirror "
+                    f"(already read-only via its own poller); marking it "
+                    f"with a write policy would not change enforcement and "
+                    f"misleadingly implies a granted token could write here"
+                )
+
+            for tid, token_id, actions in normalized_grants:
+                token_row = await conn.fetchrow(
+                    """
+                    SELECT t.id, t.scopes, t.vault_scope, t.key_class,
+                           (t.expires_at IS NULL OR t.expires_at > NOW()) AS is_unexpired,
+                           u.account_kind, u.account_status, u.is_admin
+                      FROM tokens t
+                      JOIN users u ON u.id = t.user_id
+                     WHERE t.id = $1
+                       FOR SHARE OF t, u
+                    """,
+                    tid,
+                )
+                if not token_row:
+                    raise NotFoundError("Token", token_id)
+                if actions != (WRITE_ACTION_WILDCARD,):
+                    _validate_action_limited_grant_token(
+                        dict(token_row), vault_name,
+                    )
+
+            policy = await write_policy_repo.set_policy(
+                vault["id"], managed_by, created_by=actor_id, note=note, conn=conn,
+            )
+            grant_results = []
+            for tid, token_id, actions in normalized_grants:
+                await write_policy_repo.add_grant(
+                    vault["id"],
+                    tid,
+                    actor_id,
+                    conn=conn,
+                    write_actions=actions,
+                )
+                grant_results.append(
+                    {"token_id": token_id, "write_actions": list(actions)}
+                )
+
+            await emit_event(
+                conn,
+                "vault.write_policy_changed",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=actor_id,
+                payload={
+                    "action": "bootstrapped",
+                    "vault": vault_name,
+                    "managed_by": managed_by,
+                    "note": note,
+                    "grants": grant_results,
+                },
+            )
+
+    logger.info(
+        "Atomically marked vault %s write-managed by %s with %d grants",
+        vault_name,
+        managed_by,
+        len(grant_results),
+    )
+    return {
+        "vault": vault_name,
+        "managed_by": policy["managed_by"],
+        "note": policy["note"],
+        "marked": True,
+        "grants": grant_results,
+    }
+
+
 async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     """Admin-only: unmark ``vault_name`` — restore ordinary ACL-gated writes.
 
@@ -1038,17 +1293,26 @@ async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     return {"vault": vault_name, "unmarked": True, "was_marked": existing is not None}
 
 
-async def add_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -> dict:
+async def add_vault_write_grant(
+    actor_id: str,
+    vault_name: str,
+    token_id: str,
+    *,
+    write_actions: list[str] | tuple[str, ...] | None = None,
+) -> dict:
     """Admin-only: grant ``token_id`` write access to a MARKED vault.
 
     Requires the vault to already be marked (409 `ConflictError` — a grant
     on an ungoverned vault has no allowlist to join and almost certainly
     means the caller meant to mark first) and `token_id` to exist (404).
-    The design is class-agnostic (collector/gardener/operator/human PATs
-    are all just rows on the allowlist — see `vault_write_policy_repo`'s
-    module docstring), so no further ownership/role check on the token is
-    performed here.
+    Legacy wildcard grants remain class-agnostic. An explicit action-limited
+    grant is a stronger managed capability: it requires an active, unexpired,
+    non-admin service account token with exactly coarse ``write`` scope and an
+    exact one-Vault scope. This makes configuration errors fail at grant time
+    instead of on the first product request.
     """
+    actions_were_explicit = write_actions is not None
+    normalized_actions = normalize_write_actions(write_actions)
     try:
         tid = uuid.UUID(token_id)
     except (AttributeError, TypeError, ValueError):
@@ -1070,11 +1334,30 @@ async def add_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -
                     f"first with PUT .../write-policy"
                 )
 
-            token_row = await conn.fetchrow("SELECT id FROM tokens WHERE id = $1", tid)
+            token_row = await conn.fetchrow(
+                """
+                SELECT t.id, t.scopes, t.vault_scope, t.key_class,
+                       (t.expires_at IS NULL OR t.expires_at > NOW()) AS is_unexpired,
+                       u.account_kind, u.account_status, u.is_admin
+                  FROM tokens t
+                  JOIN users u ON u.id = t.user_id
+                 WHERE t.id = $1
+                   FOR SHARE OF t, u
+                """,
+                tid,
+            )
             if not token_row:
                 raise NotFoundError("Token", token_id)
+            if normalized_actions != (WRITE_ACTION_WILDCARD,):
+                _validate_action_limited_grant_token(dict(token_row), vault_name)
 
-            await write_policy_repo.add_grant(vault["id"], tid, actor_id, conn=conn)
+            await write_policy_repo.add_grant(
+                vault["id"],
+                tid,
+                actor_id,
+                conn=conn,
+                write_actions=normalized_actions,
+            )
             await emit_event(
                 conn, "vault.write_policy_changed",
                 vault_id=vault["id"],
@@ -1085,11 +1368,19 @@ async def add_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -
                     "vault": vault_name,
                     "managed_by": policy["managed_by"],
                     "token_id": token_id,
+                    "write_actions": list(normalized_actions),
                 },
             )
 
     logger.info("Granted token %s write access to vault %s", token_id, vault_name)
-    return {"vault": vault_name, "token_id": token_id, "granted": True}
+    result = {
+        "vault": vault_name,
+        "token_id": token_id,
+        "granted": True,
+    }
+    if actions_were_explicit:
+        result["write_actions"] = list(normalized_actions)
+    return result
 
 
 async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -> dict:

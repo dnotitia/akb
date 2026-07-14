@@ -213,7 +213,8 @@ async def _apply_migrations() -> None:
         "041_tokens_key_class.py",              # tokens.key_class ('pat' default, 'service' BFF key, 'publishable' reserved seam)
         "042_vault_migrations.py",              # vault_migrations catalog for table migration idempotency/checksum replay
         "043_workspace_account_governance.py",  # users account status/kind + stable external OIDC identities
-        "044_vault_write_policy.py",             # vault_write_policy + vault_write_grants: vault-grain token-allowlist substrate (P0 S3; guard is a later slice)
+        "044_vault_write_policy.py",             # vault_write_policy + vault_write_grants: vault-grain token-allowlist substrate
+        "045_vault_write_grant_actions.py",      # additive action limits; existing grants backfill to wildcard
     ):
         if filename in applied:
             continue

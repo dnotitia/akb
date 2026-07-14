@@ -25,9 +25,9 @@ plans/2026-07-10-naut-edit-semantics-sot-writeback-design.md §5.1a).
    leaves the vault with zero live writers. See
    ``app/repositories/vault_write_policy_repo.py``.
 
-This slice (P0 S3) builds ONLY the substrate: the two tables + the repo.
-Nothing reads them yet — no guard, no API route (that is a later slice).
-Marking a vault today has zero runtime effect.
+Migration 044 originally shipped as substrate only. The current access service
+and admin API enforce and manage these rows; migration 045 adds optional
+operation limits while preserving every 044 row as a wildcard grant.
 
 Idempotent — safe to re-run on fresh and existing DBs (mirrors migration
 010/042's ``CREATE TABLE IF NOT EXISTS`` + transaction-wrapped style).

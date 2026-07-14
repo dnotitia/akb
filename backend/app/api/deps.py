@@ -1,5 +1,6 @@
 """Shared dependencies for API routes."""
 
+from dataclasses import dataclass
 from typing import NoReturn
 
 from fastapi import HTTPException, Request, Security
@@ -9,11 +10,24 @@ from app.models.vault_scope import (
     current_request_jwt_claims,
     parse_request_jwt_claims_header,
 )
-from app.services.auth_service import AuthenticatedUser, resolve_token, token_has_scope
+from app.services.auth_service import (
+    AuthenticatedUser,
+    resolve_akb_session_authorization,
+    resolve_token,
+    token_has_scope,
+)
 
 bearer_auth = HTTPBearer(auto_error=False, scheme_name="bearerAuth")
 
 _CLAIMS_HEADER = "x-akb-claims"
+_DELEGATED_AUTH_HEADER = "X-Akb-Delegated-Authorization"
+
+
+@dataclass(frozen=True)
+class DelegatedActor:
+    user: AuthenticatedUser
+    service_user_id: str
+    service_token_id: str
 
 
 def _required_scope_for_request(request: Request) -> str:
@@ -31,6 +45,45 @@ def _reject_claims(message: str, code: str) -> NoReturn:
             "message": message,
             "code": code,
         },
+    )
+
+
+def _reject_delegation(message: str, code: str) -> NoReturn:
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "message": message,
+            "code": code,
+        },
+    )
+
+
+async def require_delegated_actor(
+    request: Request,
+    service_user: AuthenticatedUser,
+) -> DelegatedActor:
+    """Resolve the human principal paired with an action-limited service key."""
+    if service_user.key_class != "service" or service_user.token_id is None:
+        _reject_delegation(
+            "Delegated authorization requires a service key",
+            "delegation_requires_service_key",
+        )
+    authorization = request.headers.get(_DELEGATED_AUTH_HEADER)
+    if authorization is None:
+        _reject_delegation(
+            f"{_DELEGATED_AUTH_HEADER} is required",
+            "delegated_authorization_required",
+        )
+    delegated = await resolve_akb_session_authorization(authorization)
+    if delegated is None or delegated.auth_method != "jwt":
+        _reject_delegation(
+            "Delegated authorization must be an active AKB user session",
+            "invalid_delegated_authorization",
+        )
+    return DelegatedActor(
+        user=delegated,
+        service_user_id=service_user.user_id,
+        service_token_id=service_user.token_id,
     )
 
 

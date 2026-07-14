@@ -26,6 +26,7 @@ from app.services.account_service import (
 from app.services.access_service import (
     add_vault_write_grant,
     archive_vault,
+    bootstrap_vault_write_policy,
     delete_user_account,
     delete_vault,
     get_vault_info,
@@ -75,6 +76,31 @@ class SetVaultWritePolicyRequest(NFCModel):
     note: str | None = Field(
         default=None,
         description="Optional operator note. A re-mark REPLACES the whole policy row: omitting note clears any previously stored note (grants are preserved).",
+    )
+
+
+class AddVaultWriteGrantRequest(NFCModel):
+    actions: list[str] = Field(
+        min_length=1,
+        description="Managed write actions. Omit the body for the legacy wildcard grant.",
+    )
+
+
+class BootstrapVaultWriteGrantRequest(NFCModel):
+    token_id: str
+    actions: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        description="Omit for a legacy wildcard grant.",
+    )
+
+
+class BootstrapVaultWritePolicyRequest(NFCModel):
+    managed_by: str
+    note: str | None = None
+    grants: list[BootstrapVaultWriteGrantRequest] = Field(
+        min_length=1,
+        description="Complete initial writer set committed with the policy.",
     )
 
 
@@ -230,6 +256,31 @@ async def admin_set_vault_write_policy(
     return await set_vault_write_policy(user.user_id, vault, req.managed_by, note=req.note)
 
 
+@router.put(
+    "/admin/vaults/{vault}/write-policy/bootstrap",
+    summary="[admin] Atomically mark a vault and install its initial write grants",
+)
+async def admin_bootstrap_vault_write_policy(
+    vault: str,
+    req: BootstrapVaultWritePolicyRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    _require_admin(user)
+    return await bootstrap_vault_write_policy(
+        user.user_id,
+        vault,
+        req.managed_by,
+        [
+            {
+                "token_id": grant.token_id,
+                "write_actions": grant.actions,
+            }
+            for grant in req.grants
+        ],
+        note=req.note,
+    )
+
+
 @router.delete(
     "/admin/vaults/{vault}/write-policy",
     summary="[admin] Unmark a vault (restore ordinary ACL-gated writes)",
@@ -250,9 +301,17 @@ async def admin_add_vault_write_grant(
     vault: str,
     token_id: str,
     user: AuthenticatedUser = Depends(get_current_user),
+    req: AddVaultWriteGrantRequest | None = None,
 ):
     _require_admin(user)
-    return await add_vault_write_grant(user.user_id, vault, token_id)
+    if req is None:
+        return await add_vault_write_grant(user.user_id, vault, token_id)
+    return await add_vault_write_grant(
+        user.user_id,
+        vault,
+        token_id,
+        write_actions=req.actions,
+    )
 
 
 @router.delete(

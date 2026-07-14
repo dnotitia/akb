@@ -4,11 +4,12 @@ Sidecar 1:1 to ``vaults`` — generalizes the ``vault_external_git`` sidecar
 pattern (migration 010) to a new axis. A vault WITHOUT a
 ``vault_write_policy`` row is ungoverned; existing code is completely
 unaffected. A vault WITH a row is *marked*: mutating calls should only be
-accepted from a PAT on its ``vault_write_grants`` allowlist
-(class-agnostic — collector, gardener, and operator PATs are all just rows
-here). This module is pure substrate: no caller enforces the allowlist
-yet — that guard is a later slice (P0 S4). Marking a vault today has zero
-runtime effect.
+accepted from a token on its ``vault_write_grants`` allowlist. The access
+service enforces that allowlist. Migration 045 adds an operation set to each
+row: ``['*']`` keeps the historical class-agnostic broad grant used by
+collector, gardener, and operator credentials, while an explicit action such
+as ``file_upload`` requires a narrowly scoped service key and fails closed for
+every other write.
 
 CASCADE HAZARD: ``vault_write_grants.token_id`` is ``ON DELETE CASCADE``
 against ``tokens.id``. Deleting a token (revoke, suspend, rotation)
@@ -32,8 +33,10 @@ _GET_POLICY_SQL = """
      WHERE vault_id = $1
 """
 
-_IS_GRANTED_SQL = """
-    SELECT 1 FROM vault_write_grants WHERE vault_id = $1 AND token_id = $2
+_GET_GRANT_ACTIONS_SQL = """
+    SELECT write_actions
+      FROM vault_write_grants
+     WHERE vault_id = $1 AND token_id = $2
 """
 
 _SET_POLICY_SQL = """
@@ -48,9 +51,11 @@ _SET_POLICY_SQL = """
 _REMOVE_POLICY_SQL = "DELETE FROM vault_write_policy WHERE vault_id = $1"
 
 _ADD_GRANT_SQL = """
-    INSERT INTO vault_write_grants (vault_id, token_id, granted_by)
-    VALUES ($1, $2, $3)
-    ON CONFLICT (vault_id, token_id) DO NOTHING
+    INSERT INTO vault_write_grants (vault_id, token_id, granted_by, write_actions)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (vault_id, token_id) DO UPDATE
+       SET write_actions = EXCLUDED.write_actions,
+           granted_by = EXCLUDED.granted_by
 """
 
 _REMOVE_GRANT_SQL = (
@@ -69,21 +74,40 @@ async def get_policy(vault_id: uuid.UUID, conn=None) -> dict | None:
     return dict(row) if row is not None else None
 
 
-async def is_granted(vault_id: uuid.UUID, token_id: uuid.UUID, conn=None) -> bool:
-    """True iff ``token_id`` is on ``vault_id``'s write-grant allowlist.
+async def get_grant_actions(
+    vault_id: uuid.UUID, token_id: uuid.UUID, conn=None,
+) -> frozenset[str] | None:
+    """Return the granted action set, or ``None`` when no grant exists."""
+    if conn is not None:
+        raw = await conn.fetchval(_GET_GRANT_ACTIONS_SQL, vault_id, token_id)
+    else:
+        pool = await get_pool()
+        async with pool.acquire() as acq:
+            raw = await acq.fetchval(_GET_GRANT_ACTIONS_SQL, vault_id, token_id)
+    if raw is None:
+        return None
+    return frozenset(str(action) for action in raw)
+
+
+async def is_granted(
+    vault_id: uuid.UUID,
+    token_id: uuid.UUID,
+    conn=None,
+    *,
+    action: str | None = None,
+) -> bool:
+    """True iff the grant permits ``action``.
 
     This function alone does not tell a caller whether a write should be
     allowed — an ungoverned vault (no ``vault_write_policy`` row) has no
     allowlist to check against, and "no policy" means unrestricted, not
-    deny. That branch belongs to the guard (a later slice), not here.
+    deny. A wildcard grant permits every action and preserves the pre-045
+    behavior. An action-limited grant never matches an omitted action.
     """
-    if conn is not None:
-        found = await conn.fetchval(_IS_GRANTED_SQL, vault_id, token_id)
-    else:
-        pool = await get_pool()
-        async with pool.acquire() as acq:
-            found = await acq.fetchval(_IS_GRANTED_SQL, vault_id, token_id)
-    return found is not None
+    actions = await get_grant_actions(vault_id, token_id, conn=conn)
+    if actions is None:
+        return False
+    return "*" in actions or (action is not None and action in actions)
 
 
 async def set_policy(
@@ -120,20 +144,30 @@ async def remove_policy(vault_id: uuid.UUID, conn=None) -> None:
 
 
 async def add_grant(
-    vault_id: uuid.UUID, token_id: uuid.UUID, granted_by: str, conn=None
+    vault_id: uuid.UUID,
+    token_id: uuid.UUID,
+    granted_by: str,
+    conn=None,
+    *,
+    write_actions: tuple[str, ...] = ("*",),
 ) -> None:
     """Grant ``token_id`` write access to ``vault_id``.
 
     Requires an existing ``vault_write_policy`` row for ``vault_id`` (FK
     — call ``set_policy`` first, or this raises a foreign-key violation).
-    Idempotent: granting an already-granted token is a no-op, not an error.
+    Idempotent for the same action set. Re-granting replaces the action set,
+    which gives operators a deterministic narrow/widen operation with one row.
     """
     if conn is not None:
-        await conn.execute(_ADD_GRANT_SQL, vault_id, token_id, granted_by)
+        await conn.execute(
+            _ADD_GRANT_SQL, vault_id, token_id, granted_by, list(write_actions),
+        )
     else:
         pool = await get_pool()
         async with pool.acquire() as acq:
-            await acq.execute(_ADD_GRANT_SQL, vault_id, token_id, granted_by)
+            await acq.execute(
+                _ADD_GRANT_SQL, vault_id, token_id, granted_by, list(write_actions),
+            )
 
 
 async def remove_grant(vault_id: uuid.UUID, token_id: uuid.UUID, conn=None) -> None:

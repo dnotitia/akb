@@ -48,6 +48,24 @@ _PRESIGN_UPLOAD_TTL = 3600
 _PRESIGN_DOWNLOAD_TTL = 3600
 _S3_STREAM_CHUNK_SIZE = 64 * 1024
 
+_DELEGATED_ACTOR_EVENT_KEYS = (
+    "delegated_user_id",
+    "service_user_id",
+    "service_token_id",
+)
+
+
+def _delegated_actor_event_fields(
+    delegated_actor: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return the exact non-secret delegation fields allowed in file events."""
+    if delegated_actor is None:
+        return {}
+    return {
+        key: delegated_actor[key]
+        for key in _DELEGATED_ACTOR_EVENT_KEYS
+    }
+
 
 # ── HTTP header helper (kept here — not S3-specific) ─────────────
 
@@ -208,6 +226,7 @@ class FileService:
         file_id: str,
         *,
         actor_id: str,
+        delegated_actor: dict[str, str] | None = None,
         content_hash: str | None = None,
         hash_algorithm: str = HASH_ALGORITHM,
     ) -> dict:
@@ -299,6 +318,7 @@ class FileService:
                         "hash_algorithm": HASH_ALGORITHM,
                         "etag": etag,
                         "storage_version": storage_version,
+                        **_delegated_actor_event_fields(delegated_actor),
                     },
                 )
 
