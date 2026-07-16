@@ -1031,7 +1031,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_transfer_ownership",
-        description="Transfer vault ownership to another user. Only the current owner can do this.",
+        description=(
+            "Transfer vault ownership to another user. The current owner or "
+            "a system admin can do this."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
