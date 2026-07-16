@@ -267,10 +267,19 @@ async def check_vault_access(
                     f"service token with the required write action"
                 )
 
-        # System admin bypasses all vault ACL
+        # System admin bypasses all vault ACL. `role` stays "owner" so every
+        # required_role gate keeps passing, but `role_source` must tell the
+        # truth: labelling the bypass "member" made downstream callers
+        # (get_vault_info's role field, transfer_ownership's owner re-check)
+        # believe the admin literally owns the vault.
         is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
         if is_admin:
-            return {"vault_id": vault["id"], "role": "owner", "status": vault["status"], "role_source": "member"}
+            return {
+                "vault_id": vault["id"],
+                "role": "owner",
+                "status": vault["status"],
+                "role_source": "system_admin",
+            }
 
         # Owner always has full access
         if vault["owner_id"] == uid:
@@ -624,6 +633,16 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
 
     vault = await _r("SELECT * FROM vaults WHERE name = $1", vault_name)
     vid = vault["id"]
+    if (
+        role_source in ("system_admin", "write_policy_admin_bypass")
+        and vault["owner_id"] != uuid.UUID(user_id)
+    ):
+        # An admin bypass is access, not ownership. Report the same "admin"
+        # label `list_accessible_vaults` uses for this caller/vault pair so
+        # consumers gating on role == "owner" (ownership transfer UIs, the
+        # pipeline's Pattern 35 target-vault gate) cannot mistake a
+        # superuser grant for ownership.
+        caller_role = "admin"
     (
         owner,
         member_count,
@@ -775,7 +794,7 @@ def _coerce_example(v):
 # ── Transfer ownership ──────────────────────────────────────
 
 async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username: str) -> dict:
-    """Transfer vault ownership. Only current owner can do this.
+    """Transfer vault ownership. The current owner or a system admin can do this.
 
     All three mutations (owner update, old-owner-to-admin grant, new-owner
     vault_access cleanup) run in ONE transaction so a crash mid-transfer
@@ -783,7 +802,15 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
     (06-F1). The vault row is selected ``FOR UPDATE`` so a concurrent
     transfer also serializes — only one of N parallel transfers wins.
     """
-    await check_vault_access(owner_id, vault_name, required_role="owner")
+    access = await check_vault_access(owner_id, vault_name, required_role="owner")
+    # An admin passes the gate above without literally owning the vault, so
+    # the owner-staleness re-check below must not treat that as a lost race
+    # (it used to raise a misleading "owner_id moved" conflict on EVERY
+    # admin-initiated transfer).
+    caller_is_system_admin = access["role_source"] in (
+        "system_admin",
+        "write_policy_admin_bypass",
+    )
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -796,8 +823,11 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 raise NotFoundError("Vault", vault_name)
             current_owner_uid = uuid.UUID(owner_id)
             # Re-verify ownership under the row lock — a concurrent
-            # transfer might have already moved owner_id away from us.
-            if vault["owner_id"] != current_owner_uid:
+            # transfer might have already moved owner_id away from us. An
+            # admin's right to transfer does not depend on who currently
+            # owns the row (the FOR UPDATE lock still serializes), so the
+            # staleness check only applies to owner-initiated transfers.
+            if vault["owner_id"] != current_owner_uid and not caller_is_system_admin:
                 raise ConflictError(
                     "owner_id moved during transfer (another transfer won the race)"
                 )
