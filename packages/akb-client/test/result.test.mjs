@@ -1056,3 +1056,121 @@ test("createClient rejects cross-origin absolute URLs before adding credentials"
   );
   assert.equal(called, false);
 });
+
+test("graph facade maps typed methods to graph URLs and preserves auth envelopes", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    defaultVault: "default vault",
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({
+        url: String(input),
+        method: init?.method ?? "GET",
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      if (url.pathname.endsWith("/graph/overview")) {
+        return new Response(JSON.stringify({
+          kind: "graph_overview",
+          nodes: [{ uri: "akb://default vault/doc/top", name: "Top", resource_type: "doc", degree: 4 }],
+          edges: [],
+          nodes_total: 9,
+          edges_total: 4,
+          returned: 1,
+          truncated: true,
+          orphans_returned: 2,
+          orphans_truncated: false,
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/graph/health")) {
+        return new Response(JSON.stringify({
+          kind: "graph_health",
+          hubs: [{ uri: "akb://scope/doc/hub", name: "Hub", resource_type: "doc", degree: 7 }],
+          orphans: { count: 3, sample: [{ uri: "akb://scope/doc/orphan", name: "Orphan", resource_type: "doc" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        kind: "graph_neighbors",
+        nodes: [{ uri: url.searchParams.get("uri"), name: "Center", resource_type: "doc", depth: 0 }],
+        edges: [{ source: "a", target: "b", relation: "links_to", kind: "explicit" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  }).actingAs({ sub: "end-user-2", app_metadata: { org_id: "org-2", role: "reader" } });
+
+  const neighbors = await client.graph.neighbors("akb://default vault/doc/a b", { hops: 3, limit: 17 });
+  const overview = await client.graph.overview({ topK: 37 });
+  const health = await client.vault("scope/vault").graph.health({ hubThreshold: 7, limit: 11 });
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/graph?uri=akb%3A%2F%2Fdefault+vault%2Fdoc%2Fa+b&hops=3&limit=17");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/graph/overview?vault=default+vault&top_k=37");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/graph/health?vault=scope%2Fvault&hub_threshold=7&limit=11");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "GET", "GET"]);
+  for (const call of calls) {
+    assert.equal(call.headers.authorization, "Bearer service-key");
+    assert.deepEqual(JSON.parse(call.headers["x-akb-claims"]), {
+      sub: "end-user-2",
+      app_metadata: { org_id: "org-2", role: "reader" },
+    });
+  }
+  assert.equal(neighbors.throwOnError().data.kind, "graph_neighbors");
+  assert.equal(neighbors.throwOnError().data.edges[0].relation, "links_to");
+  assert.equal(overview.throwOnError().data.kind, "graph_overview");
+  assert.equal(overview.throwOnError().data.nodes_total, 9);
+  assert.equal(health.throwOnError().data.kind, "graph_health");
+  assert.equal(health.throwOnError().data.orphans.count, 3);
+});
+
+test("graph facade omits defaults, preflights vault, preserves 4xx, and keeps raw request", async () => {
+  const calls = [];
+  const responses = [
+    new Response(JSON.stringify({ kind: "graph_neighbors", nodes: [], edges: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ kind: "graph_overview", nodes: [], edges: [], nodes_total: 0, edges_total: 0, returned: 0, truncated: false, orphans_returned: 0, orphans_truncated: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ detail: [{ loc: ["query", "limit"], msg: "Input should be less than or equal to 200" }], code: "validation_error" }), {
+      status: 422,
+      statusText: "Unprocessable Entity",
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ kind: "graph_overview", nodes: [], edges: [], nodes_total: 0, edges_total: 0, returned: 0, truncated: false, orphans_returned: 0, orphans_truncated: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  ];
+  const scoped = createClient("https://akb.test/api/v1", {
+    fetch: async (input, init) => {
+      calls.push({ url: String(input), method: init?.method ?? "GET" });
+      return responses.shift();
+    },
+  }).vault("reef");
+
+  await scoped.graph.neighbors("akb://reef/doc/one");
+  await scoped.graph.overview();
+  const invalid = await scoped.graph.health({ limit: 999 });
+  const raw = await scoped.graph.request("?vault=reef");
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/graph?uri=akb%3A%2F%2Freef%2Fdoc%2Fone");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/graph/overview?vault=reef");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/graph/health?vault=reef&limit=999");
+  assert.equal(calls[3].url, "https://akb.test/api/v1/graph/?vault=reef");
+  assert.equal(invalid.data, null);
+  assert.equal(invalid.error?.status, 422);
+  assert.equal(invalid.error?.code, "validation_error");
+  assert.throws(() => invalid.throwOnError(), AkbError);
+  assert.equal(raw.throwOnError().data.kind, "graph_overview");
+
+  let noVaultCalls = 0;
+  const root = createClient("https://akb.test/api/v1", {
+    fetch: async () => {
+      noVaultCalls += 1;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  assert.throws(() => root.graph.overview(), /Select a vault.*graph overview/i);
+  assert.throws(() => root.graph.health(), /Select a vault.*graph health/i);
+  assert.equal(noVaultCalls, 0);
+});

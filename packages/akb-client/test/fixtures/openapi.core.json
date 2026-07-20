@@ -165,6 +165,48 @@
         }
       }
     },
+    "/api/v1/graph": {
+      "get": {
+        "operationId": "graphNeighbors",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbGraphEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graph/overview": {
+      "get": {
+        "operationId": "graphOverview",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbGraphOverviewEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graph/health": {
+      "get": {
+        "operationId": "graphHealth",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbGraphHealthEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/search": {
       "get": {
         "operationId": "searchSearchDocuments",
@@ -371,6 +413,82 @@
       "AkbError": {},
       "AkbFileEnvelope": {},
       "AkbGrepEnvelope": {},
+      "AkbGraphNode": {
+        "type": "object",
+        "required": ["uri", "name", "resource_type"],
+        "properties": {
+          "uri": { "type": "string" },
+          "name": { "type": "string" },
+          "resource_type": { "type": "string", "enum": ["doc", "table", "file"] },
+          "depth": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+          "degree": { "anyOf": [{ "type": "integer" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "AkbGraphEdge": {
+        "type": "object",
+        "required": ["source", "target", "relation", "kind"],
+        "properties": {
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from", "links_to"] },
+          "kind": { "type": "string", "enum": ["implicit", "explicit"] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "AkbGraphEnvelope": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/AkbGraphNeighborsEnvelope" },
+          { "$ref": "#/components/schemas/AkbGraphOverviewEnvelope" }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+            "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope"
+          }
+        }
+      },
+      "AkbGraphNeighborsEnvelope": {
+        "type": "object",
+        "required": ["kind", "nodes", "edges"],
+        "properties": {
+          "kind": { "type": "string", "const": "graph_neighbors" },
+          "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphNode" } },
+          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphEdge" } }
+        }
+      },
+      "AkbGraphOverviewEnvelope": {
+        "type": "object",
+        "required": ["kind", "nodes", "edges", "nodes_total", "edges_total", "returned", "truncated", "orphans_returned", "orphans_truncated"],
+        "properties": {
+          "kind": { "type": "string", "const": "graph_overview" },
+          "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphNode" } },
+          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphEdge" } },
+          "nodes_total": { "type": "integer" },
+          "edges_total": { "type": "integer" },
+          "returned": { "type": "integer" },
+          "truncated": { "type": "boolean" },
+          "orphans_returned": { "type": "integer" },
+          "orphans_truncated": { "type": "boolean" }
+        }
+      },
+      "AkbGraphHealthEnvelope": {
+        "type": "object",
+        "required": ["kind", "hubs", "orphans"],
+        "properties": {
+          "kind": { "type": "string", "const": "graph_health" },
+          "hubs": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphNode" } },
+          "orphans": {
+            "type": "object",
+            "required": ["count", "sample"],
+            "properties": {
+              "count": { "type": "integer" },
+              "sample": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphNode" } }
+            }
+          }
+        }
+      },
       "AkbSearchEnvelope": {},
       "AkbSqlEnvelope": {},
       "AkbTableEnvelope": {},

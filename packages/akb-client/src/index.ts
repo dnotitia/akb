@@ -18,6 +18,12 @@ export type {
   AkbFileEnvelope,
   AkbDrillDownEnvelope,
   AkbGrepEnvelope,
+  AkbGraphEdge,
+  AkbGraphEnvelope,
+  AkbGraphHealthEnvelope,
+  AkbGraphNeighborsEnvelope,
+  AkbGraphNode,
+  AkbGraphOverviewEnvelope,
   AkbSearchEnvelope,
   AkbSqlEnvelope,
   AkbTableEnvelope,
@@ -365,6 +371,33 @@ export interface AkbSearchFacade extends AkbNamespaceStub {
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbGrepEnvelope>>;
 }
 
+export interface AkbGraphNeighborsOptions {
+  hops?: 1 | 2 | 3 | 4 | 5;
+  limit?: number;
+}
+
+export interface AkbGraphOverviewOptions {
+  topK?: number;
+}
+
+export interface AkbGraphHealthOptions {
+  hubThreshold?: number;
+  limit?: number;
+}
+
+export interface AkbGraphFacade extends AkbNamespaceStub {
+  neighbors(
+    uri: string,
+    options?: AkbGraphNeighborsOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphNeighborsEnvelope>>;
+  overview(
+    options?: AkbGraphOverviewOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphOverviewEnvelope>>;
+  health(
+    options?: AkbGraphHealthOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphHealthEnvelope>>;
+}
+
 export interface AkbDocsFacade extends AkbNamespaceStub {
   get(
     docId: string,
@@ -505,7 +538,7 @@ export interface AkbClient<Schema = unknown> {
     AkbTableUpdate<Schema, TableName>
   >;
   readonly search: AkbSearchFacade;
-  readonly graph: AkbNamespaceStub;
+  readonly graph: AkbGraphFacade;
   readonly docs: AkbDocsFacade;
   readonly storage: AkbStorageFacade;
 }
@@ -688,7 +721,7 @@ function makeClient(
       });
     },
     search: makeSearchFacade(request, scope.defaultVault),
-    graph: makeNamespaceStub("graph", "/graph", request),
+    graph: makeGraphFacade(request, scope.defaultVault),
     docs: makeDocsFacade(request, scope.defaultVault),
     storage: makeStorageFacade(request, scope.defaultVault, fetchImpl),
   };
@@ -762,6 +795,40 @@ function makeNamespaceStub(
       return request(joinPath(prefix, path), init);
     },
   }) as AkbNamespaceStub;
+}
+
+function makeGraphFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbGraphFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(
+    path: string | URL = "",
+    init: RequestInit = {},
+  ) => request<T>(joinPath("/graph", path), init);
+  const facade = {
+    name: "graph",
+    request: rawRequest,
+    neighbors(uri: string, options: AkbGraphNeighborsOptions = {}) {
+      const params = new URLSearchParams({ uri });
+      appendOptional(params, "hops", options.hops);
+      appendOptional(params, "limit", options.limit);
+      return request<import("./core/schema.gen.js").AkbGraphNeighborsEnvelope>(`/graph?${params}`);
+    },
+    overview(options: AkbGraphOverviewOptions = {}) {
+      const vault = resolveGraphVault(defaultVault, "overview");
+      const params = new URLSearchParams({ vault });
+      appendOptional(params, "top_k", options.topK);
+      return request<import("./core/schema.gen.js").AkbGraphOverviewEnvelope>(`/graph/overview?${params}`);
+    },
+    health(options: AkbGraphHealthOptions = {}) {
+      const vault = resolveGraphVault(defaultVault, "health");
+      const params = new URLSearchParams({ vault });
+      appendOptional(params, "hub_threshold", options.hubThreshold);
+      appendOptional(params, "limit", options.limit);
+      return request<import("./core/schema.gen.js").AkbGraphHealthEnvelope>(`/graph/health?${params}`);
+    },
+  } satisfies AkbGraphFacade;
+  return Object.freeze(facade);
 }
 
 function makeDocsFacade(
@@ -1059,6 +1126,11 @@ function resolveDocumentVault(vault: string | null | undefined): string {
 function resolveStorageVault(vault: string | null | undefined): string {
   if (typeof vault === "string" && vault.length > 0) return vault;
   throw new TypeError("Select a vault before using storage: client.vault(\"...\").storage.");
+}
+
+function resolveGraphVault(vault: string | null | undefined, operation: "overview" | "health"): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError(`Select a vault before using graph ${operation}: client.vault("...").graph.${operation}().`);
 }
 
 function encodePathSegment(value: string): string {
