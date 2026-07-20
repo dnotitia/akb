@@ -712,12 +712,15 @@ TOOLS = [
             "Use table names directly (e.g. 'pipeline', 'partners') — they are auto-resolved to the vault's tables. "
             "For cross-vault queries, list all vaults in the vaults parameter. "
             "Prefix table names with vault name for cross-vault: sales__pipeline, external_projects__partners. "
-            "SELECT requires reader role. INSERT/UPDATE/DELETE requires writer role."
+            "SELECT requires reader role. INSERT/UPDATE/DELETE requires writer role. "
+            "Add a LIMIT to SELECTs unless you truly need every row — the full result set is "
+            "returned (nothing is silently truncated), so an unbounded SELECT on a large table "
+            "can send back a very large response."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "sql": {"type": "string", "description": "SQL query to execute"},
+                "sql": {"type": "string", "description": "SQL query to execute. For large tables, add a LIMIT to cap the rows returned unless you need the full set."},
                 "vaults": {
                     "type": "array",
                     "items": {"type": "string"},
