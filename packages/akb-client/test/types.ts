@@ -8,6 +8,10 @@ import {
   type AkbDocumentEnvelope,
   type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
+  type AkbGraphEnvelope,
+  type AkbGraphHealthEnvelope,
+  type AkbGraphNeighborsEnvelope,
+  type AkbGraphOverviewEnvelope,
   type AkbOperationResponse,
   type AkbStorageUploadOptions,
   type operations,
@@ -73,6 +77,35 @@ const searchResult = await typedClient.vault("eng").search("postgres", {
 });
 searchResult.throwOnError().data.kind satisfies "search";
 searchResult.throwOnError().data.results.at(0)?.uri satisfies string | undefined;
+const graphNeighbors = await typedClient.graph.neighbors("akb://eng/doc/readme.md", { hops: 5, limit: 17 });
+graphNeighbors.throwOnError().data.kind satisfies "graph_neighbors";
+graphNeighbors.throwOnError().data.nodes.at(0)?.resource_type satisfies "doc" | "table" | "file" | undefined;
+graphNeighbors.throwOnError().data.edges.at(0)?.relation satisfies "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from" | "links_to" | undefined;
+const graphOverview = await typedClient.vault("eng").graph.overview({ topK: 37 });
+graphOverview.throwOnError().data.kind satisfies "graph_overview";
+graphOverview.throwOnError().data.nodes_total satisfies number;
+const graphHealth = await typedClient.vault("eng").graph.health({ hubThreshold: 7, limit: 11 });
+graphHealth.throwOnError().data.kind satisfies "graph_health";
+graphHealth.throwOnError().data.orphans.sample.at(0)?.degree satisfies number | null | undefined;
+// @ts-expect-error graph hops are constrained to the backend-supported 1..5 range.
+typedClient.graph.neighbors("akb://eng/doc/readme.md", { hops: 0 });
+// @ts-expect-error graph hops are constrained to the backend-supported 1..5 range.
+typedClient.graph.neighbors("akb://eng/doc/readme.md", { hops: 6 });
+// @ts-expect-error graph traversal uses hops, not browse depth.
+typedClient.graph.neighbors("akb://eng/doc/readme.md", { depth: 2 });
+const graphLeaf: AkbGraphNeighborsEnvelope = graphNeighbors.throwOnError().data;
+const overviewLeaf: AkbGraphOverviewEnvelope = graphOverview.throwOnError().data;
+const healthLeaf: AkbGraphHealthEnvelope = graphHealth.throwOnError().data;
+const rawGraph = await typedClient.graph.request<AkbGraphEnvelope>("?vault=eng");
+const rawGraphData = rawGraph.throwOnError().data;
+if (rawGraphData.kind === "graph_neighbors") {
+  rawGraphData.nodes satisfies AkbGraphNeighborsEnvelope["nodes"];
+} else {
+  rawGraphData.nodes_total satisfies number;
+}
+graphLeaf.kind satisfies "graph_neighbors";
+overviewLeaf.kind satisfies "graph_overview";
+healthLeaf.kind satisfies "graph_health";
 const drillDownResult = await typedClient.vault("eng").search.drillDown("akb://eng/doc/readme.md", {
   section: "Intro",
 });
@@ -226,6 +259,20 @@ const searchEnvelope: SearchResponse = {
   results: [{ source_type: "document", uri: "akb://eng/doc/readme.md", vault: "eng", path: "readme.md", title: "Readme", tags: [], score: 1 }],
 };
 searchEnvelope.kind satisfies "search";
+
+type RawGraphResponse = AkbOperationResponse<operations["graphNeighbors"]>;
+const rawGraphResponse: RawGraphResponse = {
+  kind: "graph_neighbors",
+  nodes: [{ uri: "akb://eng/doc/readme.md", name: "Readme", resource_type: "doc", depth: 0 }],
+  edges: [],
+};
+rawGraphResponse.kind satisfies "graph_neighbors" | "graph_overview";
+type GraphOverviewResponse = AkbOperationResponse<operations["graphOverview"]>;
+const graphOverviewResponse: GraphOverviewResponse = overviewLeaf;
+graphOverviewResponse.kind satisfies "graph_overview";
+type GraphHealthResponse = AkbOperationResponse<operations["graphHealth"]>;
+const graphHealthResponse: GraphHealthResponse = healthLeaf;
+graphHealthResponse.kind satisfies "graph_health";
 
 type InsertRowsResponse = AkbOperationResponse<operations["tablesInsertRows"]>;
 const insertRowsNoContent: InsertRowsResponse = null;

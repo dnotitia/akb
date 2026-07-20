@@ -222,6 +222,56 @@ export interface AkbGrepEnvelope {
   [key: string]: unknown;
 }
 
+export interface AkbGraphNode {
+  uri: string;
+  name: string;
+  resource_type: "doc" | "table" | "file";
+  depth?: number | null;
+  degree?: number | null;
+  [key: string]: unknown;
+}
+
+export interface AkbGraphEdge {
+  source: string;
+  target: string;
+  relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from" | "links_to";
+  kind: "implicit" | "explicit";
+  [key: string]: unknown;
+}
+
+export interface AkbGraphNeighborsEnvelope {
+  kind: "graph_neighbors";
+  nodes: AkbGraphNode[];
+  edges: AkbGraphEdge[];
+  [key: string]: unknown;
+}
+
+export interface AkbGraphOverviewEnvelope {
+  kind: "graph_overview";
+  nodes: AkbGraphNode[];
+  edges: AkbGraphEdge[];
+  nodes_total: number;
+  edges_total: number;
+  returned: number;
+  truncated: boolean;
+  orphans_returned: number;
+  orphans_truncated: boolean;
+  [key: string]: unknown;
+}
+
+export interface AkbGraphHealthEnvelope {
+  kind: "graph_health";
+  hubs: AkbGraphNode[];
+  orphans: {
+    count: number;
+    sample: AkbGraphNode[];
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export type AkbGraphEnvelope = AkbGraphNeighborsEnvelope | AkbGraphOverviewEnvelope;
+
 export type AkbSuccessEnvelope =
   | AkbTableEnvelope
   | AkbTableMigrationEnvelope
@@ -234,7 +284,10 @@ export type AkbSuccessEnvelope =
   | AkbDocumentWriteEnvelope
   | AkbSearchEnvelope
   | AkbDrillDownEnvelope
-  | AkbGrepEnvelope;
+  | AkbGrepEnvelope
+  | AkbGraphNeighborsEnvelope
+  | AkbGraphOverviewEnvelope
+  | AkbGraphHealthEnvelope;
 
 export interface paths {
   "/api/v1/browse/{vault}": {
@@ -265,6 +318,15 @@ export interface paths {
   };
   "/api/v1/files/{vault}/{file_id}/download": {
     get: AkbOperation<"get", "/api/v1/files/{vault}/{file_id}/download", { path: { vault: string; file_id: string } }, never, AkbFileEnvelope>;
+  };
+  "/api/v1/graph": {
+    get: AkbOperation<"get", "/api/v1/graph", never, never, AkbGraphEnvelope>;
+  };
+  "/api/v1/graph/health": {
+    get: AkbOperation<"get", "/api/v1/graph/health", never, never, AkbGraphHealthEnvelope>;
+  };
+  "/api/v1/graph/overview": {
+    get: AkbOperation<"get", "/api/v1/graph/overview", never, never, AkbGraphOverviewEnvelope>;
   };
   "/api/v1/grep": {
     get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
@@ -315,6 +377,9 @@ export interface operations {
   filesDeleteFileId: paths["/api/v1/files/{vault}/{file_id}"]["delete"];
   filesPostFileIdConfirm: paths["/api/v1/files/{vault}/{file_id}/confirm"]["post"];
   filesGetFileIdDownload: paths["/api/v1/files/{vault}/{file_id}/download"]["get"];
+  graphNeighbors: paths["/api/v1/graph"]["get"];
+  graphHealth: paths["/api/v1/graph/health"]["get"];
+  graphOverview: paths["/api/v1/graph/overview"]["get"];
   searchGrepDocuments: paths["/api/v1/grep"]["get"];
   searchSearchDocuments: paths["/api/v1/search"]["get"];
   tablesGetVault: paths["/api/v1/tables/{vault}"]["get"];
@@ -348,5 +413,11 @@ export interface components {
     AkbSearchEnvelope: AkbSearchEnvelope;
     AkbDrillDownEnvelope: AkbDrillDownEnvelope;
     AkbGrepEnvelope: AkbGrepEnvelope;
+    AkbGraphNode: AkbGraphNode;
+    AkbGraphEdge: AkbGraphEdge;
+    AkbGraphEnvelope: AkbGraphEnvelope;
+    AkbGraphNeighborsEnvelope: AkbGraphNeighborsEnvelope;
+    AkbGraphOverviewEnvelope: AkbGraphOverviewEnvelope;
+    AkbGraphHealthEnvelope: AkbGraphHealthEnvelope;
   };
 }
