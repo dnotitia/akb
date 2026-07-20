@@ -106,6 +106,13 @@ def test_success_envelope_components_are_kind_discriminated():
             "search": "#/components/schemas/AkbSearchEnvelope",
             "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
             "grep": "#/components/schemas/AkbGrepEnvelope",
+            "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+            "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+            "graph_health": "#/components/schemas/AkbGraphHealthEnvelope",
+            "relations": "#/components/schemas/AkbRelationsEnvelope",
+            "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
+            "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
+            "provenance": "#/components/schemas/AkbProvenanceEnvelope",
         },
     }
     for name, kind in (
@@ -121,6 +128,13 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbSearchEnvelope", "search"),
         ("AkbDrillDownEnvelope", "drill_down"),
         ("AkbGrepEnvelope", "grep"),
+        ("AkbGraphNeighborsEnvelope", "graph_neighbors"),
+        ("AkbGraphOverviewEnvelope", "graph_overview"),
+        ("AkbGraphHealthEnvelope", "graph_health"),
+        ("AkbRelationsEnvelope", "relations"),
+        ("AkbRelationLinkEnvelope", "relation_link"),
+        ("AkbRelationUnlinkEnvelope", "relation_unlink"),
+        ("AkbProvenanceEnvelope", "provenance"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
@@ -156,6 +170,13 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/files/{vault}/{file_id}/download", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}", "delete", "200"): "AkbFileEnvelope",
+        ("/api/v1/graph", "get", "200"): "AkbGraphEnvelope",
+        ("/api/v1/graph/overview", "get", "200"): "AkbGraphOverviewEnvelope",
+        ("/api/v1/graph/health", "get", "200"): "AkbGraphHealthEnvelope",
+        ("/api/v1/relations", "get", "200"): "AkbRelationsEnvelope",
+        ("/api/v1/relations", "post", "200"): "AkbRelationLinkEnvelope",
+        ("/api/v1/relations", "delete", "200"): "AkbRelationUnlinkEnvelope",
+        ("/api/v1/provenance", "get", "200"): "AkbProvenanceEnvelope",
     }
     for (path, method, status), component in expected.items():
         success_schema = (
@@ -163,6 +184,56 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
             ["content"]["application/json"]["schema"]
         )
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
+
+
+def test_graph_rest_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    expected = {
+        ("/api/v1/graph", "get"): "graphNeighbors",
+        ("/api/v1/graph/overview", "get"): "graphOverview",
+        ("/api/v1/graph/health", "get"): "graphHealth",
+        ("/api/v1/relations", "get"): "graphRelations",
+        ("/api/v1/relations", "post"): "graphLink",
+        ("/api/v1/relations", "delete"): "graphUnlink",
+        ("/api/v1/provenance", "get"): "graphProvenance",
+    }
+    for (path, method), operation_id in expected.items():
+        operation = paths[path][method]
+        assert operation["operationId"] == operation_id
+        assert operation["tags"] == ["graph"]
+
+    schemas = schema["components"]["schemas"]
+    graph_union = schemas["AkbGraphEnvelope"]
+    assert graph_union["discriminator"] == {
+        "propertyName": "kind",
+        "mapping": {
+            "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+            "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+        },
+    }
+    assert {item["$ref"] for item in graph_union["oneOf"]} == set(
+        graph_union["discriminator"]["mapping"].values()
+    )
+
+    node = schemas["AkbGraphNode"]
+    assert node["properties"]["resource_type"]["enum"] == ["doc", "table", "file"]
+    assert {"depth", "degree"}.issubset(node["properties"])
+    edge = schemas["AkbGraphEdge"]
+    assert edge["properties"]["kind"]["enum"] == ["implicit", "explicit"]
+    relation = schemas["AkbRelation"]
+    assert relation["properties"]["direction"]["enum"] == ["incoming", "outgoing"]
+    assert "links_to" in relation["properties"]["relation"]["enum"]
+
+    get_relations = paths["/api/v1/relations"]["get"]
+    params = {param["name"]: param for param in get_relations["parameters"]}
+    assert set(params["direction"]["schema"]["enum"]) == {"incoming", "outgoing", "both"}
+    type_schema = params["type"]["schema"]
+    type_enum = next(item["enum"] for item in type_schema["anyOf"] if "enum" in item)
+    assert "links_to" in type_enum
+
+    link_schema = schemas["LinkRequest"]
+    assert "links_to" not in link_schema["properties"]["relation"]["enum"]
 
 
 def test_document_openapi_contract_is_codegen_typed():

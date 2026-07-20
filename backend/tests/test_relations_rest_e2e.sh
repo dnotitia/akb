@@ -4,9 +4,9 @@
 #
 # Covers POST /api/v1/relations (link) and DELETE /api/v1/relations
 # (unlink) — the REST twins of MCP akb_link / akb_unlink. The read
-# side (GET /relations) is exercised here only to round-trip the edges
-# the write routes create. Bootstrap (users / MCP / vault / docs)
-# mirrors test_graph_replace_e2e.sh.
+# side (GET /relations) is exercised here to round-trip the edges the
+# write routes create. Fixtures use the same public REST surface under
+# test, which keeps the suite portable across MCP transport revisions.
 #
 set -uo pipefail
 
@@ -14,7 +14,6 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 PASS=0
 FAIL=0
 ERRORS=()
-MCP_ID=10
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
@@ -24,6 +23,31 @@ echo "║   Relations REST (link/unlink) E2E       ║"
 echo "║   Target: $BASE_URL"
 echo "╚══════════════════════════════════════════╝"
 echo ""
+
+OPENAPI_CHECK=$(curl -sk "$BASE_URL/openapi.json" | python3 -c '
+import json,sys
+d=json.load(sys.stdin); p=d["paths"]; s=d["components"]["schemas"]
+expected={
+ ("/api/v1/graph","get"):("graphNeighbors","AkbGraphEnvelope"),
+ ("/api/v1/graph/overview","get"):("graphOverview","AkbGraphOverviewEnvelope"),
+ ("/api/v1/graph/health","get"):("graphHealth","AkbGraphHealthEnvelope"),
+ ("/api/v1/relations","get"):("graphRelations","AkbRelationsEnvelope"),
+ ("/api/v1/relations","post"):("graphLink","AkbRelationLinkEnvelope"),
+ ("/api/v1/relations","delete"):("graphUnlink","AkbRelationUnlinkEnvelope"),
+ ("/api/v1/provenance","get"):("graphProvenance","AkbProvenanceEnvelope"),
+}
+ok=True
+for (path,method),(opid,component) in expected.items():
+ op=p[path][method]
+ ok &= op["operationId"]==opid and op["tags"]==["graph"]
+ ok &= op["responses"]["200"]["content"]["application/json"]["schema"]=={"$ref":"#/components/schemas/"+component}
+leaf={"graph_neighbors":"AkbGraphNeighborsEnvelope","graph_overview":"AkbGraphOverviewEnvelope","graph_health":"AkbGraphHealthEnvelope","relations":"AkbRelationsEnvelope","relation_link":"AkbRelationLinkEnvelope","relation_unlink":"AkbRelationUnlinkEnvelope","provenance":"AkbProvenanceEnvelope"}
+mapping={k:"#/components/schemas/"+v for k,v in leaf.items()}
+ok &= mapping.items() <= s["AkbSuccessEnvelope"]["discriminator"]["mapping"].items()
+ok &= all("kind" in s[v]["required"] and s[v]["properties"]["kind"]["enum"]==[k] for k,v in leaf.items())
+print("OK" if ok else "BAD")
+' 2>&1)
+[ "$OPENAPI_CHECK" = "OK" ] && pass "OpenAPI: 7 graph operations + leaf discriminator contract" || fail "OpenAPI contract" "$OPENAPI_CHECK"
 
 # ── Setup ────────────────────────────────────────────────────
 echo "▸ 0. Setup"
@@ -41,36 +65,6 @@ setup_user() {
     -H 'Content-Type: application/json' \
     -d '{"name":"e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null
 }
-
-setup_mcp() {
-  local pat=$1
-  local tmpfile=$(mktemp)
-  curl -sk -i -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"rel-rest-e2e","version":"1.0"}}}' > "$tmpfile" 2>/dev/null
-  local sid=$(grep -i "mcp-session-id" "$tmpfile" | tr -d '\r' | awk '{print $2}')
-  rm -f "$tmpfile"
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "mcp-session-id: $sid" \
-    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
-  echo "$sid"
-}
-
-mc() {
-  local pat=$1 sid=$2 tool=$3 args=$4
-  MCP_ID=$((MCP_ID+1))
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $pat" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "mcp-session-id: $sid" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" 2>&1
-}
-mr() { python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['result']['content'][0]['text'])" 2>/dev/null; }
 
 # ── REST helpers (PAT-authenticated) ─────────────────────────
 # POST /relations with a JSON body; *_code variants return the HTTP status.
@@ -97,6 +91,9 @@ rdel_code() {
 }
 # count outgoing+undirected relations reported by GET /relations for a uri
 rel_count() { rget_rel "$1" "$2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('relations',[])))" 2>/dev/null; }
+create_vault() { curl -sk -X POST -G "$BASE_URL/api/v1/vaults" --data-urlencode "name=$2" --data-urlencode "description=$3" -H "Authorization: Bearer $1"; }
+grant_reader() { curl -sk -X POST "$BASE_URL/api/v1/vaults/$2/grant" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' -d "{\"user\":\"$3\",\"role\":\"reader\"}"; }
+put_doc() { curl -sk -X POST "$BASE_URL/api/v1/documents" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' -d "{\"vault\":\"$2\",\"collection\":\"specs\",\"title\":\"$3\",\"content\":\"$4\"}"; }
 
 USER1="rel-rest-u1-$(date +%s)"     # owner (writer) of V1
 USER2="rel-rest-u2-$(date +%s)"     # reader on V1
@@ -104,22 +101,19 @@ PAT1=$(setup_user "$USER1")
 PAT2=$(setup_user "$USER2")
 [ -n "$PAT1" ] && [ -n "$PAT2" ] && pass "2 users created" || { fail "Setup" "user creation failed"; exit 1; }
 
-SID1=$(setup_mcp "$PAT1")
-m1() { mc "$PAT1" "$SID1" "$1" "$2" | mr; }
-
 VAULT1="rel-rest-$(date +%s)"
 VAULT2="rel-rest2-$(($(date +%s)+1))"
-m1 "akb_create_vault" "{\"name\":\"$VAULT1\",\"description\":\"relations rest test\"}" >/dev/null
-m1 "akb_create_vault" "{\"name\":\"$VAULT2\",\"description\":\"cross vault\"}" >/dev/null
-m1 "akb_grant" "{\"vault\":\"$VAULT1\",\"user\":\"$USER2\",\"role\":\"reader\"}" >/dev/null
+create_vault "$PAT1" "$VAULT1" "relations rest test" >/dev/null
+create_vault "$PAT1" "$VAULT2" "cross vault" >/dev/null
+grant_reader "$PAT1" "$VAULT1" "$USER2" >/dev/null
 pass "2 vaults created, USER2 granted reader on V1"
 
-# Three docs in V1, one in V2. Fetch canonical URIs from akb_get responses.
+# Three docs in V1, one in V2. Fetch canonical URIs from REST responses.
 geturi() { echo "$1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null; }
-URI_A=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Issue Doc\",\"content\":\"# Issue\"}")")
-URI_B=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Target Doc\",\"content\":\"# Target\"}")")
-URI_C=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Third Doc\",\"content\":\"# Third\"}")")
-URI_V2=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT2\",\"collection\":\"specs\",\"title\":\"Other Vault Doc\",\"content\":\"# Other\"}")")
+URI_A=$(geturi "$(put_doc "$PAT1" "$VAULT1" "Issue Doc" "# Issue")")
+URI_B=$(geturi "$(put_doc "$PAT1" "$VAULT1" "Target Doc" "# Target")")
+URI_C=$(geturi "$(put_doc "$PAT1" "$VAULT1" "Third Doc" "# Third")")
+URI_V2=$(geturi "$(put_doc "$PAT1" "$VAULT2" "Other Vault Doc" "# Other")")
 [ -n "$URI_A" ] && [ -n "$URI_B" ] && [ -n "$URI_C" ] && [ -n "$URI_V2" ] \
   && pass "4 docs created ($URI_A …)" || { fail "Docs" "missing URIs"; exit 1; }
 
@@ -139,8 +133,14 @@ CODE=$(rpost_code "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relati
 LINKED=$(rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"references\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('linked'))" 2>/dev/null)
 [ "$LINKED" = "True" ] && pass "response body {linked:true} (idempotent upsert)" || fail "link body" "linked=$LINKED"
 
+LINK_KIND=$(rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"references\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('kind'))" 2>/dev/null)
+[ "$LINK_KIND" = "relation_link" ] && pass "POST response kind=relation_link" || fail "link kind" "kind=$LINK_KIND"
+
 C=$(rel_count "$PAT1" "$URI_A")
 [ "$C" -ge 1 ] 2>/dev/null && pass "GET /relations round-trips the edge ($C)" || fail "round-trip" "count=$C"
+
+REL_KIND=$(rget_rel "$PAT1" "$URI_A" | python3 -c "import sys,json; print(json.load(sys.stdin).get('kind'))" 2>/dev/null)
+[ "$REL_KIND" = "relations" ] && pass "GET response kind=relations" || fail "relations kind" "kind=$REL_KIND"
 
 # Upsert must not create a duplicate edge.
 [ "$C" = "1" ] && pass "upsert: still exactly 1 edge after 2 POSTs" || fail "upsert dedupe" "count=$C"
@@ -151,6 +151,9 @@ echo "▸ 2. POST validation & authz"
 
 CODE=$(rpost_code "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"bogus_rel\"}")
 [ "$CODE" = "422" ] && pass "invalid relation enum → 422" || fail "bad relation" "got $CODE"
+
+CODE=$(curl -sk -o /dev/null -w '%{http_code}' -G "$BASE_URL/api/v1/relations" --data-urlencode "uri=$URI_A" --data-urlencode "direction=sideways" -H "Authorization: Bearer $PAT1")
+[ "$CODE" = "422" ] && pass "invalid read direction enum → 422" || fail "bad direction" "got $CODE"
 
 CODE=$(rpost_code "$PAT1" "{\"source\":\"$URI_A\",\"relation\":\"references\"}")
 [ "$CODE" = "422" ] && pass "missing required field (target) → 422" || fail "missing field" "got $CODE"
@@ -180,14 +183,15 @@ CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/api/v1/relatio
 echo ""
 echo "▸ 3. DELETE /relations (unlink, writer)"
 
-CODE=$(rdel_code "$PAT1" "$URI_A" "$URI_B" "references")
-[ "$CODE" = "200" ] && pass "unlink A→B references → 200" || fail "DELETE unlink" "got $CODE"
+FIRST_UNLINK=$(rdel "$PAT1" "$URI_A" "$URI_B" "references")
+FIRST_REMOVED=$(echo "$FIRST_UNLINK" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('unlinked'))+':'+str(d.get('kind')))" 2>/dev/null)
+[ "$FIRST_REMOVED" = "1:relation_unlink" ] && pass "unlink A→B → unlinked:1, kind=relation_unlink" || fail "DELETE unlink" "got $FIRST_REMOVED"
 
 C=$(rel_count "$PAT1" "$URI_A")
 [ "$C" = "0" ] && pass "edge removed (GET /relations now 0)" || fail "unlink verify" "count=$C"
 
-REMOVED=$(rdel "$PAT1" "$URI_A" "$URI_B" "references" | python3 -c "import sys,json; print(json.load(sys.stdin).get('unlinked'))" 2>/dev/null)
-[ "$REMOVED" = "0" ] && pass "unlink idempotent: re-delete → unlinked:0, 200" || fail "unlink idempotent" "unlinked=$REMOVED"
+REMOVED=$(rdel "$PAT1" "$URI_A" "$URI_B" "references" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('unlinked'))+':'+str(d.get('kind')))" 2>/dev/null)
+[ "$REMOVED" = "0:relation_unlink" ] && pass "unlink idempotent: re-delete → unlinked:0, kind=relation_unlink" || fail "unlink idempotent" "body=$REMOVED"
 
 CODE=$(rdel_code "$PAT2" "$URI_A" "$URI_B" "references")
 [ "$CODE" = "403" ] && pass "reader cannot unlink → 403" || fail "reader unlink gate" "got $CODE"
@@ -237,7 +241,7 @@ C=$(rel_count "$PAT1" "$URI_A")
 echo ""
 echo "▸ 5. GET /graph/overview + /graph/health"
 
-URI_D=$(geturi "$(m1 "akb_put" "{\"vault\":\"$VAULT1\",\"collection\":\"specs\",\"title\":\"Orphan Doc\",\"content\":\"# Orphan\"}")")
+URI_D=$(geturi "$(put_doc "$PAT1" "$VAULT1" "Orphan Doc" "# Orphan")")
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_B\",\"relation\":\"depends_on\"}" >/dev/null
 rpost "$PAT1" "{\"source\":\"$URI_A\",\"target\":\"$URI_C\",\"relation\":\"depends_on\"}" >/dev/null
 
@@ -245,13 +249,22 @@ gov()      { curl -sk             -G "$BASE_URL/api/v1/graph/overview" --data-ur
 gov_code() { curl -sk -o /dev/null -w '%{http_code}' -G "$BASE_URL/api/v1/graph/overview" --data-urlencode "vault=$2" -H "Authorization: Bearer $1"; }
 ghealth()  { curl -sk             -G "$BASE_URL/api/v1/graph/health"   --data-urlencode "vault=$2" --data-urlencode "hub_threshold=${3:-2}" -H "Authorization: Bearer $1"; }
 
+NEIGHBOR_CHECK=$(curl -sk -G "$BASE_URL/api/v1/graph" --data-urlencode "uri=$URI_A" -H "Authorization: Bearer $PAT1" | python3 -c "import sys,json; d=json.load(sys.stdin); print('OK' if d.get('kind')=='graph_neighbors' and {'nodes','edges'} <= set(d) else 'BAD')" 2>&1)
+[ "$NEIGHBOR_CHECK" = "OK" ] && pass "GET /graph?uri selects graph_neighbors" || fail "neighbors kind" "$NEIGHBOR_CHECK"
+
+LEGACY_CHECK=$(curl -sk -G "$BASE_URL/api/v1/graph" --data-urlencode "vault=$VAULT1" -H "Authorization: Bearer $PAT1" | python3 -c "import sys,json; d=json.load(sys.stdin); req={'nodes','edges','nodes_total','edges_total','returned','truncated','orphans_returned','orphans_truncated'}; print('OK' if d.get('kind')=='graph_overview' and req <= set(d) else 'BAD')" 2>&1)
+[ "$LEGACY_CHECK" = "OK" ] && pass "legacy GET /graph?vault selects graph_overview and keeps totals" || fail "legacy graph" "$LEGACY_CHECK"
+
+PROVENANCE_CHECK=$(curl -sk -G "$BASE_URL/api/v1/provenance" --data-urlencode "uri=$URI_A" -H "Authorization: Bearer $PAT1" | python3 -c "import sys,json; d=json.load(sys.stdin); req={'doc_id','title','path','vault','uri','created_by','created_at','updated_at','current_commit','relations'}; print('OK' if d.get('kind')=='provenance' and req <= set(d) and 'provenance' not in d else 'BAD')" 2>&1)
+[ "$PROVENANCE_CHECK" = "OK" ] && pass "GET /provenance stays flat with kind=provenance" || fail "provenance" "$PROVENANCE_CHECK"
+
 # overview: totals are honest, top node is the degree-2 hub A, edges carry kind.
 OVCHECK=$(gov "$PAT1" "$VAULT1" 200 | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 top=max(d['nodes'], key=lambda n: n.get('degree',0)) if d['nodes'] else {}
 kinds=sorted({e.get('kind') for e in d['edges']})
-ok = (d['edges_total']==2 and d['nodes_total']==3 and d['truncated'] is False
+ok = (d.get('kind')=='graph_overview' and d['edges_total']==2 and d['nodes_total']==3 and d['truncated'] is False
       and top.get('degree')==2 and top.get('uri')=='$URI_A' and kinds==['explicit'])
 print('OK' if ok else 'BAD '+json.dumps({'edges_total':d['edges_total'],'nodes_total':d['nodes_total'],'trunc':d['truncated'],'top':top.get('uri'),'deg':top.get('degree'),'kinds':kinds}))
 " 2>&1)
@@ -265,7 +278,7 @@ import sys,json
 d=json.load(sys.stdin)
 by_uri={n['uri']:n for n in d['nodes']}
 dn=by_uri.get('$URI_D')
-ok = (d.get('orphans_returned',0) >= 1 and dn is not None and dn.get('degree')==0 and d['nodes_total']==3)
+ok = (d.get('kind')=='graph_overview' and d.get('orphans_returned',0) >= 1 and dn is not None and dn.get('degree')==0 and d['nodes_total']==3)
 print('OK' if ok else 'BAD orphans_returned='+str(d.get('orphans_returned'))+' D='+json.dumps(dn))
 " 2>&1)
 [ "$ORPHCHECK" = "OK" ] && pass "overview: unlinked doc D surfaced as degree-0 orphan node" || fail "overview orphans" "$ORPHCHECK"
@@ -281,7 +294,7 @@ d=json.load(sys.stdin)
 hubs=d.get('hubs',[]); orph=d.get('orphans',{})
 hub_ok = any(h.get('uri')=='$URI_A' and h.get('degree')==2 for h in hubs)
 orph_ok = orph.get('count',0)>=1 and any('Orphan Doc' in (o.get('name') or '') for o in orph.get('sample',[]))
-print('OK' if (hub_ok and orph_ok) else 'BAD '+json.dumps({'hubs':[(h.get('uri'),h.get('degree')) for h in hubs],'orphans':orph}))
+print('OK' if (d.get('kind')=='graph_health' and hub_ok and orph_ok) else 'BAD '+json.dumps({'kind':d.get('kind'),'hubs':[(h.get('uri'),h.get('degree')) for h in hubs],'orphans':orph}))
 " 2>&1)
 [ "$HCHECK" = "OK" ] && pass "health: hub A(deg2) + orphan D reported" || fail "health" "$HCHECK"
 
@@ -320,8 +333,8 @@ CODE=$(curl -sk -o /dev/null -w '%{http_code}' -G "$BASE_URL/api/v1/graph/overvi
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-m1 "akb_delete_vault" "{\"name\":\"$VAULT1\"}" >/dev/null 2>&1
-m1 "akb_delete_vault" "{\"name\":\"$VAULT2\"}" >/dev/null 2>&1
+curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$VAULT1" -H "Authorization: Bearer $PAT1" >/dev/null
+curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$VAULT2" -H "Authorization: Bearer $PAT1" >/dev/null
 pass "Vaults deleted"
 
 # ── Summary ──────────────────────────────────────────────────
