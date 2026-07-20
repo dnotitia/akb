@@ -132,6 +132,23 @@ def test_post_success_passthrough_200(client, monkeypatch):
                     json={"source": DOC_A, "target": DOC_B, "relation": "references"})
     assert r.status_code == 200
     assert r.json()["linked"] is True
+    assert r.json()["kind"] == "relation_link"
+
+
+def test_get_invalid_direction_and_relation_are_422(client):
+    assert client.get("/api/v1/relations", params={"uri": DOC_A, "direction": "sideways"}).status_code == 422
+    assert client.get("/api/v1/relations", params={"uri": DOC_A, "type": "bogus"}).status_code == 422
+
+
+def test_get_links_to_filter_is_allowed(client, monkeypatch):
+    async def _relations(*_a, **kwargs):
+        assert kwargs["relation_type"] == "links_to"
+        return []
+
+    monkeypatch.setattr(knowledge, "get_resource_relations", _relations)
+    r = client.get("/api/v1/relations", params={"uri": DOC_A, "type": "links_to"})
+    assert r.status_code == 200
+    assert r.json() == {"kind": "relations", "uri": DOC_A, "relations": []}
 
 
 # ── _bridge_service_error unit behaviour (dict guard + unmapped code) ─
