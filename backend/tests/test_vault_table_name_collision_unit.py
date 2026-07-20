@@ -9,8 +9,11 @@ forges the `__` separator: vault `a--b` + table `c` and vault `a` + table
 2. `create_vault` rejecting fusion-capable names before any side effect,
 3. `create_table`'s physical-name preflight → precise 409 (DB-free),
 4. the create/create race fallback on `DuplicateTableError` (DB-free),
-5. genuine index-name clashes keeping their existing 422 message (DB-free),
-6. slug producers never emitting edge hyphens after truncation,
+5. index-name clashes keeping their existing 422 — including the case
+   where the caller's index name IS the table's own physical name, which
+   the PG message cannot distinguish from the race above (DB-free),
+6. the legacy username/agent_id slug derivation staying frozen so the
+   adoption probe still matches pre-migration vaults,
 7. the full fusion end-to-end against a real Postgres (skips without one).
 
 DB-free tests reuse the fake-pool pattern from
@@ -19,6 +22,7 @@ DB-free tests reuse the fake-pool pattern from
 from __future__ import annotations
 
 import os
+import re
 import uuid
 
 import asyncpg
@@ -26,7 +30,11 @@ import pytest
 
 from app.exceptions import ConflictError, ValidationError
 from app.services import table_service
-from app.services.agent_memory_service import sanitise_agent_id, sanitise_username
+from app.services.agent_memory_service import (
+    legacy_memory_vault_name,
+    sanitise_agent_id,
+    sanitise_username,
+)
 from app.services.document_service import DocumentService, validate_vault_name
 
 pytestmark = pytest.mark.asyncio
@@ -173,18 +181,62 @@ async def test_index_name_clash_keeps_unique_key_message(monkeypatch):
     assert "unique-key or index name" in str(ei.value)
 
 
-# ── 6. slug producers can't mint edge-hyphen vault names ─────────
+async def test_self_named_index_clash_is_422_not_fusion_409(monkeypatch):
+    """A caller may legally name a unique key / index exactly the table's
+    own physical name (`_resolve_unique_keys` takes caller names verbatim
+    through `safe_ident`, unprefixed). PG then raises 42P07 quoting THAT
+    relation — indistinguishable by message from a lost CREATE TABLE race.
+    It is still a caller-fixable name clash (422), not a cross-vault
+    fusion (409). Scoping the fusion arm to the CREATE TABLE call is what
+    keeps them apart; a message-substring test cannot (PR #286 review)."""
+    _wire(monkeypatch, _FakeConn("a", taken=False))
+
+    async def _create_ok(*a, **k):
+        return None
+
+    async def _self_named_clash(*a, **k):
+        # Verbatim PG text, reproduced against a live server: both
+        # CREATE INDEX and ADD CONSTRAINT emit exactly this for 42P07.
+        raise asyncpg.DuplicateTableError('relation "vt_a__b__c" already exists')
+
+    monkeypatch.setattr(
+        table_service.table_data_repo, "create_dynamic_table", _create_ok)
+    monkeypatch.setattr(
+        table_service.table_data_repo, "create_unique_constraint", _self_named_clash)
+
+    with pytest.raises(ValidationError) as ei:
+        await table_service.create_table(
+            uuid.uuid4(), "b__c", _COLS, actor_id="t",
+            unique_keys=[{"columns": ["x"], "name": "vt_a__b__c"}],
+        )
+    msg = str(ei.value)
+    assert "unique-key or index name" in msg
+    assert "another vault" not in msg
 
 
-async def test_username_slug_never_ends_with_separator_after_cap():
-    # 60th char lands right after a '-' so the cap used to re-expose it.
-    raw = "a" * 59 + "-tail"
+# ── 6. legacy slug derivation stays frozen ───────────────────────
+
+
+async def test_legacy_slug_derivation_is_frozen():
+    """`sanitise_username` output is NOT a vault name: `ensure_memory_vault`
+    only ever creates the user_id-keyed `memory_vault_name`. It feeds
+    `legacy_memory_vault_name`, whose output is a read-only adoption probe
+    (`SELECT ... WHERE name = $1`). So it must reproduce pre-migration
+    names byte-for-byte — including the trailing separator the 60-char cap
+    can re-expose, which the OLD grammar permitted. Re-normalising here
+    would orphan such a vault instead of adopting it (PR #286 review)."""
+    raw = "a" * 59 + "-tail"  # 60th char lands right after the '-'
     slug = sanitise_username(raw)
-    assert not slug.endswith(("-", ".")) and len(slug) <= 60
-    validate_vault_name(f"agent-memory-{slug}"[:63])  # grammar-compatible
+    assert slug == "a" * 59 + "-", "cap only: the separator must survive"
+    assert legacy_memory_vault_name(raw) == f"agent-memory-{slug}"
+    # That legacy name was creatable: the pre-#285 grammar allowed it.
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", f"agent-memory-{slug}")
+    # And it is never re-validated against today's stricter grammar.
+    with pytest.raises(ValidationError):
+        validate_vault_name(f"agent-memory-{slug}")
 
-    agent = sanitise_agent_id("x" * 31 + "-tail")
-    assert not agent.endswith(("-", "."))
+    # agent_id is a document PATH segment, frozen for the same reason.
+    assert sanitise_agent_id("x" * 39 + "-tail") == "x" * 39 + "-"
 
 
 # ── 7. end-to-end fusion against real PG (skips when unreachable) ─

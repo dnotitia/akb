@@ -667,9 +667,22 @@ async def create_table(
             await _validate_column_references(conn, vault_id, columns)
 
             try:
-                await table_data_repo.create_dynamic_table(
-                    conn, pg_name, columns, vault_name=vault["name"],
-                )
+                try:
+                    await table_data_repo.create_dynamic_table(
+                        conn, pg_name, columns, vault_name=vault["name"],
+                    )
+                except asyncpg.DuplicateTableError as e:
+                    # The CREATE TABLE itself lost a create/create race past
+                    # the to_regclass preflight above → cross-vault fusion
+                    # (issue #285). Scoped to this one call on purpose: the
+                    # cause is then structural rather than inferred from PG's
+                    # message. A caller may legally name a unique key / index
+                    # exactly this table's physical name, and PG reports that
+                    # clash with the same 42P07 naming the same relation — it
+                    # is caller-fixable input (422 below), not a fusion.
+                    raise ConflictError(
+                        _physical_name_conflict_message(vault["name"], name, pg_name)
+                    ) from e
                 for uk in resolved_uks:
                     await table_data_repo.create_unique_constraint(
                         conn, pg_name, uk["name"], uk["columns"],
@@ -696,23 +709,15 @@ async def create_table(
                     f"Column names (including the reserved id/created_at/"
                     f"updated_at/created_by) must each appear once."
                 ) from e
-            except asyncpg.DuplicateTableError as e:
-                # 42P07 comes from two distinct causes here: the CREATE TABLE
-                # itself losing a create/create race past the to_regclass
-                # preflight (the relation in the error IS this table's
-                # physical name → cross-vault fusion, issue #285), or a
-                # CREATE INDEX whose name clashed with an existing relation.
-                # Disambiguate on the quoted relation name in the PG message.
-                if f'"{pg_name}"' in str(e):
-                    raise ConflictError(
-                        _physical_name_conflict_message(vault["name"], name, pg_name)
-                    ) from e
-                raise ValidationError(_ddl_name_clash_message(name, e)) from e
-            except asyncpg.DuplicateObjectError as e:
+            except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
                 # A caller-supplied unique-key / index NAME collided with an
                 # existing constraint or index. These names share PostgreSQL's
                 # schema-global index namespace, so a clash with another table's
                 # index is possible and is caller-fixable input → clean 422.
+                # 42P07 (DuplicateTableError) reaches here when the clash is
+                # with a *relation* of that name — including this table's own
+                # physical name, which a caller may legally supply. The fusion
+                # case never does: it is caught at the CREATE TABLE call above.
                 raise ValidationError(_ddl_name_clash_message(name, e)) from e
             except (
                 asyncpg.ForeignKeyViolationError,

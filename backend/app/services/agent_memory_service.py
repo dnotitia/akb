@@ -154,15 +154,27 @@ _DASH_COLLAPSE_RE = re.compile(r"-+")
 
 
 def sanitise_username(raw: str) -> str:
-    """Map an arbitrary username to a vault-name-safe slug.
+    """Reproduce the PRE-MIGRATION memory-vault slug for a username.
 
-    Vault names must match ``^[a-z0-9]+(-[a-z0-9]+)*$`` (validated by
-    ``DocumentService.create_vault``). Usernames in the user catalogue
-    are not constrained that tightly — they may carry dots, underscores,
-    capitals, Unicode. Slugify here and cap at 60 chars so the final
-    vault name ``agent-memory-{slug}`` stays under PG's 63-byte
-    role-name budget downstream (PG roles `akb_user_<vault_id>` use the
-    uuid; the vault name itself only bounds the on-disk git path).
+    This is no longer a vault-name factory. New vaults are keyed on the
+    immutable ``user_id`` (``memory_vault_name``), and that canonical name
+    is the only one ``ensure_memory_vault`` ever hands to
+    ``DocumentService.create_vault``. This slug feeds
+    ``legacy_memory_vault_name`` alone, whose output is used *read-only* —
+    the ``SELECT ... WHERE name = $1`` adoption probe in
+    ``ensure_memory_vault`` / ``_resolve_memory_vault``.
+
+    So the derivation is FROZEN, not merely "safe": it must reproduce
+    byte-for-byte the names minted under the old vault grammar
+    (``^[a-z0-9][a-z0-9-]*$``, which permitted a trailing hyphen). Any
+    extra normalisation here — however tidy — changes the probe string and
+    silently ORPHANS a legacy vault instead of adopting it. In particular
+    do not re-strip after the cap: the result is never checked against the
+    current vault grammar, so a re-exposed trailing separator is correct
+    output, not a bug. (PR #286 review.)
+
+    The 60-char cap is part of that frozen shape: it kept the legacy name
+    ``agent-memory-{slug}`` inside PG's 63-byte identifier budget.
     """
     if not raw:
         raise ValidationError("username is required to derive a memory vault name")
@@ -170,11 +182,10 @@ def sanitise_username(raw: str) -> str:
     s = s.lower().strip()
     s = _SAFE_RE.sub("-", s)
     s = _DASH_COLLAPSE_RE.sub("-", s).strip("-.")
-    # Re-strip after capping: the cut can land right after a `-`/`.` and
-    # re-expose a trailing separator, which the vault-name grammar rejects
-    # (single hyphens only — issue #285). Position 0 survives the strip
-    # above, so the result can only be empty if `s` already was.
-    s = s[:60].rstrip("-.")
+    # Cap only — deliberately NOT re-stripped. See the docstring: this
+    # output is a lookup key for vaults that already exist, so it has to
+    # match how they were named, not how we would name them today.
+    s = s[:60]
     if not s:
         raise ValidationError(f"username cannot be safely slugified: {raw!r}")
     return s
@@ -196,8 +207,14 @@ def sanitise_agent_id(raw: str) -> str:
     s = s.lower().strip()
     s = _SAFE_RE.sub("-", s)
     s = _DASH_COLLAPSE_RE.sub("-", s).strip("-.")
-    # Same cap-then-restrip as sanitise_username: never end on `-`/`.`.
-    s = s[:AGENT_ID_MAX_LEN].rstrip("-.")
+    # Cap only — frozen for the same reason as sanitise_username, with a
+    # different consumer: this slug is a document PATH segment
+    # (`sessions/{date}/{agent_id}/{session_id}`) and a LIKE pattern in
+    # `list_sessions`. Re-normalising it would write new sessions to a
+    # different path than the ones already recorded under the old slug,
+    # and hide those from agent_id-filtered recall. Never a vault name,
+    # so the vault grammar has no say here.
+    s = s[:AGENT_ID_MAX_LEN]
     if not s:
         raise ValidationError(f"agent_id cannot be safely slugified: {raw!r}")
     return s

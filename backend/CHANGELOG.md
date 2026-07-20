@@ -16,8 +16,9 @@ both mapped to `vt_a__b__c` (#285). Existing vaults are unaffected;
 `create_table` now preflights the generated physical name and reports a
 cross-vault fusion as a clear 409 conflict naming the fusion rule, instead
 of a misleading unique-key/index 422 that echoed the raw PostgreSQL error.
-Genuine index/constraint-name clashes keep their existing message, and
-agent-memory slugs can no longer end with a stray hyphen after truncation.
+Genuine index/constraint-name clashes keep their existing 422 — including
+the case where the supplied index name is the table's own physical name,
+which PostgreSQL reports with the same error as a lost create race.
 
 Standalone model routing remains unchanged under the default
 `external_metering` profile. Managed deployments can opt into
