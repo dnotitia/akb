@@ -24,6 +24,13 @@ export type {
   AkbGraphNeighborsEnvelope,
   AkbGraphNode,
   AkbGraphOverviewEnvelope,
+  AkbProvenanceEnvelope,
+  AkbRelation,
+  AkbRelationLinkEnvelope,
+  AkbRelationType,
+  AkbRelationUnlinkEnvelope,
+  AkbRelationsEnvelope,
+  AkbWritableRelationType,
   AkbSearchEnvelope,
   AkbSqlEnvelope,
   AkbTableEnvelope,
@@ -385,6 +392,24 @@ export interface AkbGraphHealthOptions {
   limit?: number;
 }
 
+export interface AkbGraphRelationsOptions {
+  direction?: "incoming" | "outgoing" | "both";
+  type?: import("./core/schema.gen.js").AkbRelationType;
+}
+
+export interface AkbGraphLinkInput {
+  source: string;
+  target: string;
+  relation: import("./core/schema.gen.js").AkbWritableRelationType;
+  metadata?: Record<string, AkbJsonValue>;
+}
+
+export interface AkbGraphUnlinkInput {
+  source: string;
+  target: string;
+  relation?: import("./core/schema.gen.js").AkbWritableRelationType;
+}
+
 export interface AkbGraphFacade extends AkbNamespaceStub {
   neighbors(
     uri: string,
@@ -396,6 +421,19 @@ export interface AkbGraphFacade extends AkbNamespaceStub {
   health(
     options?: AkbGraphHealthOptions,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphHealthEnvelope>>;
+  relations(
+    uri: string,
+    options?: AkbGraphRelationsOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationsEnvelope>>;
+  link(
+    input: AkbGraphLinkInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationLinkEnvelope>>;
+  unlink(
+    input: AkbGraphUnlinkInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationUnlinkEnvelope>>;
+  provenance(
+    uri: string,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbProvenanceEnvelope>>;
 }
 
 export interface AkbDocsFacade extends AkbNamespaceStub {
@@ -826,6 +864,35 @@ function makeGraphFacade(
       appendOptional(params, "hub_threshold", options.hubThreshold);
       appendOptional(params, "limit", options.limit);
       return request<import("./core/schema.gen.js").AkbGraphHealthEnvelope>(`/graph/health?${params}`);
+    },
+    relations(uri: string, options: AkbGraphRelationsOptions = {}) {
+      const params = new URLSearchParams({ uri });
+      appendOptional(params, "direction", options.direction);
+      appendOptional(params, "type", options.type);
+      return request<import("./core/schema.gen.js").AkbRelationsEnvelope>(`/relations?${params}`);
+    },
+    link(input: AkbGraphLinkInput) {
+      const body = {
+        source: input.source,
+        target: input.target,
+        relation: input.relation,
+        ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+      };
+      return request<import("./core/schema.gen.js").AkbRelationLinkEnvelope>("/relations", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    unlink(input: AkbGraphUnlinkInput) {
+      const params = new URLSearchParams({ source: input.source, target: input.target });
+      appendOptional(params, "relation", input.relation);
+      return request<import("./core/schema.gen.js").AkbRelationUnlinkEnvelope>(`/relations?${params}`, {
+        method: "DELETE",
+      });
+    },
+    provenance(uri: string) {
+      const params = new URLSearchParams({ uri });
+      return request<import("./core/schema.gen.js").AkbProvenanceEnvelope>(`/provenance?${params}`);
     },
   } satisfies AkbGraphFacade;
   return Object.freeze(facade);

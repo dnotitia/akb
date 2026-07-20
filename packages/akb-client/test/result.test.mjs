@@ -1174,3 +1174,108 @@ test("graph facade omits defaults, preflights vault, preserves 4xx, and keeps ra
   assert.throws(() => root.graph.health(), /Select a vault.*graph health/i);
   assert.equal(noVaultCalls, 0);
 });
+
+test("graph relation and provenance facade maps exact root requests and preserves envelopes", async () => {
+  const calls = [];
+  let omittedUnlinks = 0;
+  const claims = { sub: "relation-user", app_metadata: { org_id: "org-graph", role: "writer" } };
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      const body = init && Object.hasOwn(init, "body") ? init.body : undefined;
+      calls.push({
+        url: String(input), method, body,
+        hasBody: init ? Object.hasOwn(init, "body") : false,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      if (url.pathname.endsWith("/provenance")) {
+        const uri = url.searchParams.get("uri");
+        return responseJson({
+          kind: "provenance", doc_id: uri.endsWith("alpha doc") ? "doc-alpha" : "doc-beta",
+          title: uri.endsWith("alpha doc") ? "Alpha" : "Beta", path: "proof.md",
+          vault: uri.includes("vault one") ? "vault one" : "vault-two", uri,
+          created_by: null, created_at: null, updated_at: "2026-07-20T00:00:00Z",
+          current_commit: null, relations: [],
+        });
+      }
+      if (method === "POST") return responseJson({ kind: "relation_link", ...JSON.parse(init.body) });
+      if (method === "DELETE") {
+        const relation = url.searchParams.get("relation");
+        if (relation === null) omittedUnlinks += 1;
+        return responseJson({
+          kind: "relation_unlink", source: url.searchParams.get("source"),
+          target: url.searchParams.get("target"), relation,
+          unlinked: relation === null ? (omittedUnlinks === 1 ? 1 : 0) : 1,
+        });
+      }
+      return responseJson({
+        kind: "relations", uri: url.searchParams.get("uri"),
+        relations: [{ direction: "outgoing", relation: url.searchParams.get("type") ?? "related_to",
+          uri: "akb://vault-two/table/target", resource_type: "table", name: null }],
+      });
+    },
+  }).actingAs(claims);
+
+  const relationsA = await client.graph.relations("akb://vault one/doc/alpha doc", { direction: "outgoing", type: "links_to" });
+  const relationsB = await client.graph.relations("akb://vault-two/table/source");
+  const linkA = await client.graph.link({ source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references", metadata: { confidence: 0.75, source: "fixture-a" } });
+  const linkB = await client.graph.link({ source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2", relation: "attached_to" });
+  const namedUnlink = await client.graph.unlink({ source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references" });
+  const unlinkInput = { source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2" };
+  const unlinkFirst = await client.graph.unlink(unlinkInput);
+  const unlinkAgain = await client.graph.unlink(unlinkInput);
+  const provenanceA = await client.graph.provenance("akb://vault one/doc/alpha doc");
+  const provenanceB = await client.graph.provenance("akb://vault-two/doc/beta");
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/relations?uri=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc&direction=outgoing&type=links_to");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/relations?uri=akb%3A%2F%2Fvault-two%2Ftable%2Fsource");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/relations");
+  assert.deepEqual(JSON.parse(calls[2].body), { source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references", metadata: { confidence: 0.75, source: "fixture-a" } });
+  assert.deepEqual(JSON.parse(calls[3].body), { source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2", relation: "attached_to" });
+  assert.equal(calls[4].url, "https://akb.test/api/v1/relations?source=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc&target=akb%3A%2F%2Fvault-two%2Ftable%2Ftarget&relation=references");
+  assert.equal(calls[5].url, "https://akb.test/api/v1/relations?source=akb%3A%2F%2Fvault-two%2Fdoc%2Fbeta&target=akb%3A%2F%2Fvault-two%2Ffile%2Ffile-2");
+  assert.equal(calls[6].url, calls[5].url);
+  assert.equal(calls[7].url, "https://akb.test/api/v1/provenance?uri=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc");
+  assert.equal(calls[8].url, "https://akb.test/api/v1/provenance?uri=akb%3A%2F%2Fvault-two%2Fdoc%2Fbeta");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "GET", "POST", "POST", "DELETE", "DELETE", "DELETE", "GET", "GET"]);
+  assert.ok(calls.slice(4, 7).every((call) => !call.hasBody && call.body === undefined));
+  assert.ok(calls.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
+  assert.equal(relationsA.throwOnError().data.kind, "relations");
+  assert.equal(relationsA.data.relations[0].relation, "links_to");
+  assert.equal(relationsB.data.relations[0].relation, "related_to");
+  assert.equal(linkA.throwOnError().data.kind, "relation_link");
+  assert.deepEqual(linkA.data.metadata, { confidence: 0.75, source: "fixture-a" });
+  assert.equal(linkB.data.metadata, undefined);
+  assert.equal(namedUnlink.throwOnError().data.kind, "relation_unlink");
+  assert.equal(unlinkFirst.data.unlinked, 1);
+  assert.equal(unlinkAgain.data.unlinked, 0);
+  assert.equal(provenanceA.throwOnError().data.kind, "provenance");
+  assert.equal(provenanceA.data.doc_id, "doc-alpha");
+  assert.equal(provenanceB.data.doc_id, "doc-beta");
+  assert.equal(Object.hasOwn(provenanceA.data, "provenance"), false);
+});
+
+test("graph relation and provenance facade preserves backend 4xx result behavior", async () => {
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input, init) => (init?.method ?? "GET") === "POST"
+      ? responseJson({ message: "writer role required", code: "permission_denied" }, 403, "Forbidden")
+      : responseJson({ detail: "invalid document URI", code: "validation_error" }, 422, "Unprocessable Entity"),
+  });
+  const invalid = await client.graph.provenance("not-an-akb-uri");
+  const denied = await client.graph.link({ source: "akb://reader/doc/a", target: "akb://reader/doc/b", relation: "related_to" });
+  assert.equal(invalid.data, null);
+  assert.equal(invalid.error.status, 422);
+  assert.equal(invalid.error.code, "validation_error");
+  assert.throws(() => invalid.throwOnError(), AkbError);
+  assert.equal(denied.data, null);
+  assert.equal(denied.error.status, 403);
+  assert.equal(denied.error.code, "permission_denied");
+  assert.throws(() => denied.throwOnError(), AkbError);
+});
+
+function responseJson(body, status = 200, statusText = "OK") {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json" } });
+}

@@ -207,6 +207,58 @@
         }
       }
     },
+    "/api/v1/relations": {
+      "get": {
+        "operationId": "graphRelations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbRelationsEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "graphLink",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbRelationLinkEnvelope" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "graphUnlink",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbRelationUnlinkEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/provenance": {
+      "get": {
+        "operationId": "graphProvenance",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbProvenanceEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/search": {
       "get": {
         "operationId": "searchSearchDocuments",
@@ -487,6 +539,65 @@
               "sample": { "type": "array", "items": { "$ref": "#/components/schemas/AkbGraphNode" } }
             }
           }
+        }
+      },
+      "AkbRelation": {
+        "type": "object",
+        "required": ["direction", "relation", "uri", "resource_type"],
+        "properties": {
+          "direction": { "type": "string", "enum": ["incoming", "outgoing"] },
+          "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from", "links_to"] },
+          "uri": { "type": "string" },
+          "resource_type": { "type": "string", "enum": ["doc", "table", "file"] },
+          "name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "AkbRelationsEnvelope": {
+        "type": "object",
+        "required": ["kind", "uri", "relations"],
+        "properties": {
+          "kind": { "type": "string", "const": "relations" },
+          "uri": { "type": "string" },
+          "relations": { "type": "array", "items": { "$ref": "#/components/schemas/AkbRelation" } }
+        }
+      },
+      "AkbRelationLinkEnvelope": {
+        "type": "object",
+        "required": ["kind", "linked", "source", "target", "relation"],
+        "properties": {
+          "kind": { "type": "string", "const": "relation_link" },
+          "linked": { "type": "boolean" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from"] }
+        }
+      },
+      "AkbRelationUnlinkEnvelope": {
+        "type": "object",
+        "required": ["kind", "unlinked", "source", "target"],
+        "properties": {
+          "kind": { "type": "string", "const": "relation_unlink" },
+          "unlinked": { "type": "integer" },
+          "source": { "type": "string" },
+          "target": { "type": "string" }
+        }
+      },
+      "AkbProvenanceEnvelope": {
+        "type": "object",
+        "required": ["kind", "doc_id", "title", "path", "vault", "uri", "created_by", "created_at", "updated_at", "current_commit", "relations"],
+        "properties": {
+          "kind": { "type": "string", "const": "provenance" },
+          "doc_id": { "type": "string" },
+          "title": { "type": "string" },
+          "path": { "type": "string" },
+          "vault": { "type": "string" },
+          "uri": { "type": "string" },
+          "created_by": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "created_at": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "updated_at": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "current_commit": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "relations": { "type": "array", "items": { "$ref": "#/components/schemas/AkbRelation" } }
         }
       },
       "AkbSearchEnvelope": {},

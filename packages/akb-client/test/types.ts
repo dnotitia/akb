@@ -12,6 +12,14 @@ import {
   type AkbGraphHealthEnvelope,
   type AkbGraphNeighborsEnvelope,
   type AkbGraphOverviewEnvelope,
+  type AkbGraphRelationsOptions,
+  type AkbProvenanceEnvelope,
+  type AkbRelation,
+  type AkbRelationLinkEnvelope,
+  type AkbRelationType,
+  type AkbRelationUnlinkEnvelope,
+  type AkbRelationsEnvelope,
+  type AkbWritableRelationType,
   type AkbOperationResponse,
   type AkbStorageUploadOptions,
   type operations,
@@ -106,6 +114,42 @@ if (rawGraphData.kind === "graph_neighbors") {
 graphLeaf.kind satisfies "graph_neighbors";
 overviewLeaf.kind satisfies "graph_overview";
 healthLeaf.kind satisfies "graph_health";
+const relationFilter: AkbRelationType = "links_to";
+const writableRelation: AkbWritableRelationType = "derived_from";
+const relationOptions: AkbGraphRelationsOptions = { direction: "incoming", type: relationFilter };
+const graphRelations = await typedClient.graph.relations("akb://eng/doc/readme.md", relationOptions);
+const relationsLeaf: AkbRelationsEnvelope = graphRelations.throwOnError().data;
+relationsLeaf.kind satisfies "relations";
+const relationRow: AkbRelation | undefined = relationsLeaf.relations.at(0);
+relationRow?.direction satisfies "incoming" | "outgoing" | undefined;
+relationRow?.relation satisfies AkbRelationType | undefined;
+relationRow?.resource_type satisfies "doc" | "table" | "file" | undefined;
+relationRow?.name satisfies string | null | undefined;
+const graphLink = await typedClient.graph.link({
+  source: "akb://eng/doc/readme.md",
+  target: "akb://eng/table/tasks",
+  relation: writableRelation,
+  metadata: { confidence: 1 },
+});
+const linkLeaf: AkbRelationLinkEnvelope = graphLink.throwOnError().data;
+linkLeaf.kind satisfies "relation_link";
+linkLeaf.relation satisfies AkbWritableRelationType;
+const graphUnlink = await typedClient.graph.unlink({ source: "akb://eng/doc/readme.md", target: "akb://eng/table/tasks" });
+const unlinkLeaf: AkbRelationUnlinkEnvelope = graphUnlink.throwOnError().data;
+unlinkLeaf.kind satisfies "relation_unlink";
+unlinkLeaf.unlinked satisfies number;
+const graphProvenance = await typedClient.graph.provenance("akb://eng/doc/readme.md");
+const provenanceLeaf: AkbProvenanceEnvelope = graphProvenance.throwOnError().data;
+provenanceLeaf.kind satisfies "provenance";
+provenanceLeaf.created_by satisfies string | null;
+provenanceLeaf.created_at satisfies string | null;
+provenanceLeaf.updated_at satisfies string | null;
+provenanceLeaf.current_commit satisfies string | null;
+provenanceLeaf.relations satisfies AkbRelation[];
+// @ts-expect-error links_to is implicit/read-only and cannot be created explicitly.
+typedClient.graph.link({ source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "links_to" });
+// @ts-expect-error links_to cannot be used for a named unlink; omit relation to remove all matching edges.
+typedClient.graph.unlink({ source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "links_to" });
 const drillDownResult = await typedClient.vault("eng").search.drillDown("akb://eng/doc/readme.md", {
   section: "Intro",
 });
@@ -273,6 +317,18 @@ graphOverviewResponse.kind satisfies "graph_overview";
 type GraphHealthResponse = AkbOperationResponse<operations["graphHealth"]>;
 const graphHealthResponse: GraphHealthResponse = healthLeaf;
 graphHealthResponse.kind satisfies "graph_health";
+type GraphRelationsResponse = AkbOperationResponse<operations["graphRelations"]>;
+const graphRelationsResponse: GraphRelationsResponse = relationsLeaf;
+graphRelationsResponse.kind satisfies "relations";
+type GraphLinkResponse = AkbOperationResponse<operations["graphLink"]>;
+const graphLinkResponse: GraphLinkResponse = linkLeaf;
+graphLinkResponse.kind satisfies "relation_link";
+type GraphUnlinkResponse = AkbOperationResponse<operations["graphUnlink"]>;
+const graphUnlinkResponse: GraphUnlinkResponse = unlinkLeaf;
+graphUnlinkResponse.kind satisfies "relation_unlink";
+type GraphProvenanceResponse = AkbOperationResponse<operations["graphProvenance"]>;
+const graphProvenanceResponse: GraphProvenanceResponse = provenanceLeaf;
+graphProvenanceResponse.kind satisfies "provenance";
 
 type InsertRowsResponse = AkbOperationResponse<operations["tablesInsertRows"]>;
 const insertRowsNoContent: InsertRowsResponse = null;

@@ -234,7 +234,7 @@ export interface AkbGraphNode {
 export interface AkbGraphEdge {
   source: string;
   target: string;
-  relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from" | "links_to";
+  relation: AkbRelationType;
   kind: "implicit" | "explicit";
   [key: string]: unknown;
 }
@@ -272,6 +272,64 @@ export interface AkbGraphHealthEnvelope {
 
 export type AkbGraphEnvelope = AkbGraphNeighborsEnvelope | AkbGraphOverviewEnvelope;
 
+export type AkbWritableRelationType =
+  | "depends_on"
+  | "related_to"
+  | "implements"
+  | "references"
+  | "attached_to"
+  | "derived_from";
+
+export type AkbRelationType = AkbWritableRelationType | "links_to";
+
+export interface AkbRelation {
+  direction: "incoming" | "outgoing";
+  relation: AkbRelationType;
+  uri: string;
+  resource_type: "doc" | "table" | "file";
+  name?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbRelationsEnvelope {
+  kind: "relations";
+  uri: string;
+  relations: AkbRelation[];
+  [key: string]: unknown;
+}
+
+export interface AkbRelationLinkEnvelope {
+  kind: "relation_link";
+  linked: boolean;
+  source: string;
+  target: string;
+  relation: AkbWritableRelationType;
+  [key: string]: unknown;
+}
+
+export interface AkbRelationUnlinkEnvelope {
+  kind: "relation_unlink";
+  unlinked: number;
+  source: string;
+  target: string;
+  [key: string]: unknown;
+}
+
+export interface AkbProvenanceEnvelope {
+  kind: "provenance";
+  doc_id: string;
+  title: string;
+  path: string;
+  vault: string;
+  uri: string;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  current_commit: string | null;
+  relations: AkbRelation[];
+  [key: string]: unknown;
+}
+
 export type AkbSuccessEnvelope =
   | AkbTableEnvelope
   | AkbTableMigrationEnvelope
@@ -287,7 +345,11 @@ export type AkbSuccessEnvelope =
   | AkbGrepEnvelope
   | AkbGraphNeighborsEnvelope
   | AkbGraphOverviewEnvelope
-  | AkbGraphHealthEnvelope;
+  | AkbGraphHealthEnvelope
+  | AkbRelationsEnvelope
+  | AkbRelationLinkEnvelope
+  | AkbRelationUnlinkEnvelope
+  | AkbProvenanceEnvelope;
 
 export interface paths {
   "/api/v1/browse/{vault}": {
@@ -330,6 +392,14 @@ export interface paths {
   };
   "/api/v1/grep": {
     get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
+  };
+  "/api/v1/provenance": {
+    get: AkbOperation<"get", "/api/v1/provenance", never, never, AkbProvenanceEnvelope>;
+  };
+  "/api/v1/relations": {
+    delete: AkbOperation<"delete", "/api/v1/relations", never, never, AkbRelationUnlinkEnvelope>;
+    get: AkbOperation<"get", "/api/v1/relations", never, never, AkbRelationsEnvelope>;
+    post: AkbOperation<"post", "/api/v1/relations", never, unknown, AkbRelationLinkEnvelope>;
   };
   "/api/v1/search": {
     get: AkbOperation<"get", "/api/v1/search", never, never, AkbSearchEnvelope>;
@@ -381,6 +451,10 @@ export interface operations {
   graphHealth: paths["/api/v1/graph/health"]["get"];
   graphOverview: paths["/api/v1/graph/overview"]["get"];
   searchGrepDocuments: paths["/api/v1/grep"]["get"];
+  graphProvenance: paths["/api/v1/provenance"]["get"];
+  graphUnlink: paths["/api/v1/relations"]["delete"];
+  graphRelations: paths["/api/v1/relations"]["get"];
+  graphLink: paths["/api/v1/relations"]["post"];
   searchSearchDocuments: paths["/api/v1/search"]["get"];
   tablesGetVault: paths["/api/v1/tables/{vault}"]["get"];
   tablesPostVault: paths["/api/v1/tables/{vault}"]["post"];
@@ -419,5 +493,10 @@ export interface components {
     AkbGraphNeighborsEnvelope: AkbGraphNeighborsEnvelope;
     AkbGraphOverviewEnvelope: AkbGraphOverviewEnvelope;
     AkbGraphHealthEnvelope: AkbGraphHealthEnvelope;
+    AkbRelation: AkbRelation;
+    AkbRelationsEnvelope: AkbRelationsEnvelope;
+    AkbRelationLinkEnvelope: AkbRelationLinkEnvelope;
+    AkbRelationUnlinkEnvelope: AkbRelationUnlinkEnvelope;
+    AkbProvenanceEnvelope: AkbProvenanceEnvelope;
   };
 }
