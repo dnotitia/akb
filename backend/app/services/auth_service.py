@@ -8,6 +8,7 @@ Handles:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import secrets
@@ -89,6 +90,21 @@ def verify_password(password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(password.encode(), password_hash.encode())
     except ValueError:
         return False
+
+
+# bcrypt (cost 12) costs ~hundreds of ms per call and — unlike Kiwi's
+# tokenizer — RELEASES the GIL while hashing, so a worker thread genuinely
+# runs it off the single event loop (and lets concurrent hashes overlap).
+# Calling it inline starved the loop under concurrent auth → /livez probe
+# timeouts → 503 / kubelet SIGKILL (2026-07-20 incident). Always await these
+# async wrappers from request paths; the sync forms remain the thread target.
+
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, password_hash)
 
 
 # ── JWT ──────────────────────────────────────────────────────
@@ -206,7 +222,7 @@ def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
 async def register(username: str, email: str, password: str, display_name: str | None = None) -> dict:
     require_local_auth_enabled()
     pool = await get_pool()
-    pw_hash = hash_password(password)
+    pw_hash = await hash_password_async(password)
     user_id = uuid.uuid4()
 
     async with pool.acquire() as conn:
@@ -275,7 +291,7 @@ async def login(username: str, password: str) -> dict:
                 row["auth_provider"] != "local" or row["account_kind"] != "human"
             ):
                 raise AuthenticationError("Invalid credentials")
-            if not row or not verify_password(password, row["password_hash"]):
+            if not row or not await verify_password_async(password, row["password_hash"]):
                 raise AuthenticationError("Invalid credentials")
 
             # Push iat past the revocation cutoff so a login in the same
@@ -689,14 +705,14 @@ async def change_password(user_id: str, current: str, new: str) -> None:
                 raise AccountSuspendedError()
             if row["auth_provider"] != "local" or row["account_kind"] != "human":
                 raise PasswordLifecycleUnavailableError()
-            if not verify_password(current, row["password_hash"]):
+            if not await verify_password_async(current, row["password_hash"]):
                 raise AuthenticationError("Current password is incorrect")
-            if verify_password(new, row["password_hash"]):
+            if await verify_password_async(new, row["password_hash"]):
                 raise BadPasswordChange("New password must differ from current")
 
             await conn.execute(
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
-                hash_password(new),
+                await hash_password_async(new),
                 uuid.UUID(user_id),
             )
             # Otherwise a thief holding an old JWT would keep access
