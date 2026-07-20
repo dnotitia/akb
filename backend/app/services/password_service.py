@@ -25,7 +25,7 @@ from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_service import (
     REVOKE_REASON_PASSWORD_RESET,
     _revoke_sessions_in_conn,
-    hash_password,
+    hash_password_async,
 )
 
 
@@ -73,7 +73,7 @@ async def reset_password(
             temp = generate_temp_password()
             await conn.execute(
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
-                hash_password(temp),
+                await hash_password_async(temp),
                 row["id"],
             )
             # Otherwise the attacker who triggered the reset (or held

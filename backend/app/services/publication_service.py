@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 import re
 import secrets
 import uuid
@@ -121,6 +122,15 @@ def _generate_slug() -> str:
 
 def _hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+async def _hash_password_async(password: str) -> str:
+    # Offload bcrypt off the event loop — see auth_service.hash_password_async.
+    return await asyncio.to_thread(_hash_password, password)
+
+
+async def _verify_password_async(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(_verify_password, password, password_hash)
 
 
 def _verify_password(password: str, password_hash: str) -> bool:
@@ -317,7 +327,7 @@ async def create_publication(
             )
 
     slug = _generate_slug()
-    pwd_hash = _hash_password(password) if password else None
+    pwd_hash = await _hash_password_async(password) if password else None
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -699,7 +709,7 @@ async def resolve_publication(
         if row["password_hash"] and not bypass_password:
             if not password:
                 raise PublicationPasswordRequired()
-            if not _verify_password(password, row["password_hash"]):
+            if not await _verify_password_async(password, row["password_hash"]):
                 raise PublicationPasswordInvalid()
 
         if increment_view:
