@@ -7,6 +7,18 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+Vault names now accept only single hyphens between lowercase alphanumeric
+segments (no leading, trailing, or consecutive hyphens). Hyphens map to
+underscores inside physical vault-table names and `__` separates the vault
+and table parts, so a hyphen run could fuse two different vault/table pairs
+onto one physical table — vault `a--b` table `c` and vault `a` table `b__c`
+both mapped to `vt_a__b__c` (#285). Existing vaults are unaffected;
+`create_table` now preflights the generated physical name and reports a
+cross-vault fusion as a clear 409 conflict naming the fusion rule, instead
+of a misleading unique-key/index 422 that echoed the raw PostgreSQL error.
+Genuine index/constraint-name clashes keep their existing message, and
+agent-memory slugs can no longer end with a stray hyphen after truncation.
+
 Standalone model routing remains unchanged under the default
 `external_metering` profile. Managed deployments can opt into
 `platform_hard`, which fails startup unless every active embedding, chat, and

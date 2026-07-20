@@ -156,7 +156,7 @@ _DASH_COLLAPSE_RE = re.compile(r"-+")
 def sanitise_username(raw: str) -> str:
     """Map an arbitrary username to a vault-name-safe slug.
 
-    Vault names must match ``^[a-z0-9][a-z0-9-]*$`` (validated by
+    Vault names must match ``^[a-z0-9]+(-[a-z0-9]+)*$`` (validated by
     ``DocumentService.create_vault``). Usernames in the user catalogue
     are not constrained that tightly — they may carry dots, underscores,
     capitals, Unicode. Slugify here and cap at 60 chars so the final
@@ -170,7 +170,11 @@ def sanitise_username(raw: str) -> str:
     s = s.lower().strip()
     s = _SAFE_RE.sub("-", s)
     s = _DASH_COLLAPSE_RE.sub("-", s).strip("-.")
-    s = s[:60]
+    # Re-strip after capping: the cut can land right after a `-`/`.` and
+    # re-expose a trailing separator, which the vault-name grammar rejects
+    # (single hyphens only — issue #285). Position 0 survives the strip
+    # above, so the result can only be empty if `s` already was.
+    s = s[:60].rstrip("-.")
     if not s:
         raise ValidationError(f"username cannot be safely slugified: {raw!r}")
     return s
@@ -192,7 +196,8 @@ def sanitise_agent_id(raw: str) -> str:
     s = s.lower().strip()
     s = _SAFE_RE.sub("-", s)
     s = _DASH_COLLAPSE_RE.sub("-", s).strip("-.")
-    s = s[:AGENT_ID_MAX_LEN]
+    # Same cap-then-restrip as sanitise_username: never end on `-`/`.`.
+    s = s[:AGENT_ID_MAX_LEN].rstrip("-.")
     if not s:
         raise ValidationError(f"agent_id cannot be safely slugified: {raw!r}")
     return s
