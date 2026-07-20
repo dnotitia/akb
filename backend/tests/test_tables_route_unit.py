@@ -15,7 +15,11 @@ class _User:
 
 
 @pytest.mark.asyncio
-async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
+async def test_execute_sql_route_streams_envelope_and_forwards_params(monkeypatch) -> None:
+    import json
+
+    from starlette.responses import StreamingResponse
+
     from app.api.routes import tables
 
     captured: dict[str, Any] = {}
@@ -36,7 +40,14 @@ async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
         _User(),  # type: ignore[arg-type]
     )
 
-    assert result["kind"] == "table_query"
+    # The route now STREAMS the envelope (so serialising a huge result never
+    # blocks the single event loop) — the body is still one ordinary JSON
+    # document, byte-for-value identical to the old dict return.
+    assert isinstance(result, StreamingResponse)
+    assert result.media_type == "application/json"
+    body = b"".join([chunk async for chunk in result.body_iterator])
+    envelope = json.loads(body)
+    assert envelope["kind"] == "table_query"
     assert captured == {
         "vault_names": ["demo"],
         "user_id": _User.user_id,

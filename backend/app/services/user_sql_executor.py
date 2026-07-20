@@ -19,12 +19,14 @@ model.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Optional
 
 import asyncpg
 
+from app.config import settings
 from app.models.vault_scope import (
     current_request_jwt_claims,
     current_token_id,
@@ -51,6 +53,26 @@ def _coerce_value(v: Any) -> Any:
 
 def _coerce_row(row: asyncpg.Record) -> dict:
     return {k: _coerce_value(v) for k, v in dict(row).items()}
+
+
+async def _coerce_rows_yielding(rows: list) -> list[dict]:
+    """Coerce a full result set to JSON dicts WITHOUT blocking the event loop.
+
+    `[_coerce_row(r) for r in rows]` is pure-Python CPU with no ``await``; on a
+    million-row result it holds the single event loop for seconds and starves
+    the liveness probe (→ 503). We chunk it and ``await asyncio.sleep(0)``
+    between chunks so the loop can service other tasks (health probes, other
+    requests) between batches. The result is NOT truncated — only the CPU work
+    is interleaved.
+    """
+    batch = max(1, settings.akb_sql_coerce_batch)
+    if len(rows) <= batch:
+        return [_coerce_row(r) for r in rows]
+    items: list[dict] = []
+    for start in range(0, len(rows), batch):
+        items.extend(_coerce_row(r) for r in rows[start:start + batch])
+        await asyncio.sleep(0)  # yield to the loop between batches
+    return items
 
 
 def _affected_rows_from_command_tag(tag: str) -> int | None:
@@ -184,11 +206,12 @@ class UserSqlExecutor:
 
                     if should_fetch:
                         rows = await conn.fetch(sql, *bind_params)
+                        items = await _coerce_rows_yielding(rows)
                         return {
                             "kind": "table_query",
                             "vaults": vault_names or [],
                             "columns": list(dict(rows[0]).keys()) if rows else [],
-                            "items": [_coerce_row(r) for r in rows],
+                            "items": items,
                             "total": len(rows),
                         }
                     result = await conn.execute(sql, *bind_params)

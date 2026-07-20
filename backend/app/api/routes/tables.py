@@ -1,8 +1,11 @@
 """REST API routes for vault tables (structured data)."""
 
-from typing import Any, Literal
+import asyncio
+import json
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user
@@ -81,6 +84,34 @@ class SqlRequest(NFCModel):
     sql: str
     params: list[Any] | None = None
     vaults: list[str] | None = None
+
+
+async def _stream_json(obj: Any, *, flush_bytes: int = 65536, yield_every: int = 1000) -> AsyncIterator[bytes]:
+    """Serialise `obj` to JSON incrementally, yielding to the event loop.
+
+    A large `akb_sql` result (e.g. a million-row SELECT) serialised in one
+    `json.dumps` call blocks the single event loop for seconds → /livez probe
+    timeout → 503. `JSONEncoder.iterencode` produces the same JSON document
+    piece by piece; we batch pieces into ~64 KiB network chunks and
+    `await asyncio.sleep(0)` periodically so the loop stays responsive. The
+    client still receives one ordinary JSON document (no contract change), and
+    the full result is streamed (no truncation)."""
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    buf: list[str] = []
+    size = 0
+    n = 0
+    for piece in encoder.iterencode(obj):
+        buf.append(piece)
+        size += len(piece)
+        n += 1
+        if size >= flush_bytes:
+            yield "".join(buf).encode("utf-8")
+            buf.clear()
+            size = 0
+        if n % yield_every == 0:
+            await asyncio.sleep(0)
+    if buf:
+        yield "".join(buf).encode("utf-8")
 
 
 class QueryRowsRequest(NFCModel):
@@ -209,7 +240,7 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     for v in vaults:
         await check_vault_access(user.user_id, v, required_role="reader")
 
-    return _raise_service_error(
+    result = _raise_service_error(
         await table_service.execute_sql(
             vault_names=vaults,
             user_id=user.user_id,
@@ -218,6 +249,10 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             is_admin=user.is_admin,
         )
     )
+    # Stream the JSON so serialising a large result set never blocks the event
+    # loop. Errors (permission/SQL) already raised above, before the response
+    # starts, so streaming only ever carries a success envelope.
+    return StreamingResponse(_stream_json(result), media_type="application/json")
 
 
 @router.get(
