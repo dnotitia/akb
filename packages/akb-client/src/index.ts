@@ -386,10 +386,6 @@ export interface AkbGraphHealthOptions {
 }
 
 export interface AkbGraphFacade extends AkbNamespaceStub {
-  request<T = import("./core/schema.gen.js").AkbGraphEnvelope>(
-    path?: string | URL,
-    init?: RequestInit,
-  ): Promise<AkbResult<T>>;
   neighbors(
     uri: string,
     options?: AkbGraphNeighborsOptions,
@@ -805,7 +801,7 @@ function makeGraphFacade(
   request: AkbClient["request"],
   defaultVault: string | null,
 ): AkbGraphFacade {
-  const rawRequest = <T = import("./core/schema.gen.js").AkbGraphEnvelope>(
+  const rawRequest = <T = AkbSuccessEnvelope>(
     path: string | URL = "",
     init: RequestInit = {},
   ) => request<T>(joinPath("/graph", path), init);
