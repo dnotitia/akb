@@ -216,6 +216,20 @@ class Settings(BaseModel):
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
     s3_region: str = ""
+    # boto3/botocore default to a 60 s connect AND 60 s read timeout with NO
+    # retries. A stalled MinIO/S3 (network blip, cold bucket, dead endpoint)
+    # then blocks the caller for up to 60 s — and several S3 primitives run on
+    # the single event loop (public raw-file read, snapshot put/read, HEAD
+    # confirm, bucket cold-start), so one stall starves /livez → probe timeout
+    # → 503. Bound every S3 call instead: connect ≤ 3 s, read ≤ 10 s, with a
+    # short retry for transient blips.
+    # NOTE: botocore's `max_attempts` is the RETRY count — total attempts =
+    # s3_max_attempts + 1. So the default 2 = 3 total attempts, i.e. a
+    # worst-case read hang of 3 × 10 s = 30 s (down from an unbounded 60 s,
+    # and now recoverable), and a connect failure bounded to 3 × 3 s = 9 s.
+    s3_connect_timeout_secs: float = 3.0
+    s3_read_timeout_secs: float = 10.0
+    s3_max_attempts: int = 2
 
     # Auth — jwt_secret must be set (validated at startup in lifecycle.init_storage)
     jwt_secret: str = ""
