@@ -91,6 +91,14 @@ class Settings(BaseModel):
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 
+    # Max rows a single `akb_sql` / REST SQL SELECT may return. The result is
+    # coerced + JSON-serialised on the single event loop, so an unbounded
+    # SELECT (e.g. `SELECT * FROM generate_series(1, 2e6)`) stalls /livez past
+    # the liveness probe → 503. Over-limit results are truncated and flagged
+    # (`truncated: true`) so callers paginate. Statement execution is
+    # unchanged — only the returned row count is capped.
+    akb_sql_max_rows: int = 10000
+
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 

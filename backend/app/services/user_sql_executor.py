@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import asyncpg
 
+from app.config import settings
 from app.models.vault_scope import (
     current_request_jwt_claims,
     current_token_id,
@@ -184,12 +185,25 @@ class UserSqlExecutor:
 
                     if should_fetch:
                         rows = await conn.fetch(sql, *bind_params)
+                        # Cap the materialised result. `_coerce_row` + the
+                        # downstream JSON serialisation are pure-Python CPU on
+                        # the single event loop with no `await`, so an
+                        # unbounded SELECT stalls /livez (probe-timeout 503,
+                        # ~3s per 1M rows measured). Truncate to a configured
+                        # ceiling and flag it so callers paginate. The query
+                        # itself already ran identically — only the returned
+                        # rows are capped.
+                        max_rows = settings.akb_sql_max_rows
+                        truncated = len(rows) > max_rows
+                        if truncated:
+                            rows = rows[:max_rows]
                         return {
                             "kind": "table_query",
                             "vaults": vault_names or [],
                             "columns": list(dict(rows[0]).keys()) if rows else [],
                             "items": [_coerce_row(r) for r in rows],
                             "total": len(rows),
+                            "truncated": truncated,
                         }
                     result = await conn.execute(sql, *bind_params)
                     out = {
