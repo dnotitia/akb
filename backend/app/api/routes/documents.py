@@ -5,7 +5,11 @@ from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.services import template_registry
-from app.services.access_service import check_vault_access, list_accessible_vaults
+from app.services.access_service import (
+    check_vault_access,
+    check_vault_scope,
+    list_accessible_vaults,
+)
 from app.models.document import (
     DocumentDeleteResponse,
     DocumentPutRequest,
@@ -45,6 +49,10 @@ async def create_vault(name: str, description: str = "", template: str | None = 
         )
     name = to_nfc(name)
     description = to_nfc(description)
+    # Per-PAT vault scope, on the NFC-normalised name the service will
+    # actually store. Creation confers ownership, hence required_role
+    # "owner" (dnotitia/akb#284).
+    check_vault_scope(name, required_role="owner")
     vault_id = await doc_service.create_vault(name, description, owner_id=user.user_id, template=template, public_access=public_access)
     return {"vault_id": vault_id, "name": name, "template": template, "public_access": public_access}
 

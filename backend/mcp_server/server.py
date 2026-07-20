@@ -35,9 +35,9 @@ from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
-    check_vault_access, grant_access, revoke_access, list_vault_members,
-    list_accessible_vaults, get_vault_info, search_users, transfer_ownership,
-    archive_vault,
+    check_vault_access, check_vault_scope, grant_access, revoke_access,
+    list_vault_members, list_accessible_vaults, get_vault_info, search_users,
+    transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_token, token_has_scope
 from app.util.errors import (
@@ -333,6 +333,10 @@ async def _handle_list_vaults(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_create_vault")
 async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
+    # Per-PAT vault scope. Guard-first, like every other mutating tool —
+    # creation confers ownership, hence required_role "owner"
+    # (dnotitia/akb#284).
+    check_vault_scope(args["name"], required_role="owner")
     try:
         vault_id = await doc_service.create_vault(
             args["name"], args.get("description", ""),

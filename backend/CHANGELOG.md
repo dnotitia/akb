@@ -50,6 +50,16 @@ contains only counts and stable issue codes; it never returns email, subject,
 password, token, or credential material. Standalone defaults and ordinary
 `/readyz` behavior are unchanged.
 
+A personal access token's vault scope now bounds vault **creation** as well as
+administration. Creating a vault whose name falls outside the token's scope is
+refused with `permission_denied`, in the same wording the scope guard already
+uses for administrative operations, on both the MCP `akb_create_vault` tool and
+`POST /vaults`. Previously creation consulted no scope at all, so a scoped token
+could place a vault anywhere in the namespace and was then denied every
+administrative operation on the vault it had just created — including deleting
+it — stranding a vault its creator could not remove. Unscoped tokens keep their
+existing behavior, and reads remain unrestricted.
+
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 
 AKB now preserves its existing local user UUID while binding verified OIDC
