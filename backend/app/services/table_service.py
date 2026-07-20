@@ -485,6 +485,34 @@ def _foreign_key_validation_message(table_name: str, e: Exception) -> str:
     )
 
 
+def _physical_name_conflict_message(vault_name: str, table_name: str, pg_name: str) -> str:
+    """409 body for a cross-vault physical-name fusion (issue #285).
+
+    Deliberately explains the fusion rule instead of echoing the raw PG
+    error: the PG message names the winning relation verbatim, which both
+    confuses the caller (their *table* name is the problem, not an index)
+    and confirms another tenant's physical table by name."""
+    return (
+        f"Table name {table_name!r} is unavailable in vault {vault_name!r}: "
+        f"its physical table name {pg_name!r} is already in use by a table "
+        f"in another vault. Vault and table names are joined with '__' and "
+        f"hyphens in vault names map to underscores, so e.g. vault 'a--b' "
+        f"table 'c' and vault 'a' table 'b__c' collide. Choose a different "
+        f"table name."
+    )
+
+
+def _ddl_name_clash_message(table_name: str, e: Exception) -> str:
+    """422 body for a caller-supplied unique-key / index name that collided
+    with an existing schema-global constraint/index name."""
+    return (
+        f"A unique-key or index name in table {table_name!r} already "
+        f"exists in the database: {e}. Constraint/index names are "
+        f"shared schema-wide — choose a different name (or omit it "
+        f"to let AKB generate a collision-safe one)."
+    )
+
+
 # ── Indexing helpers ─────────────────────────────────────────────
 
 
@@ -606,6 +634,24 @@ async def create_table(
                     f"({name!r})."
                 )
 
+            # Cross-vault physical-name fusion preflight (issue #285).
+            # `_sanitize_pg_part` maps `-` → `_` and `__` is also the
+            # vault/table separator, so two DIFFERENT (vault, table) pairs
+            # can produce the same physical name: vault `a--b` + table `c`
+            # and vault `a` + table `b__c` both map to `vt_a__b__c`. The
+            # same-vault duplicate is already a clean 409 via find_by_name
+            # above; without this check the fusion case surfaces from
+            # CREATE TABLE as DuplicateTableError and gets mis-reported by
+            # the constraint/index except-arm below. New vault names can no
+            # longer contain hyphen runs (`validate_vault_name`), but vaults
+            # created before that grammar landed still can.
+            if await conn.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL", f"public.{pg_name}"
+            ):
+                raise ConflictError(
+                    _physical_name_conflict_message(vault["name"], name, pg_name)
+                )
+
             # Resolve + validate declarative constraints/indexes BEFORE any
             # DDL so a bad spec rolls back with zero schema change. On a
             # freshly-created (empty) table there is no duplicate-preflight
@@ -621,9 +667,22 @@ async def create_table(
             await _validate_column_references(conn, vault_id, columns)
 
             try:
-                await table_data_repo.create_dynamic_table(
-                    conn, pg_name, columns, vault_name=vault["name"],
-                )
+                try:
+                    await table_data_repo.create_dynamic_table(
+                        conn, pg_name, columns, vault_name=vault["name"],
+                    )
+                except asyncpg.DuplicateTableError as e:
+                    # The CREATE TABLE itself lost a create/create race past
+                    # the to_regclass preflight above → cross-vault fusion
+                    # (issue #285). Scoped to this one call on purpose: the
+                    # cause is then structural rather than inferred from PG's
+                    # message. A caller may legally name a unique key / index
+                    # exactly this table's physical name, and PG reports that
+                    # clash with the same 42P07 naming the same relation — it
+                    # is caller-fixable input (422 below), not a fusion.
+                    raise ConflictError(
+                        _physical_name_conflict_message(vault["name"], name, pg_name)
+                    ) from e
                 for uk in resolved_uks:
                     await table_data_repo.create_unique_constraint(
                         conn, pg_name, uk["name"], uk["columns"],
@@ -655,12 +714,11 @@ async def create_table(
                 # existing constraint or index. These names share PostgreSQL's
                 # schema-global index namespace, so a clash with another table's
                 # index is possible and is caller-fixable input → clean 422.
-                raise ValidationError(
-                    f"A unique-key or index name in table {name!r} already "
-                    f"exists in the database: {e}. Constraint/index names are "
-                    f"shared schema-wide — choose a different name (or omit it "
-                    f"to let AKB generate a collision-safe one)."
-                ) from e
+                # 42P07 (DuplicateTableError) reaches here when the clash is
+                # with a *relation* of that name — including this table's own
+                # physical name, which a caller may legally supply. The fusion
+                # case never does: it is caught at the CREATE TABLE call above.
+                raise ValidationError(_ddl_name_clash_message(name, e)) from e
             except (
                 asyncpg.ForeignKeyViolationError,
                 asyncpg.InvalidForeignKeyError,

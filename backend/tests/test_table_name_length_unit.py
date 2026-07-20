@@ -49,6 +49,11 @@ class _FakeConn:
         # so create_table proceeds to the length guard (no ConflictError).
         return None
 
+    async def fetchval(self, sql: str, *params):
+        # Physical-name fusion preflight (issue #285) → name is free, so
+        # create_table proceeds past it to the DDL stage these tests probe.
+        return False
+
 
 class _FakePool:
     def __init__(self, conn):

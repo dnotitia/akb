@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -235,6 +236,29 @@ def _certified_content_hash(md_content: str) -> str:
     """
     _, canonical_body = _parse_markdown(md_content)
     return _body_content_hash(canonical_body)
+
+
+# Vault-name grammar: lowercase alphanumeric segments joined by SINGLE
+# hyphens (no leading / trailing / consecutive hyphens). The physical name
+# of a vault table is `vt_{sanitize(vault)}__{sanitize(table)}` where
+# sanitisation maps `-` → `_` — so a hyphen RUN (or edge hyphen) in a vault
+# name forges the `__` separator and fuses with another vault's namespace:
+# vault `a--b` + table `c` and vault `a` + table `b__c` both map to
+# `vt_a__b__c` (issue #285). Table names already exclude hyphens for the
+# same reason (`table_service._TABLE_NAME_RE`); this closes the vault axis.
+# Enforced at vault creation only, so pre-existing vaults keep working —
+# `create_table`'s physical-name preflight covers those at use time.
+_VAULT_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def validate_vault_name(name: str) -> None:
+    """Raise ValidationError (422) unless `name` fits the vault grammar."""
+    if not name or not _VAULT_NAME_RE.fullmatch(name):
+        raise ValidationError(
+            f"Invalid vault name: '{name}'. Use lowercase letters and "
+            "digits, with single hyphens between segments (no leading, "
+            "trailing, or consecutive hyphens)."
+        )
 
 
 class DocumentService:
@@ -1615,16 +1639,11 @@ class DocumentService:
         public_access: str = "none",
         external_git: dict | None = None,
     ) -> str:
-        vault_repo, doc_repo, coll_repo = await self._repos()
+        # Validate before touching any dependency so a bad name is a pure
+        # 422 with zero side effects.
+        validate_vault_name(name)
 
-        # Validate vault name: lowercase, hyphens, digits only, non-empty.
-        # Raise ValidationError (422) rather than bare ValueError (500).
-        import re as _re
-        if not name or not _re.match(r'^[a-z0-9][a-z0-9-]*$', name):
-            raise ValidationError(
-                f"Invalid vault name: '{name}'. "
-                "Use lowercase letters, digits, and hyphens only. Must start with a letter or digit."
-            )
+        vault_repo, doc_repo, coll_repo = await self._repos()
 
         from app.services.access_service import validate_public_access
         public_access = validate_public_access(public_access)
