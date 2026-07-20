@@ -14,6 +14,7 @@ from app.api.routes import knowledge
 
 VAULT = "graphunit"
 URI = f"akb://{VAULT}/doc/specs/a.md"
+COLLECTION_URI = f"akb://{VAULT}/coll/specs"
 
 
 class _FakeUser:
@@ -69,6 +70,12 @@ def test_graph_uri_and_legacy_vault_select_distinct_union_branches(client, monke
     assert "degree" not in neighbors["nodes"][0]
     assert overview["kind"] == "graph_overview"
     assert set(_overview_payload()).issubset(overview)
+
+
+def test_graph_rejects_collection_uri_before_response_validation(client):
+    response = client.get("/api/v1/graph", params={"uri": COLLECTION_URI})
+    assert response.status_code == 400
+    assert "doc, table, or file" in response.json()["detail"]
 
 
 def test_overview_and_health_keep_existing_nested_shape(client, monkeypatch):

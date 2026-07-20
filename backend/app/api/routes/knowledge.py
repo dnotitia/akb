@@ -221,7 +221,12 @@ async def vault_graph(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     if uri:
-        center_vault, _rtype, _ident = _parse_resource_uri(uri)
+        center_vault, resource_type, _ident = _parse_resource_uri(uri)
+        if resource_type not in {"doc", "table", "file"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Graph resources must be doc, table, or file URIs; got {resource_type}.",
+            )
         vault_name = center_vault
     else:
         if not vault:
