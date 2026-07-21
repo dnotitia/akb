@@ -6,13 +6,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.api.routes import activity as routes
 from app.models.activity import (
     AkbActivityEnvelope,
     AkbDocumentDiffEnvelope,
     AkbDocumentHistoryEnvelope,
     AkbRecentChangesEnvelope,
 )
+
+
+@pytest.fixture
+def routes(monkeypatch, tmp_path):
+    """Import the module only after redirecting its module-level GitService."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from app.api.routes import activity
+
+    return activity
 
 
 def _pool_with(*, rows=(), vault_id="vault-id"):
@@ -30,7 +40,7 @@ def _pool_with(*, rows=(), vault_id="vault-id"):
 
 
 @pytest.mark.asyncio
-async def test_activity_adds_kind_and_preserves_unresolved_author_absence(monkeypatch):
+async def test_activity_adds_kind_and_preserves_unresolved_author_absence(monkeypatch, routes):
     entry = {
         "hash": "abc123",
         "subject": "[update] notes/a.md",
@@ -55,7 +65,7 @@ async def test_activity_adds_kind_and_preserves_unresolved_author_absence(monkey
 
 
 @pytest.mark.asyncio
-async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch):
+async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch, routes):
     rows = [{
         "id": "uuid-1",
         "title": "Nullable",
@@ -90,7 +100,9 @@ async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch):
         }, True),
     ],
 )
-async def test_diff_adds_kind_and_preserves_optional_error(monkeypatch, git_result, has_error):
+async def test_diff_adds_kind_and_preserves_optional_error(
+    monkeypatch, routes, git_result, has_error,
+):
     pool, _ = _pool_with()
     monkeypatch.setattr(routes, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(routes, "check_vault_access", AsyncMock())
@@ -110,7 +122,7 @@ async def test_diff_adds_kind_and_preserves_optional_error(monkeypatch, git_resu
 
 
 @pytest.mark.asyncio
-async def test_history_adds_kind_without_changing_entries(monkeypatch):
+async def test_history_adds_kind_without_changing_entries(monkeypatch, routes):
     entry = {
         "hash": "abc123",
         "message": "update",
