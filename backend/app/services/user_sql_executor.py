@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from typing import Any, Optional
 
@@ -46,6 +47,12 @@ def _coerce_value(v: Any) -> Any:
         return str(v)
     if hasattr(v, "isoformat"):
         return v.isoformat()
+    if isinstance(v, float) and not math.isfinite(v):
+        # NaN / ±Infinity have no JSON representation. The default encoder
+        # emits bare NaN/Infinity tokens — invalid JSON that browser
+        # JSON.parse (and strict parsers) reject — so normalise to null.
+        # PG float8 can produce these via e.g. 'NaN'::float8 or 1e308*10.
+        return None
     if isinstance(v, (int, float, str, bool, type(None))):
         return v
     return str(v)

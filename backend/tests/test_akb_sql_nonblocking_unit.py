@@ -16,11 +16,13 @@ import pytest
 
 from app.config import settings
 from app.api.routes.tables import _stream_json
-from app.services.user_sql_executor import _coerce_rows_yielding
+from app.services.user_sql_executor import _coerce_rows_yielding, _coerce_value
 
-pytestmark = pytest.mark.asyncio
+# Async tests are marked individually (not module-wide) so the one sync test
+# (`test_coerce_value_*`) doesn't get a spurious asyncio mark.
 
 
+@pytest.mark.asyncio
 async def test_coerce_rows_yields_to_loop_and_preserves_all(monkeypatch):
     # Small batch so a modest row count still crosses several batches.
     monkeypatch.setattr(settings, "akb_sql_coerce_batch", 10)
@@ -52,6 +54,7 @@ async def test_coerce_rows_yields_to_loop_and_preserves_all(monkeypatch):
     assert ticks_during >= 1
 
 
+@pytest.mark.asyncio
 async def test_coerce_small_result_fast_path(monkeypatch):
     monkeypatch.setattr(settings, "akb_sql_coerce_batch", 2000)
     rows = [{"x": i} for i in range(5)]
@@ -59,6 +62,67 @@ async def test_coerce_small_result_fast_path(monkeypatch):
     assert out == [{"x": i} for i in range(5)]
 
 
+def test_coerce_value_non_finite_floats_become_null():
+    # NaN / ±Infinity have no JSON representation → normalise to null so the
+    # response is valid JSON on BOTH the REST and MCP paths (Codex #293 P2).
+    assert _coerce_value(float("nan")) is None
+    assert _coerce_value(float("inf")) is None
+    assert _coerce_value(float("-inf")) is None
+    # Finite values pass through untouched.
+    assert _coerce_value(3.14) == 3.14
+    assert _coerce_value(0.0) == 0.0
+    assert _coerce_value(42) == 42
+
+
+@pytest.mark.asyncio
+async def test_coerce_rows_yielding_emits_valid_json_for_non_finite(monkeypatch):
+    monkeypatch.setattr(settings, "akb_sql_coerce_batch", 2000)
+    rows = [{"x": float("nan"), "y": float("inf"), "z": 1.5}]
+    out = await _coerce_rows_yielding(rows)
+    assert out == [{"x": None, "y": None, "z": 1.5}]
+    # The coerced result serialises to strict, parseable JSON — no NaN tokens.
+    body = json.dumps({"items": out})
+    assert "NaN" not in body and "Infinity" not in body
+    assert json.loads(body) == {"items": [{"x": None, "y": None, "z": 1.5}]}
+
+
+@pytest.mark.asyncio
+async def test_mcp_encode_result_yielding_matches_dumps_and_yields():
+    # The MCP path can't stream a single JSON-RPC result, so it chunk-encodes
+    # with yields instead (Codex #293 P1). Output must stay byte-for-value
+    # identical to the json.dumps it replaced.
+    import asyncio
+
+    from mcp_server.server import _encode_result_yielding
+
+    obj = {
+        "kind": "table_query",
+        "items": [{"n": i, "s": f"v{i}"} for i in range(3000)],
+        "total": 3000,
+    }
+    assert await _encode_result_yielding(obj, yield_every=50) == json.dumps(
+        obj, ensure_ascii=False, default=str
+    )
+
+    # And it actually yields to the loop during a large encode.
+    ticks = 0
+    stop = False
+
+    async def _ticker():
+        nonlocal ticks
+        while not stop:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    t = asyncio.create_task(_ticker())
+    await _encode_result_yielding(obj, yield_every=50)
+    during = ticks
+    stop = True
+    await t
+    assert during >= 1
+
+
+@pytest.mark.asyncio
 async def test_stream_json_emits_one_valid_document_equal_to_dumps():
     obj = {
         "kind": "table_query",
