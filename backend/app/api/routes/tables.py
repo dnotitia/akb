@@ -1,10 +1,10 @@
 """REST API routes for vault tables (structured data)."""
 
-from typing import Any, AsyncIterator, Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
 from pydantic import ConfigDict
+from pydantic_core import to_json
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
@@ -32,7 +32,6 @@ from app.util.errors import (
     UNIQUE_VIOLATION,
     VAULT_ARCHIVED,
 )
-from app.util.json_encode import iter_json_chunks
 from app.util.text import NFCModel
 
 router = APIRouter()
@@ -83,20 +82,6 @@ class SqlRequest(NFCModel):
     sql: str
     params: list[Any] | None = None
     vaults: list[str] | None = None
-
-
-async def _stream_json(obj: Any, *, flush_bytes: int = 65536, yield_every: int = 1000) -> AsyncIterator[bytes]:
-    """Stream `obj` as JSON bytes without blocking the event loop.
-
-    A large `akb_sql` result serialised in one `json.dumps` blocks the single
-    event loop for seconds → /livez probe timeout → 503. Delegates to the shared
-    chunked encoder (`app.util.json_encode`); `compact=True` matches Starlette's
-    default `JSONResponse` separators, so the streamed body stays byte-identical
-    to the old dict return, and the full result is streamed (no truncation)."""
-    async for chunk in iter_json_chunks(
-        obj, compact=True, flush_bytes=flush_bytes, yield_every=yield_every
-    ):
-        yield chunk.encode("utf-8")
 
 
 class QueryRowsRequest(NFCModel):
@@ -234,10 +219,13 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             is_admin=user.is_admin,
         )
     )
-    # Stream the JSON so serialising a large result set never blocks the event
-    # loop. Errors (permission/SQL) already raised above, before the response
-    # starts, so streaming only ever carries a success envelope.
-    return StreamingResponse(_stream_json(result), media_type="application/json")
+    # Serialise with pydantic-core (Rust) instead of FastAPI's default
+    # jsonable_encoder + json.dumps: a large `akb_sql` result (rows already
+    # coerced to JSON-native types + NaN→null in user_sql_executor) encodes in
+    # one fast pass (~0.4s for a 205MB result) that keeps the single event-loop
+    # block well under the /livez probe timeout. Errors were raised above,
+    # before this point, so we only ever serialise a success envelope.
+    return Response(to_json(result), media_type="application/json")
 
 
 @router.get(

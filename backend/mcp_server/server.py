@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent
+from pydantic_core import to_json
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
@@ -55,7 +56,6 @@ from app.util.errors import (
     UNKNOWN_TOOL,
     WRITE_BUSY,
 )
-from app.util.json_encode import encode_json_str
 from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
@@ -1384,18 +1384,16 @@ async def call_tool(name: str, arguments: dict):
     try:
         result = await _dispatch(name, arguments, user)
         audit_log.record_tool(name, arguments, user, result)
-        # Build the tool-result JSON via the shared bounded-chunk encoder
-        # (cooperative + bounded memory vs a single json.dumps; same bytes as
-        # the old json.dumps(default=str)). NOTE: this only covers OUR encode —
+        # Serialise the tool result with pydantic-core (Rust) — one fast pass
+        # (~0.4s for a 205MB result); the result is already coerced to JSON-
+        # native types (NaN→null) upstream. NOTE: this only covers OUR encode —
         # the MCP SDK transport then re-serialises the whole JSON-RPC message
-        # synchronously (streamable_http.py / stdio.py `model_dump_json`), so a
-        # pathologically large result can still stall the loop for ~1s at the
-        # transport. Accepted tradeoff: bounded by the liveness probe tolerance
-        # and discouraged by the akb_sql LIMIT hint (fixing it would need a
-        # result-size cap or an SDK patch — deliberately not done).
-        return [
-            TextContent(type="text", text=await encode_json_str(result, default=str))
-        ]
+        # synchronously (streamable_http.py / stdio.py `model_dump_json`, also
+        # pydantic-core), so a pathologically large result can still block the
+        # loop ~0.3s at the transport. Accepted tradeoff: bounded by the liveness
+        # probe tolerance and discouraged by the akb_sql LIMIT hint (fixing it
+        # would need a result-size cap or an SDK patch — deliberately not done).
+        return [TextContent(type="text", text=to_json(result).decode("utf-8"))]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
