@@ -104,6 +104,8 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("post", "/api/v1/relations"): "#/components/schemas/AkbRelationLinkEnvelope",
     ("delete", "/api/v1/relations"): "#/components/schemas/AkbRelationUnlinkEnvelope",
     ("get", "/api/v1/provenance"): "#/components/schemas/AkbProvenanceEnvelope",
+    ("post", "/api/v1/collections/{vault}"): "#/components/schemas/AkbCollectionCreateEnvelope",
+    ("delete", "/api/v1/collections/{vault}/{path}"): "#/components/schemas/AkbCollectionDeleteEnvelope",
 }
 KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS: dict[tuple[str, str], dict[str, str | None]] = {
     ("post", "/api/v1/tables/{vault}/{table}/rows"): {
@@ -265,6 +267,42 @@ def _error_description(status: str) -> str:
 
 def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
     return {
+        "AkbCollectionSummary": {
+            "type": "object",
+            "required": ["path", "name", "summary", "doc_count"],
+            "properties": {
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "summary": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "doc_count": {"type": "integer"},
+            },
+        },
+        "AkbCollectionCreateEnvelope": {
+            "type": "object",
+            "required": ["kind", "ok", "created", "collection"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["collection_create"]},
+                "ok": {"type": "boolean", "enum": [True]},
+                "created": {"type": "boolean"},
+                "collection": {"$ref": "#/components/schemas/AkbCollectionSummary"},
+            },
+        },
+        "AkbCollectionDeleteEnvelope": {
+            "type": "object",
+            "required": [
+                "kind", "ok", "collection", "deleted_docs", "deleted_files",
+                "deleted_sub_collections", "deleted_tables",
+            ],
+            "properties": {
+                "kind": {"type": "string", "enum": ["collection_delete"]},
+                "ok": {"type": "boolean", "enum": [True]},
+                "collection": {"type": "string"},
+                "deleted_docs": {"type": "integer"},
+                "deleted_files": {"type": "integer"},
+                "deleted_sub_collections": {"type": "integer"},
+                "deleted_tables": {"type": "integer"},
+            },
+        },
         "AkbSuccessEnvelope": {
             "description": "HTTP success envelope union. SDKs unwrap this to {data,error}.",
             "oneOf": [
@@ -287,6 +325,8 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 {"$ref": "#/components/schemas/AkbRelationLinkEnvelope"},
                 {"$ref": "#/components/schemas/AkbRelationUnlinkEnvelope"},
                 {"$ref": "#/components/schemas/AkbProvenanceEnvelope"},
+                {"$ref": "#/components/schemas/AkbCollectionCreateEnvelope"},
+                {"$ref": "#/components/schemas/AkbCollectionDeleteEnvelope"},
             ],
             "discriminator": {
                 "propertyName": "kind",
@@ -310,6 +350,8 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
                     "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
                     "provenance": "#/components/schemas/AkbProvenanceEnvelope",
+                    "collection_create": "#/components/schemas/AkbCollectionCreateEnvelope",
+                    "collection_delete": "#/components/schemas/AkbCollectionDeleteEnvelope",
                 },
             },
         },

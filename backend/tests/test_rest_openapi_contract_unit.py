@@ -113,6 +113,8 @@ def test_success_envelope_components_are_kind_discriminated():
             "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
             "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
             "provenance": "#/components/schemas/AkbProvenanceEnvelope",
+            "collection_create": "#/components/schemas/AkbCollectionCreateEnvelope",
+            "collection_delete": "#/components/schemas/AkbCollectionDeleteEnvelope",
         },
     }
     for name, kind in (
@@ -135,6 +137,8 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbRelationLinkEnvelope", "relation_link"),
         ("AkbRelationUnlinkEnvelope", "relation_unlink"),
         ("AkbProvenanceEnvelope", "provenance"),
+        ("AkbCollectionCreateEnvelope", "collection_create"),
+        ("AkbCollectionDeleteEnvelope", "collection_delete"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
@@ -177,6 +181,8 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/relations", "post", "200"): "AkbRelationLinkEnvelope",
         ("/api/v1/relations", "delete", "200"): "AkbRelationUnlinkEnvelope",
         ("/api/v1/provenance", "get", "200"): "AkbProvenanceEnvelope",
+        ("/api/v1/collections/{vault}", "post", "200"): "AkbCollectionCreateEnvelope",
+        ("/api/v1/collections/{vault}/{path}", "delete", "200"): "AkbCollectionDeleteEnvelope",
     }
     for (path, method, status), component in expected.items():
         success_schema = (
@@ -275,6 +281,53 @@ def test_document_openapi_contract_is_codegen_typed():
     assert {"kind", "uri", "vault", "path", "commit_hash", "chunks_indexed", "entities_found"}.issubset(
         write["required"]
     )
+
+
+def test_collection_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    create = paths["/api/v1/collections/{vault}"]["post"]
+    delete = paths["/api/v1/collections/{vault}/{path}"]["delete"]
+
+    assert create["operationId"] == "collectionsCreateCollection"
+    assert delete["operationId"] == "collectionsDeleteCollection"
+    assert create["tags"] == ["collections"]
+    assert delete["tags"] == ["collections"]
+    assert create["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CreateCollectionRequest"
+    }
+    recursive = next(param for param in delete["parameters"] if param["name"] == "recursive")
+    assert recursive["in"] == "query"
+    assert recursive["schema"]["type"] == "boolean"
+
+    schemas = schema["components"]["schemas"]
+    summary = schemas["AkbCollectionSummary"]
+    assert {"path", "name", "summary", "doc_count"} == set(summary["required"])
+    assert summary["properties"]["summary"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
+    create_envelope = schemas["AkbCollectionCreateEnvelope"]
+    assert {"kind", "ok", "created", "collection"} == set(create_envelope["required"])
+    assert create_envelope["properties"]["kind"]["enum"] == ["collection_create"]
+    delete_envelope = schemas["AkbCollectionDeleteEnvelope"]
+    assert {
+        "kind", "ok", "collection", "deleted_docs", "deleted_files",
+        "deleted_sub_collections", "deleted_tables",
+    } == set(delete_envelope["required"])
+    assert delete_envelope["properties"]["kind"]["enum"] == ["collection_delete"]
+
+    for operation, component in (
+        (create, "AkbCollectionCreateEnvelope"),
+        (delete, "AkbCollectionDeleteEnvelope"),
+    ):
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{component}"
+        }
+        for status in ERROR_STATUSES:
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
 
 def test_search_openapi_contract_is_codegen_typed():
