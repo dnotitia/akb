@@ -68,8 +68,14 @@ ASK_BASH = [
 SECRET_PATH_PATTERNS = [
     re.compile(r"(^|/)\.env(\.|$)"),
     re.compile(r"(^|/)config/secret\.ya?ml$"),
-    re.compile(r"(^|/)backend/config/"),
-    re.compile(r"(^|/)deploy/k8s/(internal|aws-internal|aws-demo-internal)(/|$)"),
+    # Actual secret files inside backend/config or the deploy overlays are
+    # still caught by the generic secret/credential pattern below (e.g.
+    # deploy/k8s/internal/secret.yaml). The overlays themselves are ordinary
+    # (non-secret) config — real credentials live in the manually-managed
+    # akb-secret-config Secret / sealed-secrets / vault, never committed here —
+    # so we no longer blanket-block the whole internal/ tree (it was too broad:
+    # it even tripped on unrelated commands that merely mentioned the path).
+    re.compile(r"(^|/)backend/config/secret\.ya?ml$"),
     re.compile(r"(^|/)(secrets?|credentials?)(/|\.|$)", re.IGNORECASE),
 ]
 
