@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import tempfile
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
+
+# The route module constructs DocumentService at import time. Keep this unit
+# test independent of the deployment-only default `/data/vaults` path.
+settings.git_storage_path = tempfile.mkdtemp(prefix="akb-collection-routes-test-")
+
 from app.api.deps import get_current_user
-from app.api.routes import collections
-from app.main import app
-from app.services.collection_service import CollectionNotEmptyError
+from app.api.routes import collections  # noqa: E402
+from app.main import app  # noqa: E402
+from app.services.collection_service import CollectionNotEmptyError  # noqa: E402
 
 
 class _FakeUser:
