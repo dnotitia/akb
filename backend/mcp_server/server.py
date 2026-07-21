@@ -55,6 +55,7 @@ from app.util.errors import (
     UNKNOWN_TOOL,
     WRITE_BUSY,
 )
+from app.util.json_encode import encode_json_str
 from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
@@ -1375,26 +1376,6 @@ async def list_tools():
     return TOOLS
 
 
-async def _encode_result_yielding(result: Any, *, yield_every: int = 1000) -> str:
-    """Serialise a tool result to a JSON string WITHOUT blocking the loop.
-
-    `call_tool` runs on the single MCP event loop. A large result (e.g. a
-    million-row `akb_sql`) handed to one synchronous `json.dumps` holds the
-    loop for seconds → `/livez` probe timeout → 503. The REST route streams
-    for the same reason; an MCP tool result is a single JSON-RPC payload that
-    can't be streamed, so we chunk the encode via `iterencode` and
-    `await asyncio.sleep(0)` between chunks. Same `ensure_ascii`/`default`
-    behaviour as the previous `json.dumps`, so the wire bytes are unchanged.
-    """
-    encoder = json.JSONEncoder(ensure_ascii=False, default=str)
-    parts: list[str] = []
-    for i, piece in enumerate(encoder.iterencode(result), 1):
-        parts.append(piece)
-        if i % yield_every == 0:
-            await asyncio.sleep(0)
-    return "".join(parts)
-
-
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     # Resolve the actor once and reuse it for both dispatch and the audit
@@ -1403,7 +1384,14 @@ async def call_tool(name: str, arguments: dict):
     try:
         result = await _dispatch(name, arguments, user)
         audit_log.record_tool(name, arguments, user, result)
-        return [TextContent(type="text", text=await _encode_result_yielding(result))]
+        # A large result (e.g. a million-row akb_sql) handed to one synchronous
+        # json.dumps holds this MCP event loop for seconds → /livez timeout →
+        # 503. An MCP result is a single JSON-RPC payload (can't stream), so
+        # build it via the shared bounded-chunk encoder — loop stays responsive,
+        # bounded memory, same bytes as the old json.dumps(default=str).
+        return [
+            TextContent(type="text", text=await encode_json_str(result, default=str))
+        ]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including

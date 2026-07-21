@@ -1,7 +1,5 @@
 """REST API routes for vault tables (structured data)."""
 
-import asyncio
-import json
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
@@ -34,6 +32,7 @@ from app.util.errors import (
     UNIQUE_VIOLATION,
     VAULT_ARCHIVED,
 )
+from app.util.json_encode import iter_json_chunks
 from app.util.text import NFCModel
 
 router = APIRouter()
@@ -87,31 +86,17 @@ class SqlRequest(NFCModel):
 
 
 async def _stream_json(obj: Any, *, flush_bytes: int = 65536, yield_every: int = 1000) -> AsyncIterator[bytes]:
-    """Serialise `obj` to JSON incrementally, yielding to the event loop.
+    """Stream `obj` as JSON bytes without blocking the event loop.
 
-    A large `akb_sql` result (e.g. a million-row SELECT) serialised in one
-    `json.dumps` call blocks the single event loop for seconds → /livez probe
-    timeout → 503. `JSONEncoder.iterencode` produces the same JSON document
-    piece by piece; we batch pieces into ~64 KiB network chunks and
-    `await asyncio.sleep(0)` periodically so the loop stays responsive. The
-    client still receives one ordinary JSON document (no contract change), and
-    the full result is streamed (no truncation)."""
-    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
-    buf: list[str] = []
-    size = 0
-    n = 0
-    for piece in encoder.iterencode(obj):
-        buf.append(piece)
-        size += len(piece)
-        n += 1
-        if size >= flush_bytes:
-            yield "".join(buf).encode("utf-8")
-            buf.clear()
-            size = 0
-        if n % yield_every == 0:
-            await asyncio.sleep(0)
-    if buf:
-        yield "".join(buf).encode("utf-8")
+    A large `akb_sql` result serialised in one `json.dumps` blocks the single
+    event loop for seconds → /livez probe timeout → 503. Delegates to the shared
+    chunked encoder (`app.util.json_encode`); `compact=True` matches Starlette's
+    default `JSONResponse` separators, so the streamed body stays byte-identical
+    to the old dict return, and the full result is streamed (no truncation)."""
+    async for chunk in iter_json_chunks(
+        obj, compact=True, flush_bytes=flush_bytes, yield_every=yield_every
+    ):
+        yield chunk.encode("utf-8")
 
 
 class QueryRowsRequest(NFCModel):

@@ -17,6 +17,7 @@ import pytest
 from app.config import settings
 from app.api.routes.tables import _stream_json
 from app.services.user_sql_executor import _coerce_rows_yielding, _coerce_value
+from app.util.json_encode import encode_json_str, iter_json_chunks
 
 # Async tests are marked individually (not module-wide) so the one sync test
 # (`test_coerce_value_*`) doesn't get a spurious asyncio mark.
@@ -87,22 +88,31 @@ async def test_coerce_rows_yielding_emits_valid_json_for_non_finite(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_mcp_encode_result_yielding_matches_dumps_and_yields():
+async def test_encode_json_str_matches_dumps_yields_and_bounds_chunks():
     # The MCP path can't stream a single JSON-RPC result, so it chunk-encodes
-    # with yields instead (Codex #293 P1). Output must stay byte-for-value
-    # identical to the json.dumps it replaced.
+    # into one string via the shared encoder (Codex #293 P1). Imported from the
+    # side-effect-free util module (NOT mcp_server.server, whose module-level
+    # DocumentService/GitService would touch /data/vaults) so the test is
+    # hermetic (Codex re-review P2). Output must stay byte-for-value identical
+    # to the json.dumps it replaced.
     import asyncio
-
-    from mcp_server.server import _encode_result_yielding
 
     obj = {
         "kind": "table_query",
         "items": [{"n": i, "s": f"v{i}"} for i in range(3000)],
         "total": 3000,
     }
-    assert await _encode_result_yielding(obj, yield_every=50) == json.dumps(
+    assert await encode_json_str(obj, default=str) == json.dumps(
         obj, ensure_ascii=False, default=str
     )
+
+    # Fragments are coalesced into BOUNDED chunks (not one giant string, and not
+    # millions of tiny fragments held at once) — several ~flush_bytes chunks.
+    chunks = [c async for c in iter_json_chunks(obj, default=str, flush_bytes=4096)]
+    assert len(chunks) > 1
+    assert all(isinstance(c, str) for c in chunks)
+    # No chunk wildly exceeds the flush size (bounded buffering).
+    assert max(len(c) for c in chunks) < 4096 * 4
 
     # And it actually yields to the loop during a large encode.
     ticks = 0
@@ -115,7 +125,7 @@ async def test_mcp_encode_result_yielding_matches_dumps_and_yields():
             ticks += 1
 
     t = asyncio.create_task(_ticker())
-    await _encode_result_yielding(obj, yield_every=50)
+    await encode_json_str(obj, default=str, yield_every=50)
     during = ticks
     stop = True
     await t
