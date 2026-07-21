@@ -1384,11 +1384,15 @@ async def call_tool(name: str, arguments: dict):
     try:
         result = await _dispatch(name, arguments, user)
         audit_log.record_tool(name, arguments, user, result)
-        # A large result (e.g. a million-row akb_sql) handed to one synchronous
-        # json.dumps holds this MCP event loop for seconds → /livez timeout →
-        # 503. An MCP result is a single JSON-RPC payload (can't stream), so
-        # build it via the shared bounded-chunk encoder — loop stays responsive,
-        # bounded memory, same bytes as the old json.dumps(default=str).
+        # Build the tool-result JSON via the shared bounded-chunk encoder
+        # (cooperative + bounded memory vs a single json.dumps; same bytes as
+        # the old json.dumps(default=str)). NOTE: this only covers OUR encode —
+        # the MCP SDK transport then re-serialises the whole JSON-RPC message
+        # synchronously (streamable_http.py / stdio.py `model_dump_json`), so a
+        # pathologically large result can still stall the loop for ~1s at the
+        # transport. Accepted tradeoff: bounded by the liveness probe tolerance
+        # and discouraged by the akb_sql LIMIT hint (fixing it would need a
+        # result-size cap or an SDK patch — deliberately not done).
         return [
             TextContent(type="text", text=await encode_json_str(result, default=str))
         ]
