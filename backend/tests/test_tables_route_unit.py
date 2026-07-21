@@ -15,7 +15,11 @@ class _User:
 
 
 @pytest.mark.asyncio
-async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
+async def test_execute_sql_route_serialises_envelope_and_forwards_params(monkeypatch) -> None:
+    import json
+
+    from starlette.responses import Response
+
     from app.api.routes import tables
 
     captured: dict[str, Any] = {}
@@ -36,7 +40,13 @@ async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
         _User(),  # type: ignore[arg-type]
     )
 
-    assert result["kind"] == "table_query"
+    # The route serialises the envelope with pydantic-core (Rust) into one
+    # `Response` — a single fast pass that keeps the event-loop block far under
+    # the /livez probe timeout. The body is one ordinary JSON document.
+    assert isinstance(result, Response)
+    assert result.media_type == "application/json"
+    envelope = json.loads(result.body)
+    assert envelope["kind"] == "table_query"
     assert captured == {
         "vault_names": ["demo"],
         "user_id": _User.user_id,

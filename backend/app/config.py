@@ -91,6 +91,14 @@ class Settings(BaseModel):
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 
+    # `akb_sql` / REST SQL: rows are coerced to JSON dicts on the single event
+    # loop. A huge SELECT (`SELECT * FROM generate_series(1, 2e6)`) coerced in
+    # one pass blocks the loop for seconds → /livez probe timeout → 503. We
+    # coerce in batches of this size, yielding to the loop between batches, so
+    # the result is NOT truncated (akb_sql is arbitrary SQL — callers bound
+    # their own results with LIMIT) but the loop stays responsive.
+    akb_sql_coerce_batch: int = 2000
+
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 
