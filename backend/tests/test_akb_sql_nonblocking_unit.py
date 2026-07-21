@@ -7,11 +7,15 @@ serialisation. Fixes:
 
   - Coercion (`_coerce_rows_yielding`) runs in `akb_sql_coerce_batch` chunks
     with `await asyncio.sleep(0)` between batches so the loop stays responsive.
-  - Serialisation uses pydantic-core (Rust) `to_json` — one fast pass
-    (~7-10x less CPU than driving stdlib `iterencode` fragment-by-fragment in
-    Python) — on BOTH the REST route (`tables.execute_sql`) and the MCP tool
-    result (`server.call_tool`), with `inf_nan_mode="null"` so a PG float8
-    NaN/±Inf serialises to `null` (valid JSON) instead of a bare NaN token.
+    This is shared by BOTH surfaces (REST route and MCP tool).
+  - Serialisation on the REST route (`tables.execute_sql`) uses pydantic-core
+    (Rust) `to_json` — one fast pass (~7-10x less CPU than driving stdlib
+    `iterencode` fragment-by-fragment in Python) — with `inf_nan_mode="null"`
+    so a PG float8 NaN/±Inf serialises to `null` (valid JSON) instead of a bare
+    NaN token that the table viewer's JSON.parse rejects. The MCP tool result
+    (`server.call_tool`) keeps its pre-hardening `json.dumps(default=str)` so
+    the MCP wire format stays byte-identical for every tool; these tests pin the
+    REST serialisation behaviour.
 
 The result is NOT truncated (akb_sql is arbitrary SQL; callers bound their own
 rows via LIMIT). DB-free. Runs in `pytest -k 'not _e2e'`.
@@ -71,8 +75,8 @@ async def test_coerce_small_result_fast_path(monkeypatch):
 def test_non_finite_floats_serialise_to_null():
     # A PG float8 NaN/±Inf has no JSON representation; `to_json`'s default mode
     # emits bare NaN/Infinity — invalid JSON that browser JSON.parse rejects.
-    # Both serialisation boundaries (REST + MCP) pass inf_nan_mode="null" so it
-    # renders as `null` in the Rust pass; finite floats are untouched.
+    # The REST route passes inf_nan_mode="null" so it renders as `null` in the
+    # Rust pass; finite floats are untouched.
     body = to_json(
         {"a": float("nan"), "b": float("inf"), "c": float("-inf"), "d": 1.5},
         inf_nan_mode="null",
@@ -83,9 +87,9 @@ def test_non_finite_floats_serialise_to_null():
 
 @pytest.mark.asyncio
 async def test_coerced_envelope_serialises_to_valid_json(monkeypatch):
-    # The full path both transports use: coerce rows, then to_json with
-    # inf_nan_mode="null". Non-finite floats survive coercion and become null
-    # only at serialisation. Must be strict, parseable JSON.
+    # The full REST path: coerce rows, then to_json with inf_nan_mode="null".
+    # Non-finite floats survive coercion and become null only at serialisation.
+    # Must be strict, parseable JSON.
     monkeypatch.setattr(settings, "akb_sql_coerce_batch", 2000)
     rows = [
         {"x": float("nan"), "y": float("inf"), "z": 1.5},
@@ -94,7 +98,7 @@ async def test_coerced_envelope_serialises_to_valid_json(monkeypatch):
     items = await _coerce_rows_yielding(rows)
     envelope = {"kind": "table_query", "columns": ["x", "y", "z"], "items": items, "total": len(items)}
 
-    text = to_json(envelope, inf_nan_mode="null").decode("utf-8")  # exactly what REST/MCP emit
+    text = to_json(envelope, inf_nan_mode="null").decode("utf-8")  # exactly what the REST route emits
     assert "NaN" not in text and "Infinity" not in text
     assert json.loads(text) == {
         "kind": "table_query",

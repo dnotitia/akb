@@ -27,7 +27,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent
-from pydantic_core import to_json
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
@@ -1384,23 +1383,17 @@ async def call_tool(name: str, arguments: dict):
     try:
         result = await _dispatch(name, arguments, user)
         audit_log.record_tool(name, arguments, user, result)
-        # Serialise the tool result with pydantic-core (Rust) — one fast pass
-        # (~0.4s for a 205MB result); the result is already coerced to JSON-
-        # native types (NaN→null) upstream. NOTE: this only covers OUR encode —
-        # the MCP SDK transport then re-serialises the whole JSON-RPC message
-        # synchronously (streamable_http.py / stdio.py `model_dump_json`, also
-        # pydantic-core), so a pathologically large result can still block the
-        # loop ~0.3s at the transport. Accepted tradeoff: bounded by the liveness
-        # probe tolerance and discouraged by the akb_sql LIMIT hint (fixing it
-        # would need a result-size cap or an SDK patch — deliberately not done).
-        return [
-            TextContent(
-                type="text",
-                # inf_nan_mode="null": any non-finite float in any tool result
-                # serialises to `null` (valid JSON) instead of a bare NaN token.
-                text=to_json(result, inf_nan_mode="null").decode("utf-8"),
-            )
-        ]
+        # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
+        # so the MCP wire format stays byte-identical for every tool (datetime →
+        # `str()` space form, Enum → `str()`, unknown → stringified). The
+        # akb_sql event-loop fix lives where the measured symptom was — the
+        # non-blocking row coercion in UserSqlExecutor (shared by both surfaces)
+        # and the Rust `to_json(inf_nan_mode="null")` serialisation on the REST
+        # `/tables/{vault}/sql` route (the table viewer + snapshot consumer). We
+        # deliberately do NOT switch this MCP encode to `to_json`: it would shift
+        # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
+        # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including

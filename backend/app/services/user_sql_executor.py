@@ -41,12 +41,15 @@ logger = logging.getLogger("akb.user_sql")
 
 
 def _coerce_value(v: Any) -> Any:
-    """Make `v` JSON-friendly for the MCP response envelope.
+    """Make `v` JSON-friendly for the akb_sql response envelope.
 
-    Non-finite floats (NaN/±Inf) are left as-is here and normalised to `null`
-    at the serialisation boundary via `to_json(..., inf_nan_mode="null")`, which
-    covers every serialised path in one place rather than a per-value check on
-    this hot loop.
+    Non-finite floats (NaN/±Inf) are left as-is here — they are normalised to
+    `null` only on the REST `tables.execute_sql` route, which serialises the
+    envelope with `to_json(..., inf_nan_mode="null")` (the table viewer +
+    snapshot consumer that a bare `NaN` token broke). The MCP `server.call_tool`
+    path keeps its pre-hardening `json.dumps(default=str)` for byte-identical
+    wire compatibility, so a non-finite float there still renders as a bare
+    token exactly as before — a pre-existing edge, not widened by this change.
     """
     if isinstance(v, uuid.UUID):
         return str(v)
@@ -217,7 +220,11 @@ class UserSqlExecutor:
                         return {
                             "kind": "table_query",
                             "vaults": vault_names or [],
-                            "columns": list(rows[0].keys()) if rows else [],
+                            # dict(...) collapses duplicate column labels the
+                            # same way each coerced `items` row does, so columns
+                            # and row keys stay consistent for `SELECT id, id`
+                            # or cross-vault joins that share a column name.
+                            "columns": list(dict(rows[0]).keys()) if rows else [],
                             "items": items,
                             "total": len(rows),
                         }
