@@ -6,28 +6,28 @@ pure-Python CPU steps on the single event loop: per-row coercion and JSON
 serialisation. Fixes:
 
   - Coercion (`_coerce_rows_yielding`) runs in `akb_sql_coerce_batch` chunks
-    with `await asyncio.sleep(0)` between batches, and normalises non-finite
-    floats (NaN/±Inf) to null so the output is valid JSON.
+    with `await asyncio.sleep(0)` between batches so the loop stays responsive.
   - Serialisation uses pydantic-core (Rust) `to_json` — one fast pass
     (~7-10x less CPU than driving stdlib `iterencode` fragment-by-fragment in
-    Python) whose single loop block stays far under the /livez probe timeout —
-    on BOTH the REST route (`tables.execute_sql`) and the MCP tool result
-    (`server.call_tool`).
+    Python) — on BOTH the REST route (`tables.execute_sql`) and the MCP tool
+    result (`server.call_tool`), with `inf_nan_mode="null"` so a PG float8
+    NaN/±Inf serialises to `null` (valid JSON) instead of a bare NaN token.
 
 The result is NOT truncated (akb_sql is arbitrary SQL; callers bound their own
 rows via LIMIT). DB-free. Runs in `pytest -k 'not _e2e'`.
 """
 
+import asyncio
 import json
 
 import pytest
 from pydantic_core import to_json
 
 from app.config import settings
-from app.services.user_sql_executor import _coerce_rows_yielding, _coerce_value
+from app.services.user_sql_executor import _coerce_rows_yielding
 
-# Async tests are marked individually (not module-wide) so the one sync test
-# (`test_coerce_value_*`) doesn't get a spurious asyncio mark.
+# The async tests are marked individually so the one sync test
+# (`test_non_finite_floats_serialise_to_null`) doesn't get a spurious mark.
 
 
 @pytest.mark.asyncio
@@ -42,11 +42,9 @@ async def test_coerce_rows_yields_to_loop_and_preserves_all(monkeypatch):
     async def _ticker():
         nonlocal ticks
         while not stop:
-            import asyncio
             await asyncio.sleep(0)
             ticks += 1
 
-    import asyncio
     t = asyncio.create_task(_ticker())
     out = await _coerce_rows_yielding(rows)
     ticks_during = ticks  # accumulated while the coercion was yielding
@@ -70,33 +68,37 @@ async def test_coerce_small_result_fast_path(monkeypatch):
     assert out == [{"x": i} for i in range(5)]
 
 
-def test_coerce_value_non_finite_floats_become_null():
-    # NaN / ±Infinity have no JSON representation. pydantic-core `to_json` (like
-    # stdlib) would emit bare NaN/Infinity tokens — invalid JSON that browser
-    # JSON.parse rejects — so coercion normalises them to null upstream, on both
-    # the REST and MCP paths.
-    assert _coerce_value(float("nan")) is None
-    assert _coerce_value(float("inf")) is None
-    assert _coerce_value(float("-inf")) is None
-    # Finite values pass through untouched.
-    assert _coerce_value(3.14) == 3.14
-    assert _coerce_value(0.0) == 0.0
-    assert _coerce_value(42) == 42
+def test_non_finite_floats_serialise_to_null():
+    # A PG float8 NaN/±Inf has no JSON representation; `to_json`'s default mode
+    # emits bare NaN/Infinity — invalid JSON that browser JSON.parse rejects.
+    # Both serialisation boundaries (REST + MCP) pass inf_nan_mode="null" so it
+    # renders as `null` in the Rust pass; finite floats are untouched.
+    body = to_json(
+        {"a": float("nan"), "b": float("inf"), "c": float("-inf"), "d": 1.5},
+        inf_nan_mode="null",
+    ).decode("utf-8")
+    assert "NaN" not in body and "Infinity" not in body
+    assert json.loads(body) == {"a": None, "b": None, "c": None, "d": 1.5}
 
 
 @pytest.mark.asyncio
-async def test_coerced_envelope_serialises_to_valid_json_via_to_json(monkeypatch):
-    # The full serialisation path both transports now use: coerce (incl.
-    # NaN→null), then pydantic-core `to_json`. Must be strict, parseable JSON.
+async def test_coerced_envelope_serialises_to_valid_json(monkeypatch):
+    # The full path both transports use: coerce rows, then to_json with
+    # inf_nan_mode="null". Non-finite floats survive coercion and become null
+    # only at serialisation. Must be strict, parseable JSON.
     monkeypatch.setattr(settings, "akb_sql_coerce_batch", 2000)
-    rows = [{"x": float("nan"), "y": float("inf"), "z": 1.5}, {"x": 2.0, "y": -1.0, "z": 3.0}]
+    rows = [
+        {"x": float("nan"), "y": float("inf"), "z": 1.5},
+        {"x": 2.0, "y": -1.0, "z": 3.0},
+    ]
     items = await _coerce_rows_yielding(rows)
-    assert items[0] == {"x": None, "y": None, "z": 1.5}
-
     envelope = {"kind": "table_query", "columns": ["x", "y", "z"], "items": items, "total": len(items)}
-    body = to_json(envelope)  # bytes, exactly what REST/MCP emit
-    assert isinstance(body, (bytes, bytearray))
-    text = body.decode("utf-8")
-    # No non-finite tokens leaked; round-trips to the same structure.
+
+    text = to_json(envelope, inf_nan_mode="null").decode("utf-8")  # exactly what REST/MCP emit
     assert "NaN" not in text and "Infinity" not in text
-    assert json.loads(text) == envelope
+    assert json.loads(text) == {
+        "kind": "table_query",
+        "columns": ["x", "y", "z"],
+        "items": [{"x": None, "y": None, "z": 1.5}, {"x": 2.0, "y": -1.0, "z": 3.0}],
+        "total": 2,
+    }

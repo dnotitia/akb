@@ -1393,7 +1393,14 @@ async def call_tool(name: str, arguments: dict):
         # loop ~0.3s at the transport. Accepted tradeoff: bounded by the liveness
         # probe tolerance and discouraged by the akb_sql LIMIT hint (fixing it
         # would need a result-size cap or an SDK patch — deliberately not done).
-        return [TextContent(type="text", text=to_json(result).decode("utf-8"))]
+        return [
+            TextContent(
+                type="text",
+                # inf_nan_mode="null": any non-finite float in any tool result
+                # serialises to `null` (valid JSON) instead of a bare NaN token.
+                text=to_json(result, inf_nan_mode="null").decode("utf-8"),
+            )
+        ]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including

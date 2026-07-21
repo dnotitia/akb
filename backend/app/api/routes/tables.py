@@ -225,7 +225,9 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     # one fast pass (~0.4s for a 205MB result) that keeps the single event-loop
     # block well under the /livez probe timeout. Errors were raised above,
     # before this point, so we only ever serialise a success envelope.
-    return Response(to_json(result), media_type="application/json")
+    # inf_nan_mode="null" so a PG float8 NaN/±Inf in the result serialises to
+    # `null` (valid JSON) instead of a bare NaN/Infinity token, in the Rust pass.
+    return Response(to_json(result, inf_nan_mode="null"), media_type="application/json")
 
 
 @router.get(
