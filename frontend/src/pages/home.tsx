@@ -53,9 +53,12 @@ type ConnectMode = "pat" | "oauth";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 
-// Recent-activity fetch size. The list shows this many; when the result is
-// full we render the count as "N+" rather than implying it's the grand total.
+// Recent-activity fetch size. The list starts with this many; "Show more"
+// grows it (doubling — "this many again") up to RECENT_MAX. When a fetch comes
+// back full we render the count as "N+" rather than implying it's the total.
 const RECENT_LIMIT = 8;
+// Backend /recent caps `limit` at 100, so that's the ceiling for "Show more".
+const RECENT_MAX = 100;
 // How many vaults the Home preview shows before linking out to /vault.
 const VAULT_PREVIEW_LIMIT = 6;
 
@@ -81,6 +84,8 @@ export default function HomePage() {
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
+  const [recentLimit, setRecentLimit] = useState(RECENT_LIMIT);
+  const [recentLoadingMore, setRecentLoadingMore] = useState(false);
   const [pats, setPats] = useState<PATRow[]>([]);
   const [pendingRevoke, setPendingRevoke] = useState<PATRow | null>(null);
   const [activePat, setActivePat] = useState<string | null>(null);
@@ -93,7 +98,9 @@ export default function HomePage() {
   const [quickstartOpen, setQuickstartOpen] = useState(false);
   const quickstartChecked = useRef(false);
   const location = useLocation();
-  const recentCapped = recent.length >= RECENT_LIMIT;
+  const recentCapped = recent.length >= recentLimit;
+  const canLoadMore =
+    !recentLoading && !recentError && recent.length >= recentLimit && recentLimit < RECENT_MAX;
 
   useEffect(() => {
     let cancelled = false;
@@ -111,19 +118,39 @@ export default function HomePage() {
     };
   }, []);
 
-  async function loadRecent(isCancelled: () => boolean = () => false) {
-    setRecentLoading(true);
-    setRecentError(false);
+  async function loadRecent(
+    isCancelled: () => boolean = () => false,
+    targetLimit: number = RECENT_LIMIT,
+    { more = false }: { more?: boolean } = {},
+  ) {
+    // "Show more" keeps the current list visible (spinner on the button);
+    // a fresh/initial load shows the skeleton.
+    if (more) setRecentLoadingMore(true);
+    else {
+      setRecentLoading(true);
+      setRecentError(false);
+    }
     try {
-      const d = await getRecent(undefined, RECENT_LIMIT);
+      const d = await getRecent(undefined, targetLimit);
       if (isCancelled()) return;
       setRecent(d.changes || []);
+      setRecentLimit(targetLimit);
     } catch {
       if (isCancelled()) return;
-      setRecentError(true);
+      // On a "Show more" failure keep the existing list; only a fresh load
+      // surfaces the error panel.
+      if (!more) setRecentError(true);
     } finally {
-      if (!isCancelled()) setRecentLoading(false);
+      if (!isCancelled()) {
+        if (more) setRecentLoadingMore(false);
+        else setRecentLoading(false);
+      }
     }
+  }
+
+  function loadMoreRecent() {
+    // Grow by the current count ("this many again"), capped at the backend max.
+    loadRecent(() => false, Math.min(recentLimit * 2, RECENT_MAX), { more: true });
   }
 
   // Scroll to #vaults / #recent when a link lands here with that hash. Keyed on
@@ -306,6 +333,7 @@ export default function HomePage() {
               description="Recent document writes across all your vaults will appear here."
             />
           ) : (
+            <>
             <Panel
               className="mt-3"
               inset={false}
@@ -350,6 +378,20 @@ export default function HomePage() {
                 })}
               </ol>
             </Panel>
+            {canLoadMore && (
+              <div className="mt-3 flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={loadMoreRecent}
+                  disabled={recentLoadingMore}
+                  aria-label="Show more recent activity"
+                >
+                  {recentLoadingMore ? "Loading…" : "Show more"}
+                </Button>
+              </div>
+            )}
+            </>
           )}
         </section>
 
