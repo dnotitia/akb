@@ -77,7 +77,15 @@ def make_client(endpoint_url: str, access_key: str, secret_key: str, region: str
         endpoint_url=endpoint_url or None,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        config=BotoConfig(signature_version="s3v4"),
+        config=BotoConfig(
+            signature_version="s3v4",
+            # Bound every S3 op so a stalled endpoint can't block the caller
+            # (and, on the on-loop paths, the whole event loop) for the boto
+            # default of 60 s. See settings.s3_* for the rationale.
+            connect_timeout=settings.s3_connect_timeout_secs,
+            read_timeout=settings.s3_read_timeout_secs,
+            retries={"max_attempts": settings.s3_max_attempts, "mode": "standard"},
+        ),
         **({"region_name": region} if region else {}),
     )
 
