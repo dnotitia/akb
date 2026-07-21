@@ -5,6 +5,11 @@ import {
   type AkbResult,
   type AkbSuccessEnvelope,
   type AkbClient,
+  type AkbCollectionCreateEnvelope,
+  type AkbCollectionDeleteEnvelope,
+  type AkbCollectionSummary,
+  type AkbCreateCollectionInput,
+  type AkbDeleteCollectionOptions,
   type AkbDocumentEnvelope,
   type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
@@ -27,7 +32,7 @@ import {
 import { createClient as createLiteClient } from "../src/lite.js";
 import type { AkbSchema } from "./fixtures/akb.types.ts";
 
-type TableQueryEnvelope = AkbSuccessEnvelope & {
+type TableQueryEnvelope = {
   kind: "table_query";
   columns: string[];
   items: Array<{ id: string }>;
@@ -162,6 +167,36 @@ const grepResult = await typedClient.vault("eng").search.grep("needle", {
 grepResult.throwOnError().data.kind satisfies "grep";
 grepResult.throwOnError().data.files?.at(0) satisfies string | undefined;
 const docs = typedClient.vault("eng").docs;
+const createCollectionInput: AkbCreateCollectionInput = { path: "guides/api", summary: null };
+const deleteCollectionOptions: AkbDeleteCollectionOptions = { recursive: true };
+const createdCollection = await docs.createCollection(createCollectionInput);
+const collectionCreateLeaf: AkbCollectionCreateEnvelope = createdCollection.throwOnError().data;
+collectionCreateLeaf.kind satisfies "collection_create";
+collectionCreateLeaf.created satisfies boolean;
+const collectionSummary: AkbCollectionSummary = collectionCreateLeaf.collection;
+collectionSummary.summary satisfies string | null;
+collectionSummary.doc_count satisfies number;
+const deletedCollection = await docs.deleteCollection("guides/api", deleteCollectionOptions);
+const collectionDeleteLeaf: AkbCollectionDeleteEnvelope = deletedCollection.throwOnError().data;
+collectionDeleteLeaf.kind satisfies "collection_delete";
+collectionDeleteLeaf.deleted_docs satisfies number;
+collectionDeleteLeaf.deleted_files satisfies number;
+collectionDeleteLeaf.deleted_sub_collections satisfies number;
+collectionDeleteLeaf.deleted_tables satisfies number;
+type CollectionCreateOperation = AkbOperationResponse<operations["collectionsCreateCollection"]>;
+type CollectionDeleteOperation = AkbOperationResponse<operations["collectionsDeleteCollection"]>;
+collectionCreateLeaf satisfies CollectionCreateOperation;
+collectionDeleteLeaf satisfies CollectionDeleteOperation;
+declare const collectionSuccess: import("../src/core/schema.gen.js").AkbSuccessEnvelope;
+if (collectionSuccess.kind === "collection_create") {
+  collectionSuccess.collection.doc_count satisfies number;
+} else if (collectionSuccess.kind === "collection_delete") {
+  collectionSuccess.deleted_tables satisfies number;
+}
+// @ts-expect-error collection path is required.
+docs.createCollection({ summary: "missing path" });
+// @ts-expect-error recursive is boolean when provided.
+docs.deleteCollection("guides/api", { recursive: "true" });
 const documentPutInput: AkbDocumentPutInput = {
   collection: "guides",
   title: "Readme",

@@ -304,6 +304,101 @@ test("docs facade scopes document operations and maps typed payloads", async () 
   assert.equal(deleteResult.throwOnError().data.deleted, true);
 });
 
+test("docs facade creates and deletes collections with exact REST semantics", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      seen.push({
+        url: String(input),
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body,
+      });
+
+      if (method === "POST") {
+        return new Response(JSON.stringify({
+          kind: "collection_create",
+          ok: true,
+          created: body.path !== "already/there",
+          collection: {
+            path: body.path,
+            name: body.path.split("/").at(-1),
+            summary: Object.hasOwn(body, "summary") ? body.summary : "stored summary",
+            doc_count: body.path === "already/there" ? 3 : 0,
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/blocked")) {
+        return new Response(JSON.stringify({
+          message: "Collection is not empty",
+          code: "conflict",
+          detail: { message: "Collection is not empty", doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 },
+          details: { doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 },
+        }), { status: 409, statusText: "Conflict", headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/missing")) {
+        return new Response(JSON.stringify({ message: "Collection not found", code: "not_found" }), {
+          status: 404,
+          statusText: "Not Found",
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        kind: "collection_delete",
+        ok: true,
+        collection: decodeURIComponent(url.pathname.split("/").slice(6).join("/")),
+        deleted_docs: url.searchParams.get("recursive") === "true" ? 2 : 0,
+        deleted_files: 0,
+        deleted_sub_collections: 1,
+        deleted_tables: 0,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  }).vault("vault one").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "writer" } });
+
+  const omitted = await client.docs.createCollection({ path: "already/there" });
+  const explicitNull = await client.docs.createCollection({ path: "새 공간/api", summary: null });
+  const recursive = await client.docs.deleteCollection("새 공간/예약%?#", { recursive: true });
+  const explicitFalse = await client.docs.deleteCollection("plain/path", { recursive: false });
+  const defaultDelete = await client.docs.deleteCollection("plain/other");
+  const blocked = await client.docs.deleteCollection("blocked");
+  const missing = await client.docs.deleteCollection("missing");
+
+  assert.equal(seen[0].url, "https://akb.test/api/v1/collections/vault%20one");
+  assert.equal(seen[0].method, "POST");
+  assert.deepEqual(seen[0].body, { path: "already/there" });
+  assert.equal(Object.hasOwn(seen[0].body, "summary"), false);
+  assert.deepEqual(seen[1].body, { path: "새 공간/api", summary: null });
+  assert.equal(seen[2].url, "https://akb.test/api/v1/collections/vault%20one/%EC%83%88%20%EA%B3%B5%EA%B0%84/%EC%98%88%EC%95%BD%25%3F%23?recursive=true");
+  assert.equal(seen[2].method, "DELETE");
+  assert.equal(seen[3].url, "https://akb.test/api/v1/collections/vault%20one/plain/path");
+  assert.equal(seen[4].url, "https://akb.test/api/v1/collections/vault%20one/plain/other");
+  assert.ok(seen.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.ok(seen.every((call) => call.headers["x-akb-claims"]));
+  assert.equal(seen[0].headers["content-type"], "application/json");
+
+  assert.deepEqual(
+    [omitted.throwOnError().data.kind, omitted.data.created, omitted.data.collection.doc_count],
+    ["collection_create", false, 3],
+  );
+  assert.deepEqual(
+    [explicitNull.throwOnError().data.kind, explicitNull.data.collection.summary],
+    ["collection_create", null],
+  );
+  assert.deepEqual(
+    [recursive.throwOnError().data.kind, recursive.data.deleted_docs, recursive.data.deleted_files],
+    ["collection_delete", 2, 0],
+  );
+  assert.deepEqual(blocked.error?.details, { doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 });
+  assert.equal(blocked.error?.payload.detail?.file_count, 0);
+  assert.equal(missing.error?.status, 404);
+  assert.throws(() => blocked.throwOnError(), AkbError);
+  assert.throws(() => missing.throwOnError(), AkbError);
+});
+
 test("storage facade performs presigned upload, download, list, and delete flows", async () => {
   const fileId = "11111111-1111-4111-8111-111111111111";
   const fileUri = `akb://reef/coll/media/file/${fileId}`;
