@@ -773,38 +773,45 @@ async def oembed(url: str, format: str = "json"):
 
     rt = publication["resource_type"]
 
-    # Resolve a useful title. Parse the canonical URI to recover the
-    # resource handle — there are no separate id columns anymore.
-    from app.services.uri_service import parse_uri
-    parsed = parse_uri(publication.get("resource_uri") or "")
-    title = publication.get("title")
-    if not title:
-        if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
-            uri_vault, doc_path = parsed.vault, parsed.identifier
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                doc_row = await conn.fetchrow(
-                    """
-                    SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
-                     WHERE v.name = $1 AND d.path = $2
-                    """,
-                    uri_vault, doc_path,
-                )
-                if doc_row:
-                    title = doc_row["title"]
-        elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
-            file_uuid_str = parsed.identifier
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                f_row = await conn.fetchrow(
-                    "SELECT name FROM vault_files WHERE id = $1",
-                    to_uuid(file_uuid_str),
-                )
-                if f_row:
-                    title = f_row["name"]
-        elif rt == ResourceType.TABLE_QUERY:
-            title = "Shared query"
-    title = title or "AKB Publication"
+    if publication.get("password_hash"):
+        # F1: a password-protected publication must NOT leak its title / subject
+        # / filename through an unauthenticated oembed unfurl. The viewer and
+        # /embed both hide the title behind the password, so oembed can't be the
+        # bypass — return a generic card and skip every DB title lookup.
+        title = "Protected AKB publication"
+    else:
+        # Resolve a useful title. Parse the canonical URI to recover the
+        # resource handle — there are no separate id columns anymore.
+        from app.services.uri_service import parse_uri
+        parsed = parse_uri(publication.get("resource_uri") or "")
+        title = publication.get("title")
+        if not title:
+            if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
+                uri_vault, doc_path = parsed.vault, parsed.identifier
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    doc_row = await conn.fetchrow(
+                        """
+                        SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
+                         WHERE v.name = $1 AND d.path = $2
+                        """,
+                        uri_vault, doc_path,
+                    )
+                    if doc_row:
+                        title = doc_row["title"]
+            elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
+                file_uuid_str = parsed.identifier
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    f_row = await conn.fetchrow(
+                        "SELECT name FROM vault_files WHERE id = $1",
+                        to_uuid(file_uuid_str),
+                    )
+                    if f_row:
+                        title = f_row["name"]
+            elif rt == ResourceType.TABLE_QUERY:
+                title = "Shared query"
+        title = title or "AKB Publication"
 
     return {
         "version": "1.0",
