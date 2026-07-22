@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 
 
-async def insert(
+async def insert_or_adopt(
     conn,
     *,
     file_id: uuid.UUID,
@@ -26,17 +26,44 @@ async def insert(
     description: str,
     created_by: str,
     collection_id: uuid.UUID | None = None,
-) -> None:
-    await conn.execute(
+) -> uuid.UUID:
+    """Insert a file row, or adopt the row already holding `(vault_id, s3_key)`.
+
+    Returns the id of the row the caller should now use: `file_id` when a new
+    row was inserted, the pre-existing row's id when the key was already
+    taken. Callers tell the two apart by comparing against the `file_id` they
+    passed in.
+
+    Only reachable for a deterministic (content-addressed) key — a random key
+    cannot collide — so an adopted row is by construction the same bytes under
+    the same vault/collection/filename.
+
+    `ON CONFLICT ... DO UPDATE` rather than `DO NOTHING` on purpose. DO UPDATE
+    is the form PostgreSQL guarantees to be atomic insert-or-update: it always
+    returns a row, and against a *concurrent uncommitted* insert of the same
+    key it waits and then returns the winner. DO NOTHING returns no row on
+    conflict, forcing a follow-up SELECT that races the other transaction.
+
+    The re-`collection_id` is the only field touched on adopt: it re-attaches a
+    file whose collection row was dropped (`collections.id ON DELETE SET NULL`)
+    so the row agrees with the collection its key encodes. Descriptive fields
+    are left alone — first writer wins — so a repeat upload cannot silently
+    rewrite metadata that something else may already be reading.
+    """
+    row = await conn.fetchrow(
         """
         INSERT INTO vault_files
             (id, vault_id, collection_id, name, s3_key, mime_type,
              size_bytes, description, created_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (vault_id, s3_key) DO UPDATE
+            SET collection_id = EXCLUDED.collection_id
+        RETURNING id
         """,
         file_id, vault_id, collection_id, name, s3_key,
         mime_type, size_bytes, description, created_by,
     )
+    return row["id"]
 
 
 async def find_by_id(

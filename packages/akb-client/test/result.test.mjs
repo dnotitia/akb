@@ -1390,6 +1390,57 @@ test("graph relation and provenance facade preserves backend 4xx result behavior
   assert.throws(() => denied.throwOnError(), AkbError);
 });
 
+test("storage upload sends contentHash to presign so the same bytes are not stored twice", async () => {
+  const contentHash = "a".repeat(64);
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input, init) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("/upload")) {
+        return responseJson({
+          kind: "file",
+          uri: "akb://eng/media/file/11111111-1111-4111-8111-111111111111",
+          upload_url: "https://s3.test/put",
+          deduplicated: true,
+        });
+      }
+      if (url === "https://s3.test/put") return new Response(null, { status: 200 });
+      return responseJson({ kind: "file", content_hash: contentHash });
+    },
+  });
+
+  await client.vault("eng").storage.upload("media/logo.txt", "hello", { contentHash });
+
+  const presign = new URL(seen.find((u) => u.includes("/upload")));
+  assert.equal(presign.searchParams.get("content_hash"), contentHash);
+  assert.equal(presign.searchParams.get("filename"), "logo.txt");
+});
+
+test("storage upload without contentHash sends no content_hash param", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("/upload")) {
+        return responseJson({
+          kind: "file",
+          uri: "akb://eng/media/file/11111111-1111-4111-8111-111111111111",
+          upload_url: "https://s3.test/put",
+        });
+      }
+      if (url === "https://s3.test/put") return new Response(null, { status: 200 });
+      return responseJson({ kind: "file" });
+    },
+  });
+
+  await client.vault("eng").storage.upload("media/logo.txt", "hello");
+
+  const presign = new URL(seen.find((u) => u.includes("/upload")));
+  assert.equal(presign.searchParams.has("content_hash"), false);
+});
+
 function responseJson(body, status = 200, statusText = "OK") {
   return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json" } });
 }
