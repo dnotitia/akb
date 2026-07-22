@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
 from pydantic import ConfigDict
+from pydantic_core import to_json
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
@@ -209,7 +210,7 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
     for v in vaults:
         await check_vault_access(user.user_id, v, required_role="reader")
 
-    return _raise_service_error(
+    result = _raise_service_error(
         await table_service.execute_sql(
             vault_names=vaults,
             user_id=user.user_id,
@@ -218,6 +219,15 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             is_admin=user.is_admin,
         )
     )
+    # Serialise with pydantic-core (Rust) instead of FastAPI's default
+    # jsonable_encoder + json.dumps: a large `akb_sql` result (rows already
+    # coerced to JSON-native types + NaN→null in user_sql_executor) encodes in
+    # one fast pass (~0.4s for a 205MB result) that keeps the single event-loop
+    # block well under the /livez probe timeout. Errors were raised above,
+    # before this point, so we only ever serialise a success envelope.
+    # inf_nan_mode="null" so a PG float8 NaN/±Inf in the result serialises to
+    # `null` (valid JSON) instead of a bare NaN/Infinity token, in the Rust pass.
+    return Response(to_json(result, inf_nan_mode="null"), media_type="application/json")
 
 
 @router.get(

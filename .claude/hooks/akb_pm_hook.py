@@ -62,14 +62,23 @@ ASK_BASH = [
     (re.compile(r"\bnpm\s+publish\b"), "This publishes the akb-mcp package. Confirm version bump, changelog, and npm target."),
     (re.compile(r"\bgit\s+push\b"), "This pushes repository state. Confirm branch and review status."),
     (re.compile(r"\bsed\s+-i\b"), "This mutates files through Bash and bypasses file-edit hooks. Prefer Edit/MultiEdit or confirm the exact target."),
-    (re.compile(r"\b(psql|pg_restore|docker\s+compose\s+down\s+-v|helm\s+uninstall|terraform\s+destroy)\b"), "This can alter service data or infrastructure. Confirm target and rollback plan."),
+    # `psql` alone was too broad — it fired on every local read query / EXPLAIN
+    # / dev-DB benchmark. DROP DATABASE is already denied above; the infra-
+    # destroy verbs below stay gated.
+    (re.compile(r"\b(pg_restore|docker\s+compose\s+down\s+-v|helm\s+uninstall|terraform\s+destroy)\b"), "This can alter service data or infrastructure. Confirm target and rollback plan."),
 ]
 
 SECRET_PATH_PATTERNS = [
     re.compile(r"(^|/)\.env(\.|$)"),
     re.compile(r"(^|/)config/secret\.ya?ml$"),
-    re.compile(r"(^|/)backend/config/"),
-    re.compile(r"(^|/)deploy/k8s/(internal|aws-internal|aws-demo-internal)(/|$)"),
+    # Actual secret files inside backend/config or the deploy overlays are
+    # still caught by the generic secret/credential pattern below (e.g.
+    # deploy/k8s/internal/secret.yaml). The overlays themselves are ordinary
+    # (non-secret) config — real credentials live in the manually-managed
+    # akb-secret-config Secret / sealed-secrets / vault, never committed here —
+    # so we no longer blanket-block the whole internal/ tree (it was too broad:
+    # it even tripped on unrelated commands that merely mentioned the path).
+    re.compile(r"(^|/)backend/config/secret\.ya?ml$"),
     re.compile(r"(^|/)(secrets?|credentials?)(/|\.|$)", re.IGNORECASE),
 ]
 

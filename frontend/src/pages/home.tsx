@@ -27,6 +27,7 @@ import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
+import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -53,9 +54,12 @@ type ConnectMode = "pat" | "oauth";
 
 type Tab = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
 
-// Recent-activity fetch size. The list shows this many; when the result is
-// full we render the count as "N+" rather than implying it's the grand total.
+// Recent-activity fetch size. The list starts with this many; "Show more"
+// grows it (doubling — "this many again") up to RECENT_MAX. When a fetch comes
+// back full we render the count as "N+" rather than implying it's the total.
 const RECENT_LIMIT = 8;
+// Backend /recent caps `limit` at 100, so that's the ceiling for "Show more".
+const RECENT_MAX = 100;
 // How many vaults the Home preview shows before linking out to /vault.
 const VAULT_PREVIEW_LIMIT = 6;
 
@@ -78,9 +82,18 @@ interface PATRow {
 
 export default function HomePage() {
   const [vaults, setVaults] = useState<VaultRow[]>([]);
+  // How many vaults the in-page preview shows. Starts at VAULT_PREVIEW_LIMIT;
+  // "Show more" doubles it client-side (all vaults are already loaded, so no
+  // refetch — unlike Recent activity, which grows its server-side limit).
+  const [vaultLimit, setVaultLimit] = useState(VAULT_PREVIEW_LIMIT);
+  // Per-browser favorited vault IDs (localStorage) — same source the vault rail
+  // uses, so pinning here and in the rail stay in sync.
+  const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
+  const [recentLimit, setRecentLimit] = useState(RECENT_LIMIT);
+  const [recentLoadingMore, setRecentLoadingMore] = useState(false);
   const [pats, setPats] = useState<PATRow[]>([]);
   const [pendingRevoke, setPendingRevoke] = useState<PATRow | null>(null);
   const [activePat, setActivePat] = useState<string | null>(null);
@@ -93,7 +106,9 @@ export default function HomePage() {
   const [quickstartOpen, setQuickstartOpen] = useState(false);
   const quickstartChecked = useRef(false);
   const location = useLocation();
-  const recentCapped = recent.length >= RECENT_LIMIT;
+  const recentCapped = recent.length >= recentLimit;
+  const canLoadMore =
+    !recentLoading && !recentError && recent.length >= recentLimit && recentLimit < RECENT_MAX;
 
   useEffect(() => {
     let cancelled = false;
@@ -111,19 +126,39 @@ export default function HomePage() {
     };
   }, []);
 
-  async function loadRecent(isCancelled: () => boolean = () => false) {
-    setRecentLoading(true);
-    setRecentError(false);
+  async function loadRecent(
+    isCancelled: () => boolean = () => false,
+    targetLimit: number = RECENT_LIMIT,
+    { more = false }: { more?: boolean } = {},
+  ) {
+    // "Show more" keeps the current list visible (spinner on the button);
+    // a fresh/initial load shows the skeleton.
+    if (more) setRecentLoadingMore(true);
+    else {
+      setRecentLoading(true);
+      setRecentError(false);
+    }
     try {
-      const d = await getRecent(undefined, RECENT_LIMIT);
+      const d = await getRecent(undefined, targetLimit);
       if (isCancelled()) return;
       setRecent(d.changes || []);
+      setRecentLimit(targetLimit);
     } catch {
       if (isCancelled()) return;
-      setRecentError(true);
+      // On a "Show more" failure keep the existing list; only a fresh load
+      // surfaces the error panel.
+      if (!more) setRecentError(true);
     } finally {
-      if (!isCancelled()) setRecentLoading(false);
+      if (!isCancelled()) {
+        if (more) setRecentLoadingMore(false);
+        else setRecentLoading(false);
+      }
     }
+  }
+
+  function loadMoreRecent() {
+    // Grow by the current count ("this many again"), capped at the backend max.
+    loadRecent(() => false, Math.min(recentLimit * 2, RECENT_MAX), { more: true });
   }
 
   // Scroll to #vaults / #recent when a link lands here with that hash. Keyed on
@@ -212,12 +247,44 @@ export default function HomePage() {
   }, []);
 
   // Home shows a preview of the vault directory; the full list (with filter)
-  // lives on /vault. Memoized so <VaultList> doesn't re-fetch metrics on every
-  // unrelated render.
-  const previewVaults = useMemo(
-    () => vaults.slice(0, VAULT_PREVIEW_LIMIT),
-    [vaults],
+  // lives on /vault. Favorites float to the top (mirroring the vault rail) and
+  // are always visible: the preview cap is a FLOOR, not a hard slice — a
+  // favorite is never hidden behind "Show more". Memoized so <VaultList>
+  // doesn't re-fetch metrics on every unrelated render.
+  const orderedVaults = useMemo(() => {
+    // Filter to the LIVE list so a favorited-but-deleted/revoked vault id drops
+    // silently (same as the rail); newest-favorited first within the group.
+    const favs = vaults
+      .filter((v) => isFavorite(v.id))
+      .sort((a, b) => favOrder(a.id) - favOrder(b.id));
+    const rest = vaults.filter((v) => !isFavorite(v.id));
+    return [...favs, ...rest];
+  }, [vaults, isFavorite, favOrder]);
+  const liveFavCount = useMemo(
+    () => vaults.reduce((n, v) => (isFavorite(v.id) ? n + 1 : n), 0),
+    [vaults, isFavorite],
   );
+  // Show at least `vaultLimit`, but never fewer than the live favorites.
+  const visibleVaultCount = Math.max(vaultLimit, liveFavCount);
+  const previewVaults = useMemo(
+    () => orderedVaults.slice(0, visibleVaultCount),
+    [orderedVaults, visibleVaultCount],
+  );
+  const canShowMoreVaults = orderedVaults.length > visibleVaultCount;
+
+  function showMoreVaults() {
+    // Grow from the ACTUAL rendered row count (not vaultLimit — favorites may
+    // have pushed it higher), "this many again", capped at the full list.
+    setVaultLimit(() => Math.min(visibleVaultCount * 2, orderedVaults.length));
+  }
+
+  function toggleVaultFavorite(v: VaultRow) {
+    // Lock in the current row count before toggling so unpinning a cap-exempt
+    // favorite can't make its own row vanish (row reorders in place; the keyed
+    // <li> keeps keyboard focus on the star). Per Codex design review.
+    setVaultLimit((n) => Math.max(n, visibleVaultCount));
+    toggleFavorite(v.id);
+  }
 
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
@@ -306,6 +373,7 @@ export default function HomePage() {
               description="Recent document writes across all your vaults will appear here."
             />
           ) : (
+            <>
             <Panel
               className="mt-3"
               inset={false}
@@ -350,6 +418,20 @@ export default function HomePage() {
                 })}
               </ol>
             </Panel>
+            {canLoadMore && (
+              <div className="mt-3 flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={loadMoreRecent}
+                  disabled={recentLoadingMore}
+                  aria-label="Show more recent activity"
+                >
+                  {recentLoadingMore ? "Loading…" : "Show more"}
+                </Button>
+              </div>
+            )}
+            </>
           )}
         </section>
 
@@ -390,7 +472,24 @@ export default function HomePage() {
               }
             />
           ) : (
-            <VaultList vaults={previewVaults} />
+            <>
+              <VaultList
+                vaults={previewVaults}
+                favoriteControl={{ isFavorite, onToggle: toggleVaultFavorite }}
+              />
+              {canShowMoreVaults && (
+                <div className="mt-3 flex justify-center">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={showMoreVaults}
+                    aria-label="Show more vaults"
+                  >
+                    Show more
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </section>
       </div>

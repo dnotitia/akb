@@ -19,12 +19,14 @@ model.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Optional
 
 import asyncpg
 
+from app.config import settings
 from app.models.vault_scope import (
     current_request_jwt_claims,
     current_token_id,
@@ -39,7 +41,16 @@ logger = logging.getLogger("akb.user_sql")
 
 
 def _coerce_value(v: Any) -> Any:
-    """Make `v` JSON-friendly for the MCP response envelope."""
+    """Make `v` JSON-friendly for the akb_sql response envelope.
+
+    Non-finite floats (NaN/±Inf) are left as-is here — they are normalised to
+    `null` only on the REST `tables.execute_sql` route, which serialises the
+    envelope with `to_json(..., inf_nan_mode="null")` (the table viewer +
+    snapshot consumer that a bare `NaN` token broke). The MCP `server.call_tool`
+    path keeps its pre-hardening `json.dumps(default=str)` for byte-identical
+    wire compatibility, so a non-finite float there still renders as a bare
+    token exactly as before — a pre-existing edge, not widened by this change.
+    """
     if isinstance(v, uuid.UUID):
         return str(v)
     if hasattr(v, "isoformat"):
@@ -50,7 +61,28 @@ def _coerce_value(v: Any) -> Any:
 
 
 def _coerce_row(row: asyncpg.Record) -> dict:
-    return {k: _coerce_value(v) for k, v in dict(row).items()}
+    # asyncpg.Record supports .items() directly — no throwaway dict(row) copy.
+    return {k: _coerce_value(v) for k, v in row.items()}
+
+
+async def _coerce_rows_yielding(rows: list) -> list[dict]:
+    """Coerce a full result set to JSON dicts WITHOUT blocking the event loop.
+
+    `[_coerce_row(r) for r in rows]` is pure-Python CPU with no ``await``; on a
+    million-row result it holds the single event loop for seconds and starves
+    the liveness probe (→ 503). We chunk it and ``await asyncio.sleep(0)``
+    between chunks so the loop can service other tasks (health probes, other
+    requests) between batches. The result is NOT truncated — only the CPU work
+    is interleaved.
+    """
+    batch = max(1, settings.akb_sql_coerce_batch)
+    if len(rows) <= batch:
+        return [_coerce_row(r) for r in rows]
+    items: list[dict] = []
+    for start in range(0, len(rows), batch):
+        items.extend(_coerce_row(r) for r in rows[start:start + batch])
+        await asyncio.sleep(0)  # yield to the loop between batches
+    return items
 
 
 def _affected_rows_from_command_tag(tag: str) -> int | None:
@@ -184,11 +216,16 @@ class UserSqlExecutor:
 
                     if should_fetch:
                         rows = await conn.fetch(sql, *bind_params)
+                        items = await _coerce_rows_yielding(rows)
                         return {
                             "kind": "table_query",
                             "vaults": vault_names or [],
+                            # dict(...) collapses duplicate column labels the
+                            # same way each coerced `items` row does, so columns
+                            # and row keys stay consistent for `SELECT id, id`
+                            # or cross-vault joins that share a column name.
                             "columns": list(dict(rows[0]).keys()) if rows else [],
-                            "items": [_coerce_row(r) for r in rows],
+                            "items": items,
                             "total": len(rows),
                         }
                     result = await conn.execute(sql, *bind_params)

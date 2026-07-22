@@ -1387,6 +1387,16 @@ async def call_tool(name: str, arguments: dict):
     try:
         result = await _dispatch(name, arguments, user)
         audit_log.record_tool(name, arguments, user, result)
+        # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
+        # so the MCP wire format stays byte-identical for every tool (datetime →
+        # `str()` space form, Enum → `str()`, unknown → stringified). The
+        # akb_sql event-loop fix lives where the measured symptom was — the
+        # non-blocking row coercion in UserSqlExecutor (shared by both surfaces)
+        # and the Rust `to_json(inf_nan_mode="null")` serialisation on the REST
+        # `/tables/{vault}/sql` route (the table viewer + snapshot consumer). We
+        # deliberately do NOT switch this MCP encode to `to_json`: it would shift
+        # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
+        # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
