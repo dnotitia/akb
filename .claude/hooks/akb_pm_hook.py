@@ -62,7 +62,10 @@ ASK_BASH = [
     (re.compile(r"\bnpm\s+publish\b"), "This publishes the akb-mcp package. Confirm version bump, changelog, and npm target."),
     (re.compile(r"\bgit\s+push\b"), "This pushes repository state. Confirm branch and review status."),
     (re.compile(r"\bsed\s+-i\b"), "This mutates files through Bash and bypasses file-edit hooks. Prefer Edit/MultiEdit or confirm the exact target."),
-    (re.compile(r"\b(psql|pg_restore|docker\s+compose\s+down\s+-v|helm\s+uninstall|terraform\s+destroy)\b"), "This can alter service data or infrastructure. Confirm target and rollback plan."),
+    # `psql` alone was too broad — it fired on every local read query / EXPLAIN
+    # / dev-DB benchmark. DROP DATABASE is already denied above; the infra-
+    # destroy verbs below stay gated.
+    (re.compile(r"\b(pg_restore|docker\s+compose\s+down\s+-v|helm\s+uninstall|terraform\s+destroy)\b"), "This can alter service data or infrastructure. Confirm target and rollback plan."),
 ]
 
 SECRET_PATH_PATTERNS = [
