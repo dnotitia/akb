@@ -69,6 +69,14 @@ const explicitNull = await beta.docs.createCollection({ path: "새 공간/api", 
 const recursive = await beta.docs.deleteCollection("새 공간/예약%?#", { recursive: true });
 const explicitFalse = await alpha.docs.deleteCollection("plain/path", { recursive: false });
 const defaultDelete = await alpha.docs.deleteCollection("plain/other");
+const callsBeforeUnsafePaths = calls.length;
+for (const path of [".", "..", "draft/../published", "draft/./published"]) {
+  assert.throws(
+    () => alpha.docs.deleteCollection(path, { recursive: true }),
+    /must not contain URL dot segments/,
+  );
+}
+assert.equal(calls.length, callsBeforeUnsafePaths);
 const errors = {};
 for (const path of ["bad", "unauthenticated", "forbidden", "missing", "blocked", "invalid"]) {
   errors[path] = await alpha.docs.deleteCollection(path);
@@ -115,6 +123,7 @@ console.log(JSON.stringify({
   kinds: [omitted.data.kind, explicitNull.data.kind, recursive.data.kind],
   varied: { summaries: [omitted.data.collection.summary, explicitNull.data.collection.summary], counts: [omitted.data.collection.doc_count, recursive.data.deleted_docs, recursive.data.deleted_sub_collections] },
   omitted: { summary: "absent", recursive_false: "absent", recursive_default: "absent" },
+  dot_segments: { rejected_before_fetch: true, probes: 4 },
   errors: Object.fromEntries(Object.entries(errors).map(([path, result]) => [path, result.error?.status])),
   conflict: { details: errors.blocked.error.details, legacy_detail: "present", throwOnError: "AkbError" },
   screenshot: "not_applicable_non_visual_sdk",

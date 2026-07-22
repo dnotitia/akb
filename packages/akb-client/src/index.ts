@@ -1247,7 +1247,11 @@ function encodeDocumentPath(path: string): string {
 }
 
 function encodeCollectionPath(path: string): string {
-  return path.split("/").map(encodePathSegment).join("/");
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new TypeError("Collection path must not contain URL dot segments ('.' or '..').");
+  }
+  return segments.map(encodePathSegment).join("/");
 }
 
 function documentPutPayload(

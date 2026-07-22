@@ -15,16 +15,18 @@ An `@akb/client` consumer can create and delete collections through the vault-sc
 1. Create collections in two distinct vault/path/summary combinations, including omitted `summary`, explicit `null`, and a repeated idempotent create.
 2. Delete empty and non-empty collections with omitted options, `recursive: false`, and `recursive: true`.
 3. Delete nested paths containing spaces, Korean text, and reserved characters while preserving `/` hierarchy separators.
-4. Exercise all typed methods through an `actingAs()` vault-scoped client with bearer authentication.
-5. Exercise backend 400, 401, 403, 404, 409, and 422 responses as `{data:null,error}` and through `.throwOnError()`.
-6. Compile a public TypeScript consumer that uses collection input/options/summary/create/delete types, operation response mappings, literal `kind` narrowing, and the `AkbSuccessEnvelope` union without `unknown` or a generic JSON fallback.
-7. Exercise live create, idempotent create, non-empty 409, recursive delete, and missing 404 through REST.
+4. Refuse destructive delete paths containing `.` or `..` segments before any request is sent.
+5. Exercise all typed methods through an `actingAs()` vault-scoped client with bearer authentication.
+6. Exercise backend 400, 401, 403, 404, 409, and 422 responses as `{data:null,error}` and through `.throwOnError()`.
+7. Compile a public TypeScript consumer that uses collection input/options/summary/create/delete types, operation response mappings, literal `kind` narrowing, and the `AkbSuccessEnvelope` union without `unknown` or a generic JSON fallback.
+8. Exercise live create, idempotent create, non-empty 409, recursive delete, and missing 404 through REST.
 
 ## Expected Observable Behavior
 
 - Create sends exactly `POST /collections/<encoded-vault>` with JSON `{path}` or `{path,summary}`; omitted `summary` is absent and explicit `null` is preserved.
 - Create returns the flat backend payload with required literal `kind: "collection_create"`, `ok`, `created`, and the exact nested collection summary including null and zero values.
 - Delete sends exactly `DELETE /collections/<encoded-vault>/<encoded-path-segments>`; every vault/path segment is encoded once and `/` hierarchy separators remain separators.
+- Delete paths containing an exact `.` or `..` segment throw before `fetch`, preventing URL normalization from retargeting a destructive request.
 - Delete serializes `?recursive=true` only for `recursive: true`; omitted options and `recursive: false` serialize no query.
 - Delete returns the flat backend payload with required literal `kind: "collection_delete"`, exact collection path, and all four numeric deleted counts including zero values.
 - The shared request path sends `Authorization: Bearer <redacted>`, `X-Akb-Claims`, and JSON content type when a body exists.
@@ -38,6 +40,7 @@ An `@akb/client` consumer can create and delete collections through the vault-sc
 - Use at least two distinct vault, path, summary, and count sets and assert captured requests and returned values change with the inputs.
 - Compare omitted `summary` with explicit `null`, and omitted options with explicit `recursive: false`.
 - Use spaces, Korean text, `%`, `?`, and `#` in nested path segments and assert each is encoded exactly once.
+- Probe leading, trailing, and nested `.`/`..` segments and assert the fetch boundary is not called.
 - Capture method, URL, headers, body presence/content, response kinds/counts, result errors, thrown errors, and public TypeScript compile output from the installed tarball.
 - Install from the tarball only in a repository-external directory with restrictive permissions; reject repository path imports, workspace links, and source fixture access.
 - Repeat live creation and deletion observations to prove persisted backend state rather than static success output.
@@ -51,4 +54,4 @@ An `@akb/client` consumer can create and delete collections through the vault-sc
 
 ## Out Of Scope
 
-- Collection service/repository algorithms, MCP response changes, client-side path validation, browse reimplementation, move/rename/preview, frontend/UI, package version/changelog/release, deployment, and merge.
+- Collection service/repository algorithms, MCP response changes, broader client-side path validation beyond destructive URL dot-segment safety, browse reimplementation, move/rename/preview, frontend/UI, package version/changelog/release, deployment, and merge.

@@ -399,6 +399,25 @@ test("docs facade creates and deletes collections with exact REST semantics", as
   assert.throws(() => missing.throwOnError(), AkbError);
 });
 
+test("docs facade refuses collection delete paths with URL dot segments", () => {
+  let fetchCalls = 0;
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 204 });
+    },
+  }).vault("reef");
+
+  for (const path of [".", "..", "draft/../published", "draft/./published"]) {
+    assert.throws(
+      () => client.docs.deleteCollection(path, { recursive: true }),
+      /must not contain URL dot segments/,
+    );
+  }
+  assert.equal(fetchCalls, 0);
+});
+
 test("storage facade performs presigned upload, download, list, and delete flows", async () => {
   const fileId = "11111111-1111-4111-8111-111111111111";
   const fileUri = `akb://reef/coll/media/file/${fileId}`;
