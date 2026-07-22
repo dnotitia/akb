@@ -691,6 +691,19 @@ NR=$(curl -sk "$BASE_URL/api/v1/public/$NANP")
 echo "$NR" | python3 -c 'import json,sys; r=json.load(sys.stdin)["rows"][0]; sys.exit(0 if (r["nanv"] is None and r["infv"] is None and r["okv"]==2.5) else 1)' 2>/dev/null \
   && pass "F3: NaN/Inf → null, finite float preserved" || fail "F3 nan coercion" "$NR"
 
+# M3: an issued auth token is revoked immediately by unpublish — it bypasses only
+# the password check, never existence, so a deleted publication 404s even with a
+# still-live token.
+M3SLUG=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"m3pass\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+M3TOK=$(curl -sk -X POST "$BASE_URL/api/v1/public/$M3SLUG/auth" -H "Content-Type: application/json" \
+  -d '{"password":"m3pass"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$M3SLUG?token=$M3TOK")
+[ "$CODE" = "200" ] && pass "M3: token authorizes before unpublish" || fail "M3 token pre" "HTTP $CODE"
+acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/$M3SLUG" > /dev/null
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$M3SLUG?token=$M3TOK")
+[ "$CODE" = "404" ] && pass "M3: same token → 404 after unpublish (immediate revocation)" || fail "M3 token revoke" "HTTP $CODE"
+
 # Re-snapshot (should overwrite, not error)
 RS_TQ=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d '{"resource_type":"table_query","query_sql":"SELECT name FROM products LIMIT 1"}')

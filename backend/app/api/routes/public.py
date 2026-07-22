@@ -65,6 +65,11 @@ _TOKEN_TTL = 3600  # 1 hour
 
 
 def _make_token(slug: str) -> str:
+    # Bound to the slug (not the password): publications are create-only, so a
+    # password "change" is an unpublish + republish, which mints a NEW slug —
+    # tokens for the old slug are already dead. If an in-place password-update
+    # endpoint is ever added, bind this token to the password_hash too (and make
+    # _verify_token re-check it) or those tokens won't revoke. (M3.)
     ts = str(int(time.time()))
     msg = f"{slug}:{ts}".encode("utf-8")
     sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
@@ -332,7 +337,12 @@ async def _attempt_password_resolve(
             bypass_password=bypass_password,
         )
     except PublicationPasswordInvalid:
-        # Already counted by reserve() above; just let the 401 surface.
+        # Already counted by reserve() above. Record the failed attempt for the
+        # audit trail (a brute-force signal), then let the 401 surface. (M3.)
+        audit_log.record(
+            action="publication.auth.failed", target=slug,
+            outcome="error", code="invalid_password", meta={"ip": ip},
+        )
         raise
     if throttled:
         pub_rl.release(slug, ip)  # verified correct — undo the speculative count
@@ -362,9 +372,10 @@ async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request
     This is the primary brute-force target, so it goes through the same
     throttle as the content path (429 after repeated wrong passwords).
     """
+    ip = _client_ip(request)
     try:
-        await _attempt_password_resolve(
-            slug, password=req.password, ip=_client_ip(request), increment_view=False,
+        pub = await _attempt_password_resolve(
+            slug, password=req.password, ip=ip, increment_view=False,
         )
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
@@ -373,6 +384,11 @@ async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
+    # Record the successful authentication (the "login" event for this share). (M3.)
+    audit_log.record(
+        action="publication.auth.success", target=slug,
+        vault=pub.get("vault"), outcome="ok", meta={"ip": ip},
+    )
     return {"authorized": True, "token": _make_token(slug), "expires_in": _TOKEN_TTL}
 
 
