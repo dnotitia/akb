@@ -67,6 +67,34 @@
         }
       }
     },
+    "/api/v1/collections/{vault}": {
+      "post": {
+        "operationId": "collectionsCreateCollection",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbCollectionCreateEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/collections/{vault}/{path}": {
+      "delete": {
+        "operationId": "collectionsDeleteCollection",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbCollectionDeleteEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/files/{vault}": {
       "get": {
         "operationId": "filesGetVault",

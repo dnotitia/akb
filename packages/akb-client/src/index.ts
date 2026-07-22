@@ -15,6 +15,9 @@ export type {
 export type {
   AkbDocumentEnvelope,
   AkbDocumentWriteEnvelope,
+  AkbCollectionCreateEnvelope,
+  AkbCollectionDeleteEnvelope,
+  AkbCollectionSummary,
   AkbFileEnvelope,
   AkbDrillDownEnvelope,
   AkbGrepEnvelope,
@@ -52,10 +55,7 @@ export type AkbJsonValue =
   | AkbJsonValue[]
   | { [key: string]: AkbJsonValue };
 
-export interface AkbSuccessEnvelope {
-  kind: string;
-  [key: string]: AkbJsonValue | undefined;
-}
+export type AkbSuccessEnvelope = import("./core/schema.gen.js").AkbSuccessEnvelope;
 
 export interface AkbErrorPayload {
   message?: string;
@@ -277,6 +277,15 @@ export interface AkbDocumentVaultOptions {
   vault?: string | null;
 }
 
+export interface AkbCreateCollectionInput {
+  path: string;
+  summary?: string | null;
+}
+
+export interface AkbDeleteCollectionOptions {
+  recursive?: boolean;
+}
+
 export interface AkbDocumentGetOptions extends AkbDocumentVaultOptions {
   version?: string | null;
 }
@@ -437,6 +446,13 @@ export interface AkbGraphFacade extends AkbNamespaceStub {
 }
 
 export interface AkbDocsFacade extends AkbNamespaceStub {
+  createCollection(
+    input: AkbCreateCollectionInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbCollectionCreateEnvelope>>;
+  deleteCollection(
+    path: string,
+    options?: AkbDeleteCollectionOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbCollectionDeleteEnvelope>>;
   get(
     docId: string,
     options?: AkbDocumentGetOptions,
@@ -908,6 +924,24 @@ function makeDocsFacade(
   const facade = {
     name: "docs",
     request: rawRequest,
+    createCollection(input: AkbCreateCollectionInput) {
+      const vault = resolveDocumentVault(defaultVault);
+      return request<import("./core/schema.gen.js").AkbCollectionCreateEnvelope>(
+        `/collections/${encodePathSegment(vault)}`,
+        {
+          method: "POST",
+          body: JSON.stringify(omitUndefined({ path: input.path, summary: input.summary })),
+        },
+      );
+    },
+    deleteCollection(path: string, options: AkbDeleteCollectionOptions = {}) {
+      const vault = resolveDocumentVault(defaultVault);
+      const query = options.recursive === true ? "?recursive=true" : "";
+      return request<import("./core/schema.gen.js").AkbCollectionDeleteEnvelope>(
+        `/collections/${encodePathSegment(vault)}/${encodeCollectionPath(path)}${query}`,
+        { method: "DELETE" },
+      );
+    },
     get(docId: string, options: AkbDocumentGetOptions = {}) {
       const vault = resolveDocumentVault(options.vault ?? defaultVault);
       const params = new URLSearchParams();
@@ -1210,6 +1244,14 @@ function encodeDocumentPath(path: string): string {
     throw new TypeError("Document path must be a non-empty string.");
   }
   return cleaned.split("/").map(encodePathSegment).join("/");
+}
+
+function encodeCollectionPath(path: string): string {
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new TypeError("Collection path must not contain URL dot segments ('.' or '..').");
+  }
+  return segments.map(encodePathSegment).join("/");
 }
 
 function documentPutPayload(

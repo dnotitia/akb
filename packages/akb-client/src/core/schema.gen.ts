@@ -222,6 +222,30 @@ export interface AkbGrepEnvelope {
   [key: string]: unknown;
 }
 
+export interface AkbCollectionSummary {
+  path: string;
+  name: string;
+  summary: string | null;
+  doc_count: number;
+}
+
+export interface AkbCollectionCreateEnvelope {
+  kind: "collection_create";
+  ok: true;
+  created: boolean;
+  collection: AkbCollectionSummary;
+}
+
+export interface AkbCollectionDeleteEnvelope {
+  kind: "collection_delete";
+  ok: true;
+  collection: string;
+  deleted_docs: number;
+  deleted_files: number;
+  deleted_sub_collections: number;
+  deleted_tables: number;
+}
+
 export interface AkbGraphNode {
   uri: string;
   name: string;
@@ -343,6 +367,8 @@ export type AkbSuccessEnvelope =
   | AkbSearchEnvelope
   | AkbDrillDownEnvelope
   | AkbGrepEnvelope
+  | AkbCollectionCreateEnvelope
+  | AkbCollectionDeleteEnvelope
   | AkbGraphNeighborsEnvelope
   | AkbGraphOverviewEnvelope
   | AkbGraphHealthEnvelope
@@ -354,6 +380,12 @@ export type AkbSuccessEnvelope =
 export interface paths {
   "/api/v1/browse/{vault}": {
     get: AkbOperation<"get", "/api/v1/browse/{vault}", { path: { vault: string } }, never, AkbDocumentEnvelope>;
+  };
+  "/api/v1/collections/{vault}": {
+    post: AkbOperation<"post", "/api/v1/collections/{vault}", { path: { vault: string } }, unknown, AkbCollectionCreateEnvelope>;
+  };
+  "/api/v1/collections/{vault}/{path}": {
+    delete: AkbOperation<"delete", "/api/v1/collections/{vault}/{path}", { path: { vault: string; path: string } }, never, AkbCollectionDeleteEnvelope>;
   };
   "/api/v1/documents": {
     post: AkbOperation<"post", "/api/v1/documents", never, unknown, AkbDocumentWriteEnvelope>;
@@ -437,6 +469,8 @@ export interface paths {
 
 export interface operations {
   documentsBrowseVault: paths["/api/v1/browse/{vault}"]["get"];
+  collectionsCreateCollection: paths["/api/v1/collections/{vault}"]["post"];
+  collectionsDeleteCollection: paths["/api/v1/collections/{vault}/{path}"]["delete"];
   documentsPutDocument: paths["/api/v1/documents"]["post"];
   documentsDeleteDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["delete"];
   documentsGetDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["get"];
@@ -484,6 +518,9 @@ export interface components {
     AkbFileEnvelope: AkbFileEnvelope;
     AkbDocumentEnvelope: AkbDocumentEnvelope;
     AkbDocumentWriteEnvelope: AkbDocumentWriteEnvelope;
+    AkbCollectionSummary: AkbCollectionSummary;
+    AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;
+    AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;
     AkbSearchEnvelope: AkbSearchEnvelope;
     AkbDrillDownEnvelope: AkbDrillDownEnvelope;
     AkbGrepEnvelope: AkbGrepEnvelope;
