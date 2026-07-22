@@ -35,7 +35,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import ConfigDict
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_optional_user
+from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
 from app.util.text import NFCModel
@@ -242,6 +243,37 @@ async def list_publications_route(
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     publications = await publication_service.list_publications(access["vault_id"], resource_type)
     return {"publications": publications}
+
+
+@router.get("/public/{slug}/capabilities", summary="Owner capabilities for a publication (optional auth)")
+async def publication_capabilities(
+    slug: str,
+    user: AuthenticatedUser | None = Depends(get_optional_user),
+):
+    """Anonymous-first: returns ``{"can_edit": false}`` unless the *current*
+    session can write to this publication's vault. Read-only and side-effect
+    free; it reveals only the capability plus where to manage the source (never
+    the owner's name, email, or account existence), so the public page can add a
+    quiet owner toolbar client-side without leaking anything to anonymous
+    viewers. The read-only public link stays the canonical audience view — this
+    just gives the owner a route back into the app. (publish-hardening F6.)
+    """
+    if user is None:
+        return {"can_edit": False}
+    pub = await publication_service.get_publication_by_slug(slug)
+    if pub is None:
+        return {"can_edit": False}
+    try:
+        await check_vault_access(user.user_id, pub["vault"], required_role="writer")
+    except (ForbiddenError, NotFoundError):
+        return {"can_edit": False}
+    # Authorized: safe to name the vault + resource kind (the caller can already
+    # read/write them) so the client can deep-link "Manage" / "Open in AKB".
+    return {
+        "can_edit": True,
+        "vault": pub["vault"],
+        "resource_type": pub["resource_type"],
+    }
 
 
 @router.post("/publications/{vault}/{slug}/snapshot", summary="Create snapshot for table_query publication")

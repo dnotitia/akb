@@ -4,8 +4,10 @@ import { ArrowLeft, FileQuestion } from "lucide-react";
 import { MarkdownRender } from "@/components/markdown-render";
 import {
   getPublication,
+  publicationCapabilities,
   type PublicationResponse,
   type PublicationError,
+  type PublicationCapabilities,
 } from "@/lib/api";
 import { formatDate } from "@/lib/utils";
 import { PasswordGate } from "@/components/password-gate";
@@ -23,6 +25,7 @@ export default function PublicationPage() {
   const [data, setData] = useState<PublicationResponse | null>(null);
   const [error, setError] = useState<PublicationError | null>(null);
   const [needsPassword, setNeedsPassword] = useState(false);
+  const [caps, setCaps] = useState<PublicationCapabilities>({ can_edit: false });
 
   async function load() {
     if (!slug) return;
@@ -52,6 +55,21 @@ export default function PublicationPage() {
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  // Owner affordance (F6): if the current session can edit this publication's
+  // source, surface a quiet toolbar with a route back into the app. Anonymous-
+  // first — no request without a session, and any failure just hides it.
+  useEffect(() => {
+    if (!slug) return;
+    let cancelled = false;
+    setCaps({ can_edit: false });
+    publicationCapabilities(slug).then((c) => {
+      if (!cancelled) setCaps(c);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [slug]);
 
   // Per-publication document title (WCAG 2.4.2). The password gate sets its
@@ -101,6 +119,35 @@ export default function PublicationPage() {
           </div>
         </div>
       </header>
+
+      {/* Owner toolbar (F6) — only when the current session can edit the source.
+          The page above stays the exact read-only view the audience sees; this
+          is just a route back into the app to edit or manage the publication. */}
+      {caps.can_edit && caps.vault && (
+        <div className="border-b border-border bg-surface-2">
+          <div className="mx-auto max-w-[1200px] px-6 py-2 flex items-center justify-between flex-wrap gap-x-4 gap-y-1">
+            <span className="text-xs text-foreground-muted">
+              You manage this publication — viewers see the read-only page below.
+            </span>
+            <div className="flex items-center gap-4">
+              {/* vault names are server-validated URL-safe segments; encode
+                  anyway so the destination can never be steered. */}
+              <a
+                href={`/vault/${encodeURIComponent(caps.vault)}/publications`}
+                className="text-xs font-medium text-link hover:underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                Manage publications
+              </a>
+              <a
+                href={`/vault/${encodeURIComponent(caps.vault)}`}
+                className="text-xs font-medium text-link hover:underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              >
+                Open in AKB →
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Body */}
       <main className="mx-auto max-w-[1200px] px-6 py-12 fade-up">

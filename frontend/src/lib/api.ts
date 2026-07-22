@@ -669,6 +669,29 @@ export async function getPublicationMeta(slug: string): Promise<any> {
   return res.json();
 }
 
+export interface PublicationCapabilities {
+  can_edit: boolean;
+  vault?: string;
+  resource_type?: "document" | "table_query" | "file";
+}
+
+// Owner capability probe for the public page. Anonymous-first: only asks the
+// server when a session token exists, and degrades to {can_edit:false} on any
+// error so it can never break (or redirect away from) the public view. (F6.)
+export async function publicationCapabilities(slug: string): Promise<PublicationCapabilities> {
+  const token = getToken();
+  if (!token) return { can_edit: false };
+  try {
+    const res = await fetch(`${API_BASE}/public/${slug}/capabilities`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { can_edit: false };
+    return await res.json();
+  } catch {
+    return { can_edit: false };
+  }
+}
+
 export async function submitPublicationPassword(slug: string, password: string): Promise<{ token: string; expires_in: number }> {
   const res = await fetch(`${API_BASE}/public/${slug}/auth`, {
     method: "POST",
