@@ -1,5 +1,4 @@
 import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams, matchPath } from "react-router-dom";
-import { cn } from "@/lib/utils";
 import { useEffect, useState } from "react";
 import { Search as SearchIcon } from "lucide-react";
 import { getToken } from "@/lib/api";
@@ -93,16 +92,10 @@ export function Layout() {
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        {/* Header shares the content container on non-wide (app) routes so its
-            brand/nav line up with the page + footer (max-w-[1400px] px-6). Wide
-            vault-shell routes keep the wider gutter since their content is
-            full-bleed and has no 1400px column to align to. */}
-        <div
-          className={cn(
-            "mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] items-center gap-4 h-16",
-            wide ? "max-w-[1600px] px-5" : "max-w-[1400px] px-6",
-          )}
-        >
+        {/* Header uses the same max-w-[1400px] px-6 gutter as the page content
+            and footer on EVERY route, so the brand/nav stay aligned and don't
+            jump wider when entering a vault workspace. */}
+        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1400px] items-center gap-4 px-6 h-16">
           {/* Brand */}
           <Link
             to="/"
