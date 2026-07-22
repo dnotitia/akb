@@ -266,10 +266,16 @@ async def create_snapshot_route(
 # ============================================================
 
 def _extract_password(request: Request, body_password: str | None = None) -> str | None:
-    """Extract password from query string, header, or body."""
-    pw = request.query_params.get("password")
-    if pw:
-        return pw
+    """Extract the publication password from the `x-publication-password`
+    header or the request body — NEVER the query string.
+
+    A password in the query string (`?password=…`) leaks through browser
+    history, server/proxy access logs, `Referer` headers, analytics, and
+    copy-pasted/forwarded URLs. The frontend submits the password via
+    POST /public/{slug}/auth (JSON body) and then carries the returned
+    short-lived HMAC token (`?token=`/cookie); programmatic callers use the
+    header or a body field. (publish-hardening M1.)
+    """
     pw = request.headers.get("x-publication-password")
     if pw:
         return pw

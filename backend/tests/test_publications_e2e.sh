@@ -194,13 +194,18 @@ PWPROT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "401" ] && pass "No password → 401" || fail "No pw" "HTTP $CODE"
 
-# Wrong password → 401
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=wrong")
+# Wrong password → 401 (password via header — query-string ?password= was
+# removed as a leak vector in publish-hardening M1)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "x-publication-password: wrong" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "401" ] && pass "Wrong password → 401" || fail "Wrong pw" "HTTP $CODE"
 
-# Correct password → 200
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=secret123")
+# Correct password → 200 (via header)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "x-publication-password: secret123" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "200" ] && pass "Correct password → 200" || fail "Correct pw" "HTTP $CODE"
+
+# Query-string password must NOT authenticate (M1 hardening) → still 401
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=secret123")
+[ "$CODE" = "401" ] && pass "Query-string password rejected → 401" || fail "QS pw should be ignored" "HTTP $CODE"
 
 # Auth flow: POST /auth → token → use token
 R=$(curl -sk -X POST "$BASE_URL/api/v1/public/$PW_SLUG/auth" -H "Content-Type: application/json" \
