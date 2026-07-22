@@ -88,6 +88,113 @@ def test_api_error_responses_reference_single_akb_error_component():
             )
 
 
+def test_activity_history_diff_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    expected = {
+        "/api/v1/activity/{vault}": (
+            "activityList", "activity", "AkbActivityEnvelope",
+        ),
+        "/api/v1/recent": (
+            "activityRecent", "activity", "AkbRecentChangesEnvelope",
+        ),
+        "/api/v1/history/{vault}/{doc_id}": (
+            "documentsHistory", "documents", "AkbDocumentHistoryEnvelope",
+        ),
+        "/api/v1/diff/{vault}/{doc_id}": (
+            "documentsDiff", "documents", "AkbDocumentDiffEnvelope",
+        ),
+    }
+
+    operation_ids = [operation["operationId"] for _, _, operation in _api_operations()]
+    for path, (operation_id, tag, model) in expected.items():
+        operation = paths[path]["get"]
+        assert operation["operationId"] == operation_id
+        assert operation["tags"] == [tag]
+        assert operation_ids.count(operation_id) == 1
+        assert (
+            operation["responses"]["200"]["content"]["application/json"]["schema"]
+            == {"$ref": f"#/components/schemas/{model}"}
+        )
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": "#/components/schemas/AkbError"}
+            )
+
+
+def test_activity_history_diff_schemas_have_literal_kinds_and_typed_fields():
+    schemas = app.openapi()["components"]["schemas"]
+    expected_kinds = {
+        "AkbActivityEnvelope": "activity",
+        "AkbRecentChangesEnvelope": "recent_changes",
+        "AkbDocumentHistoryEnvelope": "document_history",
+        "AkbDocumentDiffEnvelope": "document_diff",
+    }
+    for model, kind in expected_kinds.items():
+        leaf = schemas[model]
+        assert "kind" in leaf["required"]
+        assert leaf["properties"]["kind"] == {
+            "type": "string",
+            "enum": [kind],
+            "description": "Success envelope discriminator.",
+        }
+
+    activity_items = schemas["AkbActivityEnvelope"]["properties"]["activity"]
+    assert activity_items == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ActivityEntry"},
+    }
+    assert schemas["ActivityEntry"]["properties"]["date"] == {
+        "type": "string", "format": "date-time",
+    }
+    assert schemas["ActivityEntry"]["properties"]["files"] == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ActivityFileChange"},
+    }
+    assert schemas["ActivityFileChange"]["properties"]["change"]["enum"] == [
+        "added", "deleted", "modified",
+    ]
+
+    recent_items = schemas["AkbRecentChangesEnvelope"]["properties"]["changes"]
+    assert recent_items["items"] == {"$ref": "#/components/schemas/RecentDocumentChange"}
+    recent = schemas["RecentDocumentChange"]["properties"]
+    assert recent["commit"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert recent["changed_at"] == {
+        "anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}],
+    }
+
+    history_items = schemas["AkbDocumentHistoryEnvelope"]["properties"]["history"]
+    assert history_items["items"] == {"$ref": "#/components/schemas/DocumentHistoryEntry"}
+    history = schemas["DocumentHistoryEntry"]["properties"]
+    assert history["hash"]["type"] == "string"
+    assert history["author"]["type"] == "string"
+    assert history["date"] == {"type": "string", "format": "date-time"}
+
+    diff = schemas["AkbDocumentDiffEnvelope"]
+    assert {"file", "commit", "type", "diff"}.issubset(diff["required"])
+    assert diff["properties"]["type"]["enum"] == [
+        "added", "deleted", "modified", "unknown", "unchanged",
+    ]
+    assert diff["properties"]["diff"]["type"] == "string"
+    assert "error" not in diff["required"]
+
+
+def test_activity_history_diff_are_registered_in_success_discriminator_once():
+    success = app.openapi()["components"]["schemas"]["AkbSuccessEnvelope"]
+    refs = [item["$ref"] for item in success["oneOf"]]
+    expected = {
+        "activity": "#/components/schemas/AkbActivityEnvelope",
+        "recent_changes": "#/components/schemas/AkbRecentChangesEnvelope",
+        "document_history": "#/components/schemas/AkbDocumentHistoryEnvelope",
+        "document_diff": "#/components/schemas/AkbDocumentDiffEnvelope",
+    }
+    mapping = success["discriminator"]["mapping"]
+    for kind, ref in expected.items():
+        assert refs.count(ref) == 1
+        assert mapping[kind] == ref
+
+
 def test_success_envelope_components_are_kind_discriminated():
     schemas = app.openapi()["components"]["schemas"]
     union = schemas["AkbSuccessEnvelope"]
@@ -113,6 +220,10 @@ def test_success_envelope_components_are_kind_discriminated():
             "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
             "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
             "provenance": "#/components/schemas/AkbProvenanceEnvelope",
+            "activity": "#/components/schemas/AkbActivityEnvelope",
+            "recent_changes": "#/components/schemas/AkbRecentChangesEnvelope",
+            "document_history": "#/components/schemas/AkbDocumentHistoryEnvelope",
+            "document_diff": "#/components/schemas/AkbDocumentDiffEnvelope",
         },
     }
     for name, kind in (
@@ -135,6 +246,10 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbRelationLinkEnvelope", "relation_link"),
         ("AkbRelationUnlinkEnvelope", "relation_unlink"),
         ("AkbProvenanceEnvelope", "provenance"),
+        ("AkbActivityEnvelope", "activity"),
+        ("AkbRecentChangesEnvelope", "recent_changes"),
+        ("AkbDocumentHistoryEnvelope", "document_history"),
+        ("AkbDocumentDiffEnvelope", "document_diff"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
