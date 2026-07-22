@@ -379,6 +379,18 @@ echo "$RAW" | grep -q '"hello":"world"' && pass "/raw streams JSON content" || f
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SLUG/download")
 [ "$CODE" = "200" ] && pass "/download streams (200)" || fail "/download" "HTTP $CODE"
 
+# F5: a file's view is counted when CONTENT is served (/raw, /download), NOT at
+# the metadata GET — so a max_views=1 file's only view isn't spent on metadata
+# (which would 410 the actual content), and a direct /raw can't serve unlimited.
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$FILE_URI\",\"max_views\":1}")
+MV_FILE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+curl -sk -o /dev/null "$BASE_URL/api/v1/public/$MV_FILE"   # metadata GET must NOT consume the single view
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/raw")
+[ "$CODE" = "200" ] && pass "F5: /raw serves after metadata GET (view not spent on metadata)" || fail "F5 /raw first" "HTTP $CODE"
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/raw")
+[ "$CODE" = "410" ] && pass "F5: 2nd /raw → 410 (max_views enforced at content serve)" || fail "F5 /raw cap" "HTTP $CODE"
+
 # Invalid file_id format
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/not-a-uuid\"}")
@@ -399,6 +411,13 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG
 R=$(curl -sk "$BASE_URL/api/v1/oembed?url=/p/$TQ_SLUG")
 TYPE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))' 2>/dev/null)
 [ "$TYPE" = "rich" ] && pass "oEmbed type=rich for table_query" || fail "oEmbed type" "$TYPE"
+
+# F1: oEmbed must NOT leak a password-protected publication's title
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"oe-secret\"}")
+OE_PW_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+OT=$(curl -sk "$BASE_URL/api/v1/oembed?url=/p/$OE_PW_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
+[ "$OT" = "Protected AKB publication" ] && pass "F1: oEmbed masks password-protected title" || fail "F1 oembed title" "$OT"
 
 # allow_embed=false → /embed → 403
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \

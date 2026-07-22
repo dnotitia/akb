@@ -471,7 +471,10 @@ async def publication_raw(slug: str, request: Request):
     browser uses the direct presigned URL via <img>/<embed> tags.
     """
     try:
-        publication = await _resolve_with_access(slug, request, increment_view=False)
+        # Count the view here — /raw serves the file's actual content, and the
+        # metadata GET deliberately doesn't count files (F5). The atomic
+        # increment enforces max_views, so a direct /raw can't serve unlimited.
+        publication = await _resolve_with_access(slug, request, increment_view=True)
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
@@ -635,9 +638,24 @@ async def get_public_publication(
       ?format=json (default), ?format=csv, ?format=html
       Or via Accept header.
     """
-    # Resolve with view-count increment
+    # Count the view here for document/table_query (this endpoint IS their
+    # content). A FILE's content is served by /raw or /download (which count),
+    # so counting the metadata resolve would spend a max_views=1 file's only
+    # view here and 410 the actual content fetch — peek the type and skip the
+    # increment for files. (publish-hardening F5.)
+    #
+    # The peek/resolve pair is race-free because a publication's slug is a
+    # unique random token that is never reused (delete → the slug 404s forever;
+    # a new publication always gets a fresh slug) and its resource_type is
+    # immutable (create + delete only, no type-changing update). So the peeked
+    # type always matches the row resolve_publication re-reads below; the only
+    # window is deletion, which makes the resolve 404 (nothing is served or
+    # counted). If a type-changing update is ever added, move this decision into
+    # resolve_publication's atomic read.
+    peeked = await publication_service.get_publication_by_slug(slug)
+    is_file = peeked is not None and peeked.get("resource_type") == ResourceType.FILE
     try:
-        publication = await _resolve_with_access(slug, request, increment_view=True)
+        publication = await _resolve_with_access(slug, request, increment_view=not is_file)
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
     except PublicationPasswordRequired:
