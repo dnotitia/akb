@@ -39,7 +39,8 @@ from app.api.deps import get_current_user
 from app.config import settings
 from app.db.postgres import get_pool
 from app.util.text import NFCModel
-from app.services import file_service, publication_service
+from app.services import audit_log, file_service, publication_service
+from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.publication_service import (
@@ -287,6 +288,57 @@ def _extract_auth_token(request: Request) -> str | None:
     return request.query_params.get("token") or request.cookies.get("akb_publication_token")
 
 
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for throttling. Behind the ingress the socket peer
+    is the proxy, so prefer the leftmost X-Forwarded-For hop (the original
+    client). It is client-spoofable, which is exactly why the per-slug backstop
+    in publication_rate_limit does not rely on the IP alone."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
+async def _attempt_password_resolve(
+    slug: str, *, password: str | None, ip: str,
+    increment_view: bool, bypass_password: bool = False,
+) -> dict:
+    """`resolve_publication` wrapped with the F2 password-attempt throttle.
+
+    Only genuine wrong-password attempts are counted: token/bypass requests and
+    the "no password supplied" case (which yields PublicationPasswordRequired,
+    not Invalid) never touch the limiter. On lockout we return 429 with
+    Retry-After and audit the event.
+    """
+    throttled = password is not None and not bypass_password
+    if throttled:
+        # Count this attempt BEFORE the (slow, awaited) bcrypt verify so a
+        # concurrent burst can't all slip past a stale counter.
+        lock = pub_rl.reserve(slug, ip)
+        if lock > 0:
+            audit_log.record(
+                action="publication.auth.throttled", target=slug,
+                outcome="error", code="rate_limited",
+                meta={"ip": ip, "lock_seconds": int(lock)},
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many password attempts. Please wait and try again.",
+                headers={"Retry-After": str(int(lock) + 1)},
+            )
+    try:
+        pub = await publication_service.resolve_publication(
+            slug, password=password, increment_view=increment_view,
+            bypass_password=bypass_password,
+        )
+    except PublicationPasswordInvalid:
+        # Already counted by reserve() above; just let the 401 surface.
+        raise
+    if throttled:
+        pub_rl.release(slug, ip)  # verified correct — undo the speculative count
+    return pub
+
+
 async def _resolve_with_access(slug: str, request: Request, increment_view: bool = True) -> dict:
     """Resolve a publication, handling password and HMAC token."""
     # If a valid token is present, bypass password check
@@ -296,16 +348,24 @@ async def _resolve_with_access(slug: str, request: Request, increment_view: bool
             slug, password=None, increment_view=increment_view, bypass_password=True,
         )
 
-    # Otherwise check password from request
+    # Otherwise check password from request (throttled against brute force)
     password = _extract_password(request)
-    return await publication_service.resolve_publication(slug, password=password, increment_view=increment_view)
+    return await _attempt_password_resolve(
+        slug, password=password, ip=_client_ip(request), increment_view=increment_view,
+    )
 
 
 @router.post("/public/{slug}/auth", summary="Submit password for a publication")
-async def publication_auth(slug: str, req: PasswordAuthRequest):
-    """Verify password and return a short-lived HMAC token."""
+async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request):
+    """Verify password and return a short-lived HMAC token.
+
+    This is the primary brute-force target, so it goes through the same
+    throttle as the content path (429 after repeated wrong passwords).
+    """
     try:
-        await publication_service.resolve_publication(slug, password=req.password, increment_view=False)
+        await _attempt_password_resolve(
+            slug, password=req.password, ip=_client_ip(request), increment_view=False,
+        )
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
     except PublicationPasswordInvalid:
