@@ -57,7 +57,7 @@ async def test_execute_sql_route_serialises_envelope_and_forwards_params(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatch) -> None:
+async def test_alter_table_route_forwards_schema_ops_with_admin_gate(monkeypatch) -> None:
     from app.api.routes import tables
 
     captured: dict[str, Any] = {}
@@ -96,7 +96,7 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
     )
 
     assert result["kind"] == "table"
-    assert roles == ["writer"]
+    assert roles == ["admin"]
     assert captured == {
         "vault_id": "vault-1",
         "table_name": "incidents",

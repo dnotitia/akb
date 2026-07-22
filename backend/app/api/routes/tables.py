@@ -180,9 +180,9 @@ async def alter_table(
     req: AlterTableRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    # REST BaaS schema changes are a writer-level surface by AKB-034/067;
-    # the legacy MCP alter tool keeps its stricter admin gate.
-    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    # Keep REST aligned with MCP's fail-closed policy until alter operations
+    # are classified into destructive and non-destructive permission tiers.
+    access = await check_vault_access(user.user_id, vault, required_role="admin")
     return await table_service.alter_table(
         access["vault_id"], table_name,
         actor_id=user.username,
