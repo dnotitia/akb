@@ -10,6 +10,7 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 VAULT="tbl-envelope-$(date +%s)"
 USER="tbl-envelope-$(date +%s)"
 READER="tbl-envelope-reader-$(date +%s)"
+WRITER="tbl-envelope-writer-$(date +%s)"
 OUTSIDER="tbl-envelope-outsider-$(date +%s)"
 TABLE="cust"
 PASS=0
@@ -51,6 +52,19 @@ READER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
   -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$WRITER\",\"email\":\"$WRITER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+
+WRITER_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$WRITER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+WRITER_PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $WRITER_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"tbl-envelope-writer"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+  -H 'Content-Type: application/json' \
   -d "{\"username\":\"$OUTSIDER\",\"email\":\"$OUTSIDER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
 
 OUTSIDER_JWT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
@@ -70,6 +84,11 @@ curl -sk -X POST "$BASE_URL/api/v1/vaults/$VAULT/grant" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
   -d "{\"user\":\"$READER\",\"role\":\"reader\"}" >/dev/null
+
+curl -sk -X POST "$BASE_URL/api/v1/vaults/$VAULT/grant" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d "{\"user\":\"$WRITER\",\"role\":\"writer\"}" >/dev/null
 
 # JSON-key assertion helper.
 assert_keys() {
@@ -119,6 +138,12 @@ ALTER_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/
   -H 'Content-Type: application/json' \
   -d '{"add_columns":[{"name":"status","type":"text"}]}')
 [ "$ALTER_DENY" = "403" ] && pass "alter.reader: HTTP 403" || fail "alter.reader" "expected 403, got $ALTER_DENY"
+
+ALTER_WRITER_DENY=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
+  -H "Authorization: Bearer $WRITER_PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"drop_columns":["age"]}')
+[ "$ALTER_WRITER_DENY" = "403" ] && pass "alter.writer: HTTP 403" || fail "alter.writer" "expected 403, got $ALTER_WRITER_DENY"
 
 ALTER=$(curl -sk -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT" \
