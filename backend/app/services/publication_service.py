@@ -878,12 +878,17 @@ async def resolve_document_publication(publication: dict) -> dict:
         "resource_type": ResourceType.DOCUMENT,
         "title": publication.get("title") or doc_row["title"],
         "type": doc_row["doc_type"],
-        "status": doc_row["status"],
         "summary": doc_row["summary"],
         "domain": doc_row["domain"],
-        "created_by": doc_row["created_by"],
+        # Author attribution via the RESOLVED name only (created_by_name =
+        # display_name, or username when no display name) — never the raw
+        # created_by, which is a username or a bare user UUID on legacy rows and
+        # would hand an anonymous viewer a valid account identifier. Also drop
+        # the internal workflow `status` (leaks draft/review state) and the
+        # unused `created_at` to minimize the exposed surface. Showing a username
+        # when no display name is set remains a product-policy choice for the
+        # attribution feature. (publish-hardening F8.)
         "created_by_name": doc_row["created_by_name"],
-        "created_at": doc_row["created_at"].isoformat() if doc_row["created_at"] else None,
         "updated_at": doc_row["updated_at"].isoformat() if doc_row["updated_at"] else None,
         "tags": list(doc_row["tags"]) if doc_row["tags"] else [],
         "content": body,

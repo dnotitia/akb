@@ -121,6 +121,11 @@ TITLE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(
 CU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content_unavailable"))' 2>/dev/null)
 [ "$CU" = "False" ] && pass "content_unavailable = false" || fail "content_unavailable" "$CU"
 
+# F8: anonymous doc response must not leak the raw creator id, internal workflow
+# status, or created_at — only the resolved author display name is exposed.
+echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); leaked=[k for k in ("created_by","status","created_at") if k in d]; sys.exit(1 if leaked else 0)' \
+  && pass "F8: doc response omits created_by/status/created_at" || fail "F8 metadata leak" "$R"
+
 # Tags returned
 TAGS=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d.get("tags",[])))' 2>/dev/null)
 [ "$TAGS" = "pub,test" ] && pass "Tags preserved" || fail "Tags" "$TAGS"

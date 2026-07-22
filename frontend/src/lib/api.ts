@@ -577,13 +577,12 @@ export interface PublicationResponse {
   title?: string;
   // document fields
   type?: string;
-  status?: string;
   summary?: string;
   domain?: string;
-  created_by?: string;
-  /** Human author name resolved from created_by (a user id) at read time. */
+  /** Human author name resolved from the doc's creator at read time. The raw
+   *  created_by identifier and internal status/created_at are not exposed to
+   *  anonymous viewers (F8). */
   created_by_name?: string;
-  created_at?: string;
   updated_at?: string;
   tags?: string[];
   content?: string;
