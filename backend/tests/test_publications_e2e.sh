@@ -680,6 +680,17 @@ HTML_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Conte
 HH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$HTML_PUB/raw")
 echo "$HH" | grep -qi '^content-security-policy: sandbox' && pass "F4: /raw on HTML sets CSP sandbox" || fail "F4 html CSP" "$HH"
 
+# F3: a table_query returning non-finite floats (NaN/±Inf) must not 500 the JSON
+# path (Starlette renders with allow_nan=False) — they coerce to null.
+NANQ="SELECT float8 'NaN' AS nanv, float8 'Infinity' AS infv, float8 '2.5' AS okv"
+NANP=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"table_query\",\"query_sql\":\"$NANQ\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$NANP")
+[ "$CODE" = "200" ] && pass "F3: NaN/Inf table_query resolves 200 (not 500)" || fail "F3 nan 200" "HTTP $CODE"
+NR=$(curl -sk "$BASE_URL/api/v1/public/$NANP")
+echo "$NR" | python3 -c 'import json,sys; r=json.load(sys.stdin)["rows"][0]; sys.exit(0 if (r["nanv"] is None and r["infv"] is None and r["okv"]==2.5) else 1)' 2>/dev/null \
+  && pass "F3: NaN/Inf → null, finite float preserved" || fail "F3 nan coercion" "$NR"
+
 # Re-snapshot (should overwrite, not error)
 RS_TQ=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d '{"resource_type":"table_query","query_sql":"SELECT name FROM products LIMIT 1"}')

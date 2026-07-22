@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import math
 import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -1068,10 +1070,26 @@ def _bind_params_to_sql(sql: str, param_defs: dict, url_params: dict) -> tuple[s
 
 
 def _serialize_value(v: Any) -> Any:
-    if v is None or isinstance(v, (bool, int, float, str)):
+    """Coerce a DB (or cached-snapshot) value into a JSON-safe form, recursing
+    into arrays/objects. Non-finite floats and Decimals (NaN / ±Inf) become null:
+    they are not valid JSON and Starlette's JSONResponse renders with
+    allow_nan=False (would 500), so a canned query that produces them — or a
+    legacy snapshot that stored them — would break the publication permanently.
+    A non-finite value is thereby indistinguishable from SQL NULL in the output.
+    (publish-hardening F3; matches akb_sql's inf_nan_mode="null".)
+    """
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if v is None or isinstance(v, (bool, int, str)):
         return v
+    if isinstance(v, Decimal):
+        return str(v) if v.is_finite() else None
     if isinstance(v, uuid.UUID):
         return str(v)
+    if isinstance(v, (list, tuple)):
+        return [_serialize_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _serialize_value(x) for k, x in v.items()}
     if hasattr(v, "isoformat"):
         return v.isoformat()
     return str(v)
@@ -1185,6 +1203,11 @@ async def _read_snapshot(publication: dict) -> dict:
     if not isinstance(data, dict):
         raise PublicationError("Snapshot data is not a valid object", status_code=500)
 
+    # Legacy snapshots written before F3 can hold literal NaN/Infinity (json.loads
+    # accepts them as float('nan')/inf), which would 500 on render — sanitize on
+    # read so old snapshots resolve instead of being permanently broken. (F3.)
+    data = _serialize_value(data)
+
     data["snapshot_at"] = publication.get("snapshot_at")
     data["mode"] = "snapshot"
     return data
@@ -1240,7 +1263,10 @@ async def create_snapshot(
             try:
                 file_service.put_object_bytes(
                     s3_key,
-                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    # allow_nan=False: result is already coerced by
+                    # _serialize_value, so this just refuses to silently persist
+                    # a stray non-finite float as invalid JSON. (F3.)
+                    json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"),
                     content_type="application/json",
                 )
             except (file_service.StorageError, IOError) as e:
