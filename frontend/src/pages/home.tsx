@@ -27,6 +27,7 @@ import { CodeSnippet } from "@/components/ui/code-snippet";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { VaultList, type VaultRow } from "@/components/vault-list";
+import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { VaultChip } from "@/components/ui/vault-chip";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -85,6 +86,9 @@ export default function HomePage() {
   // "Show more" doubles it client-side (all vaults are already loaded, so no
   // refetch — unlike Recent activity, which grows its server-side limit).
   const [vaultLimit, setVaultLimit] = useState(VAULT_PREVIEW_LIMIT);
+  // Per-browser favorited vault IDs (localStorage) — same source the vault rail
+  // uses, so pinning here and in the rail stay in sync.
+  const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
@@ -155,12 +159,6 @@ export default function HomePage() {
   function loadMoreRecent() {
     // Grow by the current count ("this many again"), capped at the backend max.
     loadRecent(() => false, Math.min(recentLimit * 2, RECENT_MAX), { more: true });
-  }
-
-  function showMoreVaults() {
-    // Client-side only — reveal "this many again" of the already-loaded vaults,
-    // capped at the full count.
-    setVaultLimit((n) => Math.min(n * 2, vaults.length));
   }
 
   // Scroll to #vaults / #recent when a link lands here with that hash. Keyed on
@@ -249,13 +247,44 @@ export default function HomePage() {
   }, []);
 
   // Home shows a preview of the vault directory; the full list (with filter)
-  // lives on /vault. Memoized so <VaultList> doesn't re-fetch metrics on every
-  // unrelated render.
-  const previewVaults = useMemo(
-    () => vaults.slice(0, vaultLimit),
-    [vaults, vaultLimit],
+  // lives on /vault. Favorites float to the top (mirroring the vault rail) and
+  // are always visible: the preview cap is a FLOOR, not a hard slice — a
+  // favorite is never hidden behind "Show more". Memoized so <VaultList>
+  // doesn't re-fetch metrics on every unrelated render.
+  const orderedVaults = useMemo(() => {
+    // Filter to the LIVE list so a favorited-but-deleted/revoked vault id drops
+    // silently (same as the rail); newest-favorited first within the group.
+    const favs = vaults
+      .filter((v) => isFavorite(v.id))
+      .sort((a, b) => favOrder(a.id) - favOrder(b.id));
+    const rest = vaults.filter((v) => !isFavorite(v.id));
+    return [...favs, ...rest];
+  }, [vaults, isFavorite, favOrder]);
+  const liveFavCount = useMemo(
+    () => vaults.reduce((n, v) => (isFavorite(v.id) ? n + 1 : n), 0),
+    [vaults, isFavorite],
   );
-  const canShowMoreVaults = vaults.length > vaultLimit;
+  // Show at least `vaultLimit`, but never fewer than the live favorites.
+  const visibleVaultCount = Math.max(vaultLimit, liveFavCount);
+  const previewVaults = useMemo(
+    () => orderedVaults.slice(0, visibleVaultCount),
+    [orderedVaults, visibleVaultCount],
+  );
+  const canShowMoreVaults = orderedVaults.length > visibleVaultCount;
+
+  function showMoreVaults() {
+    // Grow from the ACTUAL rendered row count (not vaultLimit — favorites may
+    // have pushed it higher), "this many again", capped at the full list.
+    setVaultLimit(() => Math.min(visibleVaultCount * 2, orderedVaults.length));
+  }
+
+  function toggleVaultFavorite(v: VaultRow) {
+    // Lock in the current row count before toggling so unpinning a cap-exempt
+    // favorite can't make its own row vanish (row reorders in place; the keyed
+    // <li> keeps keyboard focus on the star). Per Codex design review.
+    setVaultLimit((n) => Math.max(n, visibleVaultCount));
+    toggleFavorite(v.id);
+  }
 
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
@@ -444,7 +473,10 @@ export default function HomePage() {
             />
           ) : (
             <>
-              <VaultList vaults={previewVaults} />
+              <VaultList
+                vaults={previewVaults}
+                favoriteControl={{ isFavorite, onToggle: toggleVaultFavorite }}
+              />
               {canShowMoreVaults && (
                 <div className="mt-3 flex justify-center">
                   <Button
