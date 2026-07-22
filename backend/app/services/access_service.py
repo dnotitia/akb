@@ -1545,6 +1545,27 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             if failed:
                 logger.error("Vault %s: %d/%d S3 files failed to delete", vault_name, len(failed), len(file_rows))
 
+        # Publication snapshot objects live under snapshots/<id>.json — OUTSIDE
+        # the vault's file prefix — so the vault_files sweep above misses them.
+        # Collect + delete them here before the DB cascade drops the publication
+        # rows, or they'd orphan in S3. Same out-of-band caveat as files above.
+        # (publish-hardening F7 — the per-publication path is delete_publication.)
+        # A snapshot created in the tiny window between this read and the cascade
+        # could still orphan, but the archive-then-delete lifecycle makes the
+        # vault read-only first, so no new publication lands here in practice.
+        snap_rows = await conn.fetch(
+            "SELECT snapshot_s3_key FROM publications"
+            " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
+            vault_id,
+        )
+        if snap_rows and settings.s3_endpoint_url:
+            from app.services.adapters import s3_adapter
+            for sr in snap_rows:
+                try:
+                    s3_adapter.delete(sr["snapshot_s3_key"])
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to delete snapshot S3 object %s: %s", sr["snapshot_s3_key"], e)
+
         async with conn.transaction():
             from app.services.index_service import _drop_source_chunks_with_outbox
 

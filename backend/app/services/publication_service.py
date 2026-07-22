@@ -29,6 +29,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.services import file_service, table_service
+from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
 from app.services.uri_service import parse_uri
 
@@ -513,14 +514,25 @@ async def delete_publication(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if expected_vault_id is not None:
-            result = await conn.execute(
-                "DELETE FROM publications WHERE slug = $1 AND vault_id = $2",
-                slug, expected_vault_id,
-            )
-        else:
-            result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
-    deleted = result.endswith(" 1")
+        async with conn.transaction():
+            if expected_vault_id is not None:
+                row = await conn.fetchrow(
+                    "DELETE FROM publications WHERE slug = $1 AND vault_id = $2"
+                    " RETURNING snapshot_s3_key",
+                    slug, expected_vault_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "DELETE FROM publications WHERE slug = $1 RETURNING snapshot_s3_key",
+                    slug,
+                )
+            deleted = row is not None
+            # Reclaim the cached snapshot object so unpublishing a snapshot-mode
+            # table_query doesn't leave it orphaned in S3. Same TX as the delete
+            # via the crash-safe outbox, so a crash can't drop one without the
+            # other. (publish-hardening F7.)
+            if deleted and row["snapshot_s3_key"]:
+                await _enqueue_s3_delete(conn, row["snapshot_s3_key"])
     if deleted:
         logger.info("Publication deleted: %s", slug)
     return deleted
