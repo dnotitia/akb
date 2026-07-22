@@ -138,6 +138,14 @@ class PasswordAuthRequest(NFCModel):
 # ============================================================
 
 def _publication_error_to_http(e: PublicationError) -> HTTPException:
+    # These distinct codes (404 not-found, 401 password-required, 410
+    # expired/view-exhausted, 429 throttled) let an anonymous holder of the link
+    # tell a publication's state apart. That disclosure was reviewed and
+    # deliberately accepted (publish-hardening F9, informational): the slug is a
+    # 96-bit unguessable capability, so anyone seeing these codes already holds
+    # the link, and the frontend NEEDS the distinction to render the password
+    # gate vs an expired/removed notice. Collapsing everything to 404 would break
+    # the UX and buy no real secrecy.
     return HTTPException(status_code=e.status_code, detail=e.message)
 
 
