@@ -91,7 +91,10 @@ export function FileViewer({ slug, data }: Props) {
           </div>
           <FileBody
             mime={mime}
-            directUrl={data.download_url || ""}
+            // Images/PDFs render inline from the same-origin proxy (not a
+            // presigned S3 URL) so the vault name never leaks and the view stays
+            // counted + revocable. (publish-hardening F4.)
+            directUrl={rawUrl}
             rawUrl={rawUrl}
             name={data.name || ""}
           />
@@ -162,7 +165,7 @@ function ImageFileBody({ directUrl, name }: { directUrl: string; name: string })
       <div className="p-12 text-center">
         <div className="coord mb-2">— Preview failed —</div>
         <p className="text-sm text-foreground-muted">
-          The image couldn't be loaded (the link may have expired). Use the download link in the side rail.
+          The image couldn't be loaded. Use the download link in the side rail.
         </p>
       </div>
     );

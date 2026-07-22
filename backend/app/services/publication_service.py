@@ -759,6 +759,41 @@ async def resolve_publication(
     return _row_to_internal_dict(row)
 
 
+async def bump_view(publication: dict) -> None:
+    """Atomically record one view for an already-resolved publication, enforcing
+    max_views / expires. Raises ``PublicationViewLimitReached`` or
+    ``PublicationExpired`` if the view can't be recorded.
+
+    Used where a view must be counted only once the content is actually served —
+    e.g. ``/raw`` resolves with ``increment_view=False`` for the access check,
+    validates the mime/size, then calls this so a 415/413/404 never spends a
+    view. Same atomic guard as ``resolve_publication``'s increment, so it stays
+    correct under concurrency.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        updated = await conn.fetchrow(
+            """
+            UPDATE publications
+               SET view_count = view_count + 1
+             WHERE id = $1
+               AND (max_views IS NULL OR view_count < max_views)
+               AND (expires_at IS NULL OR expires_at > NOW())
+             RETURNING view_count
+            """,
+            to_uuid(publication["id"]),
+        )
+        if updated is None:
+            cur = await conn.fetchrow(
+                "SELECT expires_at FROM publications WHERE id = $1",
+                to_uuid(publication["id"]),
+            )
+            if cur is not None and cur["expires_at"] is not None and \
+                    cur["expires_at"] <= datetime.now(timezone.utc):
+                raise PublicationExpired()
+            raise PublicationViewLimitReached()
+
+
 # ============================================================
 # Document resolution
 # ============================================================
@@ -899,7 +934,6 @@ def _filter_section(markdown: str, section_path: str) -> tuple[str, bool]:
 # File resolution (P3)
 # ============================================================
 
-_FILE_PRESIGN_TTL = 300  # 5 minutes — short for security
 
 
 async def resolve_file_publication(publication: dict) -> dict:
@@ -932,17 +966,11 @@ async def resolve_file_publication(publication: dict) -> dict:
         if file_row is None:
             raise NotFoundError("File", str(uri))
 
-    # Override stored Content-Type with DB value so the browser inline-renders
-    # correctly even when the S3 object was uploaded as octet-stream (legacy
-    # proxy versions before v0.5.1 didn't propagate mime_type).
-    mime = file_row["mime_type"]
-    override = mime if mime and mime != "application/octet-stream" else None
-    presigned_url = file_service.get_presigned_download_url(
-        file_row["s3_key"],
-        ttl=_FILE_PRESIGN_TTL,
-        response_content_type=override,
-    )
-
+    # No presigned S3 URL is issued: the browser fetches bytes from same-origin
+    # /public/{slug}/raw (inline preview) and /public/{slug}/download (force
+    # download). A presigned URL would embed the vault name in its S3 key path
+    # and stay valid ~5 min after unpublish/view-limit; the proxy paths leak
+    # nothing, stay view-counted, and revoke instantly. (publish-hardening F4.)
     return {
         "resource_type": ResourceType.FILE,
         "name": file_row["name"],
@@ -950,8 +978,6 @@ async def resolve_file_publication(publication: dict) -> dict:
         "mime_type": file_row["mime_type"],
         "size_bytes": file_row["size_bytes"],
         "collection": file_row["collection"],
-        "download_url": presigned_url,
-        "url_expires_in": _FILE_PRESIGN_TTL,
     }
 
 

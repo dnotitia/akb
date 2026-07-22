@@ -365,14 +365,19 @@ R=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/meta")
 MIME=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mime_type",""))' 2>/dev/null)
 [ "$MIME" = "application/json" ] && pass "/meta mime_type" || fail "/meta" "$R"
 
-# /public returns full file info with download_url
+# F4: /public no longer hands out a presigned download_url — inline render is
+# proxied same-origin via /raw, so the vault name embedded in the S3 key can't
+# leak and the view stays counted + revocable.
 R=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG")
 DLURL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("download_url",""))' 2>/dev/null)
-[ -n "$DLURL" ] && pass "download_url returned" || fail "download_url" "$R"
+[ -z "$DLURL" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "$DLURL"
 
 # /raw proxies content (CORS-safe for browser)
 RAW=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
 echo "$RAW" | grep -q '"hello":"world"' && pass "/raw streams JSON content" || fail "/raw" "$RAW"
+# F4: proxied inline content is served with inline disposition + nosniff
+RH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
+echo "$RH" | grep -qi '^x-content-type-options: nosniff' && pass "F4: /raw sets nosniff" || fail "F4 nosniff" "$RH"
 
 # /download streams the bytes through the backend (mixed-content safe);
 # 0.5.x flipped from "302 to S3 presigned" to a same-origin stream.
@@ -632,7 +637,8 @@ if [ -n "$MV0_SLUG" ]; then
   [ "$CODE" = "410" ] && pass "max_views=0 → immediately 410" || fail "max_views=0" "HTTP $CODE"
 fi
 
-# /raw on non-previewable MIME (PNG image) → 415
+# F4: images render inline through the same-origin /raw proxy (200 + image/png),
+# not a presigned S3 URL.
 echo -n "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9eMyf2QAAAAASUVORK5CYII=" | base64 -d > /tmp/edge.png
 INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.png&collection=img&mime_type=image/png")
 PFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
@@ -642,8 +648,37 @@ curl -sk -X PUT "$PURL" -H "Content-Type: image/png" --data-binary @/tmp/edge.pn
 acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$PFID/confirm" > /dev/null
 PNG_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"file\",\"uri\":\"$PFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PNG_PUB/raw")
-[ "$CODE" = "415" ] && pass "/raw on image → 415" || fail "/raw image" "HTTP $CODE"
+PH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$PNG_PUB/raw")
+echo "$PH" | grep -qiE '^HTTP/[0-9.]+ 200' && pass "F4: /raw on image → 200 (inline proxy)" || fail "/raw image 200" "$PH"
+echo "$PH" | grep -qi '^content-type: image/png' && pass "F4: /raw image Content-Type image/png" || fail "/raw image mime" "$PH"
+
+# A truly non-previewable MIME (octet-stream) → 415 (use /download instead)
+echo -n "random-bytes-not-previewable" > /tmp/edge.bin
+INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.bin&collection=img&mime_type=application/octet-stream")
+BFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+BFID=$(printf '%s' "$BFILE_URI" | uri_file_id)
+BURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+curl -sk -X PUT "$BURL" -H "Content-Type: application/octet-stream" --data-binary @/tmp/edge.bin > /dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$BFID/confirm" > /dev/null
+BIN_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$BFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$BIN_PUB/raw")
+[ "$CODE" = "415" ] && pass "/raw on octet-stream → 415" || fail "/raw octet 415" "HTTP $CODE"
+
+# F4: active document types (uploaded HTML, declared with a charset param) are
+# served with a CSP sandbox so any embedded script is inert — verifies the mime
+# is normalized before the CSP decision.
+printf '<h1>x</h1><script>alert(1)</script>' > /tmp/edge.html
+INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.html&collection=img&mime_type=text/html")
+HFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+HFID=$(printf '%s' "$HFILE_URI" | uri_file_id)
+HURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+curl -sk -X PUT "$HURL" -H "Content-Type: text/html" --data-binary @/tmp/edge.html > /dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$HFID/confirm" > /dev/null
+HTML_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$HFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+HH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$HTML_PUB/raw")
+echo "$HH" | grep -qi '^content-security-policy: sandbox' && pass "F4: /raw on HTML sets CSP sandbox" || fail "F4 html CSP" "$HH"
 
 # Re-snapshot (should overwrite, not error)
 RS_TQ=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \

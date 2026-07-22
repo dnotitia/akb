@@ -430,7 +430,8 @@ async def publication_meta(slug: str, request: Request):
     return meta
 
 
-_RAW_PREVIEW_MAX_BYTES = 5 * 1024 * 1024  # 5MB
+_RAW_TEXT_MAX_BYTES = 5 * 1024 * 1024        # 5MB — text/JSON inline preview
+_RAW_INLINE_BINARY_MAX_BYTES = 25 * 1024 * 1024  # 25MB — image/PDF inline render (streamed)
 _RAW_PREVIEWABLE_MIMES = {
     "application/json",
     "text/plain",
@@ -445,6 +446,16 @@ _RAW_PREVIEWABLE_MIMES = {
     "application/x-yaml",
     "text/yaml",
 }
+# Binary types the browser renders inline via <img>/<embed>. Served here (same
+# origin, streamed, view-counted) instead of a presigned S3 URL so the vault
+# name embedded in the S3 key never leaks and the view stays revocable. (F4)
+_RAW_INLINE_BINARY_MIMES = {"application/pdf"}
+_RAW_INLINE_IMAGE_PREFIX = "image/"
+# Types the browser executes as an active same-origin document on direct
+# navigation (or when framed) → served with a CSP sandbox so any embedded
+# script stays inert. `allow-same-origin` keeps the HTML-preview iframe able to
+# read contentDocument for fit-to-width scaling; scripts are still blocked.
+_RAW_ACTIVE_DOC_MIMES = {"text/html", "image/svg+xml", "application/xml", "text/xml"}
 
 
 @router.get(
@@ -461,20 +472,22 @@ _RAW_PREVIEWABLE_MIMES = {
             "description": "Raw preview bytes for a small text-like file",
         }
     },
-    summary="Stream file content for preview (small text files)",
+    summary="Stream file content for inline preview (text, image, PDF)",
 )
 async def publication_raw(slug: str, request: Request):
-    """Proxy file content from S3 for in-browser preview.
+    """Proxy file content from S3 for same-origin in-browser preview.
 
-    Only applies to small text-based file types (JSON, text, etc.) where
-    CORS would block a direct presigned URL fetch. For images/PDFs the
-    browser uses the direct presigned URL via <img>/<embed> tags.
+    Serves text/JSON (fetched + rendered by the SPA) and image/PDF (rendered
+    via <img>/<embed>) through this origin instead of handing out a presigned
+    S3 URL. That keeps the vault name embedded in the S3 key from leaking, and
+    keeps the view access-checked, counted, and instantly revocable. Larger
+    files fall back to /download. (publish-hardening F4.)
     """
     try:
-        # Count the view here — /raw serves the file's actual content, and the
-        # metadata GET deliberately doesn't count files (F5). The atomic
-        # increment enforces max_views, so a direct /raw can't serve unlimited.
-        publication = await _resolve_with_access(slug, request, increment_view=True)
+        # Access-check WITHOUT counting yet — a file view is spent only once the
+        # bytes actually stream (below), so a 415/413/404 never burns a view
+        # against max_views. (F5 defers file counting to content-serve.)
+        publication = await _resolve_with_access(slug, request, increment_view=False)
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
@@ -485,27 +498,57 @@ async def publication_raw(slug: str, request: Request):
     parsed = parse_uri(publication.get("resource_uri") or "")
     if not parsed or parsed.kind != "file":
         raise HTTPException(status_code=404, detail="File not found")
-    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
             "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1",
-            to_uuid(file_uuid_str),
+            to_uuid(parsed.identifier),
         )
     if not file_row:
         raise HTTPException(status_code=404, detail="File not found")
 
-    if file_row["size_bytes"] and file_row["size_bytes"] > _RAW_PREVIEW_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="File too large for preview, use /download instead")
-
-    mime = file_row["mime_type"] or ""
-    if not (mime in _RAW_PREVIEWABLE_MIMES or mime.startswith("text/")):
+    # Normalize so "image/svg+xml; charset=utf-8" still matches the sets below.
+    mime = (file_row["mime_type"] or "").split(";", 1)[0].strip().lower()
+    is_text = mime in _RAW_PREVIEWABLE_MIMES or mime.startswith("text/")
+    is_inline_binary = (
+        mime.startswith(_RAW_INLINE_IMAGE_PREFIX) or mime in _RAW_INLINE_BINARY_MIMES
+    )
+    if not (is_text or is_inline_binary):
         raise HTTPException(status_code=415, detail=f"Preview not supported for mime type: {mime}")
 
-    # Stream content from S3 via server (small files only — see _RAW_PREVIEW_MAX_BYTES)
-    body = file_service.get_object_bytes(file_row["s3_key"])  # raises StorageError → 502
-    return Response(content=body, media_type=mime)
+    # Fail closed on unknown size — never stream an unbounded body inline.
+    cap = _RAW_TEXT_MAX_BYTES if is_text else _RAW_INLINE_BINARY_MAX_BYTES
+    size = file_row["size_bytes"]
+    if size is None or size > cap:
+        raise HTTPException(status_code=413, detail="File too large or unsized for inline preview, use /download instead")
+
+    # Now that we'll serve it, count the view (atomic; enforces max_views/expiry).
+    try:
+        await publication_service.bump_view(publication)
+    except PublicationError as e:
+        raise _publication_error_to_http(e)
+
+    headers = {
+        "Content-Disposition": "inline",
+        # Don't let a served text file be sniffed into active HTML.
+        "X-Content-Type-Options": "nosniff",
+    }
+    # Active document types (HTML/SVG/XML) execute as our origin if navigated to
+    # directly or framed — sandbox them so any embedded script is inert. <img>
+    # rendering of an SVG is unaffected (CSP sandbox binds only browsing
+    # contexts, not image sub-resources).
+    if mime in _RAW_ACTIVE_DOC_MIMES:
+        headers["Content-Security-Policy"] = "sandbox allow-same-origin"
+
+    # Stream in chunks; Starlette runs the sync iterator in a threadpool so it
+    # doesn't block the event loop. A storage error before the first chunk
+    # surfaces as 502; once bytes start flowing the body truncates instead.
+    return StreamingResponse(
+        file_service.iter_object_chunks(file_row["s3_key"]),
+        media_type=mime or "application/octet-stream",
+        headers=headers,
+    )
 
 
 @router.get(
