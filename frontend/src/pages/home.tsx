@@ -81,6 +81,10 @@ interface PATRow {
 
 export default function HomePage() {
   const [vaults, setVaults] = useState<VaultRow[]>([]);
+  // How many vaults the in-page preview shows. Starts at VAULT_PREVIEW_LIMIT;
+  // "Show more" doubles it client-side (all vaults are already loaded, so no
+  // refetch — unlike Recent activity, which grows its server-side limit).
+  const [vaultLimit, setVaultLimit] = useState(VAULT_PREVIEW_LIMIT);
   const [recent, setRecent] = useState<RecentRow[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
   const [recentError, setRecentError] = useState(false);
@@ -151,6 +155,12 @@ export default function HomePage() {
   function loadMoreRecent() {
     // Grow by the current count ("this many again"), capped at the backend max.
     loadRecent(() => false, Math.min(recentLimit * 2, RECENT_MAX), { more: true });
+  }
+
+  function showMoreVaults() {
+    // Client-side only — reveal "this many again" of the already-loaded vaults,
+    // capped at the full count.
+    setVaultLimit((n) => Math.min(n * 2, vaults.length));
   }
 
   // Scroll to #vaults / #recent when a link lands here with that hash. Keyed on
@@ -242,9 +252,10 @@ export default function HomePage() {
   // lives on /vault. Memoized so <VaultList> doesn't re-fetch metrics on every
   // unrelated render.
   const previewVaults = useMemo(
-    () => vaults.slice(0, VAULT_PREVIEW_LIMIT),
-    [vaults],
+    () => vaults.slice(0, vaultLimit),
+    [vaults, vaultLimit],
   );
+  const canShowMoreVaults = vaults.length > vaultLimit;
 
   // Main column — Recent + Vaults. Right rail — summary + connect.
   return (
@@ -432,7 +443,21 @@ export default function HomePage() {
               }
             />
           ) : (
-            <VaultList vaults={previewVaults} />
+            <>
+              <VaultList vaults={previewVaults} />
+              {canShowMoreVaults && (
+                <div className="mt-3 flex justify-center">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={showMoreVaults}
+                    aria-label="Show more vaults"
+                  >
+                    Show more
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </section>
       </div>
