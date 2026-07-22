@@ -334,11 +334,18 @@ export interface AkbStoragePresignUploadOptions extends AkbStorageVaultOptions {
   collection?: string | null;
   description?: string | null;
   mimeType?: string | null;
+  /**
+   * sha256 of the bytes being uploaded. Sent to `initiate_upload` as well as
+   * `confirm`, which makes the upload idempotent: re-uploading the same bytes
+   * to the same path resolves to the file that is already there rather than
+   * creating a duplicate. Omit to keep the original one-file-per-call
+   * behaviour.
+   */
+  contentHash?: string | null;
 }
 
 export interface AkbStorageUploadOptions extends AkbStoragePresignUploadOptions {
   confirm?: boolean;
-  contentHash?: string | null;
   hashAlgorithm?: string | null;
   headers?: HeadersInit;
 }
@@ -1010,6 +1017,7 @@ function makeStorageFacade(
     appendOptional(params, "collection", storagePath.collection);
     appendOptional(params, "description", options.description);
     appendOptional(params, "mime_type", options.mimeType ?? "application/octet-stream");
+    appendOptional(params, "content_hash", options.contentHash);
     return request<import("./core/schema.gen.js").AkbFileEnvelope>(
       `/files/${encodePathSegment(vault)}/upload?${params}`,
       { method: "POST" },
