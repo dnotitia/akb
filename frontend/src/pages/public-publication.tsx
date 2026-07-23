@@ -37,7 +37,9 @@ export default function PublicationPage() {
       const urlParams = new URLSearchParams(window.location.search);
       const params: Record<string, string> = {};
       urlParams.forEach((v, k) => {
-        if (k !== "token" && k !== "password" && k !== "format") params[k] = v;
+        // Drop our control params (incl. the view-grant) so they aren't sent as
+        // table_query bind params; the grant is threaded from sessionStorage.
+        if (k !== "token" && k !== "password" && k !== "format" && k !== "grant") params[k] = v;
       });
       const result = await getPublication(slug, params);
       setData(result);

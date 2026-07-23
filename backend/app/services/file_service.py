@@ -90,40 +90,32 @@ def content_disposition_attachment(filename: str) -> str:
 # ── Top-level S3 helpers (thin wrappers around s3_adapter) ───────
 
 
-def get_presigned_download_url(
-    s3_key: str,
-    ttl: int = _PRESIGN_DOWNLOAD_TTL,
-    response_content_type: str | None = None,
-    attachment_filename: str | None = None,
-) -> str:
-    """Presigned GET URL for an arbitrary S3 key.
-
-    Used by share_service to bypass the vault_files lookup when the caller
-    already has the s3_key in hand. Raises StorageError on failure.
-
-    `response_content_type` overrides the stored object's Content-Type in
-    the response (needed when the object was uploaded with a generic
-    application/octet-stream but the DB metadata has the correct value).
-
-    `attachment_filename` sets Content-Disposition so the browser forces
-    a download rather than rendering inline (the presigned URL is
-    cross-origin, so the <a download> attribute is ignored).
-    """
-    cd = (
-        content_disposition_attachment(attachment_filename)
-        if attachment_filename
-        else None
-    )
-    return s3_adapter.presign_get(
-        s3_key,
-        ttl=ttl,
-        response_content_type=response_content_type,
-        response_content_disposition=cd,
-    )
+def get_object_bytes(s3_key: str, max_bytes: int | None = None) -> bytes:
+    """Read the whole object into memory. When ``max_bytes`` is given, abort with
+    StorageError if the ACTUAL object exceeds it. Callers (e.g. /raw) pre-check a
+    DB ``size_bytes`` gate, but that recorded size can drift from the stored
+    object — the presigned PUT stays usable after confirm — so we also bound the
+    READ itself and never buffer an over-cap body into the single process."""
+    if max_bytes is None:
+        return s3_adapter.get_bytes(s3_key)
+    buf = bytearray()
+    gen = s3_adapter.iter_chunks(s3_key)
+    try:
+        for chunk in gen:
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
+    finally:
+        gen.close()  # release the boto stream promptly on cap-abort or exhaustion
+    return bytes(buf)
 
 
-def get_object_bytes(s3_key: str) -> bytes:
-    return s3_adapter.get_bytes(s3_key)
+def head_object(s3_key: str) -> dict:
+    """Cheap existence/metadata probe (S3 HEAD, no body). Raises StorageError/
+    AKBError if the object is missing or unreadable. Callers streaming a large
+    object HEAD it first (off the event loop) so a missing object is a clean 502
+    before the response is committed, without buffering the whole body."""
+    return s3_adapter.head(s3_key)
 
 
 def iter_object_chunks(

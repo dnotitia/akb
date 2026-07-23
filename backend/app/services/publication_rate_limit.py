@@ -45,12 +45,26 @@ def _wait(e: _E | None, now: float) -> float:
     return e.locked_until - now if (e is not None and e.locked_until > now) else 0.0
 
 
+def _evict(store: dict, now: float) -> None:
+    """Make room in a full map WITHOUT dropping active locks. Otherwise an
+    attacker could flood junk slugs to force eviction of a currently-locked
+    victim and reopen brute force (Codex reproduced this: 20k junk slugs evicted
+    the locked entry and the next reserve() returned unlocked). So evict the
+    oldest UNLOCKED entries first; only if the map is somehow entirely locked do
+    we fall back to oldest-overall as a last resort to bound memory."""
+    unlocked = [k for k, v in store.items() if v.locked_until <= now]
+    victims = sorted(unlocked, key=lambda k: store[k].last)[: _MAX_ENTRIES // 2]
+    if not victims:  # pathological: every entry locked — bound memory anyway
+        victims = sorted(store, key=lambda k: store[k].last)[: _MAX_ENTRIES // 2]
+    for k in victims:
+        del store[k]
+
+
 def _bump(store: dict, key, free: int, now: float) -> float:
     e = store.get(key)
     if e is None:
         if len(store) >= _MAX_ENTRIES:
-            for k in sorted(store, key=lambda k: store[k].last)[: _MAX_ENTRIES // 2]:
-                del store[k]
+            _evict(store, now)
         e = store[key] = _E()
     elif now - e.last > _DECAY_SECS:
         # Quiet period elapsed — forget prior failures so a persistent-but-legit
@@ -80,9 +94,14 @@ def reserve(slug: str, ip: str) -> float:
     now = time.monotonic()
     w = max(_wait(_by_ip.get((slug, ip)), now), _wait(_by_slug.get(slug), now))
     if w > 0.0:
+        # Locked (per-ip or the per-slug backstop). The caller rejects with 429 —
+        # UNLESS it's the authenticated owner, who is handled OUTSIDE this limiter
+        # (an anonymous flood can lock the per-slug backstop, but the owner's AKB
+        # session lets the route bypass the throttle entirely — see
+        # _attempt_password_resolve — so a flood can't shut the owner out).
         return w
-    # Not currently locked — count this attempt. _bump may set locked_until for
-    # followers; we still return 0.0 so THIS attempt reaches verification.
+    # Not locked — count this attempt. _bump may set locked_until for followers;
+    # we still return 0.0 so THIS attempt reaches verification.
     _bump(_by_ip, (slug, ip), _FREE_IP, now)
     _bump(_by_slug, slug, _FREE_SLUG, now)
     return 0.0

@@ -691,6 +691,7 @@ async def resolve_publication(
     password: str | None = None,
     increment_view: bool = True,
     bypass_password: bool = False,
+    enforce_view_cap: bool = True,
 ) -> dict:
     """Look up a publication and enforce access controls.
 
@@ -707,6 +708,13 @@ async def resolve_publication(
 
     bypass_password: skip the password check (used when caller has already
     verified an HMAC session token at the route layer).
+
+    enforce_view_cap: only meaningful when ``increment_view`` is False. The file
+    content endpoints (/raw, /download) RE-serve bytes for a view that was
+    already counted at the metadata GET, so they resolve with
+    increment_view=False AND enforce_view_cap=False — a page opened at its last
+    allowed view must still be able to fetch its bytes (Range requests, reloads,
+    preview→download) without a spurious 410. Expiry is always enforced.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -766,46 +774,11 @@ async def resolve_publication(
             # consistent with the value that just landed in PG.
             row = dict(row)
             row["view_count"] = updated["view_count"]
-        else:
+        elif enforce_view_cap:
             if row["max_views"] is not None and row["view_count"] >= row["max_views"]:
                 raise PublicationViewLimitReached()
 
     return _row_to_internal_dict(row)
-
-
-async def bump_view(publication: dict) -> None:
-    """Atomically record one view for an already-resolved publication, enforcing
-    max_views / expires. Raises ``PublicationViewLimitReached`` or
-    ``PublicationExpired`` if the view can't be recorded.
-
-    Used where a view must be counted only once the content is actually served —
-    e.g. ``/raw`` resolves with ``increment_view=False`` for the access check,
-    validates the mime/size, then calls this so a 415/413/404 never spends a
-    view. Same atomic guard as ``resolve_publication``'s increment, so it stays
-    correct under concurrency.
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        updated = await conn.fetchrow(
-            """
-            UPDATE publications
-               SET view_count = view_count + 1
-             WHERE id = $1
-               AND (max_views IS NULL OR view_count < max_views)
-               AND (expires_at IS NULL OR expires_at > NOW())
-             RETURNING view_count
-            """,
-            to_uuid(publication["id"]),
-        )
-        if updated is None:
-            cur = await conn.fetchrow(
-                "SELECT expires_at FROM publications WHERE id = $1",
-                to_uuid(publication["id"]),
-            )
-            if cur is not None and cur["expires_at"] is not None and \
-                    cur["expires_at"] <= datetime.now(timezone.utc):
-                raise PublicationExpired()
-            raise PublicationViewLimitReached()
 
 
 # ============================================================
@@ -856,7 +829,11 @@ async def resolve_document_publication(publication: dict) -> dict:
     body = ""
     content_unavailable = False
     try:
-        raw = _get_doc_service().git.read_file(doc_row["vault_name"], doc_row["path"])
+        # Git read is blocking filesystem I/O — offload it so a document page
+        # open / download never stalls the single event loop (503 risk class).
+        raw = await asyncio.to_thread(
+            _get_doc_service().git.read_file, doc_row["vault_name"], doc_row["path"]
+        )
         if raw:
             body = frontmatter.loads(raw).content
     except (FileNotFoundError, OSError) as e:
@@ -1211,7 +1188,10 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
 async def _read_snapshot(publication: dict) -> dict:
     """Read a snapshotted query result from S3."""
     try:
-        body = file_service.get_object_bytes(publication["snapshot_s3_key"])
+        # S3 GET is blocking network I/O — offload it off the event loop.
+        body = await asyncio.to_thread(
+            file_service.get_object_bytes, publication["snapshot_s3_key"]
+        )
         data = json.loads(body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise PublicationError(f"Corrupt snapshot data: {e}", status_code=500)
@@ -1286,6 +1266,14 @@ async def create_snapshot(
                     json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"),
                     content_type="application/json",
                 )
+                # NOTE: this PUT is deliberately SYNCHRONOUS (not asyncio.to_thread)
+                # even though it briefly blocks the loop. Every attempt writes the
+                # SAME key (snapshots/{id}.json), and to_thread does not cancel an
+                # in-flight PUT: a client disconnect would release the advisory lock
+                # while a zombie PUT kept running, then land AFTER a later attempt's
+                # PUT+DB-commit and overwrite the newer snapshot with stale bytes
+                # (Codex). Snapshot creation is a rare owner/admin action, so serial
+                # PUT-under-lock (race-free) beats a non-blocking-but-racy offload.
             except (file_service.StorageError, IOError) as e:
                 raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
 

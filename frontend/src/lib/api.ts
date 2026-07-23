@@ -589,13 +589,13 @@ export interface PublicationResponse {
   content_unavailable?: boolean;
   section_filter?: string | null;
   section_not_found?: boolean;
-  // file fields
+  // file fields — content is served from same-origin /raw and /download
+  // (built from the slug); the resolver no longer returns a presigned
+  // download_url / url_expires_in (F4).
   name?: string;
   mime_type?: string;
   size_bytes?: number;
   collection?: string;
-  download_url?: string;
-  url_expires_in?: number;
   // table_query fields
   columns?: string[];
   rows?: Record<string, any>[];
@@ -604,6 +604,9 @@ export interface PublicationResponse {
   applied_params?: Record<string, any>;
   mode?: "live" | "snapshot";
   snapshot_at?: string;
+  // Short-lived grant minted by this page open; carried by /raw, /download and
+  // CSV so they re-serve this same view without re-counting it.
+  view_grant?: string;
 }
 
 export interface PublicationError {
@@ -631,10 +634,29 @@ export function clearPublicationToken(slug: string) {
   sessionStorage.removeItem(publicationTokenKey(slug));
 }
 
+// View-grant: the page-open response mints one; /raw, /download and CSV carry it
+// so those re-serves of the SAME view aren't re-counted. Without it the backend
+// counts each fetch as its own view (so max_views is a hard cap on every path).
+function publicationGrantKey(slug: string) {
+  return `akb_publication_grant_${slug}`;
+}
+
+export function getViewGrant(slug: string): string | null {
+  return sessionStorage.getItem(publicationGrantKey(slug));
+}
+
+export function setViewGrant(slug: string, grant: string) {
+  sessionStorage.setItem(publicationGrantKey(slug), grant);
+}
+
 async function fetchPublic(slug: string, path: string = "", params?: Record<string, string>): Promise<Response> {
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
   if (token) search.set("token", token);
+  // Carry any grant from an earlier open so a reload / param-change within the
+  // window re-serves this view instead of spending a new one.
+  if (grant) search.set("grant", grant);
   const qs = search.toString();
   const suffix = qs ? `?${qs}` : "";
   return fetch(`${API_BASE}/public/${slug}${path}${suffix}`);
@@ -657,6 +679,9 @@ export async function getPublication(
     };
     throw err;
   }
+  // This page open spent one view and returned a grant; keep it so the paired
+  // /raw + /download re-serves of this view aren't counted again.
+  if (body.view_grant) setViewGrant(slug, body.view_grant);
   return body;
 }
 
@@ -708,23 +733,31 @@ export async function submitPublicationPassword(slug: string, password: string):
 
 export function publicationDownloadUrl(slug: string, params?: Record<string, string>): string {
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
   if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${slug}/download${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationRawUrl(slug: string): string {
   const token = getPublicationToken(slug);
-  const qs = token ? `?token=${token}` : "";
-  return `${API_BASE}/public/${slug}/raw${qs}`;
+  const grant = getViewGrant(slug);
+  const search = new URLSearchParams();
+  if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
+  const qs = search.toString();
+  return `${API_BASE}/public/${slug}/raw${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationCsvUrl(slug: string, params?: Record<string, string>): string {
   const search = new URLSearchParams(params || {});
   search.set("format", "csv");
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
   return `${API_BASE}/public/${slug}?${search.toString()}`;
 }
 
