@@ -34,6 +34,9 @@ import {
   type AkbWritableRelationType,
   type AkbOperationResponse,
   type AkbStorageUploadOptions,
+  type AlterTableRequest,
+  type CreateTableRequest,
+  type TableMigrationOperation,
   type operations,
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
@@ -374,6 +377,78 @@ const schemaResult = await typedFetch("get", "/api/v1/tables/{vault}/schema", {
 schemaResult.throwOnError().data.kind satisfies "vault_table_schema";
 // @ts-expect-error generated path params are required.
 await typedFetch("get", "/api/v1/tables/{vault}/schema");
+
+const createTableBody: CreateTableRequest = {
+  name: "incidents",
+  columns: [{ name: "state", type: "text" }],
+  indexes: [{ columns: [{ name: "state", order: "desc" }] }],
+};
+await typedFetch("post", "/api/v1/tables/{vault}", {
+  path: { vault: "eng" },
+  json: createTableBody,
+});
+
+const alterTableBody: AlterTableRequest = {
+  add_columns: [{ name: "owner", type: "text" }],
+  alter_columns: [{ name: "state", set_default: "todo" }],
+};
+await typedFetch("patch", "/api/v1/tables/{vault}/{table_name}", {
+  path: { vault: "eng", table_name: "incidents" },
+  json: alterTableBody,
+});
+
+const migrationBody: TableMigrationOperation[] = [
+  { op: "add_column", table: "incidents", name: "priority", type: "text" },
+  {
+    op: "add_index",
+    table_name: "incidents",
+    index: { name: "incidents_priority_idx", columns: [{ name: "priority", order: "desc" }] },
+  },
+];
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: { "Idempotency-Key": "11111111-1111-4111-8111-111111111111" },
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: new Headers({ "Idempotency-Key": "22222222-2222-4222-8222-222222222222" }),
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: [["Idempotency-Key", "33333333-3333-4333-8333-333333333333"]],
+  json: migrationBody,
+});
+
+declare const migrationOperation: TableMigrationOperation;
+if (migrationOperation.op === "add_index") {
+  migrationOperation.index?.columns.at(0) satisfies
+    | string
+    | { name: string; order?: "asc" | "desc" | null }
+    | undefined;
+}
+
+// @ts-expect-error table columns require a name.
+const invalidColumn: CreateTableRequest = { name: "bad", columns: [{ type: "text" }] };
+const invalidIndex: CreateTableRequest = {
+  name: "bad",
+  columns: [{ name: "state" }],
+  // @ts-expect-error index order is a closed asc/desc enum.
+  indexes: [{ columns: [{ name: "state", order: "sideways" }] }],
+};
+// @ts-expect-error migration op is restricted to the supported eight operations.
+const invalidMigration: TableMigrationOperation = { op: "raw_sql", table: "incidents" };
+// @ts-expect-error migration Idempotency-Key is a required operation header.
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}", {
+  path: { vault: "eng" },
+  // @ts-expect-error create body is checked against CreateTableRequest.
+  json: { name: "bad", columns: [{ type: "text" }] },
+});
 
 type VaultSchemaResponse = AkbOperationResponse<operations["tablesGetVaultSchema"]>;
 const vaultSchema: VaultSchemaResponse = {

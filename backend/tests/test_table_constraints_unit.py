@@ -993,8 +993,12 @@ def test_rest_create_table_request_accepts_unique_keys_and_indexes():
         unique_keys=[{"columns": ["actor", "ts"]}],
         indexes=[{"columns": ["actor"]}],
     )
-    assert req.unique_keys == [{"columns": ["actor", "ts"]}]
-    assert req.indexes == [{"columns": ["actor"]}]
+    assert [item.model_dump(exclude_unset=True) for item in req.unique_keys or []] == [
+        {"columns": ["actor", "ts"]}
+    ]
+    assert [item.model_dump(exclude_unset=True) for item in req.indexes or []] == [
+        {"columns": ["actor"]}
+    ]
     # Defaults stay None (omitted) so create_table's own defaults apply.
     req2 = CreateTableRequest(name="t", columns=[{"name": "a", "type": "text"}])
     assert req2.unique_keys is None and req2.indexes is None
