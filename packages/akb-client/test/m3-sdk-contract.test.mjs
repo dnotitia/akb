@@ -1,0 +1,234 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "vitest";
+
+import { AkbError, createClient } from "../dist/index.js";
+import { createClient as createLiteClient } from "../dist/lite.js";
+
+const contract = JSON.parse(
+  await readFile(new URL("../scripts/m3-sdk-contract.json", import.meta.url), "utf8"),
+);
+
+test("M3 matrix connects all selected facades through one scoped client contract", async () => {
+  const calls = [];
+  const claims = {
+    sub: "m3-user",
+    app_metadata: { org_id: "m3-org", role: "admin" },
+  };
+  const fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const method = init.method ?? "GET";
+    const headers = Object.fromEntries(new Headers(init.headers));
+    const body = init.body === undefined ? undefined : JSON.parse(String(init.body));
+    calls.push({ url, method, headers, body });
+    if (url.pathname.endsWith("/denied")) {
+      return json({ message: "denied", code: "permission_denied" }, 403, "Forbidden");
+    }
+    return json(responseFor(url, method, body));
+  };
+  const root = createClient({
+    baseUrl: "https://contract.invalid/api/v1",
+    token: () => "m3-contract-token",
+    fetch,
+  });
+  const client = root.vault("m3 vault").actingAs(claims);
+  const lite = createLiteClient({ baseUrl: "https://contract.invalid/api/v1", fetch });
+
+  for (const item of contract.operations) {
+    assert.equal(typeof client[item.facade.namespace][item.facade.method], "function", item.operationId);
+    assert.equal(typeof lite[item.facade.namespace][item.facade.method], "function", item.operationId);
+  }
+
+  const selected = [
+    await client.graph.neighbors("akb://m3 vault/doc/a b", { hops: 2, limit: 9 }),
+    await client.graph.overview({ topK: 12 }),
+    await client.graph.health({ hubThreshold: 4, limit: 8 }),
+    await client.graph.relations("akb://m3 vault/doc/a b", { direction: "both", type: "references" }),
+    await client.graph.link({
+      source: "akb://m3 vault/doc/a b",
+      target: "akb://m3 vault/table/t",
+      relation: "references",
+      metadata: { confidence: 1 },
+    }),
+    await client.graph.unlink({
+      source: "akb://m3 vault/doc/a b",
+      target: "akb://m3 vault/table/t",
+      relation: "references",
+    }),
+    await client.graph.provenance("akb://m3 vault/doc/a b"),
+    await client.activity.list({ collection: "notes", author: "m3-user", limit: 6 }),
+    await client.activity.recent({ limit: 5 }),
+    await client.docs.history("notes/a b.md", { limit: 4 }),
+    await client.docs.diff("notes/a b.md", { commit: "abc?123" }),
+    await client.docs.createCollection({ path: "notes/new", summary: null }),
+    await client.docs.deleteCollection("notes/new", { recursive: true }),
+    await client.tables.list(),
+    await client.tables.schema(),
+    await client.tables.schema("incident/type"),
+    await client.tables.create({ name: "incidents", columns: [{ name: "state" }] }),
+    await client.tables.alter("incidents", { drop_columns: ["legacy"] }),
+    await client.tables.migrate(
+      [{ op: "drop_column", table: "incidents", name: "legacy" }],
+      { idempotencyKey: "m3-idempotency" },
+    ),
+    await client.tables.drop("incidents"),
+  ];
+
+  assert.equal(selected.length, contract.operations.length);
+  assert.ok(selected.every((result) => result.data !== null && result.error === null));
+  assert.ok(selected.every((result) => result.throwOnError().data.kind));
+  assert.ok(calls.every((call) => call.headers.authorization === "Bearer m3-contract-token"));
+  assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
+  assert.equal(calls[4].headers["content-type"], "application/json");
+  assert.deepEqual(calls[4].body, {
+    source: "akb://m3 vault/doc/a b",
+    target: "akb://m3 vault/table/t",
+    relation: "references",
+    metadata: { confidence: 1 },
+  });
+  assert.deepEqual(calls[11].body, { path: "notes/new", summary: null });
+  assert.deepEqual(calls[16].body, { name: "incidents", columns: [{ name: "state" }] });
+  assert.deepEqual(calls[17].body, { drop_columns: ["legacy"] });
+  assert.equal(calls[18].headers["idempotency-key"], "m3-idempotency");
+
+  const rawStart = calls.length;
+  await client.graph.request("/raw");
+  await client.activity.request("/raw");
+  await client.docs.request("/raw");
+  await client.tables.request("/raw");
+  assert.deepEqual(
+    calls.slice(rawStart).map((call) => call.url.pathname),
+    [
+      "/api/v1/graph/raw",
+      "/api/v1/activity/raw",
+      "/api/v1/documents/raw",
+      "/api/v1/tables/raw",
+    ],
+  );
+
+  const denied = await client.tables.request("/denied");
+  assert.equal(denied.data, null);
+  assert.ok(denied.error instanceof AkbError);
+  assert.throws(() => denied.throwOnError(), AkbError);
+
+  let missingVaultCalls = 0;
+  const unscoped = createClient({
+    baseUrl: "https://contract.invalid/api/v1",
+    fetch: async () => {
+      missingVaultCalls += 1;
+      return json({});
+    },
+  });
+  assert.throws(() => unscoped.graph.overview(), /Select a vault/);
+  assert.throws(() => unscoped.activity.list(), /Select a vault/);
+  assert.throws(() => unscoped.docs.history("a.md"), /Select a vault/);
+  assert.throws(() => unscoped.docs.createCollection({ path: "a" }), /Select a vault/);
+  assert.throws(() => unscoped.tables.list(), /Select a vault/);
+  assert.equal(missingVaultCalls, 0);
+});
+
+function responseFor(url, method, body) {
+  if (url.pathname.endsWith("/graph")) {
+    return { kind: "graph_neighbors", nodes: [], edges: [] };
+  }
+  if (url.pathname.endsWith("/graph/overview")) {
+    return {
+      kind: "graph_overview",
+      nodes: [],
+      edges: [],
+      nodes_total: 0,
+      edges_total: 0,
+      returned: 0,
+      truncated: false,
+      orphans_returned: 0,
+      orphans_truncated: false,
+    };
+  }
+  if (url.pathname.endsWith("/graph/health")) {
+    return { kind: "graph_health", hubs: [], orphans: { count: 0, sample: [] } };
+  }
+  if (url.pathname.endsWith("/relations") && method === "POST") {
+    return { kind: "relation_link", linked: true, ...body };
+  }
+  if (url.pathname.endsWith("/relations") && method === "DELETE") {
+    return {
+      kind: "relation_unlink",
+      unlinked: 1,
+      source: url.searchParams.get("source"),
+      target: url.searchParams.get("target"),
+    };
+  }
+  if (url.pathname.endsWith("/relations")) {
+    return { kind: "relations", uri: url.searchParams.get("uri"), relations: [] };
+  }
+  if (url.pathname.endsWith("/provenance")) {
+    return {
+      kind: "provenance",
+      doc_id: "d-m3",
+      title: "M3",
+      path: "a.md",
+      vault: "m3 vault",
+      uri: url.searchParams.get("uri"),
+      created_by: null,
+      created_at: null,
+      updated_at: null,
+      current_commit: null,
+      relations: [],
+    };
+  }
+  if (url.pathname.includes("/activity/")) {
+    return { kind: "activity", vault: "m3 vault", total: 0, activity: [] };
+  }
+  if (url.pathname.endsWith("/recent")) return { kind: "recent_changes", changes: [] };
+  if (url.pathname.includes("/history/")) {
+    return { kind: "document_history", uri: "akb://m3 vault/doc/a.md", history: [] };
+  }
+  if (url.pathname.includes("/diff/")) {
+    return { kind: "document_diff", file: "a.md", commit: "abc", type: "modified", diff: "" };
+  }
+  if (url.pathname.includes("/collections/") && method === "POST") {
+    return {
+      kind: "collection_create",
+      ok: true,
+      created: true,
+      collection: { path: body.path, name: "new", summary: body.summary, doc_count: 0 },
+    };
+  }
+  if (url.pathname.includes("/collections/")) {
+    return {
+      kind: "collection_delete",
+      ok: true,
+      collection: "notes/new",
+      deleted_docs: 0,
+      deleted_files: 0,
+      deleted_sub_collections: 0,
+      deleted_tables: 0,
+    };
+  }
+  if (url.pathname.endsWith("/migrations")) {
+    return {
+      kind: "table_migration",
+      vault: "m3 vault",
+      idempotency_key: "m3-idempotency",
+      checksum: "fixture",
+      applied: true,
+      operations: 1,
+      results: [],
+    };
+  }
+  if (url.pathname.endsWith("/schema")) {
+    const table = url.pathname.split("/").at(-2);
+    return table === "m3%20vault"
+      ? { kind: "vault_table_schema", vault: "m3 vault", tables: [], total: 0 }
+      : { kind: "table_schema", vault: "m3 vault", name: table, columns: [], pg_types: {}, drift: {} };
+  }
+  return { kind: "table" };
+}
+
+function json(body, status = 200, statusText = "OK") {
+  return new Response(JSON.stringify(body), {
+    status,
+    statusText,
+    headers: { "content-type": "application/json" },
+  });
+}

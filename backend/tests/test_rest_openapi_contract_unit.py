@@ -1,7 +1,9 @@
 """REST OpenAPI contract guards for SDK code generation."""
 
+import json
 import re
 from collections import Counter
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -14,6 +16,13 @@ from app.main import app
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 SUCCESS_STATUSES = ("200", "201", "202")
 ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
+M3_SDK_CONTRACT_PATH = (
+    Path(__file__).parents[2]
+    / "packages"
+    / "akb-client"
+    / "scripts"
+    / "m3-sdk-contract.json"
+)
 
 
 def _api_operations():
@@ -24,6 +33,60 @@ def _api_operations():
         for method, operation in path_item.items():
             if method in HTTP_METHODS:
                 yield path, method, operation
+
+
+def _m3_sdk_contract():
+    return json.loads(M3_SDK_CONTRACT_PATH.read_text())
+
+
+def test_m3_sdk_contract_matrix_matches_live_openapi():
+    contract = _m3_sdk_contract()
+    matrix = contract["operations"]
+    assert len(matrix) == 20
+    assert len({item["operationId"] for item in matrix}) == len(matrix)
+
+    schema = app.openapi()
+    for item in matrix:
+        operation_id = item["operationId"]
+        operation = schema["paths"][item["path"]][item["method"]]
+        assert operation["operationId"] == operation_id
+
+        success = next(
+            operation["responses"][status]
+            for status in SUCCESS_STATUSES
+            if status in operation["responses"]
+        )
+        assert success["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{item['successSchema']}"
+        }, operation_id
+
+        request_schema = item["requestSchema"]
+        if request_schema == "never":
+            assert "requestBody" not in operation, operation_id
+        elif request_schema == "TableMigrationOperation[]":
+            body = operation["requestBody"]
+            assert body["required"] is True, operation_id
+            generated = body["content"]["application/json"]["schema"]
+            assert generated["type"] == "array", operation_id
+            assert generated["items"]["discriminator"]["propertyName"] == "op", operation_id
+        else:
+            body = operation["requestBody"]
+            assert body["required"] is True, operation_id
+            assert body["content"]["application/json"]["schema"] == {
+                "$ref": f"#/components/schemas/{request_schema}"
+            }, operation_id
+
+        required_headers = {
+            parameter["name"]
+            for parameter in operation.get("parameters", [])
+            if parameter["in"] == "header" and parameter.get("required") is True
+        }
+        assert required_headers == set(item.get("requiredHeaders", [])), operation_id
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": f"#/components/schemas/{contract['errorSchema']}"}
+            ), f"{operation_id} {status}"
 
 
 def test_bearer_auth_scheme_is_registered():

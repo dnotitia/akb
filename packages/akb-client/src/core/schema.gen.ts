@@ -451,6 +451,10 @@ export type AkbSuccessEnvelope =
   | AkbRelationUnlinkEnvelope
   | AkbProvenanceEnvelope;
 
+export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null };
+
+export type CreateCollectionRequest = { path: string; summary?: string | null };
+
 export type CreateTableRequest = { name: string; description?: string; columns: TableColumnSpec[]; collection?: string | null; unique_keys?: TableUniqueKeySpec[] | null; indexes?: TableIndexSpec[] | null };
 
 export type AlterTableRequest = { add_columns?: TableColumnSpec[] | null; alter_columns?: TableAlterColumnSpec[] | null; drop_columns?: string[] | null; rename_columns?: { [key: string]: string } | null; add_unique_keys?: TableUniqueKeySpec[] | null; drop_unique_keys?: string[] | null; add_indexes?: TableIndexSpec[] | null; drop_indexes?: string[] | null };
@@ -493,7 +497,7 @@ export interface paths {
     get: AkbOperation<"get", "/api/v1/browse/{vault}", { path: { vault: string } }, never, AkbDocumentEnvelope>;
   };
   "/api/v1/collections/{vault}": {
-    post: AkbOperation<"post", "/api/v1/collections/{vault}", { path: { vault: string } }, unknown, AkbCollectionCreateEnvelope>;
+    post: AkbOperation<"post", "/api/v1/collections/{vault}", { path: { vault: string } }, CreateCollectionRequest, AkbCollectionCreateEnvelope>;
   };
   "/api/v1/collections/{vault}/{path}": {
     delete: AkbOperation<"delete", "/api/v1/collections/{vault}/{path}", { path: { vault: string; path: string } }, never, AkbCollectionDeleteEnvelope>;
@@ -551,7 +555,7 @@ export interface paths {
   "/api/v1/relations": {
     delete: AkbOperation<"delete", "/api/v1/relations", never, never, AkbRelationUnlinkEnvelope>;
     get: AkbOperation<"get", "/api/v1/relations", never, never, AkbRelationsEnvelope>;
-    post: AkbOperation<"post", "/api/v1/relations", never, unknown, AkbRelationLinkEnvelope>;
+    post: AkbOperation<"post", "/api/v1/relations", never, LinkRequest, AkbRelationLinkEnvelope>;
   };
   "/api/v1/search": {
     get: AkbOperation<"get", "/api/v1/search", never, never, AkbSearchEnvelope>;
@@ -645,6 +649,8 @@ export interface components {
     AkbCollectionSummary: AkbCollectionSummary;
     AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;
     AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;
+    LinkRequest: LinkRequest;
+    CreateCollectionRequest: CreateCollectionRequest;
     CreateTableRequest: CreateTableRequest;
     AlterTableRequest: AlterTableRequest;
     TableColumnSpec: TableColumnSpec;
