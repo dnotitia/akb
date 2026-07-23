@@ -368,9 +368,11 @@ async def create_publication(
                 except ValueError:
                     file_uuid_obj = None
                 if file_uuid_obj is not None:
+                    # Bind to vault_id (not id alone) so this can't be satisfied
+                    # by a same-UUID file in another vault (cross-vault IDOR).
                     found = await conn.fetchval(
-                        "SELECT 1 FROM vault_files WHERE id = $1 FOR SHARE",
-                        file_uuid_obj,
+                        "SELECT 1 FROM vault_files WHERE id = $1 AND vault_id = $2 FOR SHARE",
+                        file_uuid_obj, vault_id,
                     )
                     if not found:
                         raise ValueError(
@@ -473,7 +475,14 @@ async def create_publication_for_vault(
                 """,
                 uuid.UUID(file_id), vault_id,
             )
-        file_collection = file_coll_row["collection"] if file_coll_row else None
+        # No row means the file is NOT in this vault. REJECT — otherwise a writer
+        # could publish a file UUID belonging to another vault and anonymously
+        # serve that vault's file through their own publication (cross-vault
+        # IDOR). A vault-root file returns a row with collection=NULL (still
+        # truthy), so this only rejects genuine cross-vault / missing files.
+        if file_coll_row is None:
+            raise ValueError(f"File not found in vault: {file_id}")
+        file_collection = file_coll_row["collection"]
         resource_uri = file_uri(vault_name, file_id, collection=file_collection)
     elif resource_type == ResourceType.TABLE_QUERY:
         if not resolved_query_vaults:
@@ -955,9 +964,9 @@ async def resolve_file_publication(publication: dict) -> dict:
                    c.path AS collection
               FROM vault_files f
               LEFT JOIN collections c ON c.id = f.collection_id
-             WHERE f.id = $1
+             WHERE f.id = $1 AND f.vault_id = $2
             """,
-            to_uuid(file_uuid_str),
+            to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
         if file_row is None:
             raise NotFoundError("File", str(uri))
@@ -995,8 +1004,8 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1",
-            to_uuid(file_uuid_str),
+            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+            to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
     if file_row is None:
         raise NotFoundError("File", str(uri))
@@ -1089,6 +1098,15 @@ def _serialize_value(v: Any) -> Any:
     return str(v)
 
 
+# Bounds for an ANONYMOUS public table_query (GET /public/{slug}). Both are DoS
+# guards: the timeout caps how long one query can hold a DB connection / stall
+# the single event loop; the row cap stops a huge fast result (e.g.
+# generate_series) from exhausting process memory. A published query can be
+# replayed by anyone with the slug, so these run for every public execution.
+_PUBLIC_TABLE_TIMEOUT_MS = 5000
+_PUBLIC_TABLE_ROW_CAP = 10_000
+
+
 async def resolve_table_query_publication(publication: dict, url_params: dict | None = None) -> dict:
     """Execute a canned table query publication with URL parameter binding."""
     if publication["resource_type"] != ResourceType.TABLE_QUERY:
@@ -1141,11 +1159,25 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
                 status_code=403,
             )
         role = user_role_name(created_by)
+        truncated = False
+        rows = []
         try:
             async with conn.transaction():
                 await conn.execute("SET TRANSACTION READ ONLY")
+                # DoS bounds for this anonymous path: cap DURATION so a slow query
+                # can't stall the single event loop / pin a DB connection, and cap
+                # ROWS (stream via a cursor) so a huge fast result can't OOM the
+                # process. Both apply under the creator's PG role.
+                await conn.execute(f"SET LOCAL statement_timeout = '{_PUBLIC_TABLE_TIMEOUT_MS}ms'")
                 await conn.execute(f'SET LOCAL ROLE "{role}"')
-                rows = await conn.fetch(rewritten, *values)
+                async for r in conn.cursor(rewritten, *values):
+                    if len(rows) >= _PUBLIC_TABLE_ROW_CAP:
+                        truncated = True
+                        break
+                    rows.append(r)
+        except asyncpg.exceptions.QueryCanceledError:
+            # statement_timeout fired (57014) — don't echo the query.
+            raise PublicationError("This shared query took too long to run.", status_code=400)
         except asyncpg.exceptions.InsufficientPrivilegeError:
             # 42501 — the creator's role lacks SELECT on a referenced
             # table (system table or another vault). Do not echo the
@@ -1164,10 +1196,19 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
             msg = str(e)
             if "read-only transaction" in msg:
                 raise PublicationError("Write operations are not allowed", status_code=403)
-            raise PublicationError(f"Query error: {msg}", status_code=400)
+            # Don't echo the raw DB error to an anonymous public caller — it can
+            # name tables/columns/other vaults. Log it for the operator, return
+            # a generic message. (The publish-time run already surfaced real
+            # query bugs to the authenticated author.)
+            logger.warning("public table_query error for slug=%s: %s", publication.get("slug"), msg)
+            raise PublicationError("This shared query could not be run.", status_code=400)
 
     columns = list(dict(rows[0]).keys()) if rows else []
-    result_rows = [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rows]
+    # Per-cell coercion is CPU-bound and runs for an anonymous caller — offload it
+    # so a large (capped) result set can't stall the single event loop.
+    result_rows = await asyncio.to_thread(
+        lambda rs=rows: [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rs]
+    )
 
     return {
         "resource_type": ResourceType.TABLE_QUERY,
@@ -1175,6 +1216,9 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
         "columns": columns,
         "rows": result_rows,
         "total": len(result_rows),
+        # True when the result hit the public row cap and was truncated for the
+        # preview — callers can surface "showing first N rows".
+        "truncated": truncated,
         "query_params": param_defs,
         "applied_params": {n: url_params.get(n) for n in param_defs},
         "mode": publication["mode"],
@@ -1185,25 +1229,33 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
 # Snapshot (P4)
 # ============================================================
 
-async def _read_snapshot(publication: dict) -> dict:
-    """Read a snapshotted query result from S3."""
-    try:
-        # S3 GET is blocking network I/O — offload it off the event loop.
-        body = await asyncio.to_thread(
-            file_service.get_object_bytes, publication["snapshot_s3_key"]
-        )
-        data = json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        raise PublicationError(f"Corrupt snapshot data: {e}", status_code=500)
-    # file_service.StorageError already inherits from AKBError → propagates as 502.
+_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024  # read cap — guard memory on a stray huge snapshot
 
+
+def _decode_snapshot(raw: bytes) -> dict:
+    """Decode + sanitize a snapshot body. Pure CPU — runs off the event loop."""
+    data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict):
-        raise PublicationError("Snapshot data is not a valid object", status_code=500)
-
+        raise ValueError("Snapshot data is not a valid object")
     # Legacy snapshots written before F3 can hold literal NaN/Infinity (json.loads
     # accepts them as float('nan')/inf), which would 500 on render — sanitize on
     # read so old snapshots resolve instead of being permanently broken. (F3.)
-    data = _serialize_value(data)
+    return _serialize_value(data)
+
+
+async def _read_snapshot(publication: dict) -> dict:
+    """Read a snapshotted query result from S3."""
+    try:
+        # S3 GET (blocking I/O) AND the JSON decode + F3 sanitize (CPU) both run
+        # off the event loop, and the read is capped, so serving an anonymous
+        # snapshot can't stall the single loop or OOM on an oversized body.
+        body = await asyncio.to_thread(
+            file_service.get_object_bytes, publication["snapshot_s3_key"], _SNAPSHOT_MAX_BYTES
+        )
+        data = await asyncio.to_thread(_decode_snapshot, body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        raise PublicationError(f"Corrupt snapshot data: {e}", status_code=500)
+    # file_service.StorageError already inherits from AKBError → propagates as 502.
 
     data["snapshot_at"] = publication.get("snapshot_at")
     data["mode"] = "snapshot"
@@ -1258,14 +1310,15 @@ async def create_snapshot(
 
             s3_key = f"snapshots/{publication_id}.json"
             try:
-                file_service.put_object_bytes(
-                    s3_key,
-                    # allow_nan=False: result is already coerced by
-                    # _serialize_value, so this just refuses to silently persist
-                    # a stray non-finite float as invalid JSON. (F3.)
-                    json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"),
-                    content_type="application/json",
+                # allow_nan=False: result is already coerced by _serialize_value,
+                # so this just refuses to silently persist a stray non-finite
+                # float as invalid JSON. (F3.) Serialize off the loop (CPU); the
+                # await before the PUT is a safe cancellation point (nothing
+                # written yet). result is row-capped upstream so this is bounded.
+                payload = await asyncio.to_thread(
+                    lambda: json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 )
+                file_service.put_object_bytes(s3_key, payload, content_type="application/json")
                 # NOTE: this PUT is deliberately SYNCHRONOUS (not asyncio.to_thread)
                 # even though it briefly blocks the loop. Every attempt writes the
                 # SAME key (snapshots/{id}.json), and to_thread does not cancel an

@@ -453,6 +453,24 @@ echo "$RH" | grep -qi '^x-content-type-options: nosniff' && pass "F4: /raw sets 
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SLUG/download")
 [ "$CODE" = "200" ] && pass "/download streams (200)" || fail "/download" "HTTP $CODE"
 
+# Cross-vault file IDOR: publishing ANOTHER vault's file UUID through my own vault
+# must be REJECTED at create time (else an anonymous viewer could read that vault's
+# file bytes through my publication).
+IDOR_V="pubidor_$RANDOM"
+acurl -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor" >/dev/null
+IINIT=$(acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/upload?filename=secret.txt&collection=s&mime_type=text/plain")
+IURI=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+IFID=$(printf '%s' "$IURI" | uri_file_id)
+IURL=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+printf 'top-secret-from-vault-B' | curl -sk -X PUT "$IURL" -H "Content-Type: text/plain" --data-binary @- >/dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/$IFID/confirm" >/dev/null
+# attacker (owner of $VAULT) tries to publish vault-B's file UUID through $VAULT
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}")
+IDOR_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+[ -z "$IDOR_SLUG" ] && pass "cross-vault file publish REJECTED at create (IDOR closed)" || fail "cross-vault file IDOR" "created slug=$IDOR_SLUG"
+acurl -X DELETE "$BASE_URL/api/v1/vaults/$IDOR_V" >/dev/null 2>&1
+
 # File view-count model (hard cap via view-grant): a page open counts one view
 # and mints a grant; /raw + /download re-serve THAT view free WITH the grant, but
 # a direct fetch WITHOUT a grant spends its own view and is capped.

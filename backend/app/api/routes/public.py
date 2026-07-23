@@ -604,8 +604,8 @@ async def publication_meta(slug: str, request: Request):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 file_row = await conn.fetchrow(
-                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1",
-                    to_uuid(file_uuid_str),
+                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+                    to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
                 meta.update({
@@ -718,8 +718,8 @@ async def publication_raw(slug: str, request: Request):
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1",
-            to_uuid(parsed.identifier),
+            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1 AND vault_id = $2",
+            to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
         raise HTTPException(status_code=404, detail="File not found")
@@ -1145,8 +1145,8 @@ async def oembed(url: str, format: str = "json"):
                 pool = await get_pool()
                 async with pool.acquire() as conn:
                     f_row = await conn.fetchrow(
-                        "SELECT name FROM vault_files WHERE id = $1",
-                        to_uuid(file_uuid_str),
+                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2",
+                        to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                     )
                     if f_row:
                         title = f_row["name"]
