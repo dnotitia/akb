@@ -106,7 +106,11 @@ def get_object_bytes(s3_key: str, max_bytes: int | None = None) -> bytes:
             if len(buf) > max_bytes:
                 raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
     finally:
-        gen.close()  # release the boto stream promptly on cap-abort or exhaustion
+        # release the boto stream promptly on cap-abort or exhaustion; the
+        # concrete iterator is a generator, but the annotation is Iterator[bytes]
+        close = getattr(gen, "close", None)
+        if callable(close):
+            close()
     return bytes(buf)
 
 

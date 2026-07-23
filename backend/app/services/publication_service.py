@@ -1160,7 +1160,7 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
             )
         role = user_role_name(created_by)
         truncated = False
-        rows = []
+        rows: list[asyncpg.Record] = []
         try:
             async with conn.transaction():
                 await conn.execute("SET TRANSACTION READ ONLY")
@@ -1206,9 +1206,10 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
     columns = list(dict(rows[0]).keys()) if rows else []
     # Per-cell coercion is CPU-bound and runs for an anonymous caller — offload it
     # so a large (capped) result set can't stall the single event loop.
-    result_rows = await asyncio.to_thread(
-        lambda rs=rows: [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rs]
-    )
+    def _coerce_rows() -> list[dict]:
+        return [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rows]
+
+    result_rows = await asyncio.to_thread(_coerce_rows)
 
     return {
         "resource_type": ResourceType.TABLE_QUERY,

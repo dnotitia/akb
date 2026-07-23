@@ -1085,7 +1085,7 @@ async def oembed(url: str, format: str = "json"):
         # / filename through an unauthenticated oembed unfurl. The viewer and
         # /embed both hide the title behind the password, so oembed can't be the
         # bypass — return a generic card and skip every DB title lookup.
-        title = "Protected AKB publication"
+        title: str | None = "Protected AKB publication"
     else:
         # Resolve a useful title. Parse the canonical URI to recover the
         # resource handle — there are no separate id columns anymore.
