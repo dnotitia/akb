@@ -8,6 +8,20 @@ import { createClient as createLiteClient } from "../dist/lite.js";
 const contract = JSON.parse(
   await readFile(new URL("../scripts/sdk-surface-contract.json", import.meta.url), "utf8"),
 );
+const CONTRACT_PATH_PARAMETERS = {
+  activityList: { vault: "contract vault" },
+  documentsHistory: { vault: "contract vault", doc_id: "notes/a b.md" },
+  documentsDiff: { vault: "contract vault", doc_id: "notes/a b.md" },
+  collectionsCreateCollection: { vault: "contract vault" },
+  collectionsDeleteCollection: { vault: "contract vault", path: "notes/new" },
+  tablesGetVault: { vault: "contract vault" },
+  tablesGetVaultSchema: { vault: "contract vault" },
+  tablesGetTableSchema: { vault: "contract vault", table: "incident/type" },
+  tablesPostVault: { vault: "contract vault" },
+  tablesAlterTable: { vault: "contract vault", table_name: "incidents" },
+  tablesApplyMigration: { vault: "contract vault" },
+  tablesDeleteTableName: { vault: "contract vault", table_name: "incidents" },
+};
 
 test("SDK surface matrix connects every contract facade through one scoped client", async () => {
   const calls = [];
@@ -77,6 +91,10 @@ test("SDK surface matrix connects every contract facade through one scoped clien
   assert.equal(results.length, contract.operations.length);
   assert.ok(results.every((result) => result.data !== null && result.error === null));
   assert.ok(results.every((result) => result.throwOnError().data.kind));
+  for (const [index, item] of contract.operations.entries()) {
+    assert.equal(calls[index].method, item.method.toUpperCase(), `${item.operationId} method`);
+    assert.equal(calls[index].url.pathname, contractPath(item), `${item.operationId} path`);
+  }
   assert.ok(calls.every((call) => call.headers.authorization === "Bearer contract-token"));
   assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
   assert.equal(calls[4].headers["content-type"], "application/json");
@@ -230,5 +248,16 @@ function json(body, status = 200, statusText = "OK") {
     status,
     statusText,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function contractPath(item) {
+  const parameters = CONTRACT_PATH_PARAMETERS[item.operationId] ?? {};
+  return item.path.replace(/\{([^}]+)\}/g, (_, name) => {
+    const value = parameters[name];
+    assert.equal(typeof value, "string", `${item.operationId} ${name} path parameter`);
+    return name === "doc_id" || name === "path"
+      ? value.split("/").map(encodeURIComponent).join("/")
+      : encodeURIComponent(value);
   });
 }

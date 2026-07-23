@@ -1,8 +1,29 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { AkbError, createClient } from "@akb/client";
 import { createClient as createLiteClient } from "@akb/client/lite";
 
+const contract = JSON.parse(
+  await readFile(
+    new URL("./node_modules/@akb/client/scripts/sdk-surface-contract.json", import.meta.url),
+    "utf8",
+  ),
+);
+const CONTRACT_PATH_PARAMETERS = {
+  activityList: { vault: "packed vault" },
+  documentsHistory: { vault: "packed vault", doc_id: "a.md" },
+  documentsDiff: { vault: "packed vault", doc_id: "a.md" },
+  collectionsCreateCollection: { vault: "packed vault" },
+  collectionsDeleteCollection: { vault: "packed vault", path: "new/coll" },
+  tablesGetVault: { vault: "packed vault" },
+  tablesGetVaultSchema: { vault: "packed vault" },
+  tablesGetTableSchema: { vault: "packed vault", table: "incidents" },
+  tablesPostVault: { vault: "packed vault" },
+  tablesAlterTable: { vault: "packed vault", table_name: "incidents" },
+  tablesApplyMigration: { vault: "packed vault" },
+  tablesDeleteTableName: { vault: "packed vault", table_name: "incidents" },
+};
 const calls = [];
 const claims = {
   sub: "packed-user",
@@ -70,9 +91,13 @@ const results = [
   await client.tables.drop("incidents"),
 ];
 
-assert.equal(results.length, 20);
+assert.equal(results.length, contract.operations.length);
 assert.ok(results.every((result) => result.data !== null && result.error === null));
 assert.ok(results.every((result) => result.throwOnError().data.kind));
+for (const [index, item] of contract.operations.entries()) {
+  assert.equal(calls[index].method, item.method.toUpperCase(), `${item.operationId} method`);
+  assert.equal(calls[index].url.pathname, contractPath(item), `${item.operationId} path`);
+}
 assert.ok(calls.every((call) => call.headers.authorization === "Bearer packed-contract-token"));
 assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
 assert.equal(calls[18].headers["idempotency-key"], "packed-migration");
@@ -214,5 +239,16 @@ function response(body, status = 200, statusText = "OK") {
     status,
     statusText,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function contractPath(item) {
+  const parameters = CONTRACT_PATH_PARAMETERS[item.operationId] ?? {};
+  return item.path.replace(/\{([^}]+)\}/g, (_, name) => {
+    const value = parameters[name];
+    assert.equal(typeof value, "string", `${item.operationId} ${name} path parameter`);
+    return name === "doc_id" || name === "path"
+      ? value.split("/").map(encodeURIComponent).join("/")
+      : encodeURIComponent(value);
   });
 }
