@@ -586,6 +586,57 @@ def test_alter_table_openapi_contract_is_codegen_typed():
         )
 
 
+def test_table_admin_request_components_are_structured():
+    schema = app.openapi()
+    paths = schema["paths"]
+    create = paths["/api/v1/tables/{vault}"]["post"]
+    alter = paths["/api/v1/tables/{vault}/{table_name}"]["patch"]
+    schemas = schema["components"]["schemas"]
+
+    assert create["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CreateTableRequest"
+    }
+    assert alter["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AlterTableRequest"
+    }
+
+    create_request = schemas["CreateTableRequest"]
+    assert set(create_request["required"]) == {"name", "columns"}
+    assert create_request["properties"]["columns"]["items"] == {
+        "$ref": "#/components/schemas/TableColumnSpec"
+    }
+    assert create_request["properties"]["unique_keys"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableUniqueKeySpec"
+    }
+    assert create_request["properties"]["indexes"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableIndexSpec"
+    }
+
+    alter_request = schemas["AlterTableRequest"]
+    assert "required" not in alter_request
+    assert alter_request["properties"]["add_columns"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableColumnSpec"
+    }
+    assert alter_request["properties"]["alter_columns"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableAlterColumnSpec"
+    }
+    assert alter_request["properties"]["add_unique_keys"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableUniqueKeySpec"
+    }
+    assert alter_request["properties"]["add_indexes"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableIndexSpec"
+    }
+
+    assert set(schemas["TableColumnSpec"]["required"]) == {"name"}
+    assert set(schemas["TableUniqueKeySpec"]["required"]) == {"columns"}
+    assert set(schemas["TableIndexSpec"]["required"]) == {"columns"}
+    index_column = schemas["TableIndexColumnSpec"]
+    assert set(index_column["required"]) == {"name"}
+    order_variants = index_column["properties"]["order"]["anyOf"]
+    assert {"type": "string", "enum": ["asc", "desc"]} in order_variants
+    assert {"type": "null"} in order_variants
+
+
 def test_table_migration_openapi_contract_is_codegen_typed():
     schema = app.openapi()
     operation = schema["paths"]["/api/v1/tables/{vault}/migrations"]["post"]
@@ -602,11 +653,37 @@ def test_table_migration_openapi_contract_is_codegen_typed():
     assert idempotency["in"] == "header"
     assert idempotency["required"] is True
     assert idempotency["schema"]["type"] == "string"
-    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
-        "items": {"additionalProperties": True, "type": "object"},
-        "title": "Operations",
-        "type": "array",
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["type"] == "array"
+    operation_union = request_schema["items"]
+    assert operation_union["discriminator"]["propertyName"] == "op"
+    mapping = operation_union["discriminator"]["mapping"]
+    expected_ops = {
+        "add_column",
+        "alter_column",
+        "drop_column",
+        "rename_column",
+        "add_unique_key",
+        "drop_unique_key",
+        "add_index",
+        "drop_index",
     }
+    assert expected_ops.issubset(mapping)
+    assert {item["$ref"] for item in operation_union["oneOf"]} == {
+        "#/components/schemas/TableAddColumnMigration",
+        "#/components/schemas/TableAlterColumnMigration",
+        "#/components/schemas/TableDropColumnMigration",
+        "#/components/schemas/TableRenameColumnMigration",
+        "#/components/schemas/TableAddUniqueKeyMigration",
+        "#/components/schemas/TableDropUniqueKeyMigration",
+        "#/components/schemas/TableAddIndexMigration",
+        "#/components/schemas/TableDropIndexMigration",
+    }
+    for ref in operation_union["oneOf"]:
+        component = schema["components"]["schemas"][ref["$ref"].rsplit("/", 1)[-1]]
+        assert component["additionalProperties"] is True
+        assert "op" in component["required"]
+        assert {"table", "table_name"}.issubset(component["properties"])
     migration = schema["components"]["schemas"]["AkbTableMigrationEnvelope"]
     assert {"kind", "vault", "idempotency_key", "checksum", "applied", "operations", "results"}.issubset(
         migration["required"]

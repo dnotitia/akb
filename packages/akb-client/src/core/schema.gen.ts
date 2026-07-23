@@ -451,6 +451,40 @@ export type AkbSuccessEnvelope =
   | AkbRelationUnlinkEnvelope
   | AkbProvenanceEnvelope;
 
+export type CreateTableRequest = { name: string; description?: string; columns: TableColumnSpec[]; collection?: string | null; unique_keys?: TableUniqueKeySpec[] | null; indexes?: TableIndexSpec[] | null };
+
+export type AlterTableRequest = { add_columns?: TableColumnSpec[] | null; alter_columns?: TableAlterColumnSpec[] | null; drop_columns?: string[] | null; rename_columns?: { [key: string]: string } | null; add_unique_keys?: TableUniqueKeySpec[] | null; drop_unique_keys?: string[] | null; add_indexes?: TableIndexSpec[] | null; drop_indexes?: string[] | null };
+
+export type TableColumnSpec = { name: string; type?: string | null; required?: boolean | null; default?: unknown; check?: { [key: string]: unknown } | null; enum?: unknown[] | null; unique?: boolean | null; index?: boolean | null; references?: { [key: string]: unknown } | null; on_delete?: string | null; [key: string]: unknown };
+
+export type TableUniqueKeySpec = { columns: string[]; name?: string | null; [key: string]: unknown };
+
+export type TableIndexColumnSpec = { name: string; order?: "asc" | "desc" | null; [key: string]: unknown };
+
+export type TableIndexSpec = { columns: (string | TableIndexColumnSpec)[]; name?: string | null; [key: string]: unknown };
+
+export type TableAlterColumnSpec = { name: string; set_default?: unknown; default?: unknown; drop_default?: boolean | null; set_check?: { [key: string]: unknown } | null; check?: { [key: string]: unknown } | null; drop_check?: boolean | null; set_not_null?: boolean | null; drop_not_null?: boolean | null; set_enum?: unknown[] | null; enum?: unknown[] | null; rename_enum_values?: { [key: string]: string } | null; enum_renames?: { [key: string]: string } | null; [key: string]: unknown };
+
+export type TableNamedSpec = { name: string; [key: string]: unknown };
+
+export type TableAddColumnMigration = { table?: string | null; table_name?: string | null; op: "add_column" | "add-column"; column?: TableColumnSpec | string | null; name?: string | null; type?: string | null; required?: boolean | null; default?: unknown; check?: { [key: string]: unknown } | null; enum?: unknown[] | null; unique?: boolean | null; index?: boolean | null; references?: { [key: string]: unknown } | null; on_delete?: string | null; [key: string]: unknown };
+
+export type TableAlterColumnMigration = { table?: string | null; table_name?: string | null; op: "alter_column" | "alter-column"; column?: TableAlterColumnSpec | string | null; name?: string | null; set_default?: unknown; default?: unknown; drop_default?: boolean | null; set_check?: { [key: string]: unknown } | null; check?: { [key: string]: unknown } | null; drop_check?: boolean | null; set_not_null?: boolean | null; drop_not_null?: boolean | null; set_enum?: unknown[] | null; enum?: unknown[] | null; rename_enum_values?: { [key: string]: string } | null; enum_renames?: { [key: string]: string } | null; [key: string]: unknown };
+
+export type TableDropColumnMigration = { table?: string | null; table_name?: string | null; op: "drop_column" | "drop-column"; name?: string | null; column?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableRenameColumnMigration = { table?: string | null; table_name?: string | null; op: "rename_column" | "rename-column"; from?: string | TableNamedSpec | null; old_name?: string | TableNamedSpec | null; from_name?: string | TableNamedSpec | null; old?: string | TableNamedSpec | null; column?: string | TableNamedSpec | null; to?: string | TableNamedSpec | null; new_name?: string | TableNamedSpec | null; to_name?: string | TableNamedSpec | null; new?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableAddUniqueKeyMigration = { table?: string | null; table_name?: string | null; op: "add_unique_key" | "add-unique-key"; unique_key?: TableUniqueKeySpec | null; name?: string | null; columns?: string[] | null; [key: string]: unknown };
+
+export type TableDropUniqueKeyMigration = { table?: string | null; table_name?: string | null; op: "drop_unique_key" | "drop-unique-key"; name?: string | null; unique_key?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableAddIndexMigration = { table?: string | null; table_name?: string | null; op: "add_index" | "add-index"; index?: TableIndexSpec | null; name?: string | null; columns?: (string | TableIndexColumnSpec)[] | null; [key: string]: unknown };
+
+export type TableDropIndexMigration = { table?: string | null; table_name?: string | null; op: "drop_index" | "drop-index"; name?: string | null; index?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableMigrationOperation = TableAddColumnMigration | TableAlterColumnMigration | TableDropColumnMigration | TableRenameColumnMigration | TableAddUniqueKeyMigration | TableDropUniqueKeyMigration | TableAddIndexMigration | TableDropIndexMigration;
+
 export interface paths {
   "/api/v1/activity/{vault}": {
     get: AkbOperation<"get", "/api/v1/activity/{vault}", { path: { vault: string } }, never, AkbActivityEnvelope>;
@@ -524,10 +558,10 @@ export interface paths {
   };
   "/api/v1/tables/{vault}": {
     get: AkbOperation<"get", "/api/v1/tables/{vault}", { path: { vault: string } }, never, AkbTableEnvelope>;
-    post: AkbOperation<"post", "/api/v1/tables/{vault}", { path: { vault: string } }, unknown, AkbTableEnvelope>;
+    post: AkbOperation<"post", "/api/v1/tables/{vault}", { path: { vault: string } }, CreateTableRequest, AkbTableEnvelope>;
   };
   "/api/v1/tables/{vault}/migrations": {
-    post: AkbOperation<"post", "/api/v1/tables/{vault}/migrations", { path: { vault: string } }, unknown, AkbTableMigrationEnvelope>;
+    post: AkbOperation<"post", "/api/v1/tables/{vault}/migrations", { path: { vault: string }; header: { "Idempotency-Key": string } }, (TableAddColumnMigration | TableAlterColumnMigration | TableDropColumnMigration | TableRenameColumnMigration | TableAddUniqueKeyMigration | TableDropUniqueKeyMigration | TableAddIndexMigration | TableDropIndexMigration)[], AkbTableMigrationEnvelope>;
   };
   "/api/v1/tables/{vault}/schema": {
     get: AkbOperation<"get", "/api/v1/tables/{vault}/schema", { path: { vault: string } }, never, AkbVaultTableSchemaEnvelope>;
@@ -537,7 +571,7 @@ export interface paths {
   };
   "/api/v1/tables/{vault}/{table_name}": {
     delete: AkbOperation<"delete", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, never, AkbTableEnvelope>;
-    patch: AkbOperation<"patch", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, unknown, AkbTableEnvelope>;
+    patch: AkbOperation<"patch", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, AlterTableRequest, AkbTableEnvelope>;
   };
   "/api/v1/tables/{vault}/{table}/query": {
     post: AkbOperation<"post", "/api/v1/tables/{vault}/{table}/query", { path: { vault: string; table: string } }, unknown, AkbTableQueryEnvelope | null>;
@@ -611,6 +645,22 @@ export interface components {
     AkbCollectionSummary: AkbCollectionSummary;
     AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;
     AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;
+    CreateTableRequest: CreateTableRequest;
+    AlterTableRequest: AlterTableRequest;
+    TableColumnSpec: TableColumnSpec;
+    TableUniqueKeySpec: TableUniqueKeySpec;
+    TableIndexColumnSpec: TableIndexColumnSpec;
+    TableIndexSpec: TableIndexSpec;
+    TableAlterColumnSpec: TableAlterColumnSpec;
+    TableNamedSpec: TableNamedSpec;
+    TableAddColumnMigration: TableAddColumnMigration;
+    TableAlterColumnMigration: TableAlterColumnMigration;
+    TableDropColumnMigration: TableDropColumnMigration;
+    TableRenameColumnMigration: TableRenameColumnMigration;
+    TableAddUniqueKeyMigration: TableAddUniqueKeyMigration;
+    TableDropUniqueKeyMigration: TableDropUniqueKeyMigration;
+    TableAddIndexMigration: TableAddIndexMigration;
+    TableDropIndexMigration: TableDropIndexMigration;
     ActivityFileChange: AkbActivityFileChange;
     ActivityEntry: AkbActivityEntry;
     RecentDocumentChange: AkbRecentDocumentChange;

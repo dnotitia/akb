@@ -6,6 +6,7 @@ import pytest
 
 from app.exceptions import ValidationError
 from app.services import table_migration_service
+from app.api.routes import tables
 
 
 def test_table_migration_checksum_is_stable_for_json_key_order() -> None:
@@ -113,4 +114,53 @@ def test_table_migration_rejects_unknown_ops_and_bad_idempotency_key() -> None:
     assert (
         table_migration_service._validate_idempotency_key("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")
         == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    )
+
+
+def test_table_migration_request_dump_preserves_legacy_checksum_and_input_shape() -> None:
+    raw = [
+        {
+            "op": "add-column",
+            "table_name": "incidents",
+            "column": {
+                "name": "status",
+                "type": "text",
+                "default": None,
+                "vendor_tag": "keep",
+            },
+            "trace": "legacy",
+        },
+        {
+            "op": "add_index",
+            "table": "incidents",
+            "name": "incidents_status_idx",
+            "columns": [{"name": "status", "order": "desc"}],
+            "fillfactor": 90,
+        },
+        {
+            "op": "rename_column",
+            "table": "incidents",
+            "old_name": "status",
+            "new_name": "state",
+        },
+    ]
+    parsed = [tables.TableMigrationOperationAdapter.validate_python(op) for op in raw]
+    dumped = [op.model_dump(exclude_unset=True) for op in parsed]
+
+    assert dumped == raw
+    assert table_migration_service.table_migration_checksum(dumped) == (
+        "20aebf7dbea249b74afb737438ace3b9cda2c5e5f19d914b358bb46f843e4e04"  # pragma: allowlist secret
+    )
+    assert table_migration_service._migration_op_to_alter_kwargs(dumped[0]) == (
+        "incidents",
+        {
+            "add_columns": [
+                {
+                    "name": "status",
+                    "type": "text",
+                    "default": None,
+                    "vendor_tag": "keep",
+                }
+            ]
+        },
     )

@@ -841,6 +841,98 @@ test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary",
   assert.equal(result.throwOnError().data.kind, "vault_table_schema");
 });
 
+test("createTypedFetch forwards typed table admin bodies and migration header", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      calls.push({
+        url: String(input),
+        method: init?.method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body: JSON.parse(String(init?.body)),
+      });
+      const kind = String(input).endsWith("/migrations") ? "table_migration" : "table";
+      return new Response(JSON.stringify({ kind }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const typedFetch = createTypedFetch(client);
+  await typedFetch("post", "/api/v1/tables/{vault}", {
+    path: { vault: "eng" },
+    json: { name: "incidents", columns: [{ name: "state", type: "text" }] },
+  });
+  await typedFetch("patch", "/api/v1/tables/{vault}/{table_name}", {
+    path: { vault: "eng", table_name: "incidents" },
+    json: { alter_columns: [{ name: "state", set_default: "todo" }] },
+  });
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: { "Idempotency-Key": "11111111-1111-4111-8111-111111111111" },
+    json: [{ op: "add_index", table: "incidents", columns: ["state"] }],
+  });
+
+  assert.deepEqual(
+    calls.map(({ url, method }) => ({ url, method })),
+    [
+      { url: "https://akb.test/api/v1/tables/eng", method: "POST" },
+      { url: "https://akb.test/api/v1/tables/eng/incidents", method: "PATCH" },
+      { url: "https://akb.test/api/v1/tables/eng/migrations", method: "POST" },
+    ],
+  );
+  assert.deepEqual(calls[0].body.columns, [{ name: "state", type: "text" }]);
+  assert.deepEqual(calls[1].body.alter_columns, [{ name: "state", set_default: "todo" }]);
+  assert.equal(calls[2].headers["idempotency-key"], "11111111-1111-4111-8111-111111111111");
+  assert.deepEqual(calls[2].body, [{ op: "add_index", table: "incidents", columns: ["state"] }]);
+});
+
+test("createTypedFetch validates required headers in generic HeadersInit containers", async () => {
+  let calls = 0;
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: fixtureApiKey,
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ kind: "table_migration" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const typedFetch = createTypedFetch(client);
+  const json = [{ op: "drop_index", table: "incidents", name: "old_idx" }];
+
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: new Headers({ "Idempotency-Key": "11111111-1111-4111-8111-111111111111" }),
+    json,
+  });
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: [["Idempotency-Key", "22222222-2222-4222-8222-222222222222"]],
+    json,
+  });
+  await assert.rejects(
+    typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+      path: { vault: "eng" },
+      headers: new Headers(),
+      json,
+    }),
+    /Missing required header: Idempotency-Key/,
+  );
+  await assert.rejects(
+    typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+      path: { vault: "eng" },
+      headers: [],
+      json,
+    }),
+    /Missing required header: Idempotency-Key/,
+  );
+  assert.equal(calls, 2);
+});
+
 test("from query builder is lazy thenable and fires once", async () => {
   let calls = 0;
   let seenUrl = "";
