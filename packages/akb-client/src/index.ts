@@ -532,6 +532,30 @@ export interface AkbActivityFacade extends AkbNamespaceStub {
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbRecentChangesEnvelope>>;
 }
 
+export interface AkbTableMigrationOptions {
+  idempotencyKey: string;
+}
+
+export interface AkbTablesFacade extends AkbNamespaceStub {
+  list(): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  schema(): Promise<AkbResult<import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope>>;
+  schema(table: string): Promise<AkbResult<import("./core/schema.gen.js").AkbTableSchemaEnvelope>>;
+  create(
+    input: import("./core/schema.gen.js").CreateTableRequest,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  alter(
+    table: string,
+    input: import("./core/schema.gen.js").AlterTableRequest,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  migrate(
+    operations: readonly import("./core/schema.gen.js").TableMigrationOperation[],
+    options: AkbTableMigrationOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableMigrationEnvelope>>;
+  drop(
+    table: string,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+}
+
 export interface AkbStorageFacade extends AkbNamespaceStub {
   presignUpload(
     path: string,
@@ -653,6 +677,7 @@ export interface AkbClient<Schema = unknown> {
   readonly graph: AkbGraphFacade;
   readonly docs: AkbDocsFacade;
   readonly activity: AkbActivityFacade;
+  readonly tables: AkbTablesFacade;
   readonly storage: AkbStorageFacade;
 }
 
@@ -837,6 +862,7 @@ function makeClient(
     graph: makeGraphFacade(request, scope.defaultVault),
     docs: makeDocsFacade(request, scope.defaultVault),
     activity: makeActivityFacade(request, scope.defaultVault),
+    tables: makeTablesFacade(request, scope.defaultVault),
     storage: makeStorageFacade(request, scope.defaultVault, fetchImpl),
   };
   return Object.freeze(client) as unknown as AkbClient;
@@ -971,6 +997,77 @@ function makeGraphFacade(
       return request<import("./core/schema.gen.js").AkbProvenanceEnvelope>(`/provenance?${params}`);
     },
   } satisfies AkbGraphFacade;
+  return Object.freeze(facade);
+}
+
+function makeTablesFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbTablesFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(
+    path: string | URL = "",
+    init: RequestInit = {},
+  ) => request<T>(joinPath("/tables", path), init);
+  const scopedPath = (table?: string): string => {
+    const vault = resolveTablesVault(defaultVault);
+    const root = `/tables/${encodePathSegment(vault)}`;
+    return table === undefined ? root : `${root}/${encodePathSegment(table)}`;
+  };
+  function schema(): Promise<
+    AkbResult<import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope>
+  >;
+  function schema(table: string): Promise<
+    AkbResult<import("./core/schema.gen.js").AkbTableSchemaEnvelope>
+  >;
+  function schema(
+    table?: string,
+  ): Promise<
+    AkbResult<
+      | import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope
+      | import("./core/schema.gen.js").AkbTableSchemaEnvelope
+    >
+  > {
+    const path = table === undefined ? `${scopedPath()}/schema` : `${scopedPath(table)}/schema`;
+    return request(path);
+  }
+  const facade = {
+    name: "tables",
+    request: rawRequest,
+    list() {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath());
+    },
+    schema,
+    create(input: import("./core/schema.gen.js").CreateTableRequest) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(), {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+    },
+    alter(table: string, input: import("./core/schema.gen.js").AlterTableRequest) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(table), {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      });
+    },
+    migrate(
+      operations: readonly import("./core/schema.gen.js").TableMigrationOperation[],
+      options: AkbTableMigrationOptions,
+    ) {
+      return request<import("./core/schema.gen.js").AkbTableMigrationEnvelope>(
+        `${scopedPath()}/migrations`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": options.idempotencyKey },
+          body: JSON.stringify(operations),
+        },
+      );
+    },
+    drop(table: string) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(table), {
+        method: "DELETE",
+      });
+    },
+  } satisfies AkbTablesFacade;
   return Object.freeze(facade);
 }
 
@@ -1347,6 +1444,13 @@ function resolveActivityVault(vault: string | null | undefined): string {
 function resolveGraphVault(vault: string | null | undefined, operation: "overview" | "health"): string {
   if (typeof vault === "string" && vault.length > 0) return vault;
   throw new TypeError(`Select a vault before using graph ${operation}: client.vault("...").graph.${operation}().`);
+}
+
+function resolveTablesVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError(
+    "Select a vault before using table administration: client.vault(\"...\").tables.",
+  );
 }
 
 function encodePathSegment(value: string): string {
