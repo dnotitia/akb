@@ -5,12 +5,19 @@ import {
   type AkbResult,
   type AkbSuccessEnvelope,
   type AkbClient,
+  type AkbActivityEnvelope,
+  type AkbActivityListOptions,
+  type AkbActivityRecentOptions,
   type AkbCollectionCreateEnvelope,
   type AkbCollectionDeleteEnvelope,
   type AkbCollectionSummary,
   type AkbCreateCollectionInput,
   type AkbDeleteCollectionOptions,
   type AkbDocumentEnvelope,
+  type AkbDocumentDiffEnvelope,
+  type AkbDocumentDiffOptions,
+  type AkbDocumentHistoryEnvelope,
+  type AkbDocumentHistoryOptions,
   type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
   type AkbGraphEnvelope,
@@ -220,6 +227,55 @@ const updatedDoc = await docs.update("guides/readme.md", {
 updatedDoc.throwOnError().data.current_commit satisfies string | null | undefined;
 const deletedDoc = await docs.delete("guides/readme.md");
 deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
+const historyOptions: AkbDocumentHistoryOptions = { vault: "eng", limit: 20 };
+const historyResult = await docs.history("guides/readme.md", historyOptions);
+const historyLeaf: AkbDocumentHistoryEnvelope = historyResult.throwOnError().data;
+historyLeaf.kind satisfies "document_history";
+historyLeaf.uri satisfies string;
+historyLeaf.history.at(0)?.author_name satisfies string | null | undefined;
+const diffOptions: AkbDocumentDiffOptions = { commit: "abc1234" };
+const diffResult = await docs.diff("guides/readme.md", diffOptions);
+const diffLeaf: AkbDocumentDiffEnvelope = diffResult.throwOnError().data;
+diffLeaf.kind satisfies "document_diff";
+diffLeaf.type satisfies "added" | "deleted" | "modified" | "unknown" | "unchanged";
+diffLeaf.error satisfies string | null | undefined;
+const activityOptions: AkbActivityListOptions = { collection: null, author: null, since: null, limit: 20 };
+const activityResult = await typedClient.vault("eng").activity.list(activityOptions);
+const activityLeaf: AkbActivityEnvelope = activityResult.throwOnError().data;
+activityLeaf.kind satisfies "activity";
+activityLeaf.activity.at(0)?.files.at(0)?.change satisfies "added" | "deleted" | "modified" | undefined;
+activityLeaf.activity.at(0)?.author_name satisfies string | null | undefined;
+const recentOptions: AkbActivityRecentOptions = { vault: "eng", limit: 10 };
+const recentResult = await typedClient.activity.recent(recentOptions);
+recentResult.throwOnError().data.kind satisfies "recent_changes";
+recentResult.throwOnError().data.changes.at(0)?.commit satisfies string | null | undefined;
+recentResult.throwOnError().data.changes.at(0)?.changed_at satisfies string | null | undefined;
+type HistoryOperation = AkbOperationResponse<operations["documentsHistory"]>;
+type DiffOperation = AkbOperationResponse<operations["documentsDiff"]>;
+type ActivityOperation = AkbOperationResponse<operations["activityList"]>;
+type RecentOperation = AkbOperationResponse<operations["activityRecent"]>;
+historyLeaf satisfies HistoryOperation;
+diffLeaf satisfies DiffOperation;
+activityLeaf satisfies ActivityOperation;
+recentResult.throwOnError().data satisfies RecentOperation;
+declare const activitySuccess: AkbSuccessEnvelope;
+if (activitySuccess.kind === "document_history") {
+  activitySuccess.history.at(0)?.message satisfies string | undefined;
+} else if (activitySuccess.kind === "document_diff") {
+  activitySuccess.diff satisfies string;
+} else if (activitySuccess.kind === "activity") {
+  activitySuccess.total satisfies number;
+} else if (activitySuccess.kind === "recent_changes") {
+  activitySuccess.changes.at(0)?.doc_id satisfies string | undefined;
+}
+// @ts-expect-error diff requires a commit.
+docs.diff("guides/readme.md", {});
+// @ts-expect-error history uses limit, not topK.
+docs.history("guides/readme.md", { topK: 20 });
+// @ts-expect-error activity list does not accept a recent-only option alias.
+typedClient.activity.list({ topK: 20 });
+// @ts-expect-error recent does not accept activity filters.
+typedClient.activity.recent({ author: "u1" });
 // @ts-expect-error collection is required when putting a document.
 docs.put({ title: "Missing collection", content: "# Missing collection" });
 // @ts-expect-error document status is constrained to AKB document lifecycle values.

@@ -246,6 +246,76 @@ export interface AkbCollectionDeleteEnvelope {
   deleted_tables: number;
 }
 
+export interface AkbActivityFileChange {
+  path: string;
+  change: "added" | "deleted" | "modified";
+  [key: string]: unknown;
+}
+
+export interface AkbActivityEntry {
+  hash: string;
+  subject: string;
+  author: string;
+  date: string;
+  action: string;
+  summary: string;
+  agent: string;
+  files: AkbActivityFileChange[];
+  author_name?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbRecentDocumentChange {
+  doc_id: string;
+  vault: string;
+  path: string;
+  title: string;
+  type: string;
+  commit: string | null;
+  changed_at: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentHistoryEntry {
+  hash: string;
+  message: string;
+  author: string;
+  date: string;
+  author_name?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbActivityEnvelope {
+  kind: "activity";
+  vault: string;
+  total: number;
+  activity: AkbActivityEntry[];
+  [key: string]: unknown;
+}
+
+export interface AkbRecentChangesEnvelope {
+  kind: "recent_changes";
+  changes: AkbRecentDocumentChange[];
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentHistoryEnvelope {
+  kind: "document_history";
+  uri: string;
+  history: AkbDocumentHistoryEntry[];
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentDiffEnvelope {
+  kind: "document_diff";
+  file: string;
+  commit: string;
+  type: "added" | "deleted" | "modified" | "unknown" | "unchanged";
+  diff: string;
+  error?: string | null;
+  [key: string]: unknown;
+}
+
 export interface AkbGraphNode {
   uri: string;
   name: string;
@@ -369,6 +439,10 @@ export type AkbSuccessEnvelope =
   | AkbGrepEnvelope
   | AkbCollectionCreateEnvelope
   | AkbCollectionDeleteEnvelope
+  | AkbActivityEnvelope
+  | AkbRecentChangesEnvelope
+  | AkbDocumentHistoryEnvelope
+  | AkbDocumentDiffEnvelope
   | AkbGraphNeighborsEnvelope
   | AkbGraphOverviewEnvelope
   | AkbGraphHealthEnvelope
@@ -378,6 +452,9 @@ export type AkbSuccessEnvelope =
   | AkbProvenanceEnvelope;
 
 export interface paths {
+  "/api/v1/activity/{vault}": {
+    get: AkbOperation<"get", "/api/v1/activity/{vault}", { path: { vault: string } }, never, AkbActivityEnvelope>;
+  };
   "/api/v1/browse/{vault}": {
     get: AkbOperation<"get", "/api/v1/browse/{vault}", { path: { vault: string } }, never, AkbDocumentEnvelope>;
   };
@@ -386,6 +463,9 @@ export interface paths {
   };
   "/api/v1/collections/{vault}/{path}": {
     delete: AkbOperation<"delete", "/api/v1/collections/{vault}/{path}", { path: { vault: string; path: string } }, never, AkbCollectionDeleteEnvelope>;
+  };
+  "/api/v1/diff/{vault}/{doc_id}": {
+    get: AkbOperation<"get", "/api/v1/diff/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentDiffEnvelope>;
   };
   "/api/v1/documents": {
     post: AkbOperation<"post", "/api/v1/documents", never, unknown, AkbDocumentWriteEnvelope>;
@@ -425,8 +505,14 @@ export interface paths {
   "/api/v1/grep": {
     get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
   };
+  "/api/v1/history/{vault}/{doc_id}": {
+    get: AkbOperation<"get", "/api/v1/history/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentHistoryEnvelope>;
+  };
   "/api/v1/provenance": {
     get: AkbOperation<"get", "/api/v1/provenance", never, never, AkbProvenanceEnvelope>;
+  };
+  "/api/v1/recent": {
+    get: AkbOperation<"get", "/api/v1/recent", never, never, AkbRecentChangesEnvelope>;
   };
   "/api/v1/relations": {
     delete: AkbOperation<"delete", "/api/v1/relations", never, never, AkbRelationUnlinkEnvelope>;
@@ -468,9 +554,11 @@ export interface paths {
 }
 
 export interface operations {
+  activityList: paths["/api/v1/activity/{vault}"]["get"];
   documentsBrowseVault: paths["/api/v1/browse/{vault}"]["get"];
   collectionsCreateCollection: paths["/api/v1/collections/{vault}"]["post"];
   collectionsDeleteCollection: paths["/api/v1/collections/{vault}/{path}"]["delete"];
+  documentsDiff: paths["/api/v1/diff/{vault}/{doc_id}"]["get"];
   documentsPutDocument: paths["/api/v1/documents"]["post"];
   documentsDeleteDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["delete"];
   documentsGetDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["get"];
@@ -485,7 +573,9 @@ export interface operations {
   graphHealth: paths["/api/v1/graph/health"]["get"];
   graphOverview: paths["/api/v1/graph/overview"]["get"];
   searchGrepDocuments: paths["/api/v1/grep"]["get"];
+  documentsHistory: paths["/api/v1/history/{vault}/{doc_id}"]["get"];
   graphProvenance: paths["/api/v1/provenance"]["get"];
+  activityRecent: paths["/api/v1/recent"]["get"];
   graphUnlink: paths["/api/v1/relations"]["delete"];
   graphRelations: paths["/api/v1/relations"]["get"];
   graphLink: paths["/api/v1/relations"]["post"];
@@ -521,6 +611,14 @@ export interface components {
     AkbCollectionSummary: AkbCollectionSummary;
     AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;
     AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;
+    ActivityFileChange: AkbActivityFileChange;
+    ActivityEntry: AkbActivityEntry;
+    RecentDocumentChange: AkbRecentDocumentChange;
+    DocumentHistoryEntry: AkbDocumentHistoryEntry;
+    AkbActivityEnvelope: AkbActivityEnvelope;
+    AkbRecentChangesEnvelope: AkbRecentChangesEnvelope;
+    AkbDocumentHistoryEnvelope: AkbDocumentHistoryEnvelope;
+    AkbDocumentDiffEnvelope: AkbDocumentDiffEnvelope;
     AkbSearchEnvelope: AkbSearchEnvelope;
     AkbDrillDownEnvelope: AkbDrillDownEnvelope;
     AkbGrepEnvelope: AkbGrepEnvelope;
