@@ -1346,11 +1346,23 @@ async def create_snapshot(
                 """,
                 s3_key, publication_id,
             )
-            # Reclaim the previous snapshot object (durable S3-delete outbox, in
-            # this txn so it commits with the CAS — and rolls back if the snapshot
-            # does). A crash before the reaper runs orphans one object (storage
-            # cost only; the DB points at the new key, so it's never served).
-            if old_key and old_key != s3_key:
+            if updated_row is None:
+                # The publication was unpublished concurrently (delete_publication
+                # does NOT take this advisory lock), so the UPDATE matched no row.
+                # Our just-uploaded object is now unreferenced — reclaim IT (the
+                # old key, if any, was already reclaimed by the delete path). The
+                # 404 is raised AFTER this txn commits, so the reclaim isn't rolled
+                # back. Previously this crashed on a None row and orphaned the
+                # upload (Codex).
+                await _enqueue_s3_delete(lock_conn, s3_key)
+            elif old_key and old_key != s3_key:
+                # Normal path: reclaim the PREVIOUS snapshot object via the durable
+                # outbox, committed atomically with the new key (rolls back if the
+                # snapshot txn does). A crash before the reaper runs orphans one
+                # object (storage cost only; the DB points at the new key).
                 await _enqueue_s3_delete(lock_conn, old_key)
+
+        if updated_row is None:
+            raise PublicationNotFound(str(publication_id))
 
     return to_public_dict(_row_to_internal_dict(updated_row))

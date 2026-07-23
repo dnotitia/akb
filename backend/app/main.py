@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     yield
     await stop_workers()
     await shutdown_storage()
+    # Drain the audit writer's queue so a rollout doesn't drop its tail. Off the
+    # loop since shutdown() blocks on the queue join.
+    await asyncio.to_thread(audit_log.shutdown)
     logger.info("Server shutdown")
 
 

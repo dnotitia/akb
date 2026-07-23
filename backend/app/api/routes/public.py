@@ -29,8 +29,6 @@ import hashlib
 import hmac
 import io
 import logging
-import queue
-import threading
 import time
 import uuid
 from typing import Any
@@ -393,45 +391,13 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-# Off-loop audit sink for the password hot path. ``audit_log.record`` does a
-# synchronous open()+write() under a lock; doing that inline on this single
-# event loop under a wrong-password flood serializes blocking disk I/O next to
-# the awaited bcrypt verify — the stall class behind past 503s. So we hand each
-# record to a dedicated single writer thread via a BOUNDED queue: non-blocking
-# to the request, off the shared default executor (so it can't starve bcrypt),
-# and a flood that outpaces the writer drops instead of piling up unbounded work.
-# (publish-hardening: G6.)
-_AUDIT_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=2048)
-_audit_dropped = 0
-
-
-def _audit_writer() -> None:
-    while True:
-        kw = _AUDIT_QUEUE.get()
-        try:
-            audit_log.record(**kw)
-        except Exception:  # noqa: BLE001 — audit must never break serving
-            pass
-
-
-threading.Thread(target=_audit_writer, name="pub-audit-writer", daemon=True).start()
-
-
 def _audit(**kwargs) -> None:
-    """Enqueue one audit record for the writer thread. Non-blocking and never
-    raises into the request; drops (bounded) if the queue is full under a flood."""
-    global _audit_dropped
-    try:
-        _AUDIT_QUEUE.put_nowait(kwargs)
-    except queue.Full:
-        _audit_dropped += 1
-        # Surface shedding, but NOT per-drop — a per-drop log would itself flood
-        # under the exact brute-force burst that overruns the queue. Emit once at
-        # the first drop and then every 256th, so operators see the gap without
-        # amplifying it. (The alternative — silent audit loss — hides exactly the
-        # attack the audit trail exists to record.)
-        if _audit_dropped == 1 or _audit_dropped % 256 == 0:
-            logger.warning("publication audit queue full — %d records dropped so far", _audit_dropped)
+    """Record one audit line. ``audit_log.record`` is already non-blocking — it
+    enqueues for a single dedicated writer thread (bounded, drop-on-overflow, off
+    the shared executor) — so the password hot path can call it inline without
+    ever serializing disk I/O next to the awaited bcrypt verify (the stall class
+    behind past 503s). Kept as a thin alias so call sites read clearly."""
+    audit_log.record(**kwargs)
 
 
 _MANAGER_ROLE_SOURCES = frozenset({"member", "system_admin", "write_policy_admin_bypass"})
