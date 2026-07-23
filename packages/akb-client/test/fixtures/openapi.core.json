@@ -1,6 +1,62 @@
 {
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/activity/{vault}": {
+      "get": {
+        "operationId": "activityList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbActivityEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/recent": {
+      "get": {
+        "operationId": "activityRecent",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbRecentChangesEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/history/{vault}/{doc_id}": {
+      "get": {
+        "operationId": "documentsHistory",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentHistoryEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/diff/{vault}/{doc_id}": {
+      "get": {
+        "operationId": "documentsDiff",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentDiffEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/browse/{vault}": {
       "get": {
         "operationId": "documentsBrowseVault",
@@ -487,6 +543,96 @@
   },
   "components": {
     "schemas": {
+      "ActivityFileChange": {
+        "type": "object",
+        "required": ["path", "change"],
+        "properties": {
+          "path": { "type": "string" },
+          "change": { "type": "string", "enum": ["added", "deleted", "modified"] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "ActivityEntry": {
+        "type": "object",
+        "required": ["hash", "subject", "author", "date", "action", "summary", "agent", "files"],
+        "properties": {
+          "hash": { "type": "string" },
+          "subject": { "type": "string" },
+          "author": { "type": "string" },
+          "date": { "type": "string", "format": "date-time" },
+          "action": { "type": "string" },
+          "summary": { "type": "string" },
+          "agent": { "type": "string" },
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityFileChange" } },
+          "author_name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "RecentDocumentChange": {
+        "type": "object",
+        "required": ["doc_id", "vault", "path", "title", "type", "commit", "changed_at"],
+        "properties": {
+          "doc_id": { "type": "string" },
+          "vault": { "type": "string" },
+          "path": { "type": "string" },
+          "title": { "type": "string" },
+          "type": { "type": "string" },
+          "commit": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "changed_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "DocumentHistoryEntry": {
+        "type": "object",
+        "required": ["hash", "message", "author", "date"],
+        "properties": {
+          "hash": { "type": "string" },
+          "message": { "type": "string" },
+          "author": { "type": "string" },
+          "date": { "type": "string", "format": "date-time" },
+          "author_name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "AkbActivityEnvelope": {
+        "type": "object",
+        "required": ["kind", "vault", "total", "activity"],
+        "properties": {
+          "kind": { "type": "string", "const": "activity" },
+          "vault": { "type": "string" },
+          "total": { "type": "integer" },
+          "activity": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityEntry" } }
+        }
+      },
+      "AkbRecentChangesEnvelope": {
+        "type": "object",
+        "required": ["kind", "changes"],
+        "properties": {
+          "kind": { "type": "string", "const": "recent_changes" },
+          "changes": { "type": "array", "items": { "$ref": "#/components/schemas/RecentDocumentChange" } }
+        }
+      },
+      "AkbDocumentHistoryEnvelope": {
+        "type": "object",
+        "required": ["kind", "uri", "history"],
+        "properties": {
+          "kind": { "type": "string", "const": "document_history" },
+          "uri": { "type": "string" },
+          "history": { "type": "array", "items": { "$ref": "#/components/schemas/DocumentHistoryEntry" } }
+        }
+      },
+      "AkbDocumentDiffEnvelope": {
+        "type": "object",
+        "required": ["kind", "file", "commit", "type", "diff"],
+        "properties": {
+          "kind": { "type": "string", "const": "document_diff" },
+          "file": { "type": "string" },
+          "commit": { "type": "string" },
+          "type": { "type": "string", "enum": ["added", "deleted", "modified", "unknown", "unchanged"] },
+          "diff": { "type": "string" },
+          "error": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        }
+      },
       "AkbDocumentEnvelope": {},
       "AkbDocumentWriteEnvelope": {},
       "AkbDrillDownEnvelope": {},

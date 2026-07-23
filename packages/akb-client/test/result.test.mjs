@@ -304,6 +304,132 @@ test("docs facade scopes document operations and maps typed payloads", async () 
   assert.equal(deleteResult.throwOnError().data.deleted, true);
 });
 
+test("history and activity facades preserve paths, optional queries, claims, results, and raw requests", async () => {
+  const seen = [];
+  const claims = { sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } };
+  const fetchImpl = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      headers: Object.fromEntries(new Headers(init?.headers)),
+    });
+    if (url.searchParams.get("author") === "error") {
+      return new Response(JSON.stringify({ message: "activity failed", code: "activity_failed" }), {
+        status: 503,
+        statusText: "Unavailable",
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname.includes("/history/")) {
+      return new Response(JSON.stringify({
+        kind: "document_history",
+        uri: "akb://vault one/doc/guides/read me.md",
+        history: [{ hash: "abc1234", message: "Update", author: "u1", date: "2026-07-22T00:00:00Z" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.includes("/diff/")) {
+      return new Response(JSON.stringify({
+        kind: "document_diff",
+        file: "guides/read me.md",
+        commit: url.searchParams.get("commit"),
+        type: "modified",
+        diff: "@@ changed @@",
+        error: null,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.endsWith("/recent")) {
+      return new Response(JSON.stringify({
+        kind: "recent_changes",
+        changes: [{
+          doc_id: "d-12345678",
+          vault: "vault one",
+          path: "guides/read me.md",
+          title: "Read me",
+          type: "note",
+          commit: null,
+          changed_at: null,
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      kind: "activity",
+      vault: "vault one",
+      total: 1,
+      activity: [{
+        hash: "abc1234",
+        subject: "Update",
+        author: "u1",
+        date: "2026-07-22T00:00:00Z",
+        action: "updated",
+        summary: "guides/read me.md",
+        agent: "api",
+        files: [{ path: "guides/read me.md", change: "modified" }],
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const scoped = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: fetchImpl,
+  }).vault("vault one").actingAs(claims);
+
+  const history = await scoped.docs.history("guides/read me.md", { limit: 0 });
+  const diff = await scoped.docs.diff("guides/read me.md", { vault: "override/vault", commit: "abc?123#" });
+  const activity = await scoped.activity.list({ collection: null, author: undefined, since: "2026-07-01T00:00:00Z", limit: 5 });
+  const recent = await scoped.activity.recent({ limit: 7 });
+  const raw = await scoped.activity.request("vault%20one?limit=1");
+  const failed = await scoped.activity.list({ author: "error" });
+
+  assert.equal(seen[0].url, "https://akb.test/api/v1/history/vault%20one/guides/read%20me.md?limit=0");
+  assert.equal(seen[1].url, "https://akb.test/api/v1/diff/override%2Fvault/guides/read%20me.md?commit=abc%3F123%23");
+  assert.equal(seen[2].url, "https://akb.test/api/v1/activity/vault%20one?since=2026-07-01T00%3A00%3A00Z&limit=5");
+  assert.equal(new URL(seen[2].url).searchParams.has("collection"), false);
+  assert.equal(new URL(seen[2].url).searchParams.has("author"), false);
+  assert.equal(seen[3].url, "https://akb.test/api/v1/recent?vault=vault+one&limit=7");
+  assert.equal(seen[4].url, "https://akb.test/api/v1/activity/vault%20one?limit=1");
+  assert.ok(seen.every((call) => call.method === "GET"));
+  assert.ok(seen.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.deepEqual(JSON.parse(seen[0].headers["x-akb-claims"]), claims);
+  assert.equal(history.throwOnError().data.kind, "document_history");
+  assert.equal(diff.throwOnError().data.error, null);
+  assert.equal(activity.throwOnError().data.activity[0].files[0].change, "modified");
+  assert.equal(recent.throwOnError().data.changes[0].commit, null);
+  assert.equal(raw.throwOnError().data.kind, "activity");
+  assert.equal(failed.error?.code, "activity_failed");
+  assert.throws(() => failed.throwOnError(), AkbError);
+});
+
+test("history and activity vault precedence fails before fetch while recent keeps cross-vault semantics", async () => {
+  const seen = [];
+  const fetchImpl = async (input) => {
+    seen.push(String(input));
+    return new Response(JSON.stringify({ kind: "recent_changes", changes: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const root = createClient("https://akb.test/api/v1", { fetch: fetchImpl });
+  assert.throws(() => root.docs.history("readme.md"), /Select a vault/);
+  assert.throws(() => root.docs.diff("readme.md", { commit: "abc1234" }), /Select a vault/);
+  assert.throws(() => root.activity.list(), /Select a vault/);
+  assert.equal(seen.length, 0);
+
+  const crossVault = await root.activity.recent({ vault: undefined, limit: undefined });
+  const explicit = await root.activity.recent({ vault: "explicit", limit: 2 });
+  const configured = await createClient({
+    baseUrl: "https://akb.test/api/v1",
+    defaultVault: "configured",
+    fetch: fetchImpl,
+  }).activity.recent();
+
+  assert.equal(seen[0], "https://akb.test/api/v1/recent");
+  assert.equal(seen[1], "https://akb.test/api/v1/recent?vault=explicit&limit=2");
+  assert.equal(seen[2], "https://akb.test/api/v1/recent?vault=configured");
+  assert.equal(crossVault.throwOnError().data.kind, "recent_changes");
+  assert.equal(explicit.throwOnError().data.kind, "recent_changes");
+  assert.equal(configured.throwOnError().data.kind, "recent_changes");
+});
+
 test("docs facade creates and deletes collections with exact REST semantics", async () => {
   const seen = [];
   const client = createClient("https://akb.test/api/v1/", {
