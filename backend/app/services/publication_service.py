@@ -1308,25 +1308,27 @@ async def create_snapshot(
             publication_for_exec = {**publication, "mode": Mode.LIVE}
             result = await resolve_table_query_publication(publication_for_exec, {})
 
-            s3_key = f"snapshots/{publication_id}.json"
+            # VERSIONED key (uuid per attempt) so the PUT can be OFFLOADED safely.
+            # A sync PUT under the advisory lock blocked the single event loop for
+            # the write's duration (~30s on an S3 stall → 503). Offloading it is
+            # race-free ONLY with a unique key: if the request is cancelled during
+            # the PUT, to_thread lets the zombie finish, but it writes ITS OWN
+            # unreferenced key (the rolled-back txn never points at it) instead of
+            # overwriting a newer snapshot. The DB CAS below publishes the winner's
+            # key; the previous key is enqueued for delete in the SAME transaction.
+            old_key = publication.get("snapshot_s3_key")
+            s3_key = f"snapshots/{publication_id}/{uuid.uuid4().hex}.json"
             try:
                 # allow_nan=False: result is already coerced by _serialize_value,
                 # so this just refuses to silently persist a stray non-finite
-                # float as invalid JSON. (F3.) Serialize off the loop (CPU); the
-                # await before the PUT is a safe cancellation point (nothing
-                # written yet). result is row-capped upstream so this is bounded.
+                # float as invalid JSON. (F3.) Both the CPU serialize and the S3
+                # PUT run off the event loop; result is row-capped upstream.
                 payload = await asyncio.to_thread(
                     lambda: json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 )
-                file_service.put_object_bytes(s3_key, payload, content_type="application/json")
-                # NOTE: this PUT is deliberately SYNCHRONOUS (not asyncio.to_thread)
-                # even though it briefly blocks the loop. Every attempt writes the
-                # SAME key (snapshots/{id}.json), and to_thread does not cancel an
-                # in-flight PUT: a client disconnect would release the advisory lock
-                # while a zombie PUT kept running, then land AFTER a later attempt's
-                # PUT+DB-commit and overwrite the newer snapshot with stale bytes
-                # (Codex). Snapshot creation is a rare owner/admin action, so serial
-                # PUT-under-lock (race-free) beats a non-blocking-but-racy offload.
+                await asyncio.to_thread(
+                    file_service.put_object_bytes, s3_key, payload, "application/json",
+                )
             except (file_service.StorageError, IOError) as e:
                 raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
 
@@ -1344,5 +1346,11 @@ async def create_snapshot(
                 """,
                 s3_key, publication_id,
             )
+            # Reclaim the previous snapshot object (durable S3-delete outbox, in
+            # this txn so it commits with the CAS — and rolls back if the snapshot
+            # does). A crash before the reaper runs orphans one object (storage
+            # cost only; the DB points at the new key, so it's never served).
+            if old_key and old_key != s3_key:
+                await _enqueue_s3_delete(lock_conn, old_key)
 
     return to_public_dict(_row_to_internal_dict(updated_row))

@@ -137,8 +137,11 @@ async def _get_user() -> _MCPUser:
                     )
                 # A credential was presented and rejected — that's a
                 # security-relevant event, so audit the denial. No token
-                # material is recorded.
-                audit_log.record(
+                # material is recorded. Off the event loop: this is an
+                # unauthenticated path, so a bad-credential flood would otherwise
+                # pin the single loop on the audit disk write (503 risk).
+                await asyncio.to_thread(
+                    audit_log.record,
                     action="auth.denied", actor="(unauthenticated)",
                     outcome="error", code="UNAUTHENTICATED",
                 )
@@ -1386,7 +1389,13 @@ async def call_tool(name: str, arguments: dict):
     user = await _get_user()
     try:
         result = await _dispatch(name, arguments, user)
-        audit_log.record_tool(name, arguments, user, result)
+        # Off the event loop: audit_log.record_tool does a disk write while holding
+        # audit_log._lock. Running it inline would freeze the single event loop for
+        # the write's duration (503 risk on a slow/stalled audit disk — CephFS/MDS
+        # class), and re-couple the loop to exactly the I/O the publication audit
+        # queue was moved off-loop to avoid. The write still completes (backpressure
+        # on this request only); other requests keep flowing.
+        await asyncio.to_thread(audit_log.record_tool, name, arguments, user, result)
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
         # `str()` space form, Enum → `str()`, unknown → stringified). The
@@ -1410,8 +1419,9 @@ async def call_tool(name: str, arguments: dict):
         # genuinely-unexpected as internal.
         envelope = exception_envelope(e)
         # Audit the failure too — a crashing tool call is exactly what a
-        # security review wants to see. record_tool never raises.
-        audit_log.record_tool(name, arguments, user, envelope)
+        # security review wants to see. record_tool never raises. Off-loop for
+        # the same reason as the success path (don't block the loop on the write).
+        await asyncio.to_thread(audit_log.record_tool, name, arguments, user, envelope)
         return [TextContent(
             type="text",
             text=json.dumps(envelope, ensure_ascii=False, default=str),
