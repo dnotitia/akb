@@ -64,8 +64,8 @@ step "vitest (@akb/client)"
 step "generated type drift (@akb/client)"
 (cd packages/akb-client && pnpm run codegen:check)
 
-step "packed M3 consumer proof (@akb/client)"
-(cd packages/akb-client && pnpm run proof:m3)
+step "packed SDK consumer proof (@akb/client)"
+(cd packages/akb-client && pnpm run proof:packed)
 
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge

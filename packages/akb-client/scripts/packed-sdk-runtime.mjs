@@ -112,7 +112,7 @@ assert.throws(() => unscoped.docs.createCollection({ path: "a" }), /Select a vau
 assert.throws(() => unscoped.tables.list(), /Select a vault/);
 assert.equal(missingVaultFetches, 0);
 
-console.log("M3 packed runtime proof passed: 20 operations, main/lite, raw/error/preflight.");
+console.log("Packed SDK runtime proof passed: 20 operations, main/lite, raw/error/preflight.");
 
 function payload(url, method, body) {
   if (url.pathname.endsWith("/graph")) return { kind: "graph_neighbors", nodes: [], edges: [] };

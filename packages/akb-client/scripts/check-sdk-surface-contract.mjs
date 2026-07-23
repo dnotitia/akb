@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createClient } from "../dist/index.js";
 import { createClient as createLiteClient } from "../dist/lite.js";
 
-const CONTRACT_URL = new URL("./m3-sdk-contract.json", import.meta.url);
+const CONTRACT_URL = new URL("./sdk-surface-contract.json", import.meta.url);
 const OPENAPI_URL = new URL("../test/fixtures/openapi.core.json", import.meta.url);
 const EXPECTED_OPERATION_IDS = [
   "graphNeighbors",
@@ -35,10 +35,10 @@ const matrix = contract.operations;
 const byId = new Map(matrix.map((item) => [item.operationId, item]));
 
 for (const operationId of EXPECTED_OPERATION_IDS) {
-  assert(byId.has(operationId), operationId, "missing from M3 SDK coverage matrix");
+  assert(byId.has(operationId), operationId, "missing from SDK surface contract matrix");
 }
 for (const operationId of byId.keys()) {
-  assert(EXPECTED_OPERATION_IDS.includes(operationId), operationId, "is not part of the selected M3 SDK surface");
+  assert(EXPECTED_OPERATION_IDS.includes(operationId), operationId, "is not part of the SDK contract surface");
 }
 assert(byId.size === EXPECTED_OPERATION_IDS.length, "matrix", "contains duplicate operation IDs");
 assert(openapi.components?.schemas?.[contract.errorSchema], contract.errorSchema, "missing error schema component");
@@ -106,7 +106,7 @@ for (const item of matrix) {
   }
 }
 
-console.log(`M3 SDK contract matrix passed for ${matrix.length} operations.`);
+console.log(`SDK surface contract matrix passed for ${matrix.length} operations.`);
 
 function assert(condition, operationId, message) {
   if (!condition) throw new Error(`${operationId}: ${message}`);

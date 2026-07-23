@@ -8,7 +8,7 @@ import {
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
 
-type SelectedOperationId =
+type ContractOperationId =
   | "graphNeighbors"
   | "graphOverview"
   | "graphHealth"
@@ -50,7 +50,7 @@ type IsExactly<Left, Right> =
     : false;
 type OperationRequestBody<Operation> =
   Operation extends { requestBody: infer RequestBody } ? RequestBody : never;
-type IsConcreteRequest<Id extends SelectedOperationId> =
+type IsConcreteRequest<Id extends ContractOperationId> =
   IsAny<OperationRequestBody<operations[Id]>> extends true
     ? false
     : IsUnknown<OperationRequestBody<operations[Id]>> extends true
@@ -58,7 +58,7 @@ type IsConcreteRequest<Id extends SelectedOperationId> =
       : IsExactly<OperationRequestBody<operations[Id]>, Record<string, unknown>> extends true
         ? false
         : true;
-type IsConcreteResponse<Id extends SelectedOperationId> =
+type IsConcreteResponse<Id extends ContractOperationId> =
   IsAny<AkbOperationResponse<operations[Id]>> extends true
     ? false
     : IsUnknown<AkbOperationResponse<operations[Id]>> extends true
@@ -70,11 +70,11 @@ type IsConcreteResponse<Id extends SelectedOperationId> =
           : true;
 type AllTrue<Value> = Exclude<Value, true> extends never ? true : false;
 
-type _SelectedRequestsAreConcrete = Assert<
-  AllTrue<{ [Id in SelectedOperationId]: IsConcreteRequest<Id> }[SelectedOperationId]>
+type _ContractRequestsAreConcrete = Assert<
+  AllTrue<{ [Id in ContractOperationId]: IsConcreteRequest<Id> }[ContractOperationId]>
 >;
-type _SelectedResponsesAreConcrete = Assert<
-  AllTrue<{ [Id in SelectedOperationId]: IsConcreteResponse<Id> }[SelectedOperationId]>
+type _ContractResponsesAreConcrete = Assert<
+  AllTrue<{ [Id in ContractOperationId]: IsConcreteResponse<Id> }[ContractOperationId]>
 >;
 type _GraphLinkBodyIsExact = Assert<
   IsExactly<OperationRequestBody<operations["graphLink"]>, LinkRequest>

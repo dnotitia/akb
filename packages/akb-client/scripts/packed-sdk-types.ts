@@ -25,8 +25,8 @@ type Equal<Left, Right> =
     : false;
 type Assert<Value extends true> = Value;
 
-type _LinkBody = Assert<Equal<Body<operations["graphLink"]>, LinkRequest>>;
-type _CreateBody = Assert<
+type _GraphLinkBody = Assert<Equal<Body<operations["graphLink"]>, LinkRequest>>;
+type _CollectionCreateBody = Assert<
   Equal<Body<operations["collectionsCreateCollection"]>, CreateCollectionRequest>
 >;
 type _DropResponse = Assert<

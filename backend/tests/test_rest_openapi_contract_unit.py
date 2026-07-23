@@ -21,7 +21,7 @@ M3_SDK_CONTRACT_PATH = (
     / "packages"
     / "akb-client"
     / "scripts"
-    / "m3-sdk-contract.json"
+    / "sdk-surface-contract.json"
 )
 
 

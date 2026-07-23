@@ -1,4 +1,5 @@
 {
+  "name": "SDK surface contract",
   "errorSchema": "AkbError",
   "operations": [
   {

@@ -6,14 +6,14 @@ import { AkbError, createClient } from "../dist/index.js";
 import { createClient as createLiteClient } from "../dist/lite.js";
 
 const contract = JSON.parse(
-  await readFile(new URL("../scripts/m3-sdk-contract.json", import.meta.url), "utf8"),
+  await readFile(new URL("../scripts/sdk-surface-contract.json", import.meta.url), "utf8"),
 );
 
-test("M3 matrix connects all selected facades through one scoped client contract", async () => {
+test("SDK surface matrix connects every contract facade through one scoped client", async () => {
   const calls = [];
   const claims = {
-    sub: "m3-user",
-    app_metadata: { org_id: "m3-org", role: "admin" },
+    sub: "contract-user",
+    app_metadata: { org_id: "contract-org", role: "admin" },
   };
   const fetch = async (input, init = {}) => {
     const url = new URL(String(input));
@@ -28,10 +28,10 @@ test("M3 matrix connects all selected facades through one scoped client contract
   };
   const root = createClient({
     baseUrl: "https://contract.invalid/api/v1",
-    token: () => "m3-contract-token",
+    token: () => "contract-token",
     fetch,
   });
-  const client = root.vault("m3 vault").actingAs(claims);
+  const client = root.vault("contract vault").actingAs(claims);
   const lite = createLiteClient({ baseUrl: "https://contract.invalid/api/v1", fetch });
 
   for (const item of contract.operations) {
@@ -39,24 +39,24 @@ test("M3 matrix connects all selected facades through one scoped client contract
     assert.equal(typeof lite[item.facade.namespace][item.facade.method], "function", item.operationId);
   }
 
-  const selected = [
-    await client.graph.neighbors("akb://m3 vault/doc/a b", { hops: 2, limit: 9 }),
+  const results = [
+    await client.graph.neighbors("akb://contract vault/doc/a b", { hops: 2, limit: 9 }),
     await client.graph.overview({ topK: 12 }),
     await client.graph.health({ hubThreshold: 4, limit: 8 }),
-    await client.graph.relations("akb://m3 vault/doc/a b", { direction: "both", type: "references" }),
+    await client.graph.relations("akb://contract vault/doc/a b", { direction: "both", type: "references" }),
     await client.graph.link({
-      source: "akb://m3 vault/doc/a b",
-      target: "akb://m3 vault/table/t",
+      source: "akb://contract vault/doc/a b",
+      target: "akb://contract vault/table/t",
       relation: "references",
       metadata: { confidence: 1 },
     }),
     await client.graph.unlink({
-      source: "akb://m3 vault/doc/a b",
-      target: "akb://m3 vault/table/t",
+      source: "akb://contract vault/doc/a b",
+      target: "akb://contract vault/table/t",
       relation: "references",
     }),
-    await client.graph.provenance("akb://m3 vault/doc/a b"),
-    await client.activity.list({ collection: "notes", author: "m3-user", limit: 6 }),
+    await client.graph.provenance("akb://contract vault/doc/a b"),
+    await client.activity.list({ collection: "notes", author: "contract-user", limit: 6 }),
     await client.activity.recent({ limit: 5 }),
     await client.docs.history("notes/a b.md", { limit: 4 }),
     await client.docs.diff("notes/a b.md", { commit: "abc?123" }),
@@ -69,27 +69,27 @@ test("M3 matrix connects all selected facades through one scoped client contract
     await client.tables.alter("incidents", { drop_columns: ["legacy"] }),
     await client.tables.migrate(
       [{ op: "drop_column", table: "incidents", name: "legacy" }],
-      { idempotencyKey: "m3-idempotency" },
+      { idempotencyKey: "contract-idempotency" },
     ),
     await client.tables.drop("incidents"),
   ];
 
-  assert.equal(selected.length, contract.operations.length);
-  assert.ok(selected.every((result) => result.data !== null && result.error === null));
-  assert.ok(selected.every((result) => result.throwOnError().data.kind));
-  assert.ok(calls.every((call) => call.headers.authorization === "Bearer m3-contract-token"));
+  assert.equal(results.length, contract.operations.length);
+  assert.ok(results.every((result) => result.data !== null && result.error === null));
+  assert.ok(results.every((result) => result.throwOnError().data.kind));
+  assert.ok(calls.every((call) => call.headers.authorization === "Bearer contract-token"));
   assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
   assert.equal(calls[4].headers["content-type"], "application/json");
   assert.deepEqual(calls[4].body, {
-    source: "akb://m3 vault/doc/a b",
-    target: "akb://m3 vault/table/t",
+    source: "akb://contract vault/doc/a b",
+    target: "akb://contract vault/table/t",
     relation: "references",
     metadata: { confidence: 1 },
   });
   assert.deepEqual(calls[11].body, { path: "notes/new", summary: null });
   assert.deepEqual(calls[16].body, { name: "incidents", columns: [{ name: "state" }] });
   assert.deepEqual(calls[17].body, { drop_columns: ["legacy"] });
-  assert.equal(calls[18].headers["idempotency-key"], "m3-idempotency");
+  assert.equal(calls[18].headers["idempotency-key"], "contract-idempotency");
 
   const rawStart = calls.length;
   await client.graph.request("/raw");
@@ -164,10 +164,10 @@ function responseFor(url, method, body) {
   if (url.pathname.endsWith("/provenance")) {
     return {
       kind: "provenance",
-      doc_id: "d-m3",
-      title: "M3",
+      doc_id: "d-contract",
+      title: "Contract",
       path: "a.md",
-      vault: "m3 vault",
+      vault: "contract vault",
       uri: url.searchParams.get("uri"),
       created_by: null,
       created_at: null,
@@ -177,11 +177,11 @@ function responseFor(url, method, body) {
     };
   }
   if (url.pathname.includes("/activity/")) {
-    return { kind: "activity", vault: "m3 vault", total: 0, activity: [] };
+    return { kind: "activity", vault: "contract vault", total: 0, activity: [] };
   }
   if (url.pathname.endsWith("/recent")) return { kind: "recent_changes", changes: [] };
   if (url.pathname.includes("/history/")) {
-    return { kind: "document_history", uri: "akb://m3 vault/doc/a.md", history: [] };
+    return { kind: "document_history", uri: "akb://contract vault/doc/a.md", history: [] };
   }
   if (url.pathname.includes("/diff/")) {
     return { kind: "document_diff", file: "a.md", commit: "abc", type: "modified", diff: "" };
@@ -208,8 +208,8 @@ function responseFor(url, method, body) {
   if (url.pathname.endsWith("/migrations")) {
     return {
       kind: "table_migration",
-      vault: "m3 vault",
-      idempotency_key: "m3-idempotency",
+      vault: "contract vault",
+      idempotency_key: "contract-idempotency",
       checksum: "fixture",
       applied: true,
       operations: 1,
@@ -218,9 +218,9 @@ function responseFor(url, method, body) {
   }
   if (url.pathname.endsWith("/schema")) {
     const table = url.pathname.split("/").at(-2);
-    return table === "m3%20vault"
-      ? { kind: "vault_table_schema", vault: "m3 vault", tables: [], total: 0 }
-      : { kind: "table_schema", vault: "m3 vault", name: table, columns: [], pg_types: {}, drift: {} };
+    return table === "contract%20vault"
+      ? { kind: "vault_table_schema", vault: "contract vault", tables: [], total: 0 }
+      : { kind: "table_schema", vault: "contract vault", name: table, columns: [], pg_types: {}, drift: {} };
   }
   return { kind: "table" };
 }

@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const proofRoot = await mkdtemp(join(tmpdir(), "akb-m3-packed-"));
+const proofRoot = await mkdtemp(join(tmpdir(), "akb-client-packed-"));
 
 try {
   const packDir = join(proofRoot, "pack");
@@ -30,9 +30,9 @@ try {
     "package/dist/index.d.ts",
     "package/dist/lite.js",
     "package/dist/lite.d.ts",
-    "package/scripts/m3-sdk-contract.json",
-    "package/scripts/m3-packed-runtime.mjs",
-    "package/scripts/m3-packed-types.ts",
+    "package/scripts/sdk-surface-contract.json",
+    "package/scripts/packed-sdk-runtime.mjs",
+    "package/scripts/packed-sdk-types.ts",
   ]) {
     if (!listing.includes(required)) throw new Error(`packed artifact missing ${required}`);
   }
@@ -53,7 +53,7 @@ try {
 
   const installedScripts = join(consumerDir, "node_modules", "@akb", "client", "scripts");
   const installedContract = JSON.parse(
-    await readFile(join(installedScripts, "m3-sdk-contract.json"), "utf8"),
+    await readFile(join(installedScripts, "sdk-surface-contract.json"), "utf8"),
   );
   if (installedContract.operations.length !== 20) {
     throw new Error(`installed matrix has ${installedContract.operations.length} operations`);
@@ -62,10 +62,10 @@ try {
     if (!item.packedProof) throw new Error(`${item.operationId}: missing packed proof mapping`);
   }
 
-  const runtimeProof = join(consumerDir, "m3-packed-runtime.mjs");
-  const typeProof = join(consumerDir, "m3-packed-types.ts");
-  await copyFile(join(installedScripts, "m3-packed-runtime.mjs"), runtimeProof);
-  await copyFile(join(installedScripts, "m3-packed-types.ts"), typeProof);
+  const runtimeProof = join(consumerDir, "packed-sdk-runtime.mjs");
+  const typeProof = join(consumerDir, "packed-sdk-types.ts");
+  await copyFile(join(installedScripts, "packed-sdk-runtime.mjs"), runtimeProof);
+  await copyFile(join(installedScripts, "packed-sdk-types.ts"), typeProof);
   const tsc = join(packageRoot, "node_modules", ".bin", "tsc");
   run(
     tsc,
@@ -87,7 +87,7 @@ try {
 
   console.log(JSON.stringify({
     result: "passed",
-    source_blind: true,
+    repository_source_absent: true,
     package_manager: "pnpm pack",
     operations: installedContract.operations.length,
     packed_files: listing.length,
