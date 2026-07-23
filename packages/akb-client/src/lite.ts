@@ -21,4 +21,6 @@ export type {
   AkbTablesFacade,
   AkbThrowingResult,
   AkbVaultSqlResult,
+  CreateCollectionRequest,
+  LinkRequest,
 } from "./index.js";

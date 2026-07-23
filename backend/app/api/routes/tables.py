@@ -612,7 +612,11 @@ def _raise_service_error(result: Any) -> Any:
     )
 
 
-@router.delete("/tables/{vault}/{table_name}", summary="Drop a table")
+@router.delete(
+    "/tables/{vault}/{table_name}",
+    summary="Drop a table",
+    operation_id="tablesDeleteTableName",
+)
 async def drop_table(vault: str, table_name: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="admin")
     return await table_service.drop_table(

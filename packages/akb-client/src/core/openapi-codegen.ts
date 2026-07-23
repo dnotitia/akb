@@ -1,12 +1,16 @@
 type JsonObject = Record<string, unknown>;
 
-const TABLE_ADMIN_OPERATION_IDS = new Set([
+const JSON_REQUEST_BODY_OPERATION_IDS = new Set([
+  "graphLink",
+  "collectionsCreateCollection",
   "tablesPostVault",
   "tablesAlterTable",
   "tablesApplyMigration",
 ]);
 
-const TABLE_REQUEST_COMPONENTS = [
+const REQUEST_COMPONENTS = [
+  "LinkRequest",
+  "CreateCollectionRequest",
   "CreateTableRequest",
   "AlterTableRequest",
   "TableColumnSpec",
@@ -98,7 +102,7 @@ export function generateCoreTypes(openapi: unknown): string {
     "    AkbCollectionSummary: AkbCollectionSummary;",
     "    AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;",
     "    AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;",
-    ...TABLE_REQUEST_COMPONENTS.map((name) => `    ${name}: ${name};`),
+    ...REQUEST_COMPONENTS.map((name) => `    ${name}: ${name};`),
     "    ActivityFileChange: AkbActivityFileChange;",
     "    ActivityEntry: AkbActivityEntry;",
     "    RecentDocumentChange: AkbRecentDocumentChange;",
@@ -251,7 +255,7 @@ function parameterType(path: string, operation: JsonObject): string {
 
 function requestBodyType(method: string, operationId: string, operation: JsonObject): string {
   if (method === "get" || method === "delete") return "never";
-  if (!TABLE_ADMIN_OPERATION_IDS.has(operationId)) return "unknown";
+  if (!JSON_REQUEST_BODY_OPERATION_IDS.has(operationId)) return "unknown";
   const requestBody = expectOptionalObject(operation.requestBody);
   const content = expectOptionalObject(requestBody?.content);
   const media = expectOptionalObject(content?.["application/json"]);
@@ -263,7 +267,7 @@ function requestSchemaLines(spec: JsonObject): string[] {
   const components = expectObject(spec.components, "components");
   const schemas = expectObject(components.schemas, "components.schemas");
   const lines: string[] = [];
-  for (const name of TABLE_REQUEST_COMPONENTS) {
+  for (const name of REQUEST_COMPONENTS) {
     const schema = expectObject(schemas[name], `components.schemas.${name}`);
     lines.push(`export type ${name} = ${renderSchema(schema)};`, "");
   }

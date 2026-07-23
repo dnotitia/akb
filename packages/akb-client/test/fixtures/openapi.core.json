@@ -126,6 +126,16 @@
     "/api/v1/collections/{vault}": {
       "post": {
         "operationId": "collectionsCreateCollection",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCollectionRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -306,6 +316,16 @@
       },
       "post": {
         "operationId": "graphLink",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -737,6 +757,73 @@
       "AkbDocumentWriteEnvelope": {},
       "AkbDrillDownEnvelope": {},
       "AkbError": {},
+      "CreateCollectionRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "CreateCollectionRequest"
+      },
+      "LinkRequest": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "relation": {
+            "type": "string",
+            "enum": [
+              "depends_on",
+              "related_to",
+              "implements",
+              "references",
+              "attached_to",
+              "derived_from"
+            ],
+            "title": "Relation"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target",
+          "relation"
+        ],
+        "title": "LinkRequest"
+      },
       "AkbFileEnvelope": {},
       "AkbGrepEnvelope": {},
       "AkbGraphNode": {

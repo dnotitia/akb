@@ -64,6 +64,9 @@ step "vitest (@akb/client)"
 step "generated type drift (@akb/client)"
 (cd packages/akb-client && pnpm run codegen:check)
 
+step "packed SDK consumer proof (@akb/client)"
+(cd packages/akb-client && pnpm run proof:packed)
+
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge
 # because check.sh only ran lint/type. Stage 3 (Playwright) lives
