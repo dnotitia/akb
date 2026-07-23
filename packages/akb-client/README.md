@@ -44,6 +44,29 @@ const result = await akb.request("/tables/reef");
 const { data } = result.throwOnError();
 ```
 
+Vault-scoped table administration is available through the immutable `.tables`
+facade. Request bodies use the generated public types, and migrations require
+an explicit idempotency key:
+
+```ts
+const tables = akb.vault("reef").tables;
+
+const created = await tables.create({
+  name: "incidents",
+  columns: [{ name: "state", type: "text" }],
+});
+
+const schema = await tables.schema("incidents");
+const migrated = await tables.migrate(
+  [{ op: "add_column", table: "incidents", name: "owner", type: "text" }],
+  { idempotencyKey: crypto.randomUUID() },
+);
+
+created.throwOnError();
+schema.throwOnError();
+migrated.throwOnError();
+```
+
 The backend and MCP surfaces are not rewrapped. `kind` remains the HTTP success discriminator and `{ data, error }` exists only at the SDK boundary.
 
 ## Runtime Table Types

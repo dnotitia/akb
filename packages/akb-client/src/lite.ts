@@ -16,7 +16,9 @@ export type {
   AkbResult,
   AkbSqlTag,
   AkbSuccessEnvelope,
+  AkbTableMigrationOptions,
   AkbTableStub,
+  AkbTablesFacade,
   AkbThrowingResult,
   AkbVaultSqlResult,
 } from "./index.js";
