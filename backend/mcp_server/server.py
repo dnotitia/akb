@@ -136,8 +136,10 @@ async def _get_user() -> _MCPUser:
                         key_class=user.key_class,
                     )
                 # A credential was presented and rejected — that's a
-                # security-relevant event, so audit the denial. No token
-                # material is recorded.
+                # security-relevant event, so audit the denial. No token material
+                # is recorded. Non-blocking enqueue (the dedicated audit writer
+                # does the disk write): an unauthenticated bad-credential flood
+                # can't pin the loop or starve the shared thread pool.
                 audit_log.record(
                     action="auth.denied", actor="(unauthenticated)",
                     outcome="error", code="UNAUTHENTICATED",
@@ -1386,6 +1388,10 @@ async def call_tool(name: str, arguments: dict):
     user = await _get_user()
     try:
         result = await _dispatch(name, arguments, user)
+        # Non-blocking: record_tool only ENQUEUES for the dedicated audit writer
+        # thread (audit_log). No disk I/O or lock on the event loop, and it never
+        # touches the shared to_thread pool — a stalled audit disk can't freeze
+        # the loop or starve bcrypt / document reads.
         audit_log.record_tool(name, arguments, user, result)
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
@@ -1410,7 +1416,8 @@ async def call_tool(name: str, arguments: dict):
         # genuinely-unexpected as internal.
         envelope = exception_envelope(e)
         # Audit the failure too — a crashing tool call is exactly what a
-        # security review wants to see. record_tool never raises.
+        # security review wants to see. record_tool never raises and only
+        # enqueues (non-blocking; see the success path).
         audit_log.record_tool(name, arguments, user, envelope)
         return [TextContent(
             type="text",

@@ -56,7 +56,6 @@ const textFile: PublicationResponse = {
   mime_type: "text/plain",
   size_bytes: 1880,
   collection: "runbooks",
-  download_url: `${API}/public/text-file/download`,
 };
 
 const jsonFile: PublicationResponse = {
@@ -66,7 +65,6 @@ const jsonFile: PublicationResponse = {
   mime_type: "application/json",
   size_bytes: 632,
   collection: "fixtures",
-  download_url: `${API}/public/json-file/download`,
 };
 
 const binaryFile: PublicationResponse = {
@@ -76,7 +74,6 @@ const binaryFile: PublicationResponse = {
   mime_type: "application/zip",
   size_bytes: 42_420,
   collection: "exports",
-  download_url: `${API}/public/binary-file/download`,
 };
 
 const relations: RelationRow[] = [

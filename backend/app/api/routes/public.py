@@ -23,10 +23,12 @@ is the canonical publication dict produced by
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import hmac
 import io
+import logging
 import time
 import uuid
 from typing import Any
@@ -35,11 +37,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import ConfigDict
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_optional_user
+from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
 from app.util.text import NFCModel
-from app.services import file_service, publication_service
+from app.services import audit_log, file_service, publication_service
+from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.publication_service import (
@@ -54,6 +58,7 @@ from app.services.publication_service import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("akb.publications.public")
 
 
 # ============================================================
@@ -64,6 +69,11 @@ _TOKEN_TTL = 3600  # 1 hour
 
 
 def _make_token(slug: str) -> str:
+    # Bound to the slug (not the password): publications are create-only, so a
+    # password "change" is an unpublish + republish, which mints a NEW slug —
+    # tokens for the old slug are already dead. If an in-place password-update
+    # endpoint is ever added, bind this token to the password_hash too (and make
+    # _verify_token re-check it) or those tokens won't revoke. (M3.)
     ts = str(int(time.time()))
     msg = f"{slug}:{ts}".encode("utf-8")
     sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
@@ -83,6 +93,50 @@ def _verify_token(slug: str, token: str) -> bool:
     msg = f"{slug}:{ts_str}".encode("utf-8")
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig)
+
+
+# ============================================================
+# View-grant: proves a COUNTED page open, so the paired /raw and /download
+# re-serves of that same view don't re-count and stay usable at the last allowed
+# view. Distinct from the password token (different HMAC purpose prefix) so one
+# can't substitute for the other: a password token must NOT skip view-counting,
+# and a grant must NOT bypass the password gate. WITHOUT a grant, /raw and
+# /download each count as their own view and are capped — so max_views is a HARD
+# cap on every content-delivery path, not just the page GET. TTL is short: it
+# only has to outlive a single page session's preview→download, and a short
+# window bounds how long a leaked/shared grant URL can fetch without counting.
+# ============================================================
+
+_VIEW_GRANT_TTL = 600  # 10 minutes
+
+
+def _make_view_grant(slug: str) -> str:
+    ts = str(int(time.time()))
+    msg = f"grant:{slug}:{ts}".encode("utf-8")
+    sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{ts}.{sig}"
+
+
+def _verify_view_grant(slug: str, grant: str | None) -> bool:
+    if not grant:
+        return False
+    try:
+        ts_str, sig = grant.split(".", 1)
+        ts = int(ts_str)
+    except (ValueError, AttributeError):
+        return False
+    if abs(time.time() - ts) > _VIEW_GRANT_TTL:
+        return False
+    msg = f"grant:{slug}:{ts_str}".encode("utf-8")
+    expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _extract_view_grant(request: Request) -> str | None:
+    """The view-grant from the query string or cookie. Query-string is
+    acceptable here (unlike the password): the grant is not a secret — it only
+    suppresses re-counting an already-counted view for a short window."""
+    return request.query_params.get("grant") or request.cookies.get("akb_publication_grant")
 
 
 # ============================================================
@@ -131,6 +185,14 @@ class PasswordAuthRequest(NFCModel):
 # ============================================================
 
 def _publication_error_to_http(e: PublicationError) -> HTTPException:
+    # These distinct codes (404 not-found, 401 password-required, 410
+    # expired/view-exhausted, 429 throttled) let an anonymous holder of the link
+    # tell a publication's state apart. That disclosure was reviewed and
+    # deliberately accepted (publish-hardening F9, informational): the slug is a
+    # 96-bit unguessable capability, so anyone seeing these codes already holds
+    # the link, and the frontend NEEDS the distinction to render the password
+    # gate vs an expired/removed notice. Collapsing everything to 404 would break
+    # the UX and buy no real secrecy.
     return HTTPException(status_code=e.status_code, detail=e.message)
 
 
@@ -238,6 +300,37 @@ async def list_publications_route(
     return {"publications": publications}
 
 
+@router.get("/public/{slug}/capabilities", summary="Owner capabilities for a publication (optional auth)")
+async def publication_capabilities(
+    slug: str,
+    user: AuthenticatedUser | None = Depends(get_optional_user),
+):
+    """Anonymous-first: returns ``{"can_edit": false}`` unless the *current*
+    session can write to this publication's vault. Read-only and side-effect
+    free; it reveals only the capability plus where to manage the source (never
+    the owner's name, email, or account existence), so the public page can add a
+    quiet owner toolbar client-side without leaking anything to anonymous
+    viewers. The read-only public link stays the canonical audience view — this
+    just gives the owner a route back into the app. (publish-hardening F6.)
+    """
+    if user is None:
+        return {"can_edit": False}
+    pub = await publication_service.get_publication_by_slug(slug)
+    if pub is None:
+        return {"can_edit": False}
+    try:
+        await check_vault_access(user.user_id, pub["vault"], required_role="writer")
+    except (ForbiddenError, NotFoundError):
+        return {"can_edit": False}
+    # Authorized: safe to name the vault + resource kind (the caller can already
+    # read/write them) so the client can deep-link "Manage" / "Open in AKB".
+    return {
+        "can_edit": True,
+        "vault": pub["vault"],
+        "resource_type": pub["resource_type"],
+    }
+
+
 @router.post("/publications/{vault}/{slug}/snapshot", summary="Create snapshot for table_query publication")
 async def create_snapshot_route(
     vault: str,
@@ -266,10 +359,16 @@ async def create_snapshot_route(
 # ============================================================
 
 def _extract_password(request: Request, body_password: str | None = None) -> str | None:
-    """Extract password from query string, header, or body."""
-    pw = request.query_params.get("password")
-    if pw:
-        return pw
+    """Extract the publication password from the `x-publication-password`
+    header or the request body — NEVER the query string.
+
+    A password in the query string (`?password=…`) leaks through browser
+    history, server/proxy access logs, `Referer` headers, analytics, and
+    copy-pasted/forwarded URLs. The frontend submits the password via
+    POST /public/{slug}/auth (JSON body) and then carries the returned
+    short-lived HMAC token (`?token=`/cookie); programmatic callers use the
+    header or a body field. (publish-hardening M1.)
+    """
     pw = request.headers.get("x-publication-password")
     if pw:
         return pw
@@ -281,25 +380,144 @@ def _extract_auth_token(request: Request) -> str | None:
     return request.query_params.get("token") or request.cookies.get("akb_publication_token")
 
 
-async def _resolve_with_access(slug: str, request: Request, increment_view: bool = True) -> dict:
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for throttling. Behind the ingress the socket peer
+    is the proxy, so prefer the leftmost X-Forwarded-For hop (the original
+    client). It is client-spoofable, which is exactly why the per-slug backstop
+    in publication_rate_limit does not rely on the IP alone."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
+def _audit(**kwargs) -> None:
+    """Record one audit line. ``audit_log.record`` is already non-blocking — it
+    enqueues for a single dedicated writer thread (bounded, drop-on-overflow, off
+    the shared executor) — so the password hot path can call it inline without
+    ever serializing disk I/O next to the awaited bcrypt verify (the stall class
+    behind past 503s). Kept as a thin alias so call sites read clearly."""
+    audit_log.record(**kwargs)
+
+
+_MANAGER_ROLE_SOURCES = frozenset({"member", "system_admin", "write_policy_admin_bypass"})
+
+
+async def _is_publication_manager(request: Request, slug: str) -> bool:
+    """True iff the request carries a session that can WRITE the publication's
+    vault as a REAL manager — the owner, a writer/admin member, or a system
+    admin. Fail-closed: any missing session, unknown slug, or access error
+    returns False. Used to let the authenticated owner bypass the anonymous
+    password throttle so a flood can't lock them out.
+
+    Crucially, a vault with ``public_access="writer"`` would let ANY logged-in
+    user pass the writer check (role_source="public") — that must NOT grant the
+    throttle bypass, or the anti-brute-force guarantee would silently vanish for
+    that whole class of publication. So we require a non-public role_source
+    (allowlist, so an unknown future source fails closed)."""
+    try:
+        user = await get_optional_user(request)
+        if user is None:
+            return False
+        pub = await publication_service.get_publication_by_slug(slug)
+        if pub is None:
+            return False
+        access = await check_vault_access(user.user_id, pub["vault"], required_role="writer")
+        return access.get("role_source") in _MANAGER_ROLE_SOURCES
+    except (ForbiddenError, NotFoundError):
+        return False
+    except Exception:  # noqa: BLE001 — the throttle bypass must fail closed
+        return False
+
+
+async def _attempt_password_resolve(
+    slug: str, *, password: str | None, ip: str,
+    increment_view: bool, bypass_password: bool = False,
+    enforce_view_cap: bool = True, request: Request | None = None,
+) -> dict:
+    """`resolve_publication` wrapped with the F2 password-attempt throttle.
+
+    Only genuine wrong-password attempts are counted: token/bypass requests and
+    the "no password supplied" case (which yields PublicationPasswordRequired,
+    not Invalid) never touch the limiter. On lockout we return 429 with
+    Retry-After and audit the event — unless the caller is the authenticated
+    owner, who bypasses the throttle entirely (outside anonymous accounting).
+    """
+    throttled = password is not None and not bypass_password
+    owner_bypass = False
+    if throttled:
+        # Count this attempt BEFORE the (slow, awaited) bcrypt verify so a
+        # concurrent burst can't all slip past a stale counter.
+        lock = pub_rl.reserve(slug, ip)
+        if lock > 0:
+            # Locked. An anonymous flood (rotating IPs) can trip the per-slug
+            # backstop; let the authenticated owner through so they're never shut
+            # out. reserve() did NOT bump on the locked path, and we skip
+            # release() below, so the owner attempt stays entirely outside the
+            # anonymous throttle buckets (an attacker can't piggyback on it).
+            if request is not None and await _is_publication_manager(request, slug):
+                owner_bypass = True
+            else:
+                _audit(
+                    action="publication.auth.throttled", target=slug,
+                    outcome="error", code="rate_limited",
+                    meta={"ip": ip, "lock_seconds": int(lock)},
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many password attempts. Please wait and try again.",
+                    headers={"Retry-After": str(int(lock) + 1)},
+                )
+    try:
+        pub = await publication_service.resolve_publication(
+            slug, password=password, increment_view=increment_view,
+            bypass_password=bypass_password, enforce_view_cap=enforce_view_cap,
+        )
+    except PublicationPasswordInvalid:
+        # Already counted by reserve() above. Record the failed attempt for the
+        # audit trail (a brute-force signal), then let the 401 surface. (M3.)
+        _audit(
+            action="publication.auth.failed", target=slug,
+            outcome="error", code="invalid_password", meta={"ip": ip},
+        )
+        raise
+    if throttled and not owner_bypass:
+        pub_rl.release(slug, ip)  # verified correct — undo the speculative count
+    return pub
+
+
+async def _resolve_with_access(
+    slug: str, request: Request, increment_view: bool = True, enforce_view_cap: bool = True,
+) -> dict:
     """Resolve a publication, handling password and HMAC token."""
     # If a valid token is present, bypass password check
     token = _extract_auth_token(request)
     if token and _verify_token(slug, token):
         return await publication_service.resolve_publication(
             slug, password=None, increment_view=increment_view, bypass_password=True,
+            enforce_view_cap=enforce_view_cap,
         )
 
-    # Otherwise check password from request
+    # Otherwise check password from request (throttled against brute force)
     password = _extract_password(request)
-    return await publication_service.resolve_publication(slug, password=password, increment_view=increment_view)
+    return await _attempt_password_resolve(
+        slug, password=password, ip=_client_ip(request), increment_view=increment_view,
+        enforce_view_cap=enforce_view_cap, request=request,
+    )
 
 
 @router.post("/public/{slug}/auth", summary="Submit password for a publication")
-async def publication_auth(slug: str, req: PasswordAuthRequest):
-    """Verify password and return a short-lived HMAC token."""
+async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request):
+    """Verify password and return a short-lived HMAC token.
+
+    This is the primary brute-force target, so it goes through the same
+    throttle as the content path (429 after repeated wrong passwords).
+    """
+    ip = _client_ip(request)
     try:
-        await publication_service.resolve_publication(slug, password=req.password, increment_view=False)
+        pub = await _attempt_password_resolve(
+            slug, password=req.password, ip=ip, increment_view=False, request=request,
+        )
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
     except PublicationPasswordInvalid:
@@ -307,6 +525,11 @@ async def publication_auth(slug: str, req: PasswordAuthRequest):
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
+    # Record the successful authentication (the "login" event for this share). (M3.)
+    _audit(
+        action="publication.auth.success", target=slug,
+        vault=pub.get("vault"), outcome="ok", meta={"ip": ip},
+    )
     return {"authorized": True, "token": _make_token(slug), "expires_in": _TOKEN_TTL}
 
 
@@ -347,8 +570,8 @@ async def publication_meta(slug: str, request: Request):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 file_row = await conn.fetchrow(
-                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1",
-                    to_uuid(file_uuid_str),
+                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+                    to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
                 meta.update({
@@ -364,7 +587,8 @@ async def publication_meta(slug: str, request: Request):
     return meta
 
 
-_RAW_PREVIEW_MAX_BYTES = 5 * 1024 * 1024  # 5MB
+_RAW_TEXT_MAX_BYTES = 5 * 1024 * 1024        # 5MB — text/JSON inline preview
+_RAW_INLINE_BINARY_MAX_BYTES = 25 * 1024 * 1024  # 25MB — image/PDF inline render (streamed)
 _RAW_PREVIEWABLE_MIMES = {
     "application/json",
     "text/plain",
@@ -379,6 +603,35 @@ _RAW_PREVIEWABLE_MIMES = {
     "application/x-yaml",
     "text/yaml",
 }
+# Binary types the browser renders inline via <img>/<embed>. Served here (same
+# origin, streamed, view-counted) instead of a presigned S3 URL so the vault
+# name embedded in the S3 key never leaks and the view stays revocable. (F4)
+_RAW_INLINE_BINARY_MIMES = {"application/pdf"}
+_RAW_INLINE_IMAGE_PREFIX = "image/"
+# Provably-inert types served WITHOUT a CSP sandbox: raster images, PDF, and
+# plain/CSV/markdown text. Everything else /raw serves (text/html, xml, js, any
+# future active-document mime) is sandboxed by default — fail closed.
+_RAW_INERT_MIMES = {
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+}
+# image/svg+xml is an image by MIME but an ACTIVE document — it can carry
+# <script> that runs same-origin on direct navigation. It must NOT ride the
+# generic image/ inert exemption; keep it sandboxed like HTML.
+_RAW_ACTIVE_IMAGE_MIMES = {"image/svg+xml", "image/svg"}
+
+
+def _is_inert_raw_mime(mime: str) -> bool:
+    """True when a /raw body can be served without a CSP sandbox — a raster
+    image, PDF, or plain text. SVG is explicitly excluded (scriptable), so it
+    falls through to the sandboxed default even though it starts with image/."""
+    if mime in _RAW_ACTIVE_IMAGE_MIMES:
+        return False
+    if mime.startswith(_RAW_INLINE_IMAGE_PREFIX):
+        return True
+    return mime in _RAW_INERT_MIMES
 
 
 @router.get(
@@ -395,17 +648,28 @@ _RAW_PREVIEWABLE_MIMES = {
             "description": "Raw preview bytes for a small text-like file",
         }
     },
-    summary="Stream file content for preview (small text files)",
+    summary="Stream file content for inline preview (text, image, PDF)",
 )
 async def publication_raw(slug: str, request: Request):
-    """Proxy file content from S3 for in-browser preview.
+    """Proxy file content from S3 for same-origin in-browser preview.
 
-    Only applies to small text-based file types (JSON, text, etc.) where
-    CORS would block a direct presigned URL fetch. For images/PDFs the
-    browser uses the direct presigned URL via <img>/<embed> tags.
+    Serves text/JSON (fetched + rendered by the SPA) and image/PDF (rendered
+    via <img>/<embed>) through this origin instead of handing out a presigned
+    S3 URL. That keeps the vault name embedded in the S3 key from leaking, and
+    keeps the view access-checked, counted, and instantly revocable. Larger
+    files fall back to /download. (publish-hardening F4.)
     """
     try:
-        publication = await _resolve_with_access(slug, request, increment_view=False)
+        # A valid view-grant means the paired page GET already counted this view,
+        # so re-serve WITHOUT counting or re-checking the cap (a page opened at
+        # its last allowed view can still fetch its bytes / Range requests).
+        # WITHOUT a grant this is a direct fetch = its own view: count it and
+        # enforce the cap, so max_views can't be bypassed by hitting /raw
+        # directly. Expiry and password are enforced either way.
+        has_grant = _verify_view_grant(slug, _extract_view_grant(request))
+        publication = await _resolve_with_access(
+            slug, request, increment_view=not has_grant, enforce_view_cap=not has_grant,
+        )
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
@@ -416,27 +680,64 @@ async def publication_raw(slug: str, request: Request):
     parsed = parse_uri(publication.get("resource_uri") or "")
     if not parsed or parsed.kind != "file":
         raise HTTPException(status_code=404, detail="File not found")
-    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1",
-            to_uuid(file_uuid_str),
+            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1 AND vault_id = $2",
+            to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
         raise HTTPException(status_code=404, detail="File not found")
 
-    if file_row["size_bytes"] and file_row["size_bytes"] > _RAW_PREVIEW_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="File too large for preview, use /download instead")
-
-    mime = file_row["mime_type"] or ""
-    if not (mime in _RAW_PREVIEWABLE_MIMES or mime.startswith("text/")):
+    # Normalize so "image/svg+xml; charset=utf-8" still matches the sets below.
+    mime = (file_row["mime_type"] or "").split(";", 1)[0].strip().lower()
+    is_text = mime in _RAW_PREVIEWABLE_MIMES or mime.startswith("text/")
+    is_inline_binary = (
+        mime.startswith(_RAW_INLINE_IMAGE_PREFIX) or mime in _RAW_INLINE_BINARY_MIMES
+    )
+    if not (is_text or is_inline_binary):
         raise HTTPException(status_code=415, detail=f"Preview not supported for mime type: {mime}")
 
-    # Stream content from S3 via server (small files only — see _RAW_PREVIEW_MAX_BYTES)
-    body = file_service.get_object_bytes(file_row["s3_key"])  # raises StorageError → 502
-    return Response(content=body, media_type=mime)
+    # Fail closed on unknown size — never stream an unbounded body inline.
+    cap = _RAW_TEXT_MAX_BYTES if is_text else _RAW_INLINE_BINARY_MAX_BYTES
+    size = file_row["size_bytes"]
+    if size is None or size > cap:
+        raise HTTPException(status_code=413, detail="File too large or unsized for inline preview, use /download instead")
+
+    # The view was already counted by the metadata GET (one view per page open);
+    # /raw only re-checks expiry (enforce_view_cap=False above), so PDF Range
+    # requests / reloads don't re-count.
+
+    # Read the whole (capped ≤25MB) object off the event loop and return it
+    # buffered. A missing/unreadable object raises StorageError HERE — a clean
+    # 502 before any status line — instead of the truncated HTTP 200 a lazy
+    # StreamingResponse would emit; buffering also avoids holding an S3
+    # connection open across a client disconnect. (publish-hardening.)
+    try:
+        body = await asyncio.to_thread(file_service.get_object_bytes, file_row["s3_key"], cap)
+    except Exception as e:  # StorageError / boto error → the object is unreadable/over-cap
+        logger.warning("raw preview storage error for %s: %s", slug, e)
+        raise HTTPException(status_code=502, detail="File content is temporarily unavailable")
+
+    headers = {
+        "Content-Disposition": "inline",
+        # Don't let a served text file be sniffed into active HTML.
+        "X-Content-Type-Options": "nosniff",
+    }
+    # Fail CLOSED on XSS: every /raw body is attacker-uploaded, so sandbox the
+    # browsing context by default and only lift it for provably-inert types.
+    # allow-same-origin keeps the HTML preview iframe able to read its own
+    # contentDocument for fit-scaling; scripts stay blocked, and it has no effect
+    # on <img>/<embed> rendering of the inert types.
+    if not _is_inert_raw_mime(mime):
+        headers["Content-Security-Policy"] = "sandbox allow-same-origin"
+
+    return Response(
+        content=body,
+        media_type=mime or "application/octet-stream",
+        headers=headers,
+    )
 
 
 @router.get(
@@ -462,11 +763,25 @@ async def publication_download(slug: str, request: Request):
     For documents: returns raw markdown.
     """
     try:
-        publication = await _resolve_with_access(slug, request, increment_view=True)
+        # A valid view-grant means the paired page GET already counted this view,
+        # so re-serve WITHOUT counting or re-checking the cap (preview→download
+        # is one view; a page at its last allowed view can still download).
+        # WITHOUT a grant this is a direct download = its own view: count it and
+        # enforce the cap, so a direct /download can't bypass max_views (this is
+        # uniform for file, document, and table). Expiry/password enforced either
+        # way.
+        has_grant = _verify_view_grant(slug, _extract_view_grant(request))
+        publication = await _resolve_with_access(
+            slug, request, increment_view=not has_grant, enforce_view_cap=not has_grant,
+        )
     except PublicationError as e:
         raise _publication_error_to_http(e)
 
     rt = publication["resource_type"]
+    # Counting/capping already happened in _resolve_with_access above, keyed on
+    # the view-grant: a granted (preview→download) re-serve is free; a direct
+    # download without a grant spent its own view and 410s past the cap. Uniform
+    # for file, document, and table — max_views is a hard cap on every path.
     if rt == ResourceType.FILE:
         try:
             file_storage = await publication_service.get_file_storage_for_publication(publication)
@@ -479,6 +794,18 @@ async def publication_download(slug: str, request: Request):
         # sidesteps that and removes the cross-origin <a download> caveat.
         # Content-Length is intentionally omitted — let chunked encoding
         # handle the body so a DB/S3 size mismatch can't truncate the wire.
+        # Files can be large, so we STREAM (unlike /raw, which buffers a small
+        # ≤25 MB preview). But a lazy stream would send 200 + headers before the
+        # first S3 GET runs, so a missing object would silently truncate to an
+        # empty 200. HEAD the object first (off the event loop, no body, no held
+        # GET connection): a missing/unreadable object becomes a clean 502 before
+        # the response is committed. The TOCTOU window (deleted between HEAD and
+        # the stream's GET) is negligible and merely truncates, as before.
+        try:
+            await asyncio.to_thread(file_service.head_object, file_storage["s3_key"])
+        except Exception as e:  # noqa: BLE001 — any storage failure → 502
+            logger.warning("download storage error for %s: %s", slug, e)
+            raise HTTPException(status_code=502, detail="File content is temporarily unavailable")
         return StreamingResponse(
             file_service.iter_object_chunks(file_storage["s3_key"]),
             media_type=file_storage.get("mime_type") or "application/octet-stream",
@@ -490,13 +817,19 @@ async def publication_download(slug: str, request: Request):
         )
 
     if rt == ResourceType.TABLE_QUERY:
+        # Strip OUR control params so they can't collide with a declared bind
+        # param (a `:grant`/`:token`/`:format` param would otherwise receive our
+        # control value as data). Mirrors the page GET's stripping.
+        dl_params = dict(request.query_params)
+        for k in ("format", "password", "token", "grant"):
+            dl_params.pop(k, None)
         try:
             data = await publication_service.resolve_table_query_publication(
-                publication, dict(request.query_params)
+                publication, dl_params
             )
         except PublicationError as e:
             raise _publication_error_to_http(e)
-        return _to_csv_response(data)
+        return await _to_csv_response(data)
 
     if rt == ResourceType.DOCUMENT:
         try:
@@ -523,15 +856,22 @@ def _iter_table_cells(data: dict):
     return columns, rows
 
 
-def _to_csv_response(data: dict) -> Response:
+async def _to_csv_response(data: dict) -> Response:
     columns, rows = _iter_table_cells(data)
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(columns)
-    for row in rows:
-        writer.writerow([row.get(c) for c in columns])
+
+    def _render() -> str:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row.get(c) for c in columns])
+        return buf.getvalue()
+
+    # A large query result is CPU-bound to serialize; offload it so building the
+    # CSV can't stall the single event loop.
+    content = await asyncio.to_thread(_render)
     return Response(
-        content=buf.getvalue(),
+        content=content,
         media_type="text/csv",
         headers={
             "Content-Disposition": file_service.content_disposition_attachment("query.csv"),
@@ -569,9 +909,19 @@ async def get_public_publication(
       ?format=json (default), ?format=csv, ?format=html
       Or via Accept header.
     """
-    # Resolve with view-count increment
+    # A fresh page open (no grant) spends exactly one view and hands back a
+    # short-lived view-grant (below) that the paired /raw, /download and CSV
+    # carry, so those re-serves of THIS view — and a reload within the grant
+    # window — don't re-count. WITHOUT a grant this GET (and a direct /raw or
+    # /download) spends its own view and is capped, so max_views is a HARD cap on
+    # every content path, not a soft page-open counter.
+    # (publish-hardening: view-grant hard cap, supersedes the F5 peek.)
+    incoming_grant = _extract_view_grant(request)
+    has_grant = _verify_view_grant(slug, incoming_grant)
     try:
-        publication = await _resolve_with_access(slug, request, increment_view=True)
+        publication = await _resolve_with_access(
+            slug, request, increment_view=not has_grant, enforce_view_cap=not has_grant,
+        )
     except PublicationNotFound as e:
         raise _publication_error_to_http(e)
     except PublicationPasswordRequired:
@@ -589,11 +939,23 @@ async def get_public_publication(
 
     rt = publication["resource_type"]
 
+    # Hand back a short-lived grant so the paired /raw and /download re-serves of
+    # THIS view don't re-count (and a page at its last allowed view can still
+    # fetch its bytes). Mint a FRESH grant only on a counted (grantless) open; on
+    # a grant-carried re-serve, ECHO the same grant so its ORIGINAL 600s TTL
+    # stands. Re-minting on every GET would let a viewer refresh before expiry to
+    # roll the timestamp forward indefinitely — an unlimited renewable capability
+    # from a single counted view, defeating the cap (Codex High). Only the JSON
+    # page-open responses carry it — the CSV/HTML format branches are leaf
+    # downloads, not the "open the page" call the viewer threads the grant from.
+    grant = incoming_grant if has_grant else _make_view_grant(slug)
+
     if rt == ResourceType.DOCUMENT:
         try:
             data = await publication_service.resolve_document_publication(publication)
         except PublicationError as e:
             raise _publication_error_to_http(e)
+        data["view_grant"] = grant
         return data
 
     if rt == ResourceType.FILE:
@@ -605,12 +967,16 @@ async def get_public_publication(
         # Callers needing bytes use /public/{slug}/raw (preview, capped) or
         # /public/{slug}/download (force-download). The legacy ?format=raw
         # alias was removed — it had no callers and no size cap.
+        file_data["view_grant"] = grant
         return file_data
 
     if rt == ResourceType.TABLE_QUERY:
         url_params = dict(request.query_params)
         # Strip our own params
-        for k in ("format", "password", "token"):
+        # Strip OUR control params so a table_query can't declare a bind param
+        # that collides with them (e.g. a `:grant` param would otherwise receive
+        # the HMAC grant as data and echo it back through applied_params). (Codex.)
+        for k in ("format", "password", "token", "grant"):
             url_params.pop(k, None)
         try:
             data = await publication_service.resolve_table_query_publication(publication, url_params)
@@ -621,25 +987,32 @@ async def get_public_publication(
         accept = request.headers.get("accept", "").lower()
         fmt = format or ("csv" if "text/csv" in accept else "json")
         if fmt == "csv":
-            return _to_csv_response(data)
+            return await _to_csv_response(data)
         if fmt == "html":
-            return _to_html_table_response(data)
+            return await _to_html_table_response(data)
+        data["view_grant"] = grant
         return data
 
     raise HTTPException(status_code=400, detail=f"Unknown resource_type: {rt}")
 
 
-def _to_html_table_response(data: dict) -> Response:
+async def _to_html_table_response(data: dict) -> Response:
     columns, rows = _iter_table_cells(data)
-    html_rows = ["<table border='1' cellpadding='4' cellspacing='0'>", "<thead><tr>"]
-    html_rows += [f"<th>{_html_escape(c)}</th>" for c in columns]
-    html_rows.append("</tr></thead><tbody>")
-    for r in rows:
-        html_rows.append("<tr>")
-        html_rows += [f"<td>{_html_escape(r.get(c))}</td>" for c in columns]
-        html_rows.append("</tr>")
-    html_rows.append("</tbody></table>")
-    return Response(content="\n".join(html_rows), media_type="text/html")
+
+    def _render() -> str:
+        html_rows = ["<table border='1' cellpadding='4' cellspacing='0'>", "<thead><tr>"]
+        html_rows += [f"<th>{_html_escape(c)}</th>" for c in columns]
+        html_rows.append("</tr></thead><tbody>")
+        for r in rows:
+            html_rows.append("<tr>")
+            html_rows += [f"<td>{_html_escape(r.get(c))}</td>" for c in columns]
+            html_rows.append("</tr>")
+        html_rows.append("</tbody></table>")
+        return "\n".join(html_rows)
+
+    # Same CPU-bound serialization concern as CSV — offload for large tables.
+    content = await asyncio.to_thread(_render)
+    return Response(content=content, media_type="text/html")
 
 
 def _html_escape(v: Any) -> str:
@@ -707,38 +1080,45 @@ async def oembed(url: str, format: str = "json"):
 
     rt = publication["resource_type"]
 
-    # Resolve a useful title. Parse the canonical URI to recover the
-    # resource handle — there are no separate id columns anymore.
-    from app.services.uri_service import parse_uri
-    parsed = parse_uri(publication.get("resource_uri") or "")
-    title = publication.get("title")
-    if not title:
-        if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
-            uri_vault, doc_path = parsed.vault, parsed.identifier
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                doc_row = await conn.fetchrow(
-                    """
-                    SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
-                     WHERE v.name = $1 AND d.path = $2
-                    """,
-                    uri_vault, doc_path,
-                )
-                if doc_row:
-                    title = doc_row["title"]
-        elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
-            file_uuid_str = parsed.identifier
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                f_row = await conn.fetchrow(
-                    "SELECT name FROM vault_files WHERE id = $1",
-                    to_uuid(file_uuid_str),
-                )
-                if f_row:
-                    title = f_row["name"]
-        elif rt == ResourceType.TABLE_QUERY:
-            title = "Shared query"
-    title = title or "AKB Publication"
+    if publication.get("password_hash"):
+        # F1: a password-protected publication must NOT leak its title / subject
+        # / filename through an unauthenticated oembed unfurl. The viewer and
+        # /embed both hide the title behind the password, so oembed can't be the
+        # bypass — return a generic card and skip every DB title lookup.
+        title: str | None = "Protected AKB publication"
+    else:
+        # Resolve a useful title. Parse the canonical URI to recover the
+        # resource handle — there are no separate id columns anymore.
+        from app.services.uri_service import parse_uri
+        parsed = parse_uri(publication.get("resource_uri") or "")
+        title = publication.get("title")
+        if not title:
+            if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
+                uri_vault, doc_path = parsed.vault, parsed.identifier
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    doc_row = await conn.fetchrow(
+                        """
+                        SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
+                         WHERE v.name = $1 AND d.path = $2
+                        """,
+                        uri_vault, doc_path,
+                    )
+                    if doc_row:
+                        title = doc_row["title"]
+            elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
+                file_uuid_str = parsed.identifier
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    f_row = await conn.fetchrow(
+                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2",
+                        to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
+                    )
+                    if f_row:
+                        title = f_row["name"]
+            elif rt == ResourceType.TABLE_QUERY:
+                title = "Shared query"
+        title = title or "AKB Publication"
 
     return {
         "version": "1.0",

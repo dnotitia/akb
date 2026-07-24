@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     yield
     await stop_workers()
     await shutdown_storage()
+    # Drain the audit writer's queue so a rollout doesn't drop its tail. Off the
+    # loop since shutdown() blocks on the queue join.
+    await asyncio.to_thread(audit_log.shutdown)
     logger.info("Server shutdown")
 
 
@@ -178,6 +181,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _no_store_public_surfaces(request: Request, call_next):
+    """Never let a browser, proxy, or CDN cache a publication surface
+    (publish-hardening M2).
+
+    These responses can carry password-gated content, the short-lived auth
+    token, or presigned file URLs — anything cached here could be replayed to a
+    later, unauthenticated request (e.g. via the back button or a shared cache).
+    `no-store` is the safe default for the whole public + publications surface;
+    the payloads are small and fetched by the SPA, so lost cacheability is a
+    non-issue. `/api/v1/public` also matches `/api/v1/publications/*`.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    # Match on segment boundaries so a hypothetical unrelated `/api/v1/publicX`
+    # route can't accidentally inherit no-store (per Codex M2 review). The two
+    # publication bases are listed explicitly — `/publications/*` is a sibling
+    # of `/public/*`, not a child.
+    for base in ("/api/v1/public", "/api/v1/publications", "/api/v1/oembed"):
+        if path == base or path.startswith(base + "/"):
+            response.headers["Cache-Control"] = "no-store"
+            break
+    return response
+
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])

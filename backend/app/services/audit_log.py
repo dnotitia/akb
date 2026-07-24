@@ -39,6 +39,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,12 +77,25 @@ _TARGET_KEYS = ("id", "path", "doc", "document", "collection", "table",
                 "file", "name", "query", "username", "vault")
 _TARGET_MAX = 256
 
-# ── In-process chain state (guarded by _lock) ────────────────────
+# ── In-process chain state (mutated ONLY by the single writer thread; _lock
+# guards it against init()'s reseed, which runs before the writer starts) ──
 
 _lock = threading.Lock()
 _seq = 0
 _prev = _GENESIS
 _cur_date: str | None = None
+
+# Dedicated off-loop sink. record() (called on the event loop by MCP dispatch,
+# and off-loop by other paths) only ENQUEUES; one dedicated writer thread does
+# the chain mutation + disk write. So no caller ever holds _lock during I/O —
+# the event loop can't be frozen by a stalled audit disk, and audit writes never
+# occupy the shared asyncio.to_thread pool that bcrypt / document reads use (no
+# starvation → no re-opened 503). Bounded with drop-on-overflow: audit is
+# best-effort and must never apply backpressure to serving.
+_AUDIT_QUEUE: "queue.Queue" = queue.Queue(maxsize=8192)
+_dropped = 0
+_writer_thread: threading.Thread | None = None
+_SHUTDOWN = object()  # sentinel enqueued to stop the writer on shutdown
 
 
 def _now() -> datetime:
@@ -184,6 +198,7 @@ def init() -> None:
         return
     with _lock:
         _reseed(_today())
+    _ensure_writer()  # start the single off-loop writer thread
     logger.info(
         "audit enabled: dir=%s reads=%s bucket=%s seq=%d",
         _log_dir(), settings.audit.log_reads, settings.audit.bucket or "(file-only)", _seq,
@@ -204,43 +219,107 @@ def record(
     code: str | None = None,
     meta: dict | None = None,
 ) -> None:
-    """Append one best-effort audit line. Never raises into the caller.
+    """Enqueue one best-effort audit line for the dedicated writer thread.
 
-    ``action`` is the canonical verb (an MCP tool name like ``akb_put``,
-    or ``auth.denied``). ``outcome`` is ``"ok"`` / ``"error"``. Keep
-    ``meta`` tiny — this is Metadata level; bodies do not belong here.
+    NON-BLOCKING and thread-safe: the caller never touches the disk or ``_lock``,
+    so an on-loop caller (MCP ``record_tool`` / ``auth.denied``) can't stall the
+    event loop, and the write runs on ONE dedicated thread — never the shared
+    ``asyncio.to_thread`` pool that bcrypt / document reads use. The event
+    timestamp is captured HERE (not at flush time). On overflow the record is
+    dropped (counted), never blocking the caller.
+
+    ``action`` is the canonical verb (an MCP tool name like ``akb_put``, or
+    ``auth.denied``). ``outcome`` is ``"ok"`` / ``"error"``. Keep ``meta`` tiny —
+    this is Metadata level; bodies do not belong here.
     """
     if not settings.audit.enabled:
         return
+    global _dropped
+    payload = {
+        "ts": _now().isoformat(),
+        "action": action, "actor": actor, "actor_id": actor_id,
+        "vault": vault, "target": target, "outcome": outcome,
+        "code": code, "meta": meta,
+    }
     try:
-        day = _today()
-        line_json: str
-        with _lock:
-            global _seq, _prev, _cur_date
-            if day != _cur_date:
-                _reseed(day)  # rolls the file + chain at the UTC date boundary
-            _seq += 1
-            core = {
-                "v": _SCHEMA_VERSION,
-                "ts": _now().isoformat(),
-                "seq": _seq,
-                "action": action,
-                "actor": actor,
-                "actor_id": actor_id,
-                "vault": vault,
-                "target": target,
-                "outcome": outcome,
-                "code": code,
-                "meta": meta or None,
-            }
-            h = _chain(_prev, core)
-            _prev = h
-            core["h"] = h
-            line_json = json.dumps(core, ensure_ascii=False) + "\n"
-            with _file_for(day).open("a", encoding="utf-8") as fh:
-                fh.write(line_json)
-    except Exception as e:  # noqa: BLE001 — audit must never break serving
-        logger.error("audit record dropped (action=%s): %s", action, e)
+        _AUDIT_QUEUE.put_nowait(payload)
+    except queue.Full:
+        _dropped += 1
+        # Surface shedding, but not per-drop (that would itself flood the log
+        # under the burst that overran the queue).
+        if _dropped == 1 or _dropped % 256 == 0:
+            logger.warning("audit queue full — %d records dropped so far", _dropped)
+
+
+def _write_one(payload: dict) -> None:
+    """Chain-mutate + append the file for ONE record. Runs ONLY in the single
+    writer thread, so ``_lock`` is effectively uncontended (init()'s reseed is
+    the only other holder and runs before the writer starts). Preserves the
+    exact hash-chain construction that used to live inline in record()."""
+    global _seq, _prev, _cur_date
+    day = _today()
+    with _lock:
+        if day != _cur_date:
+            _reseed(day)  # rolls the file + chain at the UTC date boundary
+        _seq += 1
+        core = {
+            "v": _SCHEMA_VERSION,
+            "ts": payload["ts"],
+            "seq": _seq,
+            "action": payload["action"],
+            "actor": payload["actor"],
+            "actor_id": payload["actor_id"],
+            "vault": payload["vault"],
+            "target": payload["target"],
+            "outcome": payload["outcome"],
+            "code": payload["code"],
+            "meta": payload["meta"] or None,
+        }
+        h = _chain(_prev, core)
+        _prev = h
+        core["h"] = h
+        line_json = json.dumps(core, ensure_ascii=False) + "\n"
+        with _file_for(day).open("a", encoding="utf-8") as fh:
+            fh.write(line_json)
+
+
+def _writer_loop() -> None:
+    while True:
+        item = _AUDIT_QUEUE.get()
+        try:
+            if item is _SHUTDOWN:
+                return
+            _write_one(item)
+        except Exception as e:  # noqa: BLE001 — audit must never crash the writer
+            logger.error("audit record dropped: %s", e)
+        finally:
+            _AUDIT_QUEUE.task_done()
+
+
+def _ensure_writer() -> None:
+    """Start the single writer thread once (idempotent — safe across re-init)."""
+    global _writer_thread
+    if _writer_thread is None or not _writer_thread.is_alive():
+        _writer_thread = threading.Thread(target=_writer_loop, name="audit-writer", daemon=True)
+        _writer_thread.start()
+
+
+def flush() -> None:
+    """Block until every queued record is written. For tests + the shutdown
+    drain — do NOT call on the event loop's hot path."""
+    _AUDIT_QUEUE.join()
+
+
+def shutdown() -> None:
+    """Drain queued records and stop the writer. Call once on process shutdown
+    so a rollout doesn't silently lose the tail of the audit trail."""
+    if _writer_thread is None:
+        return
+    try:
+        _AUDIT_QUEUE.join()
+        _AUDIT_QUEUE.put_nowait(_SHUTDOWN)
+    except Exception:  # noqa: BLE001 — shutdown must never raise
+        pass
 
 
 def _target_of(args: dict) -> str | None:

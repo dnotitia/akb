@@ -121,6 +121,17 @@ TITLE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(
 CU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content_unavailable"))' 2>/dev/null)
 [ "$CU" = "False" ] && pass "content_unavailable = false" || fail "content_unavailable" "$CU"
 
+# F8: anonymous doc response must not leak the raw creator id, internal workflow
+# status, or created_at — only the resolved author display name is exposed.
+echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); leaked=[k for k in ("created_by","status","created_at") if k in d]; sys.exit(1 if leaked else 0)' \
+  && pass "F8: doc response omits created_by/status/created_at" || fail "F8 metadata leak" "$R"
+
+# F6: owner-capability probe — anonymous can't edit; the authenticated owner can.
+CE=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG/capabilities" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("can_edit"))' 2>/dev/null)
+[ "$CE" = "False" ] && pass "F6: anonymous capabilities can_edit=false" || fail "F6 anon caps" "$CE"
+CE=$(acurl "$BASE_URL/api/v1/public/$DOC_SLUG/capabilities" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("can_edit"))' 2>/dev/null)
+[ "$CE" = "True" ] && pass "F6: owner capabilities can_edit=true" || fail "F6 owner caps" "$CE"
+
 # Tags returned
 TAGS=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d.get("tags",[])))' 2>/dev/null)
 [ "$TAGS" = "pub,test" ] && pass "Tags preserved" || fail "Tags" "$TAGS"
@@ -194,13 +205,18 @@ PWPROT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "401" ] && pass "No password → 401" || fail "No pw" "HTTP $CODE"
 
-# Wrong password → 401
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=wrong")
+# Wrong password → 401 (password via header — query-string ?password= was
+# removed as a leak vector in publish-hardening M1)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "x-publication-password: wrong" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "401" ] && pass "Wrong password → 401" || fail "Wrong pw" "HTTP $CODE"
 
-# Correct password → 200
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=secret123")
+# Correct password → 200 (via header)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" -H "x-publication-password: secret123" "$BASE_URL/api/v1/public/$PW_SLUG")
 [ "$CODE" = "200" ] && pass "Correct password → 200" || fail "Correct pw" "HTTP $CODE"
+
+# Query-string password must NOT authenticate (M1 hardening) → still 401
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PW_SLUG?password=secret123")
+[ "$CODE" = "401" ] && pass "Query-string password rejected → 401" || fail "QS pw should be ignored" "HTTP $CODE"
 
 # Auth flow: POST /auth → token → use token
 R=$(curl -sk -X POST "$BASE_URL/api/v1/public/$PW_SLUG/auth" -H "Content-Type: application/json" \
@@ -217,6 +233,24 @@ R=$(curl -sk -X POST "$BASE_URL/api/v1/public/$PW_SLUG/auth" -H "Content-Type: a
 NO_TOKEN=$(echo "$R" | python3 -c 'import json,sys; print("token" not in json.load(sys.stdin))' 2>/dev/null)
 [ "$NO_TOKEN" = "True" ] && pass "Wrong pw to /auth returns no token" || fail "Auth wrong pw" "$R"
 
+# Throttle backstop + owner bypass (F2 + G5): an anonymous wrong-password flood
+# from ROTATING IPs trips the per-slug backstop and 429s further anonymous
+# attempts (even the correct password), but the authenticated OWNER bypasses the
+# throttle so a flood can never lock them out of their own publication.
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"realpass\"}")
+TH_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+th_auth() { curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/public/$TH_SLUG/auth" \
+  -H "Content-Type: application/json" -H "X-Forwarded-For: $2" -d "{\"password\":\"$1\"}"; }
+LOCKED=0
+for i in $(seq 1 35); do [ "$(th_auth wrongpw "66.66.66.$i")" = "429" ] && LOCKED=1; done
+[ "$LOCKED" = "1" ] && pass "Anon wrong-pw flood trips backstop (429)" || fail "Backstop 429" "not locked"
+CODE=$(th_auth realpass "1.2.3.4")
+[ "$CODE" = "429" ] && pass "Anon correct pw is ALSO throttled during flood (no probe)" || fail "Anon throttled" "HTTP $CODE"
+CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/public/$TH_SLUG/auth" \
+  -H "Content-Type: application/json" -H "X-Forwarded-For: 1.2.3.4" -d '{"password":"realpass"}')
+[ "$CODE" = "200" ] && pass "Owner session bypasses the throttle (200, not locked out)" || fail "Owner bypass" "HTTP $CODE"
+
 echo ""
 
 # ── 5. View Limits ────────────────────────────────────────
@@ -230,6 +264,33 @@ curl -sk -o /dev/null "$BASE_URL/api/v1/public/$MV_SLUG"
 curl -sk -o /dev/null "$BASE_URL/api/v1/public/$MV_SLUG"
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_SLUG")
 [ "$CODE" = "410" ] && pass "View 3 → 410 (limit reached)" || fail "View limit" "HTTP $CODE"
+
+# max_views is a HARD cap on EVERY path via the view-grant. A page open mints a
+# grant; /raw & /download re-serve THAT view free WITH the grant, but a direct
+# fetch WITHOUT a grant spends its own view and 410s past the cap (bypass closed).
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_SLUG/download")
+[ "$CODE" = "410" ] && pass "doc /download WITHOUT grant after cap → 410 (hard cap, bypass closed)" || fail "doc download hard cap" "HTTP $CODE"
+
+# a grant minted by a live page open re-serves even at the last allowed view
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"max_views\":1}")
+G1_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+GRANT=$(curl -sk "$BASE_URL/api/v1/public/$G1_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("view_grant",""))' 2>/dev/null)
+[ -n "$GRANT" ] && pass "doc page open returns a view_grant" || fail "view_grant present" "empty"
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$G1_SLUG/download?grant=$GRANT")
+[ "$CODE" = "200" ] && pass "doc /download WITH grant re-serves the counted view (200)" || fail "doc download grant re-serve" "HTTP $CODE"
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$G1_SLUG/download")
+[ "$CODE" = "410" ] && pass "doc /download WITHOUT grant on exhausted pub → 410" || fail "doc download no grant" "HTTP $CODE"
+
+# No rolling renewal: re-opening WITH the grant re-serves (no re-count) but must
+# ECHO THE SAME grant string — re-minting a fresh timestamp on every GET would let
+# a viewer refresh before expiry into an unlimited renewable capability from one
+# counted view. (The identical string proves the embedded 600s TTL doesn't roll.)
+GRANT2=$(curl -sk "$BASE_URL/api/v1/public/$G1_SLUG?grant=$GRANT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("view_grant",""))' 2>/dev/null)
+[ "$GRANT2" = "$GRANT" ] && pass "grant-carried GET echoes the SAME grant (no rolling renewal)" || fail "rolling renewal" "$GRANT -> $GRANT2"
+# and renewal did not buy extra views: a grantless open is still capped
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$G1_SLUG")
+[ "$CODE" = "410" ] && pass "grantless open still 410 after grant re-serve (cap holds)" || fail "cap after renewal" "HTTP $CODE"
 
 # /meta does NOT increment view count
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -291,6 +352,19 @@ echo "$CSV" | grep -q "Bagel,food,2" && pass "CSV data row" || fail "CSV data" "
 # HTML format
 HTML=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG?format=html")
 echo "$HTML" | grep -q "<table" && pass "HTML table tag" || fail "HTML" "$HTML"
+
+# Control-param reservation: a table declaring a `:grant` bind param must NOT
+# receive our HMAC view-grant as data — `grant` is stripped, so the default is
+# used (same for the page GET, CSV, and the /download path).
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d '{"resource_type":"table_query","query_sql":"SELECT name FROM products WHERE category = :grant ORDER BY name","query_params":{"grant":{"type":"text","default":"food"}},"title":"GrantParam"}')
+GP_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+# ?grant=furniture is stripped → the :grant param falls back to its default "food",
+# so the rows are the food ones (Apple/Bagel), NOT furniture (Chair/Desk).
+GPJ=$(curl -sk "$BASE_URL/api/v1/public/$GP_SLUG?grant=furniture")
+echo "$GPJ" | grep -q "Apple" && ! echo "$GPJ" | grep -q "Chair" && pass "table :grant param ignores injected ?grant= (default food rows, page GET)" || fail "grant param inject (GET)" "$GPJ"
+CSVG=$(curl -sk "$BASE_URL/api/v1/public/$GP_SLUG/download?grant=furniture")
+echo "$CSVG" | grep -qi "furniture\|Chair\|Desk" && fail "grant param inject (/download)" "furniture rows leaked: $CSVG" || pass "table :grant ignores injected ?grant= on /download (food rows only)"
 
 # Read-only enforcement at create time
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -360,19 +434,64 @@ R=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/meta")
 MIME=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mime_type",""))' 2>/dev/null)
 [ "$MIME" = "application/json" ] && pass "/meta mime_type" || fail "/meta" "$R"
 
-# /public returns full file info with download_url
+# F4: /public no longer hands out a presigned download_url — inline render is
+# proxied same-origin via /raw, so the vault name embedded in the S3 key can't
+# leak and the view stays counted + revocable.
 R=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG")
 DLURL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("download_url",""))' 2>/dev/null)
-[ -n "$DLURL" ] && pass "download_url returned" || fail "download_url" "$R"
+[ -z "$DLURL" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "$DLURL"
 
 # /raw proxies content (CORS-safe for browser)
 RAW=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
 echo "$RAW" | grep -q '"hello":"world"' && pass "/raw streams JSON content" || fail "/raw" "$RAW"
+# F4: proxied inline content is served with inline disposition + nosniff
+RH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
+echo "$RH" | grep -qi '^x-content-type-options: nosniff' && pass "F4: /raw sets nosniff" || fail "F4 nosniff" "$RH"
 
 # /download streams the bytes through the backend (mixed-content safe);
 # 0.5.x flipped from "302 to S3 presigned" to a same-origin stream.
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SLUG/download")
 [ "$CODE" = "200" ] && pass "/download streams (200)" || fail "/download" "HTTP $CODE"
+
+# Cross-vault file IDOR: publishing ANOTHER vault's file UUID through my own vault
+# must be REJECTED at create time (else an anonymous viewer could read that vault's
+# file bytes through my publication).
+IDOR_V="pubidor_$RANDOM"
+acurl -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor" >/dev/null
+IINIT=$(acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/upload?filename=secret.txt&collection=s&mime_type=text/plain")
+IURI=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+IFID=$(printf '%s' "$IURI" | uri_file_id)
+IURL=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+printf 'top-secret-from-vault-B' | curl -sk -X PUT "$IURL" -H "Content-Type: text/plain" --data-binary @- >/dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/$IFID/confirm" >/dev/null
+# attacker (owner of $VAULT) tries to publish vault-B's file UUID through $VAULT
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}")
+IDOR_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+[ -z "$IDOR_SLUG" ] && pass "cross-vault file publish REJECTED at create (IDOR closed)" || fail "cross-vault file IDOR" "created slug=$IDOR_SLUG"
+acurl -X DELETE "$BASE_URL/api/v1/vaults/$IDOR_V" >/dev/null 2>&1
+
+# File view-count model (hard cap via view-grant): a page open counts one view
+# and mints a grant; /raw + /download re-serve THAT view free WITH the grant, but
+# a direct fetch WITHOUT a grant spends its own view and is capped.
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$FILE_URI\",\"max_views\":2}")
+MV_FILE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+GF=$(curl -sk "$BASE_URL/api/v1/public/$MV_FILE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("view_grant",""))' 2>/dev/null)  # page open #1 → view 1/2, grant
+# /raw + /download WITH the grant re-serve the SAME open without spending more views
+C1=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/raw?grant=$GF")
+C2=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/raw?grant=$GF")
+C3=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/download?grant=$GF")
+[ "$C1" = "200" ] && [ "$C2" = "200" ] && [ "$C3" = "200" ] && pass "view model: /raw+/download WITH grant re-serve one open without re-counting" || fail "re-serve" "$C1/$C2/$C3"
+# a direct /raw WITHOUT the grant spends view 2/2 → 200, then the cap is reached
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/raw")
+[ "$CODE" = "200" ] && pass "direct /raw WITHOUT grant spends its own view (200)" || fail "direct raw counts" "HTTP $CODE"
+# now exhausted (2/2): a further direct /download WITHOUT grant → 410 (hard cap, bypass closed)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE/download")
+[ "$CODE" = "410" ] && pass "direct /download WITHOUT grant past cap → 410 (bypass closed)" || fail "file download hard cap" "HTTP $CODE"
+# and a page open past the cap is also 410
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV_FILE")
+[ "$CODE" = "410" ] && pass "page open past cap → 410" || fail "cap page-open" "HTTP $CODE"
 
 # Invalid file_id format
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -394,6 +513,13 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG
 R=$(curl -sk "$BASE_URL/api/v1/oembed?url=/p/$TQ_SLUG")
 TYPE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type",""))' 2>/dev/null)
 [ "$TYPE" = "rich" ] && pass "oEmbed type=rich for table_query" || fail "oEmbed type" "$TYPE"
+
+# F1: oEmbed must NOT leak a password-protected publication's title
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"oe-secret\"}")
+OE_PW_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+OT=$(curl -sk "$BASE_URL/api/v1/oembed?url=/p/$OE_PW_SLUG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
+[ "$OT" = "Protected AKB publication" ] && pass "F1: oEmbed masks password-protected title" || fail "F1 oembed title" "$OT"
 
 # allow_embed=false → /embed → 403
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -608,7 +734,8 @@ if [ -n "$MV0_SLUG" ]; then
   [ "$CODE" = "410" ] && pass "max_views=0 → immediately 410" || fail "max_views=0" "HTTP $CODE"
 fi
 
-# /raw on non-previewable MIME (PNG image) → 415
+# F4: images render inline through the same-origin /raw proxy (200 + image/png),
+# not a presigned S3 URL.
 echo -n "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9eMyf2QAAAAASUVORK5CYII=" | base64 -d > /tmp/edge.png
 INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.png&collection=img&mime_type=image/png")
 PFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
@@ -618,8 +745,75 @@ curl -sk -X PUT "$PURL" -H "Content-Type: image/png" --data-binary @/tmp/edge.pn
 acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$PFID/confirm" > /dev/null
 PNG_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"file\",\"uri\":\"$PFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$PNG_PUB/raw")
-[ "$CODE" = "415" ] && pass "/raw on image → 415" || fail "/raw image" "HTTP $CODE"
+PH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$PNG_PUB/raw")
+echo "$PH" | grep -qiE '^HTTP/[0-9.]+ 200' && pass "F4: /raw on image → 200 (inline proxy)" || fail "/raw image 200" "$PH"
+echo "$PH" | grep -qi '^content-type: image/png' && pass "F4: /raw image Content-Type image/png" || fail "/raw image mime" "$PH"
+
+# A truly non-previewable MIME (octet-stream) → 415 (use /download instead)
+echo -n "random-bytes-not-previewable" > /tmp/edge.bin
+INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.bin&collection=img&mime_type=application/octet-stream")
+BFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+BFID=$(printf '%s' "$BFILE_URI" | uri_file_id)
+BURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+curl -sk -X PUT "$BURL" -H "Content-Type: application/octet-stream" --data-binary @/tmp/edge.bin > /dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$BFID/confirm" > /dev/null
+BIN_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$BFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$BIN_PUB/raw")
+[ "$CODE" = "415" ] && pass "/raw on octet-stream → 415" || fail "/raw octet 415" "HTTP $CODE"
+
+# F4: active document types (uploaded HTML, declared with a charset param) are
+# served with a CSP sandbox so any embedded script is inert — verifies the mime
+# is normalized before the CSP decision.
+printf '<h1>x</h1><script>alert(1)</script>' > /tmp/edge.html
+INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.html&collection=img&mime_type=text/html")
+HFILE_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+HFID=$(printf '%s' "$HFILE_URI" | uri_file_id)
+HURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+curl -sk -X PUT "$HURL" -H "Content-Type: text/html" --data-binary @/tmp/edge.html > /dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$HFID/confirm" > /dev/null
+HTML_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$HFILE_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+HH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$HTML_PUB/raw")
+echo "$HH" | grep -qi '^content-security-policy: sandbox' && pass "F4: /raw on HTML sets CSP sandbox" || fail "F4 html CSP" "$HH"
+
+# SVG is an image/* MIME but scriptable — it must still be sandboxed (the CSP
+# gate fails closed and doesn't let it ride the generic image/ exemption).
+printf '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>' > /tmp/edge.svg
+INIT=$(acurl -X POST "$BASE_URL/api/v1/files/$VAULT/upload?filename=edge.svg&collection=img&mime_type=image/svg%2Bxml")
+SVG_URI=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
+SVG_FID=$(printf '%s' "$SVG_URI" | uri_file_id)
+SVG_UURL=$(echo "$INIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
+curl -sk -X PUT "$SVG_UURL" -H "Content-Type: image/svg+xml" --data-binary @/tmp/edge.svg > /dev/null
+acurl -X POST "$BASE_URL/api/v1/files/$VAULT/$SVG_FID/confirm" > /dev/null
+SVG_PUB=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"file\",\"uri\":\"$SVG_URI\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+SH=$(curl -sk -D - -o /dev/null "$BASE_URL/api/v1/public/$SVG_PUB/raw")
+echo "$SH" | grep -qi '^content-security-policy: sandbox' && pass "CSP: /raw on SVG is sandboxed (image MIME but scriptable)" || fail "SVG CSP" "$SH"
+
+# F3: a table_query returning non-finite floats (NaN/±Inf) must not 500 the JSON
+# path (Starlette renders with allow_nan=False) — they coerce to null.
+NANQ="SELECT float8 'NaN' AS nanv, float8 'Infinity' AS infv, float8 '2.5' AS okv"
+NANP=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"table_query\",\"query_sql\":\"$NANQ\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$NANP")
+[ "$CODE" = "200" ] && pass "F3: NaN/Inf table_query resolves 200 (not 500)" || fail "F3 nan 200" "HTTP $CODE"
+NR=$(curl -sk "$BASE_URL/api/v1/public/$NANP")
+echo "$NR" | python3 -c 'import json,sys; r=json.load(sys.stdin)["rows"][0]; sys.exit(0 if (r["nanv"] is None and r["infv"] is None and r["okv"]==2.5) else 1)' 2>/dev/null \
+  && pass "F3: NaN/Inf → null, finite float preserved" || fail "F3 nan coercion" "$NR"
+
+# M3: an issued auth token is revoked immediately by unpublish — it bypasses only
+# the password check, never existence, so a deleted publication 404s even with a
+# still-live token.
+M3SLUG=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"password\":\"m3pass\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
+M3TOK=$(curl -sk -X POST "$BASE_URL/api/v1/public/$M3SLUG/auth" -H "Content-Type: application/json" \
+  -d '{"password":"m3pass"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$M3SLUG?token=$M3TOK")
+[ "$CODE" = "200" ] && pass "M3: token authorizes before unpublish" || fail "M3 token pre" "HTTP $CODE"
+acurl -X DELETE "$BASE_URL/api/v1/publications/$VAULT/$M3SLUG" > /dev/null
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$M3SLUG?token=$M3TOK")
+[ "$CODE" = "404" ] && pass "M3: same token → 404 after unpublish (immediate revocation)" || fail "M3 token revoke" "HTTP $CODE"
 
 # Re-snapshot (should overwrite, not error)
 RS_TQ=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \

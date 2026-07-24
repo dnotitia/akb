@@ -32,7 +32,8 @@ export function TableViewer({ slug, initialData }: Props) {
     }
     const urlParams = new URLSearchParams(window.location.search);
     urlParams.forEach((value, key) => {
-      if (key !== "format" && key !== "token" && key !== "password") {
+      // Exclude our control params (incl. the view-grant) from table bind params.
+      if (key !== "format" && key !== "token" && key !== "password" && key !== "grant") {
         init[key] = value;
       }
     });
