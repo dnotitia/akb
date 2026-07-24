@@ -1,6 +1,62 @@
 {
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/activity/{vault}": {
+      "get": {
+        "operationId": "activityList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbActivityEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/recent": {
+      "get": {
+        "operationId": "activityRecent",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbRecentChangesEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/history/{vault}/{doc_id}": {
+      "get": {
+        "operationId": "documentsHistory",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentHistoryEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/diff/{vault}/{doc_id}": {
+      "get": {
+        "operationId": "documentsDiff",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbDocumentDiffEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/browse/{vault}": {
       "get": {
         "operationId": "documentsBrowseVault",
@@ -61,6 +117,44 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/AkbDocumentWriteEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/collections/{vault}": {
+      "post": {
+        "operationId": "collectionsCreateCollection",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCollectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbCollectionCreateEnvelope" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/collections/{vault}/{path}": {
+      "delete": {
+        "operationId": "collectionsDeleteCollection",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AkbCollectionDeleteEnvelope" }
               }
             }
           }
@@ -222,6 +316,16 @@
       },
       "post": {
         "operationId": "graphLink",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -288,6 +392,16 @@
       },
       "post": {
         "operationId": "tablesPostVault",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTableRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -302,6 +416,86 @@
     "/api/v1/tables/{vault}/migrations": {
       "post": {
         "operationId": "tablesApplyMigration",
+        "parameters": [
+          {
+            "name": "vault",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Vault"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/TableAddColumnMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableAlterColumnMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableDropColumnMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableRenameColumnMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableAddUniqueKeyMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableDropUniqueKeyMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableAddIndexMigration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableDropIndexMigration"
+                    }
+                  ],
+                  "discriminator": {
+                    "propertyName": "op",
+                    "mapping": {
+                      "add_column": "#/components/schemas/TableAddColumnMigration",
+                      "add-column": "#/components/schemas/TableAddColumnMigration",
+                      "alter_column": "#/components/schemas/TableAlterColumnMigration",
+                      "alter-column": "#/components/schemas/TableAlterColumnMigration",
+                      "drop_column": "#/components/schemas/TableDropColumnMigration",
+                      "drop-column": "#/components/schemas/TableDropColumnMigration",
+                      "rename_column": "#/components/schemas/TableRenameColumnMigration",
+                      "rename-column": "#/components/schemas/TableRenameColumnMigration",
+                      "add_unique_key": "#/components/schemas/TableAddUniqueKeyMigration",
+                      "add-unique-key": "#/components/schemas/TableAddUniqueKeyMigration",
+                      "drop_unique_key": "#/components/schemas/TableDropUniqueKeyMigration",
+                      "drop-unique-key": "#/components/schemas/TableDropUniqueKeyMigration",
+                      "add_index": "#/components/schemas/TableAddIndexMigration",
+                      "add-index": "#/components/schemas/TableAddIndexMigration",
+                      "drop_index": "#/components/schemas/TableDropIndexMigration",
+                      "drop-index": "#/components/schemas/TableDropIndexMigration"
+                    }
+                  }
+                },
+                "title": "Operations"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -445,6 +639,16 @@
       },
       "patch": {
         "operationId": "tablesAlterTable",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlterTableRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -459,10 +663,167 @@
   },
   "components": {
     "schemas": {
+      "ActivityFileChange": {
+        "type": "object",
+        "required": ["path", "change"],
+        "properties": {
+          "path": { "type": "string" },
+          "change": { "type": "string", "enum": ["added", "deleted", "modified"] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "ActivityEntry": {
+        "type": "object",
+        "required": ["hash", "subject", "author", "date", "action", "summary", "agent", "files"],
+        "properties": {
+          "hash": { "type": "string" },
+          "subject": { "type": "string" },
+          "author": { "type": "string" },
+          "date": { "type": "string", "format": "date-time" },
+          "action": { "type": "string" },
+          "summary": { "type": "string" },
+          "agent": { "type": "string" },
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityFileChange" } },
+          "author_name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "RecentDocumentChange": {
+        "type": "object",
+        "required": ["doc_id", "vault", "path", "title", "type", "commit", "changed_at"],
+        "properties": {
+          "doc_id": { "type": "string" },
+          "vault": { "type": "string" },
+          "path": { "type": "string" },
+          "title": { "type": "string" },
+          "type": { "type": "string" },
+          "commit": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "changed_at": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "DocumentHistoryEntry": {
+        "type": "object",
+        "required": ["hash", "message", "author", "date"],
+        "properties": {
+          "hash": { "type": "string" },
+          "message": { "type": "string" },
+          "author": { "type": "string" },
+          "date": { "type": "string", "format": "date-time" },
+          "author_name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        },
+        "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
+      },
+      "AkbActivityEnvelope": {
+        "type": "object",
+        "required": ["kind", "vault", "total", "activity"],
+        "properties": {
+          "kind": { "type": "string", "const": "activity" },
+          "vault": { "type": "string" },
+          "total": { "type": "integer" },
+          "activity": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityEntry" } }
+        }
+      },
+      "AkbRecentChangesEnvelope": {
+        "type": "object",
+        "required": ["kind", "changes"],
+        "properties": {
+          "kind": { "type": "string", "const": "recent_changes" },
+          "changes": { "type": "array", "items": { "$ref": "#/components/schemas/RecentDocumentChange" } }
+        }
+      },
+      "AkbDocumentHistoryEnvelope": {
+        "type": "object",
+        "required": ["kind", "uri", "history"],
+        "properties": {
+          "kind": { "type": "string", "const": "document_history" },
+          "uri": { "type": "string" },
+          "history": { "type": "array", "items": { "$ref": "#/components/schemas/DocumentHistoryEntry" } }
+        }
+      },
+      "AkbDocumentDiffEnvelope": {
+        "type": "object",
+        "required": ["kind", "file", "commit", "type", "diff"],
+        "properties": {
+          "kind": { "type": "string", "const": "document_diff" },
+          "file": { "type": "string" },
+          "commit": { "type": "string" },
+          "type": { "type": "string", "enum": ["added", "deleted", "modified", "unknown", "unchanged"] },
+          "diff": { "type": "string" },
+          "error": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+        }
+      },
       "AkbDocumentEnvelope": {},
       "AkbDocumentWriteEnvelope": {},
       "AkbDrillDownEnvelope": {},
       "AkbError": {},
+      "CreateCollectionRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "CreateCollectionRequest"
+      },
+      "LinkRequest": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "relation": {
+            "type": "string",
+            "enum": [
+              "depends_on",
+              "related_to",
+              "implements",
+              "references",
+              "attached_to",
+              "derived_from"
+            ],
+            "title": "Relation"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target",
+          "relation"
+        ],
+        "title": "LinkRequest"
+      },
       "AkbFileEnvelope": {},
       "AkbGrepEnvelope": {},
       "AkbGraphNode": {
@@ -599,6 +960,1411 @@
           "current_commit": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
           "relations": { "type": "array", "items": { "$ref": "#/components/schemas/AkbRelation" } }
         }
+      },
+      "CreateTableRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/TableColumnSpec"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "collection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection"
+          },
+          "unique_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableUniqueKeySpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unique Keys"
+          },
+          "indexes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableIndexSpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indexes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "columns"
+        ],
+        "title": "CreateTableRequest"
+      },
+      "AlterTableRequest": {
+        "properties": {
+          "add_columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableColumnSpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Add Columns"
+          },
+          "alter_columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableAlterColumnSpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alter Columns"
+          },
+          "drop_columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Columns"
+          },
+          "rename_columns": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rename Columns"
+          },
+          "add_unique_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableUniqueKeySpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Add Unique Keys"
+          },
+          "drop_unique_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Unique Keys"
+          },
+          "add_indexes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TableIndexSpec"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Add Indexes"
+          },
+          "drop_indexes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Indexes"
+          }
+        },
+        "type": "object",
+        "title": "AlterTableRequest"
+      },
+      "TableColumnSpec": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required"
+          },
+          "default": {
+            "title": "Default"
+          },
+          "check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
+          "enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum"
+          },
+          "unique": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unique"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          },
+          "references": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "References"
+          },
+          "on_delete": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "On Delete"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TableColumnSpec"
+      },
+      "TableUniqueKeySpec": {
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "columns"
+        ],
+        "title": "TableUniqueKeySpec"
+      },
+      "TableIndexColumnSpec": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "order": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TableIndexColumnSpec"
+      },
+      "TableIndexSpec": {
+        "properties": {
+          "columns": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/TableIndexColumnSpec"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Columns"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "columns"
+        ],
+        "title": "TableIndexSpec"
+      },
+      "TableAlterColumnSpec": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "set_default": {
+            "title": "Set Default"
+          },
+          "default": {
+            "title": "Default"
+          },
+          "drop_default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Default"
+          },
+          "set_check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Check"
+          },
+          "check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
+          "drop_check": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Check"
+          },
+          "set_not_null": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Not Null"
+          },
+          "drop_not_null": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Not Null"
+          },
+          "set_enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Enum"
+          },
+          "enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum"
+          },
+          "rename_enum_values": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rename Enum Values"
+          },
+          "enum_renames": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum Renames"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TableAlterColumnSpec"
+      },
+      "TableNamedSpec": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TableNamedSpec"
+      },
+      "TableAddColumnMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "add_column",
+              "add-column"
+            ],
+            "title": "Op"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TableColumnSpec"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required"
+          },
+          "default": {
+            "title": "Default"
+          },
+          "check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
+          "enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum"
+          },
+          "unique": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unique"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          },
+          "references": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "References"
+          },
+          "on_delete": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "On Delete"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableAddColumnMigration"
+      },
+      "TableAlterColumnMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "alter_column",
+              "alter-column"
+            ],
+            "title": "Op"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TableAlterColumnSpec"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "set_default": {
+            "title": "Set Default"
+          },
+          "default": {
+            "title": "Default"
+          },
+          "drop_default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Default"
+          },
+          "set_check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Check"
+          },
+          "check": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Check"
+          },
+          "drop_check": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Check"
+          },
+          "set_not_null": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Not Null"
+          },
+          "drop_not_null": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drop Not Null"
+          },
+          "set_enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Enum"
+          },
+          "enum": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum"
+          },
+          "rename_enum_values": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rename Enum Values"
+          },
+          "enum_renames": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enum Renames"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableAlterColumnMigration"
+      },
+      "TableDropColumnMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "drop_column",
+              "drop-column"
+            ],
+            "title": "Op"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableDropColumnMigration"
+      },
+      "TableRenameColumnMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "rename_column",
+              "rename-column"
+            ],
+            "title": "Op"
+          },
+          "from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From"
+          },
+          "old_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Old Name"
+          },
+          "from_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Name"
+          },
+          "old": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Old"
+          },
+          "column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Column"
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To"
+          },
+          "new_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New Name"
+          },
+          "to_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Name"
+          },
+          "new": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableRenameColumnMigration"
+      },
+      "TableAddUniqueKeyMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "add_unique_key",
+              "add-unique-key"
+            ],
+            "title": "Op"
+          },
+          "unique_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TableUniqueKeySpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Columns"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableAddUniqueKeyMigration"
+      },
+      "TableDropUniqueKeyMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "drop_unique_key",
+              "drop-unique-key"
+            ],
+            "title": "Op"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "unique_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unique Key"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableDropUniqueKeyMigration"
+      },
+      "TableAddIndexMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "add_index",
+              "add-index"
+            ],
+            "title": "Op"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TableIndexSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "columns": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TableIndexColumnSpec"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Columns"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableAddIndexMigration"
+      },
+      "TableDropIndexMigration": {
+        "properties": {
+          "table": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table"
+          },
+          "table_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Name"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "drop_index",
+              "drop-index"
+            ],
+            "title": "Op"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/TableNamedSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "op"
+        ],
+        "title": "TableDropIndexMigration"
       },
       "AkbSearchEnvelope": {},
       "AkbSqlEnvelope": {},

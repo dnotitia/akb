@@ -222,6 +222,100 @@ export interface AkbGrepEnvelope {
   [key: string]: unknown;
 }
 
+export interface AkbCollectionSummary {
+  path: string;
+  name: string;
+  summary: string | null;
+  doc_count: number;
+}
+
+export interface AkbCollectionCreateEnvelope {
+  kind: "collection_create";
+  ok: true;
+  created: boolean;
+  collection: AkbCollectionSummary;
+}
+
+export interface AkbCollectionDeleteEnvelope {
+  kind: "collection_delete";
+  ok: true;
+  collection: string;
+  deleted_docs: number;
+  deleted_files: number;
+  deleted_sub_collections: number;
+  deleted_tables: number;
+}
+
+export interface AkbActivityFileChange {
+  path: string;
+  change: "added" | "deleted" | "modified";
+  [key: string]: unknown;
+}
+
+export interface AkbActivityEntry {
+  hash: string;
+  subject: string;
+  author: string;
+  date: string;
+  action: string;
+  summary: string;
+  agent: string;
+  files: AkbActivityFileChange[];
+  author_name?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbRecentDocumentChange {
+  doc_id: string;
+  vault: string;
+  path: string;
+  title: string;
+  type: string;
+  commit: string | null;
+  changed_at: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentHistoryEntry {
+  hash: string;
+  message: string;
+  author: string;
+  date: string;
+  author_name?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AkbActivityEnvelope {
+  kind: "activity";
+  vault: string;
+  total: number;
+  activity: AkbActivityEntry[];
+  [key: string]: unknown;
+}
+
+export interface AkbRecentChangesEnvelope {
+  kind: "recent_changes";
+  changes: AkbRecentDocumentChange[];
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentHistoryEnvelope {
+  kind: "document_history";
+  uri: string;
+  history: AkbDocumentHistoryEntry[];
+  [key: string]: unknown;
+}
+
+export interface AkbDocumentDiffEnvelope {
+  kind: "document_diff";
+  file: string;
+  commit: string;
+  type: "added" | "deleted" | "modified" | "unknown" | "unchanged";
+  diff: string;
+  error?: string | null;
+  [key: string]: unknown;
+}
+
 export interface AkbGraphNode {
   uri: string;
   name: string;
@@ -343,6 +437,12 @@ export type AkbSuccessEnvelope =
   | AkbSearchEnvelope
   | AkbDrillDownEnvelope
   | AkbGrepEnvelope
+  | AkbCollectionCreateEnvelope
+  | AkbCollectionDeleteEnvelope
+  | AkbActivityEnvelope
+  | AkbRecentChangesEnvelope
+  | AkbDocumentHistoryEnvelope
+  | AkbDocumentDiffEnvelope
   | AkbGraphNeighborsEnvelope
   | AkbGraphOverviewEnvelope
   | AkbGraphHealthEnvelope
@@ -351,9 +451,59 @@ export type AkbSuccessEnvelope =
   | AkbRelationUnlinkEnvelope
   | AkbProvenanceEnvelope;
 
+export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null };
+
+export type CreateCollectionRequest = { path: string; summary?: string | null };
+
+export type CreateTableRequest = { name: string; description?: string; columns: TableColumnSpec[]; collection?: string | null; unique_keys?: TableUniqueKeySpec[] | null; indexes?: TableIndexSpec[] | null };
+
+export type AlterTableRequest = { add_columns?: TableColumnSpec[] | null; alter_columns?: TableAlterColumnSpec[] | null; drop_columns?: string[] | null; rename_columns?: { [key: string]: string } | null; add_unique_keys?: TableUniqueKeySpec[] | null; drop_unique_keys?: string[] | null; add_indexes?: TableIndexSpec[] | null; drop_indexes?: string[] | null };
+
+export type TableColumnSpec = { name: string; type?: string | null; required?: boolean | null; default?: unknown; check?: { [key: string]: unknown } | null; enum?: unknown[] | null; unique?: boolean | null; index?: boolean | null; references?: { [key: string]: unknown } | null; on_delete?: string | null; [key: string]: unknown };
+
+export type TableUniqueKeySpec = { columns: string[]; name?: string | null; [key: string]: unknown };
+
+export type TableIndexColumnSpec = { name: string; order?: "asc" | "desc" | null; [key: string]: unknown };
+
+export type TableIndexSpec = { columns: (string | TableIndexColumnSpec)[]; name?: string | null; [key: string]: unknown };
+
+export type TableAlterColumnSpec = { name: string; set_default?: unknown; default?: unknown; drop_default?: boolean | null; set_check?: { [key: string]: unknown } | null; check?: { [key: string]: unknown } | null; drop_check?: boolean | null; set_not_null?: boolean | null; drop_not_null?: boolean | null; set_enum?: unknown[] | null; enum?: unknown[] | null; rename_enum_values?: { [key: string]: string } | null; enum_renames?: { [key: string]: string } | null; [key: string]: unknown };
+
+export type TableNamedSpec = { name: string; [key: string]: unknown };
+
+export type TableAddColumnMigration = { table?: string | null; table_name?: string | null; op: "add_column" | "add-column"; column?: TableColumnSpec | string | null; name?: string | null; type?: string | null; required?: boolean | null; default?: unknown; check?: { [key: string]: unknown } | null; enum?: unknown[] | null; unique?: boolean | null; index?: boolean | null; references?: { [key: string]: unknown } | null; on_delete?: string | null; [key: string]: unknown };
+
+export type TableAlterColumnMigration = { table?: string | null; table_name?: string | null; op: "alter_column" | "alter-column"; column?: TableAlterColumnSpec | string | null; name?: string | null; set_default?: unknown; default?: unknown; drop_default?: boolean | null; set_check?: { [key: string]: unknown } | null; check?: { [key: string]: unknown } | null; drop_check?: boolean | null; set_not_null?: boolean | null; drop_not_null?: boolean | null; set_enum?: unknown[] | null; enum?: unknown[] | null; rename_enum_values?: { [key: string]: string } | null; enum_renames?: { [key: string]: string } | null; [key: string]: unknown };
+
+export type TableDropColumnMigration = { table?: string | null; table_name?: string | null; op: "drop_column" | "drop-column"; name?: string | null; column?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableRenameColumnMigration = { table?: string | null; table_name?: string | null; op: "rename_column" | "rename-column"; from?: string | TableNamedSpec | null; old_name?: string | TableNamedSpec | null; from_name?: string | TableNamedSpec | null; old?: string | TableNamedSpec | null; column?: string | TableNamedSpec | null; to?: string | TableNamedSpec | null; new_name?: string | TableNamedSpec | null; to_name?: string | TableNamedSpec | null; new?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableAddUniqueKeyMigration = { table?: string | null; table_name?: string | null; op: "add_unique_key" | "add-unique-key"; unique_key?: TableUniqueKeySpec | null; name?: string | null; columns?: string[] | null; [key: string]: unknown };
+
+export type TableDropUniqueKeyMigration = { table?: string | null; table_name?: string | null; op: "drop_unique_key" | "drop-unique-key"; name?: string | null; unique_key?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableAddIndexMigration = { table?: string | null; table_name?: string | null; op: "add_index" | "add-index"; index?: TableIndexSpec | null; name?: string | null; columns?: (string | TableIndexColumnSpec)[] | null; [key: string]: unknown };
+
+export type TableDropIndexMigration = { table?: string | null; table_name?: string | null; op: "drop_index" | "drop-index"; name?: string | null; index?: string | TableNamedSpec | null; [key: string]: unknown };
+
+export type TableMigrationOperation = TableAddColumnMigration | TableAlterColumnMigration | TableDropColumnMigration | TableRenameColumnMigration | TableAddUniqueKeyMigration | TableDropUniqueKeyMigration | TableAddIndexMigration | TableDropIndexMigration;
+
 export interface paths {
+  "/api/v1/activity/{vault}": {
+    get: AkbOperation<"get", "/api/v1/activity/{vault}", { path: { vault: string } }, never, AkbActivityEnvelope>;
+  };
   "/api/v1/browse/{vault}": {
     get: AkbOperation<"get", "/api/v1/browse/{vault}", { path: { vault: string } }, never, AkbDocumentEnvelope>;
+  };
+  "/api/v1/collections/{vault}": {
+    post: AkbOperation<"post", "/api/v1/collections/{vault}", { path: { vault: string } }, CreateCollectionRequest, AkbCollectionCreateEnvelope>;
+  };
+  "/api/v1/collections/{vault}/{path}": {
+    delete: AkbOperation<"delete", "/api/v1/collections/{vault}/{path}", { path: { vault: string; path: string } }, never, AkbCollectionDeleteEnvelope>;
+  };
+  "/api/v1/diff/{vault}/{doc_id}": {
+    get: AkbOperation<"get", "/api/v1/diff/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentDiffEnvelope>;
   };
   "/api/v1/documents": {
     post: AkbOperation<"post", "/api/v1/documents", never, unknown, AkbDocumentWriteEnvelope>;
@@ -393,23 +543,29 @@ export interface paths {
   "/api/v1/grep": {
     get: AkbOperation<"get", "/api/v1/grep", never, never, AkbGrepEnvelope>;
   };
+  "/api/v1/history/{vault}/{doc_id}": {
+    get: AkbOperation<"get", "/api/v1/history/{vault}/{doc_id}", { path: { vault: string; doc_id: string } }, never, AkbDocumentHistoryEnvelope>;
+  };
   "/api/v1/provenance": {
     get: AkbOperation<"get", "/api/v1/provenance", never, never, AkbProvenanceEnvelope>;
+  };
+  "/api/v1/recent": {
+    get: AkbOperation<"get", "/api/v1/recent", never, never, AkbRecentChangesEnvelope>;
   };
   "/api/v1/relations": {
     delete: AkbOperation<"delete", "/api/v1/relations", never, never, AkbRelationUnlinkEnvelope>;
     get: AkbOperation<"get", "/api/v1/relations", never, never, AkbRelationsEnvelope>;
-    post: AkbOperation<"post", "/api/v1/relations", never, unknown, AkbRelationLinkEnvelope>;
+    post: AkbOperation<"post", "/api/v1/relations", never, LinkRequest, AkbRelationLinkEnvelope>;
   };
   "/api/v1/search": {
     get: AkbOperation<"get", "/api/v1/search", never, never, AkbSearchEnvelope>;
   };
   "/api/v1/tables/{vault}": {
     get: AkbOperation<"get", "/api/v1/tables/{vault}", { path: { vault: string } }, never, AkbTableEnvelope>;
-    post: AkbOperation<"post", "/api/v1/tables/{vault}", { path: { vault: string } }, unknown, AkbTableEnvelope>;
+    post: AkbOperation<"post", "/api/v1/tables/{vault}", { path: { vault: string } }, CreateTableRequest, AkbTableEnvelope>;
   };
   "/api/v1/tables/{vault}/migrations": {
-    post: AkbOperation<"post", "/api/v1/tables/{vault}/migrations", { path: { vault: string } }, unknown, AkbTableMigrationEnvelope>;
+    post: AkbOperation<"post", "/api/v1/tables/{vault}/migrations", { path: { vault: string }; header: { "Idempotency-Key": string } }, (TableAddColumnMigration | TableAlterColumnMigration | TableDropColumnMigration | TableRenameColumnMigration | TableAddUniqueKeyMigration | TableDropUniqueKeyMigration | TableAddIndexMigration | TableDropIndexMigration)[], AkbTableMigrationEnvelope>;
   };
   "/api/v1/tables/{vault}/schema": {
     get: AkbOperation<"get", "/api/v1/tables/{vault}/schema", { path: { vault: string } }, never, AkbVaultTableSchemaEnvelope>;
@@ -419,7 +575,7 @@ export interface paths {
   };
   "/api/v1/tables/{vault}/{table_name}": {
     delete: AkbOperation<"delete", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, never, AkbTableEnvelope>;
-    patch: AkbOperation<"patch", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, unknown, AkbTableEnvelope>;
+    patch: AkbOperation<"patch", "/api/v1/tables/{vault}/{table_name}", { path: { vault: string; table_name: string } }, AlterTableRequest, AkbTableEnvelope>;
   };
   "/api/v1/tables/{vault}/{table}/query": {
     post: AkbOperation<"post", "/api/v1/tables/{vault}/{table}/query", { path: { vault: string; table: string } }, unknown, AkbTableQueryEnvelope | null>;
@@ -436,7 +592,11 @@ export interface paths {
 }
 
 export interface operations {
+  activityList: paths["/api/v1/activity/{vault}"]["get"];
   documentsBrowseVault: paths["/api/v1/browse/{vault}"]["get"];
+  collectionsCreateCollection: paths["/api/v1/collections/{vault}"]["post"];
+  collectionsDeleteCollection: paths["/api/v1/collections/{vault}/{path}"]["delete"];
+  documentsDiff: paths["/api/v1/diff/{vault}/{doc_id}"]["get"];
   documentsPutDocument: paths["/api/v1/documents"]["post"];
   documentsDeleteDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["delete"];
   documentsGetDocument: paths["/api/v1/documents/{vault}/{doc_id}"]["get"];
@@ -451,7 +611,9 @@ export interface operations {
   graphHealth: paths["/api/v1/graph/health"]["get"];
   graphOverview: paths["/api/v1/graph/overview"]["get"];
   searchGrepDocuments: paths["/api/v1/grep"]["get"];
+  documentsHistory: paths["/api/v1/history/{vault}/{doc_id}"]["get"];
   graphProvenance: paths["/api/v1/provenance"]["get"];
+  activityRecent: paths["/api/v1/recent"]["get"];
   graphUnlink: paths["/api/v1/relations"]["delete"];
   graphRelations: paths["/api/v1/relations"]["get"];
   graphLink: paths["/api/v1/relations"]["post"];
@@ -484,6 +646,35 @@ export interface components {
     AkbFileEnvelope: AkbFileEnvelope;
     AkbDocumentEnvelope: AkbDocumentEnvelope;
     AkbDocumentWriteEnvelope: AkbDocumentWriteEnvelope;
+    AkbCollectionSummary: AkbCollectionSummary;
+    AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;
+    AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;
+    LinkRequest: LinkRequest;
+    CreateCollectionRequest: CreateCollectionRequest;
+    CreateTableRequest: CreateTableRequest;
+    AlterTableRequest: AlterTableRequest;
+    TableColumnSpec: TableColumnSpec;
+    TableUniqueKeySpec: TableUniqueKeySpec;
+    TableIndexColumnSpec: TableIndexColumnSpec;
+    TableIndexSpec: TableIndexSpec;
+    TableAlterColumnSpec: TableAlterColumnSpec;
+    TableNamedSpec: TableNamedSpec;
+    TableAddColumnMigration: TableAddColumnMigration;
+    TableAlterColumnMigration: TableAlterColumnMigration;
+    TableDropColumnMigration: TableDropColumnMigration;
+    TableRenameColumnMigration: TableRenameColumnMigration;
+    TableAddUniqueKeyMigration: TableAddUniqueKeyMigration;
+    TableDropUniqueKeyMigration: TableDropUniqueKeyMigration;
+    TableAddIndexMigration: TableAddIndexMigration;
+    TableDropIndexMigration: TableDropIndexMigration;
+    ActivityFileChange: AkbActivityFileChange;
+    ActivityEntry: AkbActivityEntry;
+    RecentDocumentChange: AkbRecentDocumentChange;
+    DocumentHistoryEntry: AkbDocumentHistoryEntry;
+    AkbActivityEnvelope: AkbActivityEnvelope;
+    AkbRecentChangesEnvelope: AkbRecentChangesEnvelope;
+    AkbDocumentHistoryEnvelope: AkbDocumentHistoryEnvelope;
+    AkbDocumentDiffEnvelope: AkbDocumentDiffEnvelope;
     AkbSearchEnvelope: AkbSearchEnvelope;
     AkbDrillDownEnvelope: AkbDrillDownEnvelope;
     AkbGrepEnvelope: AkbGrepEnvelope;

@@ -1,9 +1,9 @@
 """REST API routes for vault tables (structured data)."""
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, Response
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field, TypeAdapter
 from pydantic_core import to_json
 
 from app.api.deps import get_current_user
@@ -54,28 +54,179 @@ _SERVICE_ERROR_STATUS = {
 }
 
 
+class TableRequestModel(NFCModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class TableColumnSpec(TableRequestModel):
+    name: str
+    type: str | None = None
+    required: bool | None = None
+    default: Any = None
+    check: dict[str, Any] | None = None
+    enum: list[Any] | None = None
+    unique: bool | None = None
+    index: bool | None = None
+    references: dict[str, Any] | None = None
+    on_delete: str | None = None
+
+
+class TableUniqueKeySpec(TableRequestModel):
+    columns: list[str]
+    name: str | None = None
+
+
+class TableIndexColumnSpec(TableRequestModel):
+    name: str
+    order: Literal["asc", "desc"] | None = None
+
+
+class TableIndexSpec(TableRequestModel):
+    columns: list[str | TableIndexColumnSpec]
+    name: str | None = None
+
+
+class TableAlterColumnSpec(TableRequestModel):
+    name: str
+    set_default: Any = None
+    default: Any = None
+    drop_default: bool | None = None
+    set_check: dict[str, Any] | None = None
+    check: dict[str, Any] | None = None
+    drop_check: bool | None = None
+    set_not_null: bool | None = None
+    drop_not_null: bool | None = None
+    set_enum: list[Any] | None = None
+    enum: list[Any] | None = None
+    rename_enum_values: dict[str, str] | None = None
+    enum_renames: dict[str, str] | None = None
+
+
 class CreateTableRequest(NFCModel):
     name: str
     description: str = ""
-    columns: list[dict]
+    columns: list[TableColumnSpec]
     collection: str | None = None
     # Declarative unique keys / indexes (#215). Optional; mirror the MCP
     # akb_create_table surface so REST/web clients can WRITE them, not
     # just READ them back via list_tables. ValidationError/ConflictError
     # from the service map to 422/409 via the global AKBError handler.
-    unique_keys: list[dict] | None = None
-    indexes: list[dict] | None = None
+    unique_keys: list[TableUniqueKeySpec] | None = None
+    indexes: list[TableIndexSpec] | None = None
 
 
 class AlterTableRequest(NFCModel):
-    add_columns: list[dict] | None = None
-    alter_columns: list[dict] | None = None
+    add_columns: list[TableColumnSpec] | None = None
+    alter_columns: list[TableAlterColumnSpec] | None = None
     drop_columns: list[str] | None = None
     rename_columns: dict[str, str] | None = None
-    add_unique_keys: list[dict] | None = None
+    add_unique_keys: list[TableUniqueKeySpec] | None = None
     drop_unique_keys: list[str] | None = None
-    add_indexes: list[dict] | None = None
+    add_indexes: list[TableIndexSpec] | None = None
     drop_indexes: list[str] | None = None
+
+
+class TableMigrationBase(TableRequestModel):
+    table: str | None = None
+    table_name: str | None = None
+
+
+class TableNamedSpec(TableRequestModel):
+    name: str
+
+
+class TableAddColumnMigration(TableMigrationBase):
+    op: Literal["add_column", "add-column"]
+    column: TableColumnSpec | str | None = None
+    name: str | None = None
+    type: str | None = None
+    required: bool | None = None
+    default: Any = None
+    check: dict[str, Any] | None = None
+    enum: list[Any] | None = None
+    unique: bool | None = None
+    index: bool | None = None
+    references: dict[str, Any] | None = None
+    on_delete: str | None = None
+
+
+class TableAlterColumnMigration(TableMigrationBase):
+    op: Literal["alter_column", "alter-column"]
+    column: TableAlterColumnSpec | str | None = None
+    name: str | None = None
+    set_default: Any = None
+    default: Any = None
+    drop_default: bool | None = None
+    set_check: dict[str, Any] | None = None
+    check: dict[str, Any] | None = None
+    drop_check: bool | None = None
+    set_not_null: bool | None = None
+    drop_not_null: bool | None = None
+    set_enum: list[Any] | None = None
+    enum: list[Any] | None = None
+    rename_enum_values: dict[str, str] | None = None
+    enum_renames: dict[str, str] | None = None
+
+
+class TableDropColumnMigration(TableMigrationBase):
+    op: Literal["drop_column", "drop-column"]
+    name: str | None = None
+    column: str | TableNamedSpec | None = None
+
+
+class TableRenameColumnMigration(TableMigrationBase):
+    op: Literal["rename_column", "rename-column"]
+    from_: str | TableNamedSpec | None = Field(default=None, alias="from")
+    old_name: str | TableNamedSpec | None = None
+    from_name: str | TableNamedSpec | None = None
+    old: str | TableNamedSpec | None = None
+    column: str | TableNamedSpec | None = None
+    to: str | TableNamedSpec | None = None
+    new_name: str | TableNamedSpec | None = None
+    to_name: str | TableNamedSpec | None = None
+    new: str | TableNamedSpec | None = None
+
+
+class TableAddUniqueKeyMigration(TableMigrationBase):
+    op: Literal["add_unique_key", "add-unique-key"]
+    unique_key: TableUniqueKeySpec | None = None
+    name: str | None = None
+    columns: list[str] | None = None
+
+
+class TableDropUniqueKeyMigration(TableMigrationBase):
+    op: Literal["drop_unique_key", "drop-unique-key"]
+    name: str | None = None
+    unique_key: str | TableNamedSpec | None = None
+
+
+class TableAddIndexMigration(TableMigrationBase):
+    op: Literal["add_index", "add-index"]
+    index: TableIndexSpec | None = None
+    name: str | None = None
+    columns: list[str | TableIndexColumnSpec] | None = None
+
+
+class TableDropIndexMigration(TableMigrationBase):
+    op: Literal["drop_index", "drop-index"]
+    name: str | None = None
+    index: str | TableNamedSpec | None = None
+
+
+TableMigrationOperation = Annotated[
+    TableAddColumnMigration
+    | TableAlterColumnMigration
+    | TableDropColumnMigration
+    | TableRenameColumnMigration
+    | TableAddUniqueKeyMigration
+    | TableDropUniqueKeyMigration
+    | TableAddIndexMigration
+    | TableDropIndexMigration,
+    Field(discriminator="op"),
+]
+TableMigrationOperationAdapter: TypeAdapter[TableMigrationOperation] = TypeAdapter(
+    TableMigrationOperation
+)
 
 
 class SqlRequest(NFCModel):
@@ -110,11 +261,12 @@ class TableQueryResponse(NFCModel):
 @router.post("/tables/{vault}", summary="Create a table in a vault")
 async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
+    payload = req.model_dump(exclude_unset=True)
     return await table_service.create_table(
-        access["vault_id"], req.name, req.columns,
-        actor_id=user.username, description=req.description,
-        collection=req.collection,
-        unique_keys=req.unique_keys, indexes=req.indexes,
+        access["vault_id"], req.name, payload["columns"],
+        actor_id=user.username, description=payload.get("description", req.description),
+        collection=payload.get("collection"),
+        unique_keys=payload.get("unique_keys"), indexes=payload.get("indexes"),
     )
 
 
@@ -142,7 +294,7 @@ async def get_vault_schema(vault: str, user: AuthenticatedUser = Depends(get_cur
 )
 async def apply_table_migration(
     vault: str,
-    operations: list[dict] = Body(...),
+    operations: list[TableMigrationOperation] = Body(...),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
@@ -151,7 +303,10 @@ async def apply_table_migration(
         access["vault_id"],
         actor_id=user.username,
         idempotency_key=idempotency_key,
-        operations=operations,
+        operations=[
+            operation.model_dump(exclude_unset=True, by_alias=True)
+            for operation in operations
+        ],
     )
 
 
@@ -180,20 +335,21 @@ async def alter_table(
     req: AlterTableRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    # REST BaaS schema changes are a writer-level surface by AKB-034/067;
-    # the legacy MCP alter tool keeps its stricter admin gate.
-    access = await check_vault_access(user.user_id, vault, required_role="writer")
+    # Keep REST aligned with MCP's fail-closed policy until alter operations
+    # are classified into destructive and non-destructive permission tiers.
+    access = await check_vault_access(user.user_id, vault, required_role="admin")
+    payload = req.model_dump(exclude_unset=True)
     return await table_service.alter_table(
         access["vault_id"], table_name,
         actor_id=user.username,
-        add_columns=req.add_columns,
-        alter_columns=req.alter_columns,
-        drop_columns=req.drop_columns,
-        rename_columns=req.rename_columns,
-        add_unique_keys=req.add_unique_keys,
-        drop_unique_keys=req.drop_unique_keys,
-        add_indexes=req.add_indexes,
-        drop_indexes=req.drop_indexes,
+        add_columns=payload.get("add_columns"),
+        alter_columns=payload.get("alter_columns"),
+        drop_columns=payload.get("drop_columns"),
+        rename_columns=payload.get("rename_columns"),
+        add_unique_keys=payload.get("add_unique_keys"),
+        drop_unique_keys=payload.get("drop_unique_keys"),
+        add_indexes=payload.get("add_indexes"),
+        drop_indexes=payload.get("drop_indexes"),
     )
 
 
@@ -456,7 +612,11 @@ def _raise_service_error(result: Any) -> Any:
     )
 
 
-@router.delete("/tables/{vault}/{table_name}", summary="Drop a table")
+@router.delete(
+    "/tables/{vault}/{table_name}",
+    summary="Drop a table",
+    operation_id="tablesDeleteTableName",
+)
 async def drop_table(vault: str, table_name: str, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="admin")
     return await table_service.drop_table(

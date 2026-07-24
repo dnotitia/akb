@@ -1,5 +1,34 @@
 type JsonObject = Record<string, unknown>;
 
+const JSON_REQUEST_BODY_OPERATION_IDS = new Set([
+  "graphLink",
+  "collectionsCreateCollection",
+  "tablesPostVault",
+  "tablesAlterTable",
+  "tablesApplyMigration",
+]);
+
+const REQUEST_COMPONENTS = [
+  "LinkRequest",
+  "CreateCollectionRequest",
+  "CreateTableRequest",
+  "AlterTableRequest",
+  "TableColumnSpec",
+  "TableUniqueKeySpec",
+  "TableIndexColumnSpec",
+  "TableIndexSpec",
+  "TableAlterColumnSpec",
+  "TableNamedSpec",
+  "TableAddColumnMigration",
+  "TableAlterColumnMigration",
+  "TableDropColumnMigration",
+  "TableRenameColumnMigration",
+  "TableAddUniqueKeyMigration",
+  "TableDropUniqueKeyMigration",
+  "TableAddIndexMigration",
+  "TableDropIndexMigration",
+] as const;
+
 const RESPONSE_TYPE_BY_SCHEMA = new Map<string, string>([
   ["AkbTableEnvelope", "AkbTableEnvelope"],
   ["AkbTableMigrationEnvelope", "AkbTableMigrationEnvelope"],
@@ -11,6 +40,12 @@ const RESPONSE_TYPE_BY_SCHEMA = new Map<string, string>([
   ["AkbFileEnvelope", "AkbFileEnvelope"],
   ["AkbDocumentEnvelope", "AkbDocumentEnvelope"],
   ["AkbDocumentWriteEnvelope", "AkbDocumentWriteEnvelope"],
+  ["AkbCollectionCreateEnvelope", "AkbCollectionCreateEnvelope"],
+  ["AkbCollectionDeleteEnvelope", "AkbCollectionDeleteEnvelope"],
+  ["AkbActivityEnvelope", "AkbActivityEnvelope"],
+  ["AkbRecentChangesEnvelope", "AkbRecentChangesEnvelope"],
+  ["AkbDocumentHistoryEnvelope", "AkbDocumentHistoryEnvelope"],
+  ["AkbDocumentDiffEnvelope", "AkbDocumentDiffEnvelope"],
   ["AkbSearchEnvelope", "AkbSearchEnvelope"],
   ["AkbDrillDownEnvelope", "AkbDrillDownEnvelope"],
   ["AkbGrepEnvelope", "AkbGrepEnvelope"],
@@ -39,6 +74,8 @@ export function generateCoreTypes(openapi: unknown): string {
     "",
     ...schemaLines(),
     "",
+    ...requestSchemaLines(spec),
+    "",
     "export interface paths {",
     ...renderPathOperations(operations),
     "}",
@@ -62,6 +99,18 @@ export function generateCoreTypes(openapi: unknown): string {
     "    AkbFileEnvelope: AkbFileEnvelope;",
     "    AkbDocumentEnvelope: AkbDocumentEnvelope;",
     "    AkbDocumentWriteEnvelope: AkbDocumentWriteEnvelope;",
+    "    AkbCollectionSummary: AkbCollectionSummary;",
+    "    AkbCollectionCreateEnvelope: AkbCollectionCreateEnvelope;",
+    "    AkbCollectionDeleteEnvelope: AkbCollectionDeleteEnvelope;",
+    ...REQUEST_COMPONENTS.map((name) => `    ${name}: ${name};`),
+    "    ActivityFileChange: AkbActivityFileChange;",
+    "    ActivityEntry: AkbActivityEntry;",
+    "    RecentDocumentChange: AkbRecentDocumentChange;",
+    "    DocumentHistoryEntry: AkbDocumentHistoryEntry;",
+    "    AkbActivityEnvelope: AkbActivityEnvelope;",
+    "    AkbRecentChangesEnvelope: AkbRecentChangesEnvelope;",
+    "    AkbDocumentHistoryEnvelope: AkbDocumentHistoryEnvelope;",
+    "    AkbDocumentDiffEnvelope: AkbDocumentDiffEnvelope;",
     "    AkbSearchEnvelope: AkbSearchEnvelope;",
     "    AkbDrillDownEnvelope: AkbDrillDownEnvelope;",
     "    AkbGrepEnvelope: AkbGrepEnvelope;",
@@ -84,9 +133,23 @@ export function generateCoreTypes(openapi: unknown): string {
 
 function collectOperations(
   spec: JsonObject,
-): Array<{ path: string; method: string; operationId: string; responseType: string }> {
+): Array<{
+  path: string;
+  method: string;
+  operationId: string;
+  parameterType: string;
+  requestBodyType: string;
+  responseType: string;
+}> {
   const paths = expectObject(spec.paths, "paths");
-  const out: Array<{ path: string; method: string; operationId: string; responseType: string }> = [];
+  const out: Array<{
+    path: string;
+    method: string;
+    operationId: string;
+    parameterType: string;
+    requestBodyType: string;
+    responseType: string;
+  }> = [];
   for (const path of Object.keys(paths).sort()) {
     const pathItem = expectObject(paths[path], `paths.${path}`);
     for (const method of Object.keys(pathItem).sort()) {
@@ -97,6 +160,8 @@ function collectOperations(
         path,
         method,
         operationId,
+        parameterType: parameterType(path, operation),
+        requestBodyType: requestBodyType(method, operationId, operation),
         responseType: responseType(operation),
       });
     }
@@ -105,12 +170,31 @@ function collectOperations(
 }
 
 function renderPathOperations(
-  operations: Array<{ path: string; method: string; responseType: string }>,
+  operations: Array<{
+    path: string;
+    method: string;
+    parameterType: string;
+    requestBodyType: string;
+    responseType: string;
+  }>,
 ): string[] {
-  const byPath = new Map<string, Array<{ method: string; responseType: string }>>();
+  const byPath = new Map<
+    string,
+    Array<{
+      method: string;
+      parameterType: string;
+      requestBodyType: string;
+      responseType: string;
+    }>
+  >();
   for (const operation of operations) {
     const methods = byPath.get(operation.path) ?? [];
-    methods.push({ method: operation.method, responseType: operation.responseType });
+    methods.push({
+      method: operation.method,
+      parameterType: operation.parameterType,
+      requestBodyType: operation.requestBodyType,
+      responseType: operation.responseType,
+    });
     byPath.set(operation.path, methods);
   }
 
@@ -119,7 +203,7 @@ function renderPathOperations(
     lines.push(`  ${tsLiteral(path)}: {`);
     for (const method of methods) {
       lines.push(
-        `    ${method.method}: AkbOperation<${tsLiteral(method.method)}, ${tsLiteral(path)}, ${pathParameterType(path)}, ${requestBodyType(method.method)}, ${method.responseType}>;`,
+        `    ${method.method}: AkbOperation<${tsLiteral(method.method)}, ${tsLiteral(path)}, ${method.parameterType}, ${method.requestBodyType}, ${method.responseType}>;`,
       );
     }
     lines.push("  };");
@@ -147,14 +231,143 @@ function responseType(operation: JsonObject): string {
   return jsonType ?? "AkbSuccessEnvelope";
 }
 
-function pathParameterType(path: string): string {
+function parameterType(path: string, operation: JsonObject): string {
   const names = Array.from(path.matchAll(/\{([^}]+)\}/g), (match) => match[1]);
-  if (names.length === 0) return "never";
-  return `{ path: { ${names.map((name) => `${tsKey(name)}: string`).join("; ")} } }`;
+  const parts: string[] = [];
+  if (names.length > 0) {
+    parts.push(`path: { ${names.map((name) => `${tsKey(name)}: string`).join("; ")} }`);
+  }
+
+  const parameters = Array.isArray(operation.parameters) ? operation.parameters : [];
+  const headers = parameters
+    .map(expectOptionalObject)
+    .filter((parameter): parameter is JsonObject => parameter?.in === "header")
+    .map((parameter) => {
+      const name = stringProp(parameter, "name");
+      if (!name) throw new TypeError("Header parameter is missing a name.");
+      const optional = parameter.required === true ? "" : "?";
+      return `${tsKey(name)}${optional}: ${renderSchema(expectOptionalObject(parameter.schema) ?? {})}`;
+    });
+  if (headers.length > 0) parts.push(`header: { ${headers.join("; ")} }`);
+
+  return parts.length > 0 ? `{ ${parts.join("; ")} }` : "never";
 }
 
-function requestBodyType(method: string): string {
-  return method === "get" || method === "delete" ? "never" : "unknown";
+function requestBodyType(method: string, operationId: string, operation: JsonObject): string {
+  if (method === "get" || method === "delete") return "never";
+  if (!JSON_REQUEST_BODY_OPERATION_IDS.has(operationId)) return "unknown";
+  const requestBody = expectOptionalObject(operation.requestBody);
+  const content = expectOptionalObject(requestBody?.content);
+  const media = expectOptionalObject(content?.["application/json"]);
+  const schema = expectOptionalObject(media?.schema);
+  return schema ? renderSchema(schema) : "unknown";
+}
+
+function requestSchemaLines(spec: JsonObject): string[] {
+  const components = expectObject(spec.components, "components");
+  const schemas = expectObject(components.schemas, "components.schemas");
+  const lines: string[] = [];
+  for (const name of REQUEST_COMPONENTS) {
+    const schema = expectObject(schemas[name], `components.schemas.${name}`);
+    lines.push(`export type ${name} = ${renderSchema(schema)};`, "");
+  }
+
+  const paths = expectObject(spec.paths, "paths");
+  const migrationPath = expectObject(
+    paths["/api/v1/tables/{vault}/migrations"],
+    "migration path",
+  );
+  const migrationPost = expectObject(migrationPath.post, "migration post");
+  const requestBody = expectObject(migrationPost.requestBody, "migration request body");
+  const content = expectObject(requestBody.content, "migration request content");
+  const media = expectObject(content["application/json"], "migration JSON request");
+  const bodySchema = expectObject(media.schema, "migration request schema");
+  const items = expectObject(bodySchema.items, "migration operation items");
+  lines.push(`export type TableMigrationOperation = ${renderSchema(items)};`);
+  return lines;
+}
+
+function renderSchema(schema: JsonObject): string {
+  const ref = stringProp(schema, "$ref");
+  if (ref) return ref.split("/").at(-1) ?? "unknown";
+
+  const nullable = schema.nullable === true || schemaHasNull(schema);
+  const enumValues = Array.isArray(schema.enum) ? schema.enum : null;
+  if (enumValues && enumValues.length > 0) {
+    const rendered = enumValues.map(renderLiteral).join(" | ");
+    return nullable ? `${rendered} | null` : rendered;
+  }
+  if ("const" in schema) {
+    const rendered = renderLiteral(schema.const);
+    return nullable ? `${rendered} | null` : rendered;
+  }
+
+  const union = Array.isArray(schema.oneOf)
+    ? schema.oneOf
+    : Array.isArray(schema.anyOf)
+      ? schema.anyOf
+      : null;
+  if (union) {
+    return Array.from(
+      new Set(
+        union.map((item) => renderSchema(expectObject(item, "union schema"))),
+      ),
+    ).join(" | ");
+  }
+
+  if (schema.type === "null") return "null";
+  if (schema.type === "string") return nullable ? "string | null" : "string";
+  if (schema.type === "integer" || schema.type === "number") {
+    return nullable ? "number | null" : "number";
+  }
+  if (schema.type === "boolean") return nullable ? "boolean | null" : "boolean";
+  if (schema.type === "array") {
+    const item = renderSchema(expectOptionalObject(schema.items) ?? {});
+    const rendered = `${needsParens(item) ? `(${item})` : item}[]`;
+    return nullable ? `${rendered} | null` : rendered;
+  }
+  if (schema.type === "object" || schema.properties || schema.additionalProperties !== undefined) {
+    const properties = expectOptionalObject(schema.properties) ?? {};
+    const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const fields = Object.keys(properties).map((name) => {
+      const optional = required.has(name) ? "" : "?";
+      return `${tsKey(name)}${optional}: ${renderSchema(expectObject(properties[name], name))}`;
+    });
+    if (schema.additionalProperties === true) {
+      fields.push("[key: string]: unknown");
+    } else {
+      const additional = expectOptionalObject(schema.additionalProperties);
+      if (additional) fields.push(`[key: string]: ${renderSchema(additional)}`);
+    }
+    return fields.length > 0 ? `{ ${fields.join("; ")} }` : "Record<string, unknown>";
+  }
+  return "unknown";
+}
+
+function schemaHasNull(schema: JsonObject): boolean {
+  const variants = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : [];
+  return variants.some((item) => expectOptionalObject(item)?.type === "null");
+}
+
+function renderLiteral(value: unknown): string {
+  if (
+    typeof value === "string"
+    || typeof value === "number"
+    || typeof value === "boolean"
+    || value === null
+  ) {
+    const literal = JSON.stringify(value);
+    if (literal !== undefined) return literal;
+  }
+  return "unknown";
+}
+
+function needsParens(type: string): boolean {
+  return type.includes(" | ") || type.includes(" & ");
 }
 
 function schemaLines(): string[] {
@@ -374,6 +587,100 @@ function schemaLines(): string[] {
     "  [key: string]: unknown;",
     "}",
     "",
+    "export interface AkbCollectionSummary {",
+    "  path: string;",
+    "  name: string;",
+    "  summary: string | null;",
+    "  doc_count: number;",
+    "}",
+    "",
+    "export interface AkbCollectionCreateEnvelope {",
+    "  kind: \"collection_create\";",
+    "  ok: true;",
+    "  created: boolean;",
+    "  collection: AkbCollectionSummary;",
+    "}",
+    "",
+    "export interface AkbCollectionDeleteEnvelope {",
+    "  kind: \"collection_delete\";",
+    "  ok: true;",
+    "  collection: string;",
+    "  deleted_docs: number;",
+    "  deleted_files: number;",
+    "  deleted_sub_collections: number;",
+    "  deleted_tables: number;",
+    "}",
+    "",
+    "export interface AkbActivityFileChange {",
+    "  path: string;",
+    "  change: \"added\" | \"deleted\" | \"modified\";",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbActivityEntry {",
+    "  hash: string;",
+    "  subject: string;",
+    "  author: string;",
+    "  date: string;",
+    "  action: string;",
+    "  summary: string;",
+    "  agent: string;",
+    "  files: AkbActivityFileChange[];",
+    "  author_name?: string | null;",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbRecentDocumentChange {",
+    "  doc_id: string;",
+    "  vault: string;",
+    "  path: string;",
+    "  title: string;",
+    "  type: string;",
+    "  commit: string | null;",
+    "  changed_at: string | null;",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbDocumentHistoryEntry {",
+    "  hash: string;",
+    "  message: string;",
+    "  author: string;",
+    "  date: string;",
+    "  author_name?: string | null;",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbActivityEnvelope {",
+    "  kind: \"activity\";",
+    "  vault: string;",
+    "  total: number;",
+    "  activity: AkbActivityEntry[];",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbRecentChangesEnvelope {",
+    "  kind: \"recent_changes\";",
+    "  changes: AkbRecentDocumentChange[];",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbDocumentHistoryEnvelope {",
+    "  kind: \"document_history\";",
+    "  uri: string;",
+    "  history: AkbDocumentHistoryEntry[];",
+    "  [key: string]: unknown;",
+    "}",
+    "",
+    "export interface AkbDocumentDiffEnvelope {",
+    "  kind: \"document_diff\";",
+    "  file: string;",
+    "  commit: string;",
+    "  type: \"added\" | \"deleted\" | \"modified\" | \"unknown\" | \"unchanged\";",
+    "  diff: string;",
+    "  error?: string | null;",
+    "  [key: string]: unknown;",
+    "}",
+    "",
     "export interface AkbGraphNode {",
     "  uri: string;",
     "  name: string;",
@@ -495,6 +802,12 @@ function schemaLines(): string[] {
     "  | AkbSearchEnvelope",
     "  | AkbDrillDownEnvelope",
     "  | AkbGrepEnvelope",
+    "  | AkbCollectionCreateEnvelope",
+    "  | AkbCollectionDeleteEnvelope",
+    "  | AkbActivityEnvelope",
+    "  | AkbRecentChangesEnvelope",
+    "  | AkbDocumentHistoryEnvelope",
+    "  | AkbDocumentDiffEnvelope",
     "  | AkbGraphNeighborsEnvelope",
     "  | AkbGraphOverviewEnvelope",
     "  | AkbGraphHealthEnvelope",

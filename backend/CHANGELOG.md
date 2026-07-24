@@ -7,6 +7,12 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+REST table schema alteration now requires the `admin` role, matching the MCP
+`akb_alter_table` authorization boundary. This closes the route-dependent
+permission gap that allowed a `writer` to perform destructive operations such
+as dropping a column through REST while the equivalent MCP call was denied.
+Operation-level writer/admin permission tiers remain a follow-up design change.
+
 Vault names now accept only single hyphens between lowercase alphanumeric
 segments (no leading, trailing, or consecutive hyphens). Hyphens map to
 underscores inside physical vault-table names and `__` separates the vault

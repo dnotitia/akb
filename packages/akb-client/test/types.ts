@@ -5,7 +5,19 @@ import {
   type AkbResult,
   type AkbSuccessEnvelope,
   type AkbClient,
+  type AkbActivityEnvelope,
+  type AkbActivityListOptions,
+  type AkbActivityRecentOptions,
+  type AkbCollectionCreateEnvelope,
+  type AkbCollectionDeleteEnvelope,
+  type AkbCollectionSummary,
+  type AkbCreateCollectionInput,
+  type AkbDeleteCollectionOptions,
   type AkbDocumentEnvelope,
+  type AkbDocumentDiffEnvelope,
+  type AkbDocumentDiffOptions,
+  type AkbDocumentHistoryEnvelope,
+  type AkbDocumentHistoryOptions,
   type AkbDocumentPutInput,
   type AkbDocumentWriteEnvelope,
   type AkbGraphEnvelope,
@@ -22,12 +34,15 @@ import {
   type AkbWritableRelationType,
   type AkbOperationResponse,
   type AkbStorageUploadOptions,
+  type AlterTableRequest,
+  type CreateTableRequest,
+  type TableMigrationOperation,
   type operations,
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
 import type { AkbSchema } from "./fixtures/akb.types.ts";
 
-type TableQueryEnvelope = AkbSuccessEnvelope & {
+type TableQueryEnvelope = {
   kind: "table_query";
   columns: string[];
   items: Array<{ id: string }>;
@@ -162,6 +177,36 @@ const grepResult = await typedClient.vault("eng").search.grep("needle", {
 grepResult.throwOnError().data.kind satisfies "grep";
 grepResult.throwOnError().data.files?.at(0) satisfies string | undefined;
 const docs = typedClient.vault("eng").docs;
+const createCollectionInput: AkbCreateCollectionInput = { path: "guides/api", summary: null };
+const deleteCollectionOptions: AkbDeleteCollectionOptions = { recursive: true };
+const createdCollection = await docs.createCollection(createCollectionInput);
+const collectionCreateLeaf: AkbCollectionCreateEnvelope = createdCollection.throwOnError().data;
+collectionCreateLeaf.kind satisfies "collection_create";
+collectionCreateLeaf.created satisfies boolean;
+const collectionSummary: AkbCollectionSummary = collectionCreateLeaf.collection;
+collectionSummary.summary satisfies string | null;
+collectionSummary.doc_count satisfies number;
+const deletedCollection = await docs.deleteCollection("guides/api", deleteCollectionOptions);
+const collectionDeleteLeaf: AkbCollectionDeleteEnvelope = deletedCollection.throwOnError().data;
+collectionDeleteLeaf.kind satisfies "collection_delete";
+collectionDeleteLeaf.deleted_docs satisfies number;
+collectionDeleteLeaf.deleted_files satisfies number;
+collectionDeleteLeaf.deleted_sub_collections satisfies number;
+collectionDeleteLeaf.deleted_tables satisfies number;
+type CollectionCreateOperation = AkbOperationResponse<operations["collectionsCreateCollection"]>;
+type CollectionDeleteOperation = AkbOperationResponse<operations["collectionsDeleteCollection"]>;
+collectionCreateLeaf satisfies CollectionCreateOperation;
+collectionDeleteLeaf satisfies CollectionDeleteOperation;
+declare const collectionSuccess: import("../src/core/schema.gen.js").AkbSuccessEnvelope;
+if (collectionSuccess.kind === "collection_create") {
+  collectionSuccess.collection.doc_count satisfies number;
+} else if (collectionSuccess.kind === "collection_delete") {
+  collectionSuccess.deleted_tables satisfies number;
+}
+// @ts-expect-error collection path is required.
+docs.createCollection({ summary: "missing path" });
+// @ts-expect-error recursive is boolean when provided.
+docs.deleteCollection("guides/api", { recursive: "true" });
 const documentPutInput: AkbDocumentPutInput = {
   collection: "guides",
   title: "Readme",
@@ -185,6 +230,55 @@ const updatedDoc = await docs.update("guides/readme.md", {
 updatedDoc.throwOnError().data.current_commit satisfies string | null | undefined;
 const deletedDoc = await docs.delete("guides/readme.md");
 deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
+const historyOptions: AkbDocumentHistoryOptions = { vault: "eng", limit: 20 };
+const historyResult = await docs.history("guides/readme.md", historyOptions);
+const historyLeaf: AkbDocumentHistoryEnvelope = historyResult.throwOnError().data;
+historyLeaf.kind satisfies "document_history";
+historyLeaf.uri satisfies string;
+historyLeaf.history.at(0)?.author_name satisfies string | null | undefined;
+const diffOptions: AkbDocumentDiffOptions = { commit: "abc1234" };
+const diffResult = await docs.diff("guides/readme.md", diffOptions);
+const diffLeaf: AkbDocumentDiffEnvelope = diffResult.throwOnError().data;
+diffLeaf.kind satisfies "document_diff";
+diffLeaf.type satisfies "added" | "deleted" | "modified" | "unknown" | "unchanged";
+diffLeaf.error satisfies string | null | undefined;
+const activityOptions: AkbActivityListOptions = { collection: null, author: null, since: null, limit: 20 };
+const activityResult = await typedClient.vault("eng").activity.list(activityOptions);
+const activityLeaf: AkbActivityEnvelope = activityResult.throwOnError().data;
+activityLeaf.kind satisfies "activity";
+activityLeaf.activity.at(0)?.files.at(0)?.change satisfies "added" | "deleted" | "modified" | undefined;
+activityLeaf.activity.at(0)?.author_name satisfies string | null | undefined;
+const recentOptions: AkbActivityRecentOptions = { vault: "eng", limit: 10 };
+const recentResult = await typedClient.activity.recent(recentOptions);
+recentResult.throwOnError().data.kind satisfies "recent_changes";
+recentResult.throwOnError().data.changes.at(0)?.commit satisfies string | null | undefined;
+recentResult.throwOnError().data.changes.at(0)?.changed_at satisfies string | null | undefined;
+type HistoryOperation = AkbOperationResponse<operations["documentsHistory"]>;
+type DiffOperation = AkbOperationResponse<operations["documentsDiff"]>;
+type ActivityOperation = AkbOperationResponse<operations["activityList"]>;
+type RecentOperation = AkbOperationResponse<operations["activityRecent"]>;
+historyLeaf satisfies HistoryOperation;
+diffLeaf satisfies DiffOperation;
+activityLeaf satisfies ActivityOperation;
+recentResult.throwOnError().data satisfies RecentOperation;
+declare const activitySuccess: AkbSuccessEnvelope;
+if (activitySuccess.kind === "document_history") {
+  activitySuccess.history.at(0)?.message satisfies string | undefined;
+} else if (activitySuccess.kind === "document_diff") {
+  activitySuccess.diff satisfies string;
+} else if (activitySuccess.kind === "activity") {
+  activitySuccess.total satisfies number;
+} else if (activitySuccess.kind === "recent_changes") {
+  activitySuccess.changes.at(0)?.doc_id satisfies string | undefined;
+}
+// @ts-expect-error diff requires a commit.
+docs.diff("guides/readme.md", {});
+// @ts-expect-error history uses limit, not topK.
+docs.history("guides/readme.md", { topK: 20 });
+// @ts-expect-error activity list does not accept a recent-only option alias.
+typedClient.activity.list({ topK: 20 });
+// @ts-expect-error recent does not accept activity filters.
+typedClient.activity.recent({ author: "u1" });
 // @ts-expect-error collection is required when putting a document.
 docs.put({ title: "Missing collection", content: "# Missing collection" });
 // @ts-expect-error document status is constrained to AKB document lifecycle values.
@@ -283,6 +377,78 @@ const schemaResult = await typedFetch("get", "/api/v1/tables/{vault}/schema", {
 schemaResult.throwOnError().data.kind satisfies "vault_table_schema";
 // @ts-expect-error generated path params are required.
 await typedFetch("get", "/api/v1/tables/{vault}/schema");
+
+const createTableBody: CreateTableRequest = {
+  name: "incidents",
+  columns: [{ name: "state", type: "text" }],
+  indexes: [{ columns: [{ name: "state", order: "desc" }] }],
+};
+await typedFetch("post", "/api/v1/tables/{vault}", {
+  path: { vault: "eng" },
+  json: createTableBody,
+});
+
+const alterTableBody: AlterTableRequest = {
+  add_columns: [{ name: "owner", type: "text" }],
+  alter_columns: [{ name: "state", set_default: "todo" }],
+};
+await typedFetch("patch", "/api/v1/tables/{vault}/{table_name}", {
+  path: { vault: "eng", table_name: "incidents" },
+  json: alterTableBody,
+});
+
+const migrationBody: TableMigrationOperation[] = [
+  { op: "add_column", table: "incidents", name: "priority", type: "text" },
+  {
+    op: "add_index",
+    table_name: "incidents",
+    index: { name: "incidents_priority_idx", columns: [{ name: "priority", order: "desc" }] },
+  },
+];
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: { "Idempotency-Key": "11111111-1111-4111-8111-111111111111" },
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: new Headers({ "Idempotency-Key": "22222222-2222-4222-8222-222222222222" }),
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  headers: [["Idempotency-Key", "33333333-3333-4333-8333-333333333333"]],
+  json: migrationBody,
+});
+
+declare const migrationOperation: TableMigrationOperation;
+if (migrationOperation.op === "add_index") {
+  migrationOperation.index?.columns.at(0) satisfies
+    | string
+    | { name: string; order?: "asc" | "desc" | null }
+    | undefined;
+}
+
+// @ts-expect-error table columns require a name.
+const invalidColumn: CreateTableRequest = { name: "bad", columns: [{ type: "text" }] };
+const invalidIndex: CreateTableRequest = {
+  name: "bad",
+  columns: [{ name: "state" }],
+  // @ts-expect-error index order is a closed asc/desc enum.
+  indexes: [{ columns: [{ name: "state", order: "sideways" }] }],
+};
+// @ts-expect-error migration op is restricted to the supported eight operations.
+const invalidMigration: TableMigrationOperation = { op: "raw_sql", table: "incidents" };
+// @ts-expect-error migration Idempotency-Key is a required operation header.
+await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+  path: { vault: "eng" },
+  json: migrationBody,
+});
+await typedFetch("post", "/api/v1/tables/{vault}", {
+  path: { vault: "eng" },
+  // @ts-expect-error create body is checked against CreateTableRequest.
+  json: { name: "bad", columns: [{ type: "text" }] },
+});
 
 type VaultSchemaResponse = AkbOperationResponse<operations["tablesGetVaultSchema"]>;
 const vaultSchema: VaultSchemaResponse = {
