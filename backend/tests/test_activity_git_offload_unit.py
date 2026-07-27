@@ -32,17 +32,25 @@ class _User:
     username = "t"
 
 
-def _thread_recorder(ret):
-    """A stand-in git call that records the thread it ran on and returns ``ret``.
-    Accepts any args (as an instance attr it gets none; as a class attr it gets
-    ``self``) so it works whether we patch the instance or the class."""
+def _offload_probe(ret):
+    """Return a stand-in git call that records the thread it runs on (returning
+    ``ret``), plus an ``assert_offloaded(why)`` that checks it ran on a worker
+    thread rather than this — the event-loop — thread. Call this from inside the
+    test coroutine so the captured ``loop_tid`` is the event-loop thread. The
+    fake accepts any args, so it works whether patched onto an instance or a
+    class (where it also receives ``self``)."""
+    loop_tid = threading.get_ident()
     box: dict = {}
 
     def _rec(*args, **kwargs):
         box["tid"] = threading.get_ident()
         return ret
 
-    return _rec, box
+    def assert_offloaded(why):
+        assert box.get("tid") is not None, "the git call was never made"
+        assert box["tid"] != loop_tid, why
+
+    return _rec, assert_offloaded
 
 
 @pytest.fixture
@@ -72,8 +80,7 @@ async def _aidentity(entries):
 
 async def test_rest_vault_activity_offloads_vault_log(mods, monkeypatch):
     activity, _server, _gs = mods
-    loop_tid = threading.get_ident()
-    rec, box = _thread_recorder([])
+    rec, assert_offloaded = _offload_probe([])
     monkeypatch.setattr(activity, "check_vault_access", _anoop)
     monkeypatch.setattr(activity, "_resolve_activity_authors", _aidentity)
     monkeypatch.setattr(activity.git, "vault_log", rec)
@@ -83,16 +90,12 @@ async def test_rest_vault_activity_offloads_vault_log(mods, monkeypatch):
         limit=50, user=_User(),
     )
 
-    assert box.get("tid"), "git.vault_log was never called"
-    assert box["tid"] != loop_tid, (
-        "REST /activity ran git.vault_log ON the event loop (not offloaded)"
-    )
+    assert_offloaded("REST /activity ran git.vault_log ON the event loop (not offloaded)")
 
 
 async def test_rest_document_diff_offloads_file_diff_and_keeps_envelope(mods, monkeypatch):
     activity, _server, _gs = mods
-    loop_tid = threading.get_ident()
-    rec, box = _thread_recorder({"diff": "…", "type": "modified"})
+    rec, assert_offloaded = _offload_probe({"diff": "…", "type": "modified"})
 
     class _Conn:
         async def fetchrow(self, *a, **k):
@@ -128,10 +131,7 @@ async def test_rest_document_diff_offloads_file_diff_and_keeps_envelope(mods, mo
         vault="v", doc_id="docs/p.md", commit="abc1234", user=_User(),
     )
 
-    assert box.get("tid"), "git.file_diff was never called"
-    assert box["tid"] != loop_tid, (
-        "REST /diff ran git.file_diff ON the event loop (not offloaded)"
-    )
+    assert_offloaded("REST /diff ran git.file_diff ON the event loop (not offloaded)")
     # the rebase must preserve the response envelope (main added {"kind": ...})
     assert out["kind"] == "document_diff"
     assert out["diff"] == "…"
@@ -142,23 +142,18 @@ async def test_rest_document_diff_offloads_file_diff_and_keeps_envelope(mods, mo
 
 async def test_mcp_activity_offloads_vault_log(mods, monkeypatch):
     _activity, server, GitService = mods
-    loop_tid = threading.get_ident()
-    rec, box = _thread_recorder([])
+    rec, assert_offloaded = _offload_probe([])
     monkeypatch.setattr(server, "check_vault_access", _anoop)
     monkeypatch.setattr(GitService, "vault_log", rec)
 
     await server._handle_activity({"vault": "v", "limit": 5}, "uid", _User())
 
-    assert box.get("tid"), "git.vault_log was never called"
-    assert box["tid"] != loop_tid, (
-        "MCP akb_activity ran git.vault_log ON the event loop (not offloaded)"
-    )
+    assert_offloaded("MCP akb_activity ran git.vault_log ON the event loop (not offloaded)")
 
 
 async def test_mcp_diff_offloads_file_diff(mods, monkeypatch):
     _activity, server, GitService = mods
-    loop_tid = threading.get_ident()
-    rec, box = _thread_recorder({"diff": "…"})
+    rec, assert_offloaded = _offload_probe({"diff": "…"})
 
     async def _find(vault, path):
         return {"path": "docs/p.md"}
@@ -170,16 +165,12 @@ async def test_mcp_diff_offloads_file_diff(mods, monkeypatch):
 
     await server._handle_diff({"uri": "akb://v/doc/docs/p.md", "commit": "abc1234"}, "uid", _User())
 
-    assert box.get("tid"), "git.file_diff was never called"
-    assert box["tid"] != loop_tid, (
-        "MCP akb_diff ran git.file_diff ON the event loop (not offloaded)"
-    )
+    assert_offloaded("MCP akb_diff ran git.file_diff ON the event loop (not offloaded)")
 
 
 async def test_mcp_versioned_get_offloads_read_file(mods, monkeypatch):
     _activity, server, GitService = mods
-    loop_tid = threading.get_ident()
-    rec, box = _thread_recorder("body content")
+    rec, assert_offloaded = _offload_probe("body content")
 
     async def _find(vault, path):
         return {"path": "docs/p.md", "title": "P"}
@@ -193,7 +184,4 @@ async def test_mcp_versioned_get_offloads_read_file(mods, monkeypatch):
         {"uri": "akb://v/doc/docs/p.md", "version": "abc1234"}, "uid", _User(),
     )
 
-    assert box.get("tid"), "git.read_file was never called"
-    assert box["tid"] != loop_tid, (
-        "MCP versioned akb_get ran git.read_file ON the event loop (not offloaded)"
-    )
+    assert_offloaded("MCP versioned akb_get ran git.read_file ON the event loop (not offloaded)")
