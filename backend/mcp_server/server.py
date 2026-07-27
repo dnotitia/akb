@@ -224,6 +224,46 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_import": _WRITE_SCOPE,
 }
 
+# Arguments that promote an otherwise read-grade tool to write-grade.
+#
+# `_TOOL_SCOPES` classifies a tool as a whole, which cannot express a
+# read tool that carries an optional mutating argument. `akb_grep` is
+# exactly that: a search tool whose `replace` rewrites EVERY matching
+# document across the scope (git commit + re-index per doc). Mapped flat
+# as read, a read-scoped token passed the gate and reached the rewrite.
+#
+# That was never privilege escalation — `_handle_grep` still requires
+# `check_vault_access(required_role="writer")` — but it defeated the
+# reason read-only tokens exist: handing an agent a read PAT is supposed
+# to mean it cannot change anything, and for a caller who *is* a vault
+# writer it did not.
+#
+# Declared here rather than branched inside `_dispatch` so the next tool
+# that grows a mutating argument has one obvious place to say so, and so
+# a test can assert every trigger names a real argument of that tool (a
+# typo would silently un-promote it — the exact failure this prevents).
+_ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
+    "akb_grep": ("replace",),
+}
+
+
+def _required_scope(name: str, args: dict) -> str:
+    """Scope a call needs: the tool's mapping, promoted to write when the
+    call carries a mutating argument.
+
+    Unmapped tools fail CLOSED to write (see `_dispatch`). A trigger
+    counts only when the argument is actually present and not None —
+    `replace=""` IS a rewrite (it deletes every match), so emptiness must
+    not be mistaken for absence.
+    """
+    base = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+    if base == _WRITE_SCOPE:
+        return base
+    if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
+        return _WRITE_SCOPE
+    return base
+
+
 # Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
 # to reject unknown arguments with a fuzzy hint. Built once at import
 # time from the same TOOLS list returned via list_tools, so the
@@ -1449,7 +1489,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # A test in `test_mcp_oauth_unit` asserts every registered handler
     # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+        required = _required_scope(name, args)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -1458,7 +1498,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+        required = _required_scope(name, args)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(
