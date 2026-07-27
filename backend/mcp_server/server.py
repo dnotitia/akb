@@ -256,12 +256,9 @@ def _required_scope(name: str, args: dict) -> str:
     `replace=""` IS a rewrite (it deletes every match), so emptiness must
     not be mistaken for absence.
     """
-    base = _TOOL_SCOPES.get(name, _WRITE_SCOPE)
-    if base == _WRITE_SCOPE:
-        return base
     if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
         return _WRITE_SCOPE
-    return base
+    return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
 
 
 # Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch

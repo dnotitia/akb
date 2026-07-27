@@ -468,14 +468,7 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
 
 # ── akb_grep: scope depends on the arguments, not just the tool ────
 #
-# `akb_grep` is a search tool that ALSO accepts `replace`, which rewrites
-# every matching document across the scope (git commit + re-index per
-# doc). A flat read/write mapping cannot express that, so a read-scoped
-# token used to pass the gate and reach the rewrite. The handler's own
-# `check_vault_access(required_role="writer")` still applied, so this was
-# never privilege escalation — but it defeated the entire point of
-# issuing a read-only token to an agent that happens to be a vault
-# writer.
+# Rationale lives with the rule, at `_ARG_WRITE_TRIGGERS` in server.py.
 
 
 @pytest.mark.asyncio
@@ -503,7 +496,7 @@ async def test_grep_with_replace_is_refused_for_read_only_pat():
 
 
 @pytest.mark.asyncio
-async def test_grep_without_replace_stays_readable_for_read_only_pat():
+async def test_grep_without_replace_stays_readable_for_read_only_pat(monkeypatch):
     """Non-regression: plain grep must remain available to read-only
     tokens — promoting the whole tool to write-grade would have been the
     blunt fix and would take literal search away from every read agent."""
@@ -515,22 +508,15 @@ async def test_grep_without_replace_stays_readable_for_read_only_pat():
         called.append(args)
         return {"ok": True}
 
-    original = _HANDLERS.get("akb_grep")
-    _HANDLERS["akb_grep"] = _stub
-    try:
-        user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-        result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x"}, user)
-        assert result == {"ok": True}
-        assert called == [{"vault": "v", "pattern": "x"}]
-    finally:
-        if original is not None:
-            _HANDLERS["akb_grep"] = original
-        else:
-            _HANDLERS.pop("akb_grep", None)
+    monkeypatch.setitem(_HANDLERS, "akb_grep", _stub)
+    user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
+    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x"}, user)
+    assert result == {"ok": True}
+    assert called == [{"vault": "v", "pattern": "x"}]
 
 
 @pytest.mark.asyncio
-async def test_grep_with_replace_passes_when_write_scope_present():
+async def test_grep_with_replace_passes_when_write_scope_present(monkeypatch):
     from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
     called = []
@@ -539,45 +525,77 @@ async def test_grep_with_replace_passes_when_write_scope_present():
         called.append(args)
         return {"ok": True}
 
-    original = _HANDLERS.get("akb_grep")
-    _HANDLERS["akb_grep"] = _stub
-    try:
-        user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read", "write"}))
-        args = {"vault": "v", "pattern": "x", "replace": "y"}
-        assert await _dispatch("akb_grep", args, user) == {"ok": True}
-        assert called == [args]
-    finally:
-        if original is not None:
-            _HANDLERS["akb_grep"] = original
-        else:
-            _HANDLERS.pop("akb_grep", None)
+    monkeypatch.setitem(_HANDLERS, "akb_grep", _stub)
+    user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read", "write"}))
+    args = {"vault": "v", "pattern": "x", "replace": "y"}
+    assert await _dispatch("akb_grep", args, user) == {"ok": True}
+    assert called == [args]
 
 
 def test_arg_sensitive_scope_rule_is_declared_not_hardcoded_in_dispatch():
     """The rule must live in one reviewable place so the next tool that
     grows a mutating argument has somewhere obvious to declare it."""
-    from mcp_server.server import _ARG_WRITE_TRIGGERS, _WRITE_SCOPE, _required_scope
+    from mcp_server.server import _WRITE_SCOPE, _required_scope
 
-    assert _ARG_WRITE_TRIGGERS["akb_grep"] == ("replace",)
     assert _required_scope("akb_grep", {"pattern": "x"}) != _WRITE_SCOPE
     assert _required_scope("akb_grep", {"pattern": "x", "replace": ""}) == _WRITE_SCOPE
 
 
 def test_every_arg_write_trigger_names_a_real_tool_argument():
     """A typo in a trigger name would silently disable the promotion —
-    the failure mode this whole block exists to prevent. Check each
-    trigger against the tool's published inputSchema."""
-    from mcp_server.server import _ARG_WRITE_TRIGGERS
-    from mcp_server.tools import TOOLS
+    the failure mode this whole block exists to prevent. Checked against
+    `_TOOL_ARG_NAMES`, which is the same schema-derived table `_dispatch`
+    rejects unknown arguments with, so a trigger can never name an
+    argument the dispatcher would refuse anyway."""
+    from mcp_server.server import _ARG_WRITE_TRIGGERS, _TOOL_ARG_NAMES
 
-    schemas = {t.name: (t.inputSchema or {}).get("properties", {}) for t in TOOLS}
     for tool, triggers in _ARG_WRITE_TRIGGERS.items():
-        assert tool in schemas, f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
+        assert tool in _TOOL_ARG_NAMES, (
+            f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
+        )
         for arg in triggers:
-            assert arg in schemas[tool], (
+            assert arg in _TOOL_ARG_NAMES[tool], (
                 f"_ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, "
                 f"which is not an argument of {tool}"
             )
+
+
+def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
+    """The omission guard — the failure mode that actually recurs.
+
+    `_TOOL_SCOPES` has a completeness guard (a new tool must be mapped);
+    `_ARG_WRITE_TRIGGERS` needs the mirror of it, or the next read-mapped
+    tool that grows a mutating argument reproduces this bug silently.
+
+    The invariant is checkable against code that already exists: a
+    handler that can reach `check_vault_access(required_role="writer")`
+    performs a write, so its tool cannot be read-grade unless some
+    argument promotes it. Source-level check, so it sees only a writer
+    check written directly in the handler — a handler that delegates to
+    a helper is a false negative. It is a tripwire, not a proof.
+    """
+    import inspect
+
+    from mcp_server.server import (
+        _ARG_WRITE_TRIGGERS,
+        _HANDLERS,
+        _READ_SCOPE,
+        _TOOL_SCOPES,
+    )
+
+    offenders = sorted(
+        name
+        for name, handler in _HANDLERS.items()
+        if _TOOL_SCOPES.get(name) == _READ_SCOPE
+        and name not in _ARG_WRITE_TRIGGERS
+        and 'required_role="writer"' in inspect.getsource(handler)
+    )
+    assert offenders == [], (
+        f"Read-scoped tools whose handler performs a writer-gated write, with no "
+        f"_ARG_WRITE_TRIGGERS entry: {offenders}. Either the tool belongs in the "
+        f"write half of _TOOL_SCOPES, or the argument that makes it write must be "
+        f"declared in _ARG_WRITE_TRIGGERS."
+    )
 
 
 # ── /.well-known/oauth-protected-resource ──────────────────────────
