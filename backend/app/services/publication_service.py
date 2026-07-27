@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import math
 import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -27,6 +29,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, NotFoundError
 from app.services import file_service, table_service
+from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
 from app.services.uri_service import parse_uri
 
@@ -365,9 +368,11 @@ async def create_publication(
                 except ValueError:
                     file_uuid_obj = None
                 if file_uuid_obj is not None:
+                    # Bind to vault_id (not id alone) so this can't be satisfied
+                    # by a same-UUID file in another vault (cross-vault IDOR).
                     found = await conn.fetchval(
-                        "SELECT 1 FROM vault_files WHERE id = $1 FOR SHARE",
-                        file_uuid_obj,
+                        "SELECT 1 FROM vault_files WHERE id = $1 AND vault_id = $2 FOR SHARE",
+                        file_uuid_obj, vault_id,
                     )
                     if not found:
                         raise ValueError(
@@ -470,7 +475,14 @@ async def create_publication_for_vault(
                 """,
                 uuid.UUID(file_id), vault_id,
             )
-        file_collection = file_coll_row["collection"] if file_coll_row else None
+        # No row means the file is NOT in this vault. REJECT — otherwise a writer
+        # could publish a file UUID belonging to another vault and anonymously
+        # serve that vault's file through their own publication (cross-vault
+        # IDOR). A vault-root file returns a row with collection=NULL (still
+        # truthy), so this only rejects genuine cross-vault / missing files.
+        if file_coll_row is None:
+            raise ValueError(f"File not found in vault: {file_id}")
+        file_collection = file_coll_row["collection"]
         resource_uri = file_uri(vault_name, file_id, collection=file_collection)
     elif resource_type == ResourceType.TABLE_QUERY:
         if not resolved_query_vaults:
@@ -511,14 +523,25 @@ async def delete_publication(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if expected_vault_id is not None:
-            result = await conn.execute(
-                "DELETE FROM publications WHERE slug = $1 AND vault_id = $2",
-                slug, expected_vault_id,
-            )
-        else:
-            result = await conn.execute("DELETE FROM publications WHERE slug = $1", slug)
-    deleted = result.endswith(" 1")
+        async with conn.transaction():
+            if expected_vault_id is not None:
+                row = await conn.fetchrow(
+                    "DELETE FROM publications WHERE slug = $1 AND vault_id = $2"
+                    " RETURNING snapshot_s3_key",
+                    slug, expected_vault_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "DELETE FROM publications WHERE slug = $1 RETURNING snapshot_s3_key",
+                    slug,
+                )
+            deleted = row is not None
+            # Reclaim the cached snapshot object so unpublishing a snapshot-mode
+            # table_query doesn't leave it orphaned in S3. Same TX as the delete
+            # via the crash-safe outbox, so a crash can't drop one without the
+            # other. (publish-hardening F7.)
+            if deleted and row["snapshot_s3_key"]:
+                await _enqueue_s3_delete(conn, row["snapshot_s3_key"])
     if deleted:
         logger.info("Publication deleted: %s", slug)
     return deleted
@@ -677,6 +700,7 @@ async def resolve_publication(
     password: str | None = None,
     increment_view: bool = True,
     bypass_password: bool = False,
+    enforce_view_cap: bool = True,
 ) -> dict:
     """Look up a publication and enforce access controls.
 
@@ -693,6 +717,13 @@ async def resolve_publication(
 
     bypass_password: skip the password check (used when caller has already
     verified an HMAC session token at the route layer).
+
+    enforce_view_cap: only meaningful when ``increment_view`` is False. The file
+    content endpoints (/raw, /download) RE-serve bytes for a view that was
+    already counted at the metadata GET, so they resolve with
+    increment_view=False AND enforce_view_cap=False — a page opened at its last
+    allowed view must still be able to fetch its bytes (Range requests, reloads,
+    preview→download) without a spurious 410. Expiry is always enforced.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -752,7 +783,7 @@ async def resolve_publication(
             # consistent with the value that just landed in PG.
             row = dict(row)
             row["view_count"] = updated["view_count"]
-        else:
+        elif enforce_view_cap:
             if row["max_views"] is not None and row["view_count"] >= row["max_views"]:
                 raise PublicationViewLimitReached()
 
@@ -807,7 +838,11 @@ async def resolve_document_publication(publication: dict) -> dict:
     body = ""
     content_unavailable = False
     try:
-        raw = _get_doc_service().git.read_file(doc_row["vault_name"], doc_row["path"])
+        # Git read is blocking filesystem I/O — offload it so a document page
+        # open / download never stalls the single event loop (503 risk class).
+        raw = await asyncio.to_thread(
+            _get_doc_service().git.read_file, doc_row["vault_name"], doc_row["path"]
+        )
         if raw:
             body = frontmatter.loads(raw).content
     except (FileNotFoundError, OSError) as e:
@@ -829,12 +864,17 @@ async def resolve_document_publication(publication: dict) -> dict:
         "resource_type": ResourceType.DOCUMENT,
         "title": publication.get("title") or doc_row["title"],
         "type": doc_row["doc_type"],
-        "status": doc_row["status"],
         "summary": doc_row["summary"],
         "domain": doc_row["domain"],
-        "created_by": doc_row["created_by"],
+        # Author attribution via the RESOLVED name only (created_by_name =
+        # display_name, or username when no display name) — never the raw
+        # created_by, which is a username or a bare user UUID on legacy rows and
+        # would hand an anonymous viewer a valid account identifier. Also drop
+        # the internal workflow `status` (leaks draft/review state) and the
+        # unused `created_at` to minimize the exposed surface. Showing a username
+        # when no display name is set remains a product-policy choice for the
+        # attribution feature. (publish-hardening F8.)
         "created_by_name": doc_row["created_by_name"],
-        "created_at": doc_row["created_at"].isoformat() if doc_row["created_at"] else None,
         "updated_at": doc_row["updated_at"].isoformat() if doc_row["updated_at"] else None,
         "tags": list(doc_row["tags"]) if doc_row["tags"] else [],
         "content": body,
@@ -899,7 +939,6 @@ def _filter_section(markdown: str, section_path: str) -> tuple[str, bool]:
 # File resolution (P3)
 # ============================================================
 
-_FILE_PRESIGN_TTL = 300  # 5 minutes — short for security
 
 
 async def resolve_file_publication(publication: dict) -> dict:
@@ -925,24 +964,18 @@ async def resolve_file_publication(publication: dict) -> dict:
                    c.path AS collection
               FROM vault_files f
               LEFT JOIN collections c ON c.id = f.collection_id
-             WHERE f.id = $1
+             WHERE f.id = $1 AND f.vault_id = $2
             """,
-            to_uuid(file_uuid_str),
+            to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
         if file_row is None:
             raise NotFoundError("File", str(uri))
 
-    # Override stored Content-Type with DB value so the browser inline-renders
-    # correctly even when the S3 object was uploaded as octet-stream (legacy
-    # proxy versions before v0.5.1 didn't propagate mime_type).
-    mime = file_row["mime_type"]
-    override = mime if mime and mime != "application/octet-stream" else None
-    presigned_url = file_service.get_presigned_download_url(
-        file_row["s3_key"],
-        ttl=_FILE_PRESIGN_TTL,
-        response_content_type=override,
-    )
-
+    # No presigned S3 URL is issued: the browser fetches bytes from same-origin
+    # /public/{slug}/raw (inline preview) and /public/{slug}/download (force
+    # download). A presigned URL would embed the vault name in its S3 key path
+    # and stay valid ~5 min after unpublish/view-limit; the proxy paths leak
+    # nothing, stay view-counted, and revoke instantly. (publish-hardening F4.)
     return {
         "resource_type": ResourceType.FILE,
         "name": file_row["name"],
@@ -950,8 +983,6 @@ async def resolve_file_publication(publication: dict) -> dict:
         "mime_type": file_row["mime_type"],
         "size_bytes": file_row["size_bytes"],
         "collection": file_row["collection"],
-        "download_url": presigned_url,
-        "url_expires_in": _FILE_PRESIGN_TTL,
     }
 
 
@@ -973,8 +1004,8 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1",
-            to_uuid(file_uuid_str),
+            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+            to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
     if file_row is None:
         raise NotFoundError("File", str(uri))
@@ -1042,13 +1073,38 @@ def _bind_params_to_sql(sql: str, param_defs: dict, url_params: dict) -> tuple[s
 
 
 def _serialize_value(v: Any) -> Any:
-    if v is None or isinstance(v, (bool, int, float, str)):
+    """Coerce a DB (or cached-snapshot) value into a JSON-safe form, recursing
+    into arrays/objects. Non-finite floats and Decimals (NaN / ±Inf) become null:
+    they are not valid JSON and Starlette's JSONResponse renders with
+    allow_nan=False (would 500), so a canned query that produces them — or a
+    legacy snapshot that stored them — would break the publication permanently.
+    A non-finite value is thereby indistinguishable from SQL NULL in the output.
+    (publish-hardening F3; matches akb_sql's inf_nan_mode="null".)
+    """
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if v is None or isinstance(v, (bool, int, str)):
         return v
+    if isinstance(v, Decimal):
+        return str(v) if v.is_finite() else None
     if isinstance(v, uuid.UUID):
         return str(v)
+    if isinstance(v, (list, tuple)):
+        return [_serialize_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _serialize_value(x) for k, x in v.items()}
     if hasattr(v, "isoformat"):
         return v.isoformat()
     return str(v)
+
+
+# Bounds for an ANONYMOUS public table_query (GET /public/{slug}). Both are DoS
+# guards: the timeout caps how long one query can hold a DB connection / stall
+# the single event loop; the row cap stops a huge fast result (e.g.
+# generate_series) from exhausting process memory. A published query can be
+# replayed by anyone with the slug, so these run for every public execution.
+_PUBLIC_TABLE_TIMEOUT_MS = 5000
+_PUBLIC_TABLE_ROW_CAP = 10_000
 
 
 async def resolve_table_query_publication(publication: dict, url_params: dict | None = None) -> dict:
@@ -1103,11 +1159,25 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
                 status_code=403,
             )
         role = user_role_name(created_by)
+        truncated = False
+        rows: list[asyncpg.Record] = []
         try:
             async with conn.transaction():
                 await conn.execute("SET TRANSACTION READ ONLY")
+                # DoS bounds for this anonymous path: cap DURATION so a slow query
+                # can't stall the single event loop / pin a DB connection, and cap
+                # ROWS (stream via a cursor) so a huge fast result can't OOM the
+                # process. Both apply under the creator's PG role.
+                await conn.execute(f"SET LOCAL statement_timeout = '{_PUBLIC_TABLE_TIMEOUT_MS}ms'")
                 await conn.execute(f'SET LOCAL ROLE "{role}"')
-                rows = await conn.fetch(rewritten, *values)
+                async for r in conn.cursor(rewritten, *values):
+                    if len(rows) >= _PUBLIC_TABLE_ROW_CAP:
+                        truncated = True
+                        break
+                    rows.append(r)
+        except asyncpg.exceptions.QueryCanceledError:
+            # statement_timeout fired (57014) — don't echo the query.
+            raise PublicationError("This shared query took too long to run.", status_code=400)
         except asyncpg.exceptions.InsufficientPrivilegeError:
             # 42501 — the creator's role lacks SELECT on a referenced
             # table (system table or another vault). Do not echo the
@@ -1126,10 +1196,20 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
             msg = str(e)
             if "read-only transaction" in msg:
                 raise PublicationError("Write operations are not allowed", status_code=403)
-            raise PublicationError(f"Query error: {msg}", status_code=400)
+            # Don't echo the raw DB error to an anonymous public caller — it can
+            # name tables/columns/other vaults. Log it for the operator, return
+            # a generic message. (The publish-time run already surfaced real
+            # query bugs to the authenticated author.)
+            logger.warning("public table_query error for slug=%s: %s", publication.get("slug"), msg)
+            raise PublicationError("This shared query could not be run.", status_code=400)
 
     columns = list(dict(rows[0]).keys()) if rows else []
-    result_rows = [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rows]
+    # Per-cell coercion is CPU-bound and runs for an anonymous caller — offload it
+    # so a large (capped) result set can't stall the single event loop.
+    def _coerce_rows() -> list[dict]:
+        return [{k: _serialize_value(v) for k, v in dict(r).items()} for r in rows]
+
+    result_rows = await asyncio.to_thread(_coerce_rows)
 
     return {
         "resource_type": ResourceType.TABLE_QUERY,
@@ -1137,6 +1217,9 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
         "columns": columns,
         "rows": result_rows,
         "total": len(result_rows),
+        # True when the result hit the public row cap and was truncated for the
+        # preview — callers can surface "showing first N rows".
+        "truncated": truncated,
         "query_params": param_defs,
         "applied_params": {n: url_params.get(n) for n in param_defs},
         "mode": publication["mode"],
@@ -1147,17 +1230,33 @@ async def resolve_table_query_publication(publication: dict, url_params: dict | 
 # Snapshot (P4)
 # ============================================================
 
+_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024  # read cap — guard memory on a stray huge snapshot
+
+
+def _decode_snapshot(raw: bytes) -> dict:
+    """Decode + sanitize a snapshot body. Pure CPU — runs off the event loop."""
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Snapshot data is not a valid object")
+    # Legacy snapshots written before F3 can hold literal NaN/Infinity (json.loads
+    # accepts them as float('nan')/inf), which would 500 on render — sanitize on
+    # read so old snapshots resolve instead of being permanently broken. (F3.)
+    return _serialize_value(data)
+
+
 async def _read_snapshot(publication: dict) -> dict:
     """Read a snapshotted query result from S3."""
     try:
-        body = file_service.get_object_bytes(publication["snapshot_s3_key"])
-        data = json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # S3 GET (blocking I/O) AND the JSON decode + F3 sanitize (CPU) both run
+        # off the event loop, and the read is capped, so serving an anonymous
+        # snapshot can't stall the single loop or OOM on an oversized body.
+        body = await asyncio.to_thread(
+            file_service.get_object_bytes, publication["snapshot_s3_key"], _SNAPSHOT_MAX_BYTES
+        )
+        data = await asyncio.to_thread(_decode_snapshot, body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         raise PublicationError(f"Corrupt snapshot data: {e}", status_code=500)
     # file_service.StorageError already inherits from AKBError → propagates as 502.
-
-    if not isinstance(data, dict):
-        raise PublicationError("Snapshot data is not a valid object", status_code=500)
 
     data["snapshot_at"] = publication.get("snapshot_at")
     data["mode"] = "snapshot"
@@ -1210,12 +1309,26 @@ async def create_snapshot(
             publication_for_exec = {**publication, "mode": Mode.LIVE}
             result = await resolve_table_query_publication(publication_for_exec, {})
 
-            s3_key = f"snapshots/{publication_id}.json"
+            # VERSIONED key (uuid per attempt) so the PUT can be OFFLOADED safely.
+            # A sync PUT under the advisory lock blocked the single event loop for
+            # the write's duration (~30s on an S3 stall → 503). Offloading it is
+            # race-free ONLY with a unique key: if the request is cancelled during
+            # the PUT, to_thread lets the zombie finish, but it writes ITS OWN
+            # unreferenced key (the rolled-back txn never points at it) instead of
+            # overwriting a newer snapshot. The DB CAS below publishes the winner's
+            # key; the previous key is enqueued for delete in the SAME transaction.
+            old_key = publication.get("snapshot_s3_key")
+            s3_key = f"snapshots/{publication_id}/{uuid.uuid4().hex}.json"
             try:
-                file_service.put_object_bytes(
-                    s3_key,
-                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
-                    content_type="application/json",
+                # allow_nan=False: result is already coerced by _serialize_value,
+                # so this just refuses to silently persist a stray non-finite
+                # float as invalid JSON. (F3.) Both the CPU serialize and the S3
+                # PUT run off the event loop; result is row-capped upstream.
+                payload = await asyncio.to_thread(
+                    lambda: json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                )
+                await asyncio.to_thread(
+                    file_service.put_object_bytes, s3_key, payload, "application/json",
                 )
             except (file_service.StorageError, IOError) as e:
                 raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
@@ -1234,5 +1347,23 @@ async def create_snapshot(
                 """,
                 s3_key, publication_id,
             )
+            if updated_row is None:
+                # The publication was unpublished concurrently (delete_publication
+                # does NOT take this advisory lock), so the UPDATE matched no row.
+                # Our just-uploaded object is now unreferenced — reclaim IT (the
+                # old key, if any, was already reclaimed by the delete path). The
+                # 404 is raised AFTER this txn commits, so the reclaim isn't rolled
+                # back. Previously this crashed on a None row and orphaned the
+                # upload (Codex).
+                await _enqueue_s3_delete(lock_conn, s3_key)
+            elif old_key and old_key != s3_key:
+                # Normal path: reclaim the PREVIOUS snapshot object via the durable
+                # outbox, committed atomically with the new key (rolls back if the
+                # snapshot txn does). A crash before the reaper runs orphans one
+                # object (storage cost only; the DB points at the new key).
+                await _enqueue_s3_delete(lock_conn, old_key)
+
+        if updated_row is None:
+            raise PublicationNotFound(str(publication_id))
 
     return to_public_dict(_row_to_internal_dict(updated_row))

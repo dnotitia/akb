@@ -93,10 +93,17 @@ jobs:
         # ASC/DESC physical order, migration 037 upgrade path, add-unique-key
         # concurrency race). They skip in the DB-free unit job above, so gate
         # them here where AKB_TEST_DSN is reachable.
+        #
+        # Idempotent-upload keying belongs here for the same reason and one
+        # more: the invariant it protects *is* the `UNIQUE(vault_id, s3_key)`
+        # constraint. Asserting that against a mock would only prove the mock
+        # agrees with itself, and leaving the file out of this list would let
+        # it skip in both jobs — a gate that never fires.
         run: >
           pytest
           tests/test_pgvector_ext_bootstrap_e2e.py
           tests/test_migration_037_upgrade_unit.py
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
+          tests/test_file_idempotent_upload_unit.py
           -v --tb=short

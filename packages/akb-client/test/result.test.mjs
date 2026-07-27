@@ -304,6 +304,246 @@ test("docs facade scopes document operations and maps typed payloads", async () 
   assert.equal(deleteResult.throwOnError().data.deleted, true);
 });
 
+test("history and activity facades preserve paths, optional queries, claims, results, and raw requests", async () => {
+  const seen = [];
+  const claims = { sub: "end-user-1", app_metadata: { org_id: "org-1", role: "member" } };
+  const fetchImpl = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      headers: Object.fromEntries(new Headers(init?.headers)),
+    });
+    if (url.searchParams.get("author") === "error") {
+      return new Response(JSON.stringify({ message: "activity failed", code: "activity_failed" }), {
+        status: 503,
+        statusText: "Unavailable",
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname.includes("/history/")) {
+      return new Response(JSON.stringify({
+        kind: "document_history",
+        uri: "akb://vault one/doc/guides/read me.md",
+        history: [{ hash: "abc1234", message: "Update", author: "u1", date: "2026-07-22T00:00:00Z" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.includes("/diff/")) {
+      return new Response(JSON.stringify({
+        kind: "document_diff",
+        file: "guides/read me.md",
+        commit: url.searchParams.get("commit"),
+        type: "modified",
+        diff: "@@ changed @@",
+        error: null,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.endsWith("/recent")) {
+      return new Response(JSON.stringify({
+        kind: "recent_changes",
+        changes: [{
+          doc_id: "d-12345678",
+          vault: "vault one",
+          path: "guides/read me.md",
+          title: "Read me",
+          type: "note",
+          commit: null,
+          changed_at: null,
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      kind: "activity",
+      vault: "vault one",
+      total: 1,
+      activity: [{
+        hash: "abc1234",
+        subject: "Update",
+        author: "u1",
+        date: "2026-07-22T00:00:00Z",
+        action: "updated",
+        summary: "guides/read me.md",
+        agent: "api",
+        files: [{ path: "guides/read me.md", change: "modified" }],
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const scoped = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: fetchImpl,
+  }).vault("vault one").actingAs(claims);
+
+  const history = await scoped.docs.history("guides/read me.md", { limit: 0 });
+  const diff = await scoped.docs.diff("guides/read me.md", { vault: "override/vault", commit: "abc?123#" });
+  const activity = await scoped.activity.list({ collection: null, author: undefined, since: "2026-07-01T00:00:00Z", limit: 5 });
+  const recent = await scoped.activity.recent({ limit: 7 });
+  const raw = await scoped.activity.request("vault%20one?limit=1");
+  const failed = await scoped.activity.list({ author: "error" });
+
+  assert.equal(seen[0].url, "https://akb.test/api/v1/history/vault%20one/guides/read%20me.md?limit=0");
+  assert.equal(seen[1].url, "https://akb.test/api/v1/diff/override%2Fvault/guides/read%20me.md?commit=abc%3F123%23");
+  assert.equal(seen[2].url, "https://akb.test/api/v1/activity/vault%20one?since=2026-07-01T00%3A00%3A00Z&limit=5");
+  assert.equal(new URL(seen[2].url).searchParams.has("collection"), false);
+  assert.equal(new URL(seen[2].url).searchParams.has("author"), false);
+  assert.equal(seen[3].url, "https://akb.test/api/v1/recent?vault=vault+one&limit=7");
+  assert.equal(seen[4].url, "https://akb.test/api/v1/activity/vault%20one?limit=1");
+  assert.ok(seen.every((call) => call.method === "GET"));
+  assert.ok(seen.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.deepEqual(JSON.parse(seen[0].headers["x-akb-claims"]), claims);
+  assert.equal(history.throwOnError().data.kind, "document_history");
+  assert.equal(diff.throwOnError().data.error, null);
+  assert.equal(activity.throwOnError().data.activity[0].files[0].change, "modified");
+  assert.equal(recent.throwOnError().data.changes[0].commit, null);
+  assert.equal(raw.throwOnError().data.kind, "activity");
+  assert.equal(failed.error?.code, "activity_failed");
+  assert.throws(() => failed.throwOnError(), AkbError);
+});
+
+test("history and activity vault precedence fails before fetch while recent keeps cross-vault semantics", async () => {
+  const seen = [];
+  const fetchImpl = async (input) => {
+    seen.push(String(input));
+    return new Response(JSON.stringify({ kind: "recent_changes", changes: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const root = createClient("https://akb.test/api/v1", { fetch: fetchImpl });
+  assert.throws(() => root.docs.history("readme.md"), /Select a vault/);
+  assert.throws(() => root.docs.diff("readme.md", { commit: "abc1234" }), /Select a vault/);
+  assert.throws(() => root.activity.list(), /Select a vault/);
+  assert.equal(seen.length, 0);
+
+  const crossVault = await root.activity.recent({ vault: undefined, limit: undefined });
+  const explicit = await root.activity.recent({ vault: "explicit", limit: 2 });
+  const configured = await createClient({
+    baseUrl: "https://akb.test/api/v1",
+    defaultVault: "configured",
+    fetch: fetchImpl,
+  }).activity.recent();
+
+  assert.equal(seen[0], "https://akb.test/api/v1/recent");
+  assert.equal(seen[1], "https://akb.test/api/v1/recent?vault=explicit&limit=2");
+  assert.equal(seen[2], "https://akb.test/api/v1/recent?vault=configured");
+  assert.equal(crossVault.throwOnError().data.kind, "recent_changes");
+  assert.equal(explicit.throwOnError().data.kind, "recent_changes");
+  assert.equal(configured.throwOnError().data.kind, "recent_changes");
+});
+
+test("docs facade creates and deletes collections with exact REST semantics", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      seen.push({
+        url: String(input),
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body,
+      });
+
+      if (method === "POST") {
+        return new Response(JSON.stringify({
+          kind: "collection_create",
+          ok: true,
+          created: body.path !== "already/there",
+          collection: {
+            path: body.path,
+            name: body.path.split("/").at(-1),
+            summary: Object.hasOwn(body, "summary") ? body.summary : "stored summary",
+            doc_count: body.path === "already/there" ? 3 : 0,
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/blocked")) {
+        return new Response(JSON.stringify({
+          message: "Collection is not empty",
+          code: "conflict",
+          detail: { message: "Collection is not empty", doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 },
+          details: { doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 },
+        }), { status: 409, statusText: "Conflict", headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/missing")) {
+        return new Response(JSON.stringify({ message: "Collection not found", code: "not_found" }), {
+          status: 404,
+          statusText: "Not Found",
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        kind: "collection_delete",
+        ok: true,
+        collection: decodeURIComponent(url.pathname.split("/").slice(6).join("/")),
+        deleted_docs: url.searchParams.get("recursive") === "true" ? 2 : 0,
+        deleted_files: 0,
+        deleted_sub_collections: 1,
+        deleted_tables: 0,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  }).vault("vault one").actingAs({ sub: "end-user-1", app_metadata: { org_id: "org-1", role: "writer" } });
+
+  const omitted = await client.docs.createCollection({ path: "already/there" });
+  const explicitNull = await client.docs.createCollection({ path: "새 공간/api", summary: null });
+  const recursive = await client.docs.deleteCollection("새 공간/예약%?#", { recursive: true });
+  const explicitFalse = await client.docs.deleteCollection("plain/path", { recursive: false });
+  const defaultDelete = await client.docs.deleteCollection("plain/other");
+  const blocked = await client.docs.deleteCollection("blocked");
+  const missing = await client.docs.deleteCollection("missing");
+
+  assert.equal(seen[0].url, "https://akb.test/api/v1/collections/vault%20one");
+  assert.equal(seen[0].method, "POST");
+  assert.deepEqual(seen[0].body, { path: "already/there" });
+  assert.equal(Object.hasOwn(seen[0].body, "summary"), false);
+  assert.deepEqual(seen[1].body, { path: "새 공간/api", summary: null });
+  assert.equal(seen[2].url, "https://akb.test/api/v1/collections/vault%20one/%EC%83%88%20%EA%B3%B5%EA%B0%84/%EC%98%88%EC%95%BD%25%3F%23?recursive=true");
+  assert.equal(seen[2].method, "DELETE");
+  assert.equal(seen[3].url, "https://akb.test/api/v1/collections/vault%20one/plain/path");
+  assert.equal(seen[4].url, "https://akb.test/api/v1/collections/vault%20one/plain/other");
+  assert.ok(seen.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.ok(seen.every((call) => call.headers["x-akb-claims"]));
+  assert.equal(seen[0].headers["content-type"], "application/json");
+
+  assert.deepEqual(
+    [omitted.throwOnError().data.kind, omitted.data.created, omitted.data.collection.doc_count],
+    ["collection_create", false, 3],
+  );
+  assert.deepEqual(
+    [explicitNull.throwOnError().data.kind, explicitNull.data.collection.summary],
+    ["collection_create", null],
+  );
+  assert.deepEqual(
+    [recursive.throwOnError().data.kind, recursive.data.deleted_docs, recursive.data.deleted_files],
+    ["collection_delete", 2, 0],
+  );
+  assert.deepEqual(blocked.error?.details, { doc_count: 2, file_count: 0, sub_collection_count: 1, table_count: 0 });
+  assert.equal(blocked.error?.payload.detail?.file_count, 0);
+  assert.equal(missing.error?.status, 404);
+  assert.throws(() => blocked.throwOnError(), AkbError);
+  assert.throws(() => missing.throwOnError(), AkbError);
+});
+
+test("docs facade refuses collection delete paths with URL dot segments", () => {
+  let fetchCalls = 0;
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 204 });
+    },
+  }).vault("reef");
+
+  for (const path of [".", "..", "draft/../published", "draft/./published"]) {
+    assert.throws(
+      () => client.docs.deleteCollection(path, { recursive: true }),
+      /must not contain URL dot segments/,
+    );
+  }
+  assert.equal(fetchCalls, 0);
+});
+
 test("storage facade performs presigned upload, download, list, and delete flows", async () => {
   const fileId = "11111111-1111-4111-8111-111111111111";
   const fileUri = `akb://reef/coll/media/file/${fileId}`;
@@ -599,6 +839,98 @@ test("createTypedFetch substitutes OpenAPI path params and keeps auth boundary",
     app_metadata: { org_id: "org-1", role: "member" },
   });
   assert.equal(result.throwOnError().data.kind, "vault_table_schema");
+});
+
+test("createTypedFetch forwards typed table admin bodies and migration header", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      calls.push({
+        url: String(input),
+        method: init?.method,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+        body: JSON.parse(String(init?.body)),
+      });
+      const kind = String(input).endsWith("/migrations") ? "table_migration" : "table";
+      return new Response(JSON.stringify({ kind }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const typedFetch = createTypedFetch(client);
+  await typedFetch("post", "/api/v1/tables/{vault}", {
+    path: { vault: "eng" },
+    json: { name: "incidents", columns: [{ name: "state", type: "text" }] },
+  });
+  await typedFetch("patch", "/api/v1/tables/{vault}/{table_name}", {
+    path: { vault: "eng", table_name: "incidents" },
+    json: { alter_columns: [{ name: "state", set_default: "todo" }] },
+  });
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: { "Idempotency-Key": "11111111-1111-4111-8111-111111111111" },
+    json: [{ op: "add_index", table: "incidents", columns: ["state"] }],
+  });
+
+  assert.deepEqual(
+    calls.map(({ url, method }) => ({ url, method })),
+    [
+      { url: "https://akb.test/api/v1/tables/eng", method: "POST" },
+      { url: "https://akb.test/api/v1/tables/eng/incidents", method: "PATCH" },
+      { url: "https://akb.test/api/v1/tables/eng/migrations", method: "POST" },
+    ],
+  );
+  assert.deepEqual(calls[0].body.columns, [{ name: "state", type: "text" }]);
+  assert.deepEqual(calls[1].body.alter_columns, [{ name: "state", set_default: "todo" }]);
+  assert.equal(calls[2].headers["idempotency-key"], "11111111-1111-4111-8111-111111111111");
+  assert.deepEqual(calls[2].body, [{ op: "add_index", table: "incidents", columns: ["state"] }]);
+});
+
+test("createTypedFetch validates required headers in generic HeadersInit containers", async () => {
+  let calls = 0;
+  const client = createClient("https://akb.test/api/v1", {
+    apiKey: fixtureApiKey,
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ kind: "table_migration" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const typedFetch = createTypedFetch(client);
+  const json = [{ op: "drop_index", table: "incidents", name: "old_idx" }];
+
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: new Headers({ "Idempotency-Key": "11111111-1111-4111-8111-111111111111" }),
+    json,
+  });
+  await typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+    path: { vault: "eng" },
+    headers: [["Idempotency-Key", "22222222-2222-4222-8222-222222222222"]],
+    json,
+  });
+  await assert.rejects(
+    typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+      path: { vault: "eng" },
+      headers: new Headers(),
+      json,
+    }),
+    /Missing required header: Idempotency-Key/,
+  );
+  await assert.rejects(
+    typedFetch("post", "/api/v1/tables/{vault}/migrations", {
+      path: { vault: "eng" },
+      headers: [],
+      json,
+    }),
+    /Missing required header: Idempotency-Key/,
+  );
+  assert.equal(calls, 2);
 });
 
 test("from query builder is lazy thenable and fires once", async () => {
@@ -1056,3 +1388,277 @@ test("createClient rejects cross-origin absolute URLs before adding credentials"
   );
   assert.equal(called, false);
 });
+
+test("graph facade maps typed methods to graph URLs and preserves auth envelopes", async () => {
+  const calls = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    defaultVault: "default vault",
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({
+        url: String(input),
+        method: init?.method ?? "GET",
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      if (url.pathname.endsWith("/graph/overview")) {
+        return new Response(JSON.stringify({
+          kind: "graph_overview",
+          nodes: [{ uri: "akb://default vault/doc/top", name: "Top", resource_type: "doc", degree: 4 }],
+          edges: [],
+          nodes_total: 9,
+          edges_total: 4,
+          returned: 1,
+          truncated: true,
+          orphans_returned: 2,
+          orphans_truncated: false,
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/graph/health")) {
+        return new Response(JSON.stringify({
+          kind: "graph_health",
+          hubs: [{ uri: "akb://scope/doc/hub", name: "Hub", resource_type: "doc", degree: 7 }],
+          orphans: { count: 3, sample: [{ uri: "akb://scope/doc/orphan", name: "Orphan", resource_type: "doc" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        kind: "graph_neighbors",
+        nodes: [{ uri: url.searchParams.get("uri"), name: "Center", resource_type: "doc", depth: 0 }],
+        edges: [{ source: "a", target: "b", relation: "links_to", kind: "explicit" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  }).actingAs({ sub: "end-user-2", app_metadata: { org_id: "org-2", role: "reader" } });
+
+  const neighbors = await client.graph.neighbors("akb://default vault/doc/a b", { hops: 3, limit: 17 });
+  const overview = await client.graph.overview({ topK: 37 });
+  const health = await client.vault("scope/vault").graph.health({ hubThreshold: 7, limit: 11 });
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/graph?uri=akb%3A%2F%2Fdefault+vault%2Fdoc%2Fa+b&hops=3&limit=17");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/graph/overview?vault=default+vault&top_k=37");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/graph/health?vault=scope%2Fvault&hub_threshold=7&limit=11");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "GET", "GET"]);
+  for (const call of calls) {
+    assert.equal(call.headers.authorization, "Bearer service-key");
+    assert.deepEqual(JSON.parse(call.headers["x-akb-claims"]), {
+      sub: "end-user-2",
+      app_metadata: { org_id: "org-2", role: "reader" },
+    });
+  }
+  assert.equal(neighbors.throwOnError().data.kind, "graph_neighbors");
+  assert.equal(neighbors.throwOnError().data.edges[0].relation, "links_to");
+  assert.equal(overview.throwOnError().data.kind, "graph_overview");
+  assert.equal(overview.throwOnError().data.nodes_total, 9);
+  assert.equal(health.throwOnError().data.kind, "graph_health");
+  assert.equal(health.throwOnError().data.orphans.count, 3);
+});
+
+test("graph facade omits defaults, preflights vault, preserves 4xx, and keeps raw request", async () => {
+  const calls = [];
+  const responses = [
+    new Response(JSON.stringify({ kind: "graph_neighbors", nodes: [], edges: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ kind: "graph_overview", nodes: [], edges: [], nodes_total: 0, edges_total: 0, returned: 0, truncated: false, orphans_returned: 0, orphans_truncated: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ detail: [{ loc: ["query", "limit"], msg: "Input should be less than or equal to 200" }], code: "validation_error" }), {
+      status: 422,
+      statusText: "Unprocessable Entity",
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(JSON.stringify({ kind: "graph_overview", nodes: [], edges: [], nodes_total: 0, edges_total: 0, returned: 0, truncated: false, orphans_returned: 0, orphans_truncated: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  ];
+  const scoped = createClient("https://akb.test/api/v1", {
+    fetch: async (input, init) => {
+      calls.push({ url: String(input), method: init?.method ?? "GET" });
+      return responses.shift();
+    },
+  }).vault("reef");
+
+  await scoped.graph.neighbors("akb://reef/doc/one");
+  await scoped.graph.overview();
+  const invalid = await scoped.graph.health({ limit: 999 });
+  const raw = await scoped.graph.request("?vault=reef");
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/graph?uri=akb%3A%2F%2Freef%2Fdoc%2Fone");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/graph/overview?vault=reef");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/graph/health?vault=reef&limit=999");
+  assert.equal(calls[3].url, "https://akb.test/api/v1/graph/?vault=reef");
+  assert.equal(invalid.data, null);
+  assert.equal(invalid.error?.status, 422);
+  assert.equal(invalid.error?.code, "validation_error");
+  assert.throws(() => invalid.throwOnError(), AkbError);
+  assert.equal(raw.throwOnError().data.kind, "graph_overview");
+
+  let noVaultCalls = 0;
+  const root = createClient("https://akb.test/api/v1", {
+    fetch: async () => {
+      noVaultCalls += 1;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  assert.throws(() => root.graph.overview(), /Select a vault.*graph overview/i);
+  assert.throws(() => root.graph.health(), /Select a vault.*graph health/i);
+  assert.equal(noVaultCalls, 0);
+});
+
+test("graph relation and provenance facade maps exact root requests and preserves envelopes", async () => {
+  const calls = [];
+  let omittedUnlinks = 0;
+  const claims = { sub: "relation-user", app_metadata: { org_id: "org-graph", role: "writer" } };
+  const client = createClient("https://akb.test/api/v1/", {
+    apiKey: fixtureApiKey,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      const body = init && Object.hasOwn(init, "body") ? init.body : undefined;
+      calls.push({
+        url: String(input), method, body,
+        hasBody: init ? Object.hasOwn(init, "body") : false,
+        headers: Object.fromEntries(new Headers(init?.headers)),
+      });
+      if (url.pathname.endsWith("/provenance")) {
+        const uri = url.searchParams.get("uri");
+        return responseJson({
+          kind: "provenance", doc_id: uri.endsWith("alpha doc") ? "doc-alpha" : "doc-beta",
+          title: uri.endsWith("alpha doc") ? "Alpha" : "Beta", path: "proof.md",
+          vault: uri.includes("vault one") ? "vault one" : "vault-two", uri,
+          created_by: null, created_at: null, updated_at: "2026-07-20T00:00:00Z",
+          current_commit: null, relations: [],
+        });
+      }
+      if (method === "POST") return responseJson({ kind: "relation_link", ...JSON.parse(init.body) });
+      if (method === "DELETE") {
+        const relation = url.searchParams.get("relation");
+        if (relation === null) omittedUnlinks += 1;
+        return responseJson({
+          kind: "relation_unlink", source: url.searchParams.get("source"),
+          target: url.searchParams.get("target"), relation,
+          unlinked: relation === null ? (omittedUnlinks === 1 ? 1 : 0) : 1,
+        });
+      }
+      return responseJson({
+        kind: "relations", uri: url.searchParams.get("uri"),
+        relations: [{ direction: "outgoing", relation: url.searchParams.get("type") ?? "related_to",
+          uri: "akb://vault-two/table/target", resource_type: "table", name: null }],
+      });
+    },
+  }).actingAs(claims);
+
+  const relationsA = await client.graph.relations("akb://vault one/doc/alpha doc", { direction: "outgoing", type: "links_to" });
+  const relationsB = await client.graph.relations("akb://vault-two/table/source");
+  const linkA = await client.graph.link({ source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references", metadata: { confidence: 0.75, source: "fixture-a" } });
+  const linkB = await client.graph.link({ source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2", relation: "attached_to" });
+  const namedUnlink = await client.graph.unlink({ source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references" });
+  const unlinkInput = { source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2" };
+  const unlinkFirst = await client.graph.unlink(unlinkInput);
+  const unlinkAgain = await client.graph.unlink(unlinkInput);
+  const provenanceA = await client.graph.provenance("akb://vault one/doc/alpha doc");
+  const provenanceB = await client.graph.provenance("akb://vault-two/doc/beta");
+
+  assert.equal(calls[0].url, "https://akb.test/api/v1/relations?uri=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc&direction=outgoing&type=links_to");
+  assert.equal(calls[1].url, "https://akb.test/api/v1/relations?uri=akb%3A%2F%2Fvault-two%2Ftable%2Fsource");
+  assert.equal(calls[2].url, "https://akb.test/api/v1/relations");
+  assert.deepEqual(JSON.parse(calls[2].body), { source: "akb://vault one/doc/alpha doc", target: "akb://vault-two/table/target", relation: "references", metadata: { confidence: 0.75, source: "fixture-a" } });
+  assert.deepEqual(JSON.parse(calls[3].body), { source: "akb://vault-two/doc/beta", target: "akb://vault-two/file/file-2", relation: "attached_to" });
+  assert.equal(calls[4].url, "https://akb.test/api/v1/relations?source=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc&target=akb%3A%2F%2Fvault-two%2Ftable%2Ftarget&relation=references");
+  assert.equal(calls[5].url, "https://akb.test/api/v1/relations?source=akb%3A%2F%2Fvault-two%2Fdoc%2Fbeta&target=akb%3A%2F%2Fvault-two%2Ffile%2Ffile-2");
+  assert.equal(calls[6].url, calls[5].url);
+  assert.equal(calls[7].url, "https://akb.test/api/v1/provenance?uri=akb%3A%2F%2Fvault+one%2Fdoc%2Falpha+doc");
+  assert.equal(calls[8].url, "https://akb.test/api/v1/provenance?uri=akb%3A%2F%2Fvault-two%2Fdoc%2Fbeta");
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "GET", "POST", "POST", "DELETE", "DELETE", "DELETE", "GET", "GET"]);
+  assert.ok(calls.slice(4, 7).every((call) => !call.hasBody && call.body === undefined));
+  assert.ok(calls.every((call) => call.headers.authorization === "Bearer service-key"));
+  assert.ok(calls.every((call) => call.headers["x-akb-claims"] === JSON.stringify(claims)));
+  assert.equal(relationsA.throwOnError().data.kind, "relations");
+  assert.equal(relationsA.data.relations[0].relation, "links_to");
+  assert.equal(relationsB.data.relations[0].relation, "related_to");
+  assert.equal(linkA.throwOnError().data.kind, "relation_link");
+  assert.deepEqual(linkA.data.metadata, { confidence: 0.75, source: "fixture-a" });
+  assert.equal(linkB.data.metadata, undefined);
+  assert.equal(namedUnlink.throwOnError().data.kind, "relation_unlink");
+  assert.equal(unlinkFirst.data.unlinked, 1);
+  assert.equal(unlinkAgain.data.unlinked, 0);
+  assert.equal(provenanceA.throwOnError().data.kind, "provenance");
+  assert.equal(provenanceA.data.doc_id, "doc-alpha");
+  assert.equal(provenanceB.data.doc_id, "doc-beta");
+  assert.equal(Object.hasOwn(provenanceA.data, "provenance"), false);
+});
+
+test("graph relation and provenance facade preserves backend 4xx result behavior", async () => {
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input, init) => (init?.method ?? "GET") === "POST"
+      ? responseJson({ message: "writer role required", code: "permission_denied" }, 403, "Forbidden")
+      : responseJson({ detail: "invalid document URI", code: "validation_error" }, 422, "Unprocessable Entity"),
+  });
+  const invalid = await client.graph.provenance("not-an-akb-uri");
+  const denied = await client.graph.link({ source: "akb://reader/doc/a", target: "akb://reader/doc/b", relation: "related_to" });
+  assert.equal(invalid.data, null);
+  assert.equal(invalid.error.status, 422);
+  assert.equal(invalid.error.code, "validation_error");
+  assert.throws(() => invalid.throwOnError(), AkbError);
+  assert.equal(denied.data, null);
+  assert.equal(denied.error.status, 403);
+  assert.equal(denied.error.code, "permission_denied");
+  assert.throws(() => denied.throwOnError(), AkbError);
+});
+
+test("storage upload sends contentHash to presign so the same bytes are not stored twice", async () => {
+  const contentHash = "a".repeat(64);
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input, init) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("/upload")) {
+        return responseJson({
+          kind: "file",
+          uri: "akb://eng/media/file/11111111-1111-4111-8111-111111111111",
+          upload_url: "https://s3.test/put",
+          deduplicated: true,
+        });
+      }
+      if (url === "https://s3.test/put") return new Response(null, { status: 200 });
+      return responseJson({ kind: "file", content_hash: contentHash });
+    },
+  });
+
+  await client.vault("eng").storage.upload("media/logo.txt", "hello", { contentHash });
+
+  const presign = new URL(seen.find((u) => u.includes("/upload")));
+  assert.equal(presign.searchParams.get("content_hash"), contentHash);
+  assert.equal(presign.searchParams.get("filename"), "logo.txt");
+});
+
+test("storage upload without contentHash sends no content_hash param", async () => {
+  const seen = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("/upload")) {
+        return responseJson({
+          kind: "file",
+          uri: "akb://eng/media/file/11111111-1111-4111-8111-111111111111",
+          upload_url: "https://s3.test/put",
+        });
+      }
+      if (url === "https://s3.test/put") return new Response(null, { status: 200 });
+      return responseJson({ kind: "file" });
+    },
+  });
+
+  await client.vault("eng").storage.upload("media/logo.txt", "hello");
+
+  const presign = new URL(seen.find((u) => u.includes("/upload")));
+  assert.equal(presign.searchParams.has("content_hash"), false);
+});
+
+function responseJson(body, status = 200, statusText = "OK") {
+  return new Response(JSON.stringify(body), { status, statusText, headers: { "content-type": "application/json" } });
+}

@@ -29,9 +29,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
-    "codegen:check": "node scripts/check-generated-types.mjs && node scripts/check-core-types.mjs",
+    "codegen:check": "pnpm run build && node scripts/check-generated-types.mjs && node scripts/check-core-types.mjs && node scripts/check-sdk-surface-contract.mjs",
     "codegen:core:check": "node scripts/check-core-types.mjs",
     "lint": "tsc -p tsconfig.json --noEmit",
+    "proof:packed": "pnpm run build && node scripts/prove-packed-sdk-consumer.mjs",
     "test": "pnpm run build && vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "pnpm run clean && pnpm run build"

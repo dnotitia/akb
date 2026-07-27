@@ -39,6 +39,9 @@ def audit_dir(tmp_path, monkeypatch):
 
 
 def _read_lines(path) -> list[str]:
+    # record() now enqueues for the off-loop writer thread; drain it before
+    # asserting on the on-disk file.
+    audit_log.flush()
     return [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
@@ -83,6 +86,8 @@ def test_tamper_breaks_chain(audit_dir):
 def test_chain_reseeds_after_restart(audit_dir):
     audit_log.record(action="akb_put", actor="a", target="id=1")
     audit_log.record(action="akb_put", actor="a", target="id=2")
+    # Drain the writer so both records are on disk BEFORE the reseed reads them.
+    audit_log.flush()
     # Simulate a process restart: re-init re-seeds seq + prev from disk.
     audit_log.init()
     audit_log.record(action="akb_put", actor="a", target="id=3")
@@ -129,6 +134,9 @@ def test_never_raises_on_unwritable_dir(tmp_path, monkeypatch):
     audit_log.init()                       # mkdir fails, swallowed
     # Must not raise even though the file can't be written.
     audit_log.record(action="akb_put", actor="a", target="id=1")
+    # Drain here so this record (which fails to write) can't be flushed into a
+    # later test's dir once monkeypatch reverts log_dir.
+    audit_log.flush()
 
 
 def test_disabled_is_noop(tmp_path, monkeypatch):

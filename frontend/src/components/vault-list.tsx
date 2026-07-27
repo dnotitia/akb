@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowRight, File as FileIcon, FileText, Table as TableIcon } from "lucide-react";
+import { ArrowRight, File as FileIcon, FileText, Star, Table as TableIcon } from "lucide-react";
 import { getVaultInfo } from "@/lib/api";
 import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
@@ -24,6 +24,17 @@ interface VaultMetrics {
   last_activity?: string;
 }
 
+/**
+ * Optional favorite affordance. Capability-shaped (not a `showFavorite`
+ * boolean) so <VaultList> stays decoupled from where favorites live — the
+ * owner (Home) supplies the read + toggle, and a future server-synced
+ * `is_pinned` provider is invisible to this row UI.
+ */
+export interface VaultFavoriteControl {
+  isFavorite: (id: string) => boolean;
+  onToggle: (vault: VaultRow) => void;
+}
+
 // Cap concurrent /vaults/{v}/info calls — each one fans out into ~10 pooled
 // COUNT queries server-side, so an unbounded forEach risks pool exhaustion.
 const VAULT_INFO_CONCURRENCY = 5;
@@ -34,7 +45,13 @@ const VAULT_INFO_CONCURRENCY = 5;
  * per-vault /info enrichment (fetched once per name, skipped if already known),
  * so both the Home preview and the /vault index render an identical, live list.
  */
-export function VaultList({ vaults }: { vaults: VaultRow[] }) {
+export function VaultList({
+  vaults,
+  favoriteControl,
+}: {
+  vaults: VaultRow[];
+  favoriteControl?: VaultFavoriteControl;
+}) {
   const [metrics, setMetrics] = useState<Record<string, VaultMetrics>>({});
   const fetched = useRef<Set<string>>(new Set());
 
@@ -78,10 +95,13 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
           const m = metrics[v.name];
           const lastActivity = m?.last_activity;
           return (
-            <li key={v.id}>
+            <li
+              key={v.id}
+              className="group relative flex items-stretch bg-surface hover:bg-surface-muted transition-colors"
+            >
               <Link
                 to={`/vault/${v.name}`}
-                className="group grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 px-4 py-3 bg-surface hover:bg-surface-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 flex-1 min-w-0 px-4 py-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
               >
                 <VaultChip name={v.name} size="md" />
                 <div className="min-w-0 pr-4">
@@ -121,11 +141,48 @@ export function VaultList({ vaults }: { vaults: VaultRow[] }) {
                   />
                 </div>
               </Link>
+              {favoriteControl && (
+                <FavoriteStar
+                  name={v.name}
+                  favorite={favoriteControl.isFavorite(v.id)}
+                  onToggle={() => favoriteControl.onToggle(v)}
+                />
+              )}
             </li>
           );
         })}
       </ol>
     </Panel>
+  );
+}
+
+/**
+ * Favorite toggle — a sibling of the row's <Link> (never nested, so a click
+ * pins/unpins instead of navigating). Kept visible-but-muted rather than
+ * hover-only so it works on touch; the star fills + goes primary when pinned.
+ * 36×36px target meets the design-system icon-button floor.
+ */
+function FavoriteStar({
+  name,
+  favorite,
+  onToggle,
+}: {
+  name: string;
+  favorite: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={favorite}
+      aria-label={favorite ? `Remove ${name} from favorites` : `Add ${name} to favorites`}
+      className={`mr-2 grid h-9 w-9 shrink-0 self-center place-items-center rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+        favorite ? "text-primary" : "text-foreground-muted hover:text-foreground"
+      }`}
+    >
+      <Star className={`h-4 w-4 ${favorite ? "fill-current" : ""}`} aria-hidden />
+    </button>
   );
 }
 

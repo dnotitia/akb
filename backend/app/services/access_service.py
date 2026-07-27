@@ -134,6 +134,40 @@ async def _is_unscoped_system_admin(uid: uuid.UUID, conn) -> bool:
     return bool(await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid))
 
 
+def check_vault_scope(vault_name: str, required_role: str) -> None:
+    """Option B per-PAT vault scope, as a NAME-only check.
+
+    The scope is a pure name predicate — it needs no vault row — so this
+    is the whole policy, and `check_vault_access` calls it for vaults
+    that already exist. Split out so the two callers cannot drift: the
+    denial message and the resulting `permission_denied` code are
+    identical whichever surface refuses.
+
+    Callers that have no row to resolve use it directly. `create_vault`
+    is the motivating case (dnotitia/akb#284): creation is a mutating
+    op on a name that does not exist yet, so it could not route through
+    `check_vault_access`, and without this it silently escaped the
+    scope — a scoped token could plant a vault anywhere in the
+    namespace and was then denied every admin op on the vault it had
+    just made, including deleting it. Creation passes
+    `required_role="owner"` because creating a vault confers ownership
+    of it.
+
+    No-op when the request carries no scope (`None` ⇒ unscoped, the
+    historical full-ACL behaviour) or when `required_role` is
+    non-mutating — reads are never scope-restricted.
+    """
+    scope = current_vault_scope.get()
+    if (
+        scope is not None
+        and required_role in _MUTATING_ROLES
+        and not scope.permits(vault_name)
+    ):
+        raise ForbiddenError(
+            f"Token scope does not permit '{required_role}' on vault '{vault_name}'"
+        )
+
+
 async def check_vault_access(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
@@ -205,15 +239,10 @@ async def check_vault_access(
         # write permission = user-ACL ∩ scope, for the whole surface that
         # routes through check_vault_access (REST + MCP). NULL token scope ⇒
         # current_vault_scope is None ⇒ historical full-ACL behaviour.
-        scope = current_vault_scope.get()
-        if (
-            scope is not None
-            and required_role in _MUTATING_ROLES
-            and not scope.permits(vault_name)
-        ):
-            raise ForbiddenError(
-                f"Token scope does not permit '{required_role}' on vault '{vault_name}'"
-            )
+        # The predicate itself lives in `check_vault_scope` — vault
+        # CREATION has no row to resolve and calls that helper directly,
+        # so both surfaces refuse with one message (dnotitia/akb#284).
+        check_vault_scope(vault_name, required_role)
 
         # Vault write-policy guard (P0 S3, A2/A3 — see the docstring
         # above). Sits BEFORE the is_admin / owner short-circuits below,
@@ -1515,6 +1544,27 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                     logger.warning("Failed to delete S3 object %s: %s", fr["s3_key"], e)
             if failed:
                 logger.error("Vault %s: %d/%d S3 files failed to delete", vault_name, len(failed), len(file_rows))
+
+        # Publication snapshot objects live under snapshots/<id>.json — OUTSIDE
+        # the vault's file prefix — so the vault_files sweep above misses them.
+        # Collect + delete them here before the DB cascade drops the publication
+        # rows, or they'd orphan in S3. Same out-of-band caveat as files above.
+        # (publish-hardening F7 — the per-publication path is delete_publication.)
+        # A snapshot created in the tiny window between this read and the cascade
+        # could still orphan, but the archive-then-delete lifecycle makes the
+        # vault read-only first, so no new publication lands here in practice.
+        snap_rows = await conn.fetch(
+            "SELECT snapshot_s3_key FROM publications"
+            " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
+            vault_id,
+        )
+        if snap_rows and settings.s3_endpoint_url:
+            from app.services.adapters import s3_adapter
+            for sr in snap_rows:
+                try:
+                    s3_adapter.delete(sr["snapshot_s3_key"])
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to delete snapshot S3 object %s: %s", sr["snapshot_s3_key"], e)
 
         async with conn.transaction():
             from app.services.index_service import _drop_source_chunks_with_outbox

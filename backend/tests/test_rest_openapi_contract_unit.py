@@ -1,7 +1,9 @@
 """REST OpenAPI contract guards for SDK code generation."""
 
+import json
 import re
 from collections import Counter
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -14,6 +16,13 @@ from app.main import app
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 SUCCESS_STATUSES = ("200", "201", "202")
 ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
+M3_SDK_CONTRACT_PATH = (
+    Path(__file__).parents[2]
+    / "packages"
+    / "akb-client"
+    / "scripts"
+    / "sdk-surface-contract.json"
+)
 
 
 def _api_operations():
@@ -24,6 +33,60 @@ def _api_operations():
         for method, operation in path_item.items():
             if method in HTTP_METHODS:
                 yield path, method, operation
+
+
+def _m3_sdk_contract():
+    return json.loads(M3_SDK_CONTRACT_PATH.read_text())
+
+
+def test_m3_sdk_contract_matrix_matches_live_openapi():
+    contract = _m3_sdk_contract()
+    matrix = contract["operations"]
+    assert len(matrix) == 20
+    assert len({item["operationId"] for item in matrix}) == len(matrix)
+
+    schema = app.openapi()
+    for item in matrix:
+        operation_id = item["operationId"]
+        operation = schema["paths"][item["path"]][item["method"]]
+        assert operation["operationId"] == operation_id
+
+        success = next(
+            operation["responses"][status]
+            for status in SUCCESS_STATUSES
+            if status in operation["responses"]
+        )
+        assert success["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{item['successSchema']}"
+        }, operation_id
+
+        request_schema = item["requestSchema"]
+        if request_schema == "never":
+            assert "requestBody" not in operation, operation_id
+        elif request_schema == "TableMigrationOperation[]":
+            body = operation["requestBody"]
+            assert body["required"] is True, operation_id
+            generated = body["content"]["application/json"]["schema"]
+            assert generated["type"] == "array", operation_id
+            assert generated["items"]["discriminator"]["propertyName"] == "op", operation_id
+        else:
+            body = operation["requestBody"]
+            assert body["required"] is True, operation_id
+            assert body["content"]["application/json"]["schema"] == {
+                "$ref": f"#/components/schemas/{request_schema}"
+            }, operation_id
+
+        required_headers = {
+            parameter["name"]
+            for parameter in operation.get("parameters", [])
+            if parameter["in"] == "header" and parameter.get("required") is True
+        }
+        assert required_headers == set(item.get("requiredHeaders", [])), operation_id
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": f"#/components/schemas/{contract['errorSchema']}"}
+            ), f"{operation_id} {status}"
 
 
 def test_bearer_auth_scheme_is_registered():
@@ -88,6 +151,113 @@ def test_api_error_responses_reference_single_akb_error_component():
             )
 
 
+def test_activity_history_diff_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    expected = {
+        "/api/v1/activity/{vault}": (
+            "activityList", "activity", "AkbActivityEnvelope",
+        ),
+        "/api/v1/recent": (
+            "activityRecent", "activity", "AkbRecentChangesEnvelope",
+        ),
+        "/api/v1/history/{vault}/{doc_id}": (
+            "documentsHistory", "documents", "AkbDocumentHistoryEnvelope",
+        ),
+        "/api/v1/diff/{vault}/{doc_id}": (
+            "documentsDiff", "documents", "AkbDocumentDiffEnvelope",
+        ),
+    }
+
+    operation_ids = [operation["operationId"] for _, _, operation in _api_operations()]
+    for path, (operation_id, tag, model) in expected.items():
+        operation = paths[path]["get"]
+        assert operation["operationId"] == operation_id
+        assert operation["tags"] == [tag]
+        assert operation_ids.count(operation_id) == 1
+        assert (
+            operation["responses"]["200"]["content"]["application/json"]["schema"]
+            == {"$ref": f"#/components/schemas/{model}"}
+        )
+        for status in ERROR_STATUSES:
+            assert (
+                operation["responses"][status]["content"]["application/json"]["schema"]
+                == {"$ref": "#/components/schemas/AkbError"}
+            )
+
+
+def test_activity_history_diff_schemas_have_literal_kinds_and_typed_fields():
+    schemas = app.openapi()["components"]["schemas"]
+    expected_kinds = {
+        "AkbActivityEnvelope": "activity",
+        "AkbRecentChangesEnvelope": "recent_changes",
+        "AkbDocumentHistoryEnvelope": "document_history",
+        "AkbDocumentDiffEnvelope": "document_diff",
+    }
+    for model, kind in expected_kinds.items():
+        leaf = schemas[model]
+        assert "kind" in leaf["required"]
+        assert leaf["properties"]["kind"] == {
+            "type": "string",
+            "enum": [kind],
+            "description": "Success envelope discriminator.",
+        }
+
+    activity_items = schemas["AkbActivityEnvelope"]["properties"]["activity"]
+    assert activity_items == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ActivityEntry"},
+    }
+    assert schemas["ActivityEntry"]["properties"]["date"] == {
+        "type": "string", "format": "date-time",
+    }
+    assert schemas["ActivityEntry"]["properties"]["files"] == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ActivityFileChange"},
+    }
+    assert schemas["ActivityFileChange"]["properties"]["change"]["enum"] == [
+        "added", "deleted", "modified",
+    ]
+
+    recent_items = schemas["AkbRecentChangesEnvelope"]["properties"]["changes"]
+    assert recent_items["items"] == {"$ref": "#/components/schemas/RecentDocumentChange"}
+    recent = schemas["RecentDocumentChange"]["properties"]
+    assert recent["commit"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert recent["changed_at"] == {
+        "anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}],
+    }
+
+    history_items = schemas["AkbDocumentHistoryEnvelope"]["properties"]["history"]
+    assert history_items["items"] == {"$ref": "#/components/schemas/DocumentHistoryEntry"}
+    history = schemas["DocumentHistoryEntry"]["properties"]
+    assert history["hash"]["type"] == "string"
+    assert history["author"]["type"] == "string"
+    assert history["date"] == {"type": "string", "format": "date-time"}
+
+    diff = schemas["AkbDocumentDiffEnvelope"]
+    assert {"file", "commit", "type", "diff"}.issubset(diff["required"])
+    assert diff["properties"]["type"]["enum"] == [
+        "added", "deleted", "modified", "unknown", "unchanged",
+    ]
+    assert diff["properties"]["diff"]["type"] == "string"
+    assert "error" not in diff["required"]
+
+
+def test_activity_history_diff_are_registered_in_success_discriminator_once():
+    success = app.openapi()["components"]["schemas"]["AkbSuccessEnvelope"]
+    refs = [item["$ref"] for item in success["oneOf"]]
+    expected = {
+        "activity": "#/components/schemas/AkbActivityEnvelope",
+        "recent_changes": "#/components/schemas/AkbRecentChangesEnvelope",
+        "document_history": "#/components/schemas/AkbDocumentHistoryEnvelope",
+        "document_diff": "#/components/schemas/AkbDocumentDiffEnvelope",
+    }
+    mapping = success["discriminator"]["mapping"]
+    for kind, ref in expected.items():
+        assert refs.count(ref) == 1
+        assert mapping[kind] == ref
+
+
 def test_success_envelope_components_are_kind_discriminated():
     schemas = app.openapi()["components"]["schemas"]
     union = schemas["AkbSuccessEnvelope"]
@@ -106,6 +276,19 @@ def test_success_envelope_components_are_kind_discriminated():
             "search": "#/components/schemas/AkbSearchEnvelope",
             "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
             "grep": "#/components/schemas/AkbGrepEnvelope",
+            "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+            "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+            "graph_health": "#/components/schemas/AkbGraphHealthEnvelope",
+            "relations": "#/components/schemas/AkbRelationsEnvelope",
+            "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
+            "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
+            "provenance": "#/components/schemas/AkbProvenanceEnvelope",
+            "collection_create": "#/components/schemas/AkbCollectionCreateEnvelope",
+            "collection_delete": "#/components/schemas/AkbCollectionDeleteEnvelope",
+            "activity": "#/components/schemas/AkbActivityEnvelope",
+            "recent_changes": "#/components/schemas/AkbRecentChangesEnvelope",
+            "document_history": "#/components/schemas/AkbDocumentHistoryEnvelope",
+            "document_diff": "#/components/schemas/AkbDocumentDiffEnvelope",
         },
     }
     for name, kind in (
@@ -121,6 +304,19 @@ def test_success_envelope_components_are_kind_discriminated():
         ("AkbSearchEnvelope", "search"),
         ("AkbDrillDownEnvelope", "drill_down"),
         ("AkbGrepEnvelope", "grep"),
+        ("AkbGraphNeighborsEnvelope", "graph_neighbors"),
+        ("AkbGraphOverviewEnvelope", "graph_overview"),
+        ("AkbGraphHealthEnvelope", "graph_health"),
+        ("AkbRelationsEnvelope", "relations"),
+        ("AkbRelationLinkEnvelope", "relation_link"),
+        ("AkbRelationUnlinkEnvelope", "relation_unlink"),
+        ("AkbProvenanceEnvelope", "provenance"),
+        ("AkbCollectionCreateEnvelope", "collection_create"),
+        ("AkbCollectionDeleteEnvelope", "collection_delete"),
+        ("AkbActivityEnvelope", "activity"),
+        ("AkbRecentChangesEnvelope", "recent_changes"),
+        ("AkbDocumentHistoryEnvelope", "document_history"),
+        ("AkbDocumentDiffEnvelope", "document_diff"),
     ):
         schema = schemas[name]
         assert "kind" in schema["required"]
@@ -156,6 +352,15 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/files/{vault}/{file_id}/download", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}", "delete", "200"): "AkbFileEnvelope",
+        ("/api/v1/graph", "get", "200"): "AkbGraphEnvelope",
+        ("/api/v1/graph/overview", "get", "200"): "AkbGraphOverviewEnvelope",
+        ("/api/v1/graph/health", "get", "200"): "AkbGraphHealthEnvelope",
+        ("/api/v1/relations", "get", "200"): "AkbRelationsEnvelope",
+        ("/api/v1/relations", "post", "200"): "AkbRelationLinkEnvelope",
+        ("/api/v1/relations", "delete", "200"): "AkbRelationUnlinkEnvelope",
+        ("/api/v1/provenance", "get", "200"): "AkbProvenanceEnvelope",
+        ("/api/v1/collections/{vault}", "post", "200"): "AkbCollectionCreateEnvelope",
+        ("/api/v1/collections/{vault}/{path}", "delete", "200"): "AkbCollectionDeleteEnvelope",
     }
     for (path, method, status), component in expected.items():
         success_schema = (
@@ -163,6 +368,56 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
             ["content"]["application/json"]["schema"]
         )
         assert success_schema == {"$ref": f"#/components/schemas/{component}"}
+
+
+def test_graph_rest_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    expected = {
+        ("/api/v1/graph", "get"): "graphNeighbors",
+        ("/api/v1/graph/overview", "get"): "graphOverview",
+        ("/api/v1/graph/health", "get"): "graphHealth",
+        ("/api/v1/relations", "get"): "graphRelations",
+        ("/api/v1/relations", "post"): "graphLink",
+        ("/api/v1/relations", "delete"): "graphUnlink",
+        ("/api/v1/provenance", "get"): "graphProvenance",
+    }
+    for (path, method), operation_id in expected.items():
+        operation = paths[path][method]
+        assert operation["operationId"] == operation_id
+        assert operation["tags"] == ["graph"]
+
+    schemas = schema["components"]["schemas"]
+    graph_union = schemas["AkbGraphEnvelope"]
+    assert graph_union["discriminator"] == {
+        "propertyName": "kind",
+        "mapping": {
+            "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+            "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+        },
+    }
+    assert {item["$ref"] for item in graph_union["oneOf"]} == set(
+        graph_union["discriminator"]["mapping"].values()
+    )
+
+    node = schemas["AkbGraphNode"]
+    assert node["properties"]["resource_type"]["enum"] == ["doc", "table", "file"]
+    assert {"depth", "degree"}.issubset(node["properties"])
+    edge = schemas["AkbGraphEdge"]
+    assert edge["properties"]["kind"]["enum"] == ["implicit", "explicit"]
+    relation = schemas["AkbRelation"]
+    assert relation["properties"]["direction"]["enum"] == ["incoming", "outgoing"]
+    assert "links_to" in relation["properties"]["relation"]["enum"]
+
+    get_relations = paths["/api/v1/relations"]["get"]
+    params = {param["name"]: param for param in get_relations["parameters"]}
+    assert set(params["direction"]["schema"]["enum"]) == {"incoming", "outgoing", "both"}
+    type_schema = params["type"]["schema"]
+    type_enum = next(item["enum"] for item in type_schema["anyOf"] if "enum" in item)
+    assert "links_to" in type_enum
+
+    link_schema = schemas["LinkRequest"]
+    assert "links_to" not in link_schema["properties"]["relation"]["enum"]
 
 
 def test_document_openapi_contract_is_codegen_typed():
@@ -204,6 +459,53 @@ def test_document_openapi_contract_is_codegen_typed():
     assert {"kind", "uri", "vault", "path", "commit_hash", "chunks_indexed", "entities_found"}.issubset(
         write["required"]
     )
+
+
+def test_collection_openapi_contract_is_codegen_typed():
+    schema = app.openapi()
+    paths = schema["paths"]
+    create = paths["/api/v1/collections/{vault}"]["post"]
+    delete = paths["/api/v1/collections/{vault}/{path}"]["delete"]
+
+    assert create["operationId"] == "collectionsCreateCollection"
+    assert delete["operationId"] == "collectionsDeleteCollection"
+    assert create["tags"] == ["collections"]
+    assert delete["tags"] == ["collections"]
+    assert create["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CreateCollectionRequest"
+    }
+    recursive = next(param for param in delete["parameters"] if param["name"] == "recursive")
+    assert recursive["in"] == "query"
+    assert recursive["schema"]["type"] == "boolean"
+
+    schemas = schema["components"]["schemas"]
+    summary = schemas["AkbCollectionSummary"]
+    assert {"path", "name", "summary", "doc_count"} == set(summary["required"])
+    assert summary["properties"]["summary"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
+    create_envelope = schemas["AkbCollectionCreateEnvelope"]
+    assert {"kind", "ok", "created", "collection"} == set(create_envelope["required"])
+    assert create_envelope["properties"]["kind"]["enum"] == ["collection_create"]
+    delete_envelope = schemas["AkbCollectionDeleteEnvelope"]
+    assert {
+        "kind", "ok", "collection", "deleted_docs", "deleted_files",
+        "deleted_sub_collections", "deleted_tables",
+    } == set(delete_envelope["required"])
+    assert delete_envelope["properties"]["kind"]["enum"] == ["collection_delete"]
+
+    for operation, component in (
+        (create, "AkbCollectionCreateEnvelope"),
+        (delete, "AkbCollectionDeleteEnvelope"),
+    ):
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": f"#/components/schemas/{component}"
+        }
+        for status in ERROR_STATUSES:
+            assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/AkbError"
+            }
 
 
 def test_search_openapi_contract_is_codegen_typed():
@@ -347,6 +649,57 @@ def test_alter_table_openapi_contract_is_codegen_typed():
         )
 
 
+def test_table_admin_request_components_are_structured():
+    schema = app.openapi()
+    paths = schema["paths"]
+    create = paths["/api/v1/tables/{vault}"]["post"]
+    alter = paths["/api/v1/tables/{vault}/{table_name}"]["patch"]
+    schemas = schema["components"]["schemas"]
+
+    assert create["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CreateTableRequest"
+    }
+    assert alter["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AlterTableRequest"
+    }
+
+    create_request = schemas["CreateTableRequest"]
+    assert set(create_request["required"]) == {"name", "columns"}
+    assert create_request["properties"]["columns"]["items"] == {
+        "$ref": "#/components/schemas/TableColumnSpec"
+    }
+    assert create_request["properties"]["unique_keys"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableUniqueKeySpec"
+    }
+    assert create_request["properties"]["indexes"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableIndexSpec"
+    }
+
+    alter_request = schemas["AlterTableRequest"]
+    assert "required" not in alter_request
+    assert alter_request["properties"]["add_columns"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableColumnSpec"
+    }
+    assert alter_request["properties"]["alter_columns"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableAlterColumnSpec"
+    }
+    assert alter_request["properties"]["add_unique_keys"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableUniqueKeySpec"
+    }
+    assert alter_request["properties"]["add_indexes"]["anyOf"][0]["items"] == {
+        "$ref": "#/components/schemas/TableIndexSpec"
+    }
+
+    assert set(schemas["TableColumnSpec"]["required"]) == {"name"}
+    assert set(schemas["TableUniqueKeySpec"]["required"]) == {"columns"}
+    assert set(schemas["TableIndexSpec"]["required"]) == {"columns"}
+    index_column = schemas["TableIndexColumnSpec"]
+    assert set(index_column["required"]) == {"name"}
+    order_variants = index_column["properties"]["order"]["anyOf"]
+    assert {"type": "string", "enum": ["asc", "desc"]} in order_variants
+    assert {"type": "null"} in order_variants
+
+
 def test_table_migration_openapi_contract_is_codegen_typed():
     schema = app.openapi()
     operation = schema["paths"]["/api/v1/tables/{vault}/migrations"]["post"]
@@ -363,11 +716,37 @@ def test_table_migration_openapi_contract_is_codegen_typed():
     assert idempotency["in"] == "header"
     assert idempotency["required"] is True
     assert idempotency["schema"]["type"] == "string"
-    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
-        "items": {"additionalProperties": True, "type": "object"},
-        "title": "Operations",
-        "type": "array",
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["type"] == "array"
+    operation_union = request_schema["items"]
+    assert operation_union["discriminator"]["propertyName"] == "op"
+    mapping = operation_union["discriminator"]["mapping"]
+    expected_ops = {
+        "add_column",
+        "alter_column",
+        "drop_column",
+        "rename_column",
+        "add_unique_key",
+        "drop_unique_key",
+        "add_index",
+        "drop_index",
     }
+    assert expected_ops.issubset(mapping)
+    assert {item["$ref"] for item in operation_union["oneOf"]} == {
+        "#/components/schemas/TableAddColumnMigration",
+        "#/components/schemas/TableAlterColumnMigration",
+        "#/components/schemas/TableDropColumnMigration",
+        "#/components/schemas/TableRenameColumnMigration",
+        "#/components/schemas/TableAddUniqueKeyMigration",
+        "#/components/schemas/TableDropUniqueKeyMigration",
+        "#/components/schemas/TableAddIndexMigration",
+        "#/components/schemas/TableDropIndexMigration",
+    }
+    for ref in operation_union["oneOf"]:
+        component = schema["components"]["schemas"][ref["$ref"].rsplit("/", 1)[-1]]
+        assert component["additionalProperties"] is True
+        assert "op" in component["required"]
+        assert {"table", "table_name"}.issubset(component["properties"])
     migration = schema["components"]["schemas"]["AkbTableMigrationEnvelope"]
     assert {"kind", "vault", "idempotency_key", "checksum", "applied", "operations", "results"}.issubset(
         migration["required"]

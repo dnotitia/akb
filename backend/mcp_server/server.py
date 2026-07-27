@@ -35,9 +35,9 @@ from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
-    check_vault_access, grant_access, revoke_access, list_vault_members,
-    list_accessible_vaults, get_vault_info, search_users, transfer_ownership,
-    archive_vault,
+    check_vault_access, check_vault_scope, grant_access, revoke_access,
+    list_vault_members, list_accessible_vaults, get_vault_info, search_users,
+    transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_token, token_has_scope
 from app.util.errors import (
@@ -136,8 +136,10 @@ async def _get_user() -> _MCPUser:
                         key_class=user.key_class,
                     )
                 # A credential was presented and rejected — that's a
-                # security-relevant event, so audit the denial. No token
-                # material is recorded.
+                # security-relevant event, so audit the denial. No token material
+                # is recorded. Non-blocking enqueue (the dedicated audit writer
+                # does the disk write): an unauthenticated bad-credential flood
+                # can't pin the loop or starve the shared thread pool.
                 audit_log.record(
                     action="auth.denied", actor="(unauthenticated)",
                     outcome="error", code="UNAUTHENTICATED",
@@ -333,6 +335,10 @@ async def _handle_list_vaults(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_create_vault")
 async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
+    # Per-PAT vault scope. Guard-first, like every other mutating tool —
+    # creation confers ownership, hence required_role "owner"
+    # (dnotitia/akb#284).
+    check_vault_scope(args["name"], required_role="owner")
     try:
         vault_id = await doc_service.create_vault(
             args["name"], args.get("description", ""),
@@ -439,7 +445,9 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
             return err("Document not found", code=NOT_FOUND)
         from app.services.git_service import GitService
         git = GitService()
-        raw = git.read_file(vault, doc["path"], commit=version)
+        # off-load the git blob read; the un-versioned path already offloads
+        # via doc_service.get, so keep the versioned MCP read off the loop too.
+        raw = await asyncio.to_thread(git.read_file, vault, doc["path"], commit=version)
         if raw is None:
             return err(f"Version not found: {version}", code=NOT_FOUND)
         try:
@@ -1383,7 +1391,21 @@ async def call_tool(name: str, arguments: dict):
     user = await _get_user()
     try:
         result = await _dispatch(name, arguments, user)
+        # Non-blocking: record_tool only ENQUEUES for the dedicated audit writer
+        # thread (audit_log). No disk I/O or lock on the event loop, and it never
+        # touches the shared to_thread pool — a stalled audit disk can't freeze
+        # the loop or starve bcrypt / document reads.
         audit_log.record_tool(name, arguments, user, result)
+        # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
+        # so the MCP wire format stays byte-identical for every tool (datetime →
+        # `str()` space form, Enum → `str()`, unknown → stringified). The
+        # akb_sql event-loop fix lives where the measured symptom was — the
+        # non-blocking row coercion in UserSqlExecutor (shared by both surfaces)
+        # and the Rust `to_json(inf_nan_mode="null")` serialisation on the REST
+        # `/tables/{vault}/sql` route (the table viewer + snapshot consumer). We
+        # deliberately do NOT switch this MCP encode to `to_json`: it would shift
+        # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
+        # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
@@ -1397,7 +1419,8 @@ async def call_tool(name: str, arguments: dict):
         # genuinely-unexpected as internal.
         envelope = exception_envelope(e)
         # Audit the failure too — a crashing tool call is exactly what a
-        # security review wants to see. record_tool never raises.
+        # security review wants to see. record_tool never raises and only
+        # enqueues (non-blocking; see the success path).
         audit_log.record_tool(name, arguments, user, envelope)
         return [TextContent(
             type="text",

@@ -1,5 +1,7 @@
 """REST API routes for browsing collections."""
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -23,6 +25,30 @@ collection_service = CollectionService()
 class CreateCollectionRequest(BaseModel):
     path: str
     summary: str | None = None
+
+
+class AkbCollectionSummary(BaseModel):
+    path: str
+    name: str
+    summary: str | None
+    doc_count: int
+
+
+class AkbCollectionCreateEnvelope(BaseModel):
+    kind: Literal["collection_create"]
+    ok: Literal[True]
+    created: bool
+    collection: AkbCollectionSummary
+
+
+class AkbCollectionDeleteEnvelope(BaseModel):
+    kind: Literal["collection_delete"]
+    ok: Literal[True]
+    collection: str
+    deleted_docs: int
+    deleted_files: int
+    deleted_sub_collections: int
+    deleted_tables: int
 
 
 @router.get(
@@ -54,7 +80,13 @@ async def browse_vault(
     )
 
 
-@router.post("/collections/{vault}", summary="Create an empty collection")
+@router.post(
+    "/collections/{vault}",
+    response_model=AkbCollectionCreateEnvelope,
+    summary="Create an empty collection",
+    operation_id="collectionsCreateCollection",
+    tags=["collections"],
+)
 async def create_collection(
     vault: str,
     body: CreateCollectionRequest,
@@ -62,19 +94,26 @@ async def create_collection(
 ):
     await check_vault_access(user.user_id, vault, required_role="writer")
     try:
-        return await collection_service.create(
+        result = await collection_service.create(
             vault=vault,
             path=body.path,
             summary=body.summary,
             agent_id=user.user_id,
         )
+        return {"kind": "collection_create", **result}
     except InvalidPathError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
-@router.delete("/collections/{vault}/{path:path}", summary="Delete a collection")
+@router.delete(
+    "/collections/{vault}/{path:path}",
+    response_model=AkbCollectionDeleteEnvelope,
+    summary="Delete a collection",
+    operation_id="collectionsDeleteCollection",
+    tags=["collections"],
+)
 async def delete_collection(
     vault: str,
     path: str,
@@ -95,12 +134,13 @@ async def delete_collection(
     """
     await check_vault_access(user.user_id, vault, required_role="writer")
     try:
-        return await collection_service.delete(
+        result = await collection_service.delete(
             vault=vault,
             path=path,
             recursive=recursive,
             agent_id=user.user_id,
         )
+        return {"kind": "collection_delete", **result}
     except InvalidPathError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     except NotFoundError as exc:

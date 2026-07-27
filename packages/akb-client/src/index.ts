@@ -15,13 +15,42 @@ export type {
 export type {
   AkbDocumentEnvelope,
   AkbDocumentWriteEnvelope,
+  AkbCollectionCreateEnvelope,
+  AkbCollectionDeleteEnvelope,
+  AkbCollectionSummary,
+  AkbActivityEnvelope,
+  AkbActivityEntry,
+  AkbActivityFileChange,
+  AkbDocumentDiffEnvelope,
   AkbFileEnvelope,
+  AkbDocumentHistoryEnvelope,
+  AkbDocumentHistoryEntry,
   AkbDrillDownEnvelope,
   AkbGrepEnvelope,
+  AkbGraphEdge,
+  AkbGraphEnvelope,
+  AkbGraphHealthEnvelope,
+  AkbGraphNeighborsEnvelope,
+  AkbGraphNode,
+  AkbGraphOverviewEnvelope,
+  AkbProvenanceEnvelope,
+  AkbRecentChangesEnvelope,
+  AkbRecentDocumentChange,
+  AkbRelation,
+  AkbRelationLinkEnvelope,
+  AkbRelationType,
+  AkbRelationUnlinkEnvelope,
+  AkbRelationsEnvelope,
+  AkbWritableRelationType,
   AkbSearchEnvelope,
   AkbSqlEnvelope,
   AkbTableEnvelope,
   AkbTableMigrationEnvelope,
+  AlterTableRequest,
+  CreateCollectionRequest,
+  CreateTableRequest,
+  LinkRequest,
+  TableMigrationOperation,
   AkbTableQueryEnvelope,
   AkbTableSchemaEnvelope,
   AkbTableSqlEnvelope,
@@ -39,10 +68,7 @@ export type AkbJsonValue =
   | AkbJsonValue[]
   | { [key: string]: AkbJsonValue };
 
-export interface AkbSuccessEnvelope {
-  kind: string;
-  [key: string]: AkbJsonValue | undefined;
-}
+export type AkbSuccessEnvelope = import("./core/schema.gen.js").AkbSuccessEnvelope;
 
 export interface AkbErrorPayload {
   message?: string;
@@ -264,8 +290,40 @@ export interface AkbDocumentVaultOptions {
   vault?: string | null;
 }
 
+export interface AkbCreateCollectionInput {
+  path: string;
+  summary?: string | null;
+}
+
+export interface AkbDeleteCollectionOptions {
+  recursive?: boolean;
+}
+
 export interface AkbDocumentGetOptions extends AkbDocumentVaultOptions {
   version?: string | null;
+}
+
+export interface AkbDocumentHistoryOptions {
+  vault?: string;
+  limit?: number;
+}
+
+export interface AkbDocumentDiffOptions {
+  vault?: string;
+  commit: string;
+}
+
+export interface AkbActivityListOptions {
+  vault?: string;
+  collection?: string | null;
+  author?: string | null;
+  since?: string | null;
+  limit?: number;
+}
+
+export interface AkbActivityRecentOptions {
+  vault?: string;
+  limit?: number;
 }
 
 export interface AkbDocumentBrowseOptions extends AkbDocumentVaultOptions {
@@ -312,11 +370,18 @@ export interface AkbStoragePresignUploadOptions extends AkbStorageVaultOptions {
   collection?: string | null;
   description?: string | null;
   mimeType?: string | null;
+  /**
+   * sha256 of the bytes being uploaded. Sent to `initiate_upload` as well as
+   * `confirm`, which makes the upload idempotent: re-uploading the same bytes
+   * to the same path resolves to the file that is already there rather than
+   * creating a duplicate. Omit to keep the original one-file-per-call
+   * behaviour.
+   */
+  contentHash?: string | null;
 }
 
 export interface AkbStorageUploadOptions extends AkbStoragePresignUploadOptions {
   confirm?: boolean;
-  contentHash?: string | null;
   hashAlgorithm?: string | null;
   headers?: HeadersInit;
 }
@@ -365,11 +430,84 @@ export interface AkbSearchFacade extends AkbNamespaceStub {
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbGrepEnvelope>>;
 }
 
+export interface AkbGraphNeighborsOptions {
+  hops?: 1 | 2 | 3 | 4 | 5;
+  limit?: number;
+}
+
+export interface AkbGraphOverviewOptions {
+  topK?: number;
+}
+
+export interface AkbGraphHealthOptions {
+  hubThreshold?: number;
+  limit?: number;
+}
+
+export interface AkbGraphRelationsOptions {
+  direction?: "incoming" | "outgoing" | "both";
+  type?: import("./core/schema.gen.js").AkbRelationType;
+}
+
+export interface AkbGraphLinkInput {
+  source: string;
+  target: string;
+  relation: import("./core/schema.gen.js").AkbWritableRelationType;
+  metadata?: Record<string, AkbJsonValue>;
+}
+
+export interface AkbGraphUnlinkInput {
+  source: string;
+  target: string;
+  relation?: import("./core/schema.gen.js").AkbWritableRelationType;
+}
+
+export interface AkbGraphFacade extends AkbNamespaceStub {
+  neighbors(
+    uri: string,
+    options?: AkbGraphNeighborsOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphNeighborsEnvelope>>;
+  overview(
+    options?: AkbGraphOverviewOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphOverviewEnvelope>>;
+  health(
+    options?: AkbGraphHealthOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbGraphHealthEnvelope>>;
+  relations(
+    uri: string,
+    options?: AkbGraphRelationsOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationsEnvelope>>;
+  link(
+    input: AkbGraphLinkInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationLinkEnvelope>>;
+  unlink(
+    input: AkbGraphUnlinkInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRelationUnlinkEnvelope>>;
+  provenance(
+    uri: string,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbProvenanceEnvelope>>;
+}
+
 export interface AkbDocsFacade extends AkbNamespaceStub {
+  createCollection(
+    input: AkbCreateCollectionInput,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbCollectionCreateEnvelope>>;
+  deleteCollection(
+    path: string,
+    options?: AkbDeleteCollectionOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbCollectionDeleteEnvelope>>;
   get(
     docId: string,
     options?: AkbDocumentGetOptions,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
+  history(
+    docId: string,
+    options?: AkbDocumentHistoryOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentHistoryEnvelope>>;
+  diff(
+    docId: string,
+    options: AkbDocumentDiffOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentDiffEnvelope>>;
   put(
     input: AkbDocumentPutInput,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentWriteEnvelope>>;
@@ -385,6 +523,39 @@ export interface AkbDocsFacade extends AkbNamespaceStub {
   browse(
     options?: AkbDocumentBrowseOptions,
   ): Promise<AkbResult<import("./core/schema.gen.js").AkbDocumentEnvelope>>;
+}
+
+export interface AkbActivityFacade extends AkbNamespaceStub {
+  list(
+    options?: AkbActivityListOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbActivityEnvelope>>;
+  recent(
+    options?: AkbActivityRecentOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbRecentChangesEnvelope>>;
+}
+
+export interface AkbTableMigrationOptions {
+  idempotencyKey: string;
+}
+
+export interface AkbTablesFacade extends AkbNamespaceStub {
+  list(): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  schema(): Promise<AkbResult<import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope>>;
+  schema(table: string): Promise<AkbResult<import("./core/schema.gen.js").AkbTableSchemaEnvelope>>;
+  create(
+    input: import("./core/schema.gen.js").CreateTableRequest,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  alter(
+    table: string,
+    input: import("./core/schema.gen.js").AlterTableRequest,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
+  migrate(
+    operations: readonly import("./core/schema.gen.js").TableMigrationOperation[],
+    options: AkbTableMigrationOptions,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableMigrationEnvelope>>;
+  drop(
+    table: string,
+  ): Promise<AkbResult<import("./core/schema.gen.js").AkbTableEnvelope>>;
 }
 
 export interface AkbStorageFacade extends AkbNamespaceStub {
@@ -505,8 +676,10 @@ export interface AkbClient<Schema = unknown> {
     AkbTableUpdate<Schema, TableName>
   >;
   readonly search: AkbSearchFacade;
-  readonly graph: AkbNamespaceStub;
+  readonly graph: AkbGraphFacade;
   readonly docs: AkbDocsFacade;
+  readonly activity: AkbActivityFacade;
+  readonly tables: AkbTablesFacade;
   readonly storage: AkbStorageFacade;
 }
 
@@ -688,8 +861,10 @@ function makeClient(
       });
     },
     search: makeSearchFacade(request, scope.defaultVault),
-    graph: makeNamespaceStub("graph", "/graph", request),
+    graph: makeGraphFacade(request, scope.defaultVault),
     docs: makeDocsFacade(request, scope.defaultVault),
+    activity: makeActivityFacade(request, scope.defaultVault),
+    tables: makeTablesFacade(request, scope.defaultVault),
     storage: makeStorageFacade(request, scope.defaultVault, fetchImpl),
   };
   return Object.freeze(client) as unknown as AkbClient;
@@ -764,6 +939,140 @@ function makeNamespaceStub(
   }) as AkbNamespaceStub;
 }
 
+function makeGraphFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbGraphFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(
+    path: string | URL = "",
+    init: RequestInit = {},
+  ) => request<T>(joinPath("/graph", path), init);
+  const facade = {
+    name: "graph",
+    request: rawRequest,
+    neighbors(uri: string, options: AkbGraphNeighborsOptions = {}) {
+      const params = new URLSearchParams({ uri });
+      appendOptional(params, "hops", options.hops);
+      appendOptional(params, "limit", options.limit);
+      return request<import("./core/schema.gen.js").AkbGraphNeighborsEnvelope>(`/graph?${params}`);
+    },
+    overview(options: AkbGraphOverviewOptions = {}) {
+      const vault = resolveGraphVault(defaultVault, "overview");
+      const params = new URLSearchParams({ vault });
+      appendOptional(params, "top_k", options.topK);
+      return request<import("./core/schema.gen.js").AkbGraphOverviewEnvelope>(`/graph/overview?${params}`);
+    },
+    health(options: AkbGraphHealthOptions = {}) {
+      const vault = resolveGraphVault(defaultVault, "health");
+      const params = new URLSearchParams({ vault });
+      appendOptional(params, "hub_threshold", options.hubThreshold);
+      appendOptional(params, "limit", options.limit);
+      return request<import("./core/schema.gen.js").AkbGraphHealthEnvelope>(`/graph/health?${params}`);
+    },
+    relations(uri: string, options: AkbGraphRelationsOptions = {}) {
+      const params = new URLSearchParams({ uri });
+      appendOptional(params, "direction", options.direction);
+      appendOptional(params, "type", options.type);
+      return request<import("./core/schema.gen.js").AkbRelationsEnvelope>(`/relations?${params}`);
+    },
+    link(input: AkbGraphLinkInput) {
+      const body = {
+        source: input.source,
+        target: input.target,
+        relation: input.relation,
+        ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+      };
+      return request<import("./core/schema.gen.js").AkbRelationLinkEnvelope>("/relations", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    unlink(input: AkbGraphUnlinkInput) {
+      const params = new URLSearchParams({ source: input.source, target: input.target });
+      appendOptional(params, "relation", input.relation);
+      return request<import("./core/schema.gen.js").AkbRelationUnlinkEnvelope>(`/relations?${params}`, {
+        method: "DELETE",
+      });
+    },
+    provenance(uri: string) {
+      const params = new URLSearchParams({ uri });
+      return request<import("./core/schema.gen.js").AkbProvenanceEnvelope>(`/provenance?${params}`);
+    },
+  } satisfies AkbGraphFacade;
+  return Object.freeze(facade);
+}
+
+function makeTablesFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbTablesFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(
+    path: string | URL = "",
+    init: RequestInit = {},
+  ) => request<T>(joinPath("/tables", path), init);
+  const scopedPath = (table?: string): string => {
+    const vault = resolveTablesVault(defaultVault);
+    const root = `/tables/${encodePathSegment(vault)}`;
+    return table === undefined ? root : `${root}/${encodePathSegment(table)}`;
+  };
+  function schema(): Promise<
+    AkbResult<import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope>
+  >;
+  function schema(table: string): Promise<
+    AkbResult<import("./core/schema.gen.js").AkbTableSchemaEnvelope>
+  >;
+  function schema(
+    table?: string,
+  ): Promise<
+    AkbResult<
+      | import("./core/schema.gen.js").AkbVaultTableSchemaEnvelope
+      | import("./core/schema.gen.js").AkbTableSchemaEnvelope
+    >
+  > {
+    const path = table === undefined ? `${scopedPath()}/schema` : `${scopedPath(table)}/schema`;
+    return request(path);
+  }
+  const facade = {
+    name: "tables",
+    request: rawRequest,
+    list() {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath());
+    },
+    schema,
+    create(input: import("./core/schema.gen.js").CreateTableRequest) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(), {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+    },
+    alter(table: string, input: import("./core/schema.gen.js").AlterTableRequest) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(table), {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      });
+    },
+    migrate(
+      operations: readonly import("./core/schema.gen.js").TableMigrationOperation[],
+      options: AkbTableMigrationOptions,
+    ) {
+      return request<import("./core/schema.gen.js").AkbTableMigrationEnvelope>(
+        `${scopedPath()}/migrations`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": options.idempotencyKey },
+          body: JSON.stringify(operations),
+        },
+      );
+    },
+    drop(table: string) {
+      return request<import("./core/schema.gen.js").AkbTableEnvelope>(scopedPath(table), {
+        method: "DELETE",
+      });
+    },
+  } satisfies AkbTablesFacade;
+  return Object.freeze(facade);
+}
+
 function makeDocsFacade(
   request: AkbClient["request"],
   defaultVault: string | null,
@@ -774,6 +1083,24 @@ function makeDocsFacade(
   const facade = {
     name: "docs",
     request: rawRequest,
+    createCollection(input: AkbCreateCollectionInput) {
+      const vault = resolveDocumentVault(defaultVault);
+      return request<import("./core/schema.gen.js").AkbCollectionCreateEnvelope>(
+        `/collections/${encodePathSegment(vault)}`,
+        {
+          method: "POST",
+          body: JSON.stringify(omitUndefined({ path: input.path, summary: input.summary })),
+        },
+      );
+    },
+    deleteCollection(path: string, options: AkbDeleteCollectionOptions = {}) {
+      const vault = resolveDocumentVault(defaultVault);
+      const query = options.recursive === true ? "?recursive=true" : "";
+      return request<import("./core/schema.gen.js").AkbCollectionDeleteEnvelope>(
+        `/collections/${encodePathSegment(vault)}/${encodeCollectionPath(path)}${query}`,
+        { method: "DELETE" },
+      );
+    },
     get(docId: string, options: AkbDocumentGetOptions = {}) {
       const vault = resolveDocumentVault(options.vault ?? defaultVault);
       const params = new URLSearchParams();
@@ -781,6 +1108,22 @@ function makeDocsFacade(
       const query = params.size > 0 ? `?${params}` : "";
       return request<import("./core/schema.gen.js").AkbDocumentEnvelope>(
         `/documents/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}${query}`,
+      );
+    },
+    history(docId: string, options: AkbDocumentHistoryOptions = {}) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams();
+      appendOptional(params, "limit", options.limit);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbDocumentHistoryEnvelope>(
+        `/history/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}${query}`,
+      );
+    },
+    diff(docId: string, options: AkbDocumentDiffOptions) {
+      const vault = resolveDocumentVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams({ commit: options.commit });
+      return request<import("./core/schema.gen.js").AkbDocumentDiffEnvelope>(
+        `/diff/${encodePathSegment(vault)}/${encodeDocumentPath(docId)}?${params}`,
       );
     },
     put(input: AkbDocumentPutInput) {
@@ -823,6 +1166,39 @@ function makeDocsFacade(
   return Object.freeze(facade);
 }
 
+function makeActivityFacade(
+  request: AkbClient["request"],
+  defaultVault: string | null,
+): AkbActivityFacade {
+  const rawRequest = <T = AkbSuccessEnvelope>(path: string | URL = "", init: RequestInit = {}) => {
+    return request<T>(joinPath("/activity", path), init);
+  };
+  const facade = {
+    name: "activity",
+    request: rawRequest,
+    list(options: AkbActivityListOptions = {}) {
+      const vault = resolveActivityVault(options.vault ?? defaultVault);
+      const params = new URLSearchParams();
+      appendOptional(params, "collection", options.collection);
+      appendOptional(params, "author", options.author);
+      appendOptional(params, "since", options.since);
+      appendOptional(params, "limit", options.limit);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbActivityEnvelope>(
+        `/activity/${encodePathSegment(vault)}${query}`,
+      );
+    },
+    recent(options: AkbActivityRecentOptions = {}) {
+      const params = new URLSearchParams();
+      appendOptional(params, "vault", options.vault ?? defaultVault);
+      appendOptional(params, "limit", options.limit);
+      const query = params.size > 0 ? `?${params}` : "";
+      return request<import("./core/schema.gen.js").AkbRecentChangesEnvelope>(`/recent${query}`);
+    },
+  } satisfies AkbActivityFacade;
+  return Object.freeze(facade);
+}
+
 function makeStorageFacade(
   request: AkbClient["request"],
   defaultVault: string | null,
@@ -842,6 +1218,7 @@ function makeStorageFacade(
     appendOptional(params, "collection", storagePath.collection);
     appendOptional(params, "description", options.description);
     appendOptional(params, "mime_type", options.mimeType ?? "application/octet-stream");
+    appendOptional(params, "content_hash", options.contentHash);
     return request<import("./core/schema.gen.js").AkbFileEnvelope>(
       `/files/${encodePathSegment(vault)}/upload?${params}`,
       { method: "POST" },
@@ -1061,6 +1438,23 @@ function resolveStorageVault(vault: string | null | undefined): string {
   throw new TypeError("Select a vault before using storage: client.vault(\"...\").storage.");
 }
 
+function resolveActivityVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError("Select a vault before listing activity: client.vault(\"...\").activity.list().");
+}
+
+function resolveGraphVault(vault: string | null | undefined, operation: "overview" | "health"): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError(`Select a vault before using graph ${operation}: client.vault("...").graph.${operation}().`);
+}
+
+function resolveTablesVault(vault: string | null | undefined): string {
+  if (typeof vault === "string" && vault.length > 0) return vault;
+  throw new TypeError(
+    "Select a vault before using table administration: client.vault(\"...\").tables.",
+  );
+}
+
 function encodePathSegment(value: string): string {
   return encodeURIComponent(value);
 }
@@ -1071,6 +1465,14 @@ function encodeDocumentPath(path: string): string {
     throw new TypeError("Document path must be a non-empty string.");
   }
   return cleaned.split("/").map(encodePathSegment).join("/");
+}
+
+function encodeCollectionPath(path: string): string {
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new TypeError("Collection path must not contain URL dot segments ('.' or '..').");
+  }
+  return segments.map(encodePathSegment).join("/");
 }
 
 function documentPutPayload(

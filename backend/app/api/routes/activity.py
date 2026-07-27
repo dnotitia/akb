@@ -18,6 +18,12 @@ from app.services.document_service import DocumentService
 from app.services.git_service import GitService
 from app.services.user_directory import resolve_display_names
 from app.db.postgres import get_pool
+from app.models.activity import (
+    AkbActivityEnvelope,
+    AkbDocumentDiffEnvelope,
+    AkbDocumentHistoryEnvelope,
+    AkbRecentChangesEnvelope,
+)
 from app.repositories.document_repo import DocumentRepository
 
 router = APIRouter()
@@ -45,7 +51,14 @@ async def _resolve_activity_authors(entries: list[dict]) -> list[dict]:
     return entries
 
 
-@router.get("/activity/{vault}", summary="Get vault activity history (Git-based)")
+@router.get(
+    "/activity/{vault}",
+    summary="Get vault activity history (Git-based)",
+    operation_id="activityList",
+    tags=["activity"],
+    response_model=AkbActivityEnvelope,
+    response_model_exclude_unset=True,
+)
 async def vault_activity(
     vault: str,
     collection: str | None = Query(None),
@@ -71,10 +84,17 @@ async def vault_activity(
             or needle in (e.get("author_name") or "").lower()
         ]
 
-    return {"vault": vault, "total": len(entries), "activity": entries}
+    return {"kind": "activity", "vault": vault, "total": len(entries), "activity": entries}
 
 
-@router.get("/recent", summary="Recent document changes across vaults the user can access")
+@router.get(
+    "/recent",
+    summary="Recent document changes across vaults the user can access",
+    operation_id="activityRecent",
+    tags=["activity"],
+    response_model=AkbRecentChangesEnvelope,
+    response_model_exclude_unset=True,
+)
 async def recent_changes(
     vault: str | None = Query(None, description="Limit to a single vault"),
     limit: int = Query(20, ge=1, le=100),
@@ -142,10 +162,17 @@ async def recent_changes(
             "commit": r["current_commit"],
             "changed_at": r["updated_at"].isoformat() if r["updated_at"] else None,
         })
-    return {"changes": changes}
+    return {"kind": "recent_changes", "changes": changes}
 
 
-@router.get("/diff/{vault}/{doc_id:path}", summary="Get document diff at a specific commit")
+@router.get(
+    "/diff/{vault}/{doc_id:path}",
+    summary="Get document diff at a specific commit",
+    operation_id="documentsDiff",
+    tags=["documents"],
+    response_model=AkbDocumentDiffEnvelope,
+    response_model_exclude_unset=True,
+)
 async def document_diff(
     vault: str,
     doc_id: str,
@@ -162,10 +189,19 @@ async def document_diff(
         if not doc:
             raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
-    return await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
+    # off-load the git diff subprocess so the single event loop isn't starved
+    result = await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
+    return {"kind": "document_diff", **result}
 
 
-@router.get("/history/{vault}/{doc_id:path}", summary="Get document version history (Git-based)")
+@router.get(
+    "/history/{vault}/{doc_id:path}",
+    summary="Get document version history (Git-based)",
+    operation_id="documentsHistory",
+    tags=["documents"],
+    response_model=AkbDocumentHistoryEnvelope,
+    response_model_exclude_unset=True,
+)
 async def document_history(
     vault: str,
     doc_id: str,
@@ -182,4 +218,5 @@ async def document_history(
     which the global AKBError handler maps to 404.
     """
     await check_vault_access(user.user_id, vault, required_role="reader")
-    return await doc_service.history(vault, doc_id, limit=limit)
+    result = await doc_service.history(vault, doc_id, limit=limit)
+    return {"kind": "document_history", **result}

@@ -577,26 +577,25 @@ export interface PublicationResponse {
   title?: string;
   // document fields
   type?: string;
-  status?: string;
   summary?: string;
   domain?: string;
-  created_by?: string;
-  /** Human author name resolved from created_by (a user id) at read time. */
+  /** Human author name resolved from the doc's creator at read time. The raw
+   *  created_by identifier and internal status/created_at are not exposed to
+   *  anonymous viewers (F8). */
   created_by_name?: string;
-  created_at?: string;
   updated_at?: string;
   tags?: string[];
   content?: string;
   content_unavailable?: boolean;
   section_filter?: string | null;
   section_not_found?: boolean;
-  // file fields
+  // file fields — content is served from same-origin /raw and /download
+  // (built from the slug); the resolver no longer returns a presigned
+  // download_url / url_expires_in (F4).
   name?: string;
   mime_type?: string;
   size_bytes?: number;
   collection?: string;
-  download_url?: string;
-  url_expires_in?: number;
   // table_query fields
   columns?: string[];
   rows?: Record<string, any>[];
@@ -605,6 +604,9 @@ export interface PublicationResponse {
   applied_params?: Record<string, any>;
   mode?: "live" | "snapshot";
   snapshot_at?: string;
+  // Short-lived grant minted by this page open; carried by /raw, /download and
+  // CSV so they re-serve this same view without re-counting it.
+  view_grant?: string;
 }
 
 export interface PublicationError {
@@ -632,10 +634,29 @@ export function clearPublicationToken(slug: string) {
   sessionStorage.removeItem(publicationTokenKey(slug));
 }
 
+// View-grant: the page-open response mints one; /raw, /download and CSV carry it
+// so those re-serves of the SAME view aren't re-counted. Without it the backend
+// counts each fetch as its own view (so max_views is a hard cap on every path).
+function publicationGrantKey(slug: string) {
+  return `akb_publication_grant_${slug}`;
+}
+
+export function getViewGrant(slug: string): string | null {
+  return sessionStorage.getItem(publicationGrantKey(slug));
+}
+
+export function setViewGrant(slug: string, grant: string) {
+  sessionStorage.setItem(publicationGrantKey(slug), grant);
+}
+
 async function fetchPublic(slug: string, path: string = "", params?: Record<string, string>): Promise<Response> {
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
   if (token) search.set("token", token);
+  // Carry any grant from an earlier open so a reload / param-change within the
+  // window re-serves this view instead of spending a new one.
+  if (grant) search.set("grant", grant);
   const qs = search.toString();
   const suffix = qs ? `?${qs}` : "";
   return fetch(`${API_BASE}/public/${slug}${path}${suffix}`);
@@ -658,6 +679,9 @@ export async function getPublication(
     };
     throw err;
   }
+  // This page open spent one view and returned a grant; keep it so the paired
+  // /raw + /download re-serves of this view aren't counted again.
+  if (body.view_grant) setViewGrant(slug, body.view_grant);
   return body;
 }
 
@@ -668,6 +692,29 @@ export async function getPublicationMeta(slug: string): Promise<any> {
     throw { message: body.detail || body.error || res.statusText, status: res.status, password_required: body.password_required } as PublicationError;
   }
   return res.json();
+}
+
+export interface PublicationCapabilities {
+  can_edit: boolean;
+  vault?: string;
+  resource_type?: "document" | "table_query" | "file";
+}
+
+// Owner capability probe for the public page. Anonymous-first: only asks the
+// server when a session token exists, and degrades to {can_edit:false} on any
+// error so it can never break (or redirect away from) the public view. (F6.)
+export async function publicationCapabilities(slug: string): Promise<PublicationCapabilities> {
+  const token = getToken();
+  if (!token) return { can_edit: false };
+  try {
+    const res = await fetch(`${API_BASE}/public/${slug}/capabilities`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { can_edit: false };
+    return await res.json();
+  } catch {
+    return { can_edit: false };
+  }
 }
 
 export async function submitPublicationPassword(slug: string, password: string): Promise<{ token: string; expires_in: number }> {
@@ -686,23 +733,31 @@ export async function submitPublicationPassword(slug: string, password: string):
 
 export function publicationDownloadUrl(slug: string, params?: Record<string, string>): string {
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
   if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${slug}/download${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationRawUrl(slug: string): string {
   const token = getPublicationToken(slug);
-  const qs = token ? `?token=${token}` : "";
-  return `${API_BASE}/public/${slug}/raw${qs}`;
+  const grant = getViewGrant(slug);
+  const search = new URLSearchParams();
+  if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
+  const qs = search.toString();
+  return `${API_BASE}/public/${slug}/raw${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationCsvUrl(slug: string, params?: Record<string, string>): string {
   const search = new URLSearchParams(params || {});
   search.set("format", "csv");
   const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
   if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
   return `${API_BASE}/public/${slug}?${search.toString()}`;
 }
 

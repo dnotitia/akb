@@ -90,40 +90,36 @@ def content_disposition_attachment(filename: str) -> str:
 # ── Top-level S3 helpers (thin wrappers around s3_adapter) ───────
 
 
-def get_presigned_download_url(
-    s3_key: str,
-    ttl: int = _PRESIGN_DOWNLOAD_TTL,
-    response_content_type: str | None = None,
-    attachment_filename: str | None = None,
-) -> str:
-    """Presigned GET URL for an arbitrary S3 key.
-
-    Used by share_service to bypass the vault_files lookup when the caller
-    already has the s3_key in hand. Raises StorageError on failure.
-
-    `response_content_type` overrides the stored object's Content-Type in
-    the response (needed when the object was uploaded with a generic
-    application/octet-stream but the DB metadata has the correct value).
-
-    `attachment_filename` sets Content-Disposition so the browser forces
-    a download rather than rendering inline (the presigned URL is
-    cross-origin, so the <a download> attribute is ignored).
-    """
-    cd = (
-        content_disposition_attachment(attachment_filename)
-        if attachment_filename
-        else None
-    )
-    return s3_adapter.presign_get(
-        s3_key,
-        ttl=ttl,
-        response_content_type=response_content_type,
-        response_content_disposition=cd,
-    )
+def get_object_bytes(s3_key: str, max_bytes: int | None = None) -> bytes:
+    """Read the whole object into memory. When ``max_bytes`` is given, abort with
+    StorageError if the ACTUAL object exceeds it. Callers (e.g. /raw) pre-check a
+    DB ``size_bytes`` gate, but that recorded size can drift from the stored
+    object — the presigned PUT stays usable after confirm — so we also bound the
+    READ itself and never buffer an over-cap body into the single process."""
+    if max_bytes is None:
+        return s3_adapter.get_bytes(s3_key)
+    buf = bytearray()
+    gen = s3_adapter.iter_chunks(s3_key)
+    try:
+        for chunk in gen:
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
+    finally:
+        # release the boto stream promptly on cap-abort or exhaustion; the
+        # concrete iterator is a generator, but the annotation is Iterator[bytes]
+        close = getattr(gen, "close", None)
+        if callable(close):
+            close()
+    return bytes(buf)
 
 
-def get_object_bytes(s3_key: str) -> bytes:
-    return s3_adapter.get_bytes(s3_key)
+def head_object(s3_key: str) -> dict:
+    """Cheap existence/metadata probe (S3 HEAD, no body). Raises StorageError/
+    AKBError if the object is missing or unreadable. Callers streaming a large
+    object HEAD it first (off the event loop) so a missing object is a clean 502
+    before the response is committed, without buffering the whole body."""
+    return s3_adapter.head(s3_key)
 
 
 def iter_object_chunks(
@@ -141,12 +137,69 @@ def put_object_bytes(
 # ── File-key naming convention ───────────────────────────────────
 
 
-def _s3_key(vault_name: str, collection: str, filename: str) -> str:
+# A key's leading path component is `{prefix}_{safe_filename}`. Two prefix
+# flavours exist and are told apart by `_CONTENT_KEY_MARKER`:
+#
+#   `{8 random hex}_name`        — opaque. The historical default, still used
+#                                  whenever the caller cannot state the bytes
+#                                  up front. Never collides, so re-uploading
+#                                  the same artifact always makes a new row.
+#   `sha256-{16 hex}_name`       — content-addressed. The digest is the leading
+#                                  16 hex chars of the sha256 of the object's
+#                                  bytes, so the key is a function of *what the
+#                                  object is* rather than of when it was
+#                                  uploaded. Re-uploading the same artifact
+#                                  lands on the same key and therefore on the
+#                                  existing `UNIQUE(vault_id, s3_key)` row.
+#
+# The digest is deliberately a plain prefix of the content hash and not a
+# derived value: an operator holding a `vault_files.content_hash` can pair it
+# to a key by eye, which is what makes an acquired artifact traceable.
+_CONTENT_KEY_MARKER = "sha256-"
+_CONTENT_KEY_DIGEST_LEN = 16
+
+
+def _content_key_prefix(content_hash: str) -> str:
+    """Key prefix that makes an object's key a function of its bytes."""
+    return f"{_CONTENT_KEY_MARKER}{content_hash[:_CONTENT_KEY_DIGEST_LEN]}"
+
+
+def _s3_key(
+    vault_name: str,
+    collection: str,
+    filename: str,
+    *,
+    content_hash: str | None = None,
+) -> str:
+    """Build the storage key for an uploaded file.
+
+    With `content_hash`, the key is deterministic: the same bytes under the
+    same vault/collection/filename always produce the same key. Without it,
+    the key carries a random prefix and is unique per call — the pre-existing
+    behaviour, preserved for callers that cannot hash before uploading.
+    """
     safe_name = filename.replace("/", "_")
-    uid = uuid.uuid4().hex[:8]
+    prefix = (
+        _content_key_prefix(content_hash) if content_hash
+        else uuid.uuid4().hex[:8]
+    )
     if collection:
-        return f"{vault_name}/{collection}/{uid}_{safe_name}"
-    return f"{vault_name}/{uid}_{safe_name}"
+        return f"{vault_name}/{collection}/{prefix}_{safe_name}"
+    return f"{vault_name}/{prefix}_{safe_name}"
+
+
+def _content_key_honors_hash(s3_key: str, content_hash: str) -> bool:
+    """Whether `s3_key`'s content claim is borne out by `content_hash`.
+
+    Only content-addressed keys make a claim about their bytes; a random
+    (legacy) key asserts nothing and therefore always passes. This is what
+    stops a caller from declaring one hash at `initiate_upload` — thereby
+    reserving that content's key — and then storing unrelated bytes under it.
+    """
+    last_segment = s3_key.rsplit("/", 1)[-1]
+    if not last_segment.startswith(_CONTENT_KEY_MARKER):
+        return True
+    return last_segment.startswith(f"{_content_key_prefix(content_hash)}_")
 
 
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
@@ -169,6 +222,7 @@ class FileService:
         actor_id: str,
         mime_type: str = "application/octet-stream",
         description: str = "",
+        content_hash: str | None = None,
     ) -> dict:
         """Create a file record and return a presigned PUT URL.
 
@@ -177,10 +231,31 @@ class FileService:
         for vault root); a matching `collections` row is auto-created
         if needed so files share the same FK-normalized hierarchy as
         documents and tables.
+
+        `content_hash` is the caller's sha256 of the bytes it is about to
+        upload. Supplying it makes the upload **idempotent**: the storage key
+        becomes a function of the bytes, so re-uploading the same artifact to
+        the same vault/collection/filename resolves to the file that is
+        already there instead of creating a second row for the same content.
+        The returned envelope is unchanged in shape and still carries a usable
+        `upload_url` — an unaware client can re-PUT the identical bytes to the
+        identical key and confirm as usual; the net effect is one row, not two.
+        `deduplicated` says which happened, for clients that would rather skip
+        the redundant transfer.
+
+        The hash is a *claim* at this point — AKB certifies the real one in
+        `confirm_upload`, which rejects bytes that do not match the key they
+        were stored under. Omitting `content_hash` preserves the historical
+        behaviour exactly: a random key, and one new row per call.
         """
+        if content_hash is not None and not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
-        s3_key = _s3_key(vault_name, collection_path, filename)
+        s3_key = _s3_key(
+            vault_name, collection_path, filename, content_hash=content_hash,
+        )
         file_id = uuid.uuid4()
 
         presigned_url = s3_adapter.presign_put(
@@ -196,7 +271,7 @@ class FileService:
                     collection_id = await coll_repo.get_or_create(
                         vault_id, collection_path, conn=conn,
                     )
-                await vault_files_repo.insert(
+                stored_id = await vault_files_repo.insert_or_adopt(
                     conn,
                     file_id=file_id, vault_id=vault_id,
                     name=filename,
@@ -206,9 +281,12 @@ class FileService:
                     collection_id=collection_id,
                 )
 
+        deduplicated = stored_id != file_id
+        file_id = stored_id
+
         logger.info(
-            "Presigned upload URL for %s/%s (file_id=%s, collection=%s)",
-            vault_name, s3_key, file_id, collection_path or "<root>",
+            "Presigned upload URL for %s/%s (file_id=%s, collection=%s, deduplicated=%s)",
+            vault_name, s3_key, file_id, collection_path or "<root>", deduplicated,
         )
         return {
             "kind": "file",
@@ -218,6 +296,7 @@ class FileService:
             "upload_url": presigned_url,
             "s3_key": s3_key,
             "expires_in": _PRESIGN_UPLOAD_TTL,
+            "deduplicated": deduplicated,
         }
 
     async def confirm_upload(
@@ -269,7 +348,20 @@ class FileService:
             compute_stream_content_hash,
             s3_adapter.iter_chunks(row["s3_key"]),
         )
-        if content_hash and content_hash != server_content_hash:
+        # Two ways the stored bytes can fail to be what was declared: the
+        # caller's `content_hash` argument disagrees with them, or the key they
+        # were stored under is content-addressed and does not. The second check
+        # is what keeps a content-addressed key honest end to end — without it a
+        # caller could reserve some other content's key at `initiate_upload`,
+        # omit `content_hash` here, and leave unrelated bytes sitting where the
+        # next caller's idempotent upload would adopt them. Both are the same
+        # fault ("these are not the bytes you said") and take the same
+        # pre-existing 409 + cleanup path.
+        stored_bytes_disowned = (
+            (content_hash is not None and content_hash != server_content_hash)
+            or not _content_key_honors_hash(row["s3_key"], server_content_hash)
+        )
+        if stored_bytes_disowned:
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     await vault_files_repo.delete(conn, fid)

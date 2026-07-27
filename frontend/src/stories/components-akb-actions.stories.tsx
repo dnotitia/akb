@@ -212,3 +212,59 @@ export const VaultDirectory: Story = {
     </main>
   ),
 };
+
+/** VaultList with the optional favorite control — the star is a sibling of the
+ *  row link, so clicking it toggles the pin instead of navigating. */
+function VaultListFavDemo() {
+  const [favs, setFavs] = useState<Set<string>>(new Set());
+  return (
+    <main className="mx-auto max-w-5xl p-6">
+      <VaultList
+        vaults={vaults}
+        favoriteControl={{
+          isFavorite: (id) => favs.has(id),
+          onToggle: (v) =>
+            setFavs((prev) => {
+              const next = new Set(prev);
+              if (next.has(v.id)) next.delete(v.id);
+              else next.add(v.id);
+              return next;
+            }),
+        }}
+      />
+    </main>
+  );
+}
+
+export const VaultDirectoryFavorites: Story = {
+  parameters: {
+    router: { initialEntries: ["/"] },
+    msw: {
+      handlers: [
+        http.get(`${API}/vaults/:vault/info`, ({ params }) =>
+          HttpResponse.json(infoByVault[String(params.vault)] || {}),
+        ),
+      ],
+    },
+  },
+  render: () => <VaultListFavDemo />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const name = vaults[0].name;
+    // Starts unpinned: the accessible name says "Add …", aria-pressed=false.
+    const star = canvas.getByRole("button", { name: new RegExp(`Add ${name} to favorites`, "i") });
+    await expect(star).toHaveAttribute("aria-pressed", "false");
+    // Clicking the star toggles the pin in place (does not navigate — it is a
+    // sibling of the row link, not nested inside it).
+    await userEvent.click(star);
+    const unstar = await canvas.findByRole("button", {
+      name: new RegExp(`Remove ${name} from favorites`, "i"),
+    });
+    await expect(unstar).toHaveAttribute("aria-pressed", "true");
+    // Toggling back restores the original state.
+    await userEvent.click(unstar);
+    await expect(
+      canvas.getByRole("button", { name: new RegExp(`Add ${name} to favorites`, "i") }),
+    ).toHaveAttribute("aria-pressed", "false");
+  },
+};

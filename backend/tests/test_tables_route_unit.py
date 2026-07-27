@@ -15,7 +15,68 @@ class _User:
 
 
 @pytest.mark.asyncio
-async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
+async def test_create_table_route_forwards_plain_schema_with_legacy_defaults(monkeypatch) -> None:
+    from app.api.routes import tables
+
+    captured: dict[str, Any] = {}
+
+    async def fake_check_vault_access(*_args: Any, **kwargs: Any) -> dict[str, str]:
+        assert kwargs["required_role"] == "writer"
+        return {"vault_id": "vault-1"}
+
+    async def fake_create_table(vault_id: str, name: str, columns: list[dict], **kwargs: Any) -> dict[str, Any]:
+        captured.update({"vault_id": vault_id, "name": name, "columns": columns, **kwargs})
+        return {"kind": "table", "name": name}
+
+    monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
+    monkeypatch.setattr(tables.table_service, "create_table", fake_create_table)
+
+    result = await tables.create_table(
+        "demo",
+        tables.CreateTableRequest(
+            name="incidents",
+            columns=[
+                {
+                    "name": "state",
+                    "type": "enum",
+                    "enum": ["todo", "done"],
+                    "default": None,
+                    "vendor_extension": {"preserve": True},
+                }
+            ],
+            unique_keys=[{"columns": ["state"], "vendor_extension": "keep"}],
+            indexes=[{"columns": [{"name": "state", "order": "desc"}]}],
+        ),
+        _User(),  # type: ignore[arg-type]
+    )
+
+    assert result["kind"] == "table"
+    assert captured == {
+        "vault_id": "vault-1",
+        "name": "incidents",
+        "columns": [
+            {
+                "name": "state",
+                "type": "enum",
+                "enum": ["todo", "done"],
+                "default": None,
+                "vendor_extension": {"preserve": True},
+            }
+        ],
+        "actor_id": "김영로",
+        "description": "",
+        "collection": None,
+        "unique_keys": [{"columns": ["state"], "vendor_extension": "keep"}],
+        "indexes": [{"columns": [{"name": "state", "order": "desc"}]}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_route_serialises_envelope_and_forwards_params(monkeypatch) -> None:
+    import json
+
+    from starlette.responses import Response
+
     from app.api.routes import tables
 
     captured: dict[str, Any] = {}
@@ -36,7 +97,13 @@ async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
         _User(),  # type: ignore[arg-type]
     )
 
-    assert result["kind"] == "table_query"
+    # The route serialises the envelope with pydantic-core (Rust) into one
+    # `Response` — a single fast pass that keeps the event-loop block far under
+    # the /livez probe timeout. The body is one ordinary JSON document.
+    assert isinstance(result, Response)
+    assert result.media_type == "application/json"
+    envelope = json.loads(result.body)
+    assert envelope["kind"] == "table_query"
     assert captured == {
         "vault_names": ["demo"],
         "user_id": _User.user_id,
@@ -47,7 +114,7 @@ async def test_execute_sql_route_forwards_params(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatch) -> None:
+async def test_alter_table_route_forwards_schema_ops_with_admin_gate(monkeypatch) -> None:
     from app.api.routes import tables
 
     captured: dict[str, Any] = {}
@@ -86,7 +153,7 @@ async def test_alter_table_route_forwards_schema_ops_with_writer_gate(monkeypatc
     )
 
     assert result["kind"] == "table"
-    assert roles == ["writer"]
+    assert roles == ["admin"]
     assert captured == {
         "vault_id": "vault-1",
         "table_name": "incidents",
@@ -128,7 +195,33 @@ async def test_table_migration_route_forwards_key_ops_with_writer_gate(monkeypat
     monkeypatch.setattr(tables, "check_vault_access", fake_check_vault_access)
     monkeypatch.setattr(tables.table_migration_service, "apply_table_migration", fake_apply_table_migration)
 
-    ops = [{"op": "add_column", "table": "incidents", "name": "title", "type": "text"}]
+    raw_ops = [
+        {
+            "op": "add-column",
+            "table_name": "incidents",
+            "column": {
+                "name": "status",
+                "type": "text",
+                "default": None,
+                "vendor_tag": "keep",
+            },
+            "trace": "legacy",
+        },
+        {
+            "op": "add_index",
+            "table": "incidents",
+            "name": "incidents_status_idx",
+            "columns": [{"name": "status", "order": "desc"}],
+            "fillfactor": 90,
+        },
+        {
+            "op": "rename_column",
+            "table": "incidents",
+            "old_name": "status",
+            "new_name": "state",
+        },
+    ]
+    ops = [tables.TableMigrationOperationAdapter.validate_python(op) for op in raw_ops]
     result = await tables.apply_table_migration(
         "demo",
         ops,
@@ -142,7 +235,7 @@ async def test_table_migration_route_forwards_key_ops_with_writer_gate(monkeypat
         "vault_id": "vault-1",
         "actor_id": "김영로",
         "idempotency_key": "11111111-1111-4111-8111-111111111111",
-        "operations": ops,
+        "operations": raw_ops,
     }
 
 

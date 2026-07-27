@@ -7,6 +7,7 @@ before calling these endpoints.
 """
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -14,6 +15,17 @@ from app.api.deps import get_current_user
 from app.db.postgres import get_pool
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
+from app.models.knowledge import (
+    GraphHealthResponse,
+    GraphOverviewResponse,
+    GraphResponse,
+    LinkRequest,
+    ProvenanceResponse,
+    ReadRelationType,
+    RelationLinkResponse,
+    RelationsResponse,
+    RelationUnlinkResponse,
+)
 from app.services.kg_service import (
     LinkRelationType as RelationType,
     get_resource_relations,
@@ -25,7 +37,6 @@ from app.services.kg_service import (
     unlink_resources,
 )
 from app.services.uri_service import parse_uri
-from app.util.text import NFCModel
 
 router = APIRouter()
 logger = logging.getLogger("akb.api.knowledge")
@@ -64,13 +75,6 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
 # single-source `LinkRelationType` from kg_service (which the MCP
 # akb_link tool schema also derives from), so a relation one surface
 # rejects can never sneak in through the other.
-
-
-class LinkRequest(NFCModel):
-    source: str
-    target: str
-    relation: RelationType
-    metadata: dict | None = None
 
 
 # kg_service.link_resources returns an err()-envelope dict instead of
@@ -122,11 +126,18 @@ def _shared_link_vault(source: str, target: str) -> str:
     return source_vault
 
 
-@router.get("/relations", summary="Get resource relations (1-hop)")
+@router.get(
+    "/relations",
+    summary="Get resource relations (1-hop)",
+    operation_id="graphRelations",
+    tags=["graph"],
+    response_model=RelationsResponse,
+    response_model_exclude_unset=True,
+)
 async def resource_relations(
     uri: str = Query(..., description="Resource URI"),
-    direction: str = Query("both", enum=["incoming", "outgoing", "both"]),
-    type: str | None = Query(None),
+    direction: Literal["incoming", "outgoing", "both"] = Query("both"),
+    type: ReadRelationType | None = Query(None),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     vault, _rtype, _ident = _parse_resource_uri(uri)
@@ -136,10 +147,17 @@ async def resource_relations(
         vault_id=access["vault_id"],
         direction=direction, relation_type=type,
     )
-    return {"uri": uri, "relations": relations}
+    return {"kind": "relations", "uri": uri, "relations": relations}
 
 
-@router.post("/relations", summary="Create a relation edge (link)")
+@router.post(
+    "/relations",
+    summary="Create a relation edge (link)",
+    operation_id="graphLink",
+    tags=["graph"],
+    response_model=RelationLinkResponse,
+    response_model_exclude_unset=True,
+)
 async def create_relation(
     req: LinkRequest,
     user: AuthenticatedUser = Depends(get_current_user),
@@ -150,10 +168,17 @@ async def create_relation(
         vault, req.source, req.target, req.relation,
         created_by=user.username, metadata=req.metadata,
     )
-    return _bridge_service_error(result)
+    return {**_bridge_service_error(result), "kind": "relation_link"}
 
 
-@router.delete("/relations", summary="Remove a relation edge (unlink)")
+@router.delete(
+    "/relations",
+    summary="Remove a relation edge (unlink)",
+    operation_id="graphUnlink",
+    tags=["graph"],
+    response_model=RelationUnlinkResponse,
+    response_model_exclude_unset=True,
+)
 async def delete_relation(
     source: str = Query(..., description="Source resource URI"),
     target: str = Query(..., description="Target resource URI"),
@@ -169,10 +194,17 @@ async def delete_relation(
     result = await unlink_resources(
         source, target, relation_type=relation, vault_id=access["vault_id"],
     )
-    return _bridge_service_error(result)
+    return {**_bridge_service_error(result), "kind": "relation_unlink"}
 
 
-@router.get("/graph", summary="Get knowledge graph (nodes + edges)")
+@router.get(
+    "/graph",
+    summary="Get knowledge graph (nodes + edges)",
+    operation_id="graphNeighbors",
+    tags=["graph"],
+    response_model=GraphResponse,
+    response_model_exclude_unset=True,
+)
 async def vault_graph(
     uri: str | None = Query(None, description="Center resource URI (omit + pass vault for full vault graph)"),
     vault: str | None = Query(None, description="Vault name (only when uri is omitted)"),
@@ -189,7 +221,12 @@ async def vault_graph(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     if uri:
-        center_vault, _rtype, _ident = _parse_resource_uri(uri)
+        center_vault, resource_type, _ident = _parse_resource_uri(uri)
+        if resource_type not in {"doc", "table", "file"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Graph resources must be doc, table, or file URIs; got {resource_type}.",
+            )
         vault_name = center_vault
     else:
         if not vault:
@@ -198,13 +235,22 @@ async def vault_graph(
             )
         vault_name = vault
     access = await check_vault_access(user.user_id, vault_name, required_role="reader")
-    return await get_graph(
+    result = await get_graph(
         vault_name, resource_uri=uri, hops=hops, limit=limit,
         vault_id=access["vault_id"],
     )
+    kind = "graph_neighbors" if uri else "graph_overview"
+    return {**result, "kind": kind}
 
 
-@router.get("/graph/overview", summary="Get vault graph overview (degree-ranked top-K + totals)")
+@router.get(
+    "/graph/overview",
+    summary="Get vault graph overview (degree-ranked top-K + totals)",
+    operation_id="graphOverview",
+    tags=["graph"],
+    response_model=GraphOverviewResponse,
+    response_model_exclude_unset=True,
+)
 async def vault_graph_overview(
     vault: str = Query(..., description="Vault name"),
     top_k: int = Query(
@@ -217,10 +263,18 @@ async def vault_graph_overview(
     `edges_total` / `truncated` so the client can render "showing N of M".
     Replaces the recency-capped no-`uri` branch of `/graph` for overviews."""
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    return await get_overview(vault, vault_id=access["vault_id"], top_k=top_k)
+    result = await get_overview(vault, vault_id=access["vault_id"], top_k=top_k)
+    return {**result, "kind": "graph_overview"}
 
 
-@router.get("/graph/health", summary="Get vault graph health (hubs + orphans)")
+@router.get(
+    "/graph/health",
+    summary="Get vault graph health (hubs + orphans)",
+    operation_id="graphHealth",
+    tags=["graph"],
+    response_model=GraphHealthResponse,
+    response_model_exclude_unset=True,
+)
 async def vault_graph_health(
     vault: str = Query(..., description="Vault name"),
     hub_threshold: int = Query(
@@ -233,12 +287,20 @@ async def vault_graph_health(
     """KB-health audit: over-connected hubs (degree ≥ `hub_threshold`) and the
     orphan documents (no relations) that the graph view exists to surface."""
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    return await get_health(
+    result = await get_health(
         vault, vault_id=access["vault_id"], hub_threshold=hub_threshold, limit=limit,
     )
+    return {**result, "kind": "graph_health"}
 
 
-@router.get("/provenance", summary="Get document provenance")
+@router.get(
+    "/provenance",
+    summary="Get document provenance",
+    operation_id="graphProvenance",
+    tags=["graph"],
+    response_model=ProvenanceResponse,
+    response_model_exclude_unset=True,
+)
 async def document_provenance(
     uri: str = Query(..., description="Document URI"),
     user: AuthenticatedUser = Depends(get_current_user),
@@ -257,4 +319,5 @@ async def document_provenance(
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
     await check_vault_access(user.user_id, vault, required_role="reader")
-    return await get_provenance(str(row["doc_pk"]), vault_id=row["vault_id"])
+    result = await get_provenance(str(row["doc_pk"]), vault_id=row["vault_id"])
+    return {**result, "kind": "provenance"}

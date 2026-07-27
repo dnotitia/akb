@@ -48,6 +48,16 @@ async def upload_file(
     collection: str = Query("", description="Logical grouping"),
     description: str = Query("", description="File description"),
     mime_type: str = Query("application/octet-stream", description="MIME type"),
+    content_hash: str | None = Query(
+        None,
+        description=(
+            "Optional sha256 of the bytes about to be uploaded. Supplying it "
+            "makes the upload idempotent: the same bytes under the same "
+            "vault/collection/filename resolve to the existing file instead of "
+            "creating a duplicate. Omit for the original one-row-per-call "
+            "behaviour."
+        ),
+    ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Returns a presigned PUT URL. Client uploads directly to S3."""
@@ -62,6 +72,7 @@ async def upload_file(
         actor_id=actor_id,
         mime_type=mime_type,
         description=to_nfc(description),
+        content_hash=content_hash,
     )
 
 

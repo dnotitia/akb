@@ -126,20 +126,31 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 60
+          # Readiness gates traffic and MUST stay honest — shed a stalled pod
+          # from Service endpoints quickly. Keep failureThreshold small; only
+          # widen timeout so a single slow (not dead) /readyz doesn't flap the
+          # endpoint. ~3×15s = 45s of sustained unreadiness before removal.
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8000
             periodSeconds: 15
-            timeoutSeconds: 5
+            timeoutSeconds: 8
             failureThreshold: 3
+          # Liveness RESTARTS the pod (SIGKILL) — with replicas=1 that is a
+          # total outage, so it must fire ONLY on a genuinely dead loop, never
+          # on a transient multi-second stall (a big akb_sql, an indexing
+          # burst). The single event loop can be briefly unschedulable while
+          # still healthy, so tolerate ~6×30s = 3min before assuming deadlock.
+          # (Do NOT rely on a runtime `kubectl patch` — deploy-internal.sh
+          # re-applies this manifest and clobbers it; the value must live here.)
           livenessProbe:
             httpGet:
               path: /livez
               port: 8000
             periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 8
+            failureThreshold: 6
       volumes:
         - name: app-config
           configMap:

@@ -92,7 +92,10 @@ export function Layout() {
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
       <header className="app-header sticky top-0 z-40 shrink-0">
-        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1600px] items-center gap-4 px-5 h-16">
+        {/* Header uses the same max-w-[1400px] px-6 gutter as the page content
+            and footer on EVERY route, so the brand/nav stay aligned and don't
+            jump wider when entering a vault workspace. */}
+        <div className="mx-auto grid grid-cols-[1fr_minmax(0,52rem)_1fr] max-w-[1400px] items-center gap-4 px-6 h-16">
           {/* Brand */}
           <Link
             to="/"
@@ -165,7 +168,19 @@ export function Layout() {
               name="Vaults"
             />
             <div className="mx-1.5 h-6 w-px bg-border" aria-hidden />
-            <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
+            {/* Fixed-width slot so the indexing badge popping in/out (background
+                polling) can't resize the nav and shove the centered search
+                sideways. IndexingBadge still returns null when idle — the
+                always-mounted slot is the placeholder. Overflow is clipped
+                rather than pushed on the rare pending+abandoned two-chip case.
+                aria-live announces status changes politely (per Codex review). */}
+            <div
+              className="hidden sm:flex w-32 shrink-0 items-center justify-end gap-1 overflow-hidden whitespace-nowrap"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              <IndexingBadge pending={indexingPending} abandoned={indexingAbandoned} />
+            </div>
             <ThemeToggle />
             <UserMenu />
           </nav>

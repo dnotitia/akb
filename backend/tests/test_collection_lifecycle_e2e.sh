@@ -103,6 +103,60 @@ R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"collection
 VAULT_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['vault_id'])" 2>/dev/null)
 [ -n "$VAULT_ID" ] && pass "vault created ($VAULT)" || { fail "create_vault" "no vault_id"; exit 1; }
 
+# ── 2b. Typed REST lifecycle contract ───────────────────────
+echo ""
+echo "▸ 2b. Typed REST lifecycle contract"
+
+REST_BODY=$(mktemp)
+trap 'rm -f "$REST_BODY"' EXIT
+
+REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X POST "$BASE_URL/api/v1/collections/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"rest-contract","summary":null}' 2>/dev/null)
+REST_CREATE=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("kind"), d.get("ok"), d.get("created"), d.get("collection",{}).get("summary"), d.get("collection",{}).get("doc_count"))' <"$REST_BODY" 2>/dev/null)
+[ "$REST_HTTP" = "200" ] && [ "$REST_CREATE" = "collection_create True True None 0" ] \
+  && pass "REST create → typed collection_create with null summary and zero doc_count" \
+  || fail "REST typed create" "http=$REST_HTTP values=$REST_CREATE; body=$(cat "$REST_BODY")"
+
+REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X POST "$BASE_URL/api/v1/collections/$VAULT" \
+  -H "Authorization: Bearer $PAT" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"rest-contract","summary":"ignored"}' 2>/dev/null)
+REST_REPEAT=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("kind"), d.get("created"), d.get("collection",{}).get("summary"), d.get("collection",{}).get("doc_count"))' <"$REST_BODY" 2>/dev/null)
+[ "$REST_HTTP" = "200" ] && [ "$REST_REPEAT" = "collection_create False None 0" ] \
+  && pass "REST idempotent create preserves stored summary and created=false" \
+  || fail "REST idempotent create" "http=$REST_HTTP values=$REST_REPEAT; body=$(cat "$REST_BODY")"
+
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rest-contract\",\"title\":\"RestContractDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
+REST_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
+[ -n "$REST_DOC_URI" ] && pass "seeded REST contract collection" \
+  || fail "REST contract seed" "no uri; raw=$R"
+
+REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/rest-contract" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+REST_409=$(python3 -c 'import json,sys; d=json.load(sys.stdin); x=d.get("details",{}); legacy=d.get("detail",{}); print(d.get("code"), x.get("doc_count"), x.get("file_count"), x.get("sub_collection_count"), x.get("table_count"), legacy.get("file_count"))' <"$REST_BODY" 2>/dev/null)
+[ "$REST_HTTP" = "409" ] && [ "$REST_409" = "conflict 1 0 0 0 0" ] \
+  && pass "REST non-empty delete → 409 details and legacy detail preserve all counts" \
+  || fail "REST non-empty 409" "http=$REST_HTTP values=$REST_409; body=$(cat "$REST_BODY")"
+
+REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/rest-contract?recursive=true" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+REST_DELETE=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("kind"), d.get("ok"), d.get("collection"), d.get("deleted_docs"), d.get("deleted_files"), d.get("deleted_sub_collections"), d.get("deleted_tables"))' <"$REST_BODY" 2>/dev/null)
+[ "$REST_HTTP" = "200" ] && [ "$REST_DELETE" = "collection_delete True rest-contract 1 0 0 0" ] \
+  && pass "REST recursive delete → typed collection_delete with exact counts" \
+  || fail "REST typed recursive delete" "http=$REST_HTTP values=$REST_DELETE; body=$(cat "$REST_BODY")"
+
+REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
+  -X DELETE "$BASE_URL/api/v1/collections/$VAULT/rest-contract" \
+  -H "Authorization: Bearer $PAT" 2>/dev/null)
+[ "$REST_HTTP" = "404" ] && pass "REST missing collection → 404" \
+  || fail "REST missing collection 404" "http=$REST_HTTP; body=$(cat "$REST_BODY")"
+
 # ── 3. Create empty collection ──────────────────────────────
 echo ""
 echo "▸ 3. Create empty collection"

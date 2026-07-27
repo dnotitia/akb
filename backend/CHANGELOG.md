@@ -7,6 +7,25 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+REST table schema alteration now requires the `admin` role, matching the MCP
+`akb_alter_table` authorization boundary. This closes the route-dependent
+permission gap that allowed a `writer` to perform destructive operations such
+as dropping a column through REST while the equivalent MCP call was denied.
+Operation-level writer/admin permission tiers remain a follow-up design change.
+
+Vault names now accept only single hyphens between lowercase alphanumeric
+segments (no leading, trailing, or consecutive hyphens). Hyphens map to
+underscores inside physical vault-table names and `__` separates the vault
+and table parts, so a hyphen run could fuse two different vault/table pairs
+onto one physical table — vault `a--b` table `c` and vault `a` table `b__c`
+both mapped to `vt_a__b__c` (#285). Existing vaults are unaffected;
+`create_table` now preflights the generated physical name and reports a
+cross-vault fusion as a clear 409 conflict naming the fusion rule, instead
+of a misleading unique-key/index 422 that echoed the raw PostgreSQL error.
+Genuine index/constraint-name clashes keep their existing 422 — including
+the case where the supplied index name is the table's own physical name,
+which PostgreSQL reports with the same error as a lost create race.
+
 Standalone model routing remains unchanged under the default
 `external_metering` profile. Managed deployments can opt into
 `platform_hard`, which fails startup unless every active embedding, chat, and
@@ -49,6 +68,16 @@ server has the complete invite-only/local-auth-disabled profile. The response
 contains only counts and stable issue codes; it never returns email, subject,
 password, token, or credential material. Standalone defaults and ordinary
 `/readyz` behavior are unchanged.
+
+A personal access token's vault scope now bounds vault **creation** as well as
+administration. Creating a vault whose name falls outside the token's scope is
+refused with `permission_denied`, in the same wording the scope guard already
+uses for administrative operations, on both the MCP `akb_create_vault` tool and
+`POST /vaults`. Previously creation consulted no scope at all, so a scoped token
+could place a vault anywhere in the namespace and was then denied every
+administrative operation on the vault it had just created — including deleting
+it — stranding a vault its creator could not remove. Unscoped tokens keep their
+existing behavior, and reads remain unrestricted.
 
 ## 0.10.0 — 2026-07-10  *(feat — stable workspace identities and account governance)*
 

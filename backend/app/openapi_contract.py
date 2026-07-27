@@ -71,6 +71,10 @@ ERROR_STATUSES = ("400", "401", "403", "404", "409", "422", "500")
 SUCCESS_STATUSES = ("200", "201", "202")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 KIND_SUCCESS_RESPONSE_REFS = {
+    ("get", "/api/v1/activity/{vault}"): "#/components/schemas/AkbActivityEnvelope",
+    ("get", "/api/v1/recent"): "#/components/schemas/AkbRecentChangesEnvelope",
+    ("get", "/api/v1/history/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentHistoryEnvelope",
+    ("get", "/api/v1/diff/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentDiffEnvelope",
     ("post", "/api/v1/documents"): "#/components/schemas/AkbDocumentWriteEnvelope",
     ("get", "/api/v1/documents/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentEnvelope",
     ("patch", "/api/v1/documents/{vault}/{doc_id}"): "#/components/schemas/AkbDocumentWriteEnvelope",
@@ -97,6 +101,15 @@ KIND_SUCCESS_RESPONSE_REFS = {
     ("get", "/api/v1/files/{vault}/{file_id}/download"): "#/components/schemas/AkbFileEnvelope",
     ("get", "/api/v1/files/{vault}"): "#/components/schemas/AkbFileEnvelope",
     ("delete", "/api/v1/files/{vault}/{file_id}"): "#/components/schemas/AkbFileEnvelope",
+    ("get", "/api/v1/graph"): "#/components/schemas/AkbGraphEnvelope",
+    ("get", "/api/v1/graph/overview"): "#/components/schemas/AkbGraphOverviewEnvelope",
+    ("get", "/api/v1/graph/health"): "#/components/schemas/AkbGraphHealthEnvelope",
+    ("get", "/api/v1/relations"): "#/components/schemas/AkbRelationsEnvelope",
+    ("post", "/api/v1/relations"): "#/components/schemas/AkbRelationLinkEnvelope",
+    ("delete", "/api/v1/relations"): "#/components/schemas/AkbRelationUnlinkEnvelope",
+    ("get", "/api/v1/provenance"): "#/components/schemas/AkbProvenanceEnvelope",
+    ("post", "/api/v1/collections/{vault}"): "#/components/schemas/AkbCollectionCreateEnvelope",
+    ("delete", "/api/v1/collections/{vault}/{path}"): "#/components/schemas/AkbCollectionDeleteEnvelope",
 }
 KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS: dict[tuple[str, str], dict[str, str | None]] = {
     ("post", "/api/v1/tables/{vault}/{table}/rows"): {
@@ -115,6 +128,10 @@ KIND_ADDITIONAL_SUCCESS_RESPONSE_REFS: dict[tuple[str, str], dict[str, str | Non
 }
 OPERATION_TAG_OVERRIDES = {
     ("get", "/api/v1/browse/{vault}"): ["documents"],
+    ("get", "/api/v1/activity/{vault}"): ["activity"],
+    ("get", "/api/v1/recent"): ["activity"],
+    ("get", "/api/v1/history/{vault}/{doc_id}"): ["documents"],
+    ("get", "/api/v1/diff/{vault}/{doc_id}"): ["documents"],
 }
 
 
@@ -258,6 +275,42 @@ def _error_description(status: str) -> str:
 
 def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
     return {
+        "AkbCollectionSummary": {
+            "type": "object",
+            "required": ["path", "name", "summary", "doc_count"],
+            "properties": {
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "summary": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "doc_count": {"type": "integer"},
+            },
+        },
+        "AkbCollectionCreateEnvelope": {
+            "type": "object",
+            "required": ["kind", "ok", "created", "collection"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["collection_create"]},
+                "ok": {"type": "boolean", "enum": [True]},
+                "created": {"type": "boolean"},
+                "collection": {"$ref": "#/components/schemas/AkbCollectionSummary"},
+            },
+        },
+        "AkbCollectionDeleteEnvelope": {
+            "type": "object",
+            "required": [
+                "kind", "ok", "collection", "deleted_docs", "deleted_files",
+                "deleted_sub_collections", "deleted_tables",
+            ],
+            "properties": {
+                "kind": {"type": "string", "enum": ["collection_delete"]},
+                "ok": {"type": "boolean", "enum": [True]},
+                "collection": {"type": "string"},
+                "deleted_docs": {"type": "integer"},
+                "deleted_files": {"type": "integer"},
+                "deleted_sub_collections": {"type": "integer"},
+                "deleted_tables": {"type": "integer"},
+            },
+        },
         "AkbSuccessEnvelope": {
             "description": "HTTP success envelope union. SDKs unwrap this to {data,error}.",
             "oneOf": [
@@ -273,6 +326,19 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 {"$ref": "#/components/schemas/AkbSearchEnvelope"},
                 {"$ref": "#/components/schemas/AkbDrillDownEnvelope"},
                 {"$ref": "#/components/schemas/AkbGrepEnvelope"},
+                {"$ref": "#/components/schemas/AkbGraphNeighborsEnvelope"},
+                {"$ref": "#/components/schemas/AkbGraphOverviewEnvelope"},
+                {"$ref": "#/components/schemas/AkbGraphHealthEnvelope"},
+                {"$ref": "#/components/schemas/AkbRelationsEnvelope"},
+                {"$ref": "#/components/schemas/AkbRelationLinkEnvelope"},
+                {"$ref": "#/components/schemas/AkbRelationUnlinkEnvelope"},
+                {"$ref": "#/components/schemas/AkbProvenanceEnvelope"},
+                {"$ref": "#/components/schemas/AkbCollectionCreateEnvelope"},
+                {"$ref": "#/components/schemas/AkbCollectionDeleteEnvelope"},
+                {"$ref": "#/components/schemas/AkbActivityEnvelope"},
+                {"$ref": "#/components/schemas/AkbRecentChangesEnvelope"},
+                {"$ref": "#/components/schemas/AkbDocumentHistoryEnvelope"},
+                {"$ref": "#/components/schemas/AkbDocumentDiffEnvelope"},
             ],
             "discriminator": {
                 "propertyName": "kind",
@@ -289,9 +355,279 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     "search": "#/components/schemas/AkbSearchEnvelope",
                     "drill_down": "#/components/schemas/AkbDrillDownEnvelope",
                     "grep": "#/components/schemas/AkbGrepEnvelope",
+                    "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+                    "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+                    "graph_health": "#/components/schemas/AkbGraphHealthEnvelope",
+                    "relations": "#/components/schemas/AkbRelationsEnvelope",
+                    "relation_link": "#/components/schemas/AkbRelationLinkEnvelope",
+                    "relation_unlink": "#/components/schemas/AkbRelationUnlinkEnvelope",
+                    "provenance": "#/components/schemas/AkbProvenanceEnvelope",
+                    "collection_create": "#/components/schemas/AkbCollectionCreateEnvelope",
+                    "collection_delete": "#/components/schemas/AkbCollectionDeleteEnvelope",
+                    "activity": "#/components/schemas/AkbActivityEnvelope",
+                    "recent_changes": "#/components/schemas/AkbRecentChangesEnvelope",
+                    "document_history": "#/components/schemas/AkbDocumentHistoryEnvelope",
+                    "document_diff": "#/components/schemas/AkbDocumentDiffEnvelope",
                 },
             },
         },
+        "ActivityFileChange": {
+            "type": "object",
+            "required": ["path", "change"],
+            "properties": {
+                "path": {"type": "string"},
+                "change": {"type": "string", "enum": ["added", "deleted", "modified"]},
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "ActivityEntry": {
+            "type": "object",
+            "required": ["hash", "subject", "author", "date", "action", "summary", "agent", "files"],
+            "properties": {
+                "hash": {"type": "string"},
+                "subject": {"type": "string"},
+                "author": {"type": "string"},
+                "date": {"type": "string", "format": "date-time"},
+                "action": {"type": "string"},
+                "summary": {"type": "string"},
+                "agent": {"type": "string"},
+                "files": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/ActivityFileChange"},
+                },
+                "author_name": _nullable_string(),
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "RecentDocumentChange": {
+            "type": "object",
+            "required": ["doc_id", "vault", "path", "title", "type", "commit", "changed_at"],
+            "properties": {
+                "doc_id": {"type": "string"},
+                "vault": {"type": "string"},
+                "path": {"type": "string"},
+                "title": {"type": "string"},
+                "type": {"type": "string"},
+                "commit": _nullable_string(),
+                "changed_at": {
+                    "anyOf": [
+                        {"type": "string", "format": "date-time"},
+                        {"type": "null"},
+                    ],
+                },
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "DocumentHistoryEntry": {
+            "type": "object",
+            "required": ["hash", "message", "author", "date"],
+            "properties": {
+                "hash": {"type": "string"},
+                "message": {"type": "string"},
+                "author": {"type": "string"},
+                "date": {"type": "string", "format": "date-time"},
+                "author_name": _nullable_string(),
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "AkbActivityEnvelope": _kind_schema(
+            "activity",
+            {
+                "vault": {"type": "string"},
+                "total": {"type": "integer"},
+                "activity": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/ActivityEntry"},
+                },
+            },
+            "Git-backed vault activity history.",
+            required=("kind", "vault", "total", "activity"),
+        ),
+        "AkbRecentChangesEnvelope": _kind_schema(
+            "recent_changes",
+            {
+                "changes": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/RecentDocumentChange"},
+                },
+            },
+            "Recent documents visible to the current user.",
+            required=("kind", "changes"),
+        ),
+        "AkbDocumentHistoryEnvelope": _kind_schema(
+            "document_history",
+            {
+                "uri": {"type": "string"},
+                "history": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/DocumentHistoryEntry"},
+                },
+            },
+            "Git-backed document version history.",
+            required=("kind", "uri", "history"),
+        ),
+        "AkbDocumentDiffEnvelope": _kind_schema(
+            "document_diff",
+            {
+                "file": {"type": "string"},
+                "commit": {"type": "string"},
+                "type": {
+                    "type": "string",
+                    "enum": ["added", "deleted", "modified", "unknown", "unchanged"],
+                },
+                "diff": {"type": "string"},
+                "error": _nullable_string(),
+            },
+            "Document diff at one commit.",
+            required=("kind", "file", "commit", "type", "diff"),
+        ),
+        "AkbGraphNode": {
+            "type": "object",
+            "required": ["uri", "name", "resource_type"],
+            "properties": {
+                "uri": {"type": "string"},
+                "name": {"type": "string"},
+                "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
+                "depth": _nullable_integer(),
+                "degree": _nullable_integer(),
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "AkbGraphEdge": {
+            "type": "object",
+            "required": ["source", "target", "relation", "kind"],
+            "properties": {
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+                "relation": {"type": "string", "enum": [
+                    "depends_on", "related_to", "implements", "references",
+                    "attached_to", "derived_from", "links_to",
+                ]},
+                "kind": {"type": "string", "enum": ["implicit", "explicit"]},
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "AkbRelation": {
+            "type": "object",
+            "required": ["direction", "relation", "uri", "resource_type"],
+            "properties": {
+                "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
+                "relation": {"type": "string", "enum": [
+                    "depends_on", "related_to", "implements", "references",
+                    "attached_to", "derived_from", "links_to",
+                ]},
+                "uri": {"type": "string"},
+                "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
+                "name": _nullable_string(),
+            },
+            "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+        },
+        "AkbGraphEnvelope": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/AkbGraphNeighborsEnvelope"},
+                {"$ref": "#/components/schemas/AkbGraphOverviewEnvelope"},
+            ],
+            "discriminator": {
+                "propertyName": "kind",
+                "mapping": {
+                    "graph_neighbors": "#/components/schemas/AkbGraphNeighborsEnvelope",
+                    "graph_overview": "#/components/schemas/AkbGraphOverviewEnvelope",
+                },
+            },
+        },
+        "AkbGraphNeighborsEnvelope": _kind_schema(
+            "graph_neighbors",
+            {
+                "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphNode"}},
+                "edges": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphEdge"}},
+            },
+            "Resource-centered graph neighborhood.",
+            required=("kind", "nodes", "edges"),
+        ),
+        "AkbGraphOverviewEnvelope": _kind_schema(
+            "graph_overview",
+            {
+                "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphNode"}},
+                "edges": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphEdge"}},
+                "nodes_total": {"type": "integer"},
+                "edges_total": {"type": "integer"},
+                "returned": {"type": "integer"},
+                "truncated": {"type": "boolean"},
+                "orphans_returned": {"type": "integer"},
+                "orphans_truncated": {"type": "boolean"},
+            },
+            "Vault graph overview with connected and orphan totals.",
+            required=("kind", "nodes", "edges", "nodes_total", "edges_total", "returned",
+                      "truncated", "orphans_returned", "orphans_truncated"),
+        ),
+        "AkbGraphHealthEnvelope": _kind_schema(
+            "graph_health",
+            {
+                "hubs": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphNode"}},
+                "orphans": {
+                    "type": "object",
+                    "required": ["count", "sample"],
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "sample": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphNode"}},
+                    },
+                    "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
+                },
+            },
+            "Vault graph health audit.",
+            required=("kind", "hubs", "orphans"),
+        ),
+        "AkbRelationsEnvelope": _kind_schema(
+            "relations",
+            {
+                "uri": {"type": "string"},
+                "relations": {"type": "array", "items": {"$ref": "#/components/schemas/AkbRelation"}},
+            },
+            "One-hop resource relations.",
+            required=("kind", "uri", "relations"),
+        ),
+        "AkbRelationLinkEnvelope": _kind_schema(
+            "relation_link",
+            {
+                "linked": {"type": "boolean"},
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+                "relation": {"type": "string", "enum": [
+                    "depends_on", "related_to", "implements", "references",
+                    "attached_to", "derived_from",
+                ]},
+            },
+            "Relation link result.",
+            required=("kind", "linked", "source", "target", "relation"),
+        ),
+        "AkbRelationUnlinkEnvelope": _kind_schema(
+            "relation_unlink",
+            {
+                "unlinked": {"type": "integer"},
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+            },
+            "Relation unlink result.",
+            required=("kind", "unlinked", "source", "target"),
+        ),
+        "AkbProvenanceEnvelope": _kind_schema(
+            "provenance",
+            {
+                "doc_id": {"type": "string"},
+                "title": {"type": "string"},
+                "path": {"type": "string"},
+                "vault": {"type": "string"},
+                "uri": {"type": "string"},
+                "created_by": _nullable_string(),
+                "created_at": _nullable_string(),
+                "updated_at": _nullable_string(),
+                "current_commit": _nullable_string(),
+                "relations": {"type": "array", "items": {"$ref": "#/components/schemas/AkbRelation"}},
+            },
+            "Flat document provenance payload.",
+            required=("kind", "doc_id", "title", "path", "vault", "uri", "created_by",
+                      "created_at", "updated_at", "current_commit", "relations"),
+        ),
         "AkbSqlEnvelope": {
             "description": "SQL execution success envelope.",
             "oneOf": [
