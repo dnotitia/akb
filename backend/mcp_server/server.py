@@ -445,7 +445,9 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
             return err("Document not found", code=NOT_FOUND)
         from app.services.git_service import GitService
         git = GitService()
-        raw = git.read_file(vault, doc["path"], commit=version)
+        # off-load the git blob read; the un-versioned path already offloads
+        # via doc_service.get, so keep the versioned MCP read off the loop too.
+        raw = await asyncio.to_thread(git.read_file, vault, doc["path"], commit=version)
         if raw is None:
             return err(f"Version not found: {version}", code=NOT_FOUND)
         try:
@@ -806,7 +808,8 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     # post-fetch author filter below — i.e. when truncated=True the
     # caller knows commits exist past the window, but cannot tell
     # without paging whether they would survive the author filter.
-    entries = git.vault_log(
+    entries = await asyncio.to_thread(
+        git.vault_log,
         args["vault"],
         max_count=limit + 1,
         since=args.get("since"),
@@ -843,7 +846,7 @@ async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
         return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
     from app.services.git_service import GitService
     git = GitService()
-    return git.file_diff(vault, doc["path"], commit)
+    return await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
 
 
 @_h("akb_relations")

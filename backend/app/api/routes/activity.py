@@ -6,6 +6,7 @@ which are read-only views over git history rather than session
 management. The file was renamed accordingly.
 """
 
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -67,7 +68,11 @@ async def vault_activity(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
-    entries = git.vault_log(vault, max_count=limit, since=since, path=collection)
+    # vault_log spawns `git rev-list` + one `git diff` subprocess per commit;
+    # off-load it so the single event loop isn't starved (probe-timeout 503).
+    entries = await asyncio.to_thread(
+        git.vault_log, vault, max_count=limit, since=since, path=collection,
+    )
     entries = await _resolve_activity_authors(entries)
 
     if author:
@@ -184,7 +189,8 @@ async def document_diff(
         if not doc:
             raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
-    result = git.file_diff(vault, doc["path"], commit)
+    # off-load the git diff subprocess so the single event loop isn't starved
+    result = await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
     return {"kind": "document_diff", **result}
 
 
