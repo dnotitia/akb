@@ -115,6 +115,52 @@ def test_reads_skipped_when_disabled_but_writes_kept(audit_dir, monkeypatch):
     assert "akb_some_new_write" in actions
 
 
+def test_read_tool_invoked_as_a_write_is_still_audited(audit_dir, monkeypatch):
+    """`akb_grep` is in `_READ_ONLY_TOOLS`, but its `replace` argument
+    rewrites every matching document. With `log_reads` off, the tool-level
+    classification alone dropped that mass rewrite from the audit trail
+    entirely — contradicting this module's own "fail toward logging"
+    rule. The dispatcher passes `is_write`, which must override."""
+    monkeypatch.setattr(settings.audit, "log_reads", False)
+
+    class _U:
+        username, user_id = "bob", "u2"
+
+    audit_log.record_tool("akb_grep", {"vault": "v", "pattern": "x"}, _U(), {"ok": 1})
+    audit_log.record_tool(
+        "akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, _U(), {"ok": 1},
+        is_write=True,
+    )
+
+    lines = _read_lines(audit_dir / f"akb-audit-{_today()}.jsonl")
+    assert [json.loads(ln)["action"] for ln in lines] == ["akb_grep"], (
+        "the plain read must be skipped and the replace must be recorded"
+    )
+
+
+def test_read_only_set_agrees_with_the_mcp_scope_table(tmp_path, monkeypatch):
+    """The two classifications must not drift: a tool that needs
+    `akb:vault:write` to invoke is by definition state-changing, so it
+    cannot sit in the set that `log_reads=false` silently drops.
+
+    `akb_publication_snapshot` was in both — write-scoped, yet audited as
+    a read — so with read-logging off it wrote an S3 snapshot and flipped
+    a publication's mode leaving no audit line."""
+    from app.config import settings as _s
+
+    monkeypatch.setattr(_s, "git_storage_path", str(tmp_path / "vaults"))
+    from mcp_server.server import _READ_SCOPE, _TOOL_SCOPES
+
+    write_but_audited_as_read = sorted(
+        audit_log._READ_ONLY_TOOLS
+        - {n for n, scope in _TOOL_SCOPES.items() if scope == _READ_SCOPE}
+    )
+    assert write_but_audited_as_read == [], (
+        f"Tools audited as read-only but requiring the write scope: "
+        f"{write_but_audited_as_read}"
+    )
+
+
 def test_record_tool_marks_error_outcome(audit_dir):
     class _U:
         username, user_id = "bob", "u2"

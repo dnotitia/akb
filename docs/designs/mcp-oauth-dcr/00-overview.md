@@ -152,6 +152,12 @@ operation:
 | `akb_search`, `akb_get`, `akb_browse`, `akb_grep`, `akb_drill_down`, `akb_history`, `akb_relations`, `akb_graph` | `akb:vault:read` |
 | `akb_put`, `akb_update`, `akb_delete`, `akb_edit`, `akb_link`, `akb_unlink`, `akb_create_collection`, `akb_create_table`, `akb_alter_table`, `akb_publish`, `akb_unpublish`, file tools | `akb:vault:write` |
 
+The table is per-tool, but the requirement is per-**call**: `akb_grep` is
+read-grade only without its `replace` argument, which rewrites every
+matching document. `_ARG_WRITE_TRIGGERS` (`mcp_server/server.py`) declares
+such arguments and `_required_scope(name, args)` promotes the call to
+`akb:vault:write` when one is present.
+
 If neither scope is present, return `403 insufficient_scope`. The
 existing PG-RBAC layer still gates per-vault access; scopes are an
 additional coarse gate that the IdP can present at consent time.

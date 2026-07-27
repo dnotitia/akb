@@ -63,12 +63,23 @@ _GENESIS = "0" * 64
 # new write-tool can never silently escape the audit trail. (File tools
 # `akb_get_file`/`akb_put_file` are proxy-only and never reach this
 # backend dispatch, so they're intentionally absent.)
+#
+# Membership here must agree with the read half of `_TOOL_SCOPES` in
+# mcp_server.server — a tool that needs `akb:vault:write` is by definition
+# state-changing. A test asserts the two agree; `akb_publication_snapshot`
+# was listed here while mapped write-grade, so with `log_reads` off it
+# wrote an S3 snapshot and flipped a publication's mode with no audit line.
+#
+# Tool-level membership is not sufficient on its own: `akb_grep` is a read
+# tool whose `replace` argument rewrites every matching document. The
+# caller therefore passes `is_write`, computed by the same
+# `_required_scope` that gates the call, so an argument-driven write is
+# recorded even though the tool name sits in this set.
 _READ_ONLY_TOOLS = frozenset({
     "akb_get", "akb_search", "akb_browse", "akb_drill_down", "akb_grep",
     "akb_graph", "akb_relations", "akb_history", "akb_diff", "akb_activity",
     "akb_provenance", "akb_list_vaults", "akb_vault_info", "akb_vault_members",
     "akb_whoami", "akb_help", "akb_search_users", "akb_publications",
-    "akb_publication_snapshot",
 })
 
 # Best-effort target-ref extraction from tool args (no bodies — Metadata
@@ -331,7 +342,7 @@ def _target_of(args: dict) -> str | None:
     return None
 
 
-def record_tool(name: str, args: dict, user, result) -> None:
+def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) -> None:
     """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
     resolved _MCPUser; ``result`` is the handler's return envelope (or the
     final error envelope) — outcome is derived from it.
@@ -349,8 +360,10 @@ def record_tool(name: str, args: dict, user, result) -> None:
     if not settings.audit.enabled:
         return
     # Skip reads only when the operator opted out of read logging; unknown
-    # (i.e. state-changing) tools are always kept.
-    if not settings.audit.log_reads and name in _READ_ONLY_TOOLS:
+    # (i.e. state-changing) tools are always kept. `is_write` overrides the
+    # tool-level classification for a read tool invoked with a mutating
+    # argument — see the note on `_READ_ONLY_TOOLS`.
+    if not settings.audit.log_reads and name in _READ_ONLY_TOOLS and not is_write:
         return
     outcome, code = "ok", None
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
