@@ -1432,7 +1432,10 @@ async def call_tool(name: str, arguments: dict):
         # thread (audit_log). No disk I/O or lock on the event loop, and it never
         # touches the shared to_thread pool — a stalled audit disk can't freeze
         # the loop or starve bcrypt / document reads.
-        audit_log.record_tool(name, arguments, user, result)
+        audit_log.record_tool(
+            name, arguments, user, result,
+            is_write=_required_scope(name, arguments) == _WRITE_SCOPE,
+        )
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
         # `str()` space form, Enum → `str()`, unknown → stringified). The
@@ -1458,7 +1461,10 @@ async def call_tool(name: str, arguments: dict):
         # Audit the failure too — a crashing tool call is exactly what a
         # security review wants to see. record_tool never raises and only
         # enqueues (non-blocking; see the success path).
-        audit_log.record_tool(name, arguments, user, envelope)
+        audit_log.record_tool(
+            name, arguments, user, envelope,
+            is_write=_required_scope(name, arguments) == _WRITE_SCOPE,
+        )
         return [TextContent(
             type="text",
             text=json.dumps(envelope, ensure_ascii=False, default=str),

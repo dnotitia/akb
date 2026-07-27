@@ -560,6 +560,50 @@ def test_every_arg_write_trigger_names_a_real_tool_argument():
             )
 
 
+def _handler_can_write(handler) -> bool:
+    """True when the handler reaches a writer-gated access check.
+
+    AST rather than a substring scan: `'required_role="writer"' in source`
+    is defeated by single quotes, a module constant, or an enum — none of
+    which this repo lints against — so the guard below would have gone
+    green on exactly the regression it exists to catch. A non-literal
+    `required_role` is treated as a write (fail closed).
+
+    Still source-level, so a handler that delegates its access check to a
+    helper is a false negative. Tripwire, not proof.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if fname != "check_vault_access":
+            continue
+        for kw in node.keywords:
+            if kw.arg != "required_role":
+                continue
+            if not isinstance(kw.value, ast.Constant):
+                return True  # non-literal role — cannot prove it is read-only
+            if kw.value.value != "reader":
+                return True
+    return False
+
+
+def test_the_omission_guard_itself_is_not_vacuous():
+    """`_handler_can_write` is the whole force of the guard below, and a
+    silently-broken predicate would make it pass forever. Pin it against
+    the one handler known to write."""
+    from mcp_server.server import _HANDLERS
+
+    assert _handler_can_write(_HANDLERS["akb_grep"]) is True
+    assert _handler_can_write(_HANDLERS["akb_search"]) is False
+
+
 def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
     """The omission guard — the failure mode that actually recurs.
 
@@ -568,14 +612,10 @@ def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
     tool that grows a mutating argument reproduces this bug silently.
 
     The invariant is checkable against code that already exists: a
-    handler that can reach `check_vault_access(required_role="writer")`
-    performs a write, so its tool cannot be read-grade unless some
-    argument promotes it. Source-level check, so it sees only a writer
-    check written directly in the handler — a handler that delegates to
-    a helper is a false negative. It is a tripwire, not a proof.
+    handler that can reach a writer-gated `check_vault_access` performs a
+    write, so its tool cannot be read-grade unless an argument promotes
+    it.
     """
-    import inspect
-
     from mcp_server.server import (
         _ARG_WRITE_TRIGGERS,
         _HANDLERS,
@@ -588,7 +628,7 @@ def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
         for name, handler in _HANDLERS.items()
         if _TOOL_SCOPES.get(name) == _READ_SCOPE
         and name not in _ARG_WRITE_TRIGGERS
-        and 'required_role="writer"' in inspect.getsource(handler)
+        and _handler_can_write(handler)
     )
     assert offenders == [], (
         f"Read-scoped tools whose handler performs a writer-gated write, with no "
