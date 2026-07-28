@@ -529,6 +529,24 @@ def test_maintenance_is_stopped_even_when_the_drain_overruns(enabled, monkeypatc
     )
 
 
+def test_stop_never_propagates(monkeypatch):
+    """`lifecycle.stop_workers()` awaits each worker's `stop()` in sequence, so
+    an exception escaping one skips every worker after it.
+
+    Observed live: a config field this function reads on its first line was
+    missing, `AttributeError` propagated out of `stop_workers()`, and the
+    shutdown of events_publisher, metadata_worker, embed_worker and the rest
+    never ran. The module's contract already says shutdown must not raise —
+    the budget read simply sat outside the guard."""
+    class _Exploding:
+        @property
+        def tool_usage(self):
+            raise AttributeError("config drift")
+
+    monkeypatch.setattr(tool_usage, "settings", _Exploding())
+    asyncio.run(tool_usage.stop())          # must not raise
+
+
 def test_flush_is_awaitable_for_the_backfill_runner():
     """`BackfillRunner` awaits its callback — a non-coroutine crashes the loop."""
     assert inspect.iscoroutinefunction(tool_usage.flush_once)

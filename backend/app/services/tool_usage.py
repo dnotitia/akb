@@ -522,20 +522,30 @@ async def stop() -> None:
     mid-drain. Anything still queued when the budget runs out is logged rather
     than dropped in silence.
     """
-    budget = settings.tool_usage.shutdown_deadline_secs
-    # Each phase is bounded and each is *reached*. Wrapping the whole sequence
-    # in one `wait_for` meant an expiry during the drain skipped
-    # `_maintainer.stop()` entirely — its stop event never set, its task never
-    # awaited — leaving a shielded rollup running against a pool that
-    # `close_pool()` was about to tear down.
-    await _phase(_flusher.stop(timeout=budget / 2), "flusher stop")
-    await _phase(_drain_all(), "final drain", timeout=budget / 4)
-    await _phase(_maintainer.stop(timeout=budget / 4), "maintenance stop")
-    if queue_depth():
-        logger.warning(
-            "tool_usage lost %d queued record(s) at shutdown (drain incomplete)",
-            queue_depth(),
-        )
+    # NOTHING here may propagate. `lifecycle.stop_workers()` awaits each
+    # worker's `stop()` in sequence, so one exception skips every worker after
+    # it — observed live when a config field this function reads was missing:
+    # `AttributeError` escaped and events_publisher, metadata_worker,
+    # embed_worker and the rest were never stopped. The phases below are each
+    # guarded; this outer guard covers everything around them, including
+    # reading the budget itself.
+    try:
+        budget = settings.tool_usage.shutdown_deadline_secs
+        # Each phase is bounded and each is *reached*. Wrapping the whole
+        # sequence in one `wait_for` meant an expiry during the drain skipped
+        # `_maintainer.stop()` entirely — its stop event never set, its task
+        # never awaited — leaving a shielded rollup running against a pool that
+        # `close_pool()` was about to tear down.
+        await _phase(_flusher.stop(timeout=budget / 2), "flusher stop")
+        await _phase(_drain_all(), "final drain", timeout=budget / 4)
+        await _phase(_maintainer.stop(timeout=budget / 4), "maintenance stop")
+        if queue_depth():
+            logger.warning(
+                "tool_usage lost %d queued record(s) at shutdown (drain incomplete)",
+                queue_depth(),
+            )
+    except Exception as e:  # noqa: BLE001 — must not abort the shutdown chain
+        logger.warning("tool_usage shutdown aborted: %s", e)
 
 
 async def _drain_all() -> None:
