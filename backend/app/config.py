@@ -70,6 +70,53 @@ class AuditSettings(BaseModel):
     local_retention_days: int = 2
 
 
+class ToolUsageSettings(BaseModel):
+    """MCP tool-usage tracking — **analytics**, deliberately not the audit
+    stream and not the `events` outbox.
+
+    The three sinks sit at different altitudes and must not be unified:
+    `events` carries domain verbs on successful writes for Redis fanout and
+    is *deleted once delivered*; `audit` is a tamper-evident append-only
+    ledger for a SIEM and cannot be grouped; this one answers "which tool is
+    actually used, by whom, in what order, and how often does it fail".
+
+    Coupling it to `audit` would be a repeat of the `akb_grep(replace=)`
+    defect fixed in 0.9.x: `audit.log_reads=false` silently dropped a
+    read-classified tool, and read calls are most of the usage signal.
+
+    Full rationale, schema and rejected alternatives:
+    `docs/design/proposal/2026-07-28-mcp-tool-usage-tracking/README.md`.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    # Every numeric below is bounded: an unvalidated 0 or negative turns into a
+    # hot maintenance loop, a flusher that never drains, or a purge cutoff in
+    # the future that deletes live data.
+    enabled: bool = False
+    # Raw per-call rows are pruned this many days after they are folded into
+    # `tool_usage_daily` (which is kept indefinitely — ~86 rows/day). Purge is
+    # additionally bounded by the rollup watermark, so an un-aggregated row
+    # survives however old it is.
+    raw_retention_days: int = Field(default=30, ge=1, le=3650)
+    # Bounded in-memory hand-off. `record()` runs on the single event loop,
+    # so it may only append; a flusher task does the batched INSERT. On
+    # overflow the OLDEST entries are evicted and counted — never silently.
+    queue_max: int = Field(default=10_000, ge=1, le=1_000_000)
+    flush_interval_secs: int = Field(default=5, ge=1, le=3600)
+    flush_batch: int = Field(default=500, ge=1, le=10_000)
+    # Rollup/purge cadence. Runs independently of `enabled` so that turning
+    # tracking off still drains and prunes what was already collected (the
+    # `events` outbox couples publish and purge and grows forever when its
+    # transport is unconfigured — do not repeat that).
+    rollup_interval_secs: int = Field(default=3600, ge=60, le=86_400)
+    # Rows claimed/deleted per maintenance statement. Bounded so catching up
+    # after an outage happens in steady chunks instead of one transaction big
+    # enough to hit the statement timeout and spike WAL/bloat; a non-zero
+    # rollup keeps the runner looping, so a backlog still drains promptly.
+    rollup_batch: int = Field(default=5_000, ge=1, le=100_000)
+    purge_batch: int = Field(default=5_000, ge=1, le=100_000)
+
+
 class Settings(BaseModel):
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
@@ -544,6 +591,10 @@ class Settings(BaseModel):
     # Audit log — its own nested section so the surface can grow without
     # littering the flat top level. See AuditSettings above.
     audit: AuditSettings = Field(default_factory=AuditSettings)
+
+    # MCP tool-usage analytics — separate sink, separate flag. See
+    # ToolUsageSettings above for why it is not folded into `audit`.
+    tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
 
     # ── Keycloak OIDC derived endpoints ───────────────────────────
     # All computed off the realm issuer so only server_url + realm are

@@ -53,11 +53,17 @@ class BackfillRunner:
         process_once: Callable[[], Awaitable[int]],
         idle_secs: int = IDLE_INTERVAL_SECS,
         concurrency: int = 1,
+        log_progress: bool = True,
     ):
         self._name = name
         self._process_once = process_once
         self._idle_secs = idle_secs
         self._concurrency = max(1, concurrency)
+        # Per-tick "processed N items" is signal for a worker whose queue is
+        # usually empty (embed, delete, backfill) and noise for one that has
+        # work whenever the service has traffic — at a few-second poll that is
+        # thousands of INFO lines a day, burying the warnings that matter.
+        self._log_progress = log_progress
         self._tasks: list[asyncio.Task] = []
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
@@ -125,7 +131,8 @@ class BackfillRunner:
                 except asyncio.TimeoutError:
                     pass
             else:
-                log.info("%s processed %d items", task_name, done)
+                if self._log_progress:
+                    log.info("%s processed %d items", task_name, done)
                 await asyncio.sleep(0)
 
         log.info("%s loop stopped", task_name)
