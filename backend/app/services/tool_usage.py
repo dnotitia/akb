@@ -145,6 +145,10 @@ class _Row(NamedTuple):
 _maxlen: int = 1
 _queue: deque[_Row] = deque(maxlen=_maxlen)
 _dropped = 0
+# Consecutive failed flushes of the same head-of-queue batch. Bounded so an
+# un-storable row degrades the sink instead of wedging it permanently.
+_flush_failures = 0
+_MAX_FLUSH_RETRIES = 3
 
 
 def reset() -> None:
@@ -153,10 +157,11 @@ def reset() -> None:
     Called at startup and by tests; the bound is read here rather than per
     append so the hot path stays a single ``append``.
     """
-    global _queue, _dropped, _maxlen
+    global _queue, _dropped, _maxlen, _flush_failures
     _maxlen = settings.tool_usage.queue_max
     _queue = deque(maxlen=_maxlen)
     _dropped = 0
+    _flush_failures = 0
 
 
 reset()
@@ -171,6 +176,26 @@ def dropped_count() -> int:
     requeued, since the last ``reset()``. Counted so a flood shows up as a
     reported degradation instead of a silent gap."""
     return _dropped
+
+
+def stats() -> dict:
+    """Operational snapshot for `/health`.
+
+    Counting losses is only half the contract — `audit_log.stats()` is on
+    `/health` for exactly this reason. Without an endpoint the numbers live
+    only in a rate-limited log line, so an overflow or a systematic recording
+    failure is invisible to anyone watching a dashboard.
+    """
+    if not settings.tool_usage.enabled:
+        return {"enabled": False, "queued": len(_queue), "lost": _dropped}
+    return {
+        "enabled": True,
+        "queued": len(_queue),
+        "queue_max": _maxlen,
+        "lost": _dropped,
+        "consecutive_flush_failures": _flush_failures,
+        "retention_days": settings.tool_usage.raw_retention_days,
+    }
 
 
 def drain(limit: int) -> list[_Row]:
@@ -223,22 +248,52 @@ def record(
                 )
         _queue.append(_Row(
             occurred_at=datetime.now(timezone.utc),
-            tool=name,
-            actor_id=_str_or_none(getattr(user, "user_id", None)),
-            actor=_str_or_none(getattr(user, "username", None)),
-            session_id=session_id,
-            vault=_vault_of(args),
+            tool=_clip(name) or "",
+            actor_id=_clip(getattr(user, "user_id", None)),
+            actor=_clip(getattr(user, "username", None)),
+            session_id=_clip(session_id),
+            vault=_clip(_vault_of(args)),
             outcome=outcome,
-            code=code,
+            code=_clip(code),
             duration_ms=duration_ms,
             is_write=is_write,
         ))
     except Exception as e:  # noqa: BLE001 — tracking must never fail a tool call
-        logger.debug("tool_usage.record skipped: %s", e)
+        # Never raising is right; being silent about WHY nothing was recorded
+        # is not. A regression that makes this raise for every call would
+        # otherwise present as an empty table with `dropped=0` and `depth=0` —
+        # every signal reading "healthy, no traffic".
+        _dropped += 1
+        if _dropped == 1 or _dropped % 1000 == 0:
+            logger.warning("tool_usage.record failed (%d lost so far): %s", _dropped, e)
 
 
-def _str_or_none(v: Any) -> str | None:
-    return None if v is None else str(v)
+# Every string column here is caller-influenced: `tool` is the raw JSON-RPC
+# method name (the SDK forwards unknown names too), `vault` and `session_id`
+# come straight off the wire, and `code` comes from a handler's error envelope.
+# They land in a table on the volume that also holds the source-of-truth
+# Postgres, so none of them may be unbounded — the sibling audit sink clips its
+# lifted argument at `_TARGET_MAX` for the same reason.
+#
+# `tool` in particular becomes part of `tool_usage_daily`'s btree PRIMARY KEY,
+# where a value past ~2704 bytes raises "index row size exceeds btree maximum".
+# The claim and the aggregate are one statement, so that rolls the entire
+# rollup back and the offending row is re-selected every tick forever: folding
+# stops, and because purge requires the fold stamp, retention stops with it.
+_STR_MAX = 256
+
+
+def _clip(v: Any) -> str | None:
+    """Coerce to str, strip NULs, and bound the length.
+
+    NUL is not storable in PostgreSQL TEXT at all — un-stripped, one
+    `{"vault": "\x00"}` fails the batched INSERT, and a failed batch goes back
+    to the head of the deque, so the same rows re-fail on every tick.
+    """
+    if v is None:
+        return None
+    s = str(v).replace("\x00", "")
+    return s if len(s) <= _STR_MAX else s[:_STR_MAX] + "\u2026"
 
 
 # Resource tools address their target by `akb://` URI rather than a separate
@@ -253,22 +308,40 @@ _URI_ARGS = ("uri", "parent", "source", "target")
 
 
 def _vault_of(args: Any) -> str | None:
-    """Vault name from an explicit argument, else the first `akb://` URI."""
+    """The vault the handler will actually operate on.
+
+    URI arguments are checked FIRST because that is the precedence the
+    dispatch handlers use: `_handle_browse`, `_handle_graph` and
+    `_resolve_parent` all treat the URI as authoritative and ignore a `vault`
+    argument passed alongside it. Reading `vault` first would attribute
+    `akb_browse(vault="a", uri="akb://b/coll/x")` to vault `a`, which the call
+    never touched.
+
+    `akb_sql` takes a `vaults` array as its canonical multi-vault form with
+    `vault` only as the single-vault shorthand, so that shape is read too —
+    otherwise the tool with the widest data access records no vault at all.
+    """
     if not isinstance(args, dict):
         return None
-    explicit = args.get("vault")
-    if isinstance(explicit, str) and explicit:
-        return explicit
     for key in _URI_ARGS:
         value = args.get(key)
         if isinstance(value, str):
             name = vault_of(value)
             if name:
                 return name
+    explicit = args.get("vault")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    many = args.get("vaults")
+    if isinstance(many, (list, tuple)):
+        for v in many:
+            if isinstance(v, str) and v:
+                return v
     return None
 
 
 async def flush_once() -> int:
+    global _dropped, _flush_failures
     """Drain up to ``flush_batch`` records into PG in one round trip.
 
     On a DB error the batch is returned to the FRONT of the queue so a
@@ -282,13 +355,35 @@ async def flush_once() -> int:
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.executemany(_INSERT_SQL, batch)
+    except asyncio.CancelledError:
+        # `CancelledError` is a BaseException, so the handler below never sees
+        # it. The shutdown deadline firing mid-INSERT would otherwise leave
+        # these rows nowhere at all — already popped by `drain()`, never
+        # inserted, never requeued, never counted — and `stop()`'s
+        # queue-depth check would report a clean shutdown.
+        _requeue_front(batch)
+        raise
     except Exception as e:  # noqa: BLE001
-        kept = _requeue_front(batch)
-        logger.warning(
-            "tool_usage flush failed (%d requeued, %d dropped): %s",
-            kept, len(batch) - kept, e,
-        )
+        _flush_failures += 1
+        if _flush_failures >= _MAX_FLUSH_RETRIES:
+            # Requeue-to-head is right for a transient outage and catastrophic
+            # for a row PG can never accept: the same batch is re-drained and
+            # re-fails every tick, forever, and nothing behind it is ever
+            # written. Give up on it, count it, and let the queue move.
+            _dropped += len(batch)
+            _flush_failures = 0
+            logger.error(
+                "tool_usage dropping %d record(s) after %d consecutive flush "
+                "failures — last error: %s", len(batch), _MAX_FLUSH_RETRIES, e,
+            )
+        else:
+            kept = _requeue_front(batch)
+            logger.warning(
+                "tool_usage flush failed (%d requeued, %d dropped): %s",
+                kept, len(batch) - kept, e,
+            )
         return 0
+    _flush_failures = 0
     return len(batch)
 
 
@@ -364,10 +459,24 @@ async def maintenance_once() -> int:
     starved indefinitely while already-aggregated rows piled up. The wait was
     never needed: `rolled_at IS NOT NULL` makes each row individually safe to
     delete regardless of what else is still unfolded.
+
+    Each leg is attempted and accounted for independently. Sequenced without
+    isolation, a purge error after a successful 5,000-row fold would discard
+    the rollup's count as well: `BackfillRunner` turns the exception into
+    `done = 0` and then sleeps the whole idle interval — an hour — so
+    throughput collapses to one batch per hour while the other leg keeps
+    failing. The mirror case is worse: a rollup error would stop purge running
+    at all, restoring the starvation this function exists to prevent.
     """
-    folded = await rollup_once()
-    purged = await purge_once()
-    return folded + purged
+    return await _leg(rollup_once, "rollup") + await _leg(purge_once, "purge")
+
+
+async def _leg(fn, name: str) -> int:
+    try:
+        return await fn()
+    except Exception as e:  # noqa: BLE001 — one leg must not veto the other
+        logger.warning("tool_usage %s failed: %s", name, e)
+        return 0
 
 
 # ── Workers ─────────────────────────────────────────────────────
@@ -414,12 +523,14 @@ async def stop() -> None:
     than dropped in silence.
     """
     budget = settings.tool_usage.shutdown_deadline_secs
-    try:
-        await asyncio.wait_for(_shutdown_sequence(budget), timeout=budget)
-    except asyncio.TimeoutError:
-        logger.warning("tool_usage shutdown exceeded %.1fs budget", budget)
-    except Exception as e:  # noqa: BLE001 — shutdown must not raise
-        logger.warning("tool_usage shutdown failed: %s", e)
+    # Each phase is bounded and each is *reached*. Wrapping the whole sequence
+    # in one `wait_for` meant an expiry during the drain skipped
+    # `_maintainer.stop()` entirely — its stop event never set, its task never
+    # awaited — leaving a shielded rollup running against a pool that
+    # `close_pool()` was about to tear down.
+    await _phase(_flusher.stop(timeout=budget / 2), "flusher stop")
+    await _phase(_drain_all(), "final drain", timeout=budget / 4)
+    await _phase(_maintainer.stop(timeout=budget / 4), "maintenance stop")
     if queue_depth():
         logger.warning(
             "tool_usage lost %d queued record(s) at shutdown (drain incomplete)",
@@ -427,10 +538,16 @@ async def stop() -> None:
         )
 
 
-async def _shutdown_sequence(budget: float) -> None:
-    # Half the budget for the flusher to finish its iteration; the rest for the
-    # drain and the maintenance stop.
-    await _flusher.stop(timeout=budget / 2)
+async def _drain_all() -> None:
     while await flush_once():
         pass
-    await _maintainer.stop(timeout=budget / 4)
+
+
+async def _phase(coro, what: str, timeout: float | None = None) -> None:
+    """Run one shutdown phase; never raise, never let it run past its bound."""
+    try:
+        await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+    except asyncio.TimeoutError:
+        logger.warning("tool_usage %s exceeded its shutdown budget", what)
+    except Exception as e:  # noqa: BLE001 — shutdown must not raise
+        logger.warning("tool_usage %s failed: %s", what, e)

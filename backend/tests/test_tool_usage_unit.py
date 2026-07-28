@@ -152,17 +152,27 @@ def test_raw_args_are_not_stored(enabled):
     ({"uri": "akb://eng/coll/specs/doc/api.md"}, "eng"),
     ({"parent": "akb://ops/coll/runbooks"}, "ops"),
     ({"source": "akb://a/doc/x.md", "target": "akb://b/doc/y.md"}, "a"),
-    ({"vault": "explicit", "uri": "akb://other/doc/x.md"}, "explicit"),
+    # The URI wins, because that is what the handler acts on.
+    ({"vault": "ignored", "uri": "akb://other/doc/x.md"}, "other"),
+    # `akb_sql`'s canonical multi-vault form; `vault` is only its shorthand.
+    ({"vaults": ["eng", "ops"]}, "eng"),
     ({"query": "no vault anywhere"}, None),
     ({"uri": "not-a-uri"}, None),
+    # Shapes the canonical grammar rejects must not be guessed at.
+    ({"uri": "akb://eng/not-a-resource"}, None),
+    ({"uri": "akb://eng//doc/x.md"}, None),
 ])
 def test_vault_is_derived_from_uris_too(enabled, args, expected):
     """20 of the 43 tools take no `vault` argument at all — `akb_get`,
     `akb_update`, `akb_edit`, `akb_delete`, `akb_move`, `akb_link` and friends
     address resources by `akb://` URI, because the canonical API deliberately
     dropped the redundant vault parameter. Reading only `args.vault` would
-    leave the per-vault dimension NULL on most rows and quietly make the
-    "which vault uses what" question unanswerable."""
+    leave the per-vault dimension NULL on most rows.
+
+    Precedence matters as much as coverage: `_handle_browse`, `_handle_graph`
+    and `_resolve_parent` all treat the URI as authoritative and ignore a
+    `vault` passed beside it, so recording `vault` first would attribute the
+    call to a vault it never touched."""
     tool_usage.record("akb_x", args, _User(), {"ok": True})
     assert tool_usage.drain(1)[0].vault == expected
 
@@ -178,6 +188,75 @@ def test_session_and_duration_are_recorded(enabled):
     assert row.session_id == "sess-1"
     assert row.duration_ms == 42
     assert row.is_write is False
+
+
+# ── Client-controlled input must not reach the sink unbounded ───
+
+
+def test_oversized_strings_are_clipped(enabled):
+    """`tool` is the raw JSON-RPC method name and `vault` is a raw argument —
+    both attacker-chosen, and both land in a table on the volume that also
+    holds the source-of-truth Postgres.
+
+    `tool` additionally becomes part of `tool_usage_daily`'s btree PRIMARY KEY,
+    where a value over ~2704 bytes raises `index row size exceeds btree
+    maximum`. Because the claim and the aggregate are one statement, that
+    rolls the whole rollup back and the same row is re-selected every tick
+    forever — folding stops, and with it purge, so retention never fires again.
+
+    The sibling audit sink already clips its lifted argument at
+    `_TARGET_MAX`; this one must too."""
+    tool_usage.record("akb_" + "x" * 5000, {"vault": "v" * 5000}, _User(), {"ok": True})
+    row = tool_usage.drain(1)[0]
+
+    assert len(row.tool) <= tool_usage._STR_MAX + 1      # +1 for the ellipsis
+    assert len(row.vault) <= tool_usage._STR_MAX + 1
+    assert row.tool.startswith("akb_x")
+    assert row.tool.endswith("…"), "truncation must be visible, not silent"
+
+
+def test_nul_bytes_are_stripped(enabled):
+    """PostgreSQL TEXT cannot store NUL. Un-sanitised, a single
+    `{"vault": "\\x00"}` fails the batched INSERT — and because a failed batch
+    goes back to the HEAD of the deque, the very same rows are re-drained and
+    re-fail every tick, permanently. One call kills the sink until restart."""
+    tool_usage.record("akb_put", {"vault": "a\x00b"}, _User(), {"ok": True})
+    row = tool_usage.drain(1)[0]
+    assert "\x00" not in (row.vault or "")
+    assert row.vault == "ab"
+
+
+@pytest.mark.parametrize("field,args,kwargs", [
+    ("session_id", {}, {"session_id": "s" * 5000}),
+    ("code", {}, {}),
+])
+def test_every_stored_string_is_bounded(enabled, field, args, kwargs):
+    """Not just the two obvious ones — every string column is caller-influenced
+    (`code` comes from a handler's error envelope) and none may be unbounded."""
+    result = {"error": "x", "code": "C" * 5000} if field == "code" else {"ok": True}
+    tool_usage.record("akb_put", args, _User(), result, **kwargs)
+    value = getattr(tool_usage.drain(1)[0], field)
+    assert value is None or len(value) <= tool_usage._STR_MAX + 1
+
+
+def test_a_batch_that_can_never_insert_is_eventually_dropped(enabled, monkeypatch):
+    """Requeue-to-head is right for a transient outage and catastrophic for a
+    permanently un-storable row: the same batch is re-drained and re-fails on
+    every tick, forever, and nothing behind it is ever written.
+
+    After a bounded number of consecutive failures the batch is dropped and
+    *counted*, so the sink degrades instead of wedging."""
+    async def _boom():
+        raise RuntimeError("permanent")
+
+    monkeypatch.setattr(tool_usage, "get_pool", _boom)
+    tool_usage.record("akb_put", {"vault": "v"}, _User(), {"ok": True})
+
+    for _ in range(tool_usage._MAX_FLUSH_RETRIES):
+        assert asyncio.run(tool_usage.flush_once()) == 0
+
+    assert tool_usage.queue_depth() == 0, "the poison batch must not be retried forever"
+    assert tool_usage.dropped_count() == 1, "and its loss must be counted"
 
 
 # ── Flush ───────────────────────────────────────────────────────
@@ -321,6 +400,135 @@ def test_flusher_does_not_log_on_every_tick():
     )
 
 
+def test_cancelled_flush_returns_its_batch(enabled, monkeypatch):
+    """`CancelledError` is a `BaseException`, so `except Exception` does not
+    see it. When the shutdown deadline fires mid-INSERT, the batch has already
+    been popped by `drain()` — without an explicit handler it exists nowhere:
+    not inserted, not requeued, not counted, and `queue_depth()` reads 0 so
+    even the "drain incomplete" warning stays silent.
+
+    Reproduced by the reviewer as `depth=0, dropped=0` after a row had been
+    drained."""
+    async def _hang():
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(tool_usage, "get_pool", _hang)
+    tool_usage.record("akb_put", {"vault": "v"}, _User(), {"ok": True})
+
+    async def _drive():
+        task = asyncio.ensure_future(tool_usage.flush_once())
+        await asyncio.sleep(0)                       # let it drain and block
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_drive())
+    assert tool_usage.queue_depth() == 1, (
+        "a cancelled flush must put its batch back, not vanish with it"
+    )
+
+
+def test_runner_stop_waits_for_the_shielded_iteration(enabled):
+    """`BackfillRunner` shields `_process_once()` so an in-flight commit is not
+    torn in half. But on timeout `stop()` cancelled only the *wrapper* — the
+    shielded work carried on detached while `stop()` cleared its task handles
+    and returned.
+
+    `tool_usage.stop()` then drained believing it was the sole claimant, which
+    is exactly the race the reordering was meant to remove: the reviewer saw
+    `depth=0` right after `stop()`, then `depth=1` when the detached flush
+    failed and requeued afterwards.
+
+    The contract is not "the iteration always finishes" — a budget that expires
+    must still cancel. It is that **nothing is left running once `stop()`
+    returns**, so a caller draining the shared queue afterwards cannot be
+    surprised by a late write.
+    """
+    from app.services._backfill import BackfillRunner
+
+    finished: list[str] = []
+
+    async def _slow():
+        await asyncio.sleep(0.20)
+        finished.append("done")
+        return 0
+
+    async def _drive():
+        runner = BackfillRunner("t_shield", _slow, idle_secs=1)
+        runner.start()
+        await asyncio.sleep(0.02)                    # let the iteration begin
+        await runner.stop(timeout=0.03)              # expires mid-iteration
+        at_return = list(finished)
+        await asyncio.sleep(0.30)                    # far longer than the work
+        return runner, at_return, list(finished)
+
+    runner, at_return, later = asyncio.run(_drive())
+
+    assert not runner._inflight, "no in-flight work may outlive stop()"
+    assert later == at_return, (
+        "the shielded iteration ran on detached after stop() returned — the "
+        "caller's 'I am the only claimant' assumption is false"
+    )
+
+
+def test_runner_stop_lets_a_short_iteration_finish(enabled):
+    """The other half of the contract: a budget that comfortably covers the
+    in-flight iteration must let it commit rather than cancelling it."""
+    from app.services._backfill import BackfillRunner
+
+    finished: list[str] = []
+
+    async def _quick():
+        await asyncio.sleep(0.05)
+        finished.append("done")
+        return 0
+
+    async def _drive():
+        runner = BackfillRunner("t_shield_ok", _quick, idle_secs=1)
+        runner.start()
+        await asyncio.sleep(0.01)
+        await runner.stop(timeout=1.0)
+        return runner
+
+    runner = asyncio.run(_drive())
+    assert finished == ["done"], "a fitting iteration must be allowed to finish"
+    assert not runner._inflight
+
+
+def test_maintenance_is_stopped_even_when_the_drain_overruns(enabled, monkeypatch):
+    """Wrapping the whole shutdown in a single `wait_for` meant an expiry
+    during the drain skipped `_maintainer.stop()` outright — its stop event
+    never set, its task never awaited — so a shielded rollup kept running
+    against a pool `close_pool()` was about to tear down.
+
+    Every phase must be reached, each under its own bound."""
+    monkeypatch.setattr(settings.tool_usage, "shutdown_deadline_secs", 0.5)
+    stopped: list[str] = []
+
+    async def _hang():
+        await asyncio.sleep(30)                      # drain never completes
+
+    async def _flusher_stop(timeout=120.0):
+        stopped.append("flusher")
+
+    async def _maintainer_stop(timeout=120.0):
+        stopped.append("maintainer")
+
+    monkeypatch.setattr(tool_usage, "get_pool", _hang)
+    monkeypatch.setattr(tool_usage._flusher, "stop", _flusher_stop)
+    monkeypatch.setattr(tool_usage._maintainer, "stop", _maintainer_stop)
+    tool_usage.record("akb_put", {"vault": "v"}, _User(), {"ok": True})
+
+    asyncio.run(tool_usage.stop())
+
+    assert stopped == ["flusher", "maintainer"], (
+        "an overrunning drain must not skip stopping the maintenance runner"
+    )
+    assert tool_usage.queue_depth() == 1, (
+        "the cancelled drain's batch is back in the queue and therefore counted"
+    )
+
+
 def test_flush_is_awaitable_for_the_backfill_runner():
     """`BackfillRunner` awaits its callback — a non-coroutine crashes the loop."""
     assert inspect.iscoroutinefunction(tool_usage.flush_once)
@@ -380,6 +588,42 @@ def test_purge_runs_even_while_the_rollup_still_has_work(monkeypatch):
     assert calls == ["rollup", "purge"], (
         "purge must not be gated on the rollup reaching zero"
     )
+
+
+@pytest.mark.parametrize("failing", ["rollup", "purge"])
+def test_one_failing_leg_does_not_suppress_the_other(monkeypatch, failing):
+    """The two legs must fail independently.
+
+    Sequenced in one coroutine with no isolation, a purge error after a
+    successful 5,000-row fold discards the rollup's count too: `BackfillRunner`
+    turns the exception into `done = 0` and then sleeps the *entire* idle
+    interval — an hour — so throughput collapses to one batch per hour for as
+    long as the other leg keeps failing. In the mirror case a rollup error
+    stops purge being attempted at all, re-creating the starvation this
+    function was just fixed to avoid."""
+    done: list[str] = []
+
+    async def _ok(name):
+        done.append(name)
+        return 5
+
+    async def _fail(name):
+        raise RuntimeError(f"{name} exploded")
+
+    monkeypatch.setattr(
+        tool_usage, "rollup_once",
+        (lambda: _fail("rollup")) if failing == "rollup" else (lambda: _ok("rollup")),
+    )
+    monkeypatch.setattr(
+        tool_usage, "purge_once",
+        (lambda: _fail("purge")) if failing == "purge" else (lambda: _ok("purge")),
+    )
+
+    moved = asyncio.run(tool_usage.maintenance_once())
+
+    survivor = "purge" if failing == "rollup" else "rollup"
+    assert done == [survivor], f"{survivor} must still run when {failing} fails"
+    assert moved == 5, "the successful leg's work must still be reported"
 
 
 def test_purge_cutoff_is_a_whole_day_boundary():
@@ -514,6 +758,50 @@ def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_pa
     assert len(audit) == 1, f"audit recorded {len(audit)} times for one call"
     # The caller still gets a well-formed error envelope.
     assert "error" in out[0].text
+
+
+def test_lifecycle_starts_and_stops_the_workers():
+    """The chokepoint guards above cover half the wiring; this is the other
+    half, and it is the half the design doc names as fragile.
+
+    `tool_usage.start()` must NOT sit behind `settings.tool_usage.enabled` —
+    the maintenance runner has to keep folding and pruning what was already
+    collected after collection is turned off, which is precisely the coupling
+    that lets the `events` outbox grow forever. Folding it under the flag
+    looks like a tidy-up and would silently stop retention while every unit
+    test still passes, because they call the legs directly."""
+    path = pathlib.Path(__file__).resolve().parents[1] / "app/services/lifecycle.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    def _calls(fn_name: str) -> list[ast.Call]:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == fn_name:
+                return [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+            if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+                return [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+        raise AssertionError(f"lifecycle.{fn_name} not found")
+
+    def _has(calls, attr: str) -> bool:
+        return any(
+            isinstance(c.func, ast.Attribute) and c.func.attr == attr
+            and isinstance(c.func.value, ast.Name) and c.func.value.id == "tool_usage"
+            for c in calls
+        )
+
+    assert _has(_calls("start_workers"), "start"), "lifecycle must start the workers"
+    assert _has(_calls("stop_workers"), "stop"), "lifecycle must stop the workers"
+
+    # `start()` must be unconditional — find it and check no enclosing `if`.
+    src = path.read_text(encoding="utf-8")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            body_calls = [n for stmt in node.body for n in ast.walk(stmt)
+                          if isinstance(n, ast.Call)]
+            assert not _has(body_calls, "start"), (
+                "tool_usage.start() must not be gated on a flag — rollup/purge "
+                "have to keep running when collection is disabled"
+            )
+    assert "tool_usage" in src
 
 
 def test_usage_sink_is_independent_of_the_audit_flags():

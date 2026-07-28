@@ -65,6 +65,13 @@ class BackfillRunner:
         # thousands of INFO lines a day, burying the warnings that matter.
         self._log_progress = log_progress
         self._tasks: list[asyncio.Task] = []
+        # In-flight shielded iterations. `_loop` shields `process_once` so a
+        # commit is never torn in half, but that also means cancelling the loop
+        # task leaves the shielded coroutine running detached. `stop()` awaits
+        # these so its timeout bounds when work actually ends, not merely when
+        # we stop watching — callers that drain a shared queue afterwards
+        # depend on the worker really being finished.
+        self._inflight: set[asyncio.Task] = set()
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
 
@@ -105,8 +112,34 @@ class BackfillRunner:
                 for t in self._tasks:
                     if not t.done():
                         t.cancel()
+                await self._await_inflight(timeout)
         self._tasks = []
+        self._inflight.clear()
         self._stop_event = None
+
+    async def _await_inflight(self, timeout: float) -> None:
+        """Wait out iterations that survived the loop-task cancellation.
+
+        `asyncio.shield` detaches them deliberately so a commit completes, so
+        without this they keep running — and mutating whatever queue or table
+        they own — after `stop()` has returned and reported the worker down.
+        """
+        pending = [t for t in self._inflight if not t.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            self._log.warning(
+                "%s in-flight iteration still running after %.0fs; cancelling it too",
+                self._name, timeout,
+            )
+            for t in pending:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _loop(self, task_name: str) -> None:
         assert self._stop_event is not None
@@ -121,7 +154,16 @@ class BackfillRunner:
                 # iteration via _stop_event.is_set(); shielding only
                 # guarantees the in-flight chunk reaches COMMIT/ROLLBACK
                 # cleanly before we tear down.
-                done = await asyncio.shield(self._process_once())
+                inner: asyncio.Task = asyncio.ensure_future(self._process_once())
+                self._inflight.add(inner)
+                try:
+                    done = await asyncio.shield(inner)
+                finally:
+                    # Only forget it once it has actually finished; a cancelled
+                    # `shield` leaves `inner` alive and `stop()` must still
+                    # await it.
+                    if inner.done():
+                        self._inflight.discard(inner)
             except asyncio.CancelledError:
                 # Cancellation reached us despite the shield (e.g., the
                 # outer wait_for timed out and cancelled the task). Exit

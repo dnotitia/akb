@@ -103,22 +103,18 @@ class ParsedUri(NamedTuple):
     coll_path: str | None = None
 
 
-_URI_VAULT_PREFIX_RE = re.compile(rf"^akb://{_VAULT}(?:/|$)")
-
-
 def vault_of(uri: str) -> str | None:
-    """The vault component of any AKB URI form, or ``None`` if it isn't one.
+    """The vault component of a canonical AKB URI, or ``None``.
 
-    A cheap accessor for callers that only need the vault and would otherwise
-    hand-roll `uri[6:].split("/")[0]` — which quietly accepts template
-    placeholders and other shapes the canonical grammar rejects. One anchored
-    match against the same `_VAULT` fragment the full patterns use, so this
-    cannot drift away from `parse_uri` when the scheme grows a component.
+    Delegates to `parse_uri` rather than matching a prefix of its own. A
+    prefix-anchored regex looks equivalent but is strictly more permissive —
+    it would return ``"eng"`` for `akb://eng/not-a-resource`, `akb://eng/coll`
+    and `akb://eng//doc/x.md`, all of which `parse_uri` rejects. Callers that
+    only need the vault get the same grammar as callers that need the whole
+    URI, so the two cannot disagree about what counts as a URI.
     """
-    if not isinstance(uri, str) or "{" in uri or "}" in uri:
-        return None
-    m = _URI_VAULT_PREFIX_RE.match(uri)
-    return m.group(1) if m else None
+    parsed = parse_uri(uri)
+    return parsed.vault if parsed else None
 
 
 def parse_uri(uri: str) -> ParsedUri | None:

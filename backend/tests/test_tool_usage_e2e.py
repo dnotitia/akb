@@ -8,8 +8,10 @@ passed twenty mocked unit tests while being wrong in two different ways, and the
 out-of-order commit exposes.
 
 Excluded from the unit job by the `_e2e` filename filter; run by the
-`pgvector-e2e` job, which lists this file explicitly. Skips when
-`AKB_TEST_DSN` is unreachable so a local `pytest tests/` stays green.
+`pgvector-e2e` job, which lists this file explicitly. Skips only when no
+`AKB_TEST_DSN` was set, so a local `pytest tests/` stays green; if CI set one
+and it is unreachable the suite FAILS, because a gate that green-skips is not
+a gate.
 
 Isolation: everything runs in a dedicated schema created and dropped per
 module, so the suite can never touch application data (an earlier revision
@@ -31,7 +33,12 @@ import pytest_asyncio
 from app.config import settings
 from app.services import tool_usage
 
-_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
+# When CI sets the DSN explicitly, an unreachable database is a BROKEN GATE,
+# not a reason to pass: a wrong password or port would otherwise turn into
+# eight skips and a green job — exactly the "gate that never fires" the
+# workflow comment warns about. Only the local-development default may skip.
+_DSN_FROM_ENV = os.environ.get("AKB_TEST_DSN")
+_DSN = _DSN_FROM_ENV or "postgresql://akb:akb@localhost:15432/akb"
 _SCHEMA = "tool_usage_e2e"
 
 
@@ -61,7 +68,12 @@ async def db(monkeypatch):
     throughout, so re-applying per test is a no-op after the first.
     """
     if not await _can_connect(_DSN):
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+        if _DSN_FROM_ENV:
+            pytest.fail(
+                f"AKB_TEST_DSN was set but is unreachable ({_DSN_FROM_ENV}) — "
+                "this suite is a merge gate and must not skip when CI configured it"
+            )
+        pytest.skip("Postgres unreachable and no AKB_TEST_DSN set")
     pool = await asyncpg.create_pool(
         _DSN, min_size=1, max_size=8,
         server_settings={"search_path": _SCHEMA},
@@ -168,26 +180,44 @@ async def test_row_committed_after_a_higher_id_is_still_folded(db):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_runners_each_take_a_distinct_slice(db, monkeypatch):
-    """`SKIP LOCKED` is what lets a second runner make progress instead of
-    blocking on the first one's locked rows.
+async def test_skip_locked_lets_a_claimer_past_rows_another_holds(db, monkeypatch):
+    """`SKIP LOCKED` is what lets a second claimer make progress instead of
+    blocking on rows the first one holds.
 
-    The batch is deliberately smaller than the row count: with a batch large
-    enough to swallow everything, one runner finishes the work and the others
-    return zero, and the test would pass without any overlap ever occurring.
+    Merely gathering four one-shot rollups does NOT prove this: four fully
+    serialised executions over 200 rows with a 50-row batch also produce
+    `[50, 50, 50, 50]` and satisfy every assertion, and with a pool that opens
+    connections lazily, non-overlap is the likely outcome. So hold the first
+    slice locked in an explicit transaction and require the claimer to finish
+    anyway — without `SKIP LOCKED` it would block until the holder commits and
+    the `wait_for` below would expire.
     """
     monkeypatch.setattr(settings.tool_usage, "maintenance_batch", 50)
     async with db.acquire() as c:
-        await _seed(c, days=0, tool="akb_race", n=200)
+        await _seed(c, days=0, tool="akb_lock", n=100)
 
-    results = await asyncio.gather(*(tool_usage.rollup_once() for _ in range(4)))
+    holder = await db.acquire()
+    try:
+        await holder.execute("BEGIN")
+        held = await holder.fetch(
+            "SELECT id FROM tool_calls WHERE rolled_at IS NULL "
+            "ORDER BY id LIMIT 50 FOR UPDATE"
+        )
+        assert len(held) == 50, "the holder must actually own the first slice"
 
-    assert sum(results) == 200, f"every row folded exactly once, got {results}"
-    assert all(r > 0 for r in results), (
-        f"each runner must claim a slice — {results} means they serialised"
-    )
-    assert await _folded(db, "akb_race") == 200
-    assert await _unclaimed(db) == 0
+        folded = await asyncio.wait_for(tool_usage.rollup_once(), timeout=5.0)
+
+        assert folded == 50, "the claimer must take the NEXT slice, not wait"
+        held_ids = {r["id"] for r in held}
+        async with db.acquire() as c:
+            claimed = {
+                r["id"] for r in
+                await c.fetch("SELECT id FROM tool_calls WHERE rolled_at IS NOT NULL")
+            }
+        assert not (held_ids & claimed), "locked rows must have been skipped, not claimed"
+    finally:
+        await holder.execute("ROLLBACK")
+        await db.release(holder)
 
 
 @pytest.mark.asyncio
@@ -263,3 +293,39 @@ async def test_one_statement_is_bounded(db, monkeypatch):
 
     assert await tool_usage.rollup_once() == 10
     assert await _unclaimed(db) == 15
+
+
+@pytest.mark.asyncio
+async def test_record_and_flush_write_each_field_to_its_own_column(db, monkeypatch):
+    """The only end-to-end check of `_Row`'s field order against
+    `_INSERT_SQL`'s column list.
+
+    `_Row` is a positional NamedTuple; every other test seeds rows with its own
+    hand-written INSERT, and the unit suite's fake connection just collects the
+    tuples it is handed without binding them to columns. Swapping two
+    same-typed fields — `actor_id`/`actor`, or `session_id`/`vault` — would
+    type-check, pass everything else, and silently write each value into its
+    neighbour's column in production.
+    """
+    monkeypatch.setattr(settings.tool_usage, "enabled", True)
+    tool_usage.reset()
+    tool_usage.record(
+        "akb_probe", {"uri": "akb://vlt/doc/x.md"},
+        type("U", (), {"user_id": "uid-1", "username": "alice"})(),
+        {"error": "nope", "code": "NOT_FOUND"},
+        session_id="sess-9", duration_ms=77, is_write=True,
+    )
+
+    assert await tool_usage.flush_once() == 1
+
+    async with db.acquire() as c:
+        row = await c.fetchrow(
+            "SELECT tool, actor_id, actor, session_id, vault, outcome, code, "
+            "duration_ms, is_write FROM tool_calls"
+        )
+    assert dict(row) == {
+        "tool": "akb_probe", "actor_id": "uid-1", "actor": "alice",
+        "session_id": "sess-9", "vault": "vlt", "outcome": "error",
+        "code": "NOT_FOUND", "duration_ms": 77, "is_write": True,
+    }
+    tool_usage.reset()
