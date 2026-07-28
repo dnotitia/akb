@@ -38,7 +38,8 @@ from app.services import tool_usage
 # eight skips and a green job — exactly the "gate that never fires" the
 # workflow comment warns about. Only the local-development default may skip.
 _DSN_FROM_ENV = os.environ.get("AKB_TEST_DSN")
-_DSN = _DSN_FROM_ENV or "postgresql://akb:akb@localhost:15432/akb"
+# Matches the dev-compose override and the CI service; not a credential.
+_DSN = _DSN_FROM_ENV or "postgresql://akb:akb@localhost:15432/akb"  # pragma: allowlist secret
 _SCHEMA = "tool_usage_e2e"
 
 
