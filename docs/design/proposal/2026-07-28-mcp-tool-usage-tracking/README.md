@@ -3,7 +3,7 @@ status: proposal
 stage: proposal
 created: 2026-07-28
 updated: 2026-07-28
-head: d5921bd
+head: b3abdf0
 method: production measurement (PG + Redis, read-only) + PM decision on purpose/retention + independent Codex adversarial review (verdict REDESIGN; wave A applied, wave B deferred)
 ---
 
@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     outcome      TEXT        NOT NULL,        -- 'ok' | 'error'
     code         TEXT,                        -- 실패 시 에러 코드
     duration_ms  INTEGER,                     -- 디스패치 소요
-    is_write     BOOLEAN     NOT NULL DEFAULT FALSE
+    is_write     BOOLEAN     NOT NULL DEFAULT FALSE,
+    rolled_at    TIMESTAMPTZ                  -- NULL = 아직 집계 안 됨 (클레임 표시)
 );
 
 -- append-only 시계열 → BRIN이 btree보다 수백 배 작고 purge/범위질의에 충분
@@ -135,6 +136,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_occurred_brin
 -- 행동 분석: 한 세션의 호출을 순서대로
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
     ON tool_calls (session_id, id) WHERE session_id IS NOT NULL;
+-- 클레임 스캔은 미집계 행만 보므로 부분 인덱스면 백로그 크기에 비례한다
+CREATE INDEX IF NOT EXISTS idx_tool_calls_unrolled
+    ON tool_calls (id) WHERE rolled_at IS NULL;
 
 -- 롤업: 영구 보존
 CREATE TABLE IF NOT EXISTS tool_usage_daily (
@@ -286,7 +290,7 @@ class ToolUsageSettings(BaseModel):
 ## 6. 측정 경계 — 무엇이 안 잡히는가 (확인됨)
 
 이 싱크의 지표는 **"백엔드 MCP 툴 실행"** 이지 "제품 사용량" 전체가 아니다. Codex
-리뷰로 확인된 사각지대를 숨기지 않고 명시한다. 세 가지 모두 wave B 대상이다.
+리뷰로 확인된 사각지대를 숨기지 않고 명시한다. 전부 wave B 대상이다.
 
 | 사각지대 | 근거 | 영향 |
 |---|---|---|
@@ -304,9 +308,10 @@ REST 표면도 잡히지 않는다 — 지표 정의상 의도된 것이며, 위
 
 ## 7. 범위
 
-**wave A (이번):** 마이그레이션 046(3 테이블), `app/services/tool_usage.py`,
-초크포인트 배선, 설정 섹션(하한 포함), 워커 2개, `BackfillRunner.log_progress`,
-테스트 29개.
+**wave A (이번):** 마이그레이션 046(`tool_calls` + `tool_usage_daily` 2 테이블),
+`app/services/tool_usage.py`, 초크포인트 배선, 설정 섹션(하한 포함), 워커 2개,
+`BackfillRunner.log_progress` / `stop(timeout=…)`, `uri_service.vault_of()`,
+유닛 29개 + **실제 PG e2e 8개(CI `pgvector-e2e` 잡에 등록)**.
 
 **wave B (다음, Codex 재설계 항목):** 위 사각지대 3건 계측, 안정적 `event_id` +
 호출 진입 시점 시퀀스 + `started_at`/`completed_at`, 롤업에 `code`/actor/vault

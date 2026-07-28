@@ -94,9 +94,10 @@ class ToolUsageSettings(BaseModel):
     # the future that deletes live data.
     enabled: bool = False
     # Raw per-call rows are pruned this many days after they are folded into
-    # `tool_usage_daily` (which is kept indefinitely — ~86 rows/day). Purge is
-    # additionally bounded by the rollup watermark, so an un-aggregated row
-    # survives however old it is.
+    # `tool_usage_daily` (which is kept indefinitely — ~86 rows/day). Purge
+    # additionally requires the row to carry its fold stamp
+    # (`rolled_at IS NOT NULL`), so an un-aggregated row survives however old
+    # it is.
     raw_retention_days: int = Field(default=30, ge=1, le=3650)
     # Bounded in-memory hand-off. `record()` runs on the single event loop,
     # so it may only append; a flusher task does the batched INSERT. On
@@ -112,9 +113,13 @@ class ToolUsageSettings(BaseModel):
     # Rows claimed/deleted per maintenance statement. Bounded so catching up
     # after an outage happens in steady chunks instead of one transaction big
     # enough to hit the statement timeout and spike WAL/bloat; a non-zero
-    # rollup keeps the runner looping, so a backlog still drains promptly.
-    rollup_batch: int = Field(default=5_000, ge=1, le=100_000)
-    purge_batch: int = Field(default=5_000, ge=1, le=100_000)
+    # result keeps the runner looping, so a backlog still drains promptly.
+    maintenance_batch: int = Field(default=5_000, ge=1, le=100_000)
+    # Hard ceiling on the shutdown drain + worker stop, so this fits inside the
+    # container's termination grace (30s on k8s, 15s under the all-in-one
+    # supervisor) instead of the 120s a `BackfillRunner` stop may otherwise
+    # wait. Whatever is still queued when it expires is reported, not silent.
+    shutdown_deadline_secs: float = Field(default=8.0, ge=0.5, le=60.0)
 
 
 class Settings(BaseModel):

@@ -103,6 +103,24 @@ class ParsedUri(NamedTuple):
     coll_path: str | None = None
 
 
+_URI_VAULT_PREFIX_RE = re.compile(rf"^akb://{_VAULT}(?:/|$)")
+
+
+def vault_of(uri: str) -> str | None:
+    """The vault component of any AKB URI form, or ``None`` if it isn't one.
+
+    A cheap accessor for callers that only need the vault and would otherwise
+    hand-roll `uri[6:].split("/")[0]` — which quietly accepts template
+    placeholders and other shapes the canonical grammar rejects. One anchored
+    match against the same `_VAULT` fragment the full patterns use, so this
+    cannot drift away from `parse_uri` when the scheme grows a component.
+    """
+    if not isinstance(uri, str) or "{" in uri or "}" in uri:
+        return None
+    m = _URI_VAULT_PREFIX_RE.match(uri)
+    return m.group(1) if m else None
+
+
 def parse_uri(uri: str) -> ParsedUri | None:
     """Parse an AKB URI in canonical form.
 

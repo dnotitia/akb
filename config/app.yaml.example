@@ -265,16 +265,16 @@ redis_stream_maxlen: 100000
 # === MCP tool-usage analytics ==================================
 # Answers "which MCP tool is actually used, by whom, in what order, and how
 # often does it fail" — questions neither of the other two streams can serve.
-# `events` records domain verbs on successful writes (20 of the 43 tools have
-# no corresponding kind) and deletes rows once delivered to Redis; `audit` is a
-# tamper-evident ledger for a SIEM and is not locally groupable.
+# `events` records domain verbs on successful writes and deletes rows once
+# delivered to Redis (at least 29 of the 43 tools have no corresponding kind);
+# `audit` is a tamper-evident ledger for a SIEM and is not locally groupable.
 #
-# One row per tool call in `tool_calls`, folded hourly into `tool_usage_daily`
-# (kept indefinitely, ~86 rows/day) and pruned after `raw_retention_days`.
-# Budget roughly 250-350 bytes per call before bloat when sizing the PG volume.
+# One row per tool call in `tool_calls`, folded into `tool_usage_daily` (kept
+# indefinitely, ~86 rows/day) and pruned after `raw_retention_days`. Budget
+# roughly 250-350 bytes per call before bloat when sizing the PG volume.
 #
 # Off by default. Rollup/purge run even when disabled so that turning
-# collection off still drains and prunes what was already gathered.
+# collection off still folds and prunes what was already gathered.
 # tool_usage:
 #   enabled: false
 #   raw_retention_days: 30        # per-call rows; the daily rollup is kept forever
@@ -282,3 +282,5 @@ redis_stream_maxlen: 100000
 #   flush_interval_secs: 5        # idle poll only — a non-empty queue drains continuously
 #   flush_batch: 500              # rows per INSERT round trip
 #   rollup_interval_secs: 3600    # rollup + purge cadence
+#   maintenance_batch: 5000       # rows claimed/deleted per maintenance statement
+#   shutdown_deadline_secs: 8     # drain + worker stop budget; must fit the termination grace

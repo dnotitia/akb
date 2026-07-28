@@ -76,7 +76,13 @@ class BackfillRunner:
             task_name = self._name if self._concurrency == 1 else f"{self._name}-{i}"
             self._tasks.append(asyncio.create_task(self._loop(task_name), name=task_name))
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 120.0) -> None:
+        """Signal the loop and wait for the in-flight iteration.
+
+        `timeout` exists for workers whose shutdown has to fit inside the
+        container's termination grace (30s on k8s, 15s under the all-in-one
+        supervisor) rather than inside the 120s an embedding upsert can need.
+        """
         if self._stop_event:
             self._stop_event.set()
         if self._tasks:
@@ -90,11 +96,11 @@ class BackfillRunner:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=120.0,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 self._log.warning(
-                    "%s did not stop within 120s; cancelling", self._name,
+                    "%s did not stop within %.0fs; cancelling", self._name, timeout,
                 )
                 for t in self._tasks:
                     if not t.done():

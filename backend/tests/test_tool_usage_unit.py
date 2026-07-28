@@ -102,7 +102,7 @@ def test_queue_overflow_drops_oldest_and_counts_it(enabled, monkeypatch):
     assert tool_usage.queue_depth() == 3
     assert tool_usage.dropped_count() == 2, "dropped records must be counted"
     # Oldest evicted → the survivors are the LAST three.
-    assert [r["tool"] for r in tool_usage.drain(10)] == ["akb_t2", "akb_t3", "akb_t4"]
+    assert [r.tool for r in tool_usage.drain(10)] == ["akb_t2", "akb_t3", "akb_t4"]
 
 
 def test_record_never_raises(enabled):
@@ -132,8 +132,8 @@ def test_error_outcome_and_code_are_captured(enabled):
         {"error": "not found", "code": "NOT_FOUND"},
     )
     row = tool_usage.drain(1)[0]
-    assert row["outcome"] == "error"
-    assert row["code"] == "NOT_FOUND"
+    assert row.outcome == "error"
+    assert row.code == "NOT_FOUND"
 
 
 def test_raw_args_are_not_stored(enabled):
@@ -142,7 +142,7 @@ def test_raw_args_are_not_stored(enabled):
     secretish = {"vault": "v", "content": "PATIENT RECORD", "query": "salary"}
     tool_usage.record("akb_put", secretish, _User(), {"ok": True})
     row = tool_usage.drain(1)[0]
-    assert row["vault"] == "v"
+    assert row.vault == "v"
     flat = repr(row)
     assert "PATIENT RECORD" not in flat and "salary" not in flat
 
@@ -160,11 +160,11 @@ def test_vault_is_derived_from_uris_too(enabled, args, expected):
     """20 of the 43 tools take no `vault` argument at all — `akb_get`,
     `akb_update`, `akb_edit`, `akb_delete`, `akb_move`, `akb_link` and friends
     address resources by `akb://` URI, because the canonical API deliberately
-    dropped the redundant vault parameter. Reading only `args["vault"]` would
+    dropped the redundant vault parameter. Reading only `args.vault` would
     leave the per-vault dimension NULL on most rows and quietly make the
     "which vault uses what" question unanswerable."""
     tool_usage.record("akb_x", args, _User(), {"ok": True})
-    assert tool_usage.drain(1)[0]["vault"] == expected
+    assert tool_usage.drain(1)[0].vault == expected
 
 
 def test_session_and_duration_are_recorded(enabled):
@@ -175,9 +175,9 @@ def test_session_and_duration_are_recorded(enabled):
         session_id="sess-1", duration_ms=42, is_write=False,
     )
     row = tool_usage.drain(1)[0]
-    assert row["session_id"] == "sess-1"
-    assert row["duration_ms"] == 42
-    assert row["is_write"] is False
+    assert row.session_id == "sess-1"
+    assert row.duration_ms == 42
+    assert row.is_write is False
 
 
 # ── Flush ───────────────────────────────────────────────────────
@@ -344,42 +344,52 @@ def test_rollup_claims_rows_rather_than_tracking_a_sequence_watermark():
     assert "last_rolled_id" not in src, (
         "sequence watermarks are unsafe here — claim rows instead"
     )
-    rollup_sql = src.split("_ROLLUP_SQL = ")[1].split('"""')[1]
+    rollup_sql = tool_usage._ROLLUP_SQL
     assert "SET rolled_at" in rollup_sql, "the fold must stamp the rows it counts"
     assert "SKIP LOCKED" in rollup_sql, "a second runner must take a different slice"
 
-    purge_sql = src.split("_PURGE_SQL = ")[1].split('"""')[1]
+    purge_sql = tool_usage._PURGE_SQL
     assert "rolled_at IS NOT NULL" in purge_sql, (
         "an unfolded row must survive purge however old it is"
     )
 
 
-def test_maintenance_defers_purge_until_the_rollup_is_caught_up(monkeypatch):
-    """Purge is only safe once everything on hand is aggregated, and returning
-    a non-zero rollup count keeps the runner looping without pause. If purge
-    ran alongside a backlog it would be racing the very claims that authorise
-    it."""
+def test_purge_runs_even_while_the_rollup_still_has_work(monkeypatch):
+    """An earlier version returned early whenever the rollup folded anything,
+    waiting for a globally quiet moment before purging. Sustained traffic never
+    produces one, so purge could be starved indefinitely while already-folded
+    rows piled up — unbounded growth of the table the retention policy exists
+    to bound.
+
+    The wait was never needed: `rolled_at IS NOT NULL` makes each row
+    individually safe to delete regardless of what else is unfolded."""
     calls: list[str] = []
 
     async def _rollup():
         calls.append("rollup")
-        return 5                       # backlog remains
+        return 5                       # a backlog remains, tick after tick
 
     async def _purge():
         calls.append("purge")
-        return 0
+        return 3
 
     monkeypatch.setattr(tool_usage, "rollup_once", _rollup)
     monkeypatch.setattr(tool_usage, "purge_once", _purge)
-    assert asyncio.run(tool_usage.maintenance_once()) == 5
-    assert calls == ["rollup"], "purge must wait until the rollup drains"
+
+    assert asyncio.run(tool_usage.maintenance_once()) == 8
+    assert calls == ["rollup", "purge"], (
+        "purge must not be gated on the rollup reaching zero"
+    )
 
 
 def test_purge_cutoff_is_a_whole_day_boundary():
-    """A cutoff at an arbitrary instant splits a day. The next rollup then
-    recomputes that day from the surviving fragment and overwrites its correct
-    total with a smaller one — silent downward corruption of the only
-    long-lived copy."""
+    """Retention advances a whole UTC day at a time.
+
+    This began as a correctness fix — a recompute-style rollup would re-derive
+    a half-purged day from the surviving fragment and overwrite its total. The
+    rollup is now additive and per-row, so that failure is gone; the boundary
+    stays because it keeps "this day is gone" from being half-true for anyone
+    joining raw rows against the aggregate."""
     from datetime import datetime, timezone
 
     cutoff = tool_usage._purge_cutoff(
@@ -470,6 +480,40 @@ def test_error_path_records_only_when_the_success_path_did_not():
             "the error path must skip recording when the success path already "
             "recorded this invocation"
         )
+
+
+def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_path):
+    """The runtime counterpart to the AST guard above. `json.dumps` runs inside
+    the same `try` as the recording calls, so a result the encoder cannot
+    handle lands in the `except` — which without the guard logs the same
+    invocation a second time as an error.
+
+    A self-referencing dict defeats `default=str` (it recurses), which is the
+    real shape of this failure."""
+    # The module builds a GitService at import, which mkdirs the production
+    # `git_storage_path` — redirect it first (same pattern as
+    # test_activity_git_offload_unit.py).
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from mcp_server import server as srv
+
+    circular: dict = {"ok": True}
+    circular["self"] = circular
+
+    async def _dispatch(name, args, user):
+        return circular
+
+    usage: list = []
+    audit: list = []
+    monkeypatch.setattr(srv, "_dispatch", _dispatch)
+    monkeypatch.setattr(srv.tool_usage, "record", lambda *a, **k: usage.append(a[0]))
+    monkeypatch.setattr(srv.audit_log, "record_tool", lambda *a, **k: audit.append(a[0]))
+
+    out = asyncio.run(srv.call_tool("akb_put", {"vault": "v"}))
+
+    assert len(usage) == 1, f"usage recorded {len(usage)} times for one call"
+    assert len(audit) == 1, f"audit recorded {len(audit)} times for one call"
+    # The caller still gets a well-formed error envelope.
+    assert "error" in out[0].text
 
 
 def test_usage_sink_is_independent_of_the_audit_flags():

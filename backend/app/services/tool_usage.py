@@ -32,14 +32,16 @@ than no table.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.config import settings
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner
+from app.services.uri_service import vault_of
 
 logger = logging.getLogger("akb.tool_usage")
 
@@ -94,18 +96,23 @@ _ROLLUP_SQL = """
 """
 
 # Raw rows are the only copy until they are folded in, so the delete requires
-# the claim stamp as well as age: an old but unfolded row survives. The age
-# cutoff is a whole UTC day (see `_purge_cutoff`) so a day is never left
-# half-deleted, and `LIMIT` keeps a large backlog from becoming one huge
-# DELETE (WAL burst, statement timeout, bloat spike).
+# the claim stamp as well as age: an old but unfolded row survives. `LIMIT`
+# keeps a large backlog from becoming one huge DELETE (WAL burst, statement
+# timeout, bloat spike).
+#
+# Deliberately NOT ordered. `ORDER BY id` here makes Postgres materialise every
+# eligible row and top-N sort it just to take `LIMIT` of them: measured at ~500k
+# eligible rows, 755ms / 49,610 buffers per batch versus 10.7ms / 172 without,
+# and the waste is quadratic across a full pass. Order buys nothing — the
+# predicate already selects only eligible rows, and `ctid` lets the delete skip
+# a second primary-key probe per row.
 _PURGE_SQL = """
     WITH d AS (
         DELETE FROM tool_calls
-         WHERE id IN (
-             SELECT id FROM tool_calls
+         WHERE ctid IN (
+             SELECT ctid FROM tool_calls
               WHERE occurred_at < $1
                 AND rolled_at IS NOT NULL
-              ORDER BY id
               LIMIT $2
          )
         RETURNING 1
@@ -113,7 +120,30 @@ _PURGE_SQL = """
     SELECT COUNT(*) FROM d
 """
 
-_queue: deque[dict[str, Any]] = deque(maxlen=1)
+class _Row(NamedTuple):
+    """One queued call, already in `_INSERT_SQL` column order.
+
+    A tuple rather than a dict: asyncpg wants positional parameters anyway, so
+    the dict was a pure intermediate that cost ~2x the memory per queued row
+    and forced the column order to be restated in a third place.
+    """
+    occurred_at: datetime
+    tool: str
+    actor_id: str | None
+    actor: str | None
+    session_id: str | None
+    vault: str | None
+    outcome: str
+    code: str | None
+    duration_ms: int | None
+    is_write: bool
+
+
+# The bound is kept alongside the deque so the hot path compares against a
+# plain int instead of re-deriving `deque.maxlen` (typed `int | None`, which
+# needs a guard that can never fire).
+_maxlen: int = 1
+_queue: deque[_Row] = deque(maxlen=_maxlen)
 _dropped = 0
 
 
@@ -123,8 +153,9 @@ def reset() -> None:
     Called at startup and by tests; the bound is read here rather than per
     append so the hot path stays a single ``append``.
     """
-    global _queue, _dropped
-    _queue = deque(maxlen=max(1, int(settings.tool_usage.queue_max)))
+    global _queue, _dropped, _maxlen
+    _maxlen = settings.tool_usage.queue_max
+    _queue = deque(maxlen=_maxlen)
     _dropped = 0
 
 
@@ -136,16 +167,18 @@ def queue_depth() -> int:
 
 
 def dropped_count() -> int:
-    """Records lost to overflow since the last ``reset()``. Surfaced so a
-    flood shows up as a reported degradation instead of a silent gap."""
+    """Records lost to overflow or to a failed flush that could not be
+    requeued, since the last ``reset()``. Counted so a flood shows up as a
+    reported degradation instead of a silent gap."""
     return _dropped
 
 
-def drain(limit: int) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    while _queue and len(out) < limit:
-        out.append(_queue.popleft())
-    return out
+def drain(limit: int) -> list[_Row]:
+    if len(_queue) <= limit:
+        out = list(_queue)
+        _queue.clear()
+        return out
+    return [_queue.popleft() for _ in range(limit)]
 
 
 def record(
@@ -178,20 +211,7 @@ def record(
             outcome = "error"
             code = result.get("code")
 
-        row = {
-            "occurred_at": datetime.now(timezone.utc),
-            "tool": name,
-            "actor_id": _str_or_none(getattr(user, "user_id", None)),
-            "actor": _str_or_none(getattr(user, "username", None)),
-            "session_id": session_id,
-            "vault": _vault_of(args),
-            "outcome": outcome,
-            "code": code,
-            "duration_ms": duration_ms,
-            "is_write": bool(is_write),
-        }
-
-        if _queue.maxlen is not None and len(_queue) >= _queue.maxlen:
+        if len(_queue) >= _maxlen:
             # deque evicts the oldest on append; count it so the loss is
             # reportable rather than invisible.
             _dropped += 1
@@ -199,9 +219,20 @@ def record(
                 logger.warning(
                     "tool_usage queue full (maxlen=%d) — dropped %d record(s); "
                     "the flusher is not keeping up",
-                    _queue.maxlen, _dropped,
+                    _maxlen, _dropped,
                 )
-        _queue.append(row)
+        _queue.append(_Row(
+            occurred_at=datetime.now(timezone.utc),
+            tool=name,
+            actor_id=_str_or_none(getattr(user, "user_id", None)),
+            actor=_str_or_none(getattr(user, "username", None)),
+            session_id=session_id,
+            vault=_vault_of(args),
+            outcome=outcome,
+            code=code,
+            duration_ms=duration_ms,
+            is_write=is_write,
+        ))
     except Exception as e:  # noqa: BLE001 — tracking must never fail a tool call
         logger.debug("tool_usage.record skipped: %s", e)
 
@@ -215,16 +246,14 @@ def _str_or_none(v: Any) -> str | None:
 # the 43 tools (`akb_get`, `akb_update`, `akb_edit`, `akb_delete`, `akb_move`,
 # `akb_link`, …) carry no `vault` key at all. Reading only `args["vault"]` would
 # leave the dimension NULL on most rows.
-_URI_ARGS = ("uri", "parent", "source", "target", "resource_uri")
-_URI_PREFIX = "akb://"
+#
+# Mirrors the URI-bearing argument names in `mcp_server/tools.py`; the scheme
+# itself is parsed by `uri_service`, which owns that grammar.
+_URI_ARGS = ("uri", "parent", "source", "target")
 
 
 def _vault_of(args: Any) -> str | None:
-    """Vault name from an explicit argument, else the first `akb://` URI.
-
-    Pure string slicing — this runs on the request path, so it must not import
-    the URI parser or touch the DB to resolve an id.
-    """
+    """Vault name from an explicit argument, else the first `akb://` URI."""
     if not isinstance(args, dict):
         return None
     explicit = args.get("vault")
@@ -232,8 +261,8 @@ def _vault_of(args: Any) -> str | None:
         return explicit
     for key in _URI_ARGS:
         value = args.get(key)
-        if isinstance(value, str) and value.startswith(_URI_PREFIX):
-            name = value[len(_URI_PREFIX):].split("/", 1)[0]
+        if isinstance(value, str):
+            name = vault_of(value)
             if name:
                 return name
     return None
@@ -243,49 +272,52 @@ async def flush_once() -> int:
     """Drain up to ``flush_batch`` records into PG in one round trip.
 
     On a DB error the batch is returned to the FRONT of the queue so a
-    transient outage delays rows instead of losing them; the bound then caps
-    how much a sustained outage can retain (and the overflow is counted).
+    transient outage delays rows instead of losing them; the bound caps how
+    much a sustained outage can retain, and whatever does not fit is counted.
     """
-    batch = drain(int(settings.tool_usage.flush_batch))
+    batch = drain(settings.tool_usage.flush_batch)
     if not batch:
         return 0
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.executemany(_INSERT_SQL, [_as_tuple(r) for r in batch])
+            await conn.executemany(_INSERT_SQL, batch)
     except Exception as e:  # noqa: BLE001
-        _requeue_front(batch)
-        logger.warning("tool_usage flush failed (%d records requeued): %s", len(batch), e)
+        kept = _requeue_front(batch)
+        logger.warning(
+            "tool_usage flush failed (%d requeued, %d dropped): %s",
+            kept, len(batch) - kept, e,
+        )
         return 0
     return len(batch)
 
 
-def _requeue_front(batch: list[dict[str, Any]]) -> None:
+def _requeue_front(batch: list[_Row]) -> int:
+    """Put a failed batch back at the head. Returns how many actually fit.
+
+    New calls may have taken the freed capacity while the flush was in flight,
+    so this can only keep what the bound allows; the remainder is counted as
+    dropped rather than reported as requeued.
+    """
     global _dropped
-    room = (_queue.maxlen or 0) - len(_queue)
+    room = _maxlen - len(_queue)
     if room < len(batch):
-        _dropped += len(batch) - max(0, room)
-        batch = batch[len(batch) - max(0, room):]
+        _dropped += len(batch) - room
+        batch = batch[len(batch) - room:] if room > 0 else []
     _queue.extendleft(reversed(batch))
-
-
-def _as_tuple(r: dict[str, Any]) -> tuple:
-    return (
-        r["occurred_at"], r["tool"], r["actor_id"], r["actor"], r["session_id"],
-        r["vault"], r["outcome"], r["code"], r["duration_ms"], r["is_write"],
-    )
+    return len(batch)
 
 
 def _purge_cutoff(now: datetime | None = None) -> datetime:
     """Midnight UTC, ``raw_retention_days`` back — a whole-day boundary.
 
-    Truncating to the day is a correctness requirement, not tidiness: purging
-    at an arbitrary instant would split a day, and the next rollup would then
-    recompute that day from the surviving fragment and overwrite its correct
-    total with a smaller one.
+    Truncating to the day keeps a retention pass from splitting a day across
+    runs, so "this day is gone" is never half-true for a reader joining raw
+    rows against the aggregate. The ``now`` argument exists so the boundary can
+    be asserted deterministically in tests.
     """
     now = now or datetime.now(timezone.utc)
-    day = (now - timedelta(days=int(settings.tool_usage.raw_retention_days))).date()
+    day = (now - timedelta(days=settings.tool_usage.raw_retention_days)).date()
     return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
 
@@ -299,7 +331,7 @@ async def rollup_once() -> int:
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        n = await conn.fetchval(_ROLLUP_SQL, int(settings.tool_usage.rollup_batch))
+        n = await conn.fetchval(_ROLLUP_SQL, settings.tool_usage.maintenance_batch)
     return int(n or 0)
 
 
@@ -315,7 +347,7 @@ async def purge_once() -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         n = await conn.fetchval(
-            _PURGE_SQL, _purge_cutoff(), int(settings.tool_usage.purge_batch)
+            _PURGE_SQL, _purge_cutoff(), settings.tool_usage.maintenance_batch
         )
     n = int(n or 0)
     if n:
@@ -324,23 +356,25 @@ async def purge_once() -> int:
 
 
 async def maintenance_once() -> int:
-    """`BackfillRunner` callback: catch the rollup up first, then prune.
+    """`BackfillRunner` callback: fold a batch, then prune a batch.
 
-    Returning the rollup count while a backlog remains keeps the runner looping
-    without pause, so purge only runs once every row on hand is aggregated —
-    which is also the precondition that makes the purge predicate safe.
+    Both run every tick. An earlier version returned early whenever the rollup
+    had folded anything, on the theory that purge should wait for a globally
+    quiet moment — but sustained traffic never produces one, so purge could be
+    starved indefinitely while already-aggregated rows piled up. The wait was
+    never needed: `rolled_at IS NOT NULL` makes each row individually safe to
+    delete regardless of what else is still unfolded.
     """
     folded = await rollup_once()
-    if folded:
-        return folded
-    return await purge_once()
+    purged = await purge_once()
+    return folded + purged
 
 
 # ── Workers ─────────────────────────────────────────────────────
 
 _flusher = BackfillRunner(
     "tool_usage_flusher", flush_once,
-    idle_secs=int(settings.tool_usage.flush_interval_secs),
+    idle_secs=settings.tool_usage.flush_interval_secs,
     # This one has work on every tick the service has traffic; the runner's
     # per-tick progress line would be thousands of INFO lines a day. Overflow
     # and flush failures still log — those are the ones worth seeing.
@@ -353,7 +387,7 @@ _flusher = BackfillRunner(
 # collected.
 _maintainer = BackfillRunner(
     "tool_usage_maintenance", maintenance_once,
-    idle_secs=int(settings.tool_usage.rollup_interval_secs),
+    idle_secs=settings.tool_usage.rollup_interval_secs,
 )
 
 
@@ -365,23 +399,38 @@ def start() -> None:
 
 
 async def stop() -> None:
-    """Drain what is queued, THEN stop the workers.
+    """Quiesce the flusher, drain the remainder, then stop maintenance.
 
-    Order matters. `BackfillRunner.stop()` can wait up to ~120s for an
-    in-flight iteration, while Kubernetes gives 30s by default and the
-    all-in-one supervisor 15s — draining afterwards would routinely be
-    SIGKILLed before it ran. Draining first gets the rows out while the
-    process is still alive; the queue is bounded, so this is a handful of
-    round trips, and concurrent drains are safe because `drain()` pops.
+    Order matters in both directions. Draining *first* races the live flusher:
+    it may already own a batch, so the final drain sees an empty queue, and if
+    that in-flight INSERT then fails it requeues after we have stopped looking
+    — the tail is lost with no warning. Stopping first removes the other
+    claimant, so whatever remains in the deque is ours alone.
+
+    Everything is under one deadline. `BackfillRunner.stop()` defaults to
+    waiting 120s for an in-flight iteration, but Kubernetes grants 30s and the
+    all-in-one supervisor 15s, so an unbounded shutdown is simply SIGKILLed
+    mid-drain. Anything still queued when the budget runs out is logged rather
+    than dropped in silence.
     """
+    budget = settings.tool_usage.shutdown_deadline_secs
     try:
-        while await flush_once():
-            pass
+        await asyncio.wait_for(_shutdown_sequence(budget), timeout=budget)
+    except asyncio.TimeoutError:
+        logger.warning("tool_usage shutdown exceeded %.1fs budget", budget)
     except Exception as e:  # noqa: BLE001 — shutdown must not raise
-        logger.warning("tool_usage final drain failed: %s", e)
+        logger.warning("tool_usage shutdown failed: %s", e)
     if queue_depth():
         logger.warning(
-            "tool_usage shutting down with %d record(s) still queued", queue_depth()
+            "tool_usage lost %d queued record(s) at shutdown (drain incomplete)",
+            queue_depth(),
         )
-    await _flusher.stop()
-    await _maintainer.stop()
+
+
+async def _shutdown_sequence(budget: float) -> None:
+    # Half the budget for the flusher to finish its iteration; the rest for the
+    # drain and the maintenance stop.
+    await _flusher.stop(timeout=budget / 2)
+    while await flush_once():
+        pass
+    await _maintainer.stop(timeout=budget / 4)
