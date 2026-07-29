@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+An additive app desired-state registry now stores stable app definitions,
+immutable versioned release manifests, one installation per app/Vault pair,
+monotonic capability grants, and explicit owned or retained resources. Database
+constraints reject cross-app release pointers, incoherent lifecycle/version
+states, duplicate installations, stale grant generations, and in-place release
+or grant mutation. A security-invoker installation view returns the current
+registry state in one query, while ordinary Vault SQL roles receive no access.
+Existing users, Vaults, tokens, Vault data, and standalone behavior are
+unchanged.
+
 REST table schema alteration now requires the `admin` role, matching the MCP
 `akb_alter_table` authorization boundary. This closes the route-dependent
 permission gap that allowed a `writer` to perform destructive operations such
