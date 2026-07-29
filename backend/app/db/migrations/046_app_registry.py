@@ -2,8 +2,8 @@
 
 The registry is control-plane state, not Vault data-plane state. It defines
 stable apps, immutable releases, one installation per app/Vault pair,
-monotonic grants, and explicit resource ownership without changing existing
-users, Vaults, tokens, or Vault content.
+monotonic grants, Vault-scoped resource ownership, and registry identity
+immutability without changing existing users, Vaults, tokens, or Vault content.
 """
 
 from __future__ import annotations
@@ -174,11 +174,19 @@ async def _run(conn):
                     SELECT 1 FROM pg_constraint
                      WHERE conname = 'vault_app_installations_vault_id_fkey'
                        AND conrelid = 'vault_app_installations'::regclass
+                ) OR EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'vault_app_installations_vault_id_fkey'
+                       AND conrelid = 'vault_app_installations'::regclass
+                       AND confdeltype <> 'c'
                 ) THEN
+                    ALTER TABLE vault_app_installations
+                        DROP CONSTRAINT IF EXISTS
+                        vault_app_installations_vault_id_fkey;
                     ALTER TABLE vault_app_installations
                         ADD CONSTRAINT vault_app_installations_vault_id_fkey
                         FOREIGN KEY (vault_id) REFERENCES vaults(id)
-                        ON DELETE RESTRICT;
+                        ON DELETE CASCADE;
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
@@ -188,6 +196,15 @@ async def _run(conn):
                     ALTER TABLE vault_app_installations
                         ADD CONSTRAINT vault_app_installations_app_vault_key
                         UNIQUE (app_id, vault_id);
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'vault_app_installations_id_vault_key'
+                       AND conrelid = 'vault_app_installations'::regclass
+                ) THEN
+                    ALTER TABLE vault_app_installations
+                        ADD CONSTRAINT vault_app_installations_id_vault_key
+                        UNIQUE (id, vault_id);
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
@@ -308,12 +325,20 @@ async def _run(conn):
                     SELECT 1 FROM pg_constraint
                      WHERE conname = 'installation_grants_installation_id_fkey'
                        AND conrelid = 'installation_grants'::regclass
+                ) OR EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'installation_grants_installation_id_fkey'
+                       AND conrelid = 'installation_grants'::regclass
+                       AND confdeltype <> 'c'
                 ) THEN
+                    ALTER TABLE installation_grants
+                        DROP CONSTRAINT IF EXISTS
+                        installation_grants_installation_id_fkey;
                     ALTER TABLE installation_grants
                         ADD CONSTRAINT installation_grants_installation_id_fkey
                         FOREIGN KEY (installation_id)
                         REFERENCES vault_app_installations(id)
-                        ON DELETE RESTRICT;
+                        ON DELETE CASCADE;
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
@@ -386,6 +411,7 @@ async def _run(conn):
             CREATE TABLE IF NOT EXISTS app_owned_resources (
                 id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
                 installation_id UUID NOT NULL,
+                vault_id UUID,
                 resource_kind TEXT NOT NULL,
                 resource_key TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'owned',
@@ -394,18 +420,40 @@ async def _run(conn):
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            ALTER TABLE app_owned_resources
+                ADD COLUMN IF NOT EXISTS vault_id UUID;
+
+            UPDATE app_owned_resources AS resource
+               SET vault_id = installation.vault_id
+              FROM vault_app_installations AS installation
+             WHERE resource.installation_id = installation.id
+               AND resource.vault_id IS NULL;
+
+            ALTER TABLE app_owned_resources
+                ALTER COLUMN vault_id SET NOT NULL;
+
             DO $$
             BEGIN
-                IF NOT EXISTS (
+                IF EXISTS (
                     SELECT 1 FROM pg_constraint
                      WHERE conname = 'app_owned_resources_installation_id_fkey'
                        AND conrelid = 'app_owned_resources'::regclass
                 ) THEN
                     ALTER TABLE app_owned_resources
-                        ADD CONSTRAINT app_owned_resources_installation_id_fkey
-                        FOREIGN KEY (installation_id)
-                        REFERENCES vault_app_installations(id)
-                        ON DELETE RESTRICT;
+                        DROP CONSTRAINT
+                        app_owned_resources_installation_id_fkey;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'app_owned_resources_installation_vault_fkey'
+                       AND conrelid = 'app_owned_resources'::regclass
+                ) THEN
+                    ALTER TABLE app_owned_resources
+                        ADD CONSTRAINT
+                        app_owned_resources_installation_vault_fkey
+                        FOREIGN KEY (installation_id, vault_id)
+                        REFERENCES vault_app_installations(id, vault_id)
+                        ON DELETE CASCADE;
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
@@ -415,6 +463,15 @@ async def _run(conn):
                     ALTER TABLE app_owned_resources
                         ADD CONSTRAINT app_owned_resources_identity_key
                         UNIQUE (installation_id, resource_kind, resource_key);
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'app_owned_resources_vault_identity_key'
+                       AND conrelid = 'app_owned_resources'::regclass
+                ) THEN
+                    ALTER TABLE app_owned_resources
+                        ADD CONSTRAINT app_owned_resources_vault_identity_key
+                        UNIQUE (vault_id, resource_kind, resource_key);
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
@@ -486,6 +543,136 @@ async def _run(conn):
             CREATE TRIGGER app_owned_resources_set_updated_at
                 BEFORE UPDATE ON app_owned_resources
                 FOR EACH ROW EXECUTE FUNCTION akb_registry_set_updated_at();
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION akb_guard_app_definition_identity()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF NEW.app_key IS DISTINCT FROM OLD.app_key THEN
+                    RAISE EXCEPTION
+                        'app identity is immutable; app_key cannot be changed'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+            DROP TRIGGER IF EXISTS app_definitions_identity_immutable
+                ON app_definitions;
+            CREATE TRIGGER app_definitions_identity_immutable
+                BEFORE UPDATE ON app_definitions
+                FOR EACH ROW
+                EXECUTE FUNCTION akb_guard_app_definition_identity();
+
+            CREATE OR REPLACE FUNCTION akb_guard_installation_mutation()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    IF EXISTS (
+                        SELECT 1 FROM vaults WHERE id = OLD.vault_id
+                    ) THEN
+                        RAISE EXCEPTION
+                            'installation rows are retained; uninstall through lifecycle state'
+                            USING ERRCODE = '55000';
+                    END IF;
+                    RETURN OLD;
+                END IF;
+
+                IF NEW.app_id IS DISTINCT FROM OLD.app_id
+                   OR NEW.vault_id IS DISTINCT FROM OLD.vault_id
+                THEN
+                    RAISE EXCEPTION
+                        'installation app and vault identity are immutable'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+            DROP TRIGGER IF EXISTS vault_app_installations_identity_immutable
+                ON vault_app_installations;
+            CREATE TRIGGER vault_app_installations_identity_immutable
+                BEFORE UPDATE OR DELETE ON vault_app_installations
+                FOR EACH ROW
+                EXECUTE FUNCTION akb_guard_installation_mutation();
+
+            CREATE OR REPLACE FUNCTION akb_set_owned_resource_vault()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+                installation_vault_id UUID;
+            BEGIN
+                SELECT vault_id
+                  INTO installation_vault_id
+                  FROM vault_app_installations
+                 WHERE id = NEW.installation_id;
+
+                IF installation_vault_id IS NULL THEN
+                    RAISE EXCEPTION 'installation does not exist'
+                        USING ERRCODE = '23503';
+                END IF;
+                IF NEW.vault_id IS NULL THEN
+                    NEW.vault_id = installation_vault_id;
+                ELSIF NEW.vault_id IS DISTINCT FROM installation_vault_id THEN
+                    RAISE EXCEPTION
+                        'owned resource vault must match its installation vault'
+                        USING ERRCODE = '23503';
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+            DROP TRIGGER IF EXISTS app_owned_resources_set_vault
+                ON app_owned_resources;
+            CREATE TRIGGER app_owned_resources_set_vault
+                BEFORE INSERT ON app_owned_resources
+                FOR EACH ROW EXECUTE FUNCTION akb_set_owned_resource_vault();
+
+            CREATE OR REPLACE FUNCTION akb_guard_owned_resource_mutation()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    IF EXISTS (
+                        SELECT 1
+                          FROM vault_app_installations
+                         WHERE id = OLD.installation_id
+                    ) THEN
+                        RAISE EXCEPTION
+                            'owned resource rows are retained; update ownership status instead'
+                            USING ERRCODE = '55000';
+                    END IF;
+                    RETURN OLD;
+                END IF;
+
+                IF NEW.installation_id IS DISTINCT FROM OLD.installation_id
+                   OR NEW.vault_id IS DISTINCT FROM OLD.vault_id
+                   OR NEW.resource_kind IS DISTINCT FROM OLD.resource_kind
+                   OR NEW.resource_key IS DISTINCT FROM OLD.resource_key
+                THEN
+                    RAISE EXCEPTION
+                        'owned resource installation, vault, kind, and key are immutable'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+            DROP TRIGGER IF EXISTS app_owned_resources_identity_immutable
+                ON app_owned_resources;
+            CREATE TRIGGER app_owned_resources_identity_immutable
+                BEFORE UPDATE OR DELETE ON app_owned_resources
+                FOR EACH ROW
+                EXECUTE FUNCTION akb_guard_owned_resource_mutation();
             """
         )
 
@@ -564,9 +751,16 @@ async def _run(conn):
             AS $$
             BEGIN
                 IF TG_OP = 'DELETE' THEN
-                    RAISE EXCEPTION
-                        'installation grants are retained as immutable generations'
-                        USING ERRCODE = '55000';
+                    IF EXISTS (
+                        SELECT 1
+                          FROM vault_app_installations
+                         WHERE id = OLD.installation_id
+                    ) THEN
+                        RAISE EXCEPTION
+                            'installation grants are retained as immutable generations'
+                            USING ERRCODE = '55000';
+                    END IF;
+                    RETURN OLD;
                 END IF;
 
                 IF OLD.status = 'active'
@@ -675,6 +869,14 @@ async def _run(conn):
             FROM PUBLIC;
 
             REVOKE EXECUTE ON FUNCTION akb_registry_set_updated_at()
+                FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION akb_guard_app_definition_identity()
+                FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION akb_guard_installation_mutation()
+                FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION akb_set_owned_resource_vault()
+                FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION akb_guard_owned_resource_mutation()
                 FROM PUBLIC;
             REVOKE EXECUTE ON FUNCTION akb_reject_release_mutation()
                 FROM PUBLIC;

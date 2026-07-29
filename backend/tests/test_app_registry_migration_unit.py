@@ -130,6 +130,24 @@ async def _installation(
     )
 
 
+async def _resource(
+    conn: asyncpg.Connection,
+    installation_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    kind: str,
+    key: str,
+) -> uuid.UUID:
+    return await conn.fetchval(
+        "INSERT INTO app_owned_resources "
+        "(installation_id, vault_id, resource_kind, resource_key) "
+        "VALUES ($1, $2, $3, $4) RETURNING id",
+        installation_id,
+        vault_id,
+        kind,
+        key,
+    )
+
+
 async def test_fresh_apply_second_apply_and_compatible_partial_object():
     async with _fresh_database() as (conn, _, _):
         await _apply(conn)
@@ -575,6 +593,372 @@ async def test_uninstall_retains_owned_resources_and_registry_view_is_complete()
             ("table", "orders", "retained"),
             ("index", "orders_created_at_idx", "retained"),
         }
+
+
+async def test_resource_identity_is_unique_within_a_vault_but_reusable_across_vaults():
+    async with _fresh_database() as (conn, _, _):
+        await _apply(conn)
+        app_a = await _app(conn, f"owner-a-{uuid.uuid4().hex}")
+        app_b = await _app(conn, f"owner-b-{uuid.uuid4().hex}")
+        release_a = await _release(conn, app_a, "1.0.0")
+        release_b = await _release(conn, app_b, "1.0.0")
+        vault_a = await _vault(conn, f"owner-a-{uuid.uuid4().hex[:10]}")
+        vault_b = await _vault(conn, f"owner-b-{uuid.uuid4().hex[:10]}")
+        installation_a = await _installation(conn, app_a, vault_a, release_a)
+        installation_b = await _installation(conn, app_b, vault_a, release_b)
+        installation_other_vault = await _installation(conn, app_b, vault_b, release_b)
+
+        await _resource(conn, installation_a, vault_a, "table", "reef_issues")
+        assert (
+            await _error_state(
+                conn,
+                "INSERT INTO app_owned_resources "
+                "(installation_id, vault_id, resource_kind, resource_key) "
+                "VALUES ($1, $2, 'table', 'reef_issues')",
+                installation_b,
+                vault_a,
+            )
+            == "23505"
+        )
+        await _resource(
+            conn,
+            installation_other_vault,
+            vault_b,
+            "table",
+            "reef_issues",
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM app_owned_resources "
+                "WHERE resource_kind = 'table' AND resource_key = 'reef_issues'"
+            )
+            == 2
+        )
+
+
+async def test_upgrade_from_previous_registry_shape_preserves_registry_rows():
+    async with _fresh_database() as (conn, _, _):
+        await conn.execute(
+            """
+            CREATE TABLE app_definitions (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                app_key TEXT NOT NULL,
+                display_name TEXT,
+                description TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE app_releases (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                app_id UUID NOT NULL,
+                version TEXT NOT NULL,
+                manifest JSONB NOT NULL,
+                manifest_checksum TEXT NOT NULL,
+                registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE vault_app_installations (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                app_id UUID NOT NULL,
+                vault_id UUID NOT NULL,
+                desired_release_id UUID,
+                current_release_id UUID,
+                lifecycle TEXT NOT NULL,
+                blocked_reason TEXT,
+                grant_generation BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE installation_grants (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                installation_id UUID NOT NULL,
+                generation BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                capabilities TEXT[] NOT NULL,
+                issuer TEXT NOT NULL,
+                provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+                issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                revoked_at TIMESTAMPTZ
+            );
+            CREATE TABLE app_owned_resources (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                installation_id UUID NOT NULL,
+                resource_kind TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'owned',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        app_id = await _app(conn, f"upgrade-{uuid.uuid4().hex}")
+        release_id = await _release(conn, app_id, "1.0.0")
+        vault_id = await _vault(conn, f"upgrade-{uuid.uuid4().hex[:10]}")
+        installation_id = await conn.fetchval(
+            "INSERT INTO vault_app_installations "
+            "(app_id, vault_id, desired_release_id, current_release_id, lifecycle, grant_generation) "
+            "VALUES ($1, $2, $3, $3, 'active', 1) RETURNING id",
+            app_id,
+            vault_id,
+            release_id,
+        )
+        grant_id = await conn.fetchval(
+            "INSERT INTO installation_grants "
+            "(installation_id, generation, capabilities, issuer) "
+            "VALUES ($1, 1, ARRAY['schema.read'], 'operator') RETURNING id",
+            installation_id,
+        )
+        resource_id = await conn.fetchval(
+            "INSERT INTO app_owned_resources "
+            "(installation_id, resource_kind, resource_key, metadata) "
+            "VALUES ($1, 'table', 'reef_issues', '{\"source\":\"previous\"}'::jsonb) "
+            "RETURNING id",
+            installation_id,
+        )
+
+        await _apply(conn)
+        after_first = await conn.fetchrow(
+            """
+            SELECT
+              (SELECT row_to_json(a) FROM app_definitions a WHERE id = $1) AS app,
+              (SELECT row_to_json(r) FROM app_releases r WHERE id = $2) AS release,
+              (SELECT row_to_json(i) FROM vault_app_installations i WHERE id = $3) AS installation,
+              (SELECT row_to_json(g) FROM installation_grants g WHERE id = $4) AS grant,
+              (SELECT row_to_json(o) FROM app_owned_resources o WHERE id = $5) AS resource
+            """,
+            app_id,
+            release_id,
+            installation_id,
+            grant_id,
+            resource_id,
+        )
+        assert json.loads(after_first["resource"])["vault_id"] == str(vault_id)
+
+        await _apply(conn)
+        after_second = await conn.fetchrow(
+            """
+            SELECT
+              (SELECT row_to_json(a) FROM app_definitions a WHERE id = $1) AS app,
+              (SELECT row_to_json(r) FROM app_releases r WHERE id = $2) AS release,
+              (SELECT row_to_json(i) FROM vault_app_installations i WHERE id = $3) AS installation,
+              (SELECT row_to_json(g) FROM installation_grants g WHERE id = $4) AS grant,
+              (SELECT row_to_json(o) FROM app_owned_resources o WHERE id = $5) AS resource
+            """,
+            app_id,
+            release_id,
+            installation_id,
+            grant_id,
+            resource_id,
+        )
+        assert after_second == after_first
+
+
+async def test_registry_identities_are_immutable_but_mutable_fields_still_update():
+    async with _fresh_database() as (conn, _, _):
+        await _apply(conn)
+        app_a_key = f"identity-a-{uuid.uuid4().hex}"
+        app_a = await _app(conn, app_a_key)
+        app_b = await _app(conn, f"identity-b-{uuid.uuid4().hex}")
+        release_a = await _release(conn, app_a, "1.0.0")
+        vault_a = await _vault(conn, f"identity-a-{uuid.uuid4().hex[:10]}")
+        vault_b = await _vault(conn, f"identity-b-{uuid.uuid4().hex[:10]}")
+        installation_id = await _installation(conn, app_a, vault_a, release_a)
+        resource_id = await _resource(
+            conn,
+            installation_id,
+            vault_a,
+            "table",
+            "reef_issues",
+        )
+
+        assert (
+            await _error_state(
+                conn,
+                "UPDATE app_definitions SET app_key = $2 WHERE id = $1",
+                app_a,
+                f"renamed-{uuid.uuid4().hex}",
+            )
+            == "55000"
+        )
+        await conn.execute(
+            "UPDATE app_definitions "
+            "SET display_name = 'Updated', metadata = '{\"reviewed\":true}'::jsonb "
+            "WHERE id = $1",
+            app_a,
+        )
+
+        for column, value in (("app_id", app_b), ("vault_id", vault_b)):
+            assert (
+                await _error_state(
+                    conn,
+                    f"UPDATE vault_app_installations SET {column} = $2 WHERE id = $1",
+                    installation_id,
+                    value,
+                )
+                == "55000"
+            )
+        await conn.execute(
+            "UPDATE vault_app_installations SET desired_release_id = NULL, lifecycle = 'uninstalled' WHERE id = $1",
+            installation_id,
+        )
+
+        identity_mutations = (
+            ("installation_id", uuid.uuid4()),
+            ("vault_id", vault_b),
+            ("resource_kind", "document"),
+            ("resource_key", "other"),
+        )
+        for column, value in identity_mutations:
+            assert (
+                await _error_state(
+                    conn,
+                    f"UPDATE app_owned_resources SET {column} = $2 WHERE id = $1",
+                    resource_id,
+                    value,
+                )
+                == "55000"
+            )
+        await conn.execute(
+            "UPDATE app_owned_resources "
+            "SET status = 'retained', metadata = '{\"reason\":\"uninstall\"}'::jsonb "
+            "WHERE id = $1",
+            resource_id,
+        )
+
+        app_row = await conn.fetchrow(
+            "SELECT app_key, display_name, metadata FROM app_definitions WHERE id = $1",
+            app_a,
+        )
+        assert app_row is not None
+        assert app_row["app_key"] == app_a_key
+        assert app_row["display_name"] == "Updated"
+        assert json.loads(app_row["metadata"]) == {"reviewed": True}
+        assert (
+            await conn.fetchval(
+                "SELECT lifecycle FROM vault_app_installations WHERE id = $1",
+                installation_id,
+            )
+            == "uninstalled"
+        )
+        resource = await conn.fetchrow(
+            "SELECT installation_id, vault_id, resource_kind, resource_key, status, metadata "
+            "FROM app_owned_resources WHERE id = $1",
+            resource_id,
+        )
+        assert resource is not None
+        assert (
+            resource["installation_id"],
+            resource["vault_id"],
+            resource["resource_kind"],
+            resource["resource_key"],
+        ) == (installation_id, vault_a, "table", "reef_issues")
+        assert resource["status"] == "retained"
+        assert json.loads(resource["metadata"]) == {"reason": "uninstall"}
+
+
+async def test_vault_delete_cascades_only_its_registry_state_and_direct_deletes_fail():
+    async with _fresh_database() as (conn, _, _):
+        await _apply(conn)
+        app_id = await _app(conn, f"delete-{uuid.uuid4().hex}")
+        release_id = await _release(conn, app_id, "1.0.0")
+        target_vault = await _vault(conn, f"delete-target-{uuid.uuid4().hex[:10]}")
+        other_vault = await _vault(conn, f"delete-other-{uuid.uuid4().hex[:10]}")
+        target_installation = await _installation(
+            conn,
+            app_id,
+            target_vault,
+            release_id,
+        )
+        other_installation = await _installation(
+            conn,
+            app_id,
+            other_vault,
+            release_id,
+        )
+        grant_id = await conn.fetchval(
+            "INSERT INTO installation_grants "
+            "(installation_id, generation, capabilities, issuer) "
+            "VALUES ($1, 1, ARRAY['schema.write'], 'operator') RETURNING id",
+            target_installation,
+        )
+        resource_id = await _resource(
+            conn,
+            target_installation,
+            target_vault,
+            "table",
+            "reef_issues",
+        )
+
+        assert (
+            await _error_state(
+                conn,
+                "DELETE FROM installation_grants WHERE id = $1",
+                grant_id,
+            )
+            == "55000"
+        )
+        assert (
+            await _error_state(
+                conn,
+                "DELETE FROM app_owned_resources WHERE id = $1",
+                resource_id,
+            )
+            == "55000"
+        )
+        assert (
+            await _error_state(
+                conn,
+                "DELETE FROM vault_app_installations WHERE id = $1",
+                target_installation,
+            )
+            == "55000"
+        )
+
+        await conn.execute("DELETE FROM vaults WHERE id = $1", target_vault)
+
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vault_app_installations WHERE vault_id = $1",
+                target_vault,
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM installation_grants WHERE installation_id = $1",
+                target_installation,
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM app_owned_resources WHERE vault_id = $1",
+                target_vault,
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vault_app_installations WHERE id = $1",
+                other_installation,
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM app_definitions WHERE id = $1",
+                app_id,
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM app_releases WHERE id = $1",
+                release_id,
+            )
+            == 1
+        )
 
 
 async def test_existing_data_is_unchanged_and_ordinary_role_gets_no_registry_access():

@@ -12,10 +12,15 @@ immutable versioned release manifests, one installation per app/Vault pair,
 monotonic capability grants, and explicit owned or retained resources. Database
 constraints reject cross-app release pointers, incoherent lifecycle/version
 states, duplicate installations, stale grant generations, and in-place release
-or grant mutation. A security-invoker installation view returns the current
-registry state in one query, while ordinary Vault SQL roles receive no access.
-Existing users, Vaults, tokens, Vault data, and standalone behavior are
-unchanged.
+or grant mutation. App keys, installation app/Vault identity, and owned-resource
+identity are immutable, and one physical resource kind/key can belong to only
+one installation in a Vault. Uninstall remains a retained lifecycle state;
+direct registry deletion is rejected, while permanent Vault deletion removes
+only that Vault's installation, grant, and resource registry rows and preserves
+reusable app definitions and releases. A security-invoker installation view
+returns the current registry state in one query, while ordinary Vault SQL roles
+receive no access. Existing users, Vaults, tokens, Vault data, and standalone
+behavior are unchanged.
 
 REST table schema alteration now requires the `admin` role, matching the MCP
 `akb_alter_table` authorization boundary. This closes the route-dependent
