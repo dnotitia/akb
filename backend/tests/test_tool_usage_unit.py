@@ -279,15 +279,12 @@ def test_oversized_strings_are_clipped(enabled):
     a, b = tool_usage.drain(2)
     assert a.tool != b.tool, "truncated values must stay distinguishable"
 
-    # The distinguishing power stops at `_SCAN_MAX`, deliberately: hashing the
-    # whole of an attacker-sized value is linear work on the request path
-    # (measured 58ms for 100MB). Values that differ only past that boundary do
-    # collide, and that is the accepted price of a flat-cost sanitiser.
-    far = tool_usage._SCAN_MAX + 100
-    tool_usage.record("akb_" + "z" * far + "A", {}, _User(), {"ok": True})
-    tool_usage.record("akb_" + "z" * far + "B", {}, _User(), {"ok": True})
-    c, d = tool_usage.drain(2)
-    assert c.tool == d.tool, "documented limit: divergence past _SCAN_MAX is not seen"
+    # Note, not asserted: distinguishing power stops at `_SCAN_MAX`, because
+    # hashing the whole of an attacker-sized value is linear work on the
+    # request path (58ms for 100MB). Values differing only past that boundary
+    # collide. That is the accepted price of a flat-cost sanitiser, not a
+    # property worth pinning — raising the bound would be an improvement, and
+    # an equality assertion here would fail it.
 
 
 def test_nul_bytes_are_stripped(enabled):
@@ -351,6 +348,9 @@ def test_unstorable_batch_is_dropped_but_a_transient_outage_is_not(enabled, monk
     box: list = []
 
     class _Conn2:
+        def transaction(self):
+            return _Tx()
+
         async def executemany(self, sql, rows):
             box.append(len(rows))
             if any(r.tool == "akb_t5" for r in rows):
@@ -386,6 +386,9 @@ def test_isolation_work_is_budgeted():
         stmts = {"n": 0}
 
         class _C:
+            def transaction(self):
+                return _Tx()
+
             async def executemany(self, sql, rows):
                 stmts["n"] += 1
                 if any(r.vault == "bad" for r in rows):
@@ -413,9 +416,27 @@ def test_isolation_work_is_budgeted():
 # ── Flush ───────────────────────────────────────────────────────
 
 
+class _Tx:
+    """Stand-in for `conn.transaction()`.
+
+    The real insert path wraps the traversal in one transaction with a
+    SAVEPOINT per probe, so a double that lacks this would exercise a code
+    path production never takes — the test-double drift that let two earlier
+    defects through.
+    """
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 class _Conn:
     def __init__(self, box):
         self.box = box
+
+    def transaction(self):
+        return _Tx()
 
     async def executemany(self, sql, rows):
         self.box.append((sql, list(rows)))
@@ -627,6 +648,49 @@ def test_runner_stop_waits_for_the_shielded_iteration(enabled):
         "the shielded iteration ran on detached after stop() returned — the "
         "caller's 'I am the only claimant' assumption is false"
     )
+
+
+def test_stop_reports_whether_it_actually_quiesced(enabled):
+    """A bounded `stop()` deliberately returns with work still running. A
+    caller that then assumes sole ownership of the shared queue is wrong — the
+    abandoned flush can requeue after the final drain and after the
+    queue-depth check, so an empty queue reads as a clean shutdown while the
+    tail is lost at process exit.
+
+    The outcome therefore has to be reported, not implied. The older test uses
+    a cancellation-cooperative coroutine and cannot see this."""
+    from app.services._backfill import BackfillRunner
+
+    async def _stubborn():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.15)        # delays acknowledging cancellation
+            raise
+        return 0
+
+    async def _cooperative():
+        await asyncio.sleep(0.01)
+        return 0
+
+    async def _drive(fn, budget):
+        r = BackfillRunner(f"t_q_{id(fn)}", fn, idle_secs=1)
+        r.start()
+        await asyncio.sleep(0.02)
+        ok = await r.stop(timeout=budget)
+        # Sampled here, not after the loop closes — `asyncio.run` finishes
+        # pending tasks on the way out, so an abandoned one looks done by then.
+        return ok, r.abandoned()
+
+    quiesced_bad, abandoned = asyncio.run(_drive(_stubborn, 0.03))
+    assert quiesced_bad is False, (
+        "a stop that abandoned live work must not report success"
+    )
+    assert abandoned == 1, "and the surviving iteration must stay visible"
+
+    quiesced_ok, none_left = asyncio.run(_drive(_cooperative, 1.0))
+    assert quiesced_ok is True, "a clean stop must report success"
+    assert none_left == 0
 
 
 def test_runner_stop_lets_a_short_iteration_finish(enabled):

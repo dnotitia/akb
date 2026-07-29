@@ -468,30 +468,41 @@ async def flush_once() -> int:
 _BISECT_BUDGET = 64
 
 
-async def _insert_isolating_poison(
-    conn, batch: list[_Row], budget: list[int] | None = None,
-) -> tuple[int, int]:
+async def _insert_isolating_poison(conn, batch: list[_Row]) -> tuple[int, int]:
     """Insert `batch`, bisecting around rows PostgreSQL will never accept.
 
     Returns ``(written, dropped)``. A class-22 failure (invalid byte sequence,
     value too long, …) belongs to ONE row, but `executemany` is atomic, so
     failing the whole call would discard up to `flush_batch` perfectly valid
     siblings. Halving isolates the offender on the error path only.
+
+    The traversal runs inside ONE transaction, with each probe in its own
+    SAVEPOINT. Without the outer transaction each successful child committed on
+    its own, so a transient failure part-way through left some rows written
+    while `flush_once` requeued the WHOLE batch — and the retry inserted the
+    committed ones a second time. All-or-nothing makes the requeue safe; the
+    savepoints are what let a failed probe be retried on a smaller slice
+    instead of poisoning the enclosing transaction.
     """
-    if budget is None:
-        budget = [_BISECT_BUDGET]
+    budget = [_BISECT_BUDGET]
+    async with conn.transaction():
+        return await _probe(conn, batch, budget)
+
+
+async def _probe(conn, batch: list[_Row], budget: list[int]) -> tuple[int, int]:
     if budget[0] <= 0:
         return 0, len(batch)
     budget[0] -= 1
     try:
-        await conn.executemany(_INSERT_SQL, batch)
+        async with conn.transaction():          # SAVEPOINT — nested
+            await conn.executemany(_INSERT_SQL, batch)
         return len(batch), 0
     except DataError:
         if len(batch) == 1:
             return 0, 1
     mid = len(batch) // 2
-    left = await _insert_isolating_poison(conn, batch[:mid], budget)
-    right = await _insert_isolating_poison(conn, batch[mid:], budget)
+    left = await _probe(conn, batch[:mid], budget)
+    right = await _probe(conn, batch[mid:], budget)
     return left[0] + right[0], left[1] + right[1]
 
 
@@ -664,13 +675,22 @@ async def stop() -> None:
         # `_maintainer.stop()` entirely — its stop event never set, its task
         # never awaited — leaving a shielded rollup running against a pool that
         # `close_pool()` was about to tear down.
-        await _phase(_flusher.stop(timeout=budget / 2), "flusher stop")
+        quiesced = await _phase(_flusher.stop(timeout=budget / 2), "flusher stop")
         await _phase(_drain_all(), "final drain", timeout=budget / 4)
         await _phase(_maintainer.stop(timeout=budget / 4), "maintenance stop")
         if queue_depth():
             logger.warning(
                 "tool_usage lost %d queued record(s) at shutdown (drain incomplete)",
                 queue_depth(),
+            )
+        if quiesced is not True:
+            # The stop was bounded, so the flusher may still hold a batch and
+            # may requeue it after this point — the queue-depth check above
+            # cannot see that, and the process is about to exit. Say so rather
+            # than let an empty queue read as a clean shutdown.
+            logger.warning(
+                "tool_usage shut down without quiescing the flusher; an "
+                "in-flight batch may be lost at process exit",
             )
     except Exception as e:  # noqa: BLE001 — must not abort the shutdown chain
         logger.warning("tool_usage shutdown aborted: %s", e)
@@ -681,11 +701,16 @@ async def _drain_all() -> None:
         pass
 
 
-async def _phase(coro, what: str, timeout: float | None = None) -> None:
-    """Run one shutdown phase; never raise, never let it run past its bound."""
+async def _phase(coro, what: str, timeout: float | None = None) -> Any:
+    """Run one shutdown phase; never raise, never let it run past its bound.
+
+    Returns whatever the phase returned, so a caller can act on it — the
+    flusher stop reports whether it actually quiesced.
+    """
     try:
-        await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+        return await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
     except asyncio.TimeoutError:
         logger.warning("tool_usage %s exceeded its shutdown budget", what)
     except Exception as e:  # noqa: BLE001 — shutdown must not raise
         logger.warning("tool_usage %s failed: %s", what, e)
+    return None

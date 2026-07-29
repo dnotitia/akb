@@ -104,8 +104,13 @@ class BackfillRunner:
             task_name = self._name if self._concurrency == 1 else f"{self._name}-{i}"
             self._tasks.append(asyncio.create_task(self._loop(task_name), name=task_name))
 
-    async def stop(self, timeout: float = 120.0) -> None:
+    async def stop(self, timeout: float = 120.0) -> bool:
         """Signal the loop and join its work within an ABSOLUTE deadline.
+
+        Returns True when the worker actually quiesced. A bounded stop can
+        return with work still running, and a caller that then assumes sole
+        ownership of a shared queue would be wrong — so the outcome is
+        reported rather than implied.
 
         `timeout` bounds the whole call, and it bounds it even against a
         callback that swallows or delays `CancelledError`: `asyncio.wait`
@@ -132,6 +137,7 @@ class BackfillRunner:
         self._tasks = [t for t in self._tasks if not t.done()]
         self._inflight = {t for t in self._inflight if not t.done()}
         self._stop_event = None
+        return not (self._tasks or self._inflight)
 
     async def _join(self, tasks: list, deadline: float, what: str) -> None:
         """Wait, then cancel, then give up — never past `deadline`."""
