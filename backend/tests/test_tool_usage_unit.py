@@ -39,6 +39,7 @@ import inspect
 import logging
 import logging.handlers
 import pathlib
+from datetime import datetime, timezone
 
 import pytest
 
@@ -361,6 +362,52 @@ def test_unstorable_batch_is_dropped_but_a_transient_outage_is_not(enabled, monk
     assert written == 7, f"only the poison row may be lost, got {written} written"
     assert tool_usage.dropped_count() == 1, "and exactly one loss counted"
     assert max(box) == 8 and min(box) == 1, "the batch must have been bisected"
+
+
+def test_isolation_work_is_budgeted():
+    """Bisecting costs 1 statement for a clean batch and ~17 to isolate one bad
+    row — but 2n-1 when the whole batch is unstorable: 999 round trips for 500
+    rows, seconds of a held connection, repeated every tick for as long as the
+    cause lasts. Past a budget the remainder is dropped wholesale.
+
+    The budget must not cost precision in the case that actually happens (a
+    single bad row among many good ones)."""
+    from asyncpg.exceptions import CharacterNotInRepertoireError
+
+    now = datetime.now(timezone.utc)
+
+    def _row(i, poison):
+        return tool_usage._Row(
+            now, f"t{i}", "u", "a", None, "bad" if poison else "ok",
+            "ok", None, 1, False,
+        )
+
+    async def _measure(pred):
+        stmts = {"n": 0}
+
+        class _C:
+            async def executemany(self, sql, rows):
+                stmts["n"] += 1
+                if any(r.vault == "bad" for r in rows):
+                    raise CharacterNotInRepertoireError("x")
+
+        batch = [_row(i, pred(i)) for i in range(500)]
+        written, dropped = await tool_usage._insert_isolating_poison(_C(), batch)
+        return written, dropped, stmts["n"]
+
+    clean = asyncio.run(_measure(lambda i: False))
+    assert clean == (500, 0, 1), f"a clean batch must cost one statement, got {clean}"
+
+    one_bad = asyncio.run(_measure(lambda i: i == 250))
+    assert one_bad[0] == 499 and one_bad[1] == 1, (
+        f"a single bad row must cost only itself, got {one_bad}"
+    )
+
+    all_bad = asyncio.run(_measure(lambda i: True))
+    assert all_bad[2] <= tool_usage._BISECT_BUDGET, (
+        f"isolation must be bounded, spent {all_bad[2]} statements"
+    )
+    assert all_bad[1] == 500, "and every unstorable row still accounted for"
 
 
 # ── Flush ───────────────────────────────────────────────────────

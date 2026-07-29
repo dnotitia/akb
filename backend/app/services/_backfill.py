@@ -76,6 +76,16 @@ class BackfillRunner:
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
 
+    def abandoned(self) -> int:
+        """Iterations that ignored cancellation and outlived a `stop()`.
+
+        Non-zero means this worker is DEAD for the rest of the process: it
+        refuses to start a second loop over a queue the old one may still be
+        writing to. Exposed so that shows up on a dashboard rather than in one
+        ERROR line at shutdown.
+        """
+        return len([t for t in self._inflight if not t.done()])
+
     def start(self) -> None:
         if self._tasks and any(not t.done() for t in self._tasks):
             return

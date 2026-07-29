@@ -196,6 +196,7 @@ def stats() -> dict:
             "queued": len(_queue),
             "lost": _dropped,
             "maintenance_failures": dict(_leg_failures),
+            "abandoned_workers": _abandoned(),
         }
     return {
         "enabled": True,
@@ -205,6 +206,20 @@ def stats() -> dict:
         "consecutive_flush_failures": _flush_failures,
         "maintenance_failures": dict(_leg_failures),
         "retention_days": settings.tool_usage.raw_retention_days,
+    }
+
+
+def _abandoned() -> dict[str, int]:
+    """Workers left dead by an iteration that ignored cancellation.
+
+    `BackfillRunner.start()` refuses to run a second loop over a queue an old
+    iteration may still be writing to, which is right — but it means one bad
+    shutdown silently ends that worker for the process lifetime. Anything
+    non-zero here is a restart-required condition.
+    """
+    return {
+        name: n for name, r in (("flusher", _flusher), ("maintenance", _maintainer))
+        if (n := r.abandoned())
     }
 
 
@@ -445,15 +460,29 @@ async def flush_once() -> int:
     return written
 
 
-async def _insert_isolating_poison(conn, batch: list[_Row]) -> tuple[int, int]:
+# Statements one flush may spend isolating unstorable rows. A clean batch costs
+# 1 and a single bad row about 17, but a wholly unstorable batch would cost
+# 2n-1 — 999 round trips for 500 rows, seconds of a held connection, on every
+# tick for as long as the cause persists. Past the budget the remainder is
+# dropped wholesale: precision where it is cheap, a bound where it is not.
+_BISECT_BUDGET = 64
+
+
+async def _insert_isolating_poison(
+    conn, batch: list[_Row], budget: list[int] | None = None,
+) -> tuple[int, int]:
     """Insert `batch`, bisecting around rows PostgreSQL will never accept.
 
     Returns ``(written, dropped)``. A class-22 failure (invalid byte sequence,
     value too long, …) belongs to ONE row, but `executemany` is atomic, so
     failing the whole call would discard up to `flush_batch` perfectly valid
-    siblings. Halving isolates the offender in ~log2(n) extra statements and
-    only on the error path.
+    siblings. Halving isolates the offender on the error path only.
     """
+    if budget is None:
+        budget = [_BISECT_BUDGET]
+    if budget[0] <= 0:
+        return 0, len(batch)
+    budget[0] -= 1
     try:
         await conn.executemany(_INSERT_SQL, batch)
         return len(batch), 0
@@ -461,8 +490,8 @@ async def _insert_isolating_poison(conn, batch: list[_Row]) -> tuple[int, int]:
         if len(batch) == 1:
             return 0, 1
     mid = len(batch) // 2
-    left = await _insert_isolating_poison(conn, batch[:mid])
-    right = await _insert_isolating_poison(conn, batch[mid:])
+    left = await _insert_isolating_poison(conn, batch[:mid], budget)
+    right = await _insert_isolating_poison(conn, batch[mid:], budget)
     return left[0] + right[0], left[1] + right[1]
 
 
