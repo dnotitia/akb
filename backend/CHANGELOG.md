@@ -22,6 +22,66 @@ returns the current registry state in one query, while ordinary Vault SQL roles
 receive no access. Existing users, Vaults, tokens, Vault data, and standalone
 behavior are unchanged.
 
+## 0.11.0 — 2026-07-29  *(feat — MCP tool-usage analytics, argument-aware write scopes, hardened publication surface)*
+
+AKB can now answer which MCP tool is actually used, by whom, in what order, and
+how often it fails. Neither existing stream could: `events` records domain verbs
+on successful writes only and deletes rows once Redis has them, and `audit_log`
+writes a hash-chained JSONL ledger for a SIEM that cannot be grouped. A third
+sink at the MCP dispatch chokepoint writes one row per call to `tool_calls` —
+reads, writes and failures alike — folded into a `tool_usage_daily` aggregate
+kept indefinitely at roughly 86 rows a day, with raw rows pruned after
+`tool_usage.raw_retention_days`. Recording only appends to a bounded in-memory
+deque, so no database I/O ever runs on the event loop, and overflow evicts the
+oldest entry and counts the loss rather than blocking the caller. The fold
+claims each row in the same statement that aggregates it rather than tracking a
+sequence high-water mark, which makes it exactly-once for any number of
+concurrent writers, and purge is predicated on that claim so raw rows are never
+dropped before the aggregate that replaces them exists. Off by default
+(`tool_usage.enabled`); while disabled the tables stay empty and the dispatch
+path is unchanged. Authenticated `/health` reports queue depth, drops, and
+flush failures.
+
+MCP scope enforcement is now argument-aware. Scopes previously classified a
+tool as a whole, which cannot express a read-grade tool that carries an
+optional mutating argument: `akb_grep` accepts `replace`, which modifies
+matching documents, while the tool itself was mapped to `akb:vault:read` — the
+mapping that gates OAuth access token and personal access token scopes. The
+scope check therefore did not reflect the effect of such a call. Vault
+permissions were unaffected, since the handler independently requires writer
+access. A call now resolves its required scope from the tool and its arguments
+together, promoting a read-grade tool to write when it carries a declared
+mutating argument; an empty `replace` is included, as it also modifies matches.
+The same classification gap is closed in the audit trail, where `akb_grep` and
+`akb_publication_snapshot` were treated as read-only and so were not recorded
+when `log_reads` was disabled. Both classifications now derive from one source,
+and a test asserts they cannot drift.
+
+The public publication surface is hardened across twelve findings. `max_views`
+is now a hard cap: opening a published page mints a signed view grant, and the
+raw and download routes re-serve free while holding it but otherwise count and
+enforce the cap — closing the bypass where those routes served unlimited copies.
+A file belonging to another vault could previously be published from a vault
+that did not own it; creation and every resolver are now vault-bound. Anonymous
+table queries are bounded by a statement timeout and a row cap, with
+serialization moved off the event loop. Publication snapshots write under a
+versioned key and reclaim the old one. Audit records for these routes go through
+a dedicated non-blocking writer, and publication responses no longer disclose
+creator identity or internal state.
+
+Five synchronous git subprocess reads no longer block the event loop: the REST
+`/activity` vault log and `/diff` file diff, and the MCP `akb_activity` vault
+log, `akb_diff` file diff, and versioned `akb_get` file read. Under concurrency
+these were a direct cause of readiness-probe timeouts — a 24-way concurrent
+`/activity` flood pushed the worst `/livez` response from 1.08s to 0.008s once
+offloaded. Response envelopes are unchanged.
+
+Table administration request bodies are typed models rather than free-form
+dictionaries, so the generated OpenAPI schema documents the create, alter, and
+migration payloads and malformed input is rejected by request validation with
+field-level detail instead of surfacing later as a downstream error. A contract
+test pins the resulting schema surface.
+
 REST table schema alteration now requires the `admin` role, matching the MCP
 `akb_alter_table` authorization boundary. This closes the route-dependent
 permission gap that allowed a `writer` to perform destructive operations such
