@@ -199,19 +199,37 @@ def test_vault_attribution_follows_each_tool(enabled, tool, args, expected):
     assert tool_usage.drain(1)[0].vault == expected
 
 
-def test_absurd_uri_argument_is_not_parsed(enabled):
+def test_absurd_uri_argument_is_not_parsed(enabled, monkeypatch):
     """URI parsing is regex work on the request path. Four 1 MB arguments were
     measured at ~45ms of event-loop time — the stall class this service dies
-    of. Anything past a plausible URI length is rejected without parsing."""
-    import time as _t
+    of. Anything past a plausible URI length is rejected without parsing.
 
+    Asserted by observing that the parser is never called, rather than by a
+    wall-clock bound: scheduler preemption alone would make a timing assertion
+    flaky on a loaded runner."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tool_usage, "vault_of", lambda u: (seen.append(u), None)[1],
+    )
     args = {k: "akb://" + "x" * 1_000_000 for k in ("uri", "parent", "source", "target")}
-    start = _t.perf_counter()
+
     tool_usage.record("akb_x", args, _User(), {"ok": True})
-    elapsed = _t.perf_counter() - start
 
     assert tool_usage.drain(1)[0].vault is None
-    assert elapsed < 0.02, f"record() spent {elapsed*1000:.1f}ms parsing oversized URIs"
+    assert seen == [], "oversized arguments must never reach the URI parser"
+
+
+def test_unpublish_by_slug_records_no_vault(enabled):
+    """`_handle_unpublish` resolves the vault from the publication row when a
+    `slug` is given and never looks at `uri`, though the schema accepts both.
+    The real vault is only knowable by a DB lookup this path must not do, so
+    NULL is the honest answer — recording the URI's vault would name one the
+    call may not have touched."""
+    tool_usage.record(
+        "akb_unpublish", {"slug": "abc123", "uri": "akb://other/doc/x.md"},
+        _User(), {"deleted": 1},
+    )
+    assert tool_usage.drain(1)[0].vault is None
 
 
 def test_session_and_duration_are_recorded(enabled):
@@ -248,16 +266,27 @@ def test_oversized_strings_are_clipped(enabled):
 
     assert len(row.tool) == tool_usage._STR_MAX
     assert len(row.vault) == tool_usage._STR_MAX
+    assert len(row.tool.rsplit("\u2026", 1)[1]) == tool_usage._DIGEST
     assert row.tool.startswith("akb_x")
     assert "…" in row.tool, "truncation must be visible, not silent"
 
-    # Two distinct overlong tools sharing a prefix must NOT collapse into one
-    # aggregate row — `tool` is part of `tool_usage_daily`'s PRIMARY KEY, so a
-    # bare ellipsis would silently sum unrelated traffic.
-    tool_usage.record("akb_" + "x" * 5000 + "A", {}, _User(), {"ok": True})
-    tool_usage.record("akb_" + "x" * 5000 + "B", {}, _User(), {"ok": True})
+    # Two distinct overlong tools must NOT collapse into one aggregate row —
+    # `tool` is part of `tool_usage_daily`'s PRIMARY KEY, so a bare ellipsis
+    # would silently sum unrelated traffic.
+    tool_usage.record("akb_" + "x" * 400 + "A" + "y" * 5000, {}, _User(), {"ok": True})
+    tool_usage.record("akb_" + "x" * 400 + "B" + "y" * 5000, {}, _User(), {"ok": True})
     a, b = tool_usage.drain(2)
     assert a.tool != b.tool, "truncated values must stay distinguishable"
+
+    # The distinguishing power stops at `_SCAN_MAX`, deliberately: hashing the
+    # whole of an attacker-sized value is linear work on the request path
+    # (measured 58ms for 100MB). Values that differ only past that boundary do
+    # collide, and that is the accepted price of a flat-cost sanitiser.
+    far = tool_usage._SCAN_MAX + 100
+    tool_usage.record("akb_" + "z" * far + "A", {}, _User(), {"ok": True})
+    tool_usage.record("akb_" + "z" * far + "B", {}, _User(), {"ok": True})
+    c, d = tool_usage.drain(2)
+    assert c.tool == d.tool, "documented limit: divergence past _SCAN_MAX is not seen"
 
 
 def test_nul_bytes_are_stripped(enabled):
@@ -299,9 +328,6 @@ def test_unstorable_batch_is_dropped_but_a_transient_outage_is_not(enabled, monk
 
     calls = {"n": 0}
 
-    async def _poison():
-        raise CharacterNotInRepertoireError("invalid byte sequence")
-
     async def _transient():
         calls["n"] += 1
         raise ConnectionResetError("failover")
@@ -314,10 +340,27 @@ def test_unstorable_batch_is_dropped_but_a_transient_outage_is_not(enabled, monk
     assert tool_usage.dropped_count() == 0
     assert calls["n"] == 10, "each tick must genuinely retry"
 
-    monkeypatch.setattr(tool_usage, "get_pool", _poison)
-    assert asyncio.run(tool_usage.flush_once()) == 0
-    assert tool_usage.queue_depth() == 0, "an unstorable batch must not block the queue"
-    assert tool_usage.dropped_count() == 1, "and its loss must be counted"
+    # One poison row among valid siblings: `executemany` is atomic, so failing
+    # the call would discard up to `flush_batch` good records. Bisecting must
+    # isolate the single offender.
+    tool_usage.reset()
+    for i in range(8):
+        tool_usage.record(f"akb_t{i}", {"vault": "v"}, _User(), {"ok": True})
+
+    box: list = []
+
+    class _Conn2:
+        async def executemany(self, sql, rows):
+            box.append(len(rows))
+            if any(r.tool == "akb_t5" for r in rows):
+                raise CharacterNotInRepertoireError("invalid byte sequence")
+
+    _fake_pool_conn(monkeypatch, _Conn2())
+    written = asyncio.run(tool_usage.flush_once())
+
+    assert written == 7, f"only the poison row may be lost, got {written} written"
+    assert tool_usage.dropped_count() == 1, "and exactly one loss counted"
+    assert max(box) == 8 and min(box) == 1, "the batch must have been bisected"
 
 
 # ── Flush ───────────────────────────────────────────────────────
@@ -354,6 +397,13 @@ class _Pool:
 
     def acquire(self):
         return _Acquire(self.conn)
+
+
+def _fake_pool_conn(monkeypatch, conn):
+    async def _get_pool():
+        return _Pool(conn)
+
+    monkeypatch.setattr(tool_usage, "get_pool", _get_pool)
 
 
 def _fake_pool(monkeypatch, box):

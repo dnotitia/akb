@@ -148,6 +148,9 @@ class _Row(NamedTuple):
 _maxlen: int = 1
 _queue: deque[_Row] = deque(maxlen=_maxlen)
 _dropped = 0
+# Consecutive failed flushes. Not used to drop anything — only to make a
+# permanently failing environment distinguishable from an idle queue on /health.
+_flush_failures = 0
 
 
 def reset() -> None:
@@ -156,10 +159,11 @@ def reset() -> None:
     Called at startup and by tests; the bound is read here rather than per
     append so the hot path stays a single ``append``.
     """
-    global _queue, _dropped, _maxlen
+    global _queue, _dropped, _maxlen, _flush_failures
     _maxlen = settings.tool_usage.queue_max
     _queue = deque(maxlen=_maxlen)
     _dropped = 0
+    _flush_failures = 0
 
 
 reset()
@@ -185,12 +189,20 @@ def stats() -> dict:
     failure is invisible to anyone watching a dashboard.
     """
     if not settings.tool_usage.enabled:
-        return {"enabled": False, "queued": len(_queue), "lost": _dropped}
+        # The maintenance runner keeps folding and pruning while collection is
+        # off, so its failures have to stay visible here too.
+        return {
+            "enabled": False,
+            "queued": len(_queue),
+            "lost": _dropped,
+            "maintenance_failures": dict(_leg_failures),
+        }
     return {
         "enabled": True,
         "queued": len(_queue),
         "queue_max": _maxlen,
         "lost": _dropped,
+        "consecutive_flush_failures": _flush_failures,
         "maintenance_failures": dict(_leg_failures),
         "retention_days": settings.tool_usage.raw_retention_days,
     }
@@ -279,7 +291,15 @@ def record(
 # rollup back and the offending row is re-selected every tick forever: folding
 # stops, and because purge requires the fold stamp, retention stops with it.
 _STR_MAX = 256
-_DIGEST = 8
+# Hex chars of digest kept on truncation. 16 = 64 bits: an 8-char (32-bit)
+# suffix is fine against accident but cheap to collide on purpose, and `tool`
+# is part of `tool_usage_daily`'s PRIMARY KEY.
+_DIGEST = 16
+# Ceiling on how much of an oversized value is encoded and hashed. Both scan
+# linearly and both run on the request path — measured 0.6ms/1MB, 58ms/100MB,
+# which is the event-loop stall class this service dies of. Sampling a bounded
+# prefix keeps the cost flat regardless of what a caller sends.
+_SCAN_MAX = 4096
 
 
 def _clip(v: Any) -> str | None:
@@ -297,11 +317,15 @@ def _clip(v: Any) -> str | None:
     """
     if v is None:
         return None
-    s = str(v).encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
-    if len(s) <= _STR_MAX:
-        return s
-    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:_DIGEST]
-    return s[: _STR_MAX - _DIGEST - 1] + "\u2026" + digest
+    s = v if isinstance(v, str) else str(v)
+    oversized = len(s) > _STR_MAX
+    # Slice BEFORE encoding/hashing so neither scan is attacker-scaled.
+    sample = s[:_SCAN_MAX] if len(s) > _SCAN_MAX else s
+    sample = sample.encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+    if not oversized:
+        return sample
+    digest = hashlib.sha256(sample.encode("utf-8")).hexdigest()[:_DIGEST]
+    return sample[: _STR_MAX - _DIGEST - 1] + "\u2026" + digest
 
 
 # Resource tools address their target by `akb://` URI rather than a separate
@@ -354,6 +378,13 @@ def _vault_of(name: str, args: Any) -> str | None:
     if name == "akb_publish" and args.get("resource_type") == "table_query":
         return _scalar_vault(args)
 
+    if name == "akb_unpublish" and args.get("slug"):
+        # `_handle_unpublish` resolves the vault from the publication row when
+        # a slug is given and never looks at `uri`, though the schema accepts
+        # both. The vault is only knowable by a DB lookup, which this path must
+        # not do — NULL is the honest answer.
+        return None
+
     for key in _URI_ARGS:
         value = args.get(key)
         if isinstance(value, str) and len(value) <= _URI_ARG_MAX:
@@ -370,14 +401,17 @@ async def flush_once() -> int:
     outage delays rows instead of losing them; the queue bound caps how much a
     sustained outage can retain, and whatever does not fit is counted.
     """
-    global _dropped
+    global _dropped, _flush_failures
     batch = drain(settings.tool_usage.flush_batch)
     if not batch:
         return 0
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.executemany(_INSERT_SQL, batch)
+            # `DataError` is only meaningful for the INSERT. Raised by
+            # `get_pool()` or `acquire()` it would say nothing about the rows,
+            # so the classification lives strictly around the statement.
+            written, lost = await _insert_isolating_poison(conn, batch)
     except asyncio.CancelledError:
         # `CancelledError` is a BaseException, so the handler below never sees
         # it. The shutdown deadline firing mid-INSERT would otherwise leave
@@ -386,28 +420,50 @@ async def flush_once() -> int:
         # queue-depth check would report a clean shutdown.
         _requeue_front(batch)
         raise
-    except DataError as e:
-        # Class 22 — invalid byte sequence, value too long, and friends. That
-        # is a property of the ROWS, not the connection: retrying re-fails
-        # forever while everything behind it waits. Drop this batch, count it,
-        # let the queue move.
-        _dropped += len(batch)
-        logger.error("tool_usage dropping %d unstorable record(s): %s", len(batch), e)
-        return 0
     except Exception as e:  # noqa: BLE001
-        # Everything else — connection reset, pool exhausted, failover — is
-        # transient and must NOT cost data. An earlier version dropped after
-        # three consecutive failures of ANY kind, which turned an ordinary
-        # 10-15s PostgreSQL restart into deterministic loss, and its counter
-        # was global rather than tied to a batch, so an unrelated batch could
-        # inherit another's failures and be dropped on its first error.
+        # Connection reset, pool exhausted, failover, a missing table, a
+        # missing grant — none of these are a property of the rows, and all of
+        # them become correct again once the environment does. An earlier
+        # version dropped after three consecutive failures of ANY kind, which
+        # turned an ordinary 10-15s PostgreSQL restart into deterministic loss.
+        # A permanent environment fault therefore retries indefinitely; it
+        # degrades rather than wedges, because the queue is bounded, every
+        # eviction is counted, and `_flush_failures` makes the difference
+        # between "retrying" and "idle" visible on /health.
+        _flush_failures += 1
         kept = _requeue_front(batch)
-        logger.warning(
-            "tool_usage flush failed (%d requeued, %d dropped): %s",
-            kept, len(batch) - kept, e,
-        )
+        if _flush_failures == 1 or _flush_failures % 60 == 0:
+            logger.warning(
+                "tool_usage flush failing (%d consecutive; %d requeued, %d dropped): %s",
+                _flush_failures, kept, len(batch) - kept, e,
+            )
         return 0
-    return len(batch)
+    _flush_failures = 0
+    if lost:
+        _dropped += lost
+        logger.error("tool_usage dropped %d unstorable record(s)", lost)
+    return written
+
+
+async def _insert_isolating_poison(conn, batch: list[_Row]) -> tuple[int, int]:
+    """Insert `batch`, bisecting around rows PostgreSQL will never accept.
+
+    Returns ``(written, dropped)``. A class-22 failure (invalid byte sequence,
+    value too long, …) belongs to ONE row, but `executemany` is atomic, so
+    failing the whole call would discard up to `flush_batch` perfectly valid
+    siblings. Halving isolates the offender in ~log2(n) extra statements and
+    only on the error path.
+    """
+    try:
+        await conn.executemany(_INSERT_SQL, batch)
+        return len(batch), 0
+    except DataError:
+        if len(batch) == 1:
+            return 0, 1
+    mid = len(batch) // 2
+    left = await _insert_isolating_poison(conn, batch[:mid])
+    right = await _insert_isolating_poison(conn, batch[mid:])
+    return left[0] + right[0], left[1] + right[1]
 
 
 def _requeue_front(batch: list[_Row]) -> int:
