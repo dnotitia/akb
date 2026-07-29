@@ -115,7 +115,12 @@ async def init_storage() -> None:
 def start_workers() -> None:
     embed_worker.start()
     delete_worker.start()
-    external_git_poller.start()
+    # external-git kill-switch: the mirror poller must not run when the feature is
+    # off (no claim, no outbound). Gated so a disabled deployment
+    # starts zero mirror I/O; the read paths refuse mirror reads and the marker
+    # backfill (fail-closed safety net) still runs unconditionally at startup.
+    if settings.external_git_enabled:
+        external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
     # Phase 2). Non-blocking; search self-activates the vault path once it
     # reports ready (until then the source-id path runs unchanged). No-op for
@@ -138,7 +143,9 @@ def start_workers() -> None:
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
-    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
+    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "bm25_stats_refresher", "vault_backfill"]
+    if settings.external_git_enabled:
+        started.append("external_git_poller")
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -147,10 +154,18 @@ def start_workers() -> None:
         started.append("s3_delete_worker")
     else:
         logger.info("s3_delete_worker disabled (S3 not configured)")
-    # metadata_worker is the only LLM consumer in the request-independent
-    # path. Skip it when LLM isn't configured so OSS users running without
-    # an LLM key don't get retry/abandon noise on every external_git import.
-    if settings.llm_base_url and settings.llm_api_key:
+    # metadata_worker fills LLM-derived metadata on external_git imports only
+    # (source='external_git'), so it is meaningless — and, per the external-git
+    # kill-switch, forbidden — when external-git is off: no mirror
+    # can produce work and it must issue zero LLM outbound. It is also the only
+    # LLM consumer in the request-independent path, so it still stays off when
+    # LLM isn't configured (no retry/abandon noise for OSS users without a key).
+    if not settings.external_git_enabled:
+        logger.info(
+            "metadata_worker disabled (external_git_enabled=false; it only "
+            "fills metadata on external_git mirror imports)"
+        )
+    elif settings.llm_base_url and settings.llm_api_key:
         metadata_worker.start()
         started.append("metadata_worker")
     else:

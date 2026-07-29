@@ -145,6 +145,15 @@ def _canonicalise(raw: dict) -> dict:
 
 
 async def _process_once() -> int:
+    from app.config import settings  # local import to dodge circular import at module load
+    # external-git kill-switch (defense-in-depth): even if this worker
+    # was somehow started, a disabled deployment must do zero work — no claim,
+    # no cat_blob mirror read, no LLM outbound. The startup gate
+    # (lifecycle.start_workers) already skips starting it; this makes the worker
+    # itself inert under a live config flip too. All its rows are
+    # source='external_git', so there is never legitimate work when disabled.
+    if not settings.external_git_enabled:
+        return 0
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():

@@ -411,12 +411,35 @@ async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
         "public_access": args.get("public_access", "none"),
     }
     if args.get("external_git"):
-        response["external_git"] = {
-            "url": args["external_git"]["url"],
-            "branch": args["external_git"].get("branch") or "main",
-            "read_only": True,
-        }
+        # Echo the STORED CANONICAL remote, never the caller's raw
+        # input URL. Layer-1 (create_vault) already canonicalized + persisted it
+        # (host lowercased, default port dropped, userinfo rejected outright),
+        # so re-reading the sidecar returns exactly what a later poll will use —
+        # the response can't disagree with what was saved, and can't echo a
+        # credential the input may have embedded.
+        eg = await _external_git_view(vault_id)
+        if eg is not None:
+            response["external_git"] = eg
     return response
+
+
+async def _external_git_view(vault_id: str) -> dict | None:
+    """The credential-free external-git view for a create response: the STORED
+    canonical URL + branch. Reads the persisted sidecar row so the
+    response reflects the canonicalized value, not the caller's raw input.
+    ``remote_url`` is credential-free by construction (userinfo is rejected at
+    validation; a supported token lives in the separate ``auth_token`` column,
+    which is never echoed)."""
+    from app.repositories.vault_external_git_repo import VaultExternalGitRepository
+    pool = await get_pool()
+    row = await VaultExternalGitRepository(pool).get(uuid.UUID(vault_id))
+    if not row:
+        return None
+    return {
+        "url": row["remote_url"],
+        "branch": row["remote_branch"],
+        "read_only": True,
+    }
 
 
 @_h("akb_put")

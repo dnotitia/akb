@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _BACKEND_DIR.parent
 
@@ -29,3 +31,17 @@ _EXAMPLE_APP_YAML = _REPO_ROOT / "config" / "app.yaml.example"
 if not _BACKEND_APP_YAML.exists() and _EXAMPLE_APP_YAML.exists():
     _BACKEND_CFG_DIR.mkdir(parents=True, exist_ok=True)
     _BACKEND_APP_YAML.write_text(_EXAMPLE_APP_YAML.read_text())
+
+
+@pytest.fixture
+def git_http():
+    """A running in-process smart-HTTP git server (external-git runner
+    tests). Serves bare repos over ``git http-backend``; torn down after the
+    test. See ``tests.extgit_http``."""
+    from tests.extgit_http import GitHttpFixture
+
+    fx = GitHttpFixture()
+    try:
+        yield fx
+    finally:
+        fx.close()

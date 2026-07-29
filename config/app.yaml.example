@@ -32,6 +32,27 @@ external_git_fetch_timeout: 300
 external_git_clone_timeout: 900
 external_git_claim_lookahead_secs: 3600
 
+# === External-git mirror hardening — all optional, defaults shown ===
+# external_git_enabled: true            # master kill-switch for the mirror feature
+# external_git_allow_http: false        # single scheme-policy source (https always; http opt-in)
+# external_git_resolver_timeout: 5.0    # hard lifetime (s) for one host resolution
+# external_git_max_concurrent_resolutions: 4
+# external_git_blob_max_bytes: 10485760 # per-file ceiling for a mirrored blob (10 MiB)
+# external_git_poll_interval_min: 60    # code-owned floor; may be raised, never lowered below 60
+# external_git_poll_interval_max: 86400
+# external_git_cluster_dns_suffixes: [".svc", ".svc.cluster.local", ".cluster.local"]
+# Internal-exception allowlist — each entry is a full (host, CIDR set, ports) pin.
+# Empty (default) = fail-closed: every resolved mirror IP must be globally-routable unicast.
+# external_git_host_allowlist:
+#   - host: git.internal.example
+#     cidrs: ["10.0.0.0/8"]
+#     ports: [443, 8443]                # EVERY reachable port must be listed
+#                                       # (the standard port is NOT auto-allowed for
+#                                       # an internal-exception host); at least one required.
+# Operator pod/service CIDRs — any resolved address inside one is refused BEFORE
+# the allowlist, so a pod/service network can never be allow-listed by accident.
+# external_git_deny_cidrs: ["10.42.0.0/16", "10.96.0.0/12"]
+
 # === Embedding (required) ===
 # Any OpenAI-compatible /v1 endpoint. Default below targets OpenAI;
 # swap for OpenRouter, Ollama, vLLM, TEI, etc. — embed_dimensions must
