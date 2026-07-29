@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, Optional
 
 # Retry backoff shared by every backfill worker. Index is retry_count (0-based).
@@ -53,48 +54,115 @@ class BackfillRunner:
         process_once: Callable[[], Awaitable[int]],
         idle_secs: int = IDLE_INTERVAL_SECS,
         concurrency: int = 1,
+        log_progress: bool = True,
     ):
         self._name = name
         self._process_once = process_once
         self._idle_secs = idle_secs
         self._concurrency = max(1, concurrency)
+        # Per-tick "processed N items" is signal for a worker whose queue is
+        # usually empty (embed, delete, backfill) and noise for one that has
+        # work whenever the service has traffic — at a few-second poll that is
+        # thousands of INFO lines a day, burying the warnings that matter.
+        self._log_progress = log_progress
         self._tasks: list[asyncio.Task] = []
+        # In-flight shielded iterations. `_loop` shields `process_once` so a
+        # commit is never torn in half, but that also means cancelling the loop
+        # task leaves the shielded coroutine running detached. `stop()` awaits
+        # these so its timeout bounds when work actually ends, not merely when
+        # we stop watching — callers that drain a shared queue afterwards
+        # depend on the worker really being finished.
+        self._inflight: set[asyncio.Task] = set()
         self._stop_event: Optional[asyncio.Event] = None
         self._log = logging.getLogger(f"akb.{name}")
 
+    def abandoned(self) -> int:
+        """Iterations that ignored cancellation and outlived a `stop()`.
+
+        Non-zero means this worker is DEAD for the rest of the process: it
+        refuses to start a second loop over a queue the old one may still be
+        writing to. Exposed so that shows up on a dashboard rather than in one
+        ERROR line at shutdown.
+        """
+        return len([t for t in self._inflight if not t.done()])
+
     def start(self) -> None:
         if self._tasks and any(not t.done() for t in self._tasks):
+            return
+        # A previous `stop()` may have abandoned an iteration that ignored
+        # cancellation. Starting a second loop over the same queue while that
+        # one is still writing is worse than not starting at all.
+        alive = [t for t in self._inflight if not t.done()]
+        if alive:
+            self._log.error(
+                "%s not restarted: %d iteration(s) from the previous run are "
+                "still alive", self._name, len(alive),
+            )
             return
         self._stop_event = asyncio.Event()
         for i in range(self._concurrency):
             task_name = self._name if self._concurrency == 1 else f"{self._name}-{i}"
             self._tasks.append(asyncio.create_task(self._loop(task_name), name=task_name))
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 120.0) -> bool:
+        """Signal the loop and join its work within an ABSOLUTE deadline.
+
+        Returns True when the worker actually quiesced. A bounded stop can
+        return with work still running, and a caller that then assumes sole
+        ownership of a shared queue would be wrong — so the outcome is
+        reported rather than implied.
+
+        `timeout` bounds the whole call, and it bounds it even against a
+        callback that swallows or delays `CancelledError`: `asyncio.wait`
+        returns when the deadline passes without waiting for the cancellation
+        to be acknowledged, where `wait_for` would block indefinitely on
+        exactly that acknowledgement.
+
+        Anything still running when the budget is gone is logged and LEFT in
+        `_inflight` rather than forgotten, so `start()` can refuse to run a
+        second loop over the same queue.
+        """
         if self._stop_event:
             self._stop_event.set()
-        if self._tasks:
-            # Per-iteration work (embedding API call + vector-store upsert)
-            # can legitimately take up to ~60s end-to-end. A short stop
-            # timeout cancelled tasks mid-upsert, ROLLBACK-ing the claim's
-            # vector_next_attempt_at update and leaving rows in a half-
-            # claimed state. Give the current iteration time to finish
-            # cleanly; the stop_event still prevents another tick after
-            # this one drains.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=120.0,
-                )
-            except asyncio.TimeoutError:
-                self._log.warning(
-                    "%s did not stop within 120s; cancelling", self._name,
-                )
-                for t in self._tasks:
-                    if not t.done():
-                        t.cancel()
-        self._tasks = []
+        deadline = time.monotonic() + max(0.0, timeout)
+
+        await self._join(self._tasks, deadline, "loop task")
+        # The in-flight join runs on EVERY path. `asyncio.shield` detaches the
+        # iteration from its wrapper deliberately — so a commit finishes rather
+        # than tearing — which also means a wrapper cancelled from anywhere
+        # leaves the real work running.
+        await self._join([t for t in self._inflight if not t.done()],
+                         deadline, "in-flight iteration")
+
+        self._tasks = [t for t in self._tasks if not t.done()]
+        self._inflight = {t for t in self._inflight if not t.done()}
         self._stop_event = None
+        return not (self._tasks or self._inflight)
+
+    async def _join(self, tasks: list, deadline: float, what: str) -> None:
+        """Wait, then cancel, then give up — never past `deadline`."""
+        pending = [t for t in tasks if not t.done()]
+        if not pending:
+            return
+        _, pending_set = await asyncio.wait(pending, timeout=self._remaining(deadline))
+        if not pending_set:
+            return
+        self._log.warning(
+            "%s: %d %s(s) did not finish in the stop budget; cancelling",
+            self._name, len(pending_set), what,
+        )
+        for t in pending_set:
+            t.cancel()
+        _, still = await asyncio.wait(pending_set, timeout=self._remaining(deadline))
+        if still:
+            self._log.error(
+                "%s: %d %s(s) ignored cancellation and are abandoned; the worker "
+                "will not restart until they finish", self._name, len(still), what,
+            )
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     async def _loop(self, task_name: str) -> None:
         assert self._stop_event is not None
@@ -109,7 +177,16 @@ class BackfillRunner:
                 # iteration via _stop_event.is_set(); shielding only
                 # guarantees the in-flight chunk reaches COMMIT/ROLLBACK
                 # cleanly before we tear down.
-                done = await asyncio.shield(self._process_once())
+                inner: asyncio.Task = asyncio.ensure_future(self._process_once())
+                self._inflight.add(inner)
+                try:
+                    done = await asyncio.shield(inner)
+                finally:
+                    # Only forget it once it has actually finished; a cancelled
+                    # `shield` leaves `inner` alive and `stop()` must still
+                    # await it.
+                    if inner.done():
+                        self._inflight.discard(inner)
             except asyncio.CancelledError:
                 # Cancellation reached us despite the shield (e.g., the
                 # outer wait_for timed out and cancelled the task). Exit
@@ -125,7 +202,8 @@ class BackfillRunner:
                 except asyncio.TimeoutError:
                     pass
             else:
-                log.info("%s processed %d items", task_name, done)
+                if self._log_progress:
+                    log.info("%s processed %d items", task_name, done)
                 await asyncio.sleep(0)
 
         log.info("%s loop stopped", task_name)

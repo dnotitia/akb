@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,7 @@ from mcp_server.tools import TOOLS
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.vault_contract import project_accessible_vault
-from app.services import audit_log
+from app.services import audit_log, tool_usage
 
 
 async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
@@ -147,6 +148,23 @@ async def _get_user() -> _MCPUser:
     except (LookupError, AttributeError):
         pass
     return _FALLBACK_USER
+
+
+def _session_id() -> str | None:
+    """The caller's MCP session id, for correlating a conversation's tool calls.
+
+    Same source as `_get_user()` — the SDK stashes the originating HTTP request
+    on the request context. Absent for stdio/CLI callers and for the very first
+    POST of a session (the server mints the id during `initialize`), so this is
+    nullable by construction and must never be treated as a required key.
+    """
+    try:
+        request = server.request_context.request
+        if request:
+            return request.headers.get("mcp-session-id")
+    except (LookupError, AttributeError):
+        pass
+    return None
 doc_service = DocumentService()
 search_service = SearchService()
 
@@ -1426,16 +1444,34 @@ async def call_tool(name: str, arguments: dict):
     # Resolve the actor once and reuse it for both dispatch and the audit
     # line so the two can't disagree on who made the call.
     user = await _get_user()
+    started = time.perf_counter()
+    # Guards the two exits against recording the SAME invocation twice. The
+    # encode below sits inside this `try`, so a `json.dumps` failure falls to
+    # the `except` — which would otherwise log the call a second time as an
+    # error (inflated counts, a self-contradicting audit trail). Recording
+    # still happens right after dispatch so both sinks carry the *business*
+    # outcome: a handler that committed its write is not retroactively
+    # relabelled "error" because the response could not be encoded.
+    recorded = False
     try:
         result = await _dispatch(name, arguments, user)
-        # Non-blocking: record_tool only ENQUEUES for the dedicated audit writer
-        # thread (audit_log). No disk I/O or lock on the event loop, and it never
-        # touches the shared to_thread pool — a stalled audit disk can't freeze
-        # the loop or starve bcrypt / document reads.
-        audit_log.record_tool(
+        # Non-blocking: both calls only ENQUEUE (audit to its dedicated writer
+        # thread, usage to a bounded deque drained by a worker). No disk I/O or
+        # lock on the event loop, and neither touches the shared to_thread pool
+        # — a stalled audit disk can't freeze the loop or starve bcrypt /
+        # document reads.
+        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+        audit_log.record_tool(name, arguments, user, result, is_write=is_write)
+        # Independent sink: usage analytics go to PG so they can be grouped, and
+        # must NOT inherit the audit flags (audit is off by default and
+        # `log_reads` would drop most tool calls).
+        tool_usage.record(
             name, arguments, user, result,
-            is_write=_required_scope(name, arguments) == _WRITE_SCOPE,
+            session_id=_session_id(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            is_write=is_write,
         )
+        recorded = True
         # Serialise with json.dumps(default=str) — UNCHANGED from pre-hardening
         # so the MCP wire format stays byte-identical for every tool (datetime →
         # `str()` space form, Enum → `str()`, unknown → stringified). The
@@ -1461,10 +1497,18 @@ async def call_tool(name: str, arguments: dict):
         # Audit the failure too — a crashing tool call is exactly what a
         # security review wants to see. record_tool never raises and only
         # enqueues (non-blocking; see the success path).
-        audit_log.record_tool(
-            name, arguments, user, envelope,
-            is_write=_required_scope(name, arguments) == _WRITE_SCOPE,
-        )
+        # A crashing tool is exactly the one worth counting — but only if the
+        # success path did not already record this invocation (a response-encode
+        # failure lands here after a handler that actually succeeded).
+        if not recorded:
+            is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+            audit_log.record_tool(name, arguments, user, envelope, is_write=is_write)
+            tool_usage.record(
+                name, arguments, user, envelope,
+                session_id=_session_id(),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                is_write=is_write,
+            )
         return [TextContent(
             type="text",
             text=json.dumps(envelope, ensure_ascii=False, default=str),

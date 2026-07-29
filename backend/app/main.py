@@ -18,7 +18,7 @@ from app.exceptions import AKBError
 from app.openapi_contract import install_openapi_contract
 from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
-from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker
+from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker, tool_usage
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.health import vault_health
@@ -376,6 +376,8 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     #  - PG-RBAC hook-failure counters + last reconcile outcome (silent
     #    role-sync drift); lets dashboards / oncall see it without grepping logs.
     #  - audit-log stats.
+    #  - tool-usage queue depth + loss counters (an overflow or a systematic
+    #    recording failure is otherwise only a rate-limited log line).
     if user is not None:
         try:
             from app.services.role_sync import get_role_sync
@@ -383,6 +385,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         except Exception as e:  # noqa: BLE001
             result["rbac"] = {"error": str(e)}
         result["audit"] = audit_log.stats()
+        result["tool_usage"] = tool_usage.stats()
 
     return result
 

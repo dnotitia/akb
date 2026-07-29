@@ -215,6 +215,7 @@ async def _apply_migrations() -> None:
         "043_workspace_account_governance.py",  # users account status/kind + stable external OIDC identities
         "044_vault_write_policy.py",             # vault_write_policy + vault_write_grants: vault-grain token-allowlist substrate
         "045_vault_write_grant_actions.py",      # additive action limits; existing grants backfill to wildcard
+        "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
     ):
         if filename in applied:
             continue

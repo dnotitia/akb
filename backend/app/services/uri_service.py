@@ -103,6 +103,20 @@ class ParsedUri(NamedTuple):
     coll_path: str | None = None
 
 
+def vault_of(uri: str) -> str | None:
+    """The vault component of a canonical AKB URI, or ``None``.
+
+    Delegates to `parse_uri` rather than matching a prefix of its own. A
+    prefix-anchored regex looks equivalent but is strictly more permissive —
+    it would return ``"eng"`` for `akb://eng/not-a-resource`, `akb://eng/coll`
+    and `akb://eng//doc/x.md`, all of which `parse_uri` rejects. Callers that
+    only need the vault get the same grammar as callers that need the whole
+    URI, so the two cannot disagree about what counts as a URI.
+    """
+    parsed = parse_uri(uri)
+    return parsed.vault if parsed else None
+
+
 def parse_uri(uri: str) -> ParsedUri | None:
     """Parse an AKB URI in canonical form.
 
