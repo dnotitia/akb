@@ -363,15 +363,21 @@ async def test_poison_isolation_is_atomic_and_exact(db, monkeypatch):
     assert (written, dropped) == (15, 1)
     assert stored == written, "the reported count must match what is committed"
 
-    # Budget exhaustion still accounts for every row.
+    # Budget exhaustion still accounts for every row. The exact split matters:
+    # `written + dropped == 16` alone would also hold if the budget were
+    # ignored entirely and the traversal simply ran to completion, so it would
+    # not prove exhaustion happened at all.
     async with db.acquire() as conn:
         await conn.execute("TRUNCATE tool_calls")
     monkeypatch.setattr(tool_usage, "_BISECT_BUDGET", 3)
     async with db.acquire() as conn:
         written, dropped = await tool_usage._insert_isolating_poison(conn, batch)
         stored = int(await conn.fetchval("SELECT COUNT(*) FROM tool_calls"))
-    assert written + dropped == 16, "every row must be accounted for"
-    assert stored == written
+    assert (written, dropped) == (4, 12), (
+        f"three probes reach one clean quarter and abandon the rest, got "
+        f"{(written, dropped)} — an unbounded traversal would give (15, 1)"
+    )
+    assert stored == written, "and the reported count matches what is committed"
 
 
 @pytest.mark.asyncio
