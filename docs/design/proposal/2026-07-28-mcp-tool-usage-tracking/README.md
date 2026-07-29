@@ -347,9 +347,9 @@ class ToolUsageSettings(BaseModel):
 |---|---|---|
 | **인자 스키마 검증 실패** | MCP SDK가 `jsonschema.validate` 후 `_make_error_result`로 반환 — `call_tool`에 **도달하지 않음** | 잘못된 인자로 실패한 호출이 0으로 보임. "이 툴 실패율" 과소 추정 |
 | **프록시 전용 파일 툴 3종** | `akb_put_file`/`akb_get_file`/`akb_delete_file`은 `proxy.mjs`가 REST/S3로 직접 처리 | 에이전트가 보는 표면은 43이 아니라 **46**. 이 3개는 "죽었다"고 오판될 수 있음 |
-| **`_get_user()` 예외** | 초크포인트의 `try` **밖**에 있음 | 인증 해석 중 DB 오류면 두 싱크 모두 우회 |
+| **`_get_user()` 예외** | 초크포인트의 `try` **밖**에 있음 | 인증 해석 중 DB 오류면 이 지표에 포함되지 않음 |
 | **HTTP 인증 거부** | `http_app.py:94-123`에서 MCP 전송 계층 도달 전 반려 | 거부된 호출은 이 지표에 없음 |
-| **`CancelledError`** | `except Exception`이 안 잡음 | 클라이언트 연결 끊김/세션 취소가 두 싱크 모두 우회 |
+| **`CancelledError`** | `except Exception`이 안 잡음 | 클라이언트 연결 끊김/세션 취소는 이 지표에 포함되지 않음 |
 | **전송 실패** | 기록이 응답 전달 **전**에 일어남 | 클라이언트가 못 받은 응답도 `ok`로 남을 수 있음 |
 | **직접 Python stdio 진입점** | `tool_usage` 워커를 기동하지 않음 (`server.py` stdio 경로) | 그 경로는 큐만 쌓이고 적재 안 됨. 지원 경로인 Node 프록시→HTTP는 정상 |
 | **큐 오버플로 / SIGKILL** | 유실은 카운트되지만 표본에서 빠짐 | 모집단이 달라지므로 해석 시 감안 |
