@@ -39,7 +39,8 @@ class _FakeConn:
     def __init__(self, vault_name: str):
         self._vault_name = vault_name
 
-    def transaction(self):
+    def transaction(self, **kwargs):
+        # create_table pins isolation="read_committed"
         return _AsyncCtx()
 
     async def fetchrow(self, sql: str, *params):

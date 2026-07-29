@@ -628,6 +628,21 @@ TOOLS = [
                 },
                 "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
                 "name": {"type": "string", "description": "Table name (unique within the vault)"},
+                "if_not_exists": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "When true, an existing table is NOT an error: returns "
+                        "created=false instead of a 409 conflict. Nothing is "
+                        "altered either way. If you also hold READ access to "
+                        "the vault the response carries the STORED schema plus "
+                        "matches_request and mismatches[], so divergence from "
+                        "your spec is explicit; a write-only credential gets "
+                        "only {kind, name, created, outcome}. Must be a real "
+                        "boolean — the string \"true\" is rejected. Default "
+                        "false keeps the 409."
+                    ),
+                },
                 "collection": {
                     "type": "string",
                     "description": "Collection path (e.g. 'specs' or 'sessions/learnings'). Omit for vault root. Ignored when `parent` is given.",

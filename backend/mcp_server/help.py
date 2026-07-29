@@ -934,9 +934,43 @@ akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections c
 | columns | ✓ | Column definitions |
 | unique_keys | | Declarative UNIQUE keys: `[{name?, columns}]` |
 | indexes | | Declarative lookup indexes: `[{name?, columns}]` |
+| if_not_exists | | `true` → an existing table is not an error. Default `false`. |
 
 ## Column Types
 `text`, `number`, `boolean`, `date`, `json`
+
+## if_not_exists — "ensure this table exists"
+
+Default (`false`) is unchanged: creating a table that already exists is a
+`conflict` error.
+
+With `if_not_exists=true` the request becomes "ensure this table exists":
+
+| Table | Result |
+|---|---|
+| absent | created → `created: true` |
+| present | **nothing is altered** → `created: false`, `outcome: "already_exists"` |
+
+Must be a real boolean — the string `"true"` is rejected, not coerced.
+
+**It never reconciles a schema.** If the stored table differs from what you
+asked for, you get the STORED shape back plus:
+
+- `matches_request` — `false` when anything differs
+- `mismatches` — which of `columns` / `unique_keys` / `indexes` /
+  `collection` / `description` differ
+
+so you can decide whether to follow up with `akb_alter_table`. Do NOT assume
+the columns you passed exist just because the call succeeded.
+
+If your credential has write but not read access to the vault, the response is
+only `{kind, name, created, outcome}` — the stored schema, `matches_request`
+and `mismatches` are all withheld, because they would disclose a schema you are
+not authorised to read. Their absence means "not disclosed", not "no
+divergence".
+
+Only a table already in THIS vault is suppressed. A name that collides with
+another vault's physical table still conflicts.
 
 ## Unique keys & indexes
 - `unique_keys` — single or composite UNIQUE constraints. Each item is

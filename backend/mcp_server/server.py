@@ -265,6 +265,32 @@ _ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
 }
 
 
+async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
+    """Does this credential have READ authority on `vault`?
+
+    Write authority does not imply read: `token_has_scope` is
+    `"admin" in granted or required in granted`, with no implication, and a
+    managed-vault wildcard grant can authorise a write without reader
+    membership. A write-only caller must therefore not be handed stored
+    state it could not obtain through `akb_browse`.
+
+    Fail-closed on every uncertainty — an exception, a missing vault, a
+    denied role check all resolve to False. This gates a PROJECTION, never
+    an action, so refusing it can only under-disclose.
+    """
+    if user.oauth_scopes is not None and _READ_SCOPE not in user.oauth_scopes:
+        return False
+    if user.token_scopes is not None and not token_has_scope(
+        user.token_scopes, "read"
+    ):
+        return False
+    try:
+        await check_vault_access(uid, vault, required_role="reader")
+    except Exception:  # noqa: BLE001 — any failure means "no read authority"
+        return False
+    return True
+
+
 def _required_scope(name: str, args: dict) -> str:
     """Scope a call needs: the tool's mapping, promoted to write when the
     call carries a mutating argument.
@@ -1001,6 +1027,16 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
         vault, collection = _resolve_parent(args, kind_name="table")
     except ValueError as e:
         return err(str(e), code=INVALID_ARGUMENT)
+    # Reject rather than coerce. `bool("false")` is True, so a lenient cast
+    # hands the caller idempotent behaviour it never asked for; a strict
+    # `is True` silently gives `"true"` the 409 it did not expect. Either
+    # way the caller is misled without being told.
+    if "if_not_exists" in args and not isinstance(args["if_not_exists"], bool):
+        return err(
+            "if_not_exists must be a boolean (true/false), got "
+            f"{type(args['if_not_exists']).__name__}",
+            code=INVALID_ARGUMENT,
+        )
     access = await check_vault_access(uid, vault, required_role="writer")
     try:
         return await table_service.create_table(
@@ -1010,6 +1046,9 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             collection=collection or None,
             unique_keys=args.get("unique_keys"),
             indexes=args.get("indexes"),
+            # Type already enforced above, so a plain read is safe here.
+            if_not_exists=args.get("if_not_exists", False),
+            can_read_existing=await _can_read_vault(user, uid, vault),
         )
     except (ValidationError, ValueError) as e:
         # ValidationError: bad table name / over-long PG identifier (422).
