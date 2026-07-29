@@ -33,12 +33,15 @@ than no table.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 from app.config import settings
+from asyncpg.exceptions import DataError
+
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner
 from app.services.uri_service import vault_of
@@ -145,10 +148,6 @@ class _Row(NamedTuple):
 _maxlen: int = 1
 _queue: deque[_Row] = deque(maxlen=_maxlen)
 _dropped = 0
-# Consecutive failed flushes of the same head-of-queue batch. Bounded so an
-# un-storable row degrades the sink instead of wedging it permanently.
-_flush_failures = 0
-_MAX_FLUSH_RETRIES = 3
 
 
 def reset() -> None:
@@ -157,11 +156,10 @@ def reset() -> None:
     Called at startup and by tests; the bound is read here rather than per
     append so the hot path stays a single ``append``.
     """
-    global _queue, _dropped, _maxlen, _flush_failures
+    global _queue, _dropped, _maxlen
     _maxlen = settings.tool_usage.queue_max
     _queue = deque(maxlen=_maxlen)
     _dropped = 0
-    _flush_failures = 0
 
 
 reset()
@@ -193,7 +191,7 @@ def stats() -> dict:
         "queued": len(_queue),
         "queue_max": _maxlen,
         "lost": _dropped,
-        "consecutive_flush_failures": _flush_failures,
+        "maintenance_failures": dict(_leg_failures),
         "retention_days": settings.tool_usage.raw_retention_days,
     }
 
@@ -252,7 +250,7 @@ def record(
             actor_id=_clip(getattr(user, "user_id", None)),
             actor=_clip(getattr(user, "username", None)),
             session_id=_clip(session_id),
-            vault=_clip(_vault_of(args)),
+            vault=_clip(_vault_of(name, args)),
             outcome=outcome,
             code=_clip(code),
             duration_ms=duration_ms,
@@ -281,19 +279,29 @@ def record(
 # rollup back and the offending row is re-selected every tick forever: folding
 # stops, and because purge requires the fold stamp, retention stops with it.
 _STR_MAX = 256
+_DIGEST = 8
 
 
 def _clip(v: Any) -> str | None:
-    """Coerce to str, strip NULs, and bound the length.
+    """Coerce to a value PostgreSQL TEXT can store, bounded at `_STR_MAX`.
 
-    NUL is not storable in PostgreSQL TEXT at all — un-stripped, one
-    `{"vault": "\x00"}` fails the batched INSERT, and a failed batch goes back
-    to the head of the deque, so the same rows re-fail on every tick.
+    Two shapes are unstorable, not merely oversized: NUL, and lone surrogates
+    (which survive a Python str but cannot be encoded as UTF-8). Either one
+    fails the batched INSERT, and a failed batch returns to the head of the
+    deque — so one such value would stall every row behind it.
+
+    Truncation carries a digest of the original rather than a bare ellipsis:
+    `tool` is part of `tool_usage_daily`'s PRIMARY KEY, so two different
+    overlong values sharing a prefix would otherwise merge into one aggregate
+    row and silently sum unrelated traffic.
     """
     if v is None:
         return None
-    s = str(v).replace("\x00", "")
-    return s if len(s) <= _STR_MAX else s[:_STR_MAX] + "\u2026"
+    s = str(v).encode("utf-8", "replace").decode("utf-8").replace("\x00", "")
+    if len(s) <= _STR_MAX:
+        return s
+    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:_DIGEST]
+    return s[: _STR_MAX - _DIGEST - 1] + "\u2026" + digest
 
 
 # Resource tools address their target by `akb://` URI rather than a separate
@@ -305,49 +313,64 @@ def _clip(v: Any) -> str | None:
 # Mirrors the URI-bearing argument names in `mcp_server/tools.py`; the scheme
 # itself is parsed by `uri_service`, which owns that grammar.
 _URI_ARGS = ("uri", "parent", "source", "target")
+# A real `akb://` URI is short. Parsing is regex work on the request path, so
+# an argument past this is rejected without parsing — four 1 MB strings measured
+# ~45ms of event-loop time, which is the stall class this service dies of.
+_URI_ARG_MAX = 2048
 
 
-def _vault_of(args: Any) -> str | None:
+def _scalar_vault(args: dict) -> str | None:
+    v = args.get("vault")
+    return v if isinstance(v, str) and v else None
+
+
+def _vault_of(name: str, args: Any) -> str | None:
     """The vault the handler will actually operate on.
 
-    URI arguments are checked FIRST because that is the precedence the
-    dispatch handlers use: `_handle_browse`, `_handle_graph` and
-    `_resolve_parent` all treat the URI as authoritative and ignore a `vault`
-    argument passed alongside it. Reading `vault` first would attribute
-    `akb_browse(vault="a", uri="akb://b/coll/x")` to vault `a`, which the call
-    never touched.
+    Attribution has to follow each tool's own precedence, not one global rule,
+    or the row names a vault the call never touched:
 
-    `akb_sql` takes a `vaults` array as its canonical multi-vault form with
-    `vault` only as the single-vault shorthand, so that shape is read too —
-    otherwise the tool with the widest data access records no vault at all.
+    * `akb_sql` reads `vaults or [vault]` (`server.py`), so the array wins. A
+      genuinely multi-vault statement has no single target — recording its
+      first element would present one arbitrarily-ordered vault as *the*
+      vault, so that case is left NULL.
+    * `akb_publish(resource_type="table_query")` takes the scalar `vault` and
+      ignores any `uri`, even though the schema accepts both.
+    * Everything else addresses its target by URI; `_handle_browse`,
+      `_handle_graph` and `_resolve_parent` all ignore a `vault` passed
+      alongside one.
     """
     if not isinstance(args, dict):
         return None
+
+    if name == "akb_sql":
+        many = [v for v in (args.get("vaults") or []) if isinstance(v, str) and v]
+        if len(many) == 1:
+            return many[0]
+        if many:
+            return None
+        return _scalar_vault(args)
+
+    if name == "akb_publish" and args.get("resource_type") == "table_query":
+        return _scalar_vault(args)
+
     for key in _URI_ARGS:
         value = args.get(key)
-        if isinstance(value, str):
-            name = vault_of(value)
-            if name:
-                return name
-    explicit = args.get("vault")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    many = args.get("vaults")
-    if isinstance(many, (list, tuple)):
-        for v in many:
-            if isinstance(v, str) and v:
-                return v
-    return None
+        if isinstance(value, str) and len(value) <= _URI_ARG_MAX:
+            found = vault_of(value)
+            if found:
+                return found
+    return _scalar_vault(args)
 
 
 async def flush_once() -> int:
-    global _dropped, _flush_failures
     """Drain up to ``flush_batch`` records into PG in one round trip.
 
-    On a DB error the batch is returned to the FRONT of the queue so a
-    transient outage delays rows instead of losing them; the bound caps how
-    much a sustained outage can retain, and whatever does not fit is counted.
+    A transient failure returns the batch to the FRONT of the queue so an
+    outage delays rows instead of losing them; the queue bound caps how much a
+    sustained outage can retain, and whatever does not fit is counted.
     """
+    global _dropped
     batch = drain(settings.tool_usage.flush_batch)
     if not batch:
         return 0
@@ -363,27 +386,27 @@ async def flush_once() -> int:
         # queue-depth check would report a clean shutdown.
         _requeue_front(batch)
         raise
-    except Exception as e:  # noqa: BLE001
-        _flush_failures += 1
-        if _flush_failures >= _MAX_FLUSH_RETRIES:
-            # Requeue-to-head is right for a transient outage and catastrophic
-            # for a row PG can never accept: the same batch is re-drained and
-            # re-fails every tick, forever, and nothing behind it is ever
-            # written. Give up on it, count it, and let the queue move.
-            _dropped += len(batch)
-            _flush_failures = 0
-            logger.error(
-                "tool_usage dropping %d record(s) after %d consecutive flush "
-                "failures — last error: %s", len(batch), _MAX_FLUSH_RETRIES, e,
-            )
-        else:
-            kept = _requeue_front(batch)
-            logger.warning(
-                "tool_usage flush failed (%d requeued, %d dropped): %s",
-                kept, len(batch) - kept, e,
-            )
+    except DataError as e:
+        # Class 22 — invalid byte sequence, value too long, and friends. That
+        # is a property of the ROWS, not the connection: retrying re-fails
+        # forever while everything behind it waits. Drop this batch, count it,
+        # let the queue move.
+        _dropped += len(batch)
+        logger.error("tool_usage dropping %d unstorable record(s): %s", len(batch), e)
         return 0
-    _flush_failures = 0
+    except Exception as e:  # noqa: BLE001
+        # Everything else — connection reset, pool exhausted, failover — is
+        # transient and must NOT cost data. An earlier version dropped after
+        # three consecutive failures of ANY kind, which turned an ordinary
+        # 10-15s PostgreSQL restart into deterministic loss, and its counter
+        # was global rather than tied to a batch, so an unrelated batch could
+        # inherit another's failures and be dropped on its first error.
+        kept = _requeue_front(batch)
+        logger.warning(
+            "tool_usage flush failed (%d requeued, %d dropped): %s",
+            kept, len(batch) - kept, e,
+        )
+        return 0
     return len(batch)
 
 
@@ -471,12 +494,32 @@ async def maintenance_once() -> int:
     return await _leg(rollup_once, "rollup") + await _leg(purge_once, "purge")
 
 
+_leg_failures: dict[str, int] = {"rollup": 0, "purge": 0}
+
+
 async def _leg(fn, name: str) -> int:
+    """Run one maintenance leg; its failure must not veto the other.
+
+    Rate-limited with a traceback, and counted. Logging the bare message every
+    tick turns a permanently broken leg into a warning storm — and because the
+    surviving leg keeps reporting work, the runner re-runs immediately rather
+    than waiting out the hourly idle interval, so "every tick" is fast. The
+    count is surfaced on `/health` so a leg that is quietly always failing is
+    visible without grepping.
+    """
     try:
-        return await fn()
+        n = await fn()
     except Exception as e:  # noqa: BLE001 — one leg must not veto the other
-        logger.warning("tool_usage %s failed: %s", name, e)
+        _leg_failures[name] += 1
+        count = _leg_failures[name]
+        if count == 1 or count % 100 == 0:
+            logger.warning(
+                "tool_usage %s failed (%d consecutive): %s", name, count, e,
+                exc_info=True,
+            )
         return 0
+    _leg_failures[name] = 0
+    return n
 
 
 # ── Workers ─────────────────────────────────────────────────────

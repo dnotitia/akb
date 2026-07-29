@@ -154,8 +154,6 @@ def test_raw_args_are_not_stored(enabled):
     ({"source": "akb://a/doc/x.md", "target": "akb://b/doc/y.md"}, "a"),
     # The URI wins, because that is what the handler acts on.
     ({"vault": "ignored", "uri": "akb://other/doc/x.md"}, "other"),
-    # `akb_sql`'s canonical multi-vault form; `vault` is only its shorthand.
-    ({"vaults": ["eng", "ops"]}, "eng"),
     ({"query": "no vault anywhere"}, None),
     ({"uri": "not-a-uri"}, None),
     # Shapes the canonical grammar rejects must not be guessed at.
@@ -175,6 +173,45 @@ def test_vault_is_derived_from_uris_too(enabled, args, expected):
     call to a vault it never touched."""
     tool_usage.record("akb_x", args, _User(), {"ok": True})
     assert tool_usage.drain(1)[0].vault == expected
+
+
+@pytest.mark.parametrize("tool,args,expected", [
+    # `_handle_sql` reads `vaults or [vault]` — the ARRAY wins.
+    ("akb_sql", {"vaults": ["eng"], "vault": "ignored"}, "eng"),
+    # …and a genuinely multi-vault statement has no single target. Recording
+    # the first element would present one arbitrarily-ordered vault as *the*
+    # vault the call touched.
+    ("akb_sql", {"vaults": ["eng", "ops"]}, None),
+    ("akb_sql", {"vault": "solo"}, "solo"),
+    # `akb_publish(resource_type="table_query")` takes the scalar `vault` and
+    # ignores a `uri`, even though the schema accepts both.
+    ("akb_publish", {"resource_type": "table_query", "vault": "v",
+                     "uri": "akb://other/doc/x.md"}, "v"),
+    # …but the document form resolves from the URI.
+    ("akb_publish", {"resource_type": "document", "uri": "akb://d/doc/x.md"}, "d"),
+])
+def test_vault_attribution_follows_each_tool(enabled, tool, args, expected):
+    """One global precedence rule is wrong: the handlers disagree with each
+    other, so tracking has to follow whichever one will actually run. Getting
+    this wrong writes a vault the call never touched, and nothing cross-checks
+    the two."""
+    tool_usage.record(tool, args, _User(), {"ok": True})
+    assert tool_usage.drain(1)[0].vault == expected
+
+
+def test_absurd_uri_argument_is_not_parsed(enabled):
+    """URI parsing is regex work on the request path. Four 1 MB arguments were
+    measured at ~45ms of event-loop time — the stall class this service dies
+    of. Anything past a plausible URI length is rejected without parsing."""
+    import time as _t
+
+    args = {k: "akb://" + "x" * 1_000_000 for k in ("uri", "parent", "source", "target")}
+    start = _t.perf_counter()
+    tool_usage.record("akb_x", args, _User(), {"ok": True})
+    elapsed = _t.perf_counter() - start
+
+    assert tool_usage.drain(1)[0].vault is None
+    assert elapsed < 0.02, f"record() spent {elapsed*1000:.1f}ms parsing oversized URIs"
 
 
 def test_session_and_duration_are_recorded(enabled):
@@ -209,10 +246,18 @@ def test_oversized_strings_are_clipped(enabled):
     tool_usage.record("akb_" + "x" * 5000, {"vault": "v" * 5000}, _User(), {"ok": True})
     row = tool_usage.drain(1)[0]
 
-    assert len(row.tool) <= tool_usage._STR_MAX + 1      # +1 for the ellipsis
-    assert len(row.vault) <= tool_usage._STR_MAX + 1
+    assert len(row.tool) == tool_usage._STR_MAX
+    assert len(row.vault) == tool_usage._STR_MAX
     assert row.tool.startswith("akb_x")
-    assert row.tool.endswith("…"), "truncation must be visible, not silent"
+    assert "…" in row.tool, "truncation must be visible, not silent"
+
+    # Two distinct overlong tools sharing a prefix must NOT collapse into one
+    # aggregate row — `tool` is part of `tool_usage_daily`'s PRIMARY KEY, so a
+    # bare ellipsis would silently sum unrelated traffic.
+    tool_usage.record("akb_" + "x" * 5000 + "A", {}, _User(), {"ok": True})
+    tool_usage.record("akb_" + "x" * 5000 + "B", {}, _User(), {"ok": True})
+    a, b = tool_usage.drain(2)
+    assert a.tool != b.tool, "truncated values must stay distinguishable"
 
 
 def test_nul_bytes_are_stripped(enabled):
@@ -236,26 +281,42 @@ def test_every_stored_string_is_bounded(enabled, field, args, kwargs):
     result = {"error": "x", "code": "C" * 5000} if field == "code" else {"ok": True}
     tool_usage.record("akb_put", args, _User(), result, **kwargs)
     value = getattr(tool_usage.drain(1)[0], field)
-    assert value is None or len(value) <= tool_usage._STR_MAX + 1
+    assert value is None or len(value) <= tool_usage._STR_MAX
 
 
-def test_a_batch_that_can_never_insert_is_eventually_dropped(enabled, monkeypatch):
-    """Requeue-to-head is right for a transient outage and catastrophic for a
-    permanently un-storable row: the same batch is re-drained and re-fails on
-    every tick, forever, and nothing behind it is ever written.
+def test_unstorable_batch_is_dropped_but_a_transient_outage_is_not(enabled, monkeypatch):
+    """The two failures must be told apart by KIND, not by a retry count.
 
-    After a bounded number of consecutive failures the batch is dropped and
-    *counted*, so the sink degrades instead of wedging."""
-    async def _boom():
-        raise RuntimeError("permanent")
+    A count-based rule loses data on ordinary infrastructure events: at the
+    5s cadence an ordinary 10-15s PostgreSQL restart exceeds three attempts
+    and the batch is discarded even though the queue had ample room. And a
+    global counter is not tied to a batch — an unrelated batch can inherit
+    another's failures and be dropped on its own first error.
 
-    monkeypatch.setattr(tool_usage, "get_pool", _boom)
+    Class-22 (`DataError`) is a property of the rows and will never succeed;
+    everything else is transient and must cost nothing."""
+    from asyncpg.exceptions import CharacterNotInRepertoireError
+
+    calls = {"n": 0}
+
+    async def _poison():
+        raise CharacterNotInRepertoireError("invalid byte sequence")
+
+    async def _transient():
+        calls["n"] += 1
+        raise ConnectionResetError("failover")
+
     tool_usage.record("akb_put", {"vault": "v"}, _User(), {"ok": True})
-
-    for _ in range(tool_usage._MAX_FLUSH_RETRIES):
+    monkeypatch.setattr(tool_usage, "get_pool", _transient)
+    for _ in range(10):                       # far more than any retry budget
         assert asyncio.run(tool_usage.flush_once()) == 0
+    assert tool_usage.queue_depth() == 1, "a transient outage must not lose rows"
+    assert tool_usage.dropped_count() == 0
+    assert calls["n"] == 10, "each tick must genuinely retry"
 
-    assert tool_usage.queue_depth() == 0, "the poison batch must not be retried forever"
+    monkeypatch.setattr(tool_usage, "get_pool", _poison)
+    assert asyncio.run(tool_usage.flush_once()) == 0
+    assert tool_usage.queue_depth() == 0, "an unstorable batch must not block the queue"
     assert tool_usage.dropped_count() == 1, "and its loss must be counted"
 
 
