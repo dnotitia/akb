@@ -107,4 +107,5 @@ jobs:
           tests/concurrency/test_alter_unique_race_unit.py
           tests/test_file_idempotent_upload_unit.py
           tests/test_app_registry_migration_unit.py
+          tests/test_tool_usage_e2e.py
           -v --tb=short

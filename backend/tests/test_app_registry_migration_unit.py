@@ -18,7 +18,7 @@ pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
-_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "046_app_registry.py"
+_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret

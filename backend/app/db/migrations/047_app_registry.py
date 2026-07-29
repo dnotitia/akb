@@ -1,4 +1,4 @@
-"""Migration 046: app desired-state registry.
+"""Migration 047: app desired-state registry.
 
 The registry is control-plane state, not Vault data-plane state. It defines
 stable apps, immutable releases, one installation per app/Vault pair,
@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-logger = logging.getLogger("akb.migration.046")
+logger = logging.getLogger("akb.migration.047")
 
 
 async def migrate(conn=None):
@@ -887,7 +887,7 @@ async def _run(conn):
             """
         )
 
-    logger.info("Migration 046 added the app desired-state registry")
+    logger.info("Migration 047 added the app desired-state registry")
 
 
 async def _main():
