@@ -384,8 +384,13 @@ async def test_a_transient_failure_mid_traversal_commits_nothing(db, monkeypatch
 
     async def _flaky(conn, batch, budget):
         calls["n"] += 1
-        if calls["n"] == 3:
-            raise ConnectionResetError("failover mid-traversal")
+        # Probe #3 is the FIRST that succeeds (16 fails, 8 fails, 4 commits).
+        # The injection has to land after it: failing earlier proves nothing,
+        # because nothing had been written yet — an earlier version of this
+        # test injected at #3 and passed even with the outer transaction
+        # removed, i.e. it did not test the defect it was written for.
+        if calls["n"] == 4:
+            raise ConnectionResetError("failover after a committed probe")
         return await real(conn, batch, budget)
 
     monkeypatch.setattr(tool_usage, "_probe", _flaky)
