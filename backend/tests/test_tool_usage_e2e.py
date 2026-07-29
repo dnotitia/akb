@@ -330,3 +330,79 @@ async def test_record_and_flush_write_each_field_to_its_own_column(db, monkeypat
         "code": "NOT_FOUND", "duration_ms": 77, "is_write": True,
     }
     tool_usage.reset()
+
+
+def _raw(tool: str, *, poison: bool = False):
+    return tool_usage._Row(
+        datetime.now(timezone.utc), tool, "u", "a", None,
+        "bad\x00" if poison else "ok", "ok", None, 1, False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_poison_isolation_is_atomic_and_exact(db, monkeypatch):
+    """The insert path halves a failed batch to isolate rows PostgreSQL will
+    never accept, inside ONE transaction with a SAVEPOINT per probe.
+
+    Three properties, none of which a fake connection can show:
+
+    * A class-22 failure inside a nested transaction is recoverable — the
+      outer transaction survives it and still commits the siblings.
+    * Its `(written, dropped)` accounting matches what is actually stored,
+      including when the statement budget runs out mid-traversal.
+    * Any OTHER failure rolls the whole traversal back, which is what makes
+      `flush_once`'s requeue safe. Before the outer transaction existed, each
+      child committed on its own, so a mid-traversal connection reset left
+      rows written AND requeued — and the retry inserted them twice.
+    """
+    batch = [_raw(f"akb_t{i}", poison=(i == 5)) for i in range(16)]
+
+    async with db.acquire() as conn:
+        written, dropped = await tool_usage._insert_isolating_poison(conn, batch)
+        stored = int(await conn.fetchval("SELECT COUNT(*) FROM tool_calls"))
+    assert (written, dropped) == (15, 1)
+    assert stored == written, "the reported count must match what is committed"
+
+    # Budget exhaustion still accounts for every row.
+    async with db.acquire() as conn:
+        await conn.execute("TRUNCATE tool_calls")
+    monkeypatch.setattr(tool_usage, "_BISECT_BUDGET", 3)
+    async with db.acquire() as conn:
+        written, dropped = await tool_usage._insert_isolating_poison(conn, batch)
+        stored = int(await conn.fetchval("SELECT COUNT(*) FROM tool_calls"))
+    assert written + dropped == 16, "every row must be accounted for"
+    assert stored == written
+
+
+@pytest.mark.asyncio
+async def test_a_transient_failure_mid_traversal_commits_nothing(db, monkeypatch):
+    """The duplicate-insert case, pinned. A non-`DataError` part-way through
+    must leave the table untouched so the requeued batch cannot be written a
+    second time on retry."""
+    real = tool_usage._probe
+    calls = {"n": 0}
+
+    async def _flaky(conn, batch, budget):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ConnectionResetError("failover mid-traversal")
+        return await real(conn, batch, budget)
+
+    monkeypatch.setattr(tool_usage, "_probe", _flaky)
+    batch = [_raw(f"akb_t{i}", poison=(i == 5)) for i in range(16)]
+
+    with pytest.raises(ConnectionResetError):
+        async with db.acquire() as conn:
+            await tool_usage._insert_isolating_poison(conn, batch)
+
+    async with db.acquire() as conn:
+        stored = int(await conn.fetchval("SELECT COUNT(*) FROM tool_calls"))
+    assert stored == 0, "a partial commit here is what caused duplicate inserts"
+
+    # And the retry writes each surviving row exactly once.
+    monkeypatch.setattr(tool_usage, "_probe", real)
+    async with db.acquire() as conn:
+        written, dropped = await tool_usage._insert_isolating_poison(conn, batch)
+        tools = [r["tool"] for r in await conn.fetch("SELECT tool FROM tool_calls")]
+    assert (written, dropped) == (15, 1)
+    assert len(tools) == len(set(tools)) == 15, f"duplicates: {tools}"
