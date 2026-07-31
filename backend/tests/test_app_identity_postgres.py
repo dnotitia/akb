@@ -241,7 +241,7 @@ async def test_migration_reapply_and_plaintext_never_persists(identity_pool):
             "FROM app_credentials"
         )
     for row in rows:
-        stored = json.dumps(dict(row["stored"]), default=str)
+        stored = str(row["stored"])
         for issued in (issued_a, issued_b, issued_a_staging):
             assert issued["credential"] not in stored
         assert len(row["credential_hash"]) == 64
