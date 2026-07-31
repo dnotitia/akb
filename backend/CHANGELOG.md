@@ -7,6 +7,26 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+System administrators can now issue, list, rotate, and revoke exchange-only app
+credentials independently per app deployment. Credential plaintext is returned
+only by issue and rotation responses; PostgreSQL stores a non-secret prefix,
+generation, lifecycle timestamps, and a one-way proof hash. Exchange produces a
+separately signed short-lived app identity token with no Vault, installation,
+grant, capability, or resource claims. Rotation permits only the immediately
+previous proof during the configured overlap while binding newly exchanged
+tokens to the current generation, and rotation or revocation immediately makes
+older app tokens unusable.
+
+The app authorization seam rechecks the current credential generation, active
+installation, active grant generation, exact capability, Vault, and owned
+resource on every request. Only an explicit control-plane capability allowlist
+can pass; user membership, impersonation, documents, arbitrary tables, and raw
+SQL remain structurally unavailable to app tokens. App credentials and tokens
+are rejected by existing JWT, PAT, service-key, REST, and MCP user-auth paths.
+Credential lifecycle, exchange outcomes, and capability decisions emit bounded
+correlation-aware audit metadata without credential, token, cookie, or request
+body content. Existing user authentication and registry rows remain unchanged.
+
 An additive app desired-state registry now stores stable app definitions,
 immutable versioned release manifests, one installation per app/Vault pair,
 monotonic capability grants, and explicit owned or retained resources. Database

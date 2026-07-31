@@ -1019,6 +1019,15 @@ def _jwt_algorithm(token: str) -> str | None:
     return alg if isinstance(alg, str) else None
 
 
+def _jwt_type(token: str) -> str | None:
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        return None
+    token_type = header.get("typ")
+    return token_type if isinstance(token_type, str) else None
+
+
 async def resolve_akb_session_authorization(
     authorization: str,
 ) -> AuthenticatedUser | None:
@@ -1032,7 +1041,11 @@ async def resolve_akb_session_authorization(
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization[7:]
-    if token.startswith("akb_") or _jwt_algorithm(token) != "HS256":
+    if (
+        token.startswith("akb_")
+        or _jwt_type(token) == "AKB-APP"
+        or _jwt_algorithm(token) != "HS256"
+    ):
         return None
     return await _resolve_akb_session_jwt(token)
 
@@ -1073,6 +1086,12 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     # PAT (starts with akb_)
     if token.startswith("akb_"):
         return await _resolve_pat(token)
+
+    # App identity is a separate principal class. Reject its explicit type
+    # before any user lookup even under an unsafe operator configuration where
+    # the two signing secrets accidentally match.
+    if _jwt_type(token) == "AKB-APP":
+        return None
 
     # JWT — discriminate by `alg` header. AKB-issued JWTs are HS256;
     # Keycloak access tokens are RS256. We pick the verifier from the

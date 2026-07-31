@@ -1,7 +1,9 @@
 """Shared dependencies for API routes."""
 
 from dataclasses import dataclass
+import re
 from typing import NoReturn
+import uuid
 
 from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,11 +18,18 @@ from app.services.auth_service import (
     resolve_token,
     token_has_scope,
 )
+from app.services.app_identity_service import (
+    AppPrincipal,
+    record_app_audit,
+    resolve_app_authorization,
+)
 
 bearer_auth = HTTPBearer(auto_error=False, scheme_name="bearerAuth")
 
 _CLAIMS_HEADER = "x-akb-claims"
 _DELEGATED_AUTH_HEADER = "X-Akb-Delegated-Authorization"
+_CORRELATION_HEADER = "x-correlation-id"
+_SAFE_CORRELATION = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 @dataclass(frozen=True)
@@ -28,6 +37,13 @@ class DelegatedActor:
     user: AuthenticatedUser
     service_user_id: str
     service_token_id: str
+
+
+def request_correlation_id(request: Request) -> str:
+    supplied = request.headers.get(_CORRELATION_HEADER)
+    if supplied and _SAFE_CORRELATION.fullmatch(supplied):
+        return supplied
+    return str(uuid.uuid4())
 
 
 def _required_scope_for_request(request: Request) -> str:
@@ -152,3 +168,21 @@ async def get_optional_user(
         return None
     _apply_claim_header(request, user)
     return user
+
+
+async def get_current_app(
+    request: Request,
+    _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
+) -> AppPrincipal:
+    """Resolve only an AKB app token; user JWT/PAT/service keys are rejected."""
+    authorization = request.headers.get("authorization")
+    principal = await resolve_app_authorization(authorization or "")
+    if principal is None:
+        record_app_audit(
+            "app.token.denied",
+            correlation_id=request_correlation_id(request),
+            outcome="error",
+            reason="invalid_or_stale_app_token",
+        )
+        raise HTTPException(status_code=401, detail="Invalid or expired app token")
+    return principal

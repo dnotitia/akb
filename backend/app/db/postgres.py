@@ -217,6 +217,7 @@ async def _apply_migrations() -> None:
         "045_vault_write_grant_actions.py",      # additive action limits; existing grants backfill to wildcard
         "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
         "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
+        "048_app_credentials.py",                 # exchange-only deployment credentials for app principals
     ):
         if filename in applied:
             continue

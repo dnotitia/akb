@@ -17,7 +17,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.openapi_contract import install_openapi_contract
 from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
-from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
+from app.api.routes import access, activity, agent_sessions, app_identity, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
 from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker, tool_usage
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -209,6 +209,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
 
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
+app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
