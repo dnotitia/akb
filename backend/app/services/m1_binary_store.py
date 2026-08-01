@@ -1,21 +1,32 @@
 """Measurement-only BinaryStore comparators for M1 C8/W4.
 
-They are deliberately not wired to the public File service.  A run selects one
-driver; it never falls back or dual-writes.  A prepared CAS object is private
-until the caller's logical publication callback succeeds.
+The comparators are intentionally not wired into the public File service.  A
+measurement run selects exactly one driver; there is no fallback or dual write.
+CAS bytes may exist before logical publication, but no caller can open them
+through a logical File until the publication transaction succeeds.
 """
+
 from __future__ import annotations
 
 import hashlib
 import os
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
+
+from botocore.exceptions import ClientError
 
 from app.exceptions import ValidationError
 
 
-class BinaryStoreError(RuntimeError): pass
+_TENANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class BinaryStoreError(RuntimeError):
+    """A selected BinaryStore cannot safely fulfil the requested operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +35,11 @@ class PreparedBinary:
     digest: str
     size: int
     driver: str
+
+
+def _validate_tenant(tenant: str) -> None:
+    if not _TENANT_RE.fullmatch(tenant):
+        raise ValidationError("invalid measurement tenant")
 
 
 def _verify(data: bytes, digest: str | None, size: int | None) -> tuple[str, int]:
@@ -36,67 +52,183 @@ def _verify(data: bytes, digest: str | None, size: int | None) -> tuple[str, int
 
 
 class BinaryStore(Protocol):
-    def prepare_verified(self, tenant: str, data: bytes, expected_digest: str | None, expected_size: int | None) -> PreparedBinary: ...
+    driver: str
+
+    def prepare_verified(
+        self,
+        tenant: str,
+        data: bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedBinary: ...
+
     def open_verified(self, tenant: str, prepared: PreparedBinary) -> bytes: ...
-    def delete(self, tenant: str, prepared: PreparedBinary) -> None: ...
+
+    def stat_verified(self, tenant: str, prepared: PreparedBinary) -> int: ...
 
 
 class FilesystemCAS:
-    """Content-addressed immutable bytes under a measurement-owned root."""
+    """Content-addressed immutable bytes under one measurement-owned root."""
+
     driver = "fscas"
-    def __init__(self, root: Path): self.root = root.resolve()
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+
     def _path(self, tenant: str, digest: str) -> Path:
-        if not tenant or "/" in tenant or ".." in tenant: raise ValidationError("invalid measurement tenant")
+        _validate_tenant(tenant)
+        if not _DIGEST_RE.fullmatch(digest):
+            raise ValidationError("invalid sha256 digest")
         return self.root / tenant / "sha256" / digest[:2] / digest
-    def prepare_verified(self, tenant: str, data: bytes, expected_digest: str | None = None, expected_size: int | None = None) -> PreparedBinary:
-        digest, size = _verify(data, expected_digest, expected_size); path = self._path(tenant, digest); path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _validated_path(self, tenant: str, prepared: PreparedBinary) -> Path:
+        if prepared.driver != self.driver:
+            raise BinaryStoreError("wrong BinaryStore driver")
+        expected = self._path(tenant, prepared.digest)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            existing = path.read_bytes(); _verify(existing, digest, size)
-        else:
-            with os.fdopen(fd, "wb") as out: out.write(data); out.flush(); os.fsync(out.fileno())
+            supplied = (self.root / prepared.locator).resolve(strict=False)
+            supplied.relative_to(self.root)
+        except (OSError, ValueError) as exc:
+            raise BinaryStoreError("FilesystemCAS locator escapes the selected root") from exc
+        if supplied != expected:
+            raise BinaryStoreError("FilesystemCAS locator does not match tenant and digest")
+        return expected
+
+    def prepare_verified(
+        self,
+        tenant: str,
+        data: bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedBinary:
+        digest, size = _verify(data, expected_digest, expected_size)
+        path = self._path(tenant, digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.parent / f".{digest}.{uuid.uuid4().hex}.tmp"
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                _verify(temporary.read_bytes(), digest, size)
+                try:
+                    # link(2) is an atomic no-replace publication on the same
+                    # filesystem. A crash before it leaves only a private temp;
+                    # a crash after it leaves a fully fsynced immutable object.
+                    os.link(temporary, path)
+                except FileExistsError:
+                    _verify(path.read_bytes(), digest, size)
+            except Exception:
+                raise
+            finally:
+                temporary.unlink(missing_ok=True)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
         return PreparedBinary(str(path.relative_to(self.root)), digest, size, self.driver)
+
     def open_verified(self, tenant: str, prepared: PreparedBinary) -> bytes:
-        if prepared.driver != self.driver: raise BinaryStoreError("wrong BinaryStore driver")
-        data: bytes = (self.root / prepared.locator).read_bytes(); _verify(data, prepared.digest, prepared.size); return data
-    def delete(self, tenant: str, prepared: PreparedBinary) -> None:
-        # append-only M1 profile: logical delete makes it non-visible; physical
-        # GC is intentionally outside this measurement contract.
-        return None
+        path = self._validated_path(tenant, prepared)
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise BinaryStoreError("FilesystemCAS object is missing") from exc
+        _verify(data, prepared.digest, prepared.size)
+        return data
+
+    def stat_verified(self, tenant: str, prepared: PreparedBinary) -> int:
+        path = self._validated_path(tenant, prepared)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise BinaryStoreError("FilesystemCAS object is missing") from exc
+        if size != prepared.size:
+            raise BinaryStoreError("FilesystemCAS object size mismatch")
+        return size
 
 
 class S3CAS:
-    """Current S3 adapter comparator, using conditional content-addressed put."""
+    """S3 content-addressed comparator with conditional immutable creation."""
+
     driver = "s3"
-    def __init__(self, bucket: str, client): self.bucket, self.client = bucket, client
+
+    def __init__(self, bucket: str, client):
+        if not bucket:
+            raise ValidationError("measurement S3 bucket is required")
+        self.bucket = bucket
+        self.client = client
+
     def _key(self, tenant: str, digest: str) -> str:
-        if not tenant or "/" in tenant or ".." in tenant: raise ValidationError("invalid measurement tenant")
+        _validate_tenant(tenant)
+        if not _DIGEST_RE.fullmatch(digest):
+            raise ValidationError("invalid sha256 digest")
         return f"m1-binary/{tenant}/sha256/{digest[:2]}/{digest}"
-    def prepare_verified(self, tenant: str, data: bytes, expected_digest: str | None = None, expected_size: int | None = None) -> PreparedBinary:
-        digest, size = _verify(data, expected_digest, expected_size); key = self._key(tenant, digest)
-        try: self.client.put_object(Bucket=self.bucket, Key=key, Body=data, IfNoneMatch="*")
-        except Exception: pass  # existing object is adopted only after revalidation below
-        try: got = self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
-        except Exception as exc: raise BinaryStoreError("S3 CAS prepare/open failed") from exc
-        _verify(got, digest, size); return PreparedBinary(key, digest, size, self.driver)
+
+    def _validated_key(self, tenant: str, prepared: PreparedBinary) -> str:
+        if prepared.driver != self.driver:
+            raise BinaryStoreError("wrong BinaryStore driver")
+        expected = self._key(tenant, prepared.digest)
+        if prepared.locator != expected:
+            raise BinaryStoreError("S3 CAS locator does not match tenant and digest")
+        return expected
+
+    @staticmethod
+    def _is_existing_object(exc: ClientError) -> bool:
+        response = exc.response or {}
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = str(response.get("Error", {}).get("Code", ""))
+        return status in {409, 412} or code in {
+            "409",
+            "412",
+            "ConditionalRequestConflict",
+            "PreconditionFailed",
+        }
+
+    def prepare_verified(
+        self,
+        tenant: str,
+        data: bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedBinary:
+        digest, size = _verify(data, expected_digest, expected_size)
+        key = self._key(tenant, digest)
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if not self._is_existing_object(exc):
+                raise BinaryStoreError("S3 CAS conditional publish failed") from exc
+        prepared = PreparedBinary(key, digest, size, self.driver)
+        self.open_verified(tenant, prepared)
+        return prepared
+
     def open_verified(self, tenant: str, prepared: PreparedBinary) -> bytes:
-        if prepared.driver != self.driver: raise BinaryStoreError("wrong BinaryStore driver")
-        try: data = self.client.get_object(Bucket=self.bucket, Key=prepared.locator)["Body"].read()
-        except Exception as exc: raise BinaryStoreError("S3 CAS object is missing") from exc
-        _verify(data, prepared.digest, prepared.size); return data
-    def delete(self, tenant: str, prepared: PreparedBinary) -> None: return None
+        key = self._validated_key(tenant, prepared)
+        try:
+            data = self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        except Exception as exc:
+            raise BinaryStoreError("S3 CAS object is missing") from exc
+        _verify(data, prepared.digest, prepared.size)
+        return data
 
-
-class MeasurementUpload:
-    """Initiate/transfer/confirm state: bytes are not visible before confirm."""
-    def __init__(self, store: BinaryStore, tenant: str):
-        self.store, self.tenant = store, tenant
-        self._bytes: bytes | None = None
-    def transfer(self, data: bytes) -> None: self._bytes = data
-    def confirm(self, expected_digest: str | None, expected_size: int | None, publish: Callable[[PreparedBinary], None]) -> tuple[str, PreparedBinary | None]:
-        if self._bytes is None: return "unconfirmed_not_visible", None
-        prepared = self.store.prepare_verified(self.tenant, self._bytes, expected_digest, expected_size)
-        try: publish(prepared)
-        except Exception: return "failed_db_publish_unconfirmed", None
-        return "confirmed", prepared
+    def stat_verified(self, tenant: str, prepared: PreparedBinary) -> int:
+        key = self._validated_key(tenant, prepared)
+        try:
+            size = int(self.client.head_object(Bucket=self.bucket, Key=key)["ContentLength"])
+        except Exception as exc:
+            raise BinaryStoreError("S3 CAS object is missing") from exc
+        if size != prepared.size:
+            raise BinaryStoreError("S3 CAS object size mismatch")
+        return size
