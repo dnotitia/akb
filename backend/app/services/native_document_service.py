@@ -230,11 +230,15 @@ class NativeDocumentService(DocumentService):
         path_identity = uuid.uuid4()
         if req.slug and await self._current_path_is_owned(vault_id, base_path):
             raise ConflictError(f"Document already exists at path: {base_path}")
-        final_path = await self._resolve_native_free_path(
-            vault_id,
-            base_path,
-            path_identity,
-            aliases_own_path=False,
+        final_path = (
+            base_path
+            if req.slug
+            else await self._resolve_native_free_path(
+                vault_id,
+                base_path,
+                path_identity,
+                aliases_own_path=False,
+            )
         )
 
         frontmatter = _build_frontmatter(req, now)

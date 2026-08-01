@@ -1145,6 +1145,62 @@ async def test_public_move_response_hash_is_derived_from_the_committed_head():
         assert moved.content_hash == current.content_hash
 
 
+async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        base_path = "notes/explicit-race.md"
+
+        class ExplicitRaceDocumentService(NativeDocumentService):
+            raced = False
+            winner_resource_id: uuid.UUID | None = None
+
+            async def _current_path_is_owned(self, checked_vault_id, path):
+                owned = await super()._current_path_is_owned(checked_vault_id, path)
+                if path == base_path and not self.raced:
+                    self.raced = True
+                    winner = await NativeRevisionService(pool).create_text(
+                        namespace_id=checked_vault_id,
+                        surface="document",
+                        path=path,
+                        payload="competitor",
+                        actor="explicit-slug-racer",
+                        mutation_id=uuid.uuid4(),
+                    )
+                    self.winner_resource_id = winner.resource_id
+                return owned
+
+        service = ExplicitRaceDocumentService(pool=pool)
+        with pytest.raises(ConflictError, match=f"already exists at path: {base_path}"):
+            await service.put(
+                DocumentPutRequest(
+                    vault=vault,
+                    collection="notes",
+                    slug="explicit-race",
+                    title="Explicit race loser",
+                    content="must not be suffixed",
+                ),
+                agent_id="loser",
+            )
+
+        assert service.raced is True
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT resource_id, current_path
+                  FROM native_resources
+                 WHERE namespace_id = $1
+                   AND lifecycle = 'live'
+                   AND current_path LIKE 'notes/explicit-race%'
+                """,
+                vault_id,
+            )
+        assert [(row["resource_id"], row["current_path"]) for row in rows] == [
+            (service.winner_resource_id, base_path)
+        ]
+
+
 async def test_concurrent_title_derived_puts_allocate_distinct_paths():
     async with _fresh_database() as (pool, vault_id):
         async with pool.acquire() as conn:
