@@ -7,6 +7,7 @@ constructs a Git service nor writes the legacy document projection.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 from typing import NoReturn
@@ -60,8 +61,6 @@ class NativeRevisionUnsupportedSurfaceError(AKBError):
 class NativeDocumentService(DocumentService):
     """Document lifecycle adapter preserving existing request/response models."""
 
-    _UNPINNED_RETRY_LIMIT = 4
-
     def __init__(self, *, pool: asyncpg.Pool | None = None):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
@@ -80,6 +79,16 @@ class NativeDocumentService(DocumentService):
 
     async def _native(self) -> NativeRevisionService:
         return NativeRevisionService(await self._pool())
+
+    @staticmethod
+    async def _yield_after_head_race(race_count: int) -> None:
+        """Cooperate under sustained writers without inventing a 409 limit.
+
+        ``asyncio.sleep`` is cancellation-safe: request cancellation interrupts
+        the retry instead of leaving a detached publication loop behind.
+        """
+        delay = min(0.001 * (2 ** min(race_count, 5)), 0.032)
+        await asyncio.sleep(delay)
 
     async def _current(
         self,
@@ -285,9 +294,9 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
-        explicit_occ = req.expected_commit is not None or req.expected_content_hash is not None
-        last_conflict: ConflictError | None = None
-        for attempt in range(self._UNPINNED_RETRY_LIMIT):
+        exact_head_pinned = req.expected_commit is not None
+        race_count = 0
+        while True:
             vault_id, current = await self._current(vault, doc_ref)
             if req.expected_commit and req.expected_commit != current.revision_id:
                 raise ConflictError(
@@ -336,13 +345,10 @@ class NativeDocumentService(DocumentService):
                     summary=summary,
                 )
             except ConflictError as exc:
-                if (
-                    explicit_occ
-                    or not str(exc).startswith("Native Revision conflict:")
-                    or attempt + 1 == self._UNPINNED_RETRY_LIMIT
-                ):
+                if exact_head_pinned or not str(exc).startswith("Native Revision conflict:"):
                     raise
-                last_conflict = exc
+                await self._yield_after_head_race(race_count)
+                race_count += 1
                 continue
             return DocumentPutResponse(
                 uri=doc_uri(vault, result.path),
@@ -358,8 +364,6 @@ class NativeDocumentService(DocumentService):
                 chunks_indexed=0,
                 entities_found=0,
             )
-        assert last_conflict is not None
-        raise last_conflict
 
     async def move(
         self,
@@ -433,8 +437,8 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if not old_string:
             raise EditError("old_string cannot be empty")
-        last_conflict: ConflictError | None = None
-        for attempt in range(self._UNPINNED_RETRY_LIMIT):
+        race_count = 0
+        while True:
             _, current = await self._current(vault, doc_ref)
             if base_commit and base_commit != current.revision_id:
                 raise ConflictError(f"current_commit moved: expected {base_commit}, actual {current.revision_id}")
@@ -484,15 +488,14 @@ class NativeDocumentService(DocumentService):
                     agent_id=agent_id,
                 )
             except ConflictError as exc:
-                if base_commit is not None or attempt + 1 == self._UNPINNED_RETRY_LIMIT:
+                if base_commit is not None:
                     raise
                 if not (
                     str(exc).startswith("Native Revision conflict:") or str(exc).startswith("current_commit moved:")
                 ):
                     raise
-                last_conflict = exc
-        assert last_conflict is not None
-        raise last_conflict
+                await self._yield_after_head_race(race_count)
+                race_count += 1
 
     async def delete(self, vault: str, doc_ref: str, agent_id: str | None = None) -> bool:
         vault_id, current = await self._current(vault, doc_ref)

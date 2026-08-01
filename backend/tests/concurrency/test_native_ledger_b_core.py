@@ -472,6 +472,252 @@ async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():
         assert current.content == "ALPHA one\nBETA two"
 
 
+@pytest.mark.parametrize("operation", ["update", "edit"])
+async def test_unpinned_public_mutation_survives_more_than_four_successive_head_races(
+    operation: str,
+):
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug=f"many-races-{operation}",
+                title="Many races",
+                content="alpha body",
+            ),
+            agent_id="creator",
+        )
+
+        class SixRaceNativeService(NativeRevisionService):
+            forced_races = 0
+
+            async def replace_text(self, **kwargs):
+                if kwargs["actor"] == "target" and self.forced_races < 6:
+                    self.forced_races += 1
+                    current = await self.get_current_reference(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        reference=kwargs["path"],
+                    )
+                    await NativeRevisionService(pool).replace_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=current.path,
+                        payload=current.text,
+                        actor=f"forced-racer-{self.forced_races}",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=current.revision_id,
+                    )
+                return await super().replace_text(**kwargs)
+
+        native = SixRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        document_service._native = injected_native  # type: ignore[method-assign]
+        if operation == "update":
+            await document_service.update(
+                vault,
+                created.path,
+                DocumentUpdateRequest(title="Eventually published"),
+                agent_id="target",
+            )
+        else:
+            await document_service.edit(
+                vault,
+                created.path,
+                "alpha",
+                "omega",
+                agent_id="target",
+            )
+
+        assert native.forced_races == 6
+        current = await document_service.get(vault, created.path)
+        if operation == "update":
+            assert current.title == "Eventually published"
+            assert current.content == "alpha body"
+        else:
+            assert current.content == "omega body"
+
+
+async def test_content_hash_only_update_retries_across_metadata_head_change():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        competitor = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="hash-metadata-race",
+                title="Original title",
+                content="stable body",
+            ),
+            agent_id="creator",
+        )
+        original = await target.get(vault, created.path)
+
+        class MetadataRaceNativeService(NativeRevisionService):
+            raced = False
+
+            async def replace_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    await competitor.update(
+                        vault,
+                        created.path,
+                        DocumentUpdateRequest(title="Concurrent metadata"),
+                        agent_id="metadata-racer",
+                    )
+                return await super().replace_text(**kwargs)
+
+        native = MetadataRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        await target.update(
+            vault,
+            created.path,
+            DocumentUpdateRequest(
+                tags=["target"],
+                expected_content_hash=original.content_hash,
+            ),
+            agent_id="target",
+        )
+
+        current = await target.get(vault, created.path)
+        assert native.raced is True
+        assert current.title == "Concurrent metadata"
+        assert current.tags == ["target"]
+        assert current.content == "stable body"
+
+
+async def test_content_hash_only_update_conflicts_after_concurrent_body_change():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        competitor = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="hash-body-race",
+                title="Original title",
+                content="original body",
+            ),
+            agent_id="creator",
+        )
+        original = await target.get(vault, created.path)
+
+        class BodyRaceNativeService(NativeRevisionService):
+            raced = False
+
+            async def replace_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    await competitor.update(
+                        vault,
+                        created.path,
+                        DocumentUpdateRequest(content="changed body"),
+                        agent_id="body-racer",
+                    )
+                return await super().replace_text(**kwargs)
+
+        native = BodyRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        with pytest.raises(ConflictError, match="content_hash moved"):
+            await target.update(
+                vault,
+                created.path,
+                DocumentUpdateRequest(
+                    title="Must not publish",
+                    expected_content_hash=original.content_hash,
+                ),
+                agent_id="target",
+            )
+
+        current = await target.get(vault, created.path)
+        assert native.raced is True
+        assert current.title == "Original title"
+        assert current.content == "changed body"
+
+
+async def test_expected_commit_update_remains_single_attempt_across_head_race():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="exact-head-race",
+                title="Original title",
+                content="stable body",
+            ),
+            agent_id="creator",
+        )
+
+        class ExactHeadRaceNativeService(NativeRevisionService):
+            race_count = 0
+
+            async def replace_text(self, **kwargs):
+                if kwargs["actor"] == "target" and self.race_count == 0:
+                    self.race_count += 1
+                    current = await self.get_current_reference(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        reference=kwargs["path"],
+                    )
+                    await NativeRevisionService(pool).replace_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=current.path,
+                        payload=current.text,
+                        actor="exact-head-racer",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=current.revision_id,
+                    )
+                return await super().replace_text(**kwargs)
+
+        native = ExactHeadRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        with pytest.raises(ConflictError, match="Native Revision conflict"):
+            await target.update(
+                vault,
+                created.path,
+                DocumentUpdateRequest(
+                    title="Must not publish",
+                    expected_commit=created.commit_hash,
+                ),
+                agent_id="target",
+            )
+
+        assert native.race_count == 1
+        current = await target.get(vault, created.path)
+        assert current.title == "Original title"
+
+
 async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect():
     async with _fresh_database() as (pool, vault_id):
         service = NativeRevisionService(pool)
