@@ -237,19 +237,35 @@ class NativeDocumentService(DocumentService):
             frontmatter["created_by"] = agent_id
         raw = _compose_markdown(frontmatter, req.content)
         actor = agent_id or "unknown"
-        message = f"[put] {final_path}\n\nagent: {actor}\naction: create\nsummary: {req.title}"
-        result = await (await self._native()).create_text(
-            namespace_id=vault_id,
-            surface="document",
-            path=final_path,
-            payload=raw,
-            actor=actor,
-            mutation_id=uuid.uuid4(),
-            resource_id=path_identity,
-            message=message,
-            subject=f"[put] {final_path}",
-            summary=req.title,
-        )
+        mutation_id = uuid.uuid4()
+        race_count = 0
+        while True:
+            message = f"[put] {final_path}\n\nagent: {actor}\naction: create\nsummary: {req.title}"
+            try:
+                result = await (await self._native()).create_text(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=final_path,
+                    payload=raw,
+                    actor=actor,
+                    mutation_id=mutation_id,
+                    resource_id=path_identity,
+                    message=message,
+                    subject=f"[put] {final_path}",
+                    summary=req.title,
+                )
+                break
+            except ConflictError as exc:
+                if req.slug or not str(exc).startswith("Native Resource already exists at path:"):
+                    raise
+                await self._yield_after_head_race(race_count)
+                race_count += 1
+                final_path = await self._resolve_native_free_path(
+                    vault_id,
+                    base_path,
+                    path_identity,
+                    aliases_own_path=False,
+                )
         content_hash = _certified_content_hash(raw)
         return DocumentPutResponse(
             uri=doc_uri(req.vault, final_path),
@@ -294,10 +310,29 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
+        vault_id, current = await self._current(vault, doc_ref)
+        return await self._update_from_snapshot(
+            vault=vault,
+            vault_id=vault_id,
+            current=current,
+            req=req,
+            agent_id=agent_id,
+        )
+
+    async def _update_from_snapshot(
+        self,
+        *,
+        vault: str,
+        vault_id: uuid.UUID,
+        current: NativeRevisionSnapshot,
+        req: DocumentUpdateRequest,
+        agent_id: str | None,
+    ) -> DocumentPutResponse:
         exact_head_pinned = req.expected_commit is not None
+        resource_id = current.resource_id
+        native = await self._native()
         race_count = 0
         while True:
-            vault_id, current = await self._current(vault, doc_ref)
             if req.expected_commit and req.expected_commit != current.revision_id:
                 raise ConflictError(
                     f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
@@ -329,7 +364,7 @@ class NativeDocumentService(DocumentService):
             summary = req.message or f"Update {current.path}"
             message = f"[update] {current.path}\n\nagent: {actor}\naction: update\nsummary: {summary}"
             try:
-                result = await (await self._native()).replace_text(
+                result = await native.replace_text(
                     namespace_id=vault_id,
                     surface="document",
                     path=current.path,
@@ -340,15 +375,23 @@ class NativeDocumentService(DocumentService):
                     # attempt. Unpinned callers are transparently recomputed
                     # against the new Head; explicit predicates fail closed.
                     expected_revision_id=current.revision_id,
+                    expected_resource_id=resource_id,
                     message=message,
                     subject=f"[update] {current.path}",
                     summary=summary,
                 )
             except ConflictError as exc:
-                if exact_head_pinned or not str(exc).startswith("Native Revision conflict:"):
+                if exact_head_pinned or not str(exc).startswith(
+                    ("Native Revision conflict:", "Native Resource conflict:")
+                ):
                     raise
                 await self._yield_after_head_race(race_count)
                 race_count += 1
+                current = await native.get_current_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=resource_id,
+                )
                 continue
             return DocumentPutResponse(
                 uri=doc_uri(vault, result.path),
@@ -377,43 +420,78 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if collection is None and slug is None:
             raise ValidationError("move requires at least one of collection or slug")
-        vault_id, current = await self._current(vault, doc_ref)
-        current_collection, current_slug = split_doc_path(current.path)
-        next_collection = normalize_collection_path(collection) if collection is not None else current_collection
-        next_slug = (
-            slugify(slug)
-            if slug
-            else strip_own_suffix(
-                current_slug,
-                current.resource_id,
-            )
-        )
-        base_path = doc_path(next_collection, next_slug)
-        if base_path == current.path:
-            raise ValidationError("move is a no-op: the target path equals the current path")
-        next_path = await self._resolve_native_free_path(vault_id, base_path, current.resource_id)
-        if slug and next_path != base_path:
-            raise ConflictError(f"Document already exists at path: {base_path}")
+        requested_collection = normalize_collection_path(collection) if collection is not None else None
+        requested_slug = slugify(slug) if slug else None
         actor = agent_id or "unknown"
-        summary = message or f"{current.path} -> {next_path}"
-        history_message = f"[move] {current.path} -> {next_path}\n\nagent: {actor}\naction: move\nsummary: {summary}"
-        result = await (await self._native()).move_text(
-            namespace_id=vault_id,
-            surface="document",
-            path=current.path,
-            path_to=next_path,
-            actor=actor,
-            mutation_id=uuid.uuid4(),
-            expected_revision_id=None,
-            message=history_message,
-            subject=f"[move] {current.path} -> {next_path}",
-            summary=summary,
-        )
-        _, body = _parse_markdown(current.text)
+        vault_id, current = await self._current(vault, doc_ref)
+        resource_id = current.resource_id
+        native = await self._native()
+        race_count = 0
+        while True:
+            current_collection, current_slug = split_doc_path(current.path)
+            next_collection = requested_collection if requested_collection is not None else current_collection
+            next_slug = (
+                requested_slug
+                if requested_slug is not None
+                else strip_own_suffix(
+                    current_slug,
+                    current.resource_id,
+                )
+            )
+            base_path = doc_path(next_collection, next_slug)
+            if base_path == current.path:
+                raise ValidationError("move is a no-op: the target path equals the current path")
+            next_path = await self._resolve_native_free_path(vault_id, base_path, current.resource_id)
+            if requested_slug is not None and next_path != base_path:
+                raise ConflictError(f"Document already exists at path: {base_path}")
+            summary = message or f"{current.path} -> {next_path}"
+            history_message = (
+                f"[move] {current.path} -> {next_path}\n\n"
+                f"agent: {actor}\naction: move\nsummary: {summary}"
+            )
+            try:
+                result = await native.move_text(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=current.path,
+                    path_to=next_path,
+                    actor=actor,
+                    mutation_id=uuid.uuid4(),
+                    expected_revision_id=current.revision_id,
+                    expected_resource_id=resource_id,
+                    message=history_message,
+                    subject=f"[move] {current.path} -> {next_path}",
+                    summary=summary,
+                )
+            except ConflictError as exc:
+                retryable_authority_race = str(exc).startswith(
+                    ("Native Revision conflict:", "Native Resource conflict:")
+                )
+                retryable_allocation_race = requested_slug is None and str(exc).startswith(
+                    ("Native Resource already exists at path:", "Native Resource alias already owns path:")
+                )
+                if not (retryable_authority_race or retryable_allocation_race):
+                    raise
+                await self._yield_after_head_race(race_count)
+                race_count += 1
+                current = await native.get_current_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=resource_id,
+                )
+                continue
+            committed = await native.get_resource_revision(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=result.resource_id,
+                revision_id=result.revision_id,
+            )
+            _, body = _parse_markdown(committed.text)
+            break
         return DocumentPutResponse(
-            uri=doc_uri(vault, next_path),
+            uri=doc_uri(vault, result.path),
             vault=vault,
-            path=next_path,
+            path=result.path,
             commit_hash=result.revision_id,
             current_commit=result.revision_id,
             previous_commit=result.parent_revision_id,
@@ -437,9 +515,11 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if not old_string:
             raise EditError("old_string cannot be empty")
+        vault_id, current = await self._current(vault, doc_ref)
+        resource_id = current.resource_id
+        native = await self._native()
         race_count = 0
         while True:
-            _, current = await self._current(vault, doc_ref)
             if base_commit and base_commit != current.revision_id:
                 raise ConflictError(f"current_commit moved: expected {base_commit}, actual {current.revision_id}")
             _, body = _parse_markdown(current.text)
@@ -475,10 +555,11 @@ class NativeDocumentService(DocumentService):
                     entities_found=0,
                 )
             try:
-                return await self.update(
-                    vault,
-                    current.path,
-                    DocumentUpdateRequest(
+                return await self._update_from_snapshot(
+                    vault=vault,
+                    vault_id=vault_id,
+                    current=current,
+                    req=DocumentUpdateRequest(
                         content=new_body,
                         message=message,
                         # Pin each derived body to the snapshot it edited.
@@ -491,26 +572,48 @@ class NativeDocumentService(DocumentService):
                 if base_commit is not None:
                     raise
                 if not (
-                    str(exc).startswith("Native Revision conflict:") or str(exc).startswith("current_commit moved:")
+                    str(exc).startswith(("Native Revision conflict:", "Native Resource conflict:"))
+                    or str(exc).startswith("current_commit moved:")
                 ):
                     raise
                 await self._yield_after_head_race(race_count)
                 race_count += 1
+                current = await native.get_current_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=resource_id,
+                )
 
     async def delete(self, vault: str, doc_ref: str, agent_id: str | None = None) -> bool:
         vault_id, current = await self._current(vault, doc_ref)
+        resource_id = current.resource_id
+        native = await self._native()
         actor = agent_id or "unknown"
-        await (await self._native()).delete_resource(
-            namespace_id=vault_id,
-            surface="document",
-            path=current.path,
-            actor=actor,
-            mutation_id=uuid.uuid4(),
-            expected_revision_id=None,
-            message=f"[delete] {current.path}\n\nagent: {actor}\naction: delete",
-            subject=f"[delete] {current.path}",
-        )
-        return True
+        race_count = 0
+        while True:
+            try:
+                await native.delete_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=current.path,
+                    actor=actor,
+                    mutation_id=uuid.uuid4(),
+                    expected_revision_id=current.revision_id,
+                    expected_resource_id=resource_id,
+                    message=f"[delete] {current.path}\n\nagent: {actor}\naction: delete",
+                    subject=f"[delete] {current.path}",
+                )
+                return True
+            except ConflictError as exc:
+                if not str(exc).startswith(("Native Revision conflict:", "Native Resource conflict:")):
+                    raise
+                await self._yield_after_head_race(race_count)
+                race_count += 1
+                current = await native.get_current_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=resource_id,
+                )
 
     async def history(self, vault: str, doc_ref: str, limit: int = 20) -> dict:
         vault_id = await self._vault_id(vault)

@@ -120,6 +120,8 @@ class NativeRevisionService:
         message: str | None,
         subject: str | None,
         summary: str | None,
+        requested_resource_id: uuid.UUID | None = None,
+        expected_resource_id: uuid.UUID | None = None,
     ) -> str:
         canonical = json.dumps(
             {
@@ -134,6 +136,10 @@ class NativeRevisionService:
                 "message": message,
                 "subject": subject,
                 "summary": summary,
+                "requested_resource_id": (
+                    str(requested_resource_id) if requested_resource_id is not None else None
+                ),
+                "expected_resource_id": str(expected_resource_id) if expected_resource_id is not None else None,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -154,6 +160,7 @@ class NativeRevisionService:
         message: str | None,
         subject: str | None,
         summary: str | None,
+        expected_resource_id: uuid.UUID | None = None,
     ) -> str:
         canonical = json.dumps(
             {
@@ -167,6 +174,7 @@ class NativeRevisionService:
                 "message": message,
                 "subject": subject,
                 "summary": summary,
+                "expected_resource_id": str(expected_resource_id) if expected_resource_id is not None else None,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -220,6 +228,7 @@ class NativeRevisionService:
         surface: str,
         reference: str,
         additional_paths: tuple[str, ...] = (),
+        expected_resource_id: uuid.UUID | None = None,
     ) -> dict:
         """Lock one live Resource before locking every path the mutation uses.
 
@@ -236,6 +245,11 @@ class NativeRevisionService:
         )
         if resolved is None:
             raise NotFoundError("Native Resource", reference)
+        if expected_resource_id is not None and resolved["resource_id"] != expected_resource_id:
+            raise ConflictError(
+                "Native Resource conflict: expected "
+                f"{expected_resource_id}, reference now resolves to {resolved['resource_id']}"
+            )
         resource = await self.repository.lock_resource(conn, resolved["resource_id"])
         if resource is None or resource["lifecycle"] != "live":
             raise NotFoundError("Native Resource", reference)
@@ -256,7 +270,7 @@ class NativeRevisionService:
         if confirmed is None:
             raise NotFoundError("Native Resource", reference)
         if confirmed["resource_id"] != resource["resource_id"]:
-            raise ConflictError(f"Native Resource reference changed while mutation waited: {reference}")
+            raise ConflictError(f"Native Resource conflict: reference changed while mutation waited: {reference}")
         return resource
 
     async def create_text(
@@ -297,6 +311,7 @@ class NativeRevisionService:
             message=message,
             subject=subject,
             summary=summary,
+            requested_resource_id=resource_id,
         )
         await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_create(
@@ -467,6 +482,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None = None,
+        expected_resource_id: uuid.UUID | None = None,
         message: str | None = None,
         subject: str | None = None,
         summary: str | None = None,
@@ -494,6 +510,7 @@ class NativeRevisionService:
             message=message,
             subject=subject,
             summary=summary,
+            expected_resource_id=expected_resource_id,
         )
         await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_replace(
@@ -503,6 +520,7 @@ class NativeRevisionService:
             actor=actor,
             mutation_id=mutation_id,
             expected_revision_id=expected_revision_id,
+            expected_resource_id=expected_resource_id,
             message=message,
             subject=subject,
             summary=summary,
@@ -521,6 +539,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None,
+        expected_resource_id: uuid.UUID | None,
         message: str | None,
         subject: str | None,
         summary: str | None,
@@ -545,6 +564,7 @@ class NativeRevisionService:
                     namespace_id=namespace_id,
                     surface=surface,
                     reference=path,
+                    expected_resource_id=expected_resource_id,
                 )
                 current_path = resource["current_path"]
                 parent_revision_id = resource["head_revision_id"]
@@ -643,6 +663,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None = None,
+        expected_resource_id: uuid.UUID | None = None,
         message: str | None = None,
         subject: str | None = None,
         summary: str | None = None,
@@ -669,6 +690,7 @@ class NativeRevisionService:
             message=message,
             subject=subject,
             summary=summary,
+            expected_resource_id=expected_resource_id,
         )
         result = await self._publish_move(
             namespace_id=namespace_id,
@@ -678,6 +700,7 @@ class NativeRevisionService:
             actor=actor,
             mutation_id=mutation_id,
             expected_revision_id=expected_revision_id,
+            expected_resource_id=expected_resource_id,
             message=message,
             subject=subject,
             summary=summary,
@@ -696,6 +719,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None,
+        expected_resource_id: uuid.UUID | None,
         message: str | None,
         subject: str | None,
         summary: str | None,
@@ -721,6 +745,7 @@ class NativeRevisionService:
                         surface=surface,
                         reference=path,
                         additional_paths=(path_to,),
+                        expected_resource_id=expected_resource_id,
                     )
                     resource_id = resource["resource_id"]
                     old_path = resource["current_path"]
@@ -867,6 +892,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None = None,
+        expected_resource_id: uuid.UUID | None = None,
         message: str | None = None,
         subject: str | None = None,
         summary: str | None = None,
@@ -889,6 +915,7 @@ class NativeRevisionService:
             message=message,
             subject=subject,
             summary=summary,
+            expected_resource_id=expected_resource_id,
         )
         result = await self._publish_delete(
             namespace_id=namespace_id,
@@ -897,6 +924,7 @@ class NativeRevisionService:
             actor=actor,
             mutation_id=mutation_id,
             expected_revision_id=expected_revision_id,
+            expected_resource_id=expected_resource_id,
             message=message,
             subject=subject,
             summary=summary,
@@ -914,6 +942,7 @@ class NativeRevisionService:
         actor: str,
         mutation_id: uuid.UUID,
         expected_revision_id: str | None,
+        expected_resource_id: uuid.UUID | None,
         message: str | None,
         subject: str | None,
         summary: str | None,
@@ -936,6 +965,7 @@ class NativeRevisionService:
                     namespace_id=namespace_id,
                     surface=surface,
                     reference=path,
+                    expected_resource_id=expected_resource_id,
                 )
                 resource_id = resource["resource_id"]
                 current_path = resource["current_path"]
@@ -1058,6 +1088,24 @@ class NativeRevisionService:
             raise NotFoundError("Native Resource", reference)
         return await self._snapshot_from_row(row)
 
+    async def get_current_resource(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        resource_id: uuid.UUID,
+    ) -> NativeRevisionSnapshot:
+        """Read the current Head while preserving Resource identity."""
+        row = await self.repository.get_resource_head(resource_id=resource_id)
+        if (
+            row is None
+            or row["namespace_id"] != namespace_id
+            or row["surface"] != surface
+            or row["lifecycle"] != "live"
+        ):
+            raise NotFoundError("Native Resource", str(resource_id))
+        return await self._snapshot_from_row(row)
+
     async def get_revision(
         self,
         *,
@@ -1076,6 +1124,27 @@ class NativeRevisionService:
             raise NotFoundError("Native Resource", reference)
         row = await self.repository.get_revision(
             resource_id=resource["resource_id"],
+            revision_id=revision_id,
+        )
+        if row is None or row["namespace_id"] != namespace_id or row["surface"] != surface:
+            raise NotFoundError("Native Revision", revision_id)
+        if row["payload_manifest_id"] is None:
+            raise NotFoundError("Native Revision payload", revision_id)
+        row["path"] = row["path_at_revision"]
+        return await self._snapshot_from_row(row)
+
+    async def get_resource_revision(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        resource_id: uuid.UUID,
+        revision_id: str,
+    ) -> NativeRevisionSnapshot:
+        """Read an exact committed Revision without relying on a mutable path."""
+        self._validate_expected_revision(revision_id)
+        row = await self.repository.get_revision(
+            resource_id=resource_id,
             revision_id=revision_id,
         )
         if row is None or row["namespace_id"] != namespace_id or row["surface"] != surface:

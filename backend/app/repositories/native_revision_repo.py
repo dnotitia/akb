@@ -106,21 +106,26 @@ class NativeRevisionRepository:
         *,
         for_update: bool = False,
     ) -> dict | None:
+        """Return the namespace-wide live owner of ``path``.
+
+        ``surface`` is retained in the call shape for symmetry with the
+        Resource APIs, but paths are one authority namespace across Document
+        and File Resources.
+        """
+        del surface
         suffix = " FOR UPDATE" if for_update else ""
         row = await conn.fetchrow(
             """
             SELECT resource_id, namespace_id, surface, content_profile,
                    current_path, lifecycle, head_revision_id,
                    created_at, updated_at
-              FROM native_resources
+             FROM native_resources
              WHERE namespace_id = $1
-               AND surface = $2
-               AND current_path = $3
+               AND current_path = $2
                AND lifecycle = 'live'
             """
             + suffix,
             namespace_id,
-            surface,
             path,
         )
         return dict(row) if row is not None else None
@@ -476,17 +481,16 @@ class NativeRevisionRepository:
         retired_revision_id: str,
         occurred_at: datetime,
     ) -> None:
+        del surface
         await conn.execute(
             """
             UPDATE native_resource_path_aliases
-               SET retired_revision_id = $4, retired_at = $5
+               SET retired_revision_id = $3, retired_at = $4
              WHERE namespace_id = $1
-               AND surface = $2
-               AND old_path = $3
+               AND old_path = $2
                AND retired_revision_id IS NULL
             """,
             namespace_id,
-            surface,
             old_path,
             retired_revision_id,
             occurred_at,
@@ -723,18 +727,18 @@ class NativeRevisionRepository:
         surface: str,
         old_path: str,
     ) -> dict | None:
+        """Return the namespace-wide live alias owner of ``old_path``."""
+        del surface
         row = await conn.fetchrow(
             """
             SELECT alias_id, namespace_id, surface, old_path, resource_id,
                    created_revision_id, created_at
-              FROM native_resource_path_aliases
+             FROM native_resource_path_aliases
              WHERE namespace_id = $1
-               AND surface = $2
-               AND old_path = $3
+               AND old_path = $2
                AND retired_revision_id IS NULL
             """,
             namespace_id,
-            surface,
             old_path,
         )
         return dict(row) if row is not None else None

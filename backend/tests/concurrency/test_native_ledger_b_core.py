@@ -291,6 +291,95 @@ async def test_document_and_file_cannot_own_the_same_namespace_path():
             )
 
 
+async def test_create_retires_a_cross_surface_alias_before_claiming_its_path():
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool)
+        file_args = _create_args(vault_id)
+        file_args["surface"] = "file"
+        file_resource = await service.create_text(**file_args)
+        file_move = await service.move_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="notes/native.md",
+            path_to="archive/native.bin",
+            actor="file-mover",
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=file_resource.revision_id,
+        )
+
+        document = await service.create_text(**_create_args(vault_id))
+
+        assert document.resource_id != file_resource.resource_id
+        assert (
+            await service.get_current_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference="notes/native.md",
+            )
+        ).resource_id == document.resource_id
+        assert (
+            await service.get_current_reference(
+                namespace_id=vault_id,
+                surface="file",
+                reference="archive/native.bin",
+            )
+        ).revision_id == file_move.revision_id
+        with pytest.raises(NotFoundError):
+            await service.get_current_reference(
+                namespace_id=vault_id,
+                surface="file",
+                reference="notes/native.md",
+            )
+        async with pool.acquire() as conn:
+            retired = await conn.fetchrow(
+                """
+                SELECT retired_revision_id
+                  FROM native_resource_path_aliases
+                 WHERE namespace_id = $1 AND old_path = 'notes/native.md'
+                """,
+                vault_id,
+            )
+        assert retired["retired_revision_id"] == document.revision_id
+
+
+async def test_move_rejects_a_destination_alias_owned_by_another_surface():
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool)
+        file_args = _create_args(vault_id)
+        file_args["surface"] = "file"
+        file_resource = await service.create_text(**file_args)
+        await service.move_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="notes/native.md",
+            path_to="archive/native.bin",
+            actor="file-mover",
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=file_resource.revision_id,
+        )
+        document_args = _create_args(vault_id)
+        document_args["path"] = "notes/document.md"
+        document = await service.create_text(**document_args)
+
+        with pytest.raises(ConflictError, match="alias already owns path"):
+            await service.move_text(
+                namespace_id=vault_id,
+                surface="document",
+                path="notes/document.md",
+                path_to="notes/native.md",
+                actor="document-mover",
+                mutation_id=uuid.uuid4(),
+                expected_revision_id=document.revision_id,
+            )
+
+        current = await service.get_current(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/document.md",
+        )
+        assert current.revision_id == document.revision_id
+
+
 async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
     async with _fresh_database() as (pool, vault_id):
         created = await NativeRevisionService(pool).create_text(**_create_args(vault_id))
@@ -718,6 +807,328 @@ async def test_expected_commit_update_remains_single_attempt_across_head_race():
         assert current.title == "Original title"
 
 
+async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified_slug():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="original-name",
+                title="Move race",
+                content="stable body",
+            ),
+            agent_id="creator",
+        )
+
+        class RenameRaceNativeService(NativeRevisionService):
+            raced = False
+
+            async def move_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    await NativeRevisionService(pool).move_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=kwargs["path"],
+                        path_to="notes/concurrent-name.md",
+                        actor="rename-racer",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=kwargs["expected_revision_id"],
+                    )
+                return await super().move_text(**kwargs)
+
+        native = RenameRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        moved = await target.move(
+            vault,
+            created.path,
+            collection="archive",
+            agent_id="target",
+        )
+
+        assert native.raced is True
+        assert moved.path == "archive/concurrent-name.md"
+        current = await target.get(vault, created.path)
+        assert current.path == moved.path
+        assert moved.current_commit == current.current_commit
+
+
+async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_create():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="shadowed-name",
+                title="Alias shadow race",
+                content="original body",
+            ),
+            agent_id="creator",
+        )
+        _, original = await target._current(vault, created.path)
+
+        class AliasShadowRaceNativeService(NativeRevisionService):
+            raced = False
+            replacement_resource_id: uuid.UUID | None = None
+
+            async def move_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    competitor = NativeRevisionService(pool)
+                    await competitor.move_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=kwargs["path"],
+                        path_to="notes/concurrent-name.md",
+                        actor="rename-racer",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=kwargs["expected_revision_id"],
+                        expected_resource_id=kwargs["expected_resource_id"],
+                    )
+                    replacement = await competitor.create_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=kwargs["path"],
+                        payload=original.text.replace("original body", "replacement body"),
+                        actor="alias-shadow-racer",
+                        mutation_id=uuid.uuid4(),
+                    )
+                    self.replacement_resource_id = replacement.resource_id
+                return await super().move_text(**kwargs)
+
+        native = AliasShadowRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        moved = await target.move(
+            vault,
+            created.path,
+            collection="archive",
+            agent_id="target",
+        )
+
+        assert native.raced is True
+        assert moved.path == "archive/concurrent-name.md"
+        original_after = await native.get_current_resource(
+            namespace_id=vault_id,
+            surface="document",
+            resource_id=original.resource_id,
+        )
+        assert original_after.path == moved.path
+        replacement = await native.get_current_reference(
+            namespace_id=vault_id,
+            surface="document",
+            reference=created.path,
+        )
+        assert replacement.resource_id == native.replacement_resource_id
+        assert replacement.resource_id != original.resource_id
+        assert "replacement body" in replacement.text
+
+
+async def test_collection_only_move_reallocates_after_destination_authority_race():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="allocation-race",
+                title="Move allocation race",
+                content="original body",
+            ),
+            agent_id="creator",
+        )
+        _, original = await target._current(vault, created.path)
+
+        class DestinationRaceNativeService(NativeRevisionService):
+            raced = False
+            winner_resource_id: uuid.UUID | None = None
+
+            async def move_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    winner = await NativeRevisionService(pool).create_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=kwargs["path_to"],
+                        payload=original.text.replace("original body", "destination winner"),
+                        actor="destination-racer",
+                        mutation_id=uuid.uuid4(),
+                    )
+                    self.winner_resource_id = winner.resource_id
+                return await super().move_text(**kwargs)
+
+        native = DestinationRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        moved = await target.move(
+            vault,
+            created.path,
+            collection="archive",
+            agent_id="target",
+        )
+
+        assert native.raced is True
+        assert moved.path.startswith("archive/allocation-race-")
+        assert moved.path.endswith(".md")
+        assert (
+            await native.get_current_resource(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=original.resource_id,
+            )
+        ).path == moved.path
+        destination_winner = await native.get_current_reference(
+            namespace_id=vault_id,
+            surface="document",
+            reference="archive/allocation-race.md",
+        )
+        assert destination_winner.resource_id == native.winner_resource_id
+
+        another = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="explicit-source",
+                title="Explicit source",
+                content="body",
+            ),
+            agent_id="creator",
+        )
+        with pytest.raises(ConflictError, match="already exists at path"):
+            await target.move(
+                vault,
+                another.path,
+                collection="archive",
+                slug="allocation-race",
+                agent_id="explicit-mover",
+            )
+
+
+async def test_public_move_response_hash_is_derived_from_the_committed_head():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        target = NativeDocumentService(pool=pool)
+        created = await target.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="content-race",
+                title="Content race",
+                content="original body",
+            ),
+            agent_id="creator",
+        )
+
+        class ContentRaceNativeService(NativeRevisionService):
+            raced = False
+
+            async def move_text(self, **kwargs):
+                if kwargs["actor"] == "target" and not self.raced:
+                    self.raced = True
+                    current = await self.get_current_reference(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        reference=kwargs["path"],
+                    )
+                    await NativeRevisionService(pool).replace_text(
+                        namespace_id=kwargs["namespace_id"],
+                        surface=kwargs["surface"],
+                        path=current.path,
+                        payload=current.text.replace("original body", "concurrent body"),
+                        actor="content-racer",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=current.revision_id,
+                    )
+                return await super().move_text(**kwargs)
+
+        native = ContentRaceNativeService(pool)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        target._native = injected_native  # type: ignore[method-assign]
+        moved = await target.move(
+            vault,
+            created.path,
+            collection="archive",
+            agent_id="target",
+        )
+
+        current = await target.get(vault, moved.path)
+        assert current.content == "concurrent body"
+        assert moved.content_hash == current.content_hash
+
+
+async def test_concurrent_title_derived_puts_allocate_distinct_paths():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        both_resolved = asyncio.Event()
+        resolved_count = 0
+
+        class CoordinatedDocumentService(NativeDocumentService):
+            async def _resolve_native_free_path(self, *args, **kwargs):
+                nonlocal resolved_count
+                path = await super()._resolve_native_free_path(*args, **kwargs)
+                resolved_count += 1
+                if resolved_count == 2:
+                    both_resolved.set()
+                await both_resolved.wait()
+                return path
+
+        service = CoordinatedDocumentService(pool=pool)
+        request = DocumentPutRequest(
+            vault=vault,
+            collection="notes",
+            title="Same implicit title",
+            content="body",
+        )
+        first, second = await asyncio.gather(
+            service.put(request, agent_id="first"),
+            service.put(request, agent_id="second"),
+        )
+
+        assert first.path != second.path
+        assert {first.path, second.path} & {"notes/same-implicit-title.md"}
+        assert all(path.startswith("notes/same-implicit-title") for path in (first.path, second.path))
+
+        with pytest.raises(ConflictError, match="already exists at path"):
+            await NativeDocumentService(pool=pool).put(
+                DocumentPutRequest(
+                    vault=vault,
+                    collection="notes",
+                    slug="same-implicit-title",
+                    title="Explicit slug remains exact",
+                    content="must not suffix",
+                ),
+                agent_id="explicit",
+            )
+
+
 async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect():
     async with _fresh_database() as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -1026,6 +1437,23 @@ async def test_committed_response_lost_retry_returns_same_revision_once():
         with pytest.raises(ConflictError, match="idempotency"):
             changed = _create_args(vault_id, mutation_id=mutation_id)
             changed["payload"] = "different retry"
+            await service.create_text(**changed)
+
+
+async def test_create_idempotency_fingerprint_includes_requested_resource_identity():
+    async with _fresh_database() as (pool, vault_id):
+        mutation_id = uuid.uuid4()
+        first_resource_id = uuid.uuid4()
+        second_resource_id = uuid.uuid4()
+        service = NativeRevisionService(pool)
+        args = _create_args(vault_id, mutation_id=mutation_id)
+        args["resource_id"] = first_resource_id
+        created = await service.create_text(**args)
+        assert created.resource_id == first_resource_id
+
+        changed = _create_args(vault_id, mutation_id=mutation_id)
+        changed["resource_id"] = second_resource_id
+        with pytest.raises(ConflictError, match="idempotency"):
             await service.create_text(**changed)
 
 
