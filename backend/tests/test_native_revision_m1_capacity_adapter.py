@@ -28,7 +28,14 @@ def _matrix(cells: int) -> dict:
     return {
         "schema_version": "akb-a0-settled-pipeline-matrix/v2",
         "profile": {"dense_embedding_enabled": False},
-        "timing": {},
+        "timing": {
+            "warmup_seconds": 0,
+            "steady_seconds": 1,
+            "drain_timeout_seconds": 1,
+            "request_timeout_seconds": 1,
+            "settlement_timeout_seconds": 1,
+            "settlement_poll_interval_seconds": 0.01,
+        },
         "cases": [
             {"id": f"cell-{index}", "repeat": 1, "factor": "test", "concurrency": 1,
              "vault_topology": "same-vault", "size_bytes": 1024, "mutation_shape": "localized" if index == 0 else "full-body",
@@ -53,6 +60,78 @@ def test_load_cells_binds_five_exact_files_and_seventy_cells(monkeypatch, tmp_pa
     assert observed == digest
     assert len(hashes) == 5
     assert cells[0].mutation_shape == "localized"
+    assert cells[0].timing.steady_seconds == 1
+
+
+def test_pool_max_size_is_required_and_bounded(monkeypatch):
+    monkeypatch.setenv(CAPACITY.POOL_MAX_SIZE_ENV, "30")
+    assert CAPACITY._required_pool_max_size() == 30
+    monkeypatch.setenv(CAPACITY.POOL_MAX_SIZE_ENV, "0")
+    with pytest.raises(CAPACITY.AdapterError, match="1..128"):
+        CAPACITY._required_pool_max_size()
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def now(self) -> float:
+        return self.value
+
+    async def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+@pytest.mark.asyncio
+async def test_paced_phase_uses_global_ticket_schedule_and_fixed_window():
+    clock = _FakeClock()
+    issued_at: list[tuple[int, float]] = []
+
+    async def operation(ticket: int, _slot: int) -> None:
+        issued_at.append((ticket, clock.now()))
+
+    result = await CAPACITY._run_phase(
+        name="steady",
+        duration_seconds=.31,
+        concurrency=1,
+        load_model="paced",
+        target_rps=10,
+        issuance_cap=100,
+        request_timeout_seconds=1,
+        operation=operation,
+        clock=clock.now,
+        sleep=clock.sleep,
+    )
+    assert issued_at == [(0, 0), (1, .1), (2, .2), (3, .3)]
+    assert result.target_issuance == result.achieved_issuance == 4
+    assert result.close_reason == "steady_duration"
+    assert result.receipt(include_latency=True)["measurement_window"]["observed_seconds"] == .31
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_excludes_late_completion_from_steady_goodput():
+    clock = _FakeClock()
+
+    async def operation(_ticket: int, _slot: int) -> None:
+        clock.value += .03
+
+    result = await CAPACITY._run_phase(
+        name="steady",
+        duration_seconds=.1,
+        concurrency=1,
+        load_model="closed-loop",
+        target_rps=None,
+        issuance_cap=100,
+        request_timeout_seconds=1,
+        operation=operation,
+        clock=clock.now,
+        sleep=clock.sleep,
+    )
+    receipt = result.receipt(include_latency=True)
+    assert result.achieved_issuance == 4
+    assert result.successful == 3
+    assert receipt["drain"]["successful"] == 1
+    assert receipt["rps"] == 30.0
 
 
 def test_body_is_exact_sized_and_localized_chunk_hashes_reuse_content():
@@ -76,7 +155,7 @@ async def _reachable() -> bool:
 
 
 @pytest.mark.asyncio
-async def test_single_cell_real_pg_closes_authority_and_projection():
+async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
     if not await _reachable():
         pytest.skip("Postgres is not reachable for focused M1 capacity test")
     base, _ = DSN.rsplit("/", 1)
@@ -86,16 +165,41 @@ async def test_single_cell_real_pg_closes_authority_and_projection():
     pool = None
     try:
         pool, _database, owner, _ = await CAPACITY._setup(f"{base}/{name}")
+        timing = CAPACITY.Timing(0, 1, 1, 1, 3, .01)
+        cell = CAPACITY.Cell("test", "single", 1, "same-vault", 1024, "localized", "closed-loop", None, 2, timing)
         result = await CAPACITY._run_cell(
             pool, owner,
-            CAPACITY.Cell("test", "single", 1, "same-vault", 1024, "localized", "closed-loop", None, 2),
+            cell,
         )
         assert result["closed"] is True
         assert result["settled"]["exact_current_head"] is True
         assert result["settled"]["direct_head_grep"] is True
+        assert result["settled"]["derived_projection_exact_current_head"] is True
+        assert result["front"]["issuance_schedule"]["scope"] == "worker-closed-loop"
+        assert set(("measurement_window", "issued", "successful", "error", "close_reason", "target_issuance", "achieved_issuance")) <= set(result["front"])
+        assert set(("measurement_window", "issued", "successful", "error", "close_reason", "target_issuance", "achieved_issuance")) <= set(result["settled"])
+        assert result["cell"]["resource"]["pool_max_size"] == 24
         assert result["intents"]["pending"] == 0
         assert result["resource_snapshot"]["final"]["projection_rows"] == 0
         assert result["derived_boundary"]["failure_retry_duplicate_current_head_pinned"] is True
+        assert result["derived_boundary"]["failure_retry_projection_exact_current_head"] is True
+        original_deliver = CAPACITY._deliver
+
+        async def no_projection(*args, **kwargs):
+            delivered = await original_deliver(*args, **kwargs)
+            namespace_id = args[2]
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f"DELETE FROM {CAPACITY.MEASUREMENT_TABLE} WHERE namespace_id=$1",
+                    namespace_id,
+                )
+            return delivered
+
+        monkeypatch.setattr(CAPACITY, "_deliver", no_projection)
+        false_green = await CAPACITY._run_cell(pool, owner, cell)
+        assert false_green["settled"]["derived_projection_exact_current_head"] is False
+        assert false_green["derived_boundary"]["failure_retry_projection_exact_current_head"] is False
+        assert false_green["closed"] is False
         mixed_profile_vault = await CAPACITY._new_vault(pool, owner)
         await M1ReferencePayloadStore(pool).prepare_text(
             namespace_id=mixed_profile_vault,

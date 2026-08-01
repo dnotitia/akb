@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 import asyncpg
 
@@ -44,6 +44,7 @@ EXPECTED_CELL_COUNT = 70
 MAX_CELLS = 70
 MATRIX_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRICES_JSON"
 MATRIX_HASH_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRIX_SET_SHA256"
+POOL_MAX_SIZE_ENV = "AKB_NATIVE_REVISION_CAPACITY_POOL_MAX_SIZE"
 MEASUREMENT_TABLE = "m1_capacity_derived_projection"
 # Exact frozen workbench comparison set.  The concurrency manifest contains two
 # planned C=128 repeats that were not run after the first safety-censored cell;
@@ -58,6 +59,19 @@ EXPECTED_MATRIX_HASHES = {
     "settled_topology_matrix.json": "60ebb15b01ddfc70f43cc02892b18fb806c023fdbfda9a0ea899f7966094db8f",
 }
 EXCLUDED_PLANNED_CELL_IDS = {"text-1k-c128-r2", "text-1k-c128-r3"}
+WARMUP_ISSUANCE_SAFETY_CAP = 100_000
+
+
+@dataclass(frozen=True)
+class Timing:
+    """Frozen matrix timing bound to every cell before it is executed."""
+
+    warmup_seconds: float
+    steady_seconds: float
+    drain_timeout_seconds: float
+    request_timeout_seconds: float
+    settlement_timeout_seconds: float
+    settlement_poll_interval_seconds: float
 
 
 @dataclass(frozen=True)
@@ -71,6 +85,57 @@ class Cell:
     load_model: str
     target_rps: float | None
     request_budget: int
+    timing: Timing
+
+
+@dataclass(frozen=True)
+class PhaseMetrics:
+    name: str
+    started_at: float
+    measurement_ended_at: float
+    drain_ended_at: float
+    configured_seconds: float
+    target_issuance: int
+    achieved_issuance: int
+    successful: int
+    errors: dict[str, int]
+    drain_successful: int
+    drain_errors: dict[str, int]
+    close_reason: str
+    latencies_ms: list[float]
+
+    def receipt(self, *, include_latency: bool) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "measurement_window": {
+                "started_monotonic": round(self.started_at, 6),
+                "ended_monotonic": round(self.measurement_ended_at, 6),
+                "configured_seconds": self.configured_seconds,
+                "observed_seconds": self.configured_seconds,
+            },
+            "issued": self.achieved_issuance,
+            "successful": self.successful,
+            "error": sum(self.errors.values()),
+            "errors": self.errors,
+            "close_reason": self.close_reason,
+            "target_issuance": self.target_issuance,
+            "achieved_issuance": self.achieved_issuance,
+            "drain": {
+                "completed_after_measurement": self.drain_successful + sum(self.drain_errors.values()),
+                "successful": self.drain_successful,
+                "error": sum(self.drain_errors.values()),
+                "errors": self.drain_errors,
+                "ended_monotonic": round(self.drain_ended_at, 6),
+                "elapsed_seconds": round(max(0.0, self.drain_ended_at - self.measurement_ended_at), 6),
+            },
+        }
+        if include_latency:
+            result.update({
+                "rps": round(self.successful / max(self.configured_seconds, 0.000001), 3),
+                "p50_ms": _percentile(self.latencies_ms, .50),
+                "p95_ms": _percentile(self.latencies_ms, .95),
+                "writes": self.successful,
+            })
+        return result
 
 
 def _sha256(value: bytes) -> str:
@@ -84,6 +149,17 @@ def _json_env(name: str) -> Any:
         raise AdapterError(f"{name} must be JSON") from exc
 
 
+def _required_pool_max_size() -> int:
+    raw = required_environment(POOL_MAX_SIZE_ENV)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise AdapterError(f"{POOL_MAX_SIZE_ENV} must be an integer") from exc
+    if str(value) != raw or not 1 <= value <= 128:
+        raise AdapterError(f"{POOL_MAX_SIZE_ENV} must be in 1..128")
+    return value
+
+
 def _matrix_digest(paths: Iterable[Path]) -> str:
     """Bind the ordered exact bytes, not a mutable filename or parsed shape."""
     digest = hashlib.sha256()
@@ -92,6 +168,27 @@ def _matrix_digest(paths: Iterable[Path]) -> str:
         digest.update(len(raw).to_bytes(8, "big"))
         digest.update(raw)
     return digest.hexdigest()
+
+
+def _timing(value: Any, *, matrix: str) -> Timing:
+    if not isinstance(value, dict):
+        raise AdapterError(f"capacity matrix timing is missing: {matrix}")
+    names = (
+        "warmup_seconds", "steady_seconds", "drain_timeout_seconds",
+        "request_timeout_seconds", "settlement_timeout_seconds",
+        "settlement_poll_interval_seconds",
+    )
+    parsed: dict[str, float] = {}
+    for name in names:
+        raw = value.get(name)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
+            raise AdapterError(f"capacity matrix timing {name} must be finite: {matrix}")
+        parsed[name] = float(raw)
+    if (parsed["warmup_seconds"] < 0 or parsed["steady_seconds"] <= 0
+            or parsed["drain_timeout_seconds"] <= 0 or parsed["request_timeout_seconds"] <= 0
+            or parsed["settlement_timeout_seconds"] <= 0 or parsed["settlement_poll_interval_seconds"] <= 0):
+        raise AdapterError(f"capacity matrix timing is outside its safe range: {matrix}")
+    return Timing(**parsed)
 
 
 def load_cells() -> tuple[list[Cell], dict[str, str], str]:
@@ -123,6 +220,7 @@ def load_cells() -> tuple[list[Cell], dict[str, str], str]:
         cases = matrix.get("cases")
         if not isinstance(cases, list) or not cases:
             raise AdapterError(f"capacity matrix cases are missing: {path.name}")
+        timing = _timing(matrix.get("timing"), matrix=path.name)
         hashes[path.name] = _sha256(path.read_bytes())
         for item in cases:
             if not isinstance(item, dict):
@@ -154,7 +252,7 @@ def load_cells() -> tuple[list[Cell], dict[str, str], str]:
                 raise AdapterError("closed-loop capacity cell must have null target_rps")
             else:
                 target_value = None
-            cells.append(Cell(path.name, cell_id, concurrency, topology, size, shape, load, target_value, budget))
+            cells.append(Cell(path.name, cell_id, concurrency, topology, size, shape, load, target_value, budget, timing))
     if len(cells) != EXPECTED_CELL_COUNT:
         raise AdapterError(f"capacity matrix set must contain exactly {EXPECTED_CELL_COUNT} cells")
     return cells, hashes, actual_hash
@@ -186,7 +284,7 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1)], 3)
 
 
-async def _setup(dsn: str) -> tuple[asyncpg.Pool, str, uuid.UUID, list[uuid.UUID]]:
+async def _setup(dsn: str, *, pool_max_size: int = 24) -> tuple[asyncpg.Pool, str, uuid.UUID, list[uuid.UUID]]:
     conn = await asyncpg.connect(dsn, timeout=10)
     try:
         database = str(await conn.fetchval("SELECT current_database()"))
@@ -210,7 +308,7 @@ async def _setup(dsn: str) -> tuple[asyncpg.Pool, str, uuid.UUID, list[uuid.UUID
             )
         """)
         owner = await conn.fetchval("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, 'm1-measurement-disabled') RETURNING id", f"m1-capacity-{uuid.uuid4().hex}", f"m1-capacity-{uuid.uuid4().hex}@invalid.example")
-        return await asyncpg.create_pool(dsn, min_size=1, max_size=24), database, owner, []
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size), database, owner, []
     finally:
         await conn.close()
 
@@ -282,13 +380,144 @@ async def _snapshot(pool: asyncpg.Pool, namespace_ids: list[uuid.UUID]) -> dict[
         }
 
 
+async def _projection_matches_current_head(
+    pool: asyncpg.Pool,
+    *,
+    namespace_id: uuid.UUID,
+    resource_id: uuid.UUID,
+    revision_id: str,
+    text: str,
+) -> bool:
+    """Verify the durable derived projection, not a re-chunked authority body."""
+    expected = [(revision_id, index, digest) for index, digest in enumerate(_chunk_hashes(text))]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT revision_id, chunk_index, chunk_hash FROM {MEASUREMENT_TABLE} "
+            "WHERE namespace_id=$1 AND resource_id=$2 ORDER BY chunk_index",
+            namespace_id,
+            resource_id,
+        )
+    observed = [(str(row["revision_id"]), int(row["chunk_index"]), str(row["chunk_hash"])) for row in rows]
+    return observed == expected
+
+
+async def _run_phase(
+    *,
+    name: str,
+    duration_seconds: float,
+    concurrency: int,
+    load_model: str,
+    target_rps: float | None,
+    issuance_cap: int,
+    request_timeout_seconds: float,
+    operation: Callable[[int, int], Awaitable[None]],
+    clock: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> PhaseMetrics:
+    """Issue work against one global clock and ticket sequence.
+
+    ``issuance_cap`` is the steady request-budget safety ceiling.  Warmup uses
+    a separate fixed safety cap so it can never consume or be counted as part
+    of the steady budget.  Paced tickets are global: a worker never derives a
+    per-worker rate from concurrency.
+    """
+    if concurrency < 1 or issuance_cap < 1:
+        raise AdapterError("phase concurrency and issuance cap must be positive")
+    if load_model == "paced" and (target_rps is None or target_rps <= 0):
+        raise AdapterError("paced phase requires target_rps")
+    phase_start = clock()
+    phase_end = phase_start + duration_seconds
+    if load_model == "paced":
+        assert target_rps is not None
+        target_issuance = min(issuance_cap, math.ceil(duration_seconds * target_rps))
+    else:
+        target_issuance = issuance_cap
+    ticket_lock = asyncio.Lock()
+    next_ticket = 0
+    close_reason: str | None = None
+    issued = 0
+    successful = 0
+    errors: list[str] = []
+    drain_successful = 0
+    drain_errors: list[str] = []
+    latencies: list[float] = []
+
+    async def worker(slot: int) -> None:
+        nonlocal close_reason, issued, successful, next_ticket, drain_successful
+        while True:
+            async with ticket_lock:
+                now = clock()
+                if next_ticket >= target_issuance:
+                    close_reason = close_reason or ("steady_duration" if load_model == "paced" else "request_budget")
+                    return
+                if now >= phase_end:
+                    close_reason = close_reason or "steady_duration"
+                    return
+                ticket = next_ticket
+                if load_model == "paced":
+                    assert target_rps is not None
+                    scheduled_at = phase_start + ticket / target_rps
+                    if scheduled_at >= phase_end:
+                        close_reason = close_reason or "steady_duration"
+                        return
+                else:
+                    scheduled_at = now
+                next_ticket += 1
+            if scheduled_at > clock():
+                await sleep(scheduled_at - clock())
+            # A ticket scheduled before the boundary is not issued late merely
+            # because a loaded loop woke it after the measurement window.
+            if clock() >= phase_end:
+                async with ticket_lock:
+                    close_reason = close_reason or "steady_duration"
+                return
+            began = clock()
+            try:
+                await asyncio.wait_for(operation(ticket, slot), timeout=request_timeout_seconds)
+            except Exception as exc:  # output only the class, never message/body/DSN
+                if clock() <= phase_end:
+                    errors.append(type(exc).__name__)
+                else:
+                    drain_errors.append(type(exc).__name__)
+            else:
+                if clock() <= phase_end:
+                    successful += 1
+                    latencies.append((clock() - began) * 1000)
+                else:
+                    drain_successful += 1
+            finally:
+                issued += 1
+
+    await asyncio.gather(*(worker(slot) for slot in range(concurrency)))
+    drain_ended_at = clock()
+    if close_reason is None:
+        close_reason = ("steady_duration" if load_model == "paced" or issued < target_issuance else "request_budget")
+    return PhaseMetrics(
+        name=name,
+        started_at=phase_start,
+        measurement_ended_at=phase_end,
+        drain_ended_at=drain_ended_at,
+        configured_seconds=duration_seconds,
+        target_issuance=target_issuance,
+        achieved_issuance=issued,
+        successful=successful,
+        errors={error: errors.count(error) for error in sorted(set(errors))},
+        drain_successful=drain_successful,
+        drain_errors={error: drain_errors.count(error) for error in sorted(set(drain_errors))},
+        close_reason=close_reason,
+        latencies_ms=latencies,
+    )
+
+
 async def _run_cell(
     pool: asyncpg.Pool,
     owner: uuid.UUID,
     cell: Cell,
     *,
-    budget_override: int | None = None,
     run_namespaces: list[uuid.UUID] | None = None,
+    pool_max_size: int = 24,
+    clock: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> dict[str, Any]:
     vaults = [await _new_vault(pool, owner) for _ in range(cell.concurrency if cell.topology == "cross-vault" else 1)]
     if run_namespaces is not None:
@@ -303,88 +532,172 @@ async def _run_cell(
     for namespace in vaults:
         await _deliver(pool, service, namespace)
     baseline = await _snapshot(pool, vaults)
-    total = budget_override if budget_override is not None else cell.request_budget
-    total = max(cell.concurrency, total)
-    latencies: list[float] = []; errors: list[str] = []; revisions: dict[uuid.UUID, str] = {resource: revision for _, resource, _, revision in states}
-    lock = asyncio.Lock(); next_index = 0
-    started = time.perf_counter()
-    async def writer(slot: int) -> None:
-        nonlocal next_index
-        while True:
-            async with lock:
-                if next_index >= total: return
-                ordinal = next_index; next_index += 1
-            namespace, resource, path, _ = states[slot]
-            began = time.perf_counter()
-            try:
-                result = await service.replace_text(namespace_id=namespace, surface="document", path=path, payload=_body(cell.size_bytes, ordinal + 1, cell.mutation_shape == "localized"), actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=revisions[resource], expected_resource_id=resource)
-                revisions[resource] = result.revision_id
-            except Exception as exc:  # output only the class, never message/body/DSN
-                errors.append(type(exc).__name__)
-            finally:
-                latencies.append((time.perf_counter() - began) * 1000)
-            if cell.load_model == "paced" and cell.target_rps:
-                await asyncio.sleep(max(0.0, (cell.concurrency / cell.target_rps) - ((time.perf_counter() - began))))
-    await asyncio.gather(*(writer(index) for index in range(cell.concurrency)))
-    elapsed = max(time.perf_counter() - started, 0.000001)
+    revisions: dict[uuid.UUID, str] = {resource: revision for _, resource, _, revision in states}
+
+    async def writer(ordinal: int, slot: int) -> None:
+        namespace, resource, path, _ = states[slot]
+        result = await service.replace_text(
+            namespace_id=namespace,
+            surface="document",
+            path=path,
+            payload=_body(cell.size_bytes, ordinal + 1, cell.mutation_shape == "localized"),
+            actor="m1-capacity",
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=revisions[resource],
+            expected_resource_id=resource,
+        )
+        revisions[resource] = result.revision_id
+
+    warmup = await _run_phase(
+        name="warmup",
+        duration_seconds=cell.timing.warmup_seconds,
+        concurrency=cell.concurrency,
+        load_model=cell.load_model,
+        target_rps=cell.target_rps,
+        issuance_cap=WARMUP_ISSUANCE_SAFETY_CAP,
+        request_timeout_seconds=cell.timing.request_timeout_seconds,
+        operation=writer,
+        clock=clock,
+        sleep=sleep,
+    )
+    steady = await _run_phase(
+        name="steady",
+        duration_seconds=cell.timing.steady_seconds,
+        concurrency=cell.concurrency,
+        load_model=cell.load_model,
+        target_rps=cell.target_rps,
+        issuance_cap=cell.request_budget,
+        request_timeout_seconds=cell.timing.request_timeout_seconds,
+        operation=writer,
+        clock=clock,
+        sleep=sleep,
+    )
     published = sum([await _pending(pool, namespace) for namespace in vaults])
-    delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
-    for namespace in vaults:
-        result = await _deliver(pool, service, namespace)
-        for key in delivery: delivery[key] += result[key]
-    exact_head = True; direct_grep = True; changed: set[str] = set(); reused: set[str] = set()
-    for namespace, resource, path, _ in states:
-        current = await service.get_current(namespace_id=namespace, surface="document", path=path)
-        exact_head = exact_head and current.revision_id == revisions[resource]
-        found = await grep.grep("m1-capacity-needle", user_id=owner, resource_id=resource)
-        direct_grep = direct_grep and found["total_resources"] == 1 and found["results"][0]["revision"] == current.revision_id
-        before_hashes = set(_chunk_hashes(_body(cell.size_bytes, 0, cell.mutation_shape == "localized")))
-        after_hashes = set(_chunk_hashes(current.text)); changed.update(after_hashes - before_hashes); reused.update(after_hashes & before_hashes)
-    # Delivery failure must not block current Head/get/grep, then retry and duplicate delivery are harmless.
-    probe_ns, probe_resource, probe_path, _ = states[0]
-    probe = await service.replace_text(namespace_id=probe_ns, surface="document", path=probe_path, payload=_body(cell.size_bytes, total + 7, cell.mutation_shape == "localized"), actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=revisions[probe_resource], expected_resource_id=probe_resource)
-    delivery_started = asyncio.Event()
-    release_delivery = asyncio.Event()
-    async def delayed_failed_delivery() -> dict[str, int]:
-        delivery_started.set()
-        await release_delivery.wait()
-        return await _deliver(pool, service, probe_ns, fail_once=True)
-    delayed_task = asyncio.create_task(delayed_failed_delivery())
-    await asyncio.wait_for(delivery_started.wait(), timeout=5)
-    visible = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=5)
-    grepped = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=probe_resource), timeout=5)
-    reads_completed_before_delivery = not delayed_task.done()
-    release_delivery.set()
-    failed = await asyncio.wait_for(delayed_task, timeout=5)
-    retried = await _deliver(pool, service, probe_ns); duplicate = await _deliver(pool, service, probe_ns)
-    retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0}
-    # Tombstones must erase run-owned projection and leave no pending delivery.
-    for namespace, resource, path, _ in states:
-        current = await service.get_current(namespace_id=namespace, surface="document", path=path)
-        await service.delete_resource(namespace_id=namespace, surface="document", path=path, actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=current.revision_id, expected_resource_id=resource)
-    for namespace in vaults:
-        result = await _deliver(pool, service, namespace)
-        for key in delivery: delivery[key] += result[key]
-    final = await _snapshot(pool, vaults)
-    settled_elapsed = max(time.perf_counter() - started, 0.000001)
-    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps}, "front": {"rps": round((total - len(errors)) / elapsed, 3), "p50_ms": _percentile(latencies, .50), "p95_ms": _percentile(latencies, .95), "writes": total - len(errors), "errors": {name: errors.count(name) for name in sorted(set(errors))}}, "settled": {"rps": round((total - len(errors)) / settled_elapsed, 3), "exact_current_head": exact_head, "direct_head_grep": direct_grep}, "intents": {"published": published, "coalesced": delivery["coalesced"], "delivered": delivery["delivered"], "pending": final["pending_intents"]}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and retry_ok and not errors and final["pending_intents"] == 0 and final["projection_rows"] == 0}
+
+    async def settle() -> tuple[dict[str, int], bool, bool, bool, bool, bool, set[str], set[str], dict[str, int]]:
+        delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
+
+        async def drain(namespace: uuid.UUID, *, fail_once: bool = False) -> dict[str, int]:
+            return await asyncio.wait_for(
+                _deliver(pool, service, namespace, fail_once=fail_once),
+                timeout=cell.timing.drain_timeout_seconds,
+            )
+
+        for namespace in vaults:
+            result = await drain(namespace)
+            for key in delivery:
+                delivery[key] += result[key]
+        exact_head = True; direct_grep = True; projection_exact = True; changed: set[str] = set(); reused: set[str] = set()
+        for namespace, resource, path, _ in states:
+            current = await asyncio.wait_for(service.get_current(namespace_id=namespace, surface="document", path=path), timeout=cell.timing.request_timeout_seconds)
+            exact_head = exact_head and current.revision_id == revisions[resource]
+            found = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=resource), timeout=cell.timing.request_timeout_seconds)
+            direct_grep = direct_grep and found["total_resources"] == 1 and found["results"][0]["revision"] == current.revision_id
+            projection_exact = projection_exact and await asyncio.wait_for(
+                _projection_matches_current_head(
+                    pool,
+                    namespace_id=namespace,
+                    resource_id=resource,
+                    revision_id=current.revision_id,
+                    text=current.text,
+                ),
+                timeout=cell.timing.request_timeout_seconds,
+            )
+            before_hashes = set(_chunk_hashes(_body(cell.size_bytes, 0, cell.mutation_shape == "localized")))
+            after_hashes = set(_chunk_hashes(current.text)); changed.update(after_hashes - before_hashes); reused.update(after_hashes & before_hashes)
+        # Delivery failure must not block current Head/get/grep, then retry and duplicate delivery are harmless.
+        probe_ns, probe_resource, probe_path, _ = states[0]
+        probe = await asyncio.wait_for(service.replace_text(namespace_id=probe_ns, surface="document", path=probe_path, payload=_body(cell.size_bytes, warmup.achieved_issuance + steady.achieved_issuance + 7, cell.mutation_shape == "localized"), actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=revisions[probe_resource], expected_resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+
+        async def delayed_failed_delivery() -> dict[str, int]:
+            delivery_started.set()
+            await release_delivery.wait()
+            return await drain(probe_ns, fail_once=True)
+
+        delayed_task = asyncio.create_task(delayed_failed_delivery())
+        await asyncio.wait_for(delivery_started.wait(), timeout=cell.timing.drain_timeout_seconds)
+        visible = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
+        grepped = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
+        reads_completed_before_delivery = not delayed_task.done()
+        release_delivery.set()
+        failed = await asyncio.wait_for(delayed_task, timeout=cell.timing.drain_timeout_seconds)
+        retried = await drain(probe_ns); duplicate = await drain(probe_ns)
+        probe_current = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
+        retry_projection_exact = await asyncio.wait_for(
+            _projection_matches_current_head(
+                pool,
+                namespace_id=probe_ns,
+                resource_id=probe_resource,
+                revision_id=probe_current.revision_id,
+                text=probe_current.text,
+            ),
+            timeout=cell.timing.request_timeout_seconds,
+        )
+        retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0} and retry_projection_exact
+        # Tombstones must erase run-owned projection and leave no pending delivery.
+        for namespace, resource, path, _ in states:
+            current = await asyncio.wait_for(service.get_current(namespace_id=namespace, surface="document", path=path), timeout=cell.timing.request_timeout_seconds)
+            await asyncio.wait_for(service.delete_resource(namespace_id=namespace, surface="document", path=path, actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=current.revision_id, expected_resource_id=resource), timeout=cell.timing.request_timeout_seconds)
+        for namespace in vaults:
+            result = await drain(namespace)
+            for key in delivery:
+                delivery[key] += result[key]
+        return delivery, exact_head, direct_grep, projection_exact, retry_ok, retry_projection_exact, changed, reused, await _snapshot(pool, vaults)
+
+    settlement_started = clock()
+    settlement_error: str | None = None
+    try:
+        delivery, exact_head, direct_grep, projection_exact, retry_ok, retry_projection_exact, changed, reused, final = await asyncio.wait_for(settle(), timeout=cell.timing.settlement_timeout_seconds)
+    except Exception as exc:  # a timeout/error is evidence, never a green settlement
+        settlement_error = type(exc).__name__
+        delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
+        exact_head = direct_grep = projection_exact = retry_ok = retry_projection_exact = False
+        changed = set(); reused = set()
+        final = await _snapshot(pool, vaults)
+    settled = steady.receipt(include_latency=False)
+    settled["measurement_window"].update({
+        "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds,
+        "settlement_elapsed_seconds": round(max(0.0, clock() - settlement_started), 6),
+    })
+    settled.update({
+        "exact_current_head": exact_head,
+        "direct_head_grep": direct_grep,
+        "derived_projection_exact_current_head": projection_exact,
+        "settlement_error": settlement_error,
+    })
+    all_phase_errors = sum(warmup.errors.values()) + sum(warmup.drain_errors.values()) + sum(steady.errors.values()) + sum(steady.drain_errors.values())
+    front = steady.receipt(include_latency=True)
+    front["measurement_window"]["warmup"] = warmup.receipt(include_latency=False)["measurement_window"]
+    front["warmup"] = warmup.receipt(include_latency=False)
+    issuance_schedule = {
+        "load_model": cell.load_model,
+        "target_rps": cell.target_rps,
+        "scope": "global" if cell.load_model == "paced" else "worker-closed-loop",
+        "due_ticket": "phase_start + ticket/target_rps" if cell.load_model == "paced" else None,
+    }
+    front["issuance_schedule"] = issuance_schedule
+    settled["issuance_schedule"] = issuance_schedule
+    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps, "request_budget": cell.request_budget, "timing": {"warmup_seconds": cell.timing.warmup_seconds, "steady_seconds": cell.timing.steady_seconds, "drain_timeout_seconds": cell.timing.drain_timeout_seconds, "request_timeout_seconds": cell.timing.request_timeout_seconds, "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds, "settlement_poll_interval_seconds": cell.timing.settlement_poll_interval_seconds}, "resource": {"pool_max_size": pool_max_size}}, "front": front, "settled": settled, "intents": {"published": published, "coalesced": delivery["coalesced"], "delivered": delivery["delivered"], "pending": final["pending_intents"]}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "failure_retry_projection_exact_current_head": retry_projection_exact, "derived_projection_exact_current_head": projection_exact, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and projection_exact and retry_ok and not all_phase_errors and settlement_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0}
 
 
 async def run() -> dict[str, Any]:
     cells, matrix_hashes, matrix_set_hash = load_cells()
     dsn = required_environment("AKB_NATIVE_REVISION_MEASUREMENT_DSN")
-    pool, database, owner, _ = await _setup(dsn)
+    pool_max_size = _required_pool_max_size()
+    pool, database, owner, _ = await _setup(dsn, pool_max_size=pool_max_size)
     namespaces: list[uuid.UUID] = []
     try:
         results = []
         for cell in cells:
-            result = await _run_cell(pool, owner, cell, run_namespaces=namespaces); results.append(result)
+            result = await _run_cell(pool, owner, cell, run_namespaces=namespaces, pool_max_size=pool_max_size); results.append(result)
             if not result["closed"]:
                 raise AdapterError(f"capacity cell closed unsuccessfully: {cell.matrix}/{cell.cell_id}")
         revision = source_revision(); runtime, environment = receipt_provenance(revision, database, namespaces[0])
-        environment["storage_profile"].update({"body_store": "pg-bodystore-v1", "derived_projection": "measurement-only-current-head-coalescing-v1", "claim_scope": "measurement_only"})
+        environment["storage_profile"].update({"body_store": "pg-bodystore-v1", "derived_projection": "measurement-only-current-head-coalescing-v1", "claim_scope": "measurement_only", "pool_max_size": pool_max_size})
         artifact = write_bound_json(run_artifact_path("native-capacity-derived-cells"), {"protocol_version": PROTOCOL_VERSION, "matrix_hashes": matrix_hashes, "matrix_set_sha256": matrix_set_hash, "cells": results})
-        return {"protocol_version": PROTOCOL_VERSION, "matrix_set_sha256": matrix_set_hash, "matrix_hashes": matrix_hashes, "cell_count": len(results), "closed": all(item["closed"] for item in results), "receipt": {"runtime": runtime, "environment": environment, "resources": {"snapshot": {"cell_count": len(results), "measurement_only": True}}, "requests": {"artifact_digest": artifact["sha256"]}}, "provenance": {"adapter": {"identity": "akb.backend.scripts.native_revision_m1_capacity_adapter", "source_revision": revision}, "cells_artifact": artifact}}
+        return {"protocol_version": PROTOCOL_VERSION, "matrix_set_sha256": matrix_set_hash, "matrix_hashes": matrix_hashes, "cell_count": len(results), "closed": all(item["closed"] for item in results), "receipt": {"runtime": runtime, "environment": environment, "resources": {"snapshot": {"cell_count": len(results), "measurement_only": True, "pool_max_size": pool_max_size}}, "requests": {"artifact_digest": artifact["sha256"]}}, "provenance": {"adapter": {"identity": "akb.backend.scripts.native_revision_m1_capacity_adapter", "source_revision": revision}, "cells_artifact": artifact}}
     finally:
         async with pool.acquire() as conn:
             if namespaces:
