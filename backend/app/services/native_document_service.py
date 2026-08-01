@@ -144,7 +144,12 @@ class NativeDocumentService(DocumentService):
             candidate = f"{stem}-{path_identity.hex[:width]}.md"
             if not await path_is_owned(vault_id, candidate):
                 return candidate
-        return f"{stem}-{path_identity.hex}.md"
+        ordinal = 2
+        while True:
+            candidate = f"{stem}-{path_identity.hex}-{ordinal}.md"
+            if not await path_is_owned(vault_id, candidate):
+                return candidate
+            ordinal += 1
 
     async def _created_by_name(self, created_by: str | None) -> str | None:
         if not created_by:

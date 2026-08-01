@@ -1025,6 +1025,69 @@ async def test_collection_only_move_reallocates_after_destination_authority_race
             )
 
 
+async def test_collection_only_move_searches_beyond_all_uuid_path_candidates():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="exhausted-candidates",
+                title="Exhausted candidates",
+                content="original",
+            ),
+            agent_id="creator",
+        )
+        _, original = await document_service._current(vault, created.path)
+        stem = "archive/exhausted-candidates"
+        claimed_paths = [
+            f"{stem}.md",
+            *(f"{stem}-{original.resource_id.hex[:width]}.md" for width in (8, 12, 16, 32)),
+            f"{stem}-{original.resource_id.hex}-2.md",
+        ]
+        native = NativeRevisionService(pool)
+        for path in claimed_paths:
+            await native.create_text(
+                namespace_id=vault_id,
+                surface="document",
+                path=path,
+                payload=f"claimed: {path}",
+                actor="candidate-claimer",
+                mutation_id=uuid.uuid4(),
+            )
+
+        expected = f"{stem}-{original.resource_id.hex}-3.md"
+        assert (
+            await document_service._resolve_native_free_path(
+                vault_id,
+                f"{stem}.md",
+                original.resource_id,
+            )
+            == expected
+        )
+        moved = await asyncio.wait_for(
+            document_service.move(
+                vault,
+                created.path,
+                collection="archive",
+                agent_id="mover",
+            ),
+            timeout=3,
+        )
+
+        assert moved.path == expected
+        assert (
+            await native.get_current_resource(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=original.resource_id,
+            )
+        ).path == expected
+
+
 async def test_public_move_response_hash_is_derived_from_the_committed_head():
     async with _fresh_database() as (pool, vault_id):
         async with pool.acquire() as conn:
