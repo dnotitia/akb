@@ -101,6 +101,7 @@ class PhaseMetrics:
     errors: dict[str, int]
     drain_successful: int
     drain_errors: dict[str, int]
+    drain_timed_out: bool
     close_reason: str
     latencies_ms: list[float]
 
@@ -110,7 +111,7 @@ class PhaseMetrics:
                 "started_monotonic": round(self.started_at, 6),
                 "ended_monotonic": round(self.measurement_ended_at, 6),
                 "configured_seconds": self.configured_seconds,
-                "observed_seconds": self.configured_seconds,
+                "observed_seconds": round(max(0.0, self.measurement_ended_at - self.started_at), 6),
             },
             "issued": self.achieved_issuance,
             "successful": self.successful,
@@ -124,13 +125,14 @@ class PhaseMetrics:
                 "successful": self.drain_successful,
                 "error": sum(self.drain_errors.values()),
                 "errors": self.drain_errors,
+                "timed_out": self.drain_timed_out,
                 "ended_monotonic": round(self.drain_ended_at, 6),
                 "elapsed_seconds": round(max(0.0, self.drain_ended_at - self.measurement_ended_at), 6),
             },
         }
         if include_latency:
             result.update({
-                "rps": round(self.successful / max(self.configured_seconds, 0.000001), 3),
+                "rps": round(self.successful / max(self.measurement_ended_at - self.started_at, 0.000001), 3),
                 "p50_ms": _percentile(self.latencies_ms, .50),
                 "p95_ms": _percentile(self.latencies_ms, .95),
                 "writes": self.successful,
@@ -415,6 +417,7 @@ async def _run_phase(
     target_rps: float | None,
     issuance_cap: int,
     request_timeout_seconds: float,
+    drain_timeout_seconds: float,
     operation: Callable[[int, int], Awaitable[None]],
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -431,76 +434,102 @@ async def _run_phase(
     if load_model == "paced" and (target_rps is None or target_rps <= 0):
         raise AdapterError("paced phase requires target_rps")
     phase_start = clock()
-    phase_end = phase_start + duration_seconds
+    nominal_phase_end = phase_start + duration_seconds
     if load_model == "paced":
         assert target_rps is not None
-        target_issuance = min(issuance_cap, math.ceil(duration_seconds * target_rps))
+        theoretical_slots = math.ceil(duration_seconds * target_rps)
+        target_issuance = min(issuance_cap, theoretical_slots)
     else:
+        theoretical_slots = None
         target_issuance = issuance_cap
     ticket_lock = asyncio.Lock()
+    close_event = asyncio.Event()
     next_ticket = 0
     close_reason: str | None = None
+    measurement_ended_at: float | None = None
     issued = 0
-    successful = 0
-    errors: list[str] = []
-    drain_successful = 0
-    drain_errors: list[str] = []
-    latencies: list[float] = []
+    outcomes: list[tuple[float, str | None, float]] = []
+
+    async def close(reason: str, *, at: float | None = None) -> None:
+        nonlocal close_reason, measurement_ended_at
+        async with ticket_lock:
+            if measurement_ended_at is None:
+                measurement_ended_at = clock() if at is None else at
+                close_reason = reason
+                close_event.set()
 
     async def worker(slot: int) -> None:
-        nonlocal close_reason, issued, successful, next_ticket, drain_successful
+        nonlocal close_reason, issued, measurement_ended_at, next_ticket
         while True:
             async with ticket_lock:
                 now = clock()
-                if next_ticket >= target_issuance:
-                    close_reason = close_reason or ("steady_duration" if load_model == "paced" else "request_budget")
+                if measurement_ended_at is not None or next_ticket >= target_issuance:
                     return
-                if now >= phase_end:
-                    close_reason = close_reason or "steady_duration"
+                if now >= nominal_phase_end:
                     return
                 ticket = next_ticket
                 if load_model == "paced":
                     assert target_rps is not None
                     scheduled_at = phase_start + ticket / target_rps
-                    if scheduled_at >= phase_end:
-                        close_reason = close_reason or "steady_duration"
+                    if scheduled_at >= nominal_phase_end:
                         return
                 else:
                     scheduled_at = now
                 next_ticket += 1
             if scheduled_at > clock():
                 await sleep(scheduled_at - clock())
-            # A ticket scheduled before the boundary is not issued late merely
-            # because a loaded loop woke it after the measurement window.
-            if clock() >= phase_end:
-                async with ticket_lock:
-                    close_reason = close_reason or "steady_duration"
+            if clock() >= nominal_phase_end:
                 return
             began = clock()
+            error: str | None = None
             try:
                 await asyncio.wait_for(operation(ticket, slot), timeout=request_timeout_seconds)
             except Exception as exc:  # output only the class, never message/body/DSN
-                if clock() <= phase_end:
-                    errors.append(type(exc).__name__)
-                else:
-                    drain_errors.append(type(exc).__name__)
-            else:
-                if clock() <= phase_end:
-                    successful += 1
-                    latencies.append((clock() - began) * 1000)
-                else:
-                    drain_successful += 1
+                error = type(exc).__name__
             finally:
-                issued += 1
+                completed_at = clock()
+                async with ticket_lock:
+                    issued += 1
+                    outcomes.append((completed_at, error, (completed_at - began) * 1000))
+                    if issued >= target_issuance and (load_model != "paced" or (theoretical_slots is not None and issuance_cap < theoretical_slots)):
+                        if measurement_ended_at is None:
+                            measurement_ended_at = completed_at
+                            close_reason = "request_budget"
+                            close_event.set()
 
-    await asyncio.gather(*(worker(slot) for slot in range(concurrency)))
+    workers = asyncio.gather(*(worker(slot) for slot in range(concurrency)))
+
+    async def window_controller() -> None:
+        if close_event.is_set():
+            return
+        await sleep(max(0.0, nominal_phase_end - clock()))
+        await close("steady_duration", at=nominal_phase_end)
+
+    controller = asyncio.create_task(window_controller())
+    await close_event.wait()
+    if not controller.done():
+        controller.cancel()
+        await asyncio.gather(controller, return_exceptions=True)
+    drain_timed_out = False
+    try:
+        await asyncio.wait_for(workers, timeout=drain_timeout_seconds)
+    except TimeoutError:
+        drain_timed_out = True
+        workers.cancel()
+        await asyncio.gather(workers, return_exceptions=True)
     drain_ended_at = clock()
-    if close_reason is None:
-        close_reason = ("steady_duration" if load_model == "paced" or issued < target_issuance else "request_budget")
+    assert measurement_ended_at is not None and close_reason is not None
+    successful = sum(error is None and completed <= measurement_ended_at for completed, error, _ in outcomes)
+    errors = [error for completed, error, _ in outcomes if error is not None and completed <= measurement_ended_at]
+    drain_successful = sum(error is None and completed > measurement_ended_at for completed, error, _ in outcomes)
+    drain_errors = [error for completed, error, _ in outcomes if error is not None and completed > measurement_ended_at]
+    if drain_timed_out:
+        drain_errors.append("PhaseDrainTimeout")
+    latencies = [latency for completed, error, latency in outcomes if error is None and completed <= measurement_ended_at]
     return PhaseMetrics(
         name=name,
         started_at=phase_start,
-        measurement_ended_at=phase_end,
+        measurement_ended_at=measurement_ended_at,
         drain_ended_at=drain_ended_at,
         configured_seconds=duration_seconds,
         target_issuance=target_issuance,
@@ -509,6 +538,7 @@ async def _run_phase(
         errors={error: errors.count(error) for error in sorted(set(errors))},
         drain_successful=drain_successful,
         drain_errors={error: drain_errors.count(error) for error in sorted(set(drain_errors))},
+        drain_timed_out=drain_timed_out,
         close_reason=close_reason,
         latencies_ms=latencies,
     )
@@ -561,6 +591,7 @@ async def _run_cell(
         target_rps=cell.target_rps,
         issuance_cap=WARMUP_ISSUANCE_SAFETY_CAP,
         request_timeout_seconds=cell.timing.request_timeout_seconds,
+        drain_timeout_seconds=cell.timing.drain_timeout_seconds,
         operation=writer,
         clock=clock,
         sleep=sleep,
@@ -573,6 +604,7 @@ async def _run_cell(
         target_rps=cell.target_rps,
         issuance_cap=cell.request_budget,
         request_timeout_seconds=cell.timing.request_timeout_seconds,
+        drain_timeout_seconds=cell.timing.drain_timeout_seconds,
         operation=writer,
         clock=clock,
         sleep=sleep,
@@ -605,7 +637,7 @@ async def _run_cell(
             after_hashes = set(_chunk_hashes(current.text)); changed.update(after_hashes - before_hashes); reused.update(after_hashes & before_hashes)
         return delivery, exact_head, direct_grep, projection_exact, changed, reused
 
-    async def derived_probe() -> tuple[bool, bool]:
+    async def derived_probe() -> tuple[bool, bool, dict[str, dict[str, int]]]:
         # W5 failure/retry is intentionally outside the capacity RPS denominator.
         probe_ns, probe_resource, probe_path, _ = states[0]
         probe = await asyncio.wait_for(service.replace_text(namespace_id=probe_ns, surface="document", path=probe_path, payload=_body(cell.size_bytes, warmup.achieved_issuance + steady.achieved_issuance + 7, cell.mutation_shape == "localized"), actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=revisions[probe_resource], expected_resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
@@ -628,7 +660,7 @@ async def _run_cell(
         probe_current = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
         retry_projection_exact = await asyncio.wait_for(_projection_matches_current_head(pool, namespace_id=probe_ns, resource_id=probe_resource, revision_id=probe_current.revision_id, text=probe_current.text), timeout=cell.timing.request_timeout_seconds)
         retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0} and retry_projection_exact
-        return retry_ok, retry_projection_exact
+        return retry_ok, retry_projection_exact, {"failed": failed, "retry": retried, "duplicate": duplicate}
 
     async def cleanup() -> tuple[dict[str, int], dict[str, int]]:
         delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
@@ -652,10 +684,11 @@ async def _run_cell(
 
     probe_started = clock(); probe_error: str | None = None
     try:
-        retry_ok, retry_projection_exact = await asyncio.wait_for(derived_probe(), timeout=cell.timing.settlement_timeout_seconds)
+        retry_ok, retry_projection_exact, probe_delivery = await asyncio.wait_for(derived_probe(), timeout=cell.timing.settlement_timeout_seconds)
     except Exception as exc:
         probe_error = type(exc).__name__
         retry_ok = retry_projection_exact = False
+        probe_delivery = {"failed": {}, "retry": {}, "duplicate": {}}
     probe_elapsed = max(0.0, clock() - probe_started)
 
     cleanup_started = clock(); cleanup_error: str | None = None
@@ -666,20 +699,21 @@ async def _run_cell(
         cleanup_delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
         final = await _snapshot(pool, vaults)
     cleanup_elapsed = max(0.0, clock() - cleanup_started)
-    delivery = {key: capacity_delivery[key] + cleanup_delivery[key] for key in capacity_delivery}
+    capacity_intents_closed = published == capacity_delivery["delivered"] + capacity_delivery["coalesced"]
     settled = steady.receipt(include_latency=False)
     settled["measurement_window"].update({
         "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds,
         "capacity_settlement_elapsed_seconds": round(capacity_elapsed, 6),
+        "settlement_polling": "not_applicable_synchronous_delivery",
     })
     settled.update({
-        "settled_effective_rps": _settled_effective_rps(successful=steady.successful, steady_seconds=steady.configured_seconds, capacity_settlement_seconds=capacity_elapsed),
+        "settled_effective_rps": _settled_effective_rps(successful=steady.successful, steady_seconds=steady.measurement_ended_at - steady.started_at, capacity_settlement_seconds=capacity_elapsed),
         "exact_current_head": exact_head,
         "direct_head_grep": direct_grep,
         "derived_projection_exact_current_head": projection_exact,
-        "capacity_settlement": {"elapsed_seconds": round(capacity_elapsed, 6), "closed": exact_head and direct_grep and projection_exact and capacity_error is None, "error": capacity_error},
-        "derived_probe": {"elapsed_seconds": round(probe_elapsed, 6), "closed": retry_ok and retry_projection_exact and probe_error is None, "error": probe_error},
-        "cleanup": {"elapsed_seconds": round(cleanup_elapsed, 6), "closed": cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0, "error": cleanup_error},
+        "capacity_settlement": {"elapsed_seconds": round(capacity_elapsed, 6), "closed": exact_head and direct_grep and projection_exact and capacity_intents_closed and capacity_error is None, "error": capacity_error},
+        "derived_probe": {"elapsed_seconds": round(probe_elapsed, 6), "closed": retry_ok and retry_projection_exact and probe_error is None, "error": probe_error, "delivery": probe_delivery},
+        "cleanup": {"elapsed_seconds": round(cleanup_elapsed, 6), "closed": cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0, "error": cleanup_error, "delivery": cleanup_delivery},
     })
     all_phase_errors = sum(warmup.errors.values()) + sum(warmup.drain_errors.values()) + sum(steady.errors.values()) + sum(steady.drain_errors.values())
     front = steady.receipt(include_latency=True)
@@ -693,7 +727,7 @@ async def _run_cell(
     }
     front["issuance_schedule"] = issuance_schedule
     settled["issuance_schedule"] = issuance_schedule
-    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps, "request_budget": cell.request_budget, "timing": {"warmup_seconds": cell.timing.warmup_seconds, "steady_seconds": cell.timing.steady_seconds, "drain_timeout_seconds": cell.timing.drain_timeout_seconds, "request_timeout_seconds": cell.timing.request_timeout_seconds, "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds, "settlement_poll_interval_seconds": cell.timing.settlement_poll_interval_seconds}, "resource": {"pool_max_size": pool_max_size}}, "front": front, "settled": settled, "intents": {"published": published, "coalesced": delivery["coalesced"], "delivered": delivery["delivered"], "pending": final["pending_intents"]}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "failure_retry_projection_exact_current_head": retry_projection_exact, "derived_projection_exact_current_head": projection_exact, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and projection_exact and retry_ok and retry_projection_exact and not all_phase_errors and capacity_error is None and probe_error is None and cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0}
+    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps, "request_budget": cell.request_budget, "timing": {"warmup_seconds": cell.timing.warmup_seconds, "steady_seconds": cell.timing.steady_seconds, "drain_timeout_seconds": cell.timing.drain_timeout_seconds, "request_timeout_seconds": cell.timing.request_timeout_seconds, "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds, "settlement_poll_interval_seconds": cell.timing.settlement_poll_interval_seconds}, "resource": {"pool_max_size": pool_max_size}}, "front": front, "settled": settled, "intents": {"published": published, "coalesced": capacity_delivery["coalesced"], "delivered": capacity_delivery["delivered"], "pending": final["pending_intents"], "closed": capacity_intents_closed}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "failure_retry_projection_exact_current_head": retry_projection_exact, "derived_projection_exact_current_head": projection_exact, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and projection_exact and capacity_intents_closed and retry_ok and retry_projection_exact and not all_phase_errors and capacity_error is None and probe_error is None and cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0}
 
 
 async def run() -> dict[str, Any]:

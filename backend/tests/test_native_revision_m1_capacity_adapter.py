@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -98,6 +99,7 @@ async def test_paced_phase_uses_global_ticket_schedule_and_fixed_window():
         target_rps=10,
         issuance_cap=100,
         request_timeout_seconds=1,
+        drain_timeout_seconds=1,
         operation=operation,
         clock=clock.now,
         sleep=clock.sleep,
@@ -123,6 +125,7 @@ async def test_closed_loop_excludes_late_completion_from_steady_goodput():
         target_rps=None,
         issuance_cap=100,
         request_timeout_seconds=1,
+        drain_timeout_seconds=1,
         operation=operation,
         clock=clock.now,
         sleep=clock.sleep,
@@ -132,6 +135,78 @@ async def test_closed_loop_excludes_late_completion_from_steady_goodput():
     assert result.successful == 3
     assert receipt["drain"]["successful"] == 1
     assert receipt["rps"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_request_budget_uses_actual_early_close_window_for_closed_loop():
+    clock = _FakeClock()
+
+    async def operation(_ticket: int, _slot: int) -> None:
+        clock.value += .1
+
+    result = await CAPACITY._run_phase(
+        name="steady",
+        duration_seconds=10,
+        concurrency=1,
+        load_model="closed-loop",
+        target_rps=None,
+        issuance_cap=2,
+        request_timeout_seconds=1,
+        drain_timeout_seconds=1,
+        operation=operation,
+        clock=clock.now,
+        sleep=clock.sleep,
+    )
+    receipt = result.receipt(include_latency=True)
+    assert result.close_reason == "request_budget"
+    assert receipt["measurement_window"]["observed_seconds"] == .2
+    assert receipt["rps"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_paced_cap_close_is_request_budget_not_steady_duration():
+    clock = _FakeClock()
+
+    async def operation(_ticket: int, _slot: int) -> None:
+        return None
+
+    result = await CAPACITY._run_phase(
+        name="steady",
+        duration_seconds=10,
+        concurrency=1,
+        load_model="paced",
+        target_rps=10,
+        issuance_cap=2,
+        request_timeout_seconds=1,
+        drain_timeout_seconds=1,
+        operation=operation,
+        clock=clock.now,
+        sleep=clock.sleep,
+    )
+    assert result.close_reason == "request_budget"
+    assert result.receipt(include_latency=True)["measurement_window"]["observed_seconds"] == .1
+
+
+@pytest.mark.asyncio
+async def test_phase_drain_timeout_is_explicit_and_not_green():
+    never = asyncio.Event()
+
+    async def operation(_ticket: int, _slot: int) -> None:
+        await never.wait()
+
+    result = await CAPACITY._run_phase(
+        name="steady",
+        duration_seconds=.01,
+        concurrency=1,
+        load_model="closed-loop",
+        target_rps=None,
+        issuance_cap=1,
+        request_timeout_seconds=1,
+        drain_timeout_seconds=.01,
+        operation=operation,
+    )
+    assert result.drain_timed_out is True
+    assert result.receipt(include_latency=False)["drain"]["errors"] == {"PhaseDrainTimeout": 1}
 
 
 def test_settled_effective_rps_excludes_probe_and_cleanup_time():
@@ -186,10 +261,11 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
         assert result["settled"]["capacity_settlement"]["closed"] is True
         assert result["settled"]["derived_probe"]["closed"] is True
         assert result["settled"]["cleanup"]["closed"] is True
+        assert result["settled"]["measurement_window"]["settlement_polling"] == "not_applicable_synchronous_delivery"
         capacity_elapsed = result["settled"]["capacity_settlement"]["elapsed_seconds"]
         expected_effective_rps = CAPACITY._settled_effective_rps(
             successful=result["settled"]["successful"],
-            steady_seconds=result["settled"]["measurement_window"]["configured_seconds"],
+            steady_seconds=result["settled"]["measurement_window"]["observed_seconds"],
             capacity_settlement_seconds=capacity_elapsed,
         )
         assert result["settled"]["settled_effective_rps"] == expected_effective_rps
@@ -198,6 +274,8 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
         assert set(("measurement_window", "issued", "successful", "error", "close_reason", "target_issuance", "achieved_issuance")) <= set(result["settled"])
         assert result["cell"]["resource"]["pool_max_size"] == 24
         assert result["intents"]["pending"] == 0
+        assert result["intents"]["closed"] is True
+        assert result["intents"]["published"] == result["intents"]["delivered"] + result["intents"]["coalesced"]
         assert result["resource_snapshot"]["final"]["projection_rows"] == 0
         assert result["derived_boundary"]["failure_retry_duplicate_current_head_pinned"] is True
         assert result["derived_boundary"]["failure_retry_projection_exact_current_head"] is True
