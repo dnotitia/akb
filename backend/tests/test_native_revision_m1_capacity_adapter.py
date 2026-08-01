@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import importlib.util
 import json
@@ -11,6 +10,9 @@ import uuid
 
 import asyncpg
 import pytest
+
+from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -94,6 +96,16 @@ async def test_single_cell_real_pg_closes_authority_and_projection():
         assert result["intents"]["pending"] == 0
         assert result["resource_snapshot"]["final"]["projection_rows"] == 0
         assert result["derived_boundary"]["failure_retry_duplicate_current_head_pinned"] is True
+        mixed_profile_vault = await CAPACITY._new_vault(pool, owner)
+        await M1ReferencePayloadStore(pool).prepare_text(
+            namespace_id=mixed_profile_vault,
+            payload="reference placement",
+        )
+        with pytest.raises(asyncpg.CheckViolationError, match="cannot mix"):
+            await M1PgBodyStore(pool).prepare_text(
+                namespace_id=mixed_profile_vault,
+                payload="different PostgreSQL body placement",
+            )
     finally:
         if pool is not None:
             await pool.close()

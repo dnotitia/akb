@@ -5,8 +5,9 @@ the B-core experiment could not accidentally select a physical text profile.
 M1's B-text arm needs a separately labelled candidate while retaining the same
 manifest foreign-key, integrity, and content-addressed deduplication checks.
 The experiment keeps one placement profile per namespace; the existing
-``(namespace_id, digest, byte_size)`` key intentionally rejects mixed-profile
-coexistence rather than creating ambiguous manifest identity.
+``(namespace_id, digest, byte_size)`` key and an advisory-lock-backed insert
+trigger reject mixed-profile coexistence across the whole namespace rather
+than creating ambiguous manifest identity.
 It admits ``pg-bodystore-v1`` without changing any legacy/default write path.
 """
 
@@ -40,6 +41,33 @@ async def _run(conn):
                     'm1-reference-payload-v1',
                     'pg-bodystore-v1'
                 ));
+
+            CREATE OR REPLACE FUNCTION akb_m1_enforce_namespace_payload_placement()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(
+                    hashtextextended(NEW.namespace_id::text, 917049)
+                );
+                IF EXISTS (
+                    SELECT 1
+                      FROM m1_reference_payloads existing
+                     WHERE existing.namespace_id = NEW.namespace_id
+                       AND existing.selected_placement <> NEW.selected_placement
+                ) THEN
+                    RAISE EXCEPTION
+                        'M1 measurement namespace cannot mix payload placements'
+                        USING ERRCODE = '23514';
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+            DROP TRIGGER IF EXISTS trg_m1_namespace_payload_placement
+                ON m1_reference_payloads;
+            CREATE TRIGGER trg_m1_namespace_payload_placement
+                BEFORE INSERT ON m1_reference_payloads
+                FOR EACH ROW
+                EXECUTE FUNCTION akb_m1_enforce_namespace_payload_placement();
             """
         )
     logger.info("Migration 049: explicit M1 PostgreSQL BodyStore candidate ready")

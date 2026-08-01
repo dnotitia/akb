@@ -213,6 +213,25 @@ class S3CAS:
             "PreconditionFailed",
         }
 
+    def _remove_created_object(self, key: str) -> None:
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+            try:
+                self.client.head_object(Bucket=self.bucket, Key=key)
+            except (ClientError, KeyError) as exc:
+                if isinstance(exc, ClientError):
+                    response = exc.response or {}
+                    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                    code = str(response.get("Error", {}).get("Code", ""))
+                    if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
+                        raise
+            else:
+                raise BinaryStoreError("new S3 CAS object remained after cleanup")
+        except Exception as exc:
+            if isinstance(exc, BinaryStoreError):
+                raise
+            raise BinaryStoreError("new S3 CAS object cleanup failed") from exc
+
     def prepare_verified(
         self,
         tenant: str,
@@ -222,6 +241,7 @@ class S3CAS:
     ) -> PreparedBinary:
         digest, size = _verify(data, expected_digest, expected_size)
         key = self._key(tenant, digest)
+        created = False
         try:
             self.client.put_object(
                 Bucket=self.bucket,
@@ -229,11 +249,17 @@ class S3CAS:
                 Body=data,
                 IfNoneMatch="*",
             )
+            created = True
         except ClientError as exc:
             if not self._is_existing_object(exc):
                 raise BinaryStoreError("S3 CAS conditional publish failed") from exc
         prepared = PreparedBinary(key, digest, size, self.driver)
-        self.open_verified(tenant, prepared)
+        try:
+            self.open_verified(tenant, prepared)
+        except Exception:
+            if created:
+                self._remove_created_object(key)
+            raise
         return prepared
 
     def open_verified(self, tenant: str, prepared: PreparedBinary) -> bytes:

@@ -63,6 +63,7 @@ class _S3:
     def __init__(self):
         self.objects: dict[tuple[str, str], bytes] = {}
         self.put_error: ClientError | None = None
+        self.get_error: Exception | None = None
 
     def put_object(self, *, Bucket, Key, Body, IfNoneMatch):
         assert IfNoneMatch == "*"
@@ -77,10 +78,24 @@ class _S3:
         self.objects[identity] = Body
 
     def get_object(self, *, Bucket, Key):
+        if self.get_error is not None:
+            raise self.get_error
         return {"Body": BytesIO(self.objects[(Bucket, Key)])}
 
     def head_object(self, *, Bucket, Key):
         return {"ContentLength": len(self.objects[(Bucket, Key)])}
+
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop((Bucket, Key), None)
+
+    def list_objects_v2(self, *, Bucket, Prefix):
+        return {
+            "Contents": [
+                {"Key": key}
+                for bucket, key in self.objects
+                if bucket == Bucket and key.startswith(Prefix)
+            ]
+        }
 
 
 def test_s3_cas_adopts_only_a_reverified_existing_object():
@@ -105,3 +120,13 @@ def test_s3_cas_does_not_hide_auth_or_network_class_errors():
     )
     with pytest.raises(BinaryStoreError, match="conditional publish"):
         S3CAS("bucket", client).prepare_verified("tenant", b"x")
+
+
+def test_s3_cas_removes_new_object_when_post_put_verification_fails():
+    client = _S3()
+    client.get_error = OSError("injected post-put GET failure")
+
+    with pytest.raises(BinaryStoreError, match="object is missing"):
+        S3CAS("bucket", client).prepare_verified("tenant", b"x")
+
+    assert client.objects == {}

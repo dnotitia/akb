@@ -255,6 +255,47 @@ async def _logical_delete(pool: asyncpg.Pool, namespace_id: uuid.UUID, logical_p
         )
 
 
+def _delete_and_verify_s3_objects(
+    client,
+    bucket: str,
+    tenant: str,
+    objects: list[PreparedBinary],
+) -> None:
+    prefix = f"m1-binary/{tenant}/"
+    errors: list[str] = []
+    keys = {prepared.locator for prepared in objects}
+    try:
+        page = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        keys.update(item["Key"] for item in page.get("Contents", []))
+    except Exception:
+        errors.append("list_before_cleanup")
+    for key in sorted(keys):
+        try:
+            client.delete_object(Bucket=bucket, Key=key)
+            try:
+                client.head_object(Bucket=bucket, Key=key)
+            except ClientError as exc:
+                response = exc.response or {}
+                status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                code = str(response.get("Error", {}).get("Code", ""))
+                if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+            else:
+                raise AdapterError("run-owned S3 measurement object remained after delete")
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    try:
+        remaining = client.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+    except Exception:
+        errors.append("list_after_cleanup")
+        remaining = ["unknown"]
+    if errors or remaining:
+        raise AdapterError(
+            "run-owned S3 cleanup was incomplete "
+            f"(error_count={len(errors)}, remaining_count={len(remaining)})"
+        )
+
+
 async def _run_fixture(
     pool: asyncpg.Pool,
     store: BinaryStore,
@@ -370,15 +411,25 @@ async def run() -> dict[str, Any]:
             }
         )
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        cleanup = "namespace_pvc_owned_verified_mountpoint"
+        if s3_client is not None:
+            bucket = required_environment("AKB_NATIVE_REVISION_BINARY_MEASUREMENT_BUCKET")
+            _delete_and_verify_s3_objects(s3_client, bucket, tenant, prepared_objects)
+            prepared_objects.clear()
+            cleanup = "run_owned_s3_objects_deleted_and_absence_verified"
         request_artifact = write_bound_json(
             run_artifact_path("native-binary-requests"),
             {"workload": WORKLOAD, "driver": driver, "size_cohorts": list(SIZE_COHORTS), "stage_latency_ms": timings},
         )
         authority_artifact = write_bound_json(
             run_artifact_path("native-binary-authority"),
-            {"workload": WORKLOAD, "driver": driver, "assertions": cases["assertions"]},
+            {
+                "workload": WORKLOAD,
+                "driver": driver,
+                "assertions": cases["assertions"],
+                "cleanup": cleanup,
+            },
         )
-        cleanup = "namespace_pvc_owned" if s3_client is None else "run_owned_s3_objects_deleted"
         return {
             "protocol_version": PROTOCOL_VERSION,
             "workload": WORKLOAD,
@@ -419,23 +470,7 @@ async def run() -> dict[str, Any]:
         try:
             if s3_client is not None:
                 bucket = required_environment("AKB_NATIVE_REVISION_BINARY_MEASUREMENT_BUCKET")
-                for prepared in prepared_objects:
-                    try:
-                        s3_client.delete_object(Bucket=bucket, Key=prepared.locator)
-                        try:
-                            s3_client.head_object(Bucket=bucket, Key=prepared.locator)
-                        except ClientError as exc:
-                            response = exc.response or {}
-                            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                            code = str(response.get("Error", {}).get("Code", ""))
-                            if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
-                                raise
-                        else:
-                            raise AdapterError("run-owned S3 measurement object remained after delete")
-                    except Exception as exc:
-                        if isinstance(exc, AdapterError):
-                            raise
-                        raise AdapterError("could not remove run-owned S3 measurement object") from exc
+                _delete_and_verify_s3_objects(s3_client, bucket, tenant, prepared_objects)
             async with pool.acquire() as connection:
                 await connection.execute("DELETE FROM vaults WHERE id = $1", namespace_id)
                 await connection.execute("DELETE FROM users WHERE id = $1", owner_id)

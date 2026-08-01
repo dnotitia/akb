@@ -14,7 +14,6 @@ import hashlib
 import importlib.util
 import json
 import math
-import os
 import sys
 import time
 import uuid
@@ -46,16 +45,19 @@ MAX_CELLS = 70
 MATRIX_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRICES_JSON"
 MATRIX_HASH_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRIX_SET_SHA256"
 MEASUREMENT_TABLE = "m1_capacity_derived_projection"
-# Exact frozen workbench comparison set: base + concurrency + overload + paced
-# + topology.  The localized matrix is deliberately a separate extension, not
-# silently substituted into the published 70-cell M1 comparison population.
+# Exact frozen workbench comparison set.  The concurrency manifest contains two
+# planned C=128 repeats that were not run after the first safety-censored cell;
+# the fresh overload manifest replaced them.  Excluding those exact two IDs and
+# including the localized matrix reproduces the 70 cells actually published by
+# the M0 comparator (22 + 12 + 18 + 12 + 6).
 EXPECTED_MATRIX_HASHES = {
-    "settled_matrix.json": "4598e23e96f5cfcff0850516496abce1621ac835e2de7b90114a5da0a268460d",
     "settled_concurrency_matrix.json": "9beee2ee2aa36ec3d401f337b82e1061e5ab0e16a6fc8a2b849bddb44e22c7f6",
+    "settled_localized_matrix.json": "de982a8bd84f12a8a770ebdf7f1b0796363c819efa38659b4c1841502309bfd6",
     "settled_overload_matrix.json": "b524c0c0c796a8c112f8d51d29a8fb16b612c5bae85b499032e5a3acc361d9a9",
     "settled_paced_matrix.json": "d1e915b0b9697d4ea8a3c674a85590fdc25c81b90fee0de65ae62ac368e6419f",
     "settled_topology_matrix.json": "60ebb15b01ddfc70f43cc02892b18fb806c023fdbfda9a0ea899f7966094db8f",
 }
+EXCLUDED_PLANNED_CELL_IDS = {"text-1k-c128-r2", "text-1k-c128-r3"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ def load_cells() -> tuple[list[Cell], dict[str, str], str]:
     for path in paths:
         if _sha256(path.read_bytes()) != EXPECTED_MATRIX_HASHES[path.name]:
             raise AdapterError(f"capacity matrix SHA-256 differs from frozen M1 manifest: {path.name}")
+    paths.sort(key=lambda path: path.name)
     actual_hash = _matrix_digest(paths)
     expected_hash = required_environment(MATRIX_HASH_ENV)
     if expected_hash != actual_hash:
@@ -130,6 +133,10 @@ def load_cells() -> tuple[list[Cell], dict[str, str], str]:
                 )
             except KeyError as exc:
                 raise AdapterError("capacity cell is missing a required dimension") from exc
+            if cell_id in EXCLUDED_PLANNED_CELL_IDS:
+                if path.name != "settled_concurrency_matrix.json":
+                    raise AdapterError("excluded planned cell appeared outside the concurrency manifest")
+                continue
             if (not isinstance(cell_id, str) or not isinstance(concurrency, int) or not 1 <= concurrency <= 128
                     or topology not in {"same-vault", "cross-vault"} or not isinstance(size, int) or not 32 <= size <= 16 * 1024 * 1024
                     or not isinstance(budget, int) or not 1 <= budget <= 1_000_000):
@@ -155,12 +162,17 @@ def load_cells() -> tuple[list[Cell], dict[str, str], str]:
 
 def _body(size: int, revision: int, localized: bool) -> str:
     """Exact-size markdown with stable sections for chunk reuse comparison."""
-    marker = f"m1-capacity-needle revision-{revision % 2}\n"
-    local = f"localized-marker-{revision % 2}\n" if localized else ""
-    prefix = "# Capacity\n\n## Stable\n" + marker + ("s" * 160) + "\n\n## Mutable\n" + local
+    marker = "m1-capacity-needle\n"
+    mutable = (
+        f"localized-marker-{revision:010d}\n"
+        if localized
+        else f"full-body-marker-{revision:010d}\n"
+    )
+    prefix = "# Capacity\n\n## Stable\n" + marker + ("s" * 160) + "\n\n## Mutable\n" + mutable
     if len(prefix.encode()) > size:
         raise AdapterError("capacity payload size cannot hold fixture markers")
-    return prefix + ("a" if localized else ("a" if revision % 2 == 0 else "b")) * (size - len(prefix.encode()))
+    tail = "a" if localized else chr(ord("a") + revision % 26)
+    return prefix + tail * (size - len(prefix.encode()))
 
 
 def _chunk_hashes(body: str) -> list[str]:
@@ -255,7 +267,7 @@ async def _current_path(pool: asyncpg.Pool, resource_id: uuid.UUID) -> str:
     async with pool.acquire() as conn:
         value = await conn.fetchval("SELECT current_path FROM native_resources WHERE resource_id=$1", resource_id)
     if not isinstance(value, str):
-        raise NotFoundError("native resource no longer has a current path")
+        raise NotFoundError("native resource", str(resource_id))
     return value
 
 
