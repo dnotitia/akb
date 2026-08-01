@@ -9,10 +9,10 @@ from app.api.deps import get_current_user
 from app.services import knowledge_io
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services.document_service import DocumentService
+from app.services.revision_backend import get_document_service
 
 router = APIRouter()
-doc_service = DocumentService()
+doc_service = get_document_service()
 
 
 @router.get(

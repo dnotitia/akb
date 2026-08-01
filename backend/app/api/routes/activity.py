@@ -6,29 +6,22 @@ which are read-only views over git history rather than session
 management. The file was renamed accordingly.
 """
 
-import asyncio
-import json
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
-from app.services.document_service import DocumentService
-from app.services.git_service import GitService
+from app.services.revision_backend import get_revision_backend
 from app.services.user_directory import resolve_display_names
-from app.db.postgres import get_pool
 from app.models.activity import (
     AkbActivityEnvelope,
     AkbDocumentDiffEnvelope,
     AkbDocumentHistoryEnvelope,
     AkbRecentChangesEnvelope,
 )
-from app.repositories.document_repo import DocumentRepository
 
 router = APIRouter()
-git = GitService()
-doc_service = DocumentService()
+revision_backend = get_revision_backend()
 
 
 async def _resolve_activity_authors(entries: list[dict]) -> list[dict]:
@@ -68,10 +61,8 @@ async def vault_activity(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
-    # vault_log spawns `git rev-list` + one `git diff` subprocess per commit;
-    # off-load it so the single event loop isn't starved (probe-timeout 503).
-    entries = await asyncio.to_thread(
-        git.vault_log, vault, max_count=limit, since=since, path=collection,
+    entries = await revision_backend.vault_activity(
+        vault, max_count=limit, since=since, path=collection,
     )
     entries = await _resolve_activity_authors(entries)
 
@@ -106,62 +97,11 @@ async def recent_changes(
     check). Otherwise, returns docs from every vault the user owns or has
     been granted access to. Documents are sorted by `updated_at DESC`.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if vault:
-            await check_vault_access(user.user_id, vault, required_role="reader")
-            rows = await conn.fetch(
-                """
-                SELECT d.id, d.title, d.path, d.doc_type, d.current_commit,
-                       d.updated_at, v.name AS vault_name, d.metadata
-                FROM documents d
-                JOIN vaults v ON d.vault_id = v.id
-                WHERE v.name = $1
-                ORDER BY d.updated_at DESC
-                LIMIT $2
-                """,
-                vault, limit,
-            )
-        else:
-            # Include public-readable vaults so /recent is consistent with
-            # /search and list_accessible_vaults — pre-fix this route only
-            # surfaced owned/granted vaults, hiding docs from vaults the
-            # user could still read via public_access (06-F5).
-            rows = await conn.fetch(
-                """
-                SELECT d.id, d.title, d.path, d.doc_type, d.current_commit,
-                       d.updated_at, v.name AS vault_name, d.metadata
-                FROM documents d
-                JOIN vaults v ON d.vault_id = v.id
-                LEFT JOIN vault_access va
-                    ON va.vault_id = v.id AND va.user_id = $1
-                WHERE v.owner_id = $1
-                   OR va.user_id = $1
-                   OR v.public_access IN ('reader', 'writer')
-                ORDER BY d.updated_at DESC
-                LIMIT $2
-                """,
-                user.user_id, limit,
-            )
-
-    changes = []
-    for r in rows:
-        meta = r["metadata"] or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except json.JSONDecodeError:
-                meta = {}
-        doc_id = meta.get("id") or str(r["id"])
-        changes.append({
-            "doc_id": doc_id,
-            "vault": r["vault_name"],
-            "path": r["path"],
-            "title": r["title"],
-            "type": r["doc_type"] or "note",
-            "commit": r["current_commit"],
-            "changed_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-        })
+    if vault:
+        await check_vault_access(user.user_id, vault, required_role="reader")
+    changes = await revision_backend.recent_changes(
+        user.user_id, vault=vault, limit=limit,
+    )
     return {"kind": "recent_changes", "changes": changes}
 
 
@@ -181,16 +121,9 @@ async def document_diff(
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
 
-    pool = await get_pool()
-    doc_repo = DocumentRepository(pool)
-    async with pool.acquire() as conn:
-        v = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault)
-        doc = await doc_repo.find_by_ref_with_conn(conn, v["id"], doc_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
-
-    # off-load the git diff subprocess so the single event loop isn't starved
-    result = await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
+    result = await revision_backend.document_diff(vault, doc_id, commit)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
     return {"kind": "document_diff", **result}
 
 
@@ -218,5 +151,5 @@ async def document_history(
     which the global AKBError handler maps to 404.
     """
     await check_vault_access(user.user_id, vault, required_role="reader")
-    result = await doc_service.history(vault, doc_id, limit=limit)
+    result = await revision_backend.document_history(vault, doc_id, limit=limit)
     return {"kind": "document_history", **result}
