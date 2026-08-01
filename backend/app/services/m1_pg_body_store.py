@@ -106,7 +106,10 @@ class M1PgBodyStore:
                     len(canonical),
                     self.selected_placement,
                 )
-        assert row is not None
+        if row is None:
+            raise PgBodyIntegrityError(
+                "namespace already contains the same body under a different measurement placement"
+            )
         self._verify_row(row, expected=canonical)
         return PreparedReferencePayload(
             payload_id=row["payload_id"],

@@ -4,6 +4,9 @@ Migration 048 deliberately labelled its BYTEA payload as a reference adapter so
 the B-core experiment could not accidentally select a physical text profile.
 M1's B-text arm needs a separately labelled candidate while retaining the same
 manifest foreign-key, integrity, and content-addressed deduplication checks.
+The experiment keeps one placement profile per namespace; the existing
+``(namespace_id, digest, byte_size)`` key intentionally rejects mixed-profile
+coexistence rather than creating ambiguous manifest identity.
 It admits ``pg-bodystore-v1`` without changing any legacy/default write path.
 """
 
@@ -37,11 +40,6 @@ async def _run(conn):
                     'm1-reference-payload-v1',
                     'pg-bodystore-v1'
                 ));
-            ALTER TABLE m1_reference_payloads
-                DROP CONSTRAINT IF EXISTS m1_reference_payloads_dedup_key;
-            ALTER TABLE m1_reference_payloads
-                ADD CONSTRAINT m1_reference_payloads_dedup_key
-                UNIQUE (namespace_id, digest, byte_size);
             """
         )
     logger.info("Migration 049: explicit M1 PostgreSQL BodyStore candidate ready")

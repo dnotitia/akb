@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import secrets
 import sys
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+from botocore.exceptions import ClientError
 
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ for entry in (BACKEND, SCRIPT_DIR):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
+from app.exceptions import ValidationError  # noqa: E402
 from app.services.m1_binary_store import (  # noqa: E402
     BinaryStore,
     FilesystemCAS,
@@ -59,6 +62,8 @@ def _safe_root() -> Path:
     if root.name != "binary-measurement" or root in {Path("/").resolve(), Path.home().resolve()}:
         raise AdapterError("FilesystemCAS root must be a dedicated directory named binary-measurement")
     root.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("AKB_NATIVE_REVISION_MEASUREMENT_TIER", "E0") == "E1b" and not root.is_mount():
+        raise AdapterError("E1b FilesystemCAS root must be the run-owned PVC mountpoint")
     return root
 
 
@@ -168,6 +173,51 @@ async def _visible_count(pool: asyncpg.Pool, namespace_id: uuid.UUID) -> int:
         )
 
 
+class _InjectedPublicationFailure(RuntimeError):
+    pass
+
+
+async def _publish_then_rollback(
+    pool: asyncpg.Pool,
+    *,
+    namespace_id: uuid.UUID,
+    logical_path: str,
+    prepared: PreparedBinary,
+) -> bool:
+    """Insert a logical publication and force its transaction to roll back."""
+    try:
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO m1_binary_measurement_publications (
+                        file_id, namespace_id, logical_path, revision_id, digest,
+                        byte_size, driver, private_locator
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    uuid.uuid4(),
+                    namespace_id,
+                    logical_path,
+                    secrets.token_hex(20),
+                    prepared.digest,
+                    prepared.size,
+                    prepared.driver,
+                    prepared.locator,
+                )
+                visible_inside = int(
+                    await connection.fetchval(
+                        "SELECT count(*) FROM m1_binary_measurement_publications WHERE namespace_id = $1",
+                        namespace_id,
+                    )
+                )
+                if visible_inside != 1:
+                    raise AdapterError("injected publication was not visible inside its transaction")
+                raise _InjectedPublicationFailure
+    except _InjectedPublicationFailure:
+        return await _visible_count(pool, namespace_id) == 0
+
+
 async def _logical_open(
     pool: asyncpg.Pool,
     store: BinaryStore,
@@ -210,13 +260,25 @@ async def _run_fixture(
     store: BinaryStore,
     tenant: str,
     namespace_id: uuid.UUID,
-) -> tuple[dict[str, Any], list[float], list[PreparedBinary]]:
+    prepared_objects: list[PreparedBinary],
+) -> tuple[dict[str, Any], list[float]]:
     assertions: dict[str, bool] = {}
     timings: list[float] = []
-    prepared_objects: list[PreparedBinary] = []
-
     assertions["initiated_not_visible"] = await _visible_count(pool, namespace_id) == 0
-    assertions["interrupted_transfer_not_visible"] = await _visible_count(pool, namespace_id) == 0
+    interrupted_payload = _payload(1024)
+    try:
+        store.prepare_verified(
+            tenant,
+            interrupted_payload[:-1],
+            hashlib.sha256(interrupted_payload).hexdigest(),
+            len(interrupted_payload),
+        )
+    except ValidationError:
+        assertions["interrupted_transfer_not_visible"] = (
+            await _visible_count(pool, namespace_id) == 0
+        )
+    else:
+        assertions["interrupted_transfer_not_visible"] = False
 
     for size in SIZE_COHORTS:
         data = _payload(size)
@@ -229,8 +291,11 @@ async def _run_fixture(
 
         # A prepared CAS object does not publish a logical File.  This is the
         # injected DB-publication failure boundary.
-        assertions[f"failed_db_publish_nonvisible_{size}"] = (
-            await _visible_count(pool, namespace_id) == 0
+        assertions[f"failed_db_publish_nonvisible_{size}"] = await _publish_then_rollback(
+            pool,
+            namespace_id=namespace_id,
+            logical_path=f"rollback-{logical_path}",
+            prepared=prepared,
         )
 
         published = await _publish(
@@ -257,7 +322,7 @@ async def _run_fixture(
         await _logical_delete(pool, namespace_id, logical_path)
         assertions[f"delete_nonvisible_{size}"] = await _visible_count(pool, namespace_id) == 0
 
-    return {"assertions": assertions, "size_cohorts": list(SIZE_COHORTS)}, timings, prepared_objects
+    return {"assertions": assertions, "size_cohorts": list(SIZE_COHORTS)}, timings
 
 
 async def run() -> dict[str, Any]:
@@ -285,7 +350,13 @@ async def run() -> dict[str, Any]:
     started = time.perf_counter()
     prepared_objects: list[PreparedBinary] = []
     try:
-        cases, timings, prepared_objects = await _run_fixture(pool, store, tenant, namespace_id)
+        cases, timings = await _run_fixture(
+            pool,
+            store,
+            tenant,
+            namespace_id,
+            prepared_objects,
+        )
         if not all(cases["assertions"].values()):
             failed = [name for name, passed in cases["assertions"].items() if not passed]
             raise AdapterError(f"binary semantic assertions failed: {failed}")
@@ -307,15 +378,7 @@ async def run() -> dict[str, Any]:
             run_artifact_path("native-binary-authority"),
             {"workload": WORKLOAD, "driver": driver, "assertions": cases["assertions"]},
         )
-        cleanup = "namespace_pvc_owned"
-        if s3_client is not None:
-            bucket = required_environment("AKB_NATIVE_REVISION_BINARY_MEASUREMENT_BUCKET")
-            for prepared in prepared_objects:
-                try:
-                    s3_client.delete_object(Bucket=bucket, Key=prepared.locator)
-                except Exception as exc:
-                    raise AdapterError("could not remove run-owned S3 measurement object") from exc
-            cleanup = "run_owned_s3_objects_deleted"
+        cleanup = "namespace_pvc_owned" if s3_client is None else "run_owned_s3_objects_deleted"
         return {
             "protocol_version": PROTOCOL_VERSION,
             "workload": WORKLOAD,
@@ -353,10 +416,31 @@ async def run() -> dict[str, Any]:
             },
         }
     finally:
-        async with pool.acquire() as connection:
-            await connection.execute("DELETE FROM vaults WHERE id = $1", namespace_id)
-            await connection.execute("DELETE FROM users WHERE id = $1", owner_id)
-        await pool.close()
+        try:
+            if s3_client is not None:
+                bucket = required_environment("AKB_NATIVE_REVISION_BINARY_MEASUREMENT_BUCKET")
+                for prepared in prepared_objects:
+                    try:
+                        s3_client.delete_object(Bucket=bucket, Key=prepared.locator)
+                        try:
+                            s3_client.head_object(Bucket=bucket, Key=prepared.locator)
+                        except ClientError as exc:
+                            response = exc.response or {}
+                            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                            code = str(response.get("Error", {}).get("Code", ""))
+                            if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
+                                raise
+                        else:
+                            raise AdapterError("run-owned S3 measurement object remained after delete")
+                    except Exception as exc:
+                        if isinstance(exc, AdapterError):
+                            raise
+                        raise AdapterError("could not remove run-owned S3 measurement object") from exc
+            async with pool.acquire() as connection:
+                await connection.execute("DELETE FROM vaults WHERE id = $1", namespace_id)
+                await connection.execute("DELETE FROM users WHERE id = $1", owner_id)
+        finally:
+            await pool.close()
 
 
 def main() -> int:

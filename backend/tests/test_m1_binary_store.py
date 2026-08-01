@@ -39,6 +39,20 @@ def test_fscas_rejects_digest_mismatch_and_locator_escape(tmp_path: Path):
         store.open_verified("tenant", escaped)
 
 
+def test_fscas_failed_atomic_publication_removes_private_temp(tmp_path: Path, monkeypatch):
+    store = FilesystemCAS(tmp_path)
+
+    def fail_link(_source, _destination):
+        raise OSError("injected link failure")
+
+    monkeypatch.setattr("app.services.m1_binary_store.os.link", fail_link)
+    with pytest.raises(OSError, match="injected link failure"):
+        store.prepare_verified("tenant", b"exact")
+
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
 @pytest.mark.parametrize("tenant", ["", "../escape", "a/b", ".hidden"])
 def test_fscas_rejects_invalid_tenant(tmp_path: Path, tenant: str):
     with pytest.raises(ValidationError, match="tenant"):

@@ -74,6 +74,32 @@ class FilesystemCAS:
 
     def __init__(self, root: Path):
         self.root = root.resolve()
+        if not self.root.is_dir():
+            raise ValidationError("FilesystemCAS root must be a pre-provisioned directory")
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _durable_mkdirs(self, directory: Path) -> None:
+        """Create and durably publish each directory below the storage root."""
+        relative = directory.relative_to(self.root)
+        current = self.root
+        for component in relative.parts:
+            parent = current
+            current = current / component
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                if not current.is_dir():
+                    raise BinaryStoreError("FilesystemCAS hierarchy contains a non-directory")
+            else:
+                self._fsync_directory(current)
+                self._fsync_directory(parent)
 
     def _path(self, tenant: str, digest: str) -> Path:
         _validate_tenant(tenant)
@@ -103,7 +129,7 @@ class FilesystemCAS:
     ) -> PreparedBinary:
         digest, size = _verify(data, expected_digest, expected_size)
         path = self._path(tenant, digest)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._durable_mkdirs(path.parent)
         temporary = path.parent / f".{digest}.{uuid.uuid4().hex}.tmp"
         try:
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -124,11 +150,7 @@ class FilesystemCAS:
                 raise
             finally:
                 temporary.unlink(missing_ok=True)
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            self._fsync_directory(path.parent)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

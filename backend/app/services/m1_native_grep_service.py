@@ -15,7 +15,7 @@ from typing import Any
 
 import asyncpg
 
-from app.exceptions import ValidationError
+from app.exceptions import ForbiddenError, ValidationError
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
@@ -73,10 +73,13 @@ class M1NativeGrepService:
             conditions.append(f"v.name = ANY(${len(params)})")
         if collection:
             prefix = collection.strip("/")
-            params.extend([prefix, f"{prefix}/%"])
+            escaped_prefix = (
+                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            params.extend([prefix, f"{escaped_prefix}/%"])
             conditions.append(
                 f"(rs.current_path = ${len(params) - 1} OR "
-                f"rs.current_path LIKE ${len(params)})"
+                f"rs.current_path LIKE ${len(params)} ESCAPE '\\')"
             )
         if resource_id is not None:
             params.append(resource_id)
@@ -122,6 +125,43 @@ class M1NativeGrepService:
                 )
             )
         return bodies
+
+    async def _require_write_access(
+        self,
+        *,
+        user_id: uuid.UUID,
+        namespace_ids: set[uuid.UUID],
+    ) -> None:
+        if not namespace_ids:
+            return
+        async with self.pool.acquire() as conn:
+            writable_rows = await conn.fetch(
+                """
+                SELECT v.id
+                 FROM vaults v
+                 WHERE v.id = ANY($1::uuid[])
+                   AND v.status <> 'archived'
+                   AND (
+                       v.owner_id = $2
+                       OR EXISTS (
+                           SELECT 1 FROM users u
+                            WHERE u.id = $2 AND u.is_admin = TRUE
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM vault_access va
+                            WHERE va.vault_id = v.id
+                              AND va.user_id = $2
+                              AND va.role IN ('writer', 'admin', 'owner')
+                       )
+                       OR v.public_access = 'writer'
+                   )
+                """,
+                list(namespace_ids),
+                user_id,
+            )
+        writable_ids = {row["id"] for row in writable_rows}
+        if writable_ids != namespace_ids:
+            raise ForbiddenError("grep replace requires writer access to every matched vault")
 
     @staticmethod
     def _matcher(pattern: str, *, regex: bool, case_sensitive: bool):
@@ -213,6 +253,10 @@ class M1NativeGrepService:
         selected = matched[:limit]
         replacements: list[dict[str, Any]] = []
         if replace is not None:
+            await self._require_write_access(
+                user_id=user_id,
+                namespace_ids={item["_body"].namespace_id for item in selected},
+            )
             native = NativeRevisionService(self.pool, payload_store=self.body_store)
             for item in selected:
                 head_body: HeadBody = item["_body"]

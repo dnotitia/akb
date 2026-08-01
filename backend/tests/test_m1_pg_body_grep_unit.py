@@ -116,3 +116,5 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
     assert "rs.head_revision_id" in conn.sql
     assert "vault_access" in conn.sql
     assert "pg-bodystore-v1" in conn.sql
+    assert "ESCAPE" in conn.sql
+    assert conn.params[2:] == ("src", "src/%", resource_id)

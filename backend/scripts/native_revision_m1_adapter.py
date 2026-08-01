@@ -555,6 +555,13 @@ async def workload_isolation(
         actor="m1-isolation",
         mutation_id=mutation_id(),
     )
+    async with pool.acquire() as conn:
+        activity_before_cold_reads = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM native_revision_activity WHERE namespace_id = ANY($1::uuid[])",
+                [hot_namespace_id, cold_namespace_id],
+            )
+        )
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -593,6 +600,13 @@ async def workload_isolation(
         timeout=5,
     )
     grep_ms = round((time.perf_counter() - grep_started) * 1000, 3)
+    async with pool.acquire() as conn:
+        activity_after_cold_reads = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM native_revision_activity WHERE namespace_id = ANY($1::uuid[])",
+                [hot_namespace_id, cold_namespace_id],
+            )
+        )
     completed_before_hot_drain = not hot_task.done()
     release.set()
     published_hot = await asyncio.wait_for(hot_task, timeout=10)
@@ -624,7 +638,8 @@ async def workload_isolation(
                     "final_authority": {
                         "hot_head_revision": published_hot.revision_id,
                         "cold_head_revision": cold_get.revision_id,
-                        "unexpected_activity_delta": 0,
+                        "unexpected_activity_delta": activity_after_cold_reads
+                        - activity_before_cold_reads,
                     },
                 }
             }

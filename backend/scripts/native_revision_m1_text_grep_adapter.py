@@ -20,6 +20,7 @@ if str(BACKEND) not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from app.exceptions import ForbiddenError  # noqa: E402
 from app.services.m1_native_grep_service import M1NativeGrepService  # noqa: E402
 from app.services.m1_pg_body_store import M1PgBodyStore  # noqa: E402
 from app.services.native_revision_service import NativeRevisionService  # noqa: E402
@@ -48,7 +49,9 @@ async def _load_migration(conn: asyncpg.Connection, filename: str) -> None:
     await module.migrate(conn=conn)
 
 
-async def initialise(dsn: str) -> tuple[asyncpg.Pool, str, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+async def initialise(
+    dsn: str,
+) -> tuple[asyncpg.Pool, str, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
     conn = await asyncpg.connect(dsn, timeout=10)
     try:
         database = str(await conn.fetchval("SELECT current_database()"))
@@ -73,6 +76,14 @@ async def initialise(dsn: str) -> tuple[asyncpg.Pool, str, uuid.UUID, uuid.UUID,
             f"m1-text-denied-{suffix}",
             f"m1-text-denied-{suffix}@invalid.example",
         )
+        reader_id = await conn.fetchval(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES ($1, $2, 'm1-measurement-disabled') RETURNING id
+            """,
+            f"m1-text-reader-{suffix}",
+            f"m1-text-reader-{suffix}@invalid.example",
+        )
         allowed_vault = await conn.fetchval(
             """
             INSERT INTO vaults (name, git_path, owner_id)
@@ -89,11 +100,18 @@ async def initialise(dsn: str) -> tuple[asyncpg.Pool, str, uuid.UUID, uuid.UUID,
             f"m1-text-denied-{suffix}",
             denied_id,
         )
+        await conn.execute(
+            "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, 'reader', $3)",
+            allowed_vault,
+            reader_id,
+            owner_id,
+        )
         return (
             await asyncpg.create_pool(dsn, min_size=1, max_size=12),
             database,
             owner_id,
             denied_id,
+            reader_id,
             allowed_vault,
             denied_vault,
         )
@@ -138,6 +156,7 @@ async def _document_workload(
     service: NativeRevisionService,
     grep: M1NativeGrepService,
     owner_id: uuid.UUID,
+    reader_id: uuid.UUID,
     allowed_vault: uuid.UUID,
     denied_vault: uuid.UUID,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
@@ -163,6 +182,13 @@ async def _document_workload(
             path="secret.md",
             body="Needle forbidden\n",
         ),
+        await _create(
+            service,
+            namespace_id=allowed_vault,
+            surface="document",
+            path="team_ax/escape.md",
+            body="wildcard-scope-token\n",
+        ),
     ]
     latencies: list[float] = []
     literal, elapsed = await _timed_grep(grep, "needle", user_id=owner_id)
@@ -179,6 +205,23 @@ async def _document_workload(
     latencies.append(elapsed)
     scoped, elapsed = await _timed_grep(grep, "needle", user_id=owner_id, collection="guides/alpha.md")
     latencies.append(elapsed)
+    wildcard_scope, elapsed = await _timed_grep(
+        grep,
+        "wildcard-scope-token",
+        user_id=owner_id,
+        collection="team_%",
+    )
+    latencies.append(elapsed)
+    reader_replace_denied = False
+    try:
+        await grep.grep(
+            "common",
+            user_id=reader_id,
+            replace="forbidden-reader-write",
+            actor="m1-reader",
+        )
+    except ForbiddenError:
+        reader_replace_denied = True
     replaced, elapsed = await _timed_grep(
         grep,
         "common",
@@ -197,7 +240,9 @@ async def _document_workload(
         "count_shape": count["total_resources"] == 2 and count["total_matches"] == 2,
         "resource_list_shape": files["n_resources"] == 2,
         "scope_one": scoped["total_resources"] == 1,
+        "wildcard_scope_literal": wildcard_scope["total_resources"] == 0,
         "acl_excluded": all("forbidden" not in match["text"] for row in literal["results"] for match in row["matches"]),
+        "reader_replace_denied": reader_replace_denied,
         "replace_revisioned": replaced["replaced_resources"] == 2 and after_replace["total_resources"] == 2,
         "document_only": all(row["resource_type"] == "document" for row in literal["results"]),
     }
@@ -275,7 +320,7 @@ async def run() -> dict[str, Any]:
     if workload not in WORKLOADS:
         raise AdapterError(f"unsupported native text/grep workload: {workload}")
     dsn = required_environment("AKB_NATIVE_REVISION_MEASUREMENT_DSN")
-    pool, database, owner_id, denied_id, allowed_vault, denied_vault = await initialise(dsn)
+    pool, database, owner_id, denied_id, reader_id, allowed_vault, denied_vault = await initialise(dsn)
     started = time.perf_counter()
     requests: list[dict[str, Any]] = []
     try:
@@ -284,7 +329,7 @@ async def run() -> dict[str, Any]:
         grep = M1NativeGrepService(pool, body_store=store)
         if workload == "W3-document-grep":
             cases, requests, grep_latencies = await _document_workload(
-                service, grep, owner_id, allowed_vault, denied_vault
+                service, grep, owner_id, reader_id, allowed_vault, denied_vault
             )
         else:
             cases, requests, grep_latencies = await _text_file_workload(
@@ -345,7 +390,10 @@ async def run() -> dict[str, Any]:
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", [allowed_vault, denied_vault])
-            await conn.execute("DELETE FROM users WHERE id = ANY($1::uuid[])", [owner_id, denied_id])
+            await conn.execute(
+                "DELETE FROM users WHERE id = ANY($1::uuid[])",
+                [owner_id, denied_id, reader_id],
+            )
         await pool.close()
 
 
