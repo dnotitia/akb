@@ -16,13 +16,13 @@ thread to the loop thread and fails that test.
 No DB / no real git: the routes' and handlers' other deps are monkeypatched.
 Runs in ``pytest -k 'not _e2e'``.
 
-The module-level ``git = GitService()`` in activity.py (and ``GitService()`` in the
-MCP handlers) mkdir ``git_storage_path`` at construction — the prod default
-``/data/vaults`` is unwritable in CI — so the fixture redirects it to ``tmp_path``
-BEFORE importing the modules (the same pattern as test_activity_routes_unit.py).
+The process-selected legacy revision backend owns ``GitService()``. Its
+construction mkdirs ``git_storage_path`` — the prod default ``/data/vaults`` is
+unwritable in CI — so the fixture redirects it to ``tmp_path`` before import.
 """
 
 import threading
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,7 +83,7 @@ async def test_rest_vault_activity_offloads_vault_log(mods, monkeypatch):
     rec, assert_offloaded = _offload_probe([])
     monkeypatch.setattr(activity, "check_vault_access", _anoop)
     monkeypatch.setattr(activity, "_resolve_activity_authors", _aidentity)
-    monkeypatch.setattr(activity.git, "vault_log", rec)
+    monkeypatch.setattr(activity.revision_backend._git, "vault_log", rec)
 
     await activity.vault_activity(
         vault="v", collection=None, author=None, since=None,
@@ -97,35 +97,13 @@ async def test_rest_document_diff_offloads_file_diff_and_keeps_envelope(mods, mo
     activity, _server, _gs = mods
     rec, assert_offloaded = _offload_probe({"diff": "…", "type": "modified"})
 
-    class _Conn:
-        async def fetchrow(self, *a, **k):
-            return {"id": "vault-id"}
-
-    class _AcquireCtx:
-        async def __aenter__(self):
-            return _Conn()
-
-        async def __aexit__(self, *a):
-            return False
-
-    class _Pool:
-        def acquire(self):
-            return _AcquireCtx()
-
-    async def _get_pool():
-        return _Pool()
-
-    class _DocRepo:
-        def __init__(self, pool):
-            pass
-
-        async def find_by_ref_with_conn(self, conn, vid, doc_id):
-            return {"path": "docs/p.md"}
-
     monkeypatch.setattr(activity, "check_vault_access", _anoop)
-    monkeypatch.setattr(activity, "get_pool", _get_pool)
-    monkeypatch.setattr(activity, "DocumentRepository", _DocRepo)
-    monkeypatch.setattr(activity.git, "file_diff", rec)
+    monkeypatch.setattr(
+        activity.revision_backend,
+        "_find_document",
+        AsyncMock(return_value={"path": "docs/p.md"}),
+    )
+    monkeypatch.setattr(activity.revision_backend._git, "file_diff", rec)
 
     out = await activity.document_diff(
         vault="v", doc_id="docs/p.md", commit="abc1234", user=_User(),
@@ -141,10 +119,10 @@ async def test_rest_document_diff_offloads_file_diff_and_keeps_envelope(mods, mo
 
 
 async def test_mcp_activity_offloads_vault_log(mods, monkeypatch):
-    _activity, server, GitService = mods
+    _activity, server, _GitService = mods
     rec, assert_offloaded = _offload_probe([])
     monkeypatch.setattr(server, "check_vault_access", _anoop)
-    monkeypatch.setattr(GitService, "vault_log", rec)
+    monkeypatch.setattr(server.revision_backend._git, "vault_log", rec)
 
     await server._handle_activity({"vault": "v", "limit": 5}, "uid", _User())
 
@@ -152,16 +130,17 @@ async def test_mcp_activity_offloads_vault_log(mods, monkeypatch):
 
 
 async def test_mcp_diff_offloads_file_diff(mods, monkeypatch):
-    _activity, server, GitService = mods
+    _activity, server, _GitService = mods
     rec, assert_offloaded = _offload_probe({"diff": "…"})
-
-    async def _find(vault, path):
-        return {"path": "docs/p.md"}
 
     monkeypatch.setattr(server, "split_uri", lambda uri, expected_type=None: ("v", "docs/p.md"))
     monkeypatch.setattr(server, "check_vault_access", _anoop)
-    monkeypatch.setattr(server, "_find_doc", _find)
-    monkeypatch.setattr(GitService, "file_diff", rec)
+    monkeypatch.setattr(
+        server.revision_backend,
+        "_find_document",
+        AsyncMock(return_value={"path": "docs/p.md"}),
+    )
+    monkeypatch.setattr(server.revision_backend._git, "file_diff", rec)
 
     await server._handle_diff({"uri": "akb://v/doc/docs/p.md", "commit": "abc1234"}, "uid", _User())
 
@@ -169,16 +148,17 @@ async def test_mcp_diff_offloads_file_diff(mods, monkeypatch):
 
 
 async def test_mcp_versioned_get_offloads_read_file(mods, monkeypatch):
-    _activity, server, GitService = mods
+    _activity, server, _GitService = mods
     rec, assert_offloaded = _offload_probe("body content")
-
-    async def _find(vault, path):
-        return {"path": "docs/p.md", "title": "P"}
 
     monkeypatch.setattr(server, "split_uri", lambda uri, expected_type=None: ("v", "docs/p.md"))
     monkeypatch.setattr(server, "check_vault_access", _anoop)
-    monkeypatch.setattr(server, "_find_doc", _find)
-    monkeypatch.setattr(GitService, "read_file", rec)
+    monkeypatch.setattr(
+        server.revision_backend,
+        "_find_document",
+        AsyncMock(return_value={"path": "docs/p.md", "title": "P"}),
+    )
+    monkeypatch.setattr(server.revision_backend._git, "read_file", rec)
 
     await server._handle_get(
         {"uri": "akb://v/doc/docs/p.md", "version": "abc1234"}, "uid", _User(),

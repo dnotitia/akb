@@ -23,6 +23,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
+
+
 class AuditSettings(BaseModel):
     """Compliance-grade audit log — **producer-only**. AKB emits an
     append-only, hash-chained JSON-lines audit stream and (optionally)
@@ -154,6 +157,11 @@ class Settings(BaseModel):
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 
+    # Native ledger selection is a dedicated M1 measurement path. Normal
+    # deployments retain the legacy bare-Git revision behavior by default.
+    document_revision_backend: Literal["bare_git_current", "native_ledger_m1"] = "bare_git_current"
+    native_revision_m1_measurement_only: bool = False
+
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
     # the entire poller task forever since asyncio.to_thread can't cancel
@@ -212,6 +220,17 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":
+        if self.document_revision_backend == "native_ledger_m1":
+            if not self.native_revision_m1_measurement_only:
+                raise ValueError(
+                    "native_ledger_m1 requires native_revision_m1_measurement_only=true"
+                )
+            if self.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
+                raise ValueError(
+                    "native_ledger_m1 requires dedicated measurement database "
+                    f"{NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME!r}"
+                )
+
         if self.model_api_governance_mode != "platform_hard":
             return self
 

@@ -28,12 +28,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.config import settings
 
-# server.py instantiates DocumentService() at module load, which creates
-# the git storage path via mkdir. Tests don't write any documents; we
-# just need somewhere writable so the import doesn't blow up on the
-# default `/data/vaults`. Override once at test-module load so every
-# lazy `from mcp_server.server import …` inside a test finds a working
-# path.
+# server.py selects the process-scoped DocumentService at module load, whose
+# legacy implementation creates the git storage path via mkdir. Tests don't
+# write documents; we just need somewhere writable so lazy imports do not
+# target the default `/data/vaults`.
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-mcp-oauth-test-vaults-")
 
 

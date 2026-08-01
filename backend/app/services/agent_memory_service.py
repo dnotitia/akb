@@ -43,6 +43,7 @@ from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest
 from app.services.document_service import DocumentService
+from app.services.revision_backend import get_document_service
 
 logger = logging.getLogger("akb.agent_memory")
 
@@ -310,7 +311,7 @@ class AgentMemoryService:
     """
 
     def __init__(self, doc_service: DocumentService | None = None):
-        self.doc_service = doc_service or DocumentService()
+        self.doc_service = doc_service or get_document_service()
 
     # ── Vault provisioning ─────────────────────────────────
 

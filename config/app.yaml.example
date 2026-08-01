@@ -17,6 +17,15 @@ db_user: akb
 # === Git storage (bare repos per vault live under this path) ===
 git_storage_path: /data/vaults
 
+# === Document revision backend ===
+# Default keeps the existing bare-Git implementation. native_ledger_m1 is
+# measurement-only: it requires native_revision_m1_measurement_only: true and
+# the exact dedicated database name below. Its native service must also be
+# registered before startup, so it cannot silently affect normal deployments.
+document_revision_backend: bare_git_current  # bare_git_current | native_ledger_m1
+native_revision_m1_measurement_only: false
+# Isolated M1 measurement runs must also set: db_name: akb_revision_m1_measurement
+
 # === External-git mirror — network timeouts (seconds) ===
 external_git_lsremote_timeout: 30
 external_git_fetch_timeout: 300
