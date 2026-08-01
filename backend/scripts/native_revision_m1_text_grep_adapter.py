@@ -321,7 +321,6 @@ async def run() -> dict[str, Any]:
         raise AdapterError(f"unsupported native text/grep workload: {workload}")
     dsn = required_environment("AKB_NATIVE_REVISION_MEASUREMENT_DSN")
     pool, database, owner_id, denied_id, reader_id, allowed_vault, denied_vault = await initialise(dsn)
-    started = time.perf_counter()
     requests: list[dict[str, Any]] = []
     try:
         store = M1PgBodyStore(pool)
@@ -353,7 +352,6 @@ async def run() -> dict[str, Any]:
             )
         revision = source_revision()
         runtime, environment = receipt_provenance(revision, database, allowed_vault)
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         request_artifact = write_bound_json(
             run_artifact_path("native-text-grep-requests"),
             {"workload": workload, "requests": requests, "grep_latency_ms": grep_latencies},
@@ -374,7 +372,7 @@ async def run() -> dict[str, Any]:
                 },
                 "runtime": runtime,
                 "environment": environment,
-                "latency": {"samples_or_artifact": grep_latencies, "unit": "ms", "total_ms": elapsed_ms},
+                "latency": {"samples_or_artifact": grep_latencies, "unit": "ms"},
                 "resources": {"snapshot": {"database": database, "body_profile": profile}},
                 "requests": {"outcomes": requests, "artifact_digest": request_artifact["sha256"]},
             },

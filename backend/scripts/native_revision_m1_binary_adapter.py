@@ -388,7 +388,6 @@ async def run() -> dict[str, Any]:
     else:
         raise AdapterError("driver must be fscas or s3")
 
-    started = time.perf_counter()
     prepared_objects: list[PreparedBinary] = []
     try:
         cases, timings = await _run_fixture(
@@ -410,7 +409,6 @@ async def run() -> dict[str, Any]:
                 "locator_exposure": "private",
             }
         )
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         cleanup = "namespace_pvc_owned_verified_mountpoint"
         if s3_client is not None:
             bucket = required_environment("AKB_NATIVE_REVISION_BINARY_MEASUREMENT_BUCKET")
@@ -443,7 +441,7 @@ async def run() -> dict[str, Any]:
                 },
                 "runtime": runtime,
                 "environment": environment,
-                "latency": {"samples_or_artifact": timings, "unit": "ms", "total_ms": elapsed_ms},
+                "latency": {"samples_or_artifact": timings, "unit": "ms"},
                 "resources": {
                     "snapshot": {
                         "database": database,
