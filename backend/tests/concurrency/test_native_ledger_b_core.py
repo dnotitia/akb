@@ -135,7 +135,7 @@ async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_
                 """,
                 vault_id,
                 "notes/native.md",
-                "0123456789abcdef0123456789abcdef01234567",
+                "0123456789abcdef0123456789abcdef01234567",  # pragma: allowlist secret
             )
 
         service = NativeRevisionService(pool)
