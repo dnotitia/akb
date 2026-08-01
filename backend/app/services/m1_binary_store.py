@@ -213,18 +213,32 @@ class S3CAS:
             "PreconditionFailed",
         }
 
+    @staticmethod
+    def _is_missing_object(exc: ClientError) -> bool:
+        """Recognize only an explicit S3 HEAD not-found response.
+
+        Cleanup is a safety boundary: an arbitrary client exception (including
+        a malformed response) cannot prove that the just-created object is
+        absent.  In particular, do not treat ``KeyError`` from a fake/client
+        response parser as an S3 NoSuchKey result.
+        """
+        response = exc.response
+        if not isinstance(response, dict):
+            return False
+        metadata = response.get("ResponseMetadata")
+        error = response.get("Error")
+        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+        code = error.get("Code") if isinstance(error, dict) else None
+        return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+
     def _remove_created_object(self, key: str) -> None:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=key)
             try:
                 self.client.head_object(Bucket=self.bucket, Key=key)
-            except (ClientError, KeyError) as exc:
-                if isinstance(exc, ClientError):
-                    response = exc.response or {}
-                    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                    code = str(response.get("Error", {}).get("Code", ""))
-                    if status != 404 and code not in {"404", "NoSuchKey", "NotFound"}:
-                        raise
+            except ClientError as exc:
+                if not self._is_missing_object(exc):
+                    raise
             else:
                 raise BinaryStoreError("new S3 CAS object remained after cleanup")
         except Exception as exc:

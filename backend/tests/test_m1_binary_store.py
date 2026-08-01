@@ -64,6 +64,8 @@ class _S3:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.put_error: ClientError | None = None
         self.get_error: Exception | None = None
+        self.head_error: Exception | None = None
+        self.noop_delete = False
 
     def put_object(self, *, Bucket, Key, Body, IfNoneMatch):
         assert IfNoneMatch == "*"
@@ -83,9 +85,19 @@ class _S3:
         return {"Body": BytesIO(self.objects[(Bucket, Key)])}
 
     def head_object(self, *, Bucket, Key):
-        return {"ContentLength": len(self.objects[(Bucket, Key)])}
+        if self.head_error is not None:
+            raise self.head_error
+        try:
+            return {"ContentLength": len(self.objects[(Bucket, Key)])}
+        except KeyError as exc:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                "HeadObject",
+            ) from exc
 
     def delete_object(self, *, Bucket, Key):
+        if self.noop_delete:
+            return
         self.objects.pop((Bucket, Key), None)
 
     def list_objects_v2(self, *, Bucket, Prefix):
@@ -130,3 +142,35 @@ def test_s3_cas_removes_new_object_when_post_put_verification_fails():
         S3CAS("bucket", client).prepare_verified("tenant", b"x")
 
     assert client.objects == {}
+
+
+def test_s3_cas_cleanup_does_not_treat_key_error_head_as_verified_absence():
+    client = _S3()
+    client.get_error = OSError("injected post-put GET failure")
+    client.noop_delete = True
+    client.head_error = KeyError("malformed head response")
+
+    with pytest.raises(BinaryStoreError, match="cleanup failed"):
+        S3CAS("bucket", client).prepare_verified("tenant", b"x")
+
+    assert client.objects  # no-op delete means the failed cleanup was not absence
+
+
+@pytest.mark.parametrize(
+    "head_error",
+    [
+        OSError("transport failed"),
+        ClientError({"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}}, "HeadObject"),
+        ClientError({"unexpected": "response-shape"}, "HeadObject"),
+    ],
+)
+def test_s3_cas_cleanup_fails_closed_for_non_not_found_head_errors(head_error: Exception):
+    client = _S3()
+    client.get_error = OSError("injected post-put GET failure")
+    client.noop_delete = True
+    client.head_error = head_error
+
+    with pytest.raises(BinaryStoreError, match="cleanup failed"):
+        S3CAS("bucket", client).prepare_verified("tenant", b"x")
+
+    assert client.objects
