@@ -177,8 +177,7 @@ class NativeRevisionService:
     @staticmethod
     def _validate_expected_revision(expected_revision_id: str | None) -> None:
         if expected_revision_id is not None and (
-            len(expected_revision_id) != 40
-            or any(ch not in "0123456789abcdef" for ch in expected_revision_id)
+            len(expected_revision_id) != 40 or any(ch not in "0123456789abcdef" for ch in expected_revision_id)
         ):
             raise ValidationError("Expected native Revision ID must be exactly 40 lowercase hex")
 
@@ -212,6 +211,53 @@ class NativeRevisionService:
             if not exists:
                 return candidate
         raise ConflictError("Unable to allocate a unique native Revision ID after collisions")
+
+    async def _lock_live_reference(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        reference: str,
+        additional_paths: tuple[str, ...] = (),
+    ) -> dict:
+        """Lock one live Resource before locking every path the mutation uses.
+
+        Alias and current-path callers therefore share one global acquisition
+        order: resolve, Resource row, sorted path advisory locks, re-resolve.
+        The final resolution rejects a path that was reused while the caller
+        waited instead of mutating the Resource found by a stale pre-read.
+        """
+        resolved = await self.repository.resolve_live_reference(
+            namespace_id=namespace_id,
+            surface=surface,
+            reference=reference,
+            conn=conn,
+        )
+        if resolved is None:
+            raise NotFoundError("Native Resource", reference)
+        resource = await self.repository.lock_resource(conn, resolved["resource_id"])
+        if resource is None or resource["lifecycle"] != "live":
+            raise NotFoundError("Native Resource", reference)
+        await self.repository.lock_paths(
+            conn,
+            namespace_id,
+            surface,
+            reference,
+            resource["current_path"],
+            *additional_paths,
+        )
+        confirmed = await self.repository.resolve_live_reference(
+            namespace_id=namespace_id,
+            surface=surface,
+            reference=reference,
+            conn=conn,
+        )
+        if confirmed is None:
+            raise NotFoundError("Native Resource", reference)
+        if confirmed["resource_id"] != resource["resource_id"]:
+            raise ConflictError(f"Native Resource reference changed while mutation waited: {reference}")
+        return resource
 
     async def create_text(
         self,
@@ -252,6 +298,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
         )
+        await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_create(
             namespace_id=namespace_id,
             surface=surface,
@@ -301,13 +348,12 @@ class NativeRevisionService:
                     await self.repository.lock_paths(conn, namespace_id, surface, path)
                     if await self.repository.find_live_path(conn, namespace_id, surface, path) is not None:
                         raise ConflictError(f"Native Resource already exists at path: {path}")
-                    if await self.repository.find_live_alias(
+                    reused_alias = await self.repository.find_live_alias(
                         conn,
                         namespace_id=namespace_id,
                         surface=surface,
                         old_path=path,
-                    ) is not None:
-                        raise ConflictError(f"Native Resource alias already owns path: {path}")
+                    )
 
                     occurred_at = datetime.now(UTC)
                     await self.repository.insert_resource(
@@ -361,6 +407,16 @@ class NativeRevisionService:
                     )
                     await self._hit("authority.after_head")
                     await self._hit("authority.after_path")
+                    if reused_alias is not None:
+                        await self.repository.retire_live_alias(
+                            conn,
+                            namespace_id=namespace_id,
+                            surface=surface,
+                            old_path=path,
+                            retired_revision_id=revision_id,
+                            occurred_at=occurred_at,
+                        )
+                    await self._hit("authority.after_alias")
                     await self.repository.insert_activity(
                         conn,
                         activity_event_id=activity_id,
@@ -439,6 +495,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
         )
+        await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_replace(
             namespace_id=namespace_id,
             surface=surface,
@@ -483,12 +540,13 @@ class NativeRevisionService:
                         raise ConflictError("Native idempotency key was reused with different input")
                     return self._from_row(prior, replay=True)
 
-                await self.repository.lock_paths(conn, namespace_id, surface, path)
-                resource = await self.repository.find_live_path(
-                    conn, namespace_id, surface, path, for_update=True
+                resource = await self._lock_live_reference(
+                    conn,
+                    namespace_id=namespace_id,
+                    surface=surface,
+                    reference=path,
                 )
-                if resource is None:
-                    raise NotFoundError("Native Resource", path)
+                current_path = resource["current_path"]
                 parent_revision_id = resource["head_revision_id"]
                 if expected_revision_id is not None and expected_revision_id != parent_revision_id:
                     raise ConflictError(
@@ -514,7 +572,7 @@ class NativeRevisionService:
                     resource_id=resource_id,
                     parent_revision_id=parent_revision_id,
                     action="replace",
-                    path=path,
+                    path=current_path,
                     path_from=None,
                     path_to=None,
                     payload_manifest_id=manifest_id,
@@ -533,7 +591,7 @@ class NativeRevisionService:
                     conn,
                     resource_id=resource_id,
                     revision_id=revision_id,
-                    path=path,
+                    path=current_path,
                     lifecycle="live",
                     occurred_at=occurred_at,
                 )
@@ -570,7 +628,7 @@ class NativeRevisionService:
             revision_id=revision_id,
             parent_revision_id=parent_revision_id,
             action="replace",
-            path=path,
+            path=current_path,
             payload_manifest_id=manifest_id,
             occurred_at=occurred_at,
         )
@@ -657,27 +715,13 @@ class NativeRevisionService:
                             raise ConflictError("Native idempotency key was reused with different input")
                         return self._from_row(prior, replay=True)
 
-                    await self.repository.lock_paths(
+                    resource = await self._lock_live_reference(
                         conn,
-                        namespace_id,
-                        surface,
-                        path,
-                        path_to,
-                    )
-                    resolved = await self.repository.resolve_live_reference(
                         namespace_id=namespace_id,
                         surface=surface,
                         reference=path,
-                        conn=conn,
+                        additional_paths=(path_to,),
                     )
-                    if resolved is None:
-                        raise NotFoundError("Native Resource", path)
-                    resource = await self.repository.lock_resource(
-                        conn,
-                        resolved["resource_id"],
-                    )
-                    if resource is None or resource["lifecycle"] != "live":
-                        raise NotFoundError("Native Resource", path)
                     resource_id = resource["resource_id"]
                     old_path = resource["current_path"]
                     parent_revision_id = resource["head_revision_id"]
@@ -688,12 +732,6 @@ class NativeRevisionService:
                         )
                     if path_to == old_path:
                         raise ValidationError("Native Resource move is a no-op")
-                    await self.repository.lock_paths(
-                        conn,
-                        namespace_id,
-                        surface,
-                        old_path,
-                    )
                     destination = await self.repository.find_live_path(
                         conn,
                         namespace_id,
@@ -708,10 +746,7 @@ class NativeRevisionService:
                         surface=surface,
                         old_path=path_to,
                     )
-                    if (
-                        destination_alias is not None
-                        and destination_alias["resource_id"] != resource_id
-                    ):
+                    if destination_alias is not None and destination_alias["resource_id"] != resource_id:
                         raise ConflictError(f"Native Resource alias already owns path: {path_to}")
 
                     head = await self.repository.get_resource_head(
@@ -719,9 +754,7 @@ class NativeRevisionService:
                         conn=conn,
                     )
                     if head is None or head["payload_manifest_id"] is None:
-                        raise ReferencePayloadIntegrityError(
-                            "Live native Head does not pin a payload manifest"
-                        )
+                        raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
                     occurred_at = datetime.now(UTC)
                     await self.repository.copy_manifest(
                         conn,
@@ -898,18 +931,12 @@ class NativeRevisionService:
                         raise ConflictError("Native idempotency key was reused with different input")
                     return self._from_row(prior, replay=True)
 
-                await self.repository.lock_paths(conn, namespace_id, surface, path)
-                resolved = await self.repository.resolve_live_reference(
+                resource = await self._lock_live_reference(
+                    conn,
                     namespace_id=namespace_id,
                     surface=surface,
                     reference=path,
-                    conn=conn,
                 )
-                if resolved is None:
-                    raise NotFoundError("Native Resource", path)
-                resource = await self.repository.lock_resource(conn, resolved["resource_id"])
-                if resource is None or resource["lifecycle"] != "live":
-                    raise NotFoundError("Native Resource", path)
                 resource_id = resource["resource_id"]
                 current_path = resource["current_path"]
                 parent_revision_id = resource["head_revision_id"]
@@ -918,12 +945,6 @@ class NativeRevisionService:
                         "Native Revision conflict: expected "
                         f"{expected_revision_id}, current Head is {parent_revision_id}"
                     )
-                await self.repository.lock_paths(
-                    conn,
-                    namespace_id,
-                    surface,
-                    current_path,
-                )
                 occurred_at = datetime.now(UTC)
                 await self.repository.insert_revision(
                     conn,

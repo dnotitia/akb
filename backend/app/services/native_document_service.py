@@ -60,6 +60,8 @@ class NativeRevisionUnsupportedSurfaceError(AKBError):
 class NativeDocumentService(DocumentService):
     """Document lifecycle adapter preserving existing request/response models."""
 
+    _UNPINNED_RETRY_LIMIT = 4
+
     def __init__(self, *, pool: asyncpg.Pool | None = None):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
@@ -94,24 +96,44 @@ class NativeDocumentService(DocumentService):
 
     async def _path_is_owned(self, vault_id: uuid.UUID, path: str) -> bool:
         repository = NativeRevisionRepository(await self._pool())
-        return await repository.resolve_live_reference(
-            namespace_id=vault_id,
-            surface="document",
-            reference=path,
-        ) is not None
+        return (
+            await repository.resolve_live_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference=path,
+            )
+            is not None
+        )
+
+    async def _current_path_is_owned(self, vault_id: uuid.UUID, path: str) -> bool:
+        repository = NativeRevisionRepository(await self._pool())
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            return (
+                await repository.find_live_path(
+                    conn,
+                    vault_id,
+                    "document",
+                    path,
+                )
+                is not None
+            )
 
     async def _resolve_native_free_path(
         self,
         vault_id: uuid.UUID,
         base_path: str,
         path_identity: uuid.UUID,
+        *,
+        aliases_own_path: bool = True,
     ) -> str:
-        if not await self._path_is_owned(vault_id, base_path):
+        path_is_owned = self._path_is_owned if aliases_own_path else self._current_path_is_owned
+        if not await path_is_owned(vault_id, base_path):
             return base_path
         stem = base_path[:-3] if base_path.endswith(".md") else base_path
         for width in (8, 12, 16, len(path_identity.hex)):
             candidate = f"{stem}-{path_identity.hex[:width]}.md"
-            if not await self._path_is_owned(vault_id, candidate):
+            if not await path_is_owned(vault_id, candidate):
                 return candidate
         return f"{stem}-{path_identity.hex}.md"
 
@@ -192,19 +214,21 @@ class NativeDocumentService(DocumentService):
         collection = normalize_collection_path(req.collection)
         base_path = doc_path(collection, base_slug)
         path_identity = uuid.uuid4()
-        if req.slug and await self._path_is_owned(vault_id, base_path):
+        if req.slug and await self._current_path_is_owned(vault_id, base_path):
             raise ConflictError(f"Document already exists at path: {base_path}")
-        final_path = await self._resolve_native_free_path(vault_id, base_path, path_identity)
+        final_path = await self._resolve_native_free_path(
+            vault_id,
+            base_path,
+            path_identity,
+            aliases_own_path=False,
+        )
 
         frontmatter = _build_frontmatter(req, now)
         if agent_id:
             frontmatter["created_by"] = agent_id
         raw = _compose_markdown(frontmatter, req.content)
         actor = agent_id or "unknown"
-        message = (
-            f"[put] {final_path}\n\nagent: {actor}\n"
-            f"action: create\nsummary: {req.title}"
-        )
+        message = f"[put] {final_path}\n\nagent: {actor}\naction: create\nsummary: {req.title}"
         result = await (await self._native()).create_text(
             namespace_id=vault_id,
             surface="document",
@@ -261,68 +285,81 @@ class NativeDocumentService(DocumentService):
     ) -> DocumentPutResponse:
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
-        vault_id, current = await self._current(vault, doc_ref)
-        if req.expected_commit and req.expected_commit != current.revision_id:
-            raise ConflictError(
-                f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
+        explicit_occ = req.expected_commit is not None or req.expected_content_hash is not None
+        last_conflict: ConflictError | None = None
+        for attempt in range(self._UNPINNED_RETRY_LIMIT):
+            vault_id, current = await self._current(vault, doc_ref)
+            if req.expected_commit and req.expected_commit != current.revision_id:
+                raise ConflictError(
+                    f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
+                )
+            frontmatter, current_body = _parse_markdown(current.text)
+            previous_hash = _body_content_hash(current_body)
+            if req.expected_content_hash and req.expected_content_hash != previous_hash:
+                raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
+            if req.title:
+                frontmatter["title"] = req.title
+            if req.type:
+                frontmatter["type"] = req.type
+            if req.status:
+                frontmatter["status"] = req.status
+            if req.tags is not None:
+                frontmatter["tags"] = req.tags
+            if req.domain is not None:
+                frontmatter["domain"] = req.domain
+            if req.summary is not None:
+                frontmatter["summary"] = req.summary
+            if req.depends_on is not None:
+                frontmatter["depends_on"] = req.depends_on
+            if req.related_to is not None:
+                frontmatter["related_to"] = req.related_to
+            frontmatter["updated_at"] = datetime.now(UTC).isoformat()
+            new_body = req.content if req.content is not None else current_body
+            raw = _compose_markdown(frontmatter, new_body)
+            actor = agent_id or "unknown"
+            summary = req.message or f"Update {current.path}"
+            message = f"[update] {current.path}\n\nagent: {actor}\naction: update\nsummary: {summary}"
+            try:
+                result = await (await self._native()).replace_text(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=current.path,
+                    payload=raw,
+                    actor=actor,
+                    mutation_id=uuid.uuid4(),
+                    # This internal compare protects the read/merge/write
+                    # attempt. Unpinned callers are transparently recomputed
+                    # against the new Head; explicit predicates fail closed.
+                    expected_revision_id=current.revision_id,
+                    message=message,
+                    subject=f"[update] {current.path}",
+                    summary=summary,
+                )
+            except ConflictError as exc:
+                if (
+                    explicit_occ
+                    or not str(exc).startswith("Native Revision conflict:")
+                    or attempt + 1 == self._UNPINNED_RETRY_LIMIT
+                ):
+                    raise
+                last_conflict = exc
+                continue
+            return DocumentPutResponse(
+                uri=doc_uri(vault, result.path),
+                vault=vault,
+                path=result.path,
+                commit_hash=result.revision_id,
+                current_commit=result.revision_id,
+                previous_commit=result.parent_revision_id,
+                previous_content_hash=previous_hash,
+                content_hash=_certified_content_hash(raw),
+                hash_algorithm=HASH_ALGORITHM,
+                action="updated",
+                chunks_indexed=0,
+                entities_found=0,
             )
-        frontmatter, current_body = _parse_markdown(current.text)
-        previous_hash = _body_content_hash(current_body)
-        if req.expected_content_hash and req.expected_content_hash != previous_hash:
-            raise ConflictError(
-                f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}"
-            )
-        if req.title:
-            frontmatter["title"] = req.title
-        if req.type:
-            frontmatter["type"] = req.type
-        if req.status:
-            frontmatter["status"] = req.status
-        if req.tags is not None:
-            frontmatter["tags"] = req.tags
-        if req.domain is not None:
-            frontmatter["domain"] = req.domain
-        if req.summary is not None:
-            frontmatter["summary"] = req.summary
-        if req.depends_on is not None:
-            frontmatter["depends_on"] = req.depends_on
-        if req.related_to is not None:
-            frontmatter["related_to"] = req.related_to
-        frontmatter["updated_at"] = datetime.now(UTC).isoformat()
-        new_body = req.content if req.content is not None else current_body
-        raw = _compose_markdown(frontmatter, new_body)
-        actor = agent_id or "unknown"
-        summary = req.message or f"Update {current.path}"
-        message = (
-            f"[update] {current.path}\n\nagent: {actor}\n"
-            f"action: update\nsummary: {summary}"
-        )
-        result = await (await self._native()).replace_text(
-            namespace_id=vault_id,
-            surface="document",
-            path=current.path,
-            payload=raw,
-            actor=actor,
-            mutation_id=uuid.uuid4(),
-            expected_revision_id=current.revision_id,
-            message=message,
-            subject=f"[update] {current.path}",
-            summary=summary,
-        )
-        return DocumentPutResponse(
-            uri=doc_uri(vault, current.path),
-            vault=vault,
-            path=current.path,
-            commit_hash=result.revision_id,
-            current_commit=result.revision_id,
-            previous_commit=current.revision_id,
-            previous_content_hash=previous_hash,
-            content_hash=_certified_content_hash(raw),
-            hash_algorithm=HASH_ALGORITHM,
-            action="updated",
-            chunks_indexed=0,
-            entities_found=0,
-        )
+        assert last_conflict is not None
+        raise last_conflict
 
     async def move(
         self,
@@ -338,14 +375,14 @@ class NativeDocumentService(DocumentService):
             raise ValidationError("move requires at least one of collection or slug")
         vault_id, current = await self._current(vault, doc_ref)
         current_collection, current_slug = split_doc_path(current.path)
-        next_collection = (
-            normalize_collection_path(collection)
-            if collection is not None
-            else current_collection
-        )
-        next_slug = slugify(slug) if slug else strip_own_suffix(
-            current_slug,
-            current.resource_id,
+        next_collection = normalize_collection_path(collection) if collection is not None else current_collection
+        next_slug = (
+            slugify(slug)
+            if slug
+            else strip_own_suffix(
+                current_slug,
+                current.resource_id,
+            )
         )
         base_path = doc_path(next_collection, next_slug)
         if base_path == current.path:
@@ -355,10 +392,7 @@ class NativeDocumentService(DocumentService):
             raise ConflictError(f"Document already exists at path: {base_path}")
         actor = agent_id or "unknown"
         summary = message or f"{current.path} -> {next_path}"
-        history_message = (
-            f"[move] {current.path} -> {next_path}\n\nagent: {actor}\n"
-            f"action: move\nsummary: {summary}"
-        )
+        history_message = f"[move] {current.path} -> {next_path}\n\nagent: {actor}\naction: move\nsummary: {summary}"
         result = await (await self._native()).move_text(
             namespace_id=vault_id,
             surface="document",
@@ -366,7 +400,7 @@ class NativeDocumentService(DocumentService):
             path_to=next_path,
             actor=actor,
             mutation_id=uuid.uuid4(),
-            expected_revision_id=current.revision_id,
+            expected_revision_id=None,
             message=history_message,
             subject=f"[move] {current.path} -> {next_path}",
             summary=summary,
@@ -378,7 +412,7 @@ class NativeDocumentService(DocumentService):
             path=next_path,
             commit_hash=result.revision_id,
             current_commit=result.revision_id,
-            previous_commit=current.revision_id,
+            previous_commit=result.parent_revision_id,
             content_hash=_body_content_hash(body),
             hash_algorithm=HASH_ALGORITHM,
             action="moved",
@@ -397,51 +431,68 @@ class NativeDocumentService(DocumentService):
         agent_id: str | None = None,
         base_commit: str | None = None,
     ) -> DocumentPutResponse:
-        _, current = await self._current(vault, doc_ref)
-        if base_commit and base_commit != current.revision_id:
-            raise ConflictError(
-                f"current_commit moved: expected {base_commit}, actual {current.revision_id}"
-            )
-        _, body = _parse_markdown(current.text)
         if not old_string:
             raise EditError("old_string cannot be empty")
-        occurrences = body.count(old_string)
-        if occurrences == 0:
-            raise EditError("old_string not found in document body. Use akb_get to verify current content.")
-        if occurrences > 1 and not replace_all:
-            raise EditError(
-                f"old_string appears {occurrences} times in document. "
-                "Add more surrounding context to make it unique, or set replace_all=true."
+        last_conflict: ConflictError | None = None
+        for attempt in range(self._UNPINNED_RETRY_LIMIT):
+            _, current = await self._current(vault, doc_ref)
+            if base_commit and base_commit != current.revision_id:
+                raise ConflictError(f"current_commit moved: expected {base_commit}, actual {current.revision_id}")
+            _, body = _parse_markdown(current.text)
+            occurrences = body.count(old_string)
+            if occurrences == 0:
+                raise EditError("old_string not found in document body. Use akb_get to verify current content.")
+            if occurrences > 1 and not replace_all:
+                raise EditError(
+                    f"old_string appears {occurrences} times in document. "
+                    "Add more surrounding context to make it unique, or set replace_all=true."
+                )
+            new_body = (
+                body.replace(old_string, new_string)
+                if replace_all
+                else body.replace(
+                    old_string,
+                    new_string,
+                    1,
+                )
             )
-        new_body = body.replace(old_string, new_string) if replace_all else body.replace(
-            old_string,
-            new_string,
-            1,
-        )
-        if new_body == body:
-            content_hash = _body_content_hash(body)
-            return DocumentPutResponse(
-                uri=doc_uri(vault, current.path),
-                vault=vault,
-                path=current.path,
-                commit_hash=current.revision_id,
-                current_commit=current.revision_id,
-                content_hash=content_hash,
-                hash_algorithm=HASH_ALGORITHM,
-                action="unchanged",
-                chunks_indexed=0,
-                entities_found=0,
-            )
-        return await self.update(
-            vault,
-            current.path,
-            DocumentUpdateRequest(
-                content=new_body,
-                message=message,
-                expected_commit=current.revision_id,
-            ),
-            agent_id=agent_id,
-        )
+            if new_body == body:
+                content_hash = _body_content_hash(body)
+                return DocumentPutResponse(
+                    uri=doc_uri(vault, current.path),
+                    vault=vault,
+                    path=current.path,
+                    commit_hash=current.revision_id,
+                    current_commit=current.revision_id,
+                    content_hash=content_hash,
+                    hash_algorithm=HASH_ALGORITHM,
+                    action="unchanged",
+                    chunks_indexed=0,
+                    entities_found=0,
+                )
+            try:
+                return await self.update(
+                    vault,
+                    current.path,
+                    DocumentUpdateRequest(
+                        content=new_body,
+                        message=message,
+                        # Pin each derived body to the snapshot it edited.
+                        # An unpinned edit recomputes on a moved Head below.
+                        expected_commit=current.revision_id,
+                    ),
+                    agent_id=agent_id,
+                )
+            except ConflictError as exc:
+                if base_commit is not None or attempt + 1 == self._UNPINNED_RETRY_LIMIT:
+                    raise
+                if not (
+                    str(exc).startswith("Native Revision conflict:") or str(exc).startswith("current_commit moved:")
+                ):
+                    raise
+                last_conflict = exc
+        assert last_conflict is not None
+        raise last_conflict
 
     async def delete(self, vault: str, doc_ref: str, agent_id: str | None = None) -> bool:
         vault_id, current = await self._current(vault, doc_ref)
@@ -452,7 +503,7 @@ class NativeDocumentService(DocumentService):
             path=current.path,
             actor=actor,
             mutation_id=uuid.uuid4(),
-            expected_revision_id=current.revision_id,
+            expected_revision_id=None,
             message=f"[delete] {current.path}\n\nagent: {actor}\naction: delete",
             subject=f"[delete] {current.path}",
         )

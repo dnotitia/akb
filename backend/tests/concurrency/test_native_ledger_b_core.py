@@ -43,7 +43,7 @@ _DSN = os.environ.get(
 async def _can_connect() -> bool:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         return False
     await conn.close()
     return True
@@ -181,9 +181,10 @@ async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_
         assert current.text == "beta\n"
 
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                "SELECT current_commit FROM documents WHERE id = $1", legacy_id
-            ) == "0123456789abcdef0123456789abcdef01234567"
+            assert (
+                await conn.fetchval("SELECT current_commit FROM documents WHERE id = $1", legacy_id)
+                == "0123456789abcdef0123456789abcdef01234567"
+            )
             rows = await conn.fetch(
                 """
                 SELECT r.revision_id, r.parent_revision_id, r.action,
@@ -277,14 +278,17 @@ async def test_document_and_file_cannot_own_the_same_namespace_path():
         assert len([item for item in outcomes if not isinstance(item, Exception)]) == 1
         assert len([item for item in outcomes if isinstance(item, ConflictError)]) == 1
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*) FROM native_resources
                  WHERE namespace_id = $1 AND current_path = 'notes/native.md'
                    AND lifecycle = 'live'
                 """,
-                vault_id,
-            ) == 1
+                    vault_id,
+                )
+                == 1
+            )
 
 
 async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
@@ -334,9 +338,286 @@ async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
             first.revision_id,
             second.revision_id,
         ]
-        assert [row["occurred_at"] for row in chronological] == sorted(
-            row["occurred_at"] for row in chronological
+        assert [row["occurred_at"] for row in chronological] == sorted(row["occurred_at"] for row in chronological)
+
+
+async def test_public_unpinned_metadata_and_body_updates_recompute_and_serialize():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="public-race",
+                title="Public race",
+                content="created",
+            ),
+            agent_id="creator",
         )
+
+        prepared_count = 0
+        both_prepared = asyncio.Event()
+
+        async def hold_after_prepare(name: str) -> None:
+            nonlocal prepared_count
+            if name != "payload.after_prepare_before_tx":
+                return
+            prepared_count += 1
+            if prepared_count == 2:
+                both_prepared.set()
+            await both_prepared.wait()
+
+        native = NativeRevisionService(pool, failpoint=hold_after_prepare)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        document_service._native = injected_native  # type: ignore[method-assign]
+        first, second = await asyncio.gather(
+            document_service.update(
+                vault,
+                created.path,
+                DocumentUpdateRequest(title="Updated title"),
+                agent_id="first",
+            ),
+            document_service.update(
+                vault,
+                created.path,
+                DocumentUpdateRequest(content="second"),
+                agent_id="second",
+            ),
+        )
+
+        rows = await NativeRevisionRepository(pool).list_history(
+            resource_id=(
+                await native.get_current(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=created.path,
+                )
+            ).resource_id,
+            limit=10,
+        )
+        chronological = list(reversed(rows))
+        assert chronological[0]["revision_id"] == created.commit_hash
+        assert {row["revision_id"] for row in chronological[1:]} == {
+            first.commit_hash,
+            second.commit_hash,
+        }
+        response_parents = {
+            first.commit_hash: first.previous_commit,
+            second.commit_hash: second.previous_commit,
+        }
+        assert response_parents == {row["revision_id"]: row["parent_revision_id"] for row in chronological[1:]}
+        current = await document_service.get(vault, created.path)
+        assert current.title == "Updated title"
+        assert current.content == "second"
+
+
+async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="edit-race",
+                title="Edit race",
+                content="alpha one\nbeta two",
+            ),
+            agent_id="creator",
+        )
+        prepared_count = 0
+        both_prepared = asyncio.Event()
+
+        async def hold_first_attempts(name: str) -> None:
+            nonlocal prepared_count
+            if name != "payload.after_prepare_before_tx":
+                return
+            prepared_count += 1
+            if prepared_count == 2:
+                both_prepared.set()
+            await both_prepared.wait()
+
+        native = NativeRevisionService(pool, failpoint=hold_first_attempts)
+
+        async def injected_native() -> NativeRevisionService:
+            return native
+
+        document_service._native = injected_native  # type: ignore[method-assign]
+        await asyncio.gather(
+            document_service.edit(
+                vault,
+                created.path,
+                "alpha",
+                "ALPHA",
+                agent_id="alpha-editor",
+            ),
+            document_service.edit(
+                vault,
+                created.path,
+                "beta",
+                "BETA",
+                agent_id="beta-editor",
+            ),
+        )
+
+        current = await document_service.get(vault, created.path)
+        assert current.content == "ALPHA one\nBETA two"
+
+
+async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect():
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool)
+        created = await service.create_text(**_create_args(vault_id))
+        moved = await service.move_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/native.md",
+            path_to="archive/native.md",
+            actor="mover",
+            mutation_id=uuid.uuid4(),
+        )
+
+        replacement_args = _create_args(vault_id)
+        replacement_args["payload"] = "fresh lineage"
+        replacement = await service.create_text(**replacement_args)
+
+        assert replacement.resource_id != created.resource_id
+        assert (
+            await service.get_current_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference="notes/native.md",
+            )
+        ).resource_id == replacement.resource_id
+        assert (
+            await service.get_current_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference="archive/native.md",
+            )
+        ).resource_id == moved.resource_id
+        async with pool.acquire() as conn:
+            retired = await conn.fetchrow(
+                """
+                SELECT retired_revision_id, retired_at
+                  FROM native_resource_path_aliases
+                 WHERE namespace_id = $1 AND old_path = 'notes/native.md'
+                """,
+                vault_id,
+            )
+        assert retired["retired_revision_id"] == replacement.revision_id
+        assert retired["retired_at"] is not None
+
+
+async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_deadlock():
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool)
+        await service.create_text(**_create_args(vault_id))
+        await service.move_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/native.md",
+            path_to="archive/native.md",
+            actor="mover",
+            mutation_id=uuid.uuid4(),
+        )
+
+        alias_has_resource = asyncio.Event()
+        current_has_path = asyncio.Event()
+        current_attempted_resource = asyncio.Event()
+
+        class CoordinatedRepository(NativeRevisionRepository):
+            async def lock_resource(self, conn, resource_id):
+                task_name = asyncio.current_task().get_name()
+                if task_name == "current-update":
+                    current_attempted_resource.set()
+                    return await super().lock_resource(conn, resource_id)
+                resource = await super().lock_resource(conn, resource_id)
+                if task_name == "alias-delete":
+                    alias_has_resource.set()
+                    path_waiter = asyncio.create_task(current_has_path.wait())
+                    resource_waiter = asyncio.create_task(current_attempted_resource.wait())
+                    _, pending = await asyncio.wait(
+                        {path_waiter, resource_waiter},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for waiter in pending:
+                        waiter.cancel()
+                return resource
+
+            async def lock_paths(self, conn, namespace_id, surface, *paths):
+                if asyncio.current_task().get_name() == "current-update":
+                    await alias_has_resource.wait()
+                    await super().lock_paths(conn, namespace_id, surface, *paths)
+                    current_has_path.set()
+                    return
+                await super().lock_paths(conn, namespace_id, surface, *paths)
+
+        repository = CoordinatedRepository(pool)
+        alias_delete = asyncio.create_task(
+            NativeRevisionService(pool, repository=repository).delete_resource(
+                namespace_id=vault_id,
+                surface="document",
+                path="notes/native.md",
+                actor="deleter",
+                mutation_id=uuid.uuid4(),
+            ),
+            name="alias-delete",
+        )
+        current_update = asyncio.create_task(
+            NativeRevisionService(pool, repository=repository).replace_text(
+                namespace_id=vault_id,
+                surface="document",
+                path="archive/native.md",
+                payload="competing update",
+                actor="updater",
+                mutation_id=uuid.uuid4(),
+            ),
+            name="current-update",
+        )
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(alias_delete, current_update, return_exceptions=True),
+            timeout=5,
+        )
+
+        assert not any(isinstance(item, asyncpg.DeadlockDetectedError) for item in outcomes)
+        assert all(
+            not isinstance(item, Exception) or isinstance(item, (ConflictError, NotFoundError)) for item in outcomes
+        )
+
+
+async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry():
+    async with _fresh_database() as (pool, vault_id):
+        seen: list[str] = []
+
+        async def stop_before_authority(name: str) -> None:
+            seen.append(name)
+            if name == "payload.after_prepare_before_tx":
+                raise RuntimeError("stop before authority")
+
+        with pytest.raises(RuntimeError, match="stop before authority"):
+            await NativeRevisionService(pool, failpoint=stop_before_authority).create_text(**_create_args(vault_id))
+
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+        ]
+        assert await _authority_counts(pool) == {
+            "native_resources": 0,
+            "native_revisions": 0,
+            "native_payload_manifests": 0,
+            "native_revision_activity": 0,
+            "native_invalidation_intents": 0,
+        }
 
 
 @pytest.mark.parametrize(
@@ -461,12 +742,15 @@ async def test_delete_failpoints_preserve_live_resource_and_alias(boundary: str)
         )
         assert current.revision_id == moved.revision_id
         async with pool.acquire() as conn:
-            assert await conn.fetchval(
-                """
+            assert (
+                await conn.fetchval(
+                    """
                 SELECT count(*) FROM native_resource_path_aliases
                  WHERE retired_revision_id IS NULL
                 """
-            ) == 1
+                )
+                == 1
+            )
 
 
 async def test_committed_response_lost_retry_returns_same_revision_once():
@@ -753,9 +1037,7 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
         )
         assert fresh_snapshot.resource_id != first_resource
         fresh_history = await backend.document_history(vault, recreated.path, limit=20)
-        assert [entry["hash"] for entry in fresh_history["history"]] == [
-            recreated.commit_hash
-        ]
+        assert [entry["hash"] for entry in fresh_history["history"]] == [recreated.commit_hash]
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -769,14 +1051,20 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
                 recreated.path,
             )
             assert [row["lifecycle"] for row in rows] == ["deleted", "live"]
-            assert await conn.fetchval(
-                "SELECT action FROM native_revisions WHERE revision_id = $1",
-                rows[0]["head_revision_id"],
-            ) == "delete"
-            assert await conn.fetchval(
-                "SELECT count(*) FROM documents WHERE vault_id = $1",
-                vault_id,
-            ) == 0
+            assert (
+                await conn.fetchval(
+                    "SELECT action FROM native_revisions WHERE revision_id = $1",
+                    rows[0]["head_revision_id"],
+                )
+                == "delete"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM documents WHERE vault_id = $1",
+                    vault_id,
+                )
+                == 0
+            )
 
         with pytest.raises(NativeRevisionUnsupportedSurfaceError):
             await document_service.browse(vault)

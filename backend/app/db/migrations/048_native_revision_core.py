@@ -228,6 +228,9 @@ async def _run(conn):
             CREATE INDEX IF NOT EXISTS idx_native_revisions_resource_history
                 ON native_revisions(resource_id, occurred_at DESC, revision_id DESC);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_native_revisions_namespace_revision
+                ON native_revisions(namespace_id, revision_id);
+
             CREATE TABLE IF NOT EXISTS native_revision_activity (
                 activity_event_id UUID PRIMARY KEY,
                 namespace_id UUID NOT NULL,
@@ -332,6 +335,15 @@ async def _run(conn):
 
             CREATE INDEX IF NOT EXISTS idx_native_resource_path_aliases_resource
                 ON native_resource_path_aliases(resource_id, created_at DESC);
+
+            ALTER TABLE native_resource_path_aliases
+                DROP CONSTRAINT IF EXISTS native_resource_path_aliases_retired_revision_fkey;
+            ALTER TABLE native_resource_path_aliases
+                ADD CONSTRAINT native_resource_path_aliases_retired_revision_fkey
+                FOREIGN KEY (namespace_id, retired_revision_id)
+                REFERENCES native_revisions(namespace_id, revision_id)
+                ON DELETE NO ACTION
+                DEFERRABLE INITIALLY DEFERRED;
 
             DO $$
             BEGIN
