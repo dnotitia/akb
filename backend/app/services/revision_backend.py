@@ -12,7 +12,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
 from app.db.postgres import get_pool
@@ -133,7 +133,9 @@ class LegacyRevisionBackend:
     ) -> tuple[dict[str, Any], str] | None:
         document = await self._find_document(vault, doc_ref)
         if not document:
-            return None
+            from app.exceptions import NotFoundError
+
+            raise NotFoundError("Document", doc_ref)
         raw = await asyncio.to_thread(self._git.read_file, vault, document["path"], version)
         if raw is None:
             return None
@@ -194,22 +196,34 @@ def _assert_native_measurement_safety() -> None:
 
 def get_revision_backend() -> RevisionBackend:
     """Return the complete revision facade selected once for this process."""
-    global _revision_backend, _selected_backend
+    global _revision_backend, _selected_backend, _native_revision_backend_factory
     with _lock:
         if _revision_backend is not None:
             return _revision_backend
 
         backend = settings.document_revision_backend
+        revision_backend: RevisionBackend
         if backend == "bare_git_current":
             revision_backend = LegacyRevisionBackend()
         elif backend == "native_ledger_m1":
             _assert_native_measurement_safety()
             if _native_revision_backend_factory is None:
-                raise NativeRevisionBackendUnavailableError(
-                    "native_ledger_m1 was selected, but no native revision backend "
-                    "has been registered"
+                # Routes and the stdio MCP server select their facade from
+                # module globals during import.  Loading the native factory at
+                # this exact composition seam guarantees it is available
+                # before either caller receives a service, without importing
+                # any measurement-only code during default legacy startup.
+                from app.services.native_revision_backend import (
+                    native_revision_backend_factory,
                 )
-            revision_backend = _native_revision_backend_factory()
+
+                _native_revision_backend_factory = cast(
+                    RevisionBackendFactory,
+                    native_revision_backend_factory,
+                )
+            native_factory = _native_revision_backend_factory
+            assert native_factory is not None
+            revision_backend = native_factory()
         else:  # Settings validates this, but fail closed for in-process mutation.
             raise RuntimeError(f"unsupported document revision backend: {backend!r}")
 

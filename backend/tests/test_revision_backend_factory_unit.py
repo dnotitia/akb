@@ -24,11 +24,14 @@ def reset_revision_backend():
     revision_backend.reset_document_service_for_tests()
     yield
     revision_backend.reset_document_service_for_tests()
+    sys.modules.pop("app.main", None)
     sys.modules.pop("app.api.routes.activity", None)
+    sys.modules.pop("app.api.routes.documents", None)
     sys.modules.pop("mcp_server.server", None)
     routes_package = sys.modules.get("app.api.routes")
     if routes_package is not None:
         routes_package.__dict__.pop("activity", None)
+        routes_package.__dict__.pop("documents", None)
     mcp_package = sys.modules.get("mcp_server")
     if mcp_package is not None:
         mcp_package.__dict__.pop("server", None)
@@ -95,8 +98,9 @@ def test_native_backend_uses_registered_factory_once(monkeypatch, tmp_path):
     assert revision_backend.selected_document_revision_backend() == "native_ledger_m1"
 
 
-def test_native_backend_fails_closed_without_registered_implementation(monkeypatch, tmp_path):
+def test_native_backend_lazily_registers_real_facade_without_git(monkeypatch, tmp_path):
     from app.services import revision_backend
+    from app.services.native_document_service import NativeDocumentService
 
     monkeypatch.setattr(
         revision_backend,
@@ -109,8 +113,54 @@ def test_native_backend_fails_closed_without_registered_implementation(monkeypat
         ),
     )
 
-    with pytest.raises(revision_backend.NativeRevisionBackendUnavailableError):
-        revision_backend.get_document_service()
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("native composition must not construct GitService")
+
+    monkeypatch.setattr(revision_backend, "GitService", fail_if_constructed)
+    service = revision_backend.get_document_service()
+
+    assert isinstance(service, NativeDocumentService)
+    assert service is revision_backend.get_document_service()
+
+
+def test_app_and_stdio_imports_select_native_before_module_globals(monkeypatch, tmp_path):
+    from app.services import git_service, revision_backend
+
+    configured = _settings(
+        tmp_path,
+        db_name="akb_revision_m1_measurement",
+        document_revision_backend="native_ledger_m1",
+        native_revision_m1_measurement_only=True,
+    )
+    monkeypatch.setattr(revision_backend, "settings", configured)
+    # app.main also imports the unrelated external-Git poller. Keep that
+    # legacy subsystem's import-time storage under the test directory; the
+    # assertion below guards the selected Document backend itself.
+    monkeypatch.setattr(git_service, "settings", configured)
+
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("native app import must not construct GitService")
+
+    monkeypatch.setattr(revision_backend, "GitService", fail_if_constructed)
+    monkeypatch.setattr(revision_backend, "LegacyRevisionBackend", fail_if_constructed)
+    sys.modules.pop("app.main", None)
+    sys.modules.pop("app.api.routes.documents", None)
+    sys.modules.pop("app.api.routes.activity", None)
+    sys.modules.pop("mcp_server.server", None)
+    routes_package = sys.modules.get("app.api.routes")
+    if routes_package is not None:
+        routes_package.__dict__.pop("documents", None)
+        routes_package.__dict__.pop("activity", None)
+
+    importlib.import_module("app.main")
+    documents = importlib.import_module("app.api.routes.documents")
+    activity = importlib.import_module("app.api.routes.activity")
+    server = importlib.import_module("mcp_server.server")
+
+    selected = revision_backend.get_revision_backend()
+    assert documents.doc_service is selected.document_service
+    assert activity.revision_backend is selected
+    assert server.revision_backend is selected
 
 
 class _NativeRevisionBackend:

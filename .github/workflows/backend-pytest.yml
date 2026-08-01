@@ -89,6 +89,9 @@ jobs:
         env:
           # Matches the fixture default + the dev compose override.
           AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+          # Native-ledger correctness must fail if this live-PG gate is
+          # accidentally disconnected; a skip here would be a false green.
+          REQUIRE_REAL_PG: '1'
         # #215 declarative-DDL integration tests need a live PG too (index
         # ASC/DESC physical order, migration 037 upgrade path, add-unique-key
         # concurrency race). They skip in the DB-free unit job above, so gate
@@ -105,6 +108,7 @@ jobs:
           tests/test_migration_037_upgrade_unit.py
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
+          tests/concurrency/test_native_ledger_b_core.py
           tests/test_file_idempotent_upload_unit.py
           tests/test_app_registry_migration_unit.py
           tests/test_tool_usage_e2e.py

@@ -96,8 +96,9 @@ async def _run(conn):
                     UNIQUE (namespace_id, surface, resource_id)
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_native_resources_live_path
-                ON native_resources(namespace_id, surface, current_path)
+            DROP INDEX IF EXISTS uq_native_resources_live_path;
+            CREATE UNIQUE INDEX uq_native_resources_live_path
+                ON native_resources(namespace_id, current_path)
                 WHERE lifecycle = 'live';
 
             CREATE TABLE IF NOT EXISTS native_payload_manifests (
@@ -324,8 +325,9 @@ async def _run(conn):
                     DEFERRABLE INITIALLY DEFERRED
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_native_resource_path_aliases_live
-                ON native_resource_path_aliases(namespace_id, surface, old_path)
+            DROP INDEX IF EXISTS uq_native_resource_path_aliases_live;
+            CREATE UNIQUE INDEX uq_native_resource_path_aliases_live
+                ON native_resource_path_aliases(namespace_id, old_path)
                 WHERE retired_revision_id IS NULL;
 
             CREATE INDEX IF NOT EXISTS idx_native_resource_path_aliases_resource

@@ -165,3 +165,22 @@ async def test_mcp_versioned_get_offloads_read_file(mods, monkeypatch):
     )
 
     assert_offloaded("MCP versioned akb_get ran git.read_file ON the event loop (not offloaded)")
+
+
+async def test_mcp_versioned_get_preserves_missing_document_distinction(mods, monkeypatch):
+    _activity, server, _GitService = mods
+    monkeypatch.setattr(server, "split_uri", lambda uri, expected_type=None: ("v", "missing.md"))
+    monkeypatch.setattr(server, "check_vault_access", _anoop)
+    monkeypatch.setattr(
+        server.revision_backend,
+        "_find_document",
+        AsyncMock(return_value=None),
+    )
+
+    result = await server._handle_get(
+        {"uri": "akb://v/doc/missing.md", "version": "abc1234"},
+        "uid",
+        _User(),
+    )
+
+    assert result == {"error": "Document not found", "code": "not_found"}

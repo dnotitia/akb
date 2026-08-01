@@ -497,7 +497,10 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
         # internal-id fields living in old frontmatter (legacy d-prefix)
         # must not leak out of the MCP boundary.
         import frontmatter as _fm
-        versioned = await revision_backend.document_version(vault, doc_path, version)
+        try:
+            versioned = await revision_backend.document_version(vault, doc_path, version)
+        except NotFoundError:
+            return err("Document not found", code=NOT_FOUND)
         if versioned is None:
             return err(f"Version not found: {version}", code=NOT_FOUND)
         doc, raw = versioned
