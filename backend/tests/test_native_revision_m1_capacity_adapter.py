@@ -134,6 +134,14 @@ async def test_closed_loop_excludes_late_completion_from_steady_goodput():
     assert receipt["rps"] == 30.0
 
 
+def test_settled_effective_rps_excludes_probe_and_cleanup_time():
+    assert CAPACITY._settled_effective_rps(
+        successful=30,
+        steady_seconds=1,
+        capacity_settlement_seconds=.5,
+    ) == 20.0
+
+
 def test_body_is_exact_sized_and_localized_chunk_hashes_reuse_content():
     before = CAPACITY._body(65_536, 0, True)
     after = CAPACITY._body(65_536, 1, True)
@@ -175,6 +183,16 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
         assert result["settled"]["exact_current_head"] is True
         assert result["settled"]["direct_head_grep"] is True
         assert result["settled"]["derived_projection_exact_current_head"] is True
+        assert result["settled"]["capacity_settlement"]["closed"] is True
+        assert result["settled"]["derived_probe"]["closed"] is True
+        assert result["settled"]["cleanup"]["closed"] is True
+        capacity_elapsed = result["settled"]["capacity_settlement"]["elapsed_seconds"]
+        expected_effective_rps = CAPACITY._settled_effective_rps(
+            successful=result["settled"]["successful"],
+            steady_seconds=result["settled"]["measurement_window"]["configured_seconds"],
+            capacity_settlement_seconds=capacity_elapsed,
+        )
+        assert result["settled"]["settled_effective_rps"] == expected_effective_rps
         assert result["front"]["issuance_schedule"]["scope"] == "worker-closed-loop"
         assert set(("measurement_window", "issued", "successful", "error", "close_reason", "target_issuance", "achieved_issuance")) <= set(result["front"])
         assert set(("measurement_window", "issued", "successful", "error", "close_reason", "target_issuance", "achieved_issuance")) <= set(result["settled"])

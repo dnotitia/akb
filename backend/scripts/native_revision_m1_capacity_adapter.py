@@ -284,6 +284,11 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1)], 3)
 
 
+def _settled_effective_rps(*, successful: int, steady_seconds: float, capacity_settlement_seconds: float) -> float:
+    """M0-compatible goodput: fixed steady window plus capacity settlement."""
+    return round(successful / max(steady_seconds + capacity_settlement_seconds, 0.000001), 3)
+
+
 async def _setup(dsn: str, *, pool_max_size: int = 24) -> tuple[asyncpg.Pool, str, uuid.UUID, list[uuid.UUID]]:
     conn = await asyncpg.connect(dsn, timeout=10)
     try:
@@ -574,15 +579,14 @@ async def _run_cell(
     )
     published = sum([await _pending(pool, namespace) for namespace in vaults])
 
-    async def settle() -> tuple[dict[str, int], bool, bool, bool, bool, bool, set[str], set[str], dict[str, int]]:
+    async def drain(namespace: uuid.UUID, *, fail_once: bool = False) -> dict[str, int]:
+        return await asyncio.wait_for(
+            _deliver(pool, service, namespace, fail_once=fail_once),
+            timeout=cell.timing.drain_timeout_seconds,
+        )
+
+    async def capacity_settle() -> tuple[dict[str, int], bool, bool, bool, set[str], set[str]]:
         delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
-
-        async def drain(namespace: uuid.UUID, *, fail_once: bool = False) -> dict[str, int]:
-            return await asyncio.wait_for(
-                _deliver(pool, service, namespace, fail_once=fail_once),
-                timeout=cell.timing.drain_timeout_seconds,
-            )
-
         for namespace in vaults:
             result = await drain(namespace)
             for key in delivery:
@@ -594,18 +598,15 @@ async def _run_cell(
             found = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=resource), timeout=cell.timing.request_timeout_seconds)
             direct_grep = direct_grep and found["total_resources"] == 1 and found["results"][0]["revision"] == current.revision_id
             projection_exact = projection_exact and await asyncio.wait_for(
-                _projection_matches_current_head(
-                    pool,
-                    namespace_id=namespace,
-                    resource_id=resource,
-                    revision_id=current.revision_id,
-                    text=current.text,
-                ),
+                _projection_matches_current_head(pool, namespace_id=namespace, resource_id=resource, revision_id=current.revision_id, text=current.text),
                 timeout=cell.timing.request_timeout_seconds,
             )
             before_hashes = set(_chunk_hashes(_body(cell.size_bytes, 0, cell.mutation_shape == "localized")))
             after_hashes = set(_chunk_hashes(current.text)); changed.update(after_hashes - before_hashes); reused.update(after_hashes & before_hashes)
-        # Delivery failure must not block current Head/get/grep, then retry and duplicate delivery are harmless.
+        return delivery, exact_head, direct_grep, projection_exact, changed, reused
+
+    async def derived_probe() -> tuple[bool, bool]:
+        # W5 failure/retry is intentionally outside the capacity RPS denominator.
         probe_ns, probe_resource, probe_path, _ = states[0]
         probe = await asyncio.wait_for(service.replace_text(namespace_id=probe_ns, surface="document", path=probe_path, payload=_body(cell.size_bytes, warmup.achieved_issuance + steady.achieved_issuance + 7, cell.mutation_shape == "localized"), actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=revisions[probe_resource], expected_resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
         delivery_started = asyncio.Event()
@@ -625,18 +626,12 @@ async def _run_cell(
         failed = await asyncio.wait_for(delayed_task, timeout=cell.timing.drain_timeout_seconds)
         retried = await drain(probe_ns); duplicate = await drain(probe_ns)
         probe_current = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
-        retry_projection_exact = await asyncio.wait_for(
-            _projection_matches_current_head(
-                pool,
-                namespace_id=probe_ns,
-                resource_id=probe_resource,
-                revision_id=probe_current.revision_id,
-                text=probe_current.text,
-            ),
-            timeout=cell.timing.request_timeout_seconds,
-        )
+        retry_projection_exact = await asyncio.wait_for(_projection_matches_current_head(pool, namespace_id=probe_ns, resource_id=probe_resource, revision_id=probe_current.revision_id, text=probe_current.text), timeout=cell.timing.request_timeout_seconds)
         retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0} and retry_projection_exact
-        # Tombstones must erase run-owned projection and leave no pending delivery.
+        return retry_ok, retry_projection_exact
+
+    async def cleanup() -> tuple[dict[str, int], dict[str, int]]:
+        delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
         for namespace, resource, path, _ in states:
             current = await asyncio.wait_for(service.get_current(namespace_id=namespace, surface="document", path=path), timeout=cell.timing.request_timeout_seconds)
             await asyncio.wait_for(service.delete_resource(namespace_id=namespace, surface="document", path=path, actor="m1-capacity", mutation_id=uuid.uuid4(), expected_revision_id=current.revision_id, expected_resource_id=resource), timeout=cell.timing.request_timeout_seconds)
@@ -644,28 +639,47 @@ async def _run_cell(
             result = await drain(namespace)
             for key in delivery:
                 delivery[key] += result[key]
-        return delivery, exact_head, direct_grep, projection_exact, retry_ok, retry_projection_exact, changed, reused, await _snapshot(pool, vaults)
+        return delivery, await _snapshot(pool, vaults)
 
-    settlement_started = clock()
-    settlement_error: str | None = None
+    capacity_started = clock(); capacity_error: str | None = None
     try:
-        delivery, exact_head, direct_grep, projection_exact, retry_ok, retry_projection_exact, changed, reused, final = await asyncio.wait_for(settle(), timeout=cell.timing.settlement_timeout_seconds)
-    except Exception as exc:  # a timeout/error is evidence, never a green settlement
-        settlement_error = type(exc).__name__
-        delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
-        exact_head = direct_grep = projection_exact = retry_ok = retry_projection_exact = False
-        changed = set(); reused = set()
+        capacity_delivery, exact_head, direct_grep, projection_exact, changed, reused = await asyncio.wait_for(capacity_settle(), timeout=cell.timing.settlement_timeout_seconds)
+    except Exception as exc:
+        capacity_error = type(exc).__name__
+        capacity_delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
+        exact_head = direct_grep = projection_exact = False; changed = set(); reused = set()
+    capacity_elapsed = max(0.0, clock() - capacity_started)
+
+    probe_started = clock(); probe_error: str | None = None
+    try:
+        retry_ok, retry_projection_exact = await asyncio.wait_for(derived_probe(), timeout=cell.timing.settlement_timeout_seconds)
+    except Exception as exc:
+        probe_error = type(exc).__name__
+        retry_ok = retry_projection_exact = False
+    probe_elapsed = max(0.0, clock() - probe_started)
+
+    cleanup_started = clock(); cleanup_error: str | None = None
+    try:
+        cleanup_delivery, final = await asyncio.wait_for(cleanup(), timeout=cell.timing.settlement_timeout_seconds)
+    except Exception as exc:
+        cleanup_error = type(exc).__name__
+        cleanup_delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
         final = await _snapshot(pool, vaults)
+    cleanup_elapsed = max(0.0, clock() - cleanup_started)
+    delivery = {key: capacity_delivery[key] + cleanup_delivery[key] for key in capacity_delivery}
     settled = steady.receipt(include_latency=False)
     settled["measurement_window"].update({
         "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds,
-        "settlement_elapsed_seconds": round(max(0.0, clock() - settlement_started), 6),
+        "capacity_settlement_elapsed_seconds": round(capacity_elapsed, 6),
     })
     settled.update({
+        "settled_effective_rps": _settled_effective_rps(successful=steady.successful, steady_seconds=steady.configured_seconds, capacity_settlement_seconds=capacity_elapsed),
         "exact_current_head": exact_head,
         "direct_head_grep": direct_grep,
         "derived_projection_exact_current_head": projection_exact,
-        "settlement_error": settlement_error,
+        "capacity_settlement": {"elapsed_seconds": round(capacity_elapsed, 6), "closed": exact_head and direct_grep and projection_exact and capacity_error is None, "error": capacity_error},
+        "derived_probe": {"elapsed_seconds": round(probe_elapsed, 6), "closed": retry_ok and retry_projection_exact and probe_error is None, "error": probe_error},
+        "cleanup": {"elapsed_seconds": round(cleanup_elapsed, 6), "closed": cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0, "error": cleanup_error},
     })
     all_phase_errors = sum(warmup.errors.values()) + sum(warmup.drain_errors.values()) + sum(steady.errors.values()) + sum(steady.drain_errors.values())
     front = steady.receipt(include_latency=True)
@@ -679,7 +693,7 @@ async def _run_cell(
     }
     front["issuance_schedule"] = issuance_schedule
     settled["issuance_schedule"] = issuance_schedule
-    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps, "request_budget": cell.request_budget, "timing": {"warmup_seconds": cell.timing.warmup_seconds, "steady_seconds": cell.timing.steady_seconds, "drain_timeout_seconds": cell.timing.drain_timeout_seconds, "request_timeout_seconds": cell.timing.request_timeout_seconds, "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds, "settlement_poll_interval_seconds": cell.timing.settlement_poll_interval_seconds}, "resource": {"pool_max_size": pool_max_size}}, "front": front, "settled": settled, "intents": {"published": published, "coalesced": delivery["coalesced"], "delivered": delivery["delivered"], "pending": final["pending_intents"]}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "failure_retry_projection_exact_current_head": retry_projection_exact, "derived_projection_exact_current_head": projection_exact, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and projection_exact and retry_ok and not all_phase_errors and settlement_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0}
+    return {"cell": {"matrix": cell.matrix, "id": cell.cell_id, "concurrency": cell.concurrency, "vault_topology": cell.topology, "size_bytes": cell.size_bytes, "mutation_shape": cell.mutation_shape, "load_model": cell.load_model, "target_rps": cell.target_rps, "request_budget": cell.request_budget, "timing": {"warmup_seconds": cell.timing.warmup_seconds, "steady_seconds": cell.timing.steady_seconds, "drain_timeout_seconds": cell.timing.drain_timeout_seconds, "request_timeout_seconds": cell.timing.request_timeout_seconds, "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds, "settlement_poll_interval_seconds": cell.timing.settlement_poll_interval_seconds}, "resource": {"pool_max_size": pool_max_size}}, "front": front, "settled": settled, "intents": {"published": published, "coalesced": delivery["coalesced"], "delivered": delivery["delivered"], "pending": final["pending_intents"]}, "derived_boundary": {"failure_retry_duplicate_current_head_pinned": retry_ok, "failure_retry_projection_exact_current_head": retry_projection_exact, "derived_projection_exact_current_head": projection_exact, "changed_chunk_hashes": sorted(changed), "reused_chunk_hashes": sorted(reused)}, "resource_snapshot": {"baseline": baseline, "final": final}, "closed": exact_head and direct_grep and projection_exact and retry_ok and retry_projection_exact and not all_phase_errors and capacity_error is None and probe_error is None and cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0}
 
 
 async def run() -> dict[str, Any]:
