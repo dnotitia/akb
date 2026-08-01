@@ -701,17 +701,19 @@ async def _run_cell(
     cleanup_elapsed = max(0.0, clock() - cleanup_started)
     capacity_intents_closed = published == capacity_delivery["delivered"] + capacity_delivery["coalesced"]
     settled = steady.receipt(include_latency=False)
+    observed_steady_seconds = settled["measurement_window"]["observed_seconds"]
+    published_capacity_elapsed = round(capacity_elapsed, 6)
     settled["measurement_window"].update({
         "settlement_timeout_seconds": cell.timing.settlement_timeout_seconds,
-        "capacity_settlement_elapsed_seconds": round(capacity_elapsed, 6),
+        "capacity_settlement_elapsed_seconds": published_capacity_elapsed,
         "settlement_polling": "not_applicable_synchronous_delivery",
     })
     settled.update({
-        "settled_effective_rps": _settled_effective_rps(successful=steady.successful, steady_seconds=steady.measurement_ended_at - steady.started_at, capacity_settlement_seconds=capacity_elapsed),
+        "settled_effective_rps": _settled_effective_rps(successful=steady.successful, steady_seconds=observed_steady_seconds, capacity_settlement_seconds=published_capacity_elapsed),
         "exact_current_head": exact_head,
         "direct_head_grep": direct_grep,
         "derived_projection_exact_current_head": projection_exact,
-        "capacity_settlement": {"elapsed_seconds": round(capacity_elapsed, 6), "closed": exact_head and direct_grep and projection_exact and capacity_intents_closed and capacity_error is None, "error": capacity_error},
+        "capacity_settlement": {"elapsed_seconds": published_capacity_elapsed, "closed": exact_head and direct_grep and projection_exact and capacity_intents_closed and capacity_error is None, "error": capacity_error},
         "derived_probe": {"elapsed_seconds": round(probe_elapsed, 6), "closed": retry_ok and retry_projection_exact and probe_error is None, "error": probe_error, "delivery": probe_delivery},
         "cleanup": {"elapsed_seconds": round(cleanup_elapsed, 6), "closed": cleanup_error is None and final["pending_intents"] == 0 and final["projection_rows"] == 0, "error": cleanup_error, "delivery": cleanup_delivery},
     })
