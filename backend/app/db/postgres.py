@@ -217,6 +217,7 @@ async def _apply_migrations() -> None:
         "045_vault_write_grant_actions.py",      # additive action limits; existing grants backfill to wildcard
         "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
         "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
+        "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
     ):
         if filename in applied:
             continue
