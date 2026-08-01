@@ -218,6 +218,7 @@ async def _apply_migrations() -> None:
         "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
         "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
         "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
+        "049_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
     ):
         if filename in applied:
             continue

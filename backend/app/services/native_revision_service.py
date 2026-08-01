@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 import asyncpg
 
@@ -26,6 +27,19 @@ from app.services.m1_reference_payload_store import (
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
+
+
+class TextPayloadStore(Protocol):
+    async def prepare_text(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        payload: str | bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedReferencePayload: ...
+
+    async def open_verified(self, payload_id: uuid.UUID) -> bytes: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +84,7 @@ class NativeRevisionService:
         pool: asyncpg.Pool,
         *,
         repository: NativeRevisionRepository | None = None,
-        payload_store: M1ReferencePayloadStore | None = None,
+        payload_store: TextPayloadStore | None = None,
         failpoint: Failpoint | None = None,
     ):
         """Build the internal substrate.
