@@ -183,7 +183,7 @@ async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_
         async with pool.acquire() as conn:
             assert (
                 await conn.fetchval("SELECT current_commit FROM documents WHERE id = $1", legacy_id)
-                == "0123456789abcdef0123456789abcdef01234567"
+                == "0123456789abcdef0123456789abcdef01234567"  # pragma: allowlist secret
             )
             rows = await conn.fetch(
                 """
