@@ -66,6 +66,63 @@ async def insert_or_adopt(
     return row["id"]
 
 
+async def insert_measurement_pending(
+    conn, *, file_id: uuid.UUID, vault_id: uuid.UUID, collection_id: uuid.UUID | None,
+    name: str, mime_type: str, description: str, created_by: str,
+) -> None:
+    """Create a non-visible M1 File transfer intent backed by ``vault_files``."""
+    await conn.execute(
+        """
+        INSERT INTO vault_files
+            (id, vault_id, collection_id, name, s3_key, mime_type, size_bytes,
+             description, created_by, storage_state, storage_driver, storage_locator)
+        VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, 'pending', NULL, NULL)
+        """,
+        file_id, vault_id, collection_id, name, f"m1-pending/{file_id}", mime_type,
+        description, created_by,
+    )
+
+
+async def confirm_measurement_file(
+    conn, *, file_id: uuid.UUID, vault_id: uuid.UUID, locator: str, driver: str,
+    digest: str, size_bytes: int,
+) -> bool:
+    result = await conn.execute(
+        """
+        UPDATE vault_files SET storage_state = 'confirmed', storage_driver = $3,
+            storage_locator = $4, content_hash = $5, hash_algorithm = 'sha256',
+            size_bytes = $6, hash_verified_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND vault_id = $2 AND storage_state = 'pending'
+        """, file_id, vault_id, driver, locator, digest, size_bytes,
+    )
+    return result.endswith("1")
+
+
+async def list_measurement_confirmed(
+    conn, vault_id: uuid.UUID, *, collection: str | None, limit: int,
+) -> list[dict]:
+    params: list = [vault_id]
+    collection_clause = ""
+    if collection is not None:
+        if collection == "":
+            collection_clause = " AND vf.collection_id IS NULL"
+        else:
+            params.append(collection)
+            collection_clause = f" AND c.path = ${len(params)}"
+    params.append(limit)
+    rows = await conn.fetch(
+        """
+        SELECT vf.id, vf.vault_id, c.path AS collection, vf.name, vf.mime_type,
+               vf.size_bytes, vf.content_hash, vf.hash_algorithm, vf.storage_driver,
+               vf.storage_locator
+          FROM vault_files vf LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.vault_id = $1 AND vf.storage_state = 'confirmed'
+        """ + collection_clause + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}",
+        *params,
+    )
+    return [dict(row) for row in rows]
+
+
 async def find_by_id(
     conn,
     vault_id: uuid.UUID,
@@ -87,6 +144,19 @@ async def find_by_id(
          WHERE vf.id = $1 AND vf.vault_id = $2
         """,
         file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
+async def find_measurement_by_id(conn, vault_id: uuid.UUID, file_id: uuid.UUID) -> dict | None:
+    row = await conn.fetchrow(
+        """
+        SELECT vf.id, vf.vault_id, c.path AS collection, vf.name, vf.mime_type,
+               vf.size_bytes, vf.description, vf.content_hash, vf.storage_state,
+               vf.storage_driver, vf.storage_locator
+          FROM vault_files vf LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.id = $1 AND vf.vault_id = $2
+        """, file_id, vault_id,
     )
     return dict(row) if row else None
 

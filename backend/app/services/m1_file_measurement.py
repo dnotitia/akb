@@ -1,274 +1,299 @@
-"""Guarded, File-shaped storage-neutral facade for the M1 W4 measurement.
+"""Durable, guarded public File storage protocol for the M1 W4 measurement.
 
-This is intentionally a very small public API surface: it mirrors the File
-route sequence (initiate -> client transfer -> confirm -> download -> delete)
-without making the measurement driver a second production storage path.  It is
-constructed only after the caller has checked the dedicated M1 measurement
-guard.  The opaque transfer capability is signed with a process-local key and
-is never written to a database or receipt.
+The database, not a backend process, is the authority for pending transfers,
+opaque capabilities and confirmed File visibility.  CAS is deliberately
+conservative on logical delete: no shared digest is ever removed by a File
+delete; a later run-owned reaper can retire proven-unreferenced objects.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import secrets
-import time
 import uuid
-from dataclasses import dataclass
-from typing import Callable
-from urllib.parse import urlsplit
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 
-from app.exceptions import AKBError, NotFoundError, ValidationError
-from app.services.m1_binary_store import BinaryStore, PreparedBinary
-from app.services.resource_hash import is_sha256_hex
-
-
-_TRANSFER_TTL = 3600
-
-
-@dataclass(slots=True)
-class _File:
-    file_id: str
-    vault: str
-    filename: str
-    mime_type: str
-    declared_digest: str | None
-    transfer: bytes | None = None
-    prepared: PreparedBinary | None = None
+from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
+from app.db.postgres import get_pool
+from app.exceptions import AKBError, NotFoundError
+from app.repositories import vault_files_repo
+from app.repositories.document_repo import CollectionRepository
+from app.services.adapters import s3_adapter
+from app.services.m1_binary_store import BinaryStore, FilesystemCAS, S3CAS
+from app.services.resource_hash import HASH_ALGORITHM, is_sha256_hex
+from app.services.uri_service import file_uri
+from app.util.text import normalize_collection_path
 
 
-@dataclass(slots=True)
-class _Capability:
-    file_id: str
-    operation: str
-    expires_at: int
-    used: bool = False
+TRANSFER_TTL_SECONDS = 3600
+
+# Migration 050 owns concrete native text publication tables.  The integrating
+# native service registers this File-identity seam instead of 051 creating a
+# competing text ledger.
+NativeTextFilePublisher = Callable[[object, uuid.UUID, str, str, bytes, str], Awaitable[None]]
+_native_text_file_publisher: NativeTextFilePublisher | None = None
+NativeTextFileOpener = Callable[[uuid.UUID, str, str], Awaitable[bytes]]
+_native_text_file_opener: NativeTextFileOpener | None = None
 
 
-class MeasurementFileFacade:
-    """A process-local public File facade used solely by the W4 adapter.
+def register_native_text_file_publisher(publisher: NativeTextFilePublisher) -> None:
+    global _native_text_file_publisher
+    _native_text_file_publisher = publisher
 
-    The facade intentionally has no persistence.  A process restart therefore
-    makes unfinished uploads non-visible, which is the safe outcome for a
-    measurement run.  Confirmed bytes are immutable CAS objects; logical
-    visibility is changed only after ``prepare_verified`` succeeds.
-    """
 
-    def __init__(
-        self,
-        store: BinaryStore,
-        *,
-        base_url: str,
-        transfer_path: str = "/files/transfer",
-        now: Callable[[], float] = time.time,
-        capability_secret: bytes | None = None,
-    ) -> None:
-        if not base_url.strip():
-            raise ValidationError("measurement File base URL is required")
-        self.store = store
-        self.base_url = base_url.rstrip("/")
-        self.transfer_path = "/" + transfer_path.strip("/")
-        self._now = now
-        self._secret = capability_secret or secrets.token_bytes(32)
-        self._files: dict[str, _File] = {}
-        self._claims: dict[tuple[str, str, str], str] = {}
-        self._capabilities: dict[str, _Capability] = {}
+def register_native_text_file_opener(opener: NativeTextFileOpener) -> None:
+    global _native_text_file_opener
+    _native_text_file_opener = opener
 
-    @property
-    def pending_count(self) -> int:
-        return sum(1 for item in self._files.values() if item.prepared is None)
+
+def _is_native_text(mime_type: str, data: bytes) -> bool:
+    if not mime_type.lower().startswith("text/") or b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _new_token() -> str:
+    # Only the SHA-256 digest is stored.  The raw bearer capability is returned
+    # once and never included in an event or measurement receipt.
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+def _store() -> BinaryStore:
+    if not settings.native_revision_m1_measurement_only or settings.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
+        raise RuntimeError("M1 File CAS requires the dedicated measurement guard")
+    if settings.native_revision_m1_file_driver == "fscas":
+        return FilesystemCAS(Path(settings.native_revision_m1_file_fscas_root))
+    if settings.native_revision_m1_file_driver == "s3cas":
+        return S3CAS(settings.s3_bucket, s3_adapter.client())
+    raise RuntimeError("M1 File CAS driver must be fscas or s3cas")
+
+
+def measurement_enabled() -> bool:
+    return settings.native_revision_m1_file_driver != "s3_current"
+
+
+class MeasurementFileService:
+    """DB-backed implementation behind the existing public File endpoints."""
+
+    def __init__(self) -> None:
+        if not measurement_enabled():
+            raise RuntimeError("M1 File measurement is not enabled")
+        if not settings.public_base_url:
+            raise RuntimeError("M1 File CAS requires public_base_url")
+        self._base_url = settings.public_base_url.rstrip("/")
 
     @property
     def driver(self) -> str:
-        return "s3cas" if self.store.driver == "s3" else self.store.driver
-
-    def _token(self, file_id: str, operation: str) -> str:
-        expires_at = int(self._now()) + _TRANSFER_TTL
-        nonce = secrets.token_urlsafe(16)
-        payload = f"v1.{file_id}.{operation}.{expires_at}.{nonce}"
-        signature = hmac.new(self._secret, payload.encode(), hashlib.sha256).digest()
-        token = payload + "." + base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
-        self._capabilities[token] = _Capability(file_id, operation, expires_at)
-        return token
+        return settings.native_revision_m1_file_driver
 
     def _url(self, token: str) -> str:
-        return f"{self.base_url}{self.transfer_path}/{token}"
+        return f"{self._base_url}/api/v1/files/transfer/{token}"
 
-    def _consume(self, url: str, method: str) -> _Capability:
-        token = urlsplit(url).path.rsplit("/", 1)[-1]
-        capability = self._capabilities.get(token)
-        if capability is None:
-            raise AKBError("invalid measurement transfer capability", status_code=403)
-        pieces = token.rsplit(".", 1)
-        try:
-            signature = base64.urlsafe_b64decode(pieces[1] + "=")
-        except (IndexError, ValueError) as exc:
-            raise AKBError("invalid measurement transfer capability", status_code=403) from exc
-        expected = hmac.new(self._secret, pieces[0].encode(), hashlib.sha256).digest()
-        if not hmac.compare_digest(signature, expected):
-            raise AKBError("invalid measurement transfer capability", status_code=403)
-        if int(self._now()) > capability.expires_at:
-            raise AKBError("measurement transfer capability expired", status_code=403)
-        if capability.operation != method.lower():
-            raise AKBError("measurement transfer capability method is not allowed", status_code=405)
-        if capability.used:
-            raise AKBError("measurement transfer capability already used", status_code=409)
-        capability.used = True
-        return capability
+    async def _cleanup_expired(self, conn) -> None:
+        # An untransferred row has no CAS bytes, so this is safe, bounded
+        # cleanup.  Confirmed rows never match and are never bulk-deleted.
+        await conn.execute(
+            """
+            DELETE FROM vault_files vf
+             USING m1_file_transfer_intents ti
+             WHERE vf.id = ti.file_id
+               AND vf.storage_state = 'pending'
+               AND ti.expires_at <= NOW()
+               AND ti.consumed_at IS NULL
+            """
+        )
 
-    def initiate_upload(
-        self,
-        *,
-        vault: str,
-        filename: str,
-        mime_type: str = "application/octet-stream",
-        content_hash: str | None = None,
+    async def initiate_upload(
+        self, *, vault_name: str, vault_id: uuid.UUID, collection: str,
+        filename: str, actor_id: str, mime_type: str, description: str,
+        content_hash: str | None,
     ) -> dict:
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
-        claim = (vault, filename, content_hash) if content_hash else None
-        if claim is not None and claim in self._claims:
-            file_id = self._claims[claim]
-            item = self._files.get(file_id)
-            if item is not None:
-                return {
-                    "kind": "file", "file_id": file_id, "vault": vault,
-                    "upload_url": self._url(self._token(file_id, "put")),
-                    "expires_in": _TRANSFER_TTL, "deduplicated": True,
-                }
-        file_id = str(uuid.uuid4())
-        item = _File(file_id, vault, filename, mime_type, content_hash)
-        self._files[file_id] = item
-        if claim is not None:
-            self._claims[claim] = file_id
+        token = _new_token()
+        file_id = uuid.uuid4()
+        collection_path = normalize_collection_path(collection)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await self._cleanup_expired(conn)
+                if content_hash:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT id FROM vault_files
+                         WHERE vault_id = $1 AND name = $2 AND content_hash = $3
+                           AND storage_state = 'confirmed'
+                         ORDER BY created_at ASC LIMIT 1
+                        """, vault_id, filename, content_hash,
+                    )
+                    if existing:
+                        # Preserve the historic proxy flow: it will still PUT
+                        # then confirm.  This one-use intent accepts that PUT
+                        # as a harmless no-op against the confirmed identity.
+                        await conn.execute(
+                            """
+                            INSERT INTO m1_file_transfer_intents (id, file_id, vault_id, method, token_digest, expires_at)
+                            VALUES ($1, $2, $3, 'PUT', $4, NOW() + ($5 * INTERVAL '1 second'))
+                            """, uuid.uuid4(), existing["id"], vault_id, _token_digest(token), TRANSFER_TTL_SECONDS,
+                        )
+                        return {
+                            "kind": "file", "uri": file_uri(vault_name, str(existing["id"]), collection=collection_path or None),
+                            "vault": vault_name, "collection": collection_path or None,
+                            "upload_url": self._url(token), "s3_key": None,
+                            "expires_in": TRANSFER_TTL_SECONDS, "deduplicated": True,
+                        }
+                collection_id = None
+                if collection_path:
+                    collection_id = await CollectionRepository(pool).get_or_create(vault_id, collection_path, conn=conn)
+                await vault_files_repo.insert_measurement_pending(
+                    conn, file_id=file_id, vault_id=vault_id, collection_id=collection_id,
+                    name=filename, mime_type=mime_type, description=description, created_by=actor_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO m1_file_transfer_intents (id, file_id, vault_id, method, token_digest, expires_at)
+                    VALUES ($1, $2, $3, 'PUT', $4, NOW() + ($5 * INTERVAL '1 second'))
+                    """, uuid.uuid4(), file_id, vault_id, _token_digest(token), TRANSFER_TTL_SECONDS,
+                )
         return {
-            "kind": "file", "file_id": file_id, "vault": vault,
-            "upload_url": self._url(self._token(file_id, "put")),
-            "expires_in": _TRANSFER_TTL, "deduplicated": False,
+            "kind": "file", "uri": file_uri(vault_name, str(file_id), collection=collection_path or None),
+            "vault": vault_name, "collection": collection_path or None,
+            "upload_url": self._url(token), "s3_key": None,
+            "expires_in": TRANSFER_TTL_SECONDS, "deduplicated": False,
         }
 
-    def transfer(self, url: str, body: bytes | None = None, *, method: str | None = None) -> bytes | None:
-        selected_method = method or ("PUT" if body is not None else "GET")
-        capability = self._consume(url, selected_method)
-        item = self._files.get(capability.file_id)
-        if item is None:
-            raise NotFoundError("File", capability.file_id)
-        if selected_method.lower() == "put":
-            assert body is not None
-            if item.prepared is not None:
-                raise AKBError("file is already confirmed", status_code=409)
-            item.transfer = bytes(body)
-            return None
-        if item.prepared is None:
-            raise NotFoundError("File", capability.file_id)
-        return self.store.open_verified(item.vault, item.prepared)
+    async def transfer(self, token: str, *, method: str, body: bytes | None = None) -> bytes | None:
+        if method not in {"PUT", "GET"}:
+            raise AKBError("measurement transfer method is not allowed", status_code=405)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                intent = await conn.fetchrow(
+                    """
+                    UPDATE m1_file_transfer_intents
+                       SET consumed_at = NOW(), body = CASE WHEN method = 'PUT' THEN $2 ELSE body END
+                     WHERE token_digest = $1 AND method = $3
+                       AND consumed_at IS NULL AND expires_at > NOW()
+                    RETURNING file_id, vault_id, method
+                    """, _token_digest(token), body, method,
+                )
+                if not intent:
+                    raise AKBError("measurement transfer capability is invalid, expired, or already used", status_code=403)
+                if method == "PUT":
+                    return None
+                row = await vault_files_repo.find_measurement_by_id(conn, intent["vault_id"], intent["file_id"])
+                if not row or row["storage_state"] != "confirmed":
+                    raise NotFoundError("File", str(intent["file_id"]))
+        if row["storage_driver"] == "native_text":
+            if _native_text_file_opener is None:
+                raise AKBError("native text File opener is not registered", status_code=503)
+            return await _native_text_file_opener(row["vault_id"], str(row["id"]), row["content_hash"])
+        prepared = _prepared_from_row(row)
+        return _store().open_verified(str(row["vault_id"]), prepared)
 
-    def confirm_upload(self, file_id: str, *, content_hash: str | None = None) -> dict:
-        item = self._files.get(file_id)
-        if item is None:
-            raise NotFoundError("File", file_id)
+    async def confirm_upload(self, vault_id: uuid.UUID, file_id: str, *, content_hash: str | None) -> dict:
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
-        if item.prepared is not None:
-            return self._confirmed(item)
-        if item.transfer is None:
-            self._discard(item)
-            raise AKBError("Upload not found in storage — file record cleaned up", status_code=404)
-        actual = hashlib.sha256(item.transfer).hexdigest()
-        if (item.declared_digest and item.declared_digest != actual) or (
-            content_hash is not None and content_hash != actual
-        ):
-            self._discard(item)
-            raise AKBError("Uploaded file hash mismatch; file record was cleaned up.", status_code=409)
-        try:
-            item.prepared = self.store.prepare_verified(
-                item.vault, item.transfer, actual, len(item.transfer),
+        fid = uuid.UUID(file_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+            if not row:
+                raise NotFoundError("File", file_id)
+            if row["storage_state"] == "confirmed":
+                return _confirmed_response(row)
+            intent = await conn.fetchrow(
+                "SELECT body FROM m1_file_transfer_intents WHERE file_id = $1 AND vault_id = $2 AND method = 'PUT'", fid, vault_id,
             )
-        except Exception:
-            # Failed storage publication must never make a logical File visible.
-            self._discard(item)
-            raise
-        item.transfer = None
-        return self._confirmed(item)
+            if not intent or intent["body"] is None:
+                raise AKBError("Upload not found in storage", status_code=404)
+            data = bytes(intent["body"])
+        digest = hashlib.sha256(data).hexdigest()
+        if content_hash is not None and content_hash != digest:
+            raise AKBError("Uploaded file hash mismatch", status_code=409)
+        is_text = _is_native_text(row["mime_type"], data)
+        if is_text:
+            if _native_text_file_publisher is None:
+                raise AKBError("native text File publisher is not registered", status_code=503)
+            prepared = None
+        else:
+            prepared = _store().prepare_verified(str(vault_id), data, digest, len(data))
+        # CAS succeeds first.  If this durable logical publication fails, the
+        # bytes stay an unreachable CAS object; no public File is exposed.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if is_text:
+                    assert _native_text_file_publisher is not None
+                    await _native_text_file_publisher(conn, vault_id, file_id, row["mime_type"], data, digest)
+                updated = await vault_files_repo.confirm_measurement_file(
+                    conn, file_id=fid, vault_id=vault_id,
+                    locator=prepared.locator if prepared else f"native-text/{fid}",
+                    driver="native_text" if is_text else self.driver,
+                    digest=digest, size_bytes=len(data),
+                )
+                if not updated:
+                    raise NotFoundError("File", file_id)
+                await conn.execute("UPDATE m1_file_transfer_intents SET body = NULL WHERE file_id = $1", fid)
+                row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+        assert row is not None
+        return _confirmed_response(row)
 
-    def _confirmed(self, item: _File) -> dict:
-        assert item.prepared is not None
-        revision_id = hashlib.sha1(
-            f"{item.file_id}:{item.prepared.digest}".encode(), usedforsecurity=False,
-        ).hexdigest()
-        return {
-            "kind": "file", "file_id": item.file_id, "vault": item.vault,
-            "name": item.filename, "mime_type": item.mime_type,
-            "size_bytes": item.prepared.size, "content_hash": item.prepared.digest,
-            "hash_algorithm": "sha256", "storage_driver": self.driver,
-            "revision_id": revision_id,
-        }
+    async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
+        fid = uuid.UUID(file_id)
+        token = _new_token()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+                if not row or row["storage_state"] != "confirmed":
+                    raise NotFoundError("File", file_id)
+                await conn.execute(
+                    """
+                    INSERT INTO m1_file_transfer_intents (id, file_id, vault_id, method, token_digest, expires_at)
+                    VALUES ($1, $2, $3, 'GET', $4, NOW() + ($5 * INTERVAL '1 second'))
+                    """, uuid.uuid4(), fid, vault_id, _token_digest(token), TRANSFER_TTL_SECONDS,
+                )
+        return {**_confirmed_response(row), "download_url": self._url(token), "expires_in": TRANSFER_TTL_SECONDS}
 
-    def get_download_url(self, file_id: str) -> dict:
-        item = self._files.get(file_id)
-        if item is None or item.prepared is None:
-            raise NotFoundError("File", file_id)
-        return {
-            "kind": "file", "name": item.filename, "mime_type": item.mime_type,
-            "size_bytes": item.prepared.size, "content_hash": item.prepared.digest,
-            "hash_algorithm": "sha256", "download_url": self._url(self._token(file_id, "get")),
-            "expires_in": _TRANSFER_TTL,
-        }
+    async def list_files(self, vault_id: uuid.UUID, vault_name: str, collection: str | None, limit: int) -> list[dict]:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await vault_files_repo.list_measurement_confirmed(conn, vault_id, collection=collection, limit=limit)
+        return [{**_confirmed_response(row), "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"])} for row in rows]
 
-    def open(self, file_id: str) -> bytes:
-        item = self._files.get(file_id)
-        if item is None or item.prepared is None:
-            raise NotFoundError("File", file_id)
-        return self.store.open_verified(item.vault, item.prepared)
-
-    def delete(self, file_id: str) -> dict:
-        item = self._files.get(file_id)
-        if item is None:
-            raise NotFoundError("File", file_id)
-        # CAS may be shared by same-digest logical retries.  Retire physical
-        # bytes only after this is the final logical reference in this run.
-        prepared = item.prepared
-        self._discard(item)
-        if prepared is not None and not any(
-            other.prepared == prepared for other in self._files.values()
-        ):
-            self.store.delete_verified(item.vault, prepared)
-        return {"kind": "file", "file_id": file_id, "vault": item.vault, "name": item.filename, "deleted": True}
-
-    def _discard(self, item: _File) -> None:
-        self._files.pop(item.file_id, None)
-        if item.declared_digest:
-            self._claims.pop((item.vault, item.filename, item.declared_digest), None)
+    async def delete(self, vault_id: uuid.UUID, file_id: str) -> dict:
+        fid = uuid.UUID(file_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+                if not row or row["storage_state"] != "confirmed":
+                    raise NotFoundError("File", file_id)
+                await conn.execute("DELETE FROM m1_file_transfer_intents WHERE file_id = $1", fid)
+                await vault_files_repo.delete(conn, fid)
+        # Deliberately no CAS delete: digest ownership is shared and deletion
+        # is conservative until a durable refcount/reaper owns it.
+        return {"kind": "file", "vault": str(vault_id), "name": row["name"], "deleted": True}
 
 
-def create_guarded_measurement_file_facade() -> MeasurementFileFacade | None:
-    """Return the one selected measurement driver, or ``None`` for normal S3.
+def _prepared_from_row(row):
+    from app.services.m1_binary_store import PreparedBinary
+    return PreparedBinary(row["storage_locator"], row["content_hash"], row["size_bytes"], "s3" if row["storage_driver"] == "s3cas" else "fscas")
 
-    Settings validation repeats the guard at config-load time; this local
-    assertion prevents a test/runtime monkeypatch from accidentally activating
-    a CAS driver outside the exact M1 database.
-    """
-    from pathlib import Path
 
-    from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
-    from app.services.adapters import s3_adapter
-    from app.services.m1_binary_store import FilesystemCAS, S3CAS
-
-    driver = settings.native_revision_m1_file_driver
-    if driver == "s3_current":
-        return None
-    if not settings.native_revision_m1_measurement_only or settings.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
-        raise RuntimeError("M1 File CAS requires the dedicated measurement guard")
-    if not settings.public_base_url:
-        raise RuntimeError("M1 File CAS requires public_base_url for proxy-compatible transfer URLs")
-    if driver == "fscas":
-        store: BinaryStore = FilesystemCAS(Path(settings.native_revision_m1_file_fscas_root))
-    elif driver == "s3cas":
-        store = S3CAS(settings.s3_bucket, s3_adapter.client())
-    else:  # Literal plus this branch keeps fail-closed behavior under monkeypatches.
-        raise RuntimeError("M1 File CAS driver must be fscas or s3cas")
-    return MeasurementFileFacade(
-        store, base_url=settings.public_base_url, transfer_path="/api/v1/files/transfer",
-    )
+def _confirmed_response(row: dict) -> dict:
+    return {
+        "kind": "file", "name": row["name"], "collection": row.get("collection"), "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"], "content_hash": row["content_hash"], "hash_algorithm": HASH_ALGORITHM,
+        "storage_driver": row["storage_driver"],
+    }

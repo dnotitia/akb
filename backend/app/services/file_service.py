@@ -37,7 +37,7 @@ from app.services.resource_hash import (
 )
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
-from app.services.m1_file_measurement import create_guarded_measurement_file_facade
+from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -215,7 +215,7 @@ class FileService:
         # Normal deployments retain the existing direct-S3 File service.  The
         # facade can only exist under the config/database guard checked by its
         # factory, so there is no runtime fallback or dual write.
-        self._measurement = create_guarded_measurement_file_facade()
+        self._measurement = MeasurementFileService() if measurement_enabled() else None
 
     async def initiate_upload(
         self,
@@ -257,18 +257,11 @@ class FileService:
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
 
         if self._measurement is not None:
-            response = self._measurement.initiate_upload(
-                vault=vault_name, filename=filename, mime_type=mime_type,
-                content_hash=content_hash,
+            return await self._measurement.initiate_upload(
+                vault_name=vault_name, vault_id=vault_id, collection=collection,
+                filename=filename, actor_id=actor_id, mime_type=mime_type,
+                description=description, content_hash=content_hash,
             )
-            response.update({
-                "uri": file_uri(vault_name, response["file_id"], collection=collection or None),
-                "collection": collection or None,
-                # Kept only for the proxy's historic envelope compatibility;
-                # it is not a storage locator and is never persisted.
-                "s3_key": f"m1-measurement/pending/{response['file_id']}",
-            })
-            return response
 
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
@@ -342,7 +335,7 @@ class FileService:
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
 
         if self._measurement is not None:
-            return self._measurement.confirm_upload(file_id, content_hash=content_hash)
+            return await self._measurement.confirm_upload(vault_id, file_id, content_hash=content_hash)
 
         fid = uuid.UUID(file_id)
         pool = await get_pool()
@@ -473,7 +466,7 @@ class FileService:
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
         """Return a presigned GET URL for direct download from S3."""
         if self._measurement is not None:
-            return self._measurement.get_download_url(file_id)
+            return await self._measurement.get_download_url(vault_id, file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
@@ -522,6 +515,8 @@ class FileService:
         path = vault root) are returned. The path is resolved to a
         collection_id at query time. `vault_name` is required so each
         row's canonical `uri` can be built without a second join."""
+        if self._measurement is not None:
+            return await self._measurement.list_files(vault_id, vault_name, collection, limit)
         pool = await get_pool()
         async with pool.acquire() as conn:
             if collection is None:
@@ -574,7 +569,7 @@ class FileService:
         actor_id: str,
     ) -> dict:
         if self._measurement is not None:
-            return self._measurement.delete(file_id)
+            return await self._measurement.delete(vault_id, file_id)
         fid = uuid.UUID(file_id)
         pool = await get_pool()
 
@@ -662,10 +657,7 @@ class FileService:
         """
         if self._measurement is None:
             raise NotFoundError("File transfer", token)
-        return self._measurement.transfer(
-            f"{self._measurement.base_url}{self._measurement.transfer_path}/{token}",
-            body, method=method,
-        )
+        return await self._measurement.transfer(token, body=body, method=method)
 
 
 async def index_file_metadata(

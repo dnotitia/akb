@@ -166,6 +166,7 @@ class Settings(BaseModel):
     # unchanged; the two CAS choices have no fallback and never dual-write.
     native_revision_m1_file_driver: Literal["s3_current", "fscas", "s3cas"] = "s3_current"
     native_revision_m1_file_fscas_root: str = ""
+    native_revision_m1_file_transfer_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=128 * 1024 * 1024)
 
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls

@@ -3,6 +3,8 @@
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.api.deps import get_current_user, require_delegated_actor
+from app.config import settings
+from app.exceptions import AKBError
 from app.services.access_service import (
     FILE_UPLOAD_WRITE_ACTION,
     check_delegated_vault_writer,
@@ -25,8 +27,16 @@ async def measurement_file_transfer(token: str, request: Request):
     while the dedicated M1 measurement guard is active.
     """
     if request.method == "PUT":
+        declared = request.headers.get("content-length")
+        if declared and int(declared) > settings.native_revision_m1_file_transfer_max_bytes:
+            raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > settings.native_revision_m1_file_transfer_max_bytes:
+                raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
         await file_service.transfer_measurement_capability(
-            token, method="PUT", body=await request.body(),
+            token, method="PUT", body=bytes(body),
         )
         return Response(status_code=200)
     data = await file_service.transfer_measurement_capability(token, method="GET")
