@@ -72,7 +72,7 @@ def _load_migration(path: Path = _MIGRATION):
 
 
 @asynccontextmanager
-async def _fresh_database(*, with_derived: bool = False):
+async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8):
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
@@ -95,7 +95,7 @@ async def _fresh_database(*, with_derived: bool = False):
             await _load_migration(_BODY_MIGRATION).migrate(conn=conn)
             await _load_migration(_DERIVED_MIGRATION).migrate(conn=conn)
         await conn.close()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size)
         async with pool.acquire() as seeded:
             vault_id = await seeded.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
@@ -535,10 +535,10 @@ async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_a
                 self.created: list[tuple[uuid.UUID, uuid.UUID | None]] = []
                 self.public_access: list[tuple[uuid.UUID, str]] = []
 
-            async def on_vault_create(self, vault_id, owner_id) -> None:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
                 self.created.append((vault_id, owner_id))
 
-            async def on_public_access_change(self, vault_id, access) -> None:
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
                 self.public_access.append((vault_id, access))
 
         role_sync = _RoleSync()
@@ -579,6 +579,62 @@ async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_a
         assert list(tmp_path.iterdir()) == []
 
 
+async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkeypatch):
+    """A one-slot pool proves strict RoleSync never acquires a second slot."""
+    async with _fresh_database(pool_max_size=1) as (pool, _):
+        from app.services import native_document_service as native_documents
+        from app.services.role_sync import RoleSync, token_role_name, vault_group_role_name
+
+        owner_id = uuid.uuid4()
+        token_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
+                owner_id,
+                f"owner-{owner_id.hex}",
+                f"{owner_id.hex}@example.test",
+                "test",
+            )
+            await conn.execute(
+                """
+                INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, vault_scope)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                token_id,
+                owner_id,
+                f"scoped-{token_id.hex}",
+                token_id.hex,
+                token_id.hex[:8],
+                '{"prefixes":["native-pool-"],"extra_vaults":[]}',
+            )
+
+        role_sync = RoleSync(pool)
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: role_sync)
+        vault_name = f"native-pool-{uuid.uuid4().hex}"
+        vault_id = uuid.UUID(
+            await asyncio.wait_for(
+                NativeDocumentService(pool=pool).create_vault(vault_name, owner_id=str(owner_id)),
+                timeout=5,
+            )
+        )
+        try:
+            async with pool.acquire() as conn:
+                member = await conn.fetchval(
+                    """
+                    SELECT 1 FROM pg_auth_members membership
+                      JOIN pg_roles group_role ON group_role.oid = membership.roleid
+                      JOIN pg_roles member_role ON member_role.oid = membership.member
+                     WHERE group_role.rolname = $1 AND member_role.rolname = $2
+                    """,
+                    vault_group_role_name(vault_id, "admin"),
+                    token_role_name(token_id),
+                )
+            assert member == 1
+        finally:
+            await role_sync.on_vault_delete(vault_id)
+            await role_sync.on_token_revoke(token_id)
+
+
 async def test_public_delete_removes_native_vault_authority_and_derived_state(
     monkeypatch,
     tmp_path,
@@ -593,10 +649,10 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
             def __init__(self) -> None:
                 self.deleted: list[uuid.UUID] = []
 
-            async def on_vault_create(self, vault_id, owner_id) -> None:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
                 pass
 
-            async def on_public_access_change(self, vault_id, access) -> None:
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
                 pass
 
             async def on_vault_delete(self, vault_id) -> None:
@@ -654,15 +710,13 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
                     vault_id,
                 )
             }
-        assert not (tmp_path / f"{vault_name}.git").exists()
-        assert not (tmp_path / "_worktrees" / vault_name).exists()
+        assert list(tmp_path.iterdir()) == []
 
         deleted = await access_service.delete_vault(str(owner_id), vault_name)
 
         assert deleted == {"deleted": True, "vault": vault_name}
         assert role_sync.deleted == [vault_id]
-        assert not (tmp_path / f"{vault_name}.git").exists()
-        assert not (tmp_path / "_worktrees" / vault_name).exists()
+        assert list(tmp_path.iterdir()) == []
         async with pool.acquire() as conn:
             queued_native_chunk_ids = {
                 row["chunk_id"]
@@ -692,14 +746,8 @@ async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(
         from app.services import native_document_service as native_documents
 
         class _FailingRoleSync:
-            def __init__(self) -> None:
-                self.cleaned: list[uuid.UUID] = []
-
-            async def on_vault_create(self, vault_id, owner_id) -> None:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
                 raise RuntimeError("role sync unavailable")
-
-            async def on_vault_delete(self, vault_id) -> None:
-                self.cleaned.append(vault_id)
 
         role_sync = _FailingRoleSync()
         monkeypatch.setattr(native_documents, "get_role_sync", lambda: role_sync)
@@ -710,7 +758,31 @@ async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(
 
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
-        assert len(role_sync.cleaned) == 1
+
+
+async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_is_cancelled(
+    monkeypatch,
+):
+    async with _fresh_database() as (pool, _):
+        from app.services import native_document_service as native_documents
+
+        started = asyncio.Event()
+
+        class _BlockingRoleSync:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(native_documents, "get_role_sync", _BlockingRoleSync)
+        vault_name = f"native-cancel-{uuid.uuid4().hex}"
+        create_task = asyncio.create_task(NativeDocumentService(pool=pool).create_vault(vault_name))
+        await started.wait()
+        create_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
 
 
 async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():

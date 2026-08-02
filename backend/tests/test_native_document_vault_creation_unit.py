@@ -54,10 +54,12 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
             return vault_id
 
     class _RoleSync:
-        async def on_vault_create(self, created_vault_id, created_owner_id) -> None:
+        async def on_vault_create_in_conn(self, conn, created_vault_id, created_owner_id) -> None:
+            assert conn is connection
             calls.append(("on_vault_create", created_vault_id, created_owner_id))
 
-        async def on_public_access_change(self, created_vault_id, public_access) -> None:
+        async def on_public_access_change_in_conn(self, conn, created_vault_id, public_access) -> None:
+            assert conn is connection
             calls.append(("on_public_access_change", created_vault_id, public_access))
 
     pool_marker = _Pool()

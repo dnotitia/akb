@@ -684,35 +684,24 @@ class NativeDocumentService(DocumentService):
             raise ConflictError(f"Vault already exists: {name}")
         uid = uuid.UUID(owner_id) if owner_id else None
         vault_id: uuid.UUID | None = None
-        role_sync = None
-        try:
-            # Keep the catalog row invisible until its required lifecycle
-            # hooks have accepted it.  Unlike a legacy vault, no Git state
-            # needs compensation, and no native resource can exist before
-            # this method returns its UUID.
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    vault_id = await vault_repo.create(
-                        name=name,
-                        description=description,
-                        git_path=f"native-ledger://{name}",
-                        owner_id=uid,
-                        public_access=public_access,
-                        conn=conn,
-                    )
-                    role_sync = get_role_sync()
-                    await role_sync.on_vault_create(vault_id, uid)
-                    await role_sync.on_public_access_change(vault_id, public_access)
-        except BaseException:
-            # RoleSync is normally best-effort, but a missing/overridden
-            # lifecycle implementation must not strand a visible vault row.
-            # A partially applied role hook is separately compensated.
-            if role_sync is not None and vault_id is not None:
-                try:
-                    await role_sync.on_vault_delete(vault_id)
-                except Exception:
-                    pass
-            raise
+        # These strict same-connection hooks observe the uncommitted catalog
+        # row while scoped PAT memberships are computed, and PostgreSQL rolls
+        # back both the row and role DDL if either hook fails or is cancelled.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                vault_id = await vault_repo.create(
+                    name=name,
+                    description=description,
+                    git_path=f"native-ledger://{name}",
+                    owner_id=uid,
+                    public_access=public_access,
+                    conn=conn,
+                )
+                role_sync = get_role_sync()
+                await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
+                await role_sync.on_public_access_change_in_conn(
+                    conn, vault_id, public_access,
+                )
         assert vault_id is not None
         return str(vault_id)
 

@@ -441,28 +441,40 @@ class RoleSync:
         vault_id: uuid.UUID | str,
         owner_user_id: Optional[uuid.UUID | str] = None,
     ) -> None:
-        """Create the three group roles for the vault + role hierarchy.
-        If `owner_user_id` is provided, grant admin to that user role."""
+        """Best-effort wrapper for :meth:`on_vault_create_in_conn`."""
+        try:
+            async with self.pool.acquire() as conn:
+                await self.on_vault_create_in_conn(conn, vault_id, owner_user_id)
+        except Exception as e:  # noqa: BLE001
+            self._record_failure("on_vault_create", e, vault_id)
+
+    async def on_vault_create_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        vault_id: uuid.UUID | str,
+        owner_user_id: Optional[uuid.UUID | str] = None,
+    ) -> None:
+        """Strict vault-role setup inside the caller's transaction.
+
+        Used when catalog creation and role state must succeed or roll back
+        together.  Unlike the public lifecycle hook, exceptions propagate.
+        """
         reader = vault_group_role_name(vault_id, "reader")
         writer = vault_group_role_name(vault_id, "writer")
         admin = vault_group_role_name(vault_id, "admin")
-        try:
-            async with self.pool.acquire() as conn:
-                for role in (reader, writer, admin):
-                    await self._create_role_if_missing(conn, role)
-                # Hierarchy: writer ⊇ reader, admin ⊇ writer.
-                await self._grant_membership(conn, reader, writer)
-                await self._grant_membership(conn, writer, admin)
-                if owner_user_id:
-                    owner_role = user_role_name(owner_user_id)
-                    await self._create_role_if_missing(conn, owner_role)
-                    await self._grant_membership(conn, admin, owner_role)
-                    # A scoped token of the owner whose scope permits this new
-                    # vault must gain akb_sql reach to it NOW (e.g. a gardener
-                    # creating its own gdn-* vault via its scoped PAT).
-                    await self._sync_user_scoped_tokens(conn, owner_user_id)
-        except Exception as e:  # noqa: BLE001
-            self._record_failure("on_vault_create", e, vault_id)
+        for role in (reader, writer, admin):
+            await self._create_role_if_missing(conn, role)
+        # Hierarchy: writer ⊇ reader, admin ⊇ writer.
+        await self._grant_membership(conn, reader, writer)
+        await self._grant_membership(conn, writer, admin)
+        if owner_user_id:
+            owner_role = user_role_name(owner_user_id)
+            await self._create_role_if_missing(conn, owner_role)
+            await self._grant_membership(conn, admin, owner_role)
+            # A scoped token of the owner whose scope permits this new
+            # vault must gain akb_sql reach to it NOW (e.g. a gardener
+            # creating its own gdn-* vault via its scoped PAT).
+            await self._sync_user_scoped_tokens(conn, owner_user_id)
 
     async def on_vault_delete(self, vault_id: uuid.UUID | str) -> None:
         """Drop the three group roles. Dependent GRANTs are cleared by
@@ -564,25 +576,34 @@ class RoleSync:
         and writer → reader transitions cleanly) and grant the
         target scope. Idempotent.
         """
-        target = _public_access_scope(level)
+        # Preserve the public hook's input-validation contract; only DDL
+        # failures are best-effort lifecycle events.
+        _public_access_scope(level)
         try:
             async with self.pool.acquire() as conn:
-                await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
-                # Revoke any scope the wildcard previously held on this
-                # vault that isn't the target. Always revoke admin —
-                # public_access never grants admin.
-                for scope in ("reader", "writer", "admin"):
-                    if scope == target:
-                        continue
-                    group = vault_group_role_name(vault_id, scope)
-                    await self._revoke_membership_if_present(
-                        conn, group, AUTHENTICATED_ROLE,
-                    )
-                if target is not None:
-                    group = vault_group_role_name(vault_id, target)
-                    await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
+                await self.on_public_access_change_in_conn(conn, vault_id, level)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_public_access_change", e, vault_id, level)
+
+    async def on_public_access_change_in_conn(
+        self,
+        conn: asyncpg.Connection,
+        vault_id: uuid.UUID | str,
+        level: str,
+    ) -> None:
+        """Strict public-access role setup inside the caller's transaction."""
+        target = _public_access_scope(level)
+        await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+        # Revoke any scope the wildcard previously held on this vault that
+        # isn't the target. Always revoke admin — public access never grants it.
+        for scope in ("reader", "writer", "admin"):
+            if scope == target:
+                continue
+            group = vault_group_role_name(vault_id, scope)
+            await self._revoke_membership_if_present(conn, group, AUTHENTICATED_ROLE)
+        if target is not None:
+            group = vault_group_role_name(vault_id, target)
+            await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
 
     async def on_table_create(
         self,
@@ -1249,10 +1270,17 @@ class RoleSync:
     async def _create_role_if_missing(
         self, conn: asyncpg.Connection, role: str,
     ) -> None:
-        try:
-            await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
-        except asyncpg.exceptions.DuplicateObjectError:
-            pass
+        # A Python-side DuplicateObjectError handler is too late inside an
+        # enclosing transaction: PostgreSQL has already marked it aborted.
+        # Contain the duplicate race in a PL/pgSQL subtransaction instead.
+        await conn.execute(
+            f'''DO $$
+            BEGIN
+                CREATE ROLE "{role}" NOLOGIN;
+            EXCEPTION WHEN duplicate_object THEN
+                NULL;
+            END $$;'''
+        )
 
     async def _drop_role_if_present(
         self, conn: asyncpg.Connection, role: str,
@@ -1290,12 +1318,16 @@ class RoleSync:
         group_role: str,
         member_role: str,
     ) -> None:
-        try:
-            await conn.execute(f'REVOKE "{group_role}" FROM "{member_role}"')
-        except asyncpg.exceptions.UndefinedObjectError:
-            pass
-        except asyncpg.exceptions.InvalidGrantOperationError:
-            pass
+        # Like CREATE ROLE above, contain missing membership/role errors in a
+        # subtransaction so strict lifecycle callers keep their outer TX live.
+        await conn.execute(
+            f'''DO $$
+            BEGIN
+                REVOKE "{group_role}" FROM "{member_role}";
+            EXCEPTION WHEN undefined_object OR invalid_grant_operation THEN
+                NULL;
+            END $$;'''
+        )
 
     async def _grant_table(
         self,
