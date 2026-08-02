@@ -11,7 +11,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 import httpx
@@ -35,6 +35,13 @@ WARMUP_SECONDS = 5.0
 MEASUREMENT_SECONDS = 30.0
 REPEATS = 3
 GET_WORKERS = 4
+
+
+class RequestInterval(NamedTuple):
+    worker: str
+    kind: str
+    started: float
+    ended: float
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -80,6 +87,79 @@ def _grep_params(*, pattern: str, vault: str | None, include_text_files: bool) -
     return params
 
 
+def _interval_sets_overlap(
+    left: list[RequestInterval], right: list[RequestInterval]
+) -> bool:
+    ordered_left = sorted(left, key=lambda interval: interval.started)
+    ordered_right = sorted(right, key=lambda interval: interval.started)
+    left_index = 0
+    right_index = 0
+    while left_index < len(ordered_left) and right_index < len(ordered_right):
+        first = ordered_left[left_index]
+        second = ordered_right[right_index]
+        if max(first.started, second.started) < min(first.ended, second.ended):
+            return True
+        if first.ended <= second.ended:
+            left_index += 1
+        else:
+            right_index += 1
+    return False
+
+
+def _concurrency_evidence(
+    intervals: list[RequestInterval], *, get_workers: int = GET_WORKERS
+) -> dict[str, Any]:
+    """Prove role overlap from real request intervals, not worker envelopes."""
+    measured = [interval for interval in intervals if interval.ended > interval.started]
+    events = [
+        event
+        for interval in measured
+        for event in ((interval.started, 1), (interval.ended, -1))
+    ]
+    active = 0
+    max_simultaneous = 0
+    # At equal timestamps, process endings before starts: touching intervals
+    # are sequential and must not be counted as concurrent.
+    for _, delta in sorted(events, key=lambda event: (event[0], event[1])):
+        active += delta
+        max_simultaneous = max(max_simultaneous, active)
+
+    by_worker: dict[str, list[RequestInterval]] = {}
+    for interval in measured:
+        by_worker.setdefault(interval.worker, []).append(interval)
+    writer = by_worker.get("writer", [])
+    grep = by_worker.get("grep", [])
+    writer_get = {
+        f"writer_get_{slot}": _interval_sets_overlap(
+            writer, by_worker.get(f"get_{slot}", [])
+        )
+        for slot in range(get_workers)
+    }
+    grep_get = {
+        f"grep_get_{slot}": _interval_sets_overlap(
+            grep, by_worker.get(f"get_{slot}", [])
+        )
+        for slot in range(get_workers)
+    }
+    writer_grep = _interval_sets_overlap(writer, grep)
+    overlap_proven = (
+        max_simultaneous >= 2
+        and writer_grep
+        and bool(writer_get)
+        and all(writer_get.values())
+        and bool(grep_get)
+        and all(grep_get.values())
+    )
+    return {
+        "measured_request_intervals": len(measured),
+        "max_simultaneous_requests": max_simultaneous,
+        "writer_grep_overlap": writer_grep,
+        "writer_get_overlap": writer_get,
+        "grep_get_overlap": grep_get,
+        "overlap_proven": overlap_proven,
+    }
+
+
 async def _phase(
     client: httpx.AsyncClient,
     *,
@@ -96,7 +176,7 @@ async def _phase(
     counters: Counter[str] = Counter()
     errors: Counter[str] = Counter()
     latencies: dict[str, list[float]] = {"write": [], "get": [], "grep": []}
-    spans: dict[str, list[float]] = {}
+    request_intervals: list[RequestInterval] = []
     sequence = 0
     phase_started = time.perf_counter()
 
@@ -114,11 +194,11 @@ async def _phase(
             return None
         finally:
             if record:
-                latencies[kind].append((time.perf_counter() - started) * 1000)
                 completed = time.perf_counter()
-                span = spans.setdefault(worker, [started, completed])
-                span[0] = min(span[0], started)
-                span[1] = max(span[1], completed)
+                latencies[kind].append((completed - started) * 1000)
+                request_intervals.append(
+                    RequestInterval(worker, kind, started, completed)
+                )
 
     async def writer() -> None:
         nonlocal sequence
@@ -172,28 +252,11 @@ async def _phase(
         ),
     )
     exact.raise_for_status()
-    safe_spans = {
-        worker: {
-            "started_offset_seconds": round(values[0] - phase_started, 6),
-            "ended_offset_seconds": round(values[1] - phase_started, 6),
-        }
-        for worker, values in spans.items()
-    }
-    writer_span = spans.get("writer")
-    overlap = {
-        f"writer_get_{slot}": bool(
-            writer_span
-            and (get_span := spans.get(f"get_{slot}"))
-            and max(writer_span[0], get_span[0]) < min(writer_span[1], get_span[1])
-        )
-        for slot in range(GET_WORKERS)
-    }
     return {
         "window_seconds": observed,
         "successful": dict(counters),
         "errors": dict(errors),
-        "worker_spans": safe_spans,
-        "writer_get_overlap": overlap,
+        "concurrency": _concurrency_evidence(request_intervals),
         "latency": {
             kind: {
                 "samples": len(values),
@@ -367,10 +430,12 @@ async def run() -> dict[str, Any]:
     if any(
         set(item["measurement"]["successful"]) != required_workers
         or any(item["measurement"]["successful"].get(worker, 0) < 1 for worker in required_workers)
-        or not all(item["measurement"]["writer_get_overlap"].values())
+        or not item["measurement"]["concurrency"]["overlap_proven"]
         for item in repeats
     ):
-        raise AdapterError("mixed grep workers did not all execute with writer/GET overlap")
+        raise AdapterError(
+            "mixed grep workers did not all execute with actual writer/grep/GET request overlap"
+        )
     if any(item["measurement"]["exact_grep"].get("total_matches", 0) < 1 for item in repeats):
         raise AdapterError("mixed grep exact result disappeared after measurement")
     assert golden is not None

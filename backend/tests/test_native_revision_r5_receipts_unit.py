@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -173,14 +174,51 @@ class _Response:
 
 class _Client:
     async def request(self, *_args, **_kwargs):
+        await asyncio.sleep(0.001)
         return _Response()
 
     async def get(self, *_args, **_kwargs):
+        await asyncio.sleep(0.001)
         return _Response()
 
 
+def test_concurrency_evidence_rejects_sequential_requests_inside_overlapping_worker_envelopes():
+    adapter = _load("mixed_grep")
+    intervals = [
+        adapter.RequestInterval("writer", "write", 0.0, 1.0),
+        adapter.RequestInterval("get_0", "get", 1.0, 2.0),
+        adapter.RequestInterval("grep", "grep", 2.0, 3.0),
+        adapter.RequestInterval("writer", "write", 3.0, 4.0),
+    ]
+
+    evidence = adapter._concurrency_evidence(intervals, get_workers=1)
+
+    assert evidence["max_simultaneous_requests"] == 1
+    assert evidence["writer_grep_overlap"] is False
+    assert evidence["writer_get_overlap"] == {"writer_get_0": False}
+    assert evidence["grep_get_overlap"] == {"grep_get_0": False}
+    assert evidence["overlap_proven"] is False
+
+
+def test_concurrency_evidence_accepts_actual_overlapping_request_intervals():
+    adapter = _load("mixed_grep")
+    intervals = [
+        adapter.RequestInterval("writer", "write", 0.0, 3.0),
+        adapter.RequestInterval("grep", "grep", 0.5, 2.5),
+        adapter.RequestInterval("get_0", "get", 1.0, 2.0),
+    ]
+
+    evidence = adapter._concurrency_evidence(intervals, get_workers=1)
+
+    assert evidence["max_simultaneous_requests"] == 3
+    assert evidence["writer_grep_overlap"] is True
+    assert evidence["writer_get_overlap"] == {"writer_get_0": True}
+    assert evidence["grep_get_overlap"] == {"grep_get_0": True}
+    assert evidence["overlap_proven"] is True
+
+
 @pytest.mark.asyncio
-async def test_mixed_phase_proves_every_worker_nonzero_and_writer_get_overlap():
+async def test_mixed_phase_proves_every_worker_nonzero_and_actual_request_overlap():
     adapter = _load("mixed_grep")
 
     result = await adapter._phase(
@@ -203,4 +241,5 @@ async def test_mixed_phase_proves_every_worker_nonzero_and_writer_get_overlap():
         "get_3",
     }
     assert all(count > 0 for count in result["successful"].values())
-    assert all(result["writer_get_overlap"].values())
+    assert result["concurrency"]["max_simultaneous_requests"] >= 2
+    assert result["concurrency"]["overlap_proven"] is True
