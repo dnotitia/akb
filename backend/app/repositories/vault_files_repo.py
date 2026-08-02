@@ -66,36 +66,46 @@ async def insert_or_adopt(
     return row["id"]
 
 
-async def insert_measurement_pending(
+async def insert_or_adopt_measurement_confirmed(
     conn, *, file_id: uuid.UUID, vault_id: uuid.UUID, collection_id: uuid.UUID | None,
-    name: str, mime_type: str, description: str, created_by: str,
-) -> None:
-    """Create a non-visible M1 File transfer intent backed by ``vault_files``."""
+    name: str, mime_type: str, description: str, created_by: str, driver: str,
+    locator: str, digest: str, size_bytes: int, native_resource_id: uuid.UUID | None,
+    native_revision_id: str | None,
+) -> dict:
+    """Atomically publish a confirmed File or return its exact-content peer."""
     await conn.execute(
         """
-        INSERT INTO vault_files
-            (id, vault_id, collection_id, name, s3_key, mime_type, size_bytes,
-             description, created_by, storage_state, storage_driver, storage_locator)
-        VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, 'pending', NULL, NULL)
+        INSERT INTO vault_files (
+            id, vault_id, collection_id, name, s3_key, mime_type, size_bytes,
+            content_hash, hash_algorithm, hash_verified_at, description, created_by,
+            storage_driver, storage_locator, native_resource_id, native_revision_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'sha256', NOW(), $9, $10,
+                $11, $12, $13, $14)
+        ON CONFLICT DO NOTHING
         """,
-        file_id, vault_id, collection_id, name, f"m1-pending/{file_id}", mime_type,
-        description, created_by,
+        file_id, vault_id, collection_id, name, f"m1-logical/{file_id}", mime_type,
+        size_bytes, digest, description, created_by, driver, locator,
+        native_resource_id, native_revision_id,
     )
-
-
-async def confirm_measurement_file(
-    conn, *, file_id: uuid.UUID, vault_id: uuid.UUID, locator: str, driver: str,
-    digest: str, size_bytes: int,
-) -> bool:
-    result = await conn.execute(
+    row = await conn.fetchrow(
         """
-        UPDATE vault_files SET storage_state = 'confirmed', storage_driver = $3,
-            storage_locator = $4, content_hash = $5, hash_algorithm = 'sha256',
-            size_bytes = $6, hash_verified_at = NOW(), updated_at = NOW()
-         WHERE id = $1 AND vault_id = $2 AND storage_state = 'pending'
-        """, file_id, vault_id, driver, locator, digest, size_bytes,
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.collection_id, c.path AS collection,
+               vf.name, vf.mime_type, vf.size_bytes, vf.description,
+               vf.content_hash, vf.storage_driver, vf.storage_locator,
+               vf.native_resource_id, vf.native_revision_id
+          FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
+          LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.vault_id = $1
+           AND vf.collection_id IS NOT DISTINCT FROM $2
+           AND vf.name = $3 AND vf.content_hash = $4
+           AND vf.storage_driver IS NOT NULL
+         ORDER BY vf.created_at ASC LIMIT 1
+        """, vault_id, collection_id, name, digest,
     )
-    return result.endswith("1")
+    if row is None:
+        raise RuntimeError("confirmed File publication did not produce an exact row")
+    return dict(row)
 
 
 async def list_measurement_confirmed(
@@ -112,11 +122,12 @@ async def list_measurement_confirmed(
     params.append(limit)
     rows = await conn.fetch(
         """
-        SELECT vf.id, vf.vault_id, c.path AS collection, vf.name, vf.mime_type,
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection, vf.name, vf.mime_type,
                vf.size_bytes, vf.content_hash, vf.hash_algorithm, vf.storage_driver,
                vf.storage_locator
-          FROM vault_files vf LEFT JOIN collections c ON c.id = vf.collection_id
-         WHERE vf.vault_id = $1 AND vf.storage_state = 'confirmed'
+          FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
+          LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.vault_id = $1 AND vf.storage_driver IS NOT NULL
         """ + collection_clause + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}",
         *params,
     )
@@ -151,12 +162,36 @@ async def find_by_id(
 async def find_measurement_by_id(conn, vault_id: uuid.UUID, file_id: uuid.UUID) -> dict | None:
     row = await conn.fetchrow(
         """
-        SELECT vf.id, vf.vault_id, c.path AS collection, vf.name, vf.mime_type,
-               vf.size_bytes, vf.description, vf.content_hash, vf.storage_state,
-               vf.storage_driver, vf.storage_locator
-          FROM vault_files vf LEFT JOIN collections c ON c.id = vf.collection_id
-         WHERE vf.id = $1 AND vf.vault_id = $2
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection, vf.name, vf.mime_type,
+               vf.size_bytes, vf.description, vf.content_hash,
+               vf.storage_driver, vf.storage_locator, vf.native_resource_id,
+               vf.native_revision_id
+          FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
+          LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.id = $1 AND vf.vault_id = $2 AND vf.storage_driver IS NOT NULL
         """, file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
+async def find_measurement_exact(
+    conn, *, vault_id: uuid.UUID, collection_id: uuid.UUID | None,
+    name: str, digest: str,
+) -> dict | None:
+    row = await conn.fetchrow(
+        """
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection,
+               vf.name, vf.mime_type, vf.size_bytes, vf.description,
+               vf.content_hash, vf.storage_driver, vf.storage_locator,
+               vf.native_resource_id, vf.native_revision_id
+          FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
+          LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.vault_id = $1
+           AND vf.collection_id IS NOT DISTINCT FROM $2
+           AND vf.name = $3 AND vf.content_hash = $4
+           AND vf.storage_driver IS NOT NULL
+         ORDER BY vf.created_at ASC LIMIT 1
+        """, vault_id, collection_id, name, digest,
     )
     return dict(row) if row else None
 

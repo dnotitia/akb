@@ -569,7 +569,7 @@ class FileService:
         actor_id: str,
     ) -> dict:
         if self._measurement is not None:
-            return await self._measurement.delete(vault_id, file_id)
+            return await self._measurement.delete(vault_id, file_id, actor_id=actor_id)
         fid = uuid.UUID(file_id)
         pool = await get_pool()
 
