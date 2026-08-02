@@ -52,11 +52,11 @@ MEASUREMENT_TABLE = "m1_capacity_derived_projection"
 # including the localized matrix reproduces the 70 cells actually published by
 # the M0 comparator (22 + 12 + 18 + 12 + 6).
 EXPECTED_MATRIX_HASHES = {
-    "settled_concurrency_matrix.json": "9beee2ee2aa36ec3d401f337b82e1061e5ab0e16a6fc8a2b849bddb44e22c7f6",
-    "settled_localized_matrix.json": "de982a8bd84f12a8a770ebdf7f1b0796363c819efa38659b4c1841502309bfd6",
-    "settled_overload_matrix.json": "b524c0c0c796a8c112f8d51d29a8fb16b612c5bae85b499032e5a3acc361d9a9",
-    "settled_paced_matrix.json": "d1e915b0b9697d4ea8a3c674a85590fdc25c81b90fee0de65ae62ac368e6419f",
-    "settled_topology_matrix.json": "60ebb15b01ddfc70f43cc02892b18fb806c023fdbfda9a0ea899f7966094db8f",
+    "settled_concurrency_matrix.json": "9beee2ee2aa36ec3d401f337b82e1061e5ab0e16a6fc8a2b849bddb44e22c7f6",  # pragma: allowlist secret
+    "settled_localized_matrix.json": "de982a8bd84f12a8a770ebdf7f1b0796363c819efa38659b4c1841502309bfd6",  # pragma: allowlist secret
+    "settled_overload_matrix.json": "b524c0c0c796a8c112f8d51d29a8fb16b612c5bae85b499032e5a3acc361d9a9",  # pragma: allowlist secret
+    "settled_paced_matrix.json": "d1e915b0b9697d4ea8a3c674a85590fdc25c81b90fee0de65ae62ac368e6419f",  # pragma: allowlist secret
+    "settled_topology_matrix.json": "60ebb15b01ddfc70f43cc02892b18fb806c023fdbfda9a0ea899f7966094db8f",  # pragma: allowlist secret
 }
 EXCLUDED_PLANNED_CELL_IDS = {"text-1k-c128-r2", "text-1k-c128-r3"}
 WARMUP_ISSUANCE_SAFETY_CAP = 100_000
