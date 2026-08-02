@@ -26,7 +26,7 @@ def test_text_public_body_fact_contains_only_digest_and_size():
 
     assert fact == {
         "revision": "a" * 40,
-        "sha256": "aaecb569221e2e49869a9b3e5d61280a2098fb65b08bae1198e892e8f6f00aba",
+        "sha256": "aaecb569221e2e49869a9b3e5d61280a2098fb65b08bae1198e892e8f6f00aba",  # pragma: allowlist secret
         "byte_size": 12,
     }
     assert "private body" not in repr(fact)

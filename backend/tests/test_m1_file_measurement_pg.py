@@ -23,7 +23,7 @@ from app.services.native_derived_worker import NativeDerivedWorker
 
 _DSN = os.environ.get(
     "AKB_M1_FILE_TEST_DSN",
-    "postgresql://akb:akb-r5-local@127.0.0.1:55433/akb_revision_m1_measurement",
+    "postgresql://akb:akb-r5-local@127.0.0.1:55433/akb_revision_m1_measurement",  # pragma: allowlist secret
 )
 _BACKEND = Path(__file__).resolve().parents[1]
 
