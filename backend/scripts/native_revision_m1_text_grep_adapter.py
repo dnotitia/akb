@@ -27,6 +27,7 @@ from app.services.native_revision_service import NativeRevisionService  # noqa: 
 from native_revision_m1_adapter import (  # noqa: E402
     AdapterError,
     receipt_provenance,
+    receipt_safe_profile,
     required_environment,
     run_artifact_path,
     source_revision,
@@ -37,6 +38,50 @@ from native_revision_m1_adapter import (  # noqa: E402
 
 PROTOCOL_VERSION = "akb-native-revision-m1-text-grep/v1"
 WORKLOADS = {"W3-document-grep", "W3-text-file-grep"}
+
+
+def _safe_request_outcome(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: raw[key]
+        for key in ("surface", "revision_id", "byte_size", "latency_ms")
+        if key in raw
+    }
+
+
+def _safe_grep_observation(raw: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {
+        key: raw[key]
+        for key in (
+            "searched_resources",
+            "searched_bytes",
+            "total_resources",
+            "total_matches",
+            "returned_resources",
+            "returned_matches",
+            "n_resources",
+            "truncated",
+        )
+        if key in raw
+    }
+    safe["resources"] = [
+        {
+            key: row[key]
+            for key in ("resource_type", "revision", "content_hash")
+            if key in row
+        }
+        for row in (raw.get("results") or raw.get("resources") or [])
+    ]
+    return safe
+
+
+def _safe_cases(cases: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "assertions": cases["assertions"],
+        "observations": {
+            name: _safe_grep_observation(value)
+            for name, value in cases.get("observations", {}).items()
+        },
+    }
 
 
 async def _load_migration(conn: asyncpg.Connection, filename: str) -> None:
@@ -142,6 +187,7 @@ async def _create(
         "revision_id": result.revision_id,
         "surface": surface,
         "path": path,
+        "byte_size": len(body.encode("utf-8")),
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
     }
 
@@ -280,13 +326,25 @@ async def _text_file_workload(
         ),
     ]
     latencies: list[float] = []
-    additive, elapsed = await _timed_grep(grep, "shared", user_id=owner_id)
+    additive, elapsed = await _timed_grep(
+        grep, "shared", user_id=owner_id, include_text_files=True
+    )
     latencies.append(elapsed)
-    file_only, elapsed = await _timed_grep(grep, "needle-file", user_id=owner_id)
+    file_only, elapsed = await _timed_grep(
+        grep, "needle-file", user_id=owner_id, include_text_files=True
+    )
     latencies.append(elapsed)
-    case, elapsed = await _timed_grep(grep, "NEEDLE-FILE", user_id=owner_id, case_sensitive=True)
+    case, elapsed = await _timed_grep(
+        grep,
+        "NEEDLE-FILE",
+        user_id=owner_id,
+        case_sensitive=True,
+        include_text_files=True,
+    )
     latencies.append(elapsed)
-    no_match, elapsed = await _timed_grep(grep, "missing-file-token", user_id=owner_id)
+    no_match, elapsed = await _timed_grep(
+        grep, "missing-file-token", user_id=owner_id, include_text_files=True
+    )
     latencies.append(elapsed)
     file_resource_id = uuid.UUID(requests[1]["resource_id"])
     pinned_scope, elapsed = await _timed_grep(
@@ -294,6 +352,7 @@ async def _text_file_workload(
         "needle-file",
         user_id=owner_id,
         resource_id=file_resource_id,
+        include_text_files=True,
     )
     latencies.append(elapsed)
     snapshot = await service.get_current(
@@ -352,9 +411,16 @@ async def run() -> dict[str, Any]:
             )
         revision = source_revision()
         runtime, environment = receipt_provenance(revision, database, allowed_vault)
+        safe_cases = _safe_cases(cases)
+        safe_requests = [_safe_request_outcome(request) for request in requests]
+        safe_environment = {
+            "tier": environment["tier"],
+            "node_profile": receipt_safe_profile(environment["node_profile"]),
+            "storage_profile": receipt_safe_profile(environment["storage_profile"]),
+        }
         request_artifact = write_bound_json(
             run_artifact_path("native-text-grep-requests"),
-            {"workload": workload, "requests": requests, "grep_latency_ms": grep_latencies},
+            {"workload": workload, "requests": safe_requests, "grep_latency_ms": grep_latencies},
         )
         authority_artifact = write_bound_json(
             run_artifact_path("native-text-grep-authority"),
@@ -363,26 +429,35 @@ async def run() -> dict[str, Any]:
         return {
             "protocol_version": PROTOCOL_VERSION,
             "workload": workload,
-            "cases": cases,
+            "cases": safe_cases,
             "receipt": {
-                "inputs": {
-                    "seed": required_environment("AKB_NATIVE_REVISION_RUN_ID"),
-                    "corpus_id": str(allowed_vault),
-                    "request_trace_id": f"native-m1-text-{uuid.uuid4().hex}",
-                },
+                "inputs": receipt_safe_profile(
+                    {
+                        "run_id": required_environment("AKB_NATIVE_REVISION_RUN_ID"),
+                        "corpus_id": str(allowed_vault),
+                    }
+                ),
                 "runtime": runtime,
-                "environment": environment,
+                "environment": safe_environment,
                 "latency": {"samples_or_artifact": grep_latencies, "unit": "ms"},
-                "resources": {"snapshot": {"database": database, "body_profile": profile}},
-                "requests": {"outcomes": requests, "artifact_digest": request_artifact["sha256"]},
+                "resources": {
+                    "snapshot": {
+                        "database_binding": receipt_safe_profile({"database": database})["binding"],
+                        "body_profile": profile,
+                    }
+                },
+                "requests": {
+                    "outcomes": safe_requests,
+                    "artifact_digest": request_artifact["sha256"],
+                },
             },
             "provenance": {
                 "adapter": {
                     "identity": "akb.backend.scripts.native_revision_m1_text_grep_adapter",
                     "source_revision": revision,
                 },
-                "request_artifact": request_artifact,
-                "authority_artifact": authority_artifact,
+                "request_artifact": {"sha256": request_artifact["sha256"]},
+                "authority_artifact": {"sha256": authority_artifact["sha256"]},
             },
         }
     finally:

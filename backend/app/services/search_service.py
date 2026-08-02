@@ -200,8 +200,15 @@ class SearchService:
             params.append(vaults)
             conditions.append(f"v.name = ANY(${len(params)})")
         if collection:
-            params.append(collection)
-            conditions.append(f"r.current_path LIKE ${len(params)} || '%'")
+            prefix = collection.strip("/")
+            escaped_prefix = (
+                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            params.extend([prefix, f"{escaped_prefix}/%"])
+            conditions.append(
+                f"(r.current_path = ${len(params) - 1} OR "
+                f"r.current_path LIKE ${len(params)} ESCAPE '\\')"
+            )
         if user_uuid is not None and not is_admin:
             params.append(user_uuid)
             index = len(params)
@@ -975,6 +982,7 @@ class SearchService:
         limit: int = 20,
         count_only: bool = False,
         files_with_matches: bool = False,
+        measurement_include_text_files: bool = False,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1027,7 +1035,12 @@ class SearchService:
         # Server-side limit clamp (issue #189) — same ceiling as search().
         limit = clamp_search_limit(limit)
 
-        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+        document_source = _configured_document_source_type()
+        if measurement_include_text_files and document_source != NATIVE_DOCUMENT_SOURCE:
+            raise ValidationError(
+                "measurement_include_text_files requires the guarded native measurement backend"
+            )
+        if document_source == NATIVE_DOCUMENT_SOURCE:
             from app.services.m1_native_grep_service import M1NativeGrepService
 
             if user_id is None:
@@ -1044,6 +1057,7 @@ class SearchService:
                 limit=limit,
                 count_only=count_only,
                 files_with_matches=files_with_matches,
+                include_text_files=measurement_include_text_files,
             )
 
         pool = await get_pool()

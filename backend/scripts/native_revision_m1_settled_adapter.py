@@ -27,6 +27,7 @@ from native_revision_m1_adapter import (  # noqa: E402
     AdapterError,
     bounded_json_object,
     required_environment,
+    receipt_safe_profile,
     source_revision,
     validate_measurement_database,
 )
@@ -50,6 +51,8 @@ async def pipeline_snapshot(conn, resource_id: uuid.UUID) -> dict[str, int | str
           (SELECT head_revision_id FROM native_resources WHERE resource_id = $1) AS current_head,
           (SELECT COUNT(*) FROM native_invalidation_intents
             WHERE resource_id = $1 AND completed_at IS NULL)::int AS pending_intents,
+          (SELECT COUNT(*) FROM native_invalidation_intents
+            WHERE resource_id = $1 AND delivery_outcome = 'abandoned')::int AS abandoned_intents,
           (SELECT COUNT(*) FROM chunks
             WHERE source_type = 'native_document' AND source_id = $1)::int AS chunks,
           (SELECT COUNT(*) FROM chunks
@@ -111,6 +114,7 @@ async def settle(
         snapshot = await pipeline_snapshot(conn, resource_id)
         if (
             snapshot["pending_intents"] == 0
+            and snapshot["abandoned_intents"] == 0
             and snapshot["pending_chunks"] == 0
             and snapshot["pending_deletes"] == 0
             and snapshot["chunks"] == snapshot["mappings"] == snapshot["vector_points"]
@@ -136,6 +140,7 @@ async def settle_deleted(
         snapshot = await pipeline_snapshot(conn, resource_id)
         if (
             snapshot["pending_intents"] == 0
+            and snapshot["abandoned_intents"] == 0
             and snapshot["pending_deletes"] == 0
             and snapshot["chunks"] == snapshot["mappings"] == snapshot["vector_points"] == 0
         ):
@@ -208,6 +213,7 @@ async def run() -> dict[str, Any]:
             "current_query_hit": any(row["uri"] == expected_uri for row in current_results),
             "prior_query_absent": all(row["uri"] != expected_uri for row in stale.json()["results"]),
             "queues_settled": after["pending_intents"] == after["pending_chunks"] == after["pending_deletes"] == 0,
+            "no_abandoned_delivery": after["abandoned_intents"] == 0,
             "prior_chunk_ids_absent": all(value == 0 for value in stale_after_replace.values()),
         }
         async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=15) as client:
@@ -238,24 +244,23 @@ async def run() -> dict[str, Any]:
                 "config_digest": required_environment("AKB_NATIVE_REVISION_RUNTIME_CONFIG_DIGEST"),
             },
             "profile": {
-                "database": database,
                 "vector_driver": "pgvector",
                 "dense": "disabled-by-deployment",
-                "runtime": bounded_json_object("AKB_NATIVE_REVISION_RUNTIME_PROFILE_JSON", required=True),
+                "database_binding": receipt_safe_profile({"database": database})["binding"],
+                "runtime": receipt_safe_profile(
+                    bounded_json_object("AKB_NATIVE_REVISION_RUNTIME_PROFILE_JSON", required=True)
+                ),
             },
-            "resource_id": str(resource_id),
             "current_head": current_head,
             "pre_queue": before,
             "settlement_polling": settled,
             "post_queue": after,
-            "prior_chunk_ids": [str(value) for value in prior_chunk_ids],
             "stale_after_replace": stale_after_replace,
-            "deleted_chunk_ids": [str(value) for value in current_chunk_ids],
             "stale_after_delete": stale_after_delete,
             "delete_settlement_polling": delete_settlement,
             "cleanup_residue": post_delete,
             "public_operations": operations,
-            "search_hit": {"uri": expected_uri, "resource_id": str(resource_id), "revision": current_head},
+            "search_hit": {"uri": expected_uri, "revision": current_head},
             "assertions": assertions,
         }
     finally:

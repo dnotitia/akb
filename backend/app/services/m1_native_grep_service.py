@@ -55,7 +55,8 @@ class HeadBody:
     def uri(self) -> str:
         if self.surface == "document":
             return doc_uri(self.vault, self.path)
-        return file_uri(self.vault, str(self.resource_id))
+        collection = self.path.rsplit("/", 1)[0] if "/" in self.path else None
+        return file_uri(self.vault, str(self.resource_id), collection=collection)
 
 
 class M1NativeGrepService:
@@ -72,6 +73,7 @@ class M1NativeGrepService:
         vaults: list[str] | None,
         collection: str | None,
         resource_id: uuid.UUID | None,
+        surfaces: tuple[str, ...],
     ) -> list[HeadBody]:
         conditions = [
             "rs.lifecycle = 'live'",
@@ -83,6 +85,8 @@ class M1NativeGrepService:
             "OR v.public_access IN ('reader', 'writer'))",
         ]
         params: list[Any] = [user_id]
+        params.append(list(surfaces))
+        conditions.append(f"rs.surface = ANY(${len(params)})")
         if vaults:
             params.append(vaults)
             conditions.append(f"v.name = ANY(${len(params)})")
@@ -191,6 +195,10 @@ class M1NativeGrepService:
         folded = pattern.casefold()
         return lambda line: folded in line.casefold()
 
+    @staticmethod
+    def _selected_surfaces(*, include_text_files: bool) -> tuple[str, ...]:
+        return ("document", "file") if include_text_files else ("document",)
+
     async def grep(
         self,
         pattern: str,
@@ -206,6 +214,7 @@ class M1NativeGrepService:
         limit: int = 20,
         replace: str | None = None,
         actor: str | None = None,
+        include_text_files: bool = False,
     ) -> dict[str, Any]:
         if count_only and files_with_matches:
             raise ValidationError("count_only and files_with_matches are mutually exclusive")
@@ -222,6 +231,7 @@ class M1NativeGrepService:
             vaults=vaults,
             collection=collection,
             resource_id=resource_id,
+            surfaces=self._selected_surfaces(include_text_files=include_text_files),
         )
         matched: list[dict[str, Any]] = []
         for body in bodies:
@@ -345,21 +355,25 @@ class M1NativeGrepService:
             }
         clean = []
         for row in native.get("results", []):
-            clean.append(
-                {
-                    "uri": row["uri"],
-                    "vault": row["vault"],
-                    "path": row["path"],
-                    "title": row["title"],
-                    "resource_type": row.get("resource_type"),
-                    "revision": row.get("revision"),
-                    "content_hash": row.get("content_hash"),
-                    "matches": [
-                        {"section": None, "text": match["text"]}
-                        for match in row["matches"]
-                    ],
-                }
-            )
+            public = {
+                "uri": row["uri"],
+                "vault": row["vault"],
+                "path": row["path"],
+                "title": row["title"],
+                "matches": [
+                    {"section": None, "text": match["text"]}
+                    for match in row["matches"]
+                ],
+            }
+            if row.get("resource_type") == "file":
+                public.update(
+                    {
+                        "resource_type": "file",
+                        "revision": row["revision"],
+                        "content_hash": row["content_hash"],
+                    }
+                )
+            clean.append(public)
         result: dict[str, Any] = {
             "pattern": pattern,
             "regex": regex,
@@ -369,16 +383,6 @@ class M1NativeGrepService:
             "total_matches": native.get("total_matches", 0),
             "truncated": native.get("truncated", False),
             "results": clean,
-            # Kept as a compact receipt-oriented mirror for MCP callers. REST
-            # also preserves the additive identity on each GrepResult.
-            "measurement_resources": [
-                {
-                    key: row[key]
-                    for key in ("uri", "resource_type", "revision", "content_hash")
-                    if key in row
-                }
-                for row in native.get("results", [])
-            ],
         }
         if "replace" in native:
             replacements_by_uri = {row["uri"]: row for row in native.get("replacements", [])}

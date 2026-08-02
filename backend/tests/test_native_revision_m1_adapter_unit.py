@@ -69,6 +69,13 @@ def _assert_frozen_receipt_shape(result: dict[str, object], samples: list[float]
     assert receipt["latency"] == {"samples_or_artifact": samples, "unit": "ms"}
 
 
+def _assert_artifact_descriptors_are_digest_only(result: dict[str, object]) -> None:
+    provenance = result["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["request_artifact"] == {"sha256": "b" * 64}
+    assert provenance["authority_artifact"] == {"sha256": "b" * 64}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workload", ("W3-document-grep", "W3-text-file-grep"))
 async def test_text_grep_adapter_emits_only_frozen_latency_receipt_fields(monkeypatch, workload):
@@ -103,6 +110,7 @@ async def test_text_grep_adapter_emits_only_frozen_latency_receipt_fields(monkey
     result = await adapter.run()
 
     _assert_frozen_receipt_shape(result, [1.25])
+    _assert_artifact_descriptors_are_digest_only(result)
 
 
 @pytest.mark.asyncio

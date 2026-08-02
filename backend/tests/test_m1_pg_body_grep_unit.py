@@ -124,6 +124,7 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
         vaults=["engineering"],
         collection="src",
         resource_id=resource_id,
+        surfaces=("document", "file"),
     )
 
     assert len(bodies) == 1
@@ -133,4 +134,13 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
     assert "vault_access" in conn.sql
     assert "pg-bodystore-v1" in conn.sql
     assert "ESCAPE" in conn.sql
-    assert conn.params[2:] == ("src", "src/%", resource_id)
+    assert conn.params[3:] == ("src", "src/%", resource_id)
+    assert "rs.surface = ANY" in conn.sql
+
+
+def test_public_surface_selection_keeps_w3a_document_only_and_guards_w3b():
+    assert M1NativeGrepService._selected_surfaces(include_text_files=False) == ("document",)
+    assert M1NativeGrepService._selected_surfaces(include_text_files=True) == (
+        "document",
+        "file",
+    )

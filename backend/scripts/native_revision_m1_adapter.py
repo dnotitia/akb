@@ -156,6 +156,43 @@ def bounded_json_object(name: str, *, required: bool) -> dict[str, Any]:
     return value
 
 
+_PRIVATE_RECEIPT_KEY_PARTS = {
+    "body", "chunk", "content", "credential", "dsn", "host", "id",
+    "line", "locator", "match", "name", "password", "path", "secret",
+    "token", "url", "uri",
+}
+_SAFE_RECEIPT_TEXT_KEYS = {
+    "dense", "driver", "environment", "load_model", "node_class",
+    "storage_class", "tier", "topology", "vector_driver",
+}
+
+
+def receipt_safe_profile(value: dict[str, Any]) -> dict[str, Any]:
+    """Bind a supplied profile while exposing only coarse, non-locating facts."""
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def safe_dict(raw: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in raw.items():
+            lowered = key.lower()
+            if any(part in lowered for part in _PRIVATE_RECEIPT_KEY_PARTS):
+                continue
+            if isinstance(item, bool) or isinstance(item, (int, float)):
+                result[key] = item
+            elif isinstance(item, dict):
+                nested = safe_dict(item)
+                if nested:
+                    result[key] = nested
+            elif isinstance(item, str) and lowered in _SAFE_RECEIPT_TEXT_KEYS:
+                result[key] = item
+        return result
+
+    return {
+        "binding": {"sha256": sha256_bytes(encoded), "byte_size": len(encoded)},
+        "coarse": safe_dict(value),
+    }
+
+
 def receipt_provenance(revision: str, database: str, namespace_id: uuid.UUID) -> tuple[dict[str, str], dict[str, Any]]:
     """Read explicit runtime identity/profile inputs; never invent image facts."""
     tier = os.environ.get("AKB_NATIVE_REVISION_MEASUREMENT_TIER", "E0")

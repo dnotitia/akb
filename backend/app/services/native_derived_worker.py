@@ -147,20 +147,36 @@ class NativeDerivedWorker:
             )
 
     async def _failure(self, intent: dict, error: Exception) -> None:
+        next_retry_count = int(intent["retry_count"]) + 1
         delay = next_attempt_delay(int(intent["retry_count"]))
         next_at = datetime.now(UTC) + timedelta(seconds=delay)
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE native_invalidation_intents
-                   SET claimed_at = NULL, retry_count = retry_count + 1,
-                       next_attempt_at = $2, last_error = $3
-                 WHERE intent_id = $1 AND completed_at IS NULL
-                """,
-                intent["intent_id"],
-                next_at,
-                f"{type(error).__name__}: {error}"[:500],
-            )
+            if next_retry_count >= MAX_RETRIES:
+                await conn.execute(
+                    """
+                    UPDATE native_invalidation_intents
+                       SET claimed_at = NULL, retry_count = $2,
+                           completed_at = NOW(), delivery_outcome = 'abandoned',
+                           next_attempt_at = NULL, last_error = $3
+                     WHERE intent_id = $1 AND completed_at IS NULL
+                    """,
+                    intent["intent_id"],
+                    next_retry_count,
+                    type(error).__name__,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE native_invalidation_intents
+                       SET claimed_at = NULL, retry_count = $2,
+                           next_attempt_at = $3, last_error = $4
+                     WHERE intent_id = $1 AND completed_at IS NULL
+                    """,
+                    intent["intent_id"],
+                    next_retry_count,
+                    next_at,
+                    type(error).__name__,
+                )
 
     async def _head(self, resource_id: uuid.UUID) -> dict | None:
         async with self.pool.acquire() as conn:
@@ -368,7 +384,7 @@ class NativeDerivedWorker:
             return 1
         except Exception as exc:
             await self._failure(intent, exc)
-            logger.warning("native derived intent %s failed: %s", intent["intent_id"], exc)
+            logger.warning("native derived delivery failed: %s", type(exc).__name__)
             return 0
 
     async def pending_stats(self, namespace_id: uuid.UUID | None = None) -> dict[str, int]:
@@ -385,6 +401,7 @@ class NativeDerivedWorker:
                        COUNT(*) FILTER (WHERE delivery_outcome = 'superseded')::int AS superseded,
                        COUNT(*) FILTER (WHERE delivery_outcome = 'deleted')::int AS deleted,
                        COUNT(*) FILTER (WHERE delivery_outcome = 'direct_grep')::int AS direct_grep,
+                       COUNT(*) FILTER (WHERE delivery_outcome = 'abandoned')::int AS abandoned,
                        COUNT(*) FILTER (
                            WHERE completed_at IS NULL AND retry_count > 0
                        )::int AS retrying

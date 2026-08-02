@@ -43,7 +43,8 @@ async def _run(conn):
             ALTER TABLE native_invalidation_intents
                 ADD CONSTRAINT native_invalidation_delivery_outcome_check
                 CHECK (delivery_outcome IS NULL OR delivery_outcome IN (
-                    'applied', 'deleted', 'superseded', 'direct_grep'
+                    'applied', 'deleted', 'superseded', 'direct_grep',
+                    'abandoned'
                 ));
             DO $$
             BEGIN
