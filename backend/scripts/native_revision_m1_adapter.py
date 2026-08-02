@@ -114,7 +114,7 @@ def source_revision() -> str:
             capture_output=True,
             text=True,
         )
-    except OSError, subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         # Immutable production-style images normally contain no checkout.  The
         # image build/deploy pipeline must inject its exact source commit rather
         # than the adapter guessing a release version or using a mutable tag.
