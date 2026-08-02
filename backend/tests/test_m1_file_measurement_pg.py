@@ -23,10 +23,7 @@ from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services.native_derived_worker import NativeDerivedWorker
 
 
-_DSN = os.environ.get(
-    "AKB_M1_FILE_TEST_DSN",
-    "postgresql://akb:akb-r5-local@127.0.0.1:55433/akb_revision_m1_measurement",  # pragma: allowlist secret
-)
+_DSN = os.environ.get("AKB_M1_FILE_TEST_DSN")
 _BACKEND = Path(__file__).resolve().parents[1]
 
 
@@ -41,6 +38,10 @@ def _migration(filename: str):
 
 @pytest_asyncio.fixture
 async def pool():
+    if not _DSN:
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail("AKB_M1_FILE_TEST_DSN is required by the real-PG gate")
+        pytest.skip("AKB_M1_FILE_TEST_DSN is not configured")
     pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=8)
     async with pool.acquire() as conn:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
