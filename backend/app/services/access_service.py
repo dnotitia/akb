@@ -1586,8 +1586,8 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 
             # Drop table metadata chunks BEFORE the registry DELETE so the
             # outbox is enqueued against the still-extant source_id.
-            # delete_vault_chunks only handles source_type='document';
-            # tables/files need explicit cleanup because chunks.source_id
+            # delete_vault_chunks handles legacy and native documents;
+            # tables/files still need explicit cleanup because chunks.source_id
             # has no FK (polymorphic source) and would orphan otherwise.
             vtables = await conn.fetch(
                 "SELECT id, name FROM vault_tables WHERE vault_id = $1",

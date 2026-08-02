@@ -514,11 +514,11 @@ async def delete_file_chunks(conn, file_id: str) -> None:
 
 
 async def delete_vault_chunks(conn, vault_id) -> None:
-    """Remove every chunk under a vault, enqueuing vector-store deletes in bulk.
+    """Remove legacy and native document chunks, queuing vector deletes.
 
-    Scoped to source_type='document' because tables/files CASCADE through
-    their own vault_tables / vault_files FKs at vault-drop time — their
-    chunk cleanup is handled in the service delete hooks.
+    Tables/files have their own vault-delete cleanup hooks.  Native document
+    chunks otherwise disappear through ``chunks.vault_id`` CASCADE without
+    an outbox row, leaking their derived vector points.
     """
     # The outbox INSERT must commit atomically with the chunk DELETE
     # below; failing the enqueue silently leaks vector-store rows.
@@ -539,6 +539,25 @@ async def delete_vault_chunks(conn, vault_id) -> None:
         DELETE FROM chunks
          WHERE source_type = 'document'
            AND source_id IN (SELECT id FROM documents WHERE vault_id = $1)
+        """,
+        vault_id,
+    )
+    await conn.execute(
+        """
+        INSERT INTO vector_delete_outbox
+            (chunk_id, source_type, source_id, next_attempt_at)
+        SELECT c.id, c.source_type, c.source_id, NOW()
+          FROM chunks c
+         WHERE c.source_type = 'native_document'
+           AND c.vault_id = $1
+        """,
+        vault_id,
+    )
+    await conn.execute(
+        """
+        DELETE FROM chunks
+         WHERE source_type = 'native_document'
+           AND vault_id = $1
         """,
         vault_id,
     )

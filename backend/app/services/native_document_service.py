@@ -25,6 +25,7 @@ from app.models.document import (
     DocumentUpdateRequest,
 )
 from app.repositories.native_revision_repo import NativeRevisionRepository
+from app.repositories.vault_repo import VaultRepository
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -33,9 +34,11 @@ from app.services.document_service import (
     _certified_content_hash,
     _compose_markdown,
     _parse_markdown,
+    validate_vault_name,
 )
 from app.services.native_revision_service import NativeRevisionService, NativeRevisionSnapshot
 from app.services.resource_hash import HASH_ALGORITHM
+from app.services.role_sync import get_role_sync
 from app.services.uri_service import doc_uri
 from app.util.text import (
     doc_path,
@@ -650,8 +653,68 @@ class NativeDocumentService(DocumentService):
     async def browse(self, *args, **kwargs) -> BrowseResponse:
         self._unsupported("document browse")
 
-    async def create_vault(self, *args, **kwargs) -> str:
-        self._unsupported("vault creation")
+    async def create_vault(
+        self,
+        name: str,
+        description: str = "",
+        owner_id: str | None = None,
+        template: str | None = None,
+        public_access: str = "none",
+        external_git: dict | None = None,
+    ) -> str:
+        """Create a PG-native vault without materialising legacy Git state.
+
+        ``vaults.git_path`` remains a required legacy catalog field, so the
+        native arm records an explicitly non-filesystem sentinel.  The native
+        ledger takes the vault UUID as its namespace authority; it neither
+        initializes a bare repository nor creates a linked worktree.
+        """
+        validate_vault_name(name)
+        if template is not None:
+            self._unsupported("vault templates")
+        if external_git is not None:
+            self._unsupported("external git vaults")
+
+        from app.services.access_service import validate_public_access
+
+        public_access = validate_public_access(public_access)
+        pool = await self._pool()
+        vault_repo = VaultRepository(pool)
+        if await vault_repo.get_by_name(name):
+            raise ConflictError(f"Vault already exists: {name}")
+        uid = uuid.UUID(owner_id) if owner_id else None
+        vault_id: uuid.UUID | None = None
+        role_sync = None
+        try:
+            # Keep the catalog row invisible until its required lifecycle
+            # hooks have accepted it.  Unlike a legacy vault, no Git state
+            # needs compensation, and no native resource can exist before
+            # this method returns its UUID.
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    vault_id = await vault_repo.create(
+                        name=name,
+                        description=description,
+                        git_path=f"native-ledger://{name}",
+                        owner_id=uid,
+                        public_access=public_access,
+                        conn=conn,
+                    )
+                    role_sync = get_role_sync()
+                    await role_sync.on_vault_create(vault_id, uid)
+                    await role_sync.on_public_access_change(vault_id, public_access)
+        except BaseException:
+            # RoleSync is normally best-effort, but a missing/overridden
+            # lifecycle implementation must not strand a visible vault row.
+            # A partially applied role hook is separately compensated.
+            if role_sync is not None and vault_id is not None:
+                try:
+                    await role_sync.on_vault_delete(vault_id)
+                except Exception:
+                    pass
+            raise
+        assert vault_id is not None
+        return str(vault_id)
 
     async def list_vaults(self) -> list[dict]:
         self._unsupported("vault listing")
