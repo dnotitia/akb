@@ -327,3 +327,74 @@ async def test_concurrent_confirm_adopts_one_exact_file(context):
     assert results[0]["file_id"] == results[1]["file_id"]
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT count(*) FROM vault_files WHERE id = $1", uuid.UUID(initiated["file_id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_late_dedup_resolves_exact_peer_after_its_intent_is_consumed(context, monkeypatch):
+    """A late confirm must adopt the peer even when its pre-fetched intent vanished."""
+    pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    data = b"proxy style late dedup\x00"
+    digest = hashlib.sha256(data).hexdigest()
+
+    first = await service.initiate_upload(
+        vault_name=vault_name, vault_id=vault_id, collection="uploads", filename="race.bin",
+        actor_id="proxy-a", mime_type="application/octet-stream", description="", content_hash=None,
+    )
+    second = await service.initiate_upload(
+        vault_name=vault_name, vault_id=vault_id, collection="uploads", filename="race.bin",
+        actor_id="proxy-b", mime_type="application/octet-stream", description="", content_hash=None,
+    )
+    assert first["file_id"] != second["file_id"]
+    await service.transfer(_token(first["upload_url"]), method="PUT", body=data)
+    await service.transfer(_token(second["upload_url"]), method="PUT", body=data)
+    canonical = await service.confirm_upload(vault_id, first["file_id"], content_hash=digest)
+
+    # Pause the first late confirm after it locks the B intent.  A second B
+    # confirm has therefore already fetched that intent when the first one
+    # adopts A and deletes B's intent.  Its locked read then returns None.
+    original_find_exact = vault_files_repo.find_measurement_exact
+    original_find_by_id = vault_files_repo.find_measurement_by_id
+    exact_entered = asyncio.Event()
+    second_initial_read = asyncio.Event()
+    allow_adoption = asyncio.Event()
+    calls = 0
+    by_id_calls = 0
+
+    async def pause_first_exact(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            exact_entered.set()
+            await allow_adoption.wait()
+        return await original_find_exact(*args, **kwargs)
+
+    async def observe_second_initial_read(*args, **kwargs):
+        nonlocal by_id_calls
+        by_id_calls += 1
+        if by_id_calls == 2:
+            second_initial_read.set()
+        return await original_find_by_id(*args, **kwargs)
+
+    monkeypatch.setattr(vault_files_repo, "find_measurement_exact", pause_first_exact)
+    monkeypatch.setattr(vault_files_repo, "find_measurement_by_id", observe_second_initial_read)
+    late_one = asyncio.create_task(
+        service.confirm_upload(vault_id, second["file_id"], content_hash=digest),
+    )
+    await exact_entered.wait()
+    late_two = asyncio.create_task(
+        m1.MeasurementFileService().confirm_upload(vault_id, second["file_id"], content_hash=digest),
+    )
+    await second_initial_read.wait()
+    allow_adoption.set()
+    results = await asyncio.gather(late_one, late_two)
+
+    assert [result["file_id"] for result in results] == [canonical["file_id"]] * 2
+    assert [result["uri"] for result in results] == [canonical["uri"]] * 2
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE vault_id = $1 AND name = 'race.bin'", vault_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE vault_id = $1", vault_id,
+        ) == 0

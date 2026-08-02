@@ -298,7 +298,15 @@ class MeasurementFileService:
                     intent["id"],
                 )
                 if locked is None:
-                    peer = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
+                    # Another confirm may have adopted this distinct, late
+                    # intent into the canonical logical File and deleted the
+                    # intent before we acquired its lock.  The preallocated
+                    # file id is not canonical in that case; use the already
+                    # verified intent identity instead.
+                    peer = await vault_files_repo.find_measurement_exact(
+                        conn, vault_id=intent["vault_id"], collection_id=intent["collection_id"],
+                        name=intent["filename"], digest=digest,
+                    )
                     if peer is None:
                         raise NotFoundError("File", file_id)
                     return await self._response(peer)
