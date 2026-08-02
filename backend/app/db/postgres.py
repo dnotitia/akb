@@ -219,6 +219,8 @@ async def _apply_migrations() -> None:
         "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
         "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
         "049_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
+        "050_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
+        "051_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
     ):
         if filename in applied:
             continue

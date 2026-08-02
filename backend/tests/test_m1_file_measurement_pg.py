@@ -17,6 +17,8 @@ from app.config import settings
 from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
+from app.services.m1_native_grep_service import M1NativeGrepService
+from app.services.native_derived_worker import NativeDerivedWorker
 
 
 _DSN = os.environ.get(
@@ -26,9 +28,9 @@ _DSN = os.environ.get(
 _BACKEND = Path(__file__).resolve().parents[1]
 
 
-def _migration():
-    path = _BACKEND / "app" / "db" / "migrations" / "051_native_revision_m1_file_storage.py"
-    spec = importlib.util.spec_from_file_location("m1_file_migration_051_test", path)
+def _migration(filename: str):
+    path = _BACKEND / "app" / "db" / "migrations" / filename
+    spec = importlib.util.spec_from_file_location(f"m1_file_{filename}_test", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -40,7 +42,13 @@ async def pool():
     pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=8)
     async with pool.acquire() as conn:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        await _migration().migrate(conn)
+        for filename in (
+            "048_native_revision_core.py",
+            "049_native_revision_m1_pg_body.py",
+            "050_native_revision_searchable_derived.py",
+            "051_native_revision_m1_file_storage.py",
+        ):
+            await _migration(filename).migrate(conn)
     try:
         yield pool
     finally:
@@ -397,4 +405,139 @@ async def test_late_dedup_resolves_exact_peer_after_its_intent_is_consumed(conte
         ) == 1
         assert await conn.fetchval(
             "SELECT count(*) FROM m1_file_transfer_intents WHERE vault_id = $1", vault_id,
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_concrete_native_text_bridge_is_atomic_searchable_and_versioned(
+    context, monkeypatch,
+):
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    service = m1.MeasurementFileService()
+    data = b"bridge searchable token\nsecond line\n"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="main.py",
+        actor_id="bridge-test",
+        mime_type="text/x-python",
+        description="atomic bridge",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    resource_id = uuid.UUID(initiated["file_id"])
+    assert confirmed["storage_driver"] == "native_text"
+    assert confirmed["native_resource_id"] == initiated["file_id"]
+    assert confirmed["native_revision_id"]
+
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval("SELECT owner_id FROM vaults WHERE id = $1", vault_id)
+        row = await conn.fetchrow(
+            """
+            SELECT r.surface, r.current_path, r.lifecycle, r.head_revision_id,
+                   m.digest, m.byte_size, m.selected_placement
+              FROM native_resources r
+              JOIN native_revisions v
+                ON v.resource_id = r.resource_id AND v.revision_id = r.head_revision_id
+              JOIN native_payload_manifests m
+                ON m.payload_manifest_id = v.payload_manifest_id
+             WHERE r.resource_id = $1
+            """,
+            resource_id,
+        )
+    assert dict(row) == {
+        "surface": "file",
+        "current_path": "src/main.py",
+        "lifecycle": "live",
+        "head_revision_id": confirmed["native_revision_id"],
+        "digest": digest,
+        "byte_size": len(data),
+        "selected_placement": "pg-bodystore-v1",
+    }
+
+    download = await service.get_download_url(vault_id, initiated["file_id"])
+    assert await service.transfer(_token(download["download_url"]), method="GET") == data
+    assert await NativeDerivedWorker(pool).process_once() == 1
+    grep = await M1NativeGrepService(pool).grep(
+        "searchable token",
+        user_id=owner_id,
+        include_text_files=True,
+    )
+    assert grep["total_resources"] == 1
+    assert grep["results"][0]["uri"] == confirmed["uri"]
+    assert grep["results"][0]["resource_type"] == "file"
+    assert grep["results"][0]["revision"] == confirmed["native_revision_id"]
+    assert grep["results"][0]["content_hash"] == digest
+
+    deleted = await service.delete(vault_id, initiated["file_id"], actor_id="bridge-test")
+    assert deleted["deleted"] is True
+    async with pool.acquire() as conn:
+        deleted_head = await conn.fetchrow(
+            "SELECT lifecycle, head_revision_id FROM native_resources WHERE resource_id = $1",
+            resource_id,
+        )
+        history = await conn.fetch(
+            "SELECT action, parent_revision_id FROM native_revisions WHERE resource_id = $1",
+            resource_id,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", resource_id,
+        ) == 0
+    assert deleted_head["lifecycle"] == "deleted"
+    assert deleted_head["head_revision_id"] != confirmed["native_revision_id"]
+    assert {item["action"] for item in history} == {"create", "delete"}
+    delete_row = next(item for item in history if item["action"] == "delete")
+    assert delete_row["parent_revision_id"] == confirmed["native_revision_id"]
+
+    failed_data = b"rolled back native body\n"
+    failed_digest = hashlib.sha256(failed_data).hexdigest()
+    failed = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="rollback.py",
+        actor_id="bridge-test",
+        mime_type="text/x-python",
+        description="rollback",
+        content_hash=failed_digest,
+    )
+    await service.transfer(_token(failed["upload_url"]), method="PUT", body=failed_data)
+
+    async def fail_file_row(*_args, **_kwargs):
+        raise RuntimeError("file row publication failed")
+
+    monkeypatch.setattr(
+        vault_files_repo,
+        "insert_or_adopt_measurement_confirmed",
+        fail_file_row,
+    )
+    with pytest.raises(RuntimeError, match="file row publication failed"):
+        await service.confirm_upload(
+            vault_id, failed["file_id"], content_hash=failed_digest,
+        )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_resources WHERE resource_id = $1",
+            uuid.UUID(failed["file_id"]),
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_reference_payloads WHERE digest = $1",
+            failed_digest,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1",
+            uuid.UUID(failed["file_id"]),
         ) == 0

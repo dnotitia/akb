@@ -72,6 +72,15 @@ async def init_storage() -> None:
     _validate_required_settings()
     await init_db()
     logger.info("Database initialized")
+    if settings.native_revision_m1_file_driver != "s3_current":
+        # Text Files share the native ledger and PostgreSQL BodyStore with the
+        # guarded M1 grep arm.  Install only after 048-051 are durable; normal
+        # deployments never import or compose this measurement path.
+        from app.services.m1_native_text_file_bridge import (
+            install_m1_native_text_file_bridge,
+        )
+
+        install_m1_native_text_file_bridge()
     # Self-heal: clear stale git index.lock files left behind by a
     # crashed prior process. Without this, the affected vault's writes
     # fail silently until an operator removes the lock by hand.
