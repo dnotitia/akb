@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import multiprocessing
-import pickle
 import queue
 import re
 import threading
@@ -303,26 +303,30 @@ def _regex_child(
     max_result_bytes: int,
 ) -> None:
     """One-shot spawned worker; the parent kills it if Python ``re`` stalls."""
+    def encode(outcome: str, payload: Any) -> bytes:
+        return json.dumps(
+            [outcome, payload],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
     try:
         result = operation(*args, **kwargs)
-        message = pickle.dumps(("ok", result), protocol=pickle.HIGHEST_PROTOCOL)
+        message = encode("ok", result)
         if len(message) > max_result_bytes:
-            message = pickle.dumps(
-                (
-                    "validation",
-                    "native grep regex result exceeds bounded worker output",
-                ),
-                protocol=pickle.HIGHEST_PROTOCOL,
+            message = encode(
+                "validation",
+                "native grep regex result exceeds bounded worker output",
             )
         connection.send_bytes(message)
     except ValidationError as exc:
-        connection.send_bytes(pickle.dumps(("validation", exc.message)))
+        connection.send_bytes(encode("validation", exc.message))
     except re.error as exc:
         connection.send_bytes(
-            pickle.dumps(("validation", f"Invalid regex replacement: {exc}")),
+            encode("validation", f"Invalid regex replacement: {exc}"),
         )
     except BaseException as exc:  # noqa: BLE001 — isolate worker failures from API process
-        connection.send_bytes(pickle.dumps(("error", type(exc).__name__)))
+        connection.send_bytes(encode("error", type(exc).__name__))
     finally:
         connection.close()
 
@@ -373,7 +377,10 @@ def _run_regex_process(operation, args: tuple[Any, ...], kwargs: dict[str, Any],
             raise _RegexScanTimedOut
         if isinstance(message, BaseException):
             raise RuntimeError("native grep regex worker exited without a result") from message
-        outcome, payload = pickle.loads(message)
+        try:
+            outcome, payload = json.loads(message.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError("native grep regex worker returned an invalid envelope") from exc
         if outcome == "validation":
             raise ValidationError(payload)
         if outcome != "ok":
