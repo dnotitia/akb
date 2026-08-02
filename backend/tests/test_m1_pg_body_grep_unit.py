@@ -10,6 +10,7 @@ import pytest
 from app.exceptions import AKBError, ValidationError
 from app.services import m1_native_grep_service as native_grep
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
+from app.services import m1_pg_body_store
 from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 
 
@@ -37,6 +38,13 @@ def test_pg_body_candidate_verifies_one_canonical_utf8_representation():
 def test_pg_body_candidate_rejects_non_searchable_bytes(payload: bytes):
     with pytest.raises(ValidationError):
         M1PgBodyStore._verified_bytes(payload)
+
+
+def test_pg_body_candidate_rejects_oversize_before_text_scan(monkeypatch):
+    monkeypatch.setattr(m1_pg_body_store, "M1_PG_TEXT_MAX_BYTES", 4)
+
+    with pytest.raises(ValidationError, match="10 MiB limit"):
+        M1PgBodyStore._verified_bytes(b"12345")
 
 
 def test_pg_body_candidate_rejects_manifest_drift():

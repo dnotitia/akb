@@ -1,5 +1,7 @@
 """REST API routes for vault file storage (S3-backed)."""
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.api.deps import get_current_user, require_delegated_actor
@@ -16,6 +18,7 @@ from app.util.text import to_nfc
 
 router = APIRouter()
 file_service = FileService()
+_measurement_transfer_slots = asyncio.Semaphore(2)
 
 
 @router.api_route("/files/transfer/{token}", methods=["PUT", "GET"], include_in_schema=False)
@@ -26,21 +29,29 @@ async def measurement_file_transfer(token: str, request: Request):
     capability is its authorization.  The service only exposes this route
     while the dedicated M1 measurement guard is active.
     """
-    if request.method == "PUT":
-        declared = request.headers.get("content-length")
-        if declared and int(declared) > settings.native_revision_m1_file_transfer_max_bytes:
-            raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
-        body = bytearray()
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > settings.native_revision_m1_file_transfer_max_bytes:
-                raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
-        await file_service.transfer_measurement_capability(
-            token, method="PUT", body=bytes(body),
-        )
-        return Response(status_code=200)
-    data = await file_service.transfer_measurement_capability(token, method="GET")
-    return Response(content=data or b"", media_type="application/octet-stream")
+    async with _measurement_transfer_slots:
+        if request.method == "PUT":
+            declared = request.headers.get("content-length")
+            if declared:
+                try:
+                    declared_size = int(declared)
+                except ValueError as exc:
+                    raise AKBError("invalid measurement transfer content-length", status_code=400) from exc
+                if declared_size < 0:
+                    raise AKBError("invalid measurement transfer content-length", status_code=400)
+                if declared_size > settings.native_revision_m1_file_transfer_max_bytes:
+                    raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > settings.native_revision_m1_file_transfer_max_bytes:
+                    raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
+            await file_service.transfer_measurement_capability(
+                token, method="PUT", body=bytes(body),
+            )
+            return Response(status_code=200)
+        data = await file_service.transfer_measurement_capability(token, method="GET")
+        return Response(content=data or b"", media_type="application/octet-stream")
 
 
 async def _resolve_file_write_context(

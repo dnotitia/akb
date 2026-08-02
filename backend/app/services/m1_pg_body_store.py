@@ -7,6 +7,7 @@ open semantics without changing AKB's default revision backend.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from dataclasses import dataclass
@@ -19,6 +20,9 @@ from app.services.m1_reference_payload_store import PreparedReferencePayload
 
 class PgBodyIntegrityError(RuntimeError):
     """A persisted body no longer agrees with its manifest facts."""
+
+
+M1_PG_TEXT_MAX_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +55,15 @@ class M1PgBodyStore:
         expected_size: int | None = None,
     ) -> tuple[bytes, str]:
         if isinstance(payload, str):
+            if len(payload) > M1_PG_TEXT_MAX_BYTES:
+                raise ValidationError("PostgreSQL text body exceeds the 10 MiB limit")
             canonical = payload.encode("utf-8")
         elif isinstance(payload, bytes):
             canonical = payload
         else:
             raise ValidationError("PostgreSQL body must be str or bytes")
+        if len(canonical) > M1_PG_TEXT_MAX_BYTES:
+            raise ValidationError("PostgreSQL text body exceeds the 10 MiB limit")
         try:
             canonical.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -78,7 +86,8 @@ class M1PgBodyStore:
         expected_digest: str | None = None,
         expected_size: int | None = None,
     ) -> PreparedReferencePayload:
-        canonical, digest = self._verified_bytes(
+        canonical, digest = await asyncio.to_thread(
+            self._verified_bytes,
             payload,
             expected_digest=expected_digest,
             expected_size=expected_size,
@@ -124,7 +133,7 @@ class M1PgBodyStore:
             raise PgBodyIntegrityError(
                 "namespace already contains the same body under a different measurement placement"
             )
-        self._verify_row(row, expected=canonical)
+        await asyncio.to_thread(self._verify_row, row, expected=canonical)
         return PreparedReferencePayload(
             payload_id=row["payload_id"],
             namespace_id=row["namespace_id"],
@@ -188,7 +197,7 @@ class M1PgBodyStore:
             )
         if row is None:
             raise PgBodyIntegrityError(f"PostgreSQL body is missing: {payload_id}")
-        return self._verify_row(row)
+        return await asyncio.to_thread(self._verify_row, row)
 
     async def open_verified_receipt(self, payload_id: uuid.UUID) -> VerifiedPgTextBody:
         async with self.pool.acquire() as conn:
@@ -205,7 +214,7 @@ class M1PgBodyStore:
             )
         if row is None:
             raise PgBodyIntegrityError(f"PostgreSQL body is missing: {payload_id}")
-        return self._receipt_from_row(row)
+        return await asyncio.to_thread(self._receipt_from_row, row)
 
     async def namespace_residue(self, namespace_id: uuid.UUID) -> dict[str, int]:
         """Return bounded residue counts after a measurement namespace cleanup."""

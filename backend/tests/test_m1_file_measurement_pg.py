@@ -51,6 +51,7 @@ async def pool():
             "049_native_revision_m1_pg_body.py",
             "050_native_revision_searchable_derived.py",
             "051_native_revision_m1_file_storage.py",
+            "052_native_revision_m1_file_constraints.py",
         ):
             await _migration(filename).migrate(conn)
     try:
@@ -97,6 +98,23 @@ async def context(pool, tmp_path, monkeypatch):
 
 def _token(url: str) -> str:
     return url.rsplit("/", 1)[-1]
+
+
+@pytest.mark.asyncio
+async def test_measurement_file_storage_driver_is_database_constrained(context):
+    pool, vault_id, _denied, _vault_name = context
+    async with pool.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO vault_files (
+                    id, vault_id, name, s3_key, mime_type, size_bytes, created_by,
+                    storage_driver, storage_locator
+                ) VALUES ($1, $2, 'bad.bin', $3, 'application/octet-stream', 1,
+                          'constraint-test', 'unknown', 'bad/locator')
+                """,
+                uuid.uuid4(), vault_id, f"m1-logical/{uuid.uuid4()}",
+            )
 
 
 @pytest.mark.asyncio
@@ -391,6 +409,53 @@ async def test_binary_confirm_and_open_keep_slow_cas_io_off_the_event_loop(
     assert heartbeat == 20
     assert store.prepare_thread != loop_thread
     assert store.open_thread != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_text_classification_runs_off_the_event_loop(context, monkeypatch):
+    _pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    data = b"classification probe"
+    digest = hashlib.sha256(data).hexdigest()
+    loop_thread = threading.get_ident()
+    started = threading.Event()
+    release = threading.Event()
+    worker_thread = None
+
+    def slow_classification(_mime_type, _data):
+        nonlocal worker_thread
+        worker_thread = threading.get_ident()
+        started.set()
+        assert release.wait(timeout=2)
+        return False
+
+    monkeypatch.setattr(m1, "_is_native_text", slow_classification)
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="",
+        filename="classification.bin",
+        actor_id="tester",
+        mime_type="application/octet-stream",
+        description="",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    confirm = asyncio.create_task(
+        service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest),
+    )
+    while not started.is_set():
+        await asyncio.sleep(0)
+    heartbeat = 0
+    for _ in range(10):
+        await asyncio.sleep(0)
+        heartbeat += 1
+    release.set()
+
+    assert (await confirm)["storage_driver"] == "fscas"
+    assert heartbeat == 10
+    assert worker_thread != loop_thread
 
 
 @pytest.mark.asyncio

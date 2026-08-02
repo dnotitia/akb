@@ -18,6 +18,7 @@ from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.services.adapters import s3_adapter
 from app.services.m1_binary_store import BinaryStore, FilesystemCAS, PreparedBinary, S3CAS
+from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES
 from app.services.resource_hash import HASH_ALGORITHM, is_sha256_hex
 from app.services.uri_service import file_uri
 from app.util.text import normalize_collection_path, validate_file_name
@@ -116,6 +117,8 @@ async def _tombstone_native_text_file(
 def _is_native_text(mime_type: str, data: bytes) -> bool:
     if not mime_type.lower().startswith("text/"):
         return False
+    if len(data) > M1_PG_TEXT_MAX_BYTES:
+        raise ValidationError("declared text exceeds the 10 MiB searchable-text limit")
     if b"\x00" in data:
         raise ValidationError("declared text must be valid UTF-8 text without NUL bytes")
     try:
@@ -347,7 +350,7 @@ class MeasurementFileService:
             raise AKBError("Uploaded file hash mismatch; transfer intent was cleaned up", status_code=409)
 
         try:
-            is_text = _is_native_text(intent["mime_type"], data)
+            is_text = await asyncio.to_thread(_is_native_text, intent["mime_type"], data)
         except ValidationError:
             await self._delete_intent(intent["id"])
             raise
@@ -518,6 +521,8 @@ class MeasurementFileService:
             if digest != row["content_hash"] or len(data) != row["size_bytes"]:
                 raise AKBError("native text File failed digest/size verification", status_code=502)
             return data
+        if row["storage_driver"] not in {"fscas", "s3cas"}:
+            raise AKBError("unsupported measurement File storage driver", status_code=500)
         prepared = PreparedBinary(
             row["storage_locator"], row["content_hash"], row["size_bytes"],
             "s3" if row["storage_driver"] == "s3cas" else "fscas",

@@ -259,12 +259,19 @@ class NativeDerivedWorker:
                 )
 
     async def _apply_live(self, intent: dict, head: dict) -> int:
-        canonical = M1PgBodyStore._verify_row(head)
-        digest = hashlib.sha256(canonical).hexdigest()
-        chunks = build_native_document_chunks(
-            vault_name=head["vault_name"],
-            path=head["current_path"],
-            canonical_text=canonical.decode("utf-8", errors="strict"),
+        def prepare() -> tuple[str, list[Chunk]]:
+            canonical = M1PgBodyStore._verify_row(head)
+            return (
+                hashlib.sha256(canonical).hexdigest(),
+                build_native_document_chunks(
+                    vault_name=head["vault_name"],
+                    path=head["current_path"],
+                    canonical_text=canonical.decode("utf-8", errors="strict"),
+                ),
+            )
+
+        digest, chunks = await asyncio.to_thread(
+            prepare,
         )
         async with self.pool.acquire() as conn:
             async with conn.transaction():

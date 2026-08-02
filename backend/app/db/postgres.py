@@ -221,6 +221,7 @@ async def _apply_migrations() -> None:
         "049_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
         "050_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
         "051_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
+        "052_native_revision_m1_file_constraints.py", # M1 File placement discriminator integrity
     ):
         if filename in applied:
             continue
