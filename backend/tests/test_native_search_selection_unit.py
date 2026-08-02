@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 
+from app.exceptions import ValidationError
 from app.models.document import GrepResponse
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services.search_service import SearchService, active_document_source_type
@@ -165,13 +166,34 @@ def test_file_uri_uses_collection_from_current_native_path():
 
 
 class _CandidateConn:
-    def __init__(self):
+    def __init__(self, *, resource_count=0, body_bytes=0):
         self.sql = ""
         self.params = ()
+        self.queries = []
+        self.resource_count = resource_count
+        self.body_bytes = body_bytes
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    def transaction(self, **_kwargs):
+        return self._Transaction()
+
+    async def fetchrow(self, sql, *params):
+        self.queries.append((sql, params))
+        return {
+            "resource_count": self.resource_count,
+            "body_bytes": self.body_bytes,
+        }
 
     async def fetch(self, sql, *params):
         self.sql = sql
         self.params = params
+        self.queries.append((sql, params))
         return []
 
 
@@ -198,3 +220,45 @@ async def test_native_search_collection_is_exact_descendant_boundary_and_escaped
     assert "r.current_path =" in conn.sql
     assert "ESCAPE '\\'" in conn.sql
     assert conn.params == (collection, escaped)
+
+
+@pytest.mark.asyncio
+async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
+    conn = _CandidateConn()
+    await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=["akb://measure/doc/specs/guide.md"],
+    )
+
+    assert all("r.current_path" in sql and "r.resource_id::text" in sql for sql, _ in conn.queries)
+    assert conn.params == ("measure", "specs/guide.md")
+
+
+@pytest.mark.asyncio
+async def test_native_search_rejects_corpus_before_fetching_bodies():
+    from app.services import search_service
+
+    conn = _CandidateConn(
+        resource_count=search_service.NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES + 1,
+    )
+    with pytest.raises(ValidationError, match="bounded candidate corpus"):
+        await SearchService()._native_document_candidates(
+            conn,
+            user_uuid=None,
+            is_admin=True,
+            vaults=None,
+            collection=None,
+            doc_type=None,
+            tags=None,
+            include_archived=False,
+            source_uris=None,
+        )
+
+    assert len(conn.queries) == 1

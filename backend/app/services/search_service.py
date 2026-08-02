@@ -11,6 +11,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -32,6 +33,9 @@ logger = logging.getLogger("akb.search")
 LEGACY_DOCUMENT_SOURCE = "document"
 NATIVE_DOCUMENT_SOURCE = "native_document"
 NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
+NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
+NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
+NATIVE_SEARCH_MAX_SOURCE_URIS = 200
 
 
 def active_document_source_type(
@@ -132,6 +136,11 @@ def vault_path_eligible(
     return (
         settings.vault_filter_enabled
         and supports_vault_filter(get_vector_store())
+        # The vector-store vault filter cannot yet constrain source_type.
+        # Under the native arm, stale legacy Document points could consume the
+        # complete top-K before hydration drops them, suppressing valid native
+        # hits. Use the source-id path until the driver accepts that predicate.
+        and _configured_document_source_type() == LEGACY_DOCUMENT_SOURCE
         and not (collection or doc_type or tags or source_uris)
     )
 
@@ -216,12 +225,26 @@ class SearchService:
                 f"(v.id IN (SELECT vault_id FROM vault_access WHERE user_id = ${index}) "
                 f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
             )
-        rows = await conn.fetch(
-            f"""
-            SELECT r.resource_id, r.current_path, v.name AS vault_name,
-                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
-                   p.byte_size, p.encoding, p.selected_placement,
-                   p.verification_profile, p.canonical_bytes
+        if source_uris:
+            if len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+                raise ValidationError(
+                    f"native search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                )
+            source_clauses: list[str] = []
+            for uri in source_uris:
+                parsed = parse_uri(uri)
+                if parsed is None or parsed.kind != "doc" or not parsed.identifier:
+                    continue
+                params.extend([parsed.vault, parsed.identifier])
+                source_clauses.append(
+                    f"(v.name = ${len(params) - 1} AND "
+                    f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
+                )
+            if not source_clauses:
+                return []
+            conditions.append("(" + " OR ".join(source_clauses) + ")")
+
+        joins = """
               FROM native_resources r
               JOIN vaults v ON v.id = r.namespace_id
               JOIN native_revisions nr
@@ -230,30 +253,45 @@ class SearchService:
               JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = nr.payload_manifest_id
               JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
-             WHERE {' AND '.join(conditions)}
-            """,
-            *params,
-        )
-        allowed_refs: set[tuple[str, str]] | None = None
-        if source_uris:
-            allowed_refs = set()
-            for uri in source_uris:
-                parsed = parse_uri(uri)
-                if parsed is not None and parsed.kind == "doc" and parsed.identifier:
-                    allowed_refs.add((parsed.vault, parsed.identifier))
+        """
+        where_sql = " AND ".join(conditions)
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            scope = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*)::bigint AS resource_count,
+                       COALESCE(SUM(p.byte_size), 0)::bigint AS body_bytes
+                  {joins}
+                 WHERE {where_sql}
+                """,
+                *params,
+            )
+            if (
+                scope["resource_count"] > NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES
+                or scope["body_bytes"] > NATIVE_SEARCH_MAX_BODY_BYTES
+            ):
+                raise ValidationError(
+                    "native search scope exceeds the bounded candidate corpus"
+                )
+            rows = await conn.fetch(
+                f"""
+            SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
+                   p.byte_size, p.encoding, p.selected_placement,
+                   p.verification_profile, p.canonical_bytes
+              {joins}
+             WHERE {where_sql}
+             ORDER BY r.resource_id
+                """,
+                *params,
+            )
         from app.services.document_service import _parse_markdown
         from app.services.m1_pg_body_store import M1PgBodyStore
 
         candidates: list[str] = []
         for row in rows:
-            if allowed_refs is not None and (
-                row["vault_name"], row["current_path"]
-            ) not in allowed_refs and (
-                row["vault_name"], str(row["resource_id"])
-            ) not in allowed_refs:
-                continue
-            metadata, _ = _parse_markdown(
-                M1PgBodyStore._verify_row(row).decode("utf-8", errors="strict")
+            metadata, _ = await asyncio.to_thread(
+                _parse_markdown,
+                M1PgBodyStore._verify_row(row).decode("utf-8", errors="strict"),
             )
             if doc_type and (metadata.get("type") or "note") != doc_type:
                 continue
@@ -742,6 +780,31 @@ class SearchService:
                     for h in hits
                     if h.source_type == NATIVE_DOCUMENT_SOURCE
                 }
+                native_body_bytes = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(p.byte_size), 0)::bigint
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.lifecycle = 'live'
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_document'
+                    """,
+                    list(native_hits),
+                )
+                if native_body_bytes > NATIVE_SEARCH_MAX_BODY_BYTES:
+                    raise ValidationError(
+                        "native search hydration exceeds the bounded body corpus"
+                    )
                 rows = await conn.fetch(
                     """
                     SELECT c.id AS chunk_id, r.resource_id, r.current_path,
@@ -778,8 +841,9 @@ class SearchService:
                 for r in rows:
                     # Hydration independently verifies the current Head body;
                     # the derived chunk is only a candidate, never authority.
-                    metadata, _ = _parse_markdown(
-                        M1PgBodyStore._verify_row(r).decode("utf-8", errors="strict")
+                    metadata, _ = await asyncio.to_thread(
+                        _parse_markdown,
+                        M1PgBodyStore._verify_row(r).decode("utf-8", errors="strict"),
                     )
                     path = r["current_path"]
                     collection = path.rsplit("/", 1)[0] if "/" in path else None

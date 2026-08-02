@@ -160,6 +160,29 @@ def test_vault_path_eligible(monkeypatch):
     assert call() is False
 
 
+def test_native_document_search_disables_vault_only_vector_filter(monkeypatch):
+    """Without a source_type vector predicate, legacy points must not consume
+    the native arm's top-K; native mode therefore uses exact source ids."""
+    from app.config import settings
+    from app.services import search_service
+
+    class _Capable:
+        vault_filter_supported = True
+
+    monkeypatch.setattr(settings, "vault_filter_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "document_revision_backend", "native_ledger_m1")
+    monkeypatch.setattr(settings, "native_revision_m1_measurement_only", True)
+    monkeypatch.setattr(settings, "db_name", "akb_revision_m1_measurement")
+    monkeypatch.setattr(search_service, "get_vector_store", lambda: _Capable())
+
+    assert vault_path_eligible(
+        collection=None,
+        doc_type=None,
+        tags=None,
+        source_uris=None,
+    ) is False
+
+
 @pytest.mark.asyncio
 async def test_run_vector_search_forwards_vault_ids_to_driver(monkeypatch):
     """The VAULT path threads candidate_vault_ids into the driver's hybrid_search

@@ -783,6 +783,75 @@ async def _confirmed_native_text_file(
     )
 
 
+async def _confirmed_binary_file(
+    *, vault_id: uuid.UUID, vault_name: str, collection: str, filename: str, body: bytes,
+) -> dict:
+    service = m1.MeasurementFileService()
+    digest = hashlib.sha256(body).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection=collection,
+        filename=filename,
+        actor_id="collection-delete-test",
+        mime_type="application/octet-stream",
+        description="recursive collection delete",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=body)
+    return await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recursive_collection_delete_retains_binary_cas_without_legacy_s3_outbox(
+    context, monkeypatch,
+):
+    from app.services import collection_service as collections
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(collections, "get_pool", test_pool)
+    confirmed = await _confirmed_binary_file(
+        vault_id=vault_id,
+        vault_name=vault_name,
+        collection="binary/doomed",
+        filename="proof.bin",
+        body=b"retained binary CAS\x00",
+    )
+    file_id = uuid.UUID(confirmed["file_id"])
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT s3_key, storage_driver, storage_locator FROM vault_files WHERE id = $1",
+            file_id,
+        )
+    assert row["storage_driver"] == "fscas"
+
+    deleted = await collections.CollectionService().delete(
+        vault=vault_name,
+        path="binary",
+        recursive=True,
+        agent_id="collection-delete-test",
+    )
+    assert deleted["deleted_files"] == 1
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM s3_delete_outbox WHERE s3_key = $1", row["s3_key"],
+        ) == 0
+
+    # Logical deletion does not erase immutable shared CAS content.
+    retained = Path(settings.native_revision_m1_file_fscas_root) / row["storage_locator"]
+    assert retained.is_file()
+
+
 @pytest.mark.asyncio
 async def test_recursive_collection_delete_tombstones_native_text_lineage_and_exact_grep(
     context, monkeypatch,

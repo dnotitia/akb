@@ -314,9 +314,10 @@ class CollectionService:
                 # in the HTTP handler).
                 for f in files:
                     file_id = str(f["id"])
+                    storage_driver = f.get("storage_driver")
                     native_text = await _tombstone_native_text_file(
                         conn,
-                        storage_driver=f.get("storage_driver"),
+                        storage_driver=storage_driver,
                         vault_id=f["vault_id"],
                         native_resource_id=f.get("native_resource_id"),
                         native_revision_id=f.get("native_revision_id"),
@@ -349,8 +350,17 @@ class CollectionService:
                         logger.warning(
                             "file chunk delete failed for %s: %s", file_id, e,
                         )
-                    if not native_text:
+                    # A NULL driver is the legacy S3 path. Native text owns no
+                    # binary object, while immutable FS/S3 CAS bytes follow the
+                    # same shared-retention policy as direct File deletion.
+                    # Never enqueue the synthetic measurement `s3_key` into the
+                    # legacy delete worker.
+                    if storage_driver is None:
                         await _enqueue_s3_delete(conn, f["s3_key"])
+                    elif not native_text and storage_driver not in {"fscas", "s3cas"}:
+                        raise RuntimeError(
+                            f"unsupported File storage driver during collection delete: {storage_driver}"
+                        )
                     await vault_files_repo.delete(conn, uuid.UUID(file_id))
 
                 # Tear down tables BEFORE the collection-row DELETE so
