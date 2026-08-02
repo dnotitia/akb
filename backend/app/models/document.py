@@ -320,6 +320,24 @@ class GrepReplacement(BaseModel):
     error: str | None = None
 
 
+class GrepTruncationLimits(BaseModel):
+    """Bounded native grep materialization limits exposed by REST."""
+
+    resources: int
+    matches_per_resource: int
+    total_matches: int
+    snippet_bytes: int
+    snippet_bytes_per_resource: int
+    total_snippet_bytes: int
+
+
+class GrepTruncation(BaseModel):
+    """Why a native grep response was truncated and the applied ceilings."""
+
+    reasons: list[str] = Field(default_factory=list)
+    limits: GrepTruncationLimits
+
+
 class GrepResponse(BaseModel):
     """Response for REST grep.
 
@@ -337,6 +355,7 @@ class GrepResponse(BaseModel):
     total_docs: int | None = None
     total_matches: int | None = None
     truncated: bool | None = None
+    truncation: GrepTruncation | None = None
     hint: str | None = None
     results: list[GrepResult] | None = None
     by_doc: dict[str, int] | None = None

@@ -21,6 +21,7 @@ from app.exceptions import AKBError
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.m1_file_measurement import (
     NativeTextDeleteRequest,
+    NativeTextOpenResult,
     NativeTextPublication,
     NativeTextPublishRequest,
     register_native_text_file_services,
@@ -106,7 +107,7 @@ async def _open(
     vault_id: uuid.UUID,
     resource_id: uuid.UUID,
     revision_id: str,
-) -> bytes:
+) -> NativeTextOpenResult:
     pool = await get_pool()
     snapshot = await NativeRevisionService(
         pool,
@@ -117,7 +118,11 @@ async def _open(
         resource_id=resource_id,
         revision_id=revision_id,
     )
-    return snapshot.payload_bytes
+    return NativeTextOpenResult(
+        data=snapshot.payload_bytes,
+        digest=snapshot.digest,
+        size_bytes=snapshot.byte_size,
+    )
 
 
 async def _delete(conn: object, request: NativeTextDeleteRequest) -> None:

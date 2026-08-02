@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import threading
 import uuid
 
 import pytest
@@ -7,7 +9,9 @@ import pytest
 from app.exceptions import ValidationError
 from app.models.document import GrepResponse
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
+from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.search_service import SearchService, active_document_source_type
+from app.services.vector_store import VectorHit
 
 
 def test_document_source_selection_is_exactly_guarded():
@@ -108,6 +112,41 @@ def test_rest_grep_model_preserves_additive_text_file_head_identity():
     assert item["content_hash"] == "b" * 64
 
 
+def test_rest_grep_model_preserves_bounded_native_truncation_details():
+    response = GrepResponse.model_validate(
+        {
+            "kind": "grep",
+            "pattern": "needle",
+            "regex": False,
+            "truncated": True,
+            "truncation": {
+                "reasons": ["per_resource_match_limit", "total_match_limit"],
+                "limits": {
+                    "resources": 20,
+                    "matches_per_resource": 1_000,
+                    "total_matches": 5_000,
+                    "snippet_bytes": 4_096,
+                    "snippet_bytes_per_resource": 262_144,
+                    "total_snippet_bytes": 1_048_576,
+                },
+            },
+            "results": [],
+        }
+    )
+
+    assert response.model_dump(exclude_none=True)["truncation"] == {
+        "reasons": ["per_resource_match_limit", "total_match_limit"],
+        "limits": {
+            "resources": 20,
+            "matches_per_resource": 1_000,
+            "total_matches": 5_000,
+            "snippet_bytes": 4_096,
+            "snippet_bytes_per_resource": 262_144,
+            "total_snippet_bytes": 1_048_576,
+        },
+    }
+
+
 def test_additive_grep_only_adds_head_identity_to_file_rows():
     result = M1NativeGrepService._public_response(
         pattern="needle",
@@ -166,12 +205,13 @@ def test_file_uri_uses_collection_from_current_native_path():
 
 
 class _CandidateConn:
-    def __init__(self, *, resource_count=0, body_bytes=0):
+    def __init__(self, *, resource_count=0, body_bytes=0, rows=None):
         self.sql = ""
         self.params = ()
         self.queries = []
         self.resource_count = resource_count
         self.body_bytes = body_bytes
+        self.rows = rows or []
 
     class _Transaction:
         async def __aenter__(self):
@@ -194,7 +234,7 @@ class _CandidateConn:
         self.sql = sql
         self.params = params
         self.queries.append((sql, params))
-        return []
+        return self.rows
 
 
 @pytest.mark.asyncio
@@ -262,3 +302,141 @@ async def test_native_search_rejects_corpus_before_fetching_bodies():
         )
 
     assert len(conn.queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_verification_and_decode_run_off_event_loop(monkeypatch):
+    body = b"---\ntitle: Worker\n---\nbody\n"
+    row = {
+        "resource_id": uuid.uuid4(),
+        "current_path": "worker.md",
+        "vault_name": "measure",
+        "payload_id": uuid.uuid4(),
+        "namespace_id": uuid.uuid4(),
+        "content_profile": "text",
+        "digest": hashlib.sha256(body).hexdigest(),
+        "byte_size": len(body),
+        "encoding": "utf-8",
+        "selected_placement": "pg-bodystore-v1",
+        "verification_profile": "sha256-size-utf8-v1",
+        "canonical_bytes": body,
+    }
+    conn = _CandidateConn(resource_count=1, body_bytes=len(body), rows=[row])
+    loop_thread = threading.get_ident()
+    verify_threads = []
+    original_verify = M1PgBodyStore._verify_row
+
+    def guarded_verify(candidate):
+        verify_threads.append(threading.get_ident())
+        assert threading.get_ident() != loop_thread
+        return original_verify(candidate)
+
+    monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
+
+    candidates = await SearchService()._native_document_candidates(
+        conn,
+        user_uuid=None,
+        is_admin=True,
+        vaults=None,
+        collection=None,
+        doc_type=None,
+        tags=None,
+        include_archived=False,
+        source_uris=None,
+    )
+
+    assert candidates == [str(row["resource_id"])]
+    assert verify_threads
+
+
+class _HydrationConn:
+    def __init__(self, row):
+        self.row = row
+
+    async def fetchval(self, _sql, *_params):
+        return self.row["byte_size"]
+
+    async def fetch(self, sql, *_params):
+        if "native_derived_heads" in sql:
+            return [self.row]
+        return []
+
+
+class _HydrationAcquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _HydrationPool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _HydrationAcquire(self.conn)
+
+
+@pytest.mark.asyncio
+async def test_native_hydration_verification_and_decode_run_off_event_loop(monkeypatch):
+    from app.services import search_service
+
+    body = b"---\ntitle: Hydrated\n---\nbody\n"
+    chunk_id = uuid.uuid4()
+    resource_id = uuid.uuid4()
+    row = {
+        "chunk_id": chunk_id,
+        "resource_id": resource_id,
+        "current_path": "hydrated.md",
+        "head_revision_id": "a" * 40,
+        "vault_name": "measure",
+        "payload_id": uuid.uuid4(),
+        "namespace_id": uuid.uuid4(),
+        "content_profile": "text",
+        "digest": hashlib.sha256(body).hexdigest(),
+        "byte_size": len(body),
+        "encoding": "utf-8",
+        "selected_placement": "pg-bodystore-v1",
+        "verification_profile": "sha256-size-utf8-v1",
+        "canonical_bytes": body,
+    }
+    pool = _HydrationPool(_HydrationConn(row))
+
+    async def get_test_pool():
+        return pool
+
+    monkeypatch.setattr(search_service, "get_pool", get_test_pool)
+    monkeypatch.setattr(
+        search_service,
+        "_configured_document_source_type",
+        lambda: search_service.NATIVE_DOCUMENT_SOURCE,
+    )
+    loop_thread = threading.get_ident()
+    verify_threads = []
+    original_verify = M1PgBodyStore._verify_row
+
+    def guarded_verify(candidate):
+        verify_threads.append(threading.get_ident())
+        assert threading.get_ident() != loop_thread
+        return original_verify(candidate)
+
+    monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
+    results = await SearchService()._hydrate_hits(
+        [
+            VectorHit(
+                chunk_id=str(chunk_id),
+                source_type=search_service.NATIVE_DOCUMENT_SOURCE,
+                source_id=str(resource_id),
+                section_path="",
+                content="body",
+                score=1.0,
+            )
+        ]
+    )
+
+    assert results[0].title == "Hydrated"
+    assert verify_threads

@@ -335,6 +335,10 @@ class _RegexScanTimedOut(RuntimeError):
     pass
 
 
+class _RegexStartTimedOut(_RegexScanTimedOut):
+    """Spawn exceeded the request deadline; its capacity slot is reaper-owned."""
+
+
 def _terminate_regex_process(process) -> None:
     if not process.is_alive():
         process.join()
@@ -346,7 +350,14 @@ def _terminate_regex_process(process) -> None:
         process.join(_REGEX_PROCESS_STOP_SECONDS)
 
 
-def _run_regex_process(operation, args: tuple[Any, ...], kwargs: dict[str, Any], timeout: float):
+def _run_regex_process(
+    operation,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    timeout: float,
+    *,
+    delayed_cleanup=None,
+):
     """Run one regex operation after the caller acquires a process slot."""
     context = multiprocessing.get_context("spawn")
     receiving, sending = context.Pipe(duplex=False)
@@ -358,7 +369,18 @@ def _run_regex_process(operation, args: tuple[Any, ...], kwargs: dict[str, Any],
     )
     deadline = time.monotonic() + timeout
     started = False
+    deferred_cleanup = False
+    start_finished = threading.Event()
+    start_errors: list[BaseException] = []
     received: queue.Queue[bytes | BaseException] = queue.Queue(maxsize=1)
+
+    def start() -> None:
+        try:
+            process.start()
+        except BaseException as exc:  # noqa: BLE001 — handed back to bounded caller
+            start_errors.append(exc)
+        finally:
+            start_finished.set()
 
     def receive() -> None:
         try:
@@ -366,8 +388,30 @@ def _run_regex_process(operation, args: tuple[Any, ...], kwargs: dict[str, Any],
         except BaseException as exc:  # noqa: BLE001 — handed back to bounded caller
             received.put(exc)
 
+    def cleanup_after_delayed_start() -> None:
+        """Reap a process whose synchronous spawn outlived the request deadline."""
+        start_finished.wait()
+        try:
+            if not start_errors:
+                _terminate_regex_process(process)
+        finally:
+            receiving.close()
+            sending.close()
+            if delayed_cleanup is not None:
+                delayed_cleanup()
+
     try:
-        process.start()
+        threading.Thread(target=start, name="m1-regex-start", daemon=True).start()
+        if not start_finished.wait(timeout=max(0.0, deadline - time.monotonic())):
+            deferred_cleanup = True
+            threading.Thread(
+                target=cleanup_after_delayed_start,
+                name="m1-regex-start-reaper",
+                daemon=True,
+            ).start()
+            raise _RegexStartTimedOut
+        if start_errors:
+            raise RuntimeError("native grep regex worker failed to start") from start_errors[0]
         started = True
         sending.close()
         threading.Thread(target=receive, name="m1-regex-recv", daemon=True).start()
@@ -387,20 +431,34 @@ def _run_regex_process(operation, args: tuple[Any, ...], kwargs: dict[str, Any],
             raise RuntimeError(f"native grep regex worker failed ({payload})")
         return payload
     finally:
-        receiving.close()
-        sending.close()
-        if started:
-            _terminate_regex_process(process)
+        if not deferred_cleanup:
+            receiving.close()
+            sending.close()
+            if started:
+                _terminate_regex_process(process)
 
 
 def _run_regex_bounded(operation, args: tuple[Any, ...], kwargs: dict[str, Any], timeout: float):
     """Run one regex operation with process-concurrency and wall-clock bounds."""
     if not _REGEX_PROCESS_SLOTS.acquire(blocking=False):
         raise AKBError("native grep regex worker capacity exhausted", status_code=429)
+    release_deferred = False
     try:
-        return _run_regex_process(operation, args, kwargs, timeout)
+        return _run_regex_process(
+            operation,
+            args,
+            kwargs,
+            timeout,
+            delayed_cleanup=_REGEX_PROCESS_SLOTS.release,
+        )
+    except _RegexStartTimedOut:
+        # The delayed-start reaper owns the slot until it can terminate the
+        # eventual process. Releasing here would exceed the process bound.
+        release_deferred = True
+        raise
     finally:
-        _REGEX_PROCESS_SLOTS.release()
+        if not release_deferred:
+            _REGEX_PROCESS_SLOTS.release()
 
 
 class M1NativeGrepService:
@@ -579,6 +637,8 @@ class M1NativeGrepService:
             raise ValidationError("count_only and files_with_matches are mutually exclusive")
         if replace is not None and (count_only or files_with_matches):
             raise ValidationError("replace is incompatible with count_only/files_with_matches")
+        if replace is not None and include_text_files:
+            raise ValidationError("native grep replace does not support File resources")
         if replace is not None and not actor:
             raise ValidationError("actor is required for native grep replacement")
         if limit < 1 or limit > 1000:

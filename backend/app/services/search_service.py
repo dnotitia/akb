@@ -188,6 +188,16 @@ def _normalize_vault_scope(vault: str | list[str] | None) -> list[str] | None:
     return [v for v in (vault or []) if v] or None
 
 
+def _verified_native_metadata(row) -> dict:
+    """Verify, decode, and parse one native body on a worker thread."""
+    from app.services.document_service import _parse_markdown
+    from app.services.m1_pg_body_store import M1PgBodyStore
+
+    canonical = M1PgBodyStore._verify_row(row)
+    metadata, _ = _parse_markdown(canonical.decode("utf-8", errors="strict"))
+    return metadata
+
+
 class SearchService:
 
     async def _native_document_candidates(
@@ -284,15 +294,9 @@ class SearchService:
                 """,
                 *params,
             )
-        from app.services.document_service import _parse_markdown
-        from app.services.m1_pg_body_store import M1PgBodyStore
-
         candidates: list[str] = []
         for row in rows:
-            metadata, _ = await asyncio.to_thread(
-                _parse_markdown,
-                M1PgBodyStore._verify_row(row).decode("utf-8", errors="strict"),
-            )
+            metadata = await asyncio.to_thread(_verified_native_metadata, row)
             if doc_type and (metadata.get("type") or "note") != doc_type:
                 continue
             row_tags = set(metadata.get("tags") or [])
@@ -326,6 +330,10 @@ class SearchService:
         """
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
+        if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+            raise ValidationError(
+                f"search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+            )
 
         document_source = _configured_document_source_type()
 
@@ -835,16 +843,10 @@ class SearchService:
                     """,
                     list(native_hits),
                 )
-                from app.services.document_service import _parse_markdown
-                from app.services.m1_pg_body_store import M1PgBodyStore
-
                 for r in rows:
                     # Hydration independently verifies the current Head body;
                     # the derived chunk is only a candidate, never authority.
-                    metadata, _ = await asyncio.to_thread(
-                        _parse_markdown,
-                        M1PgBodyStore._verify_row(r).decode("utf-8", errors="strict"),
-                    )
+                    metadata = await asyncio.to_thread(_verified_native_metadata, r)
                     path = r["current_path"]
                     collection = path.rsplit("/", 1)[0] if "/" in path else None
                     meta[(NATIVE_DOCUMENT_SOURCE, str(r["resource_id"]))] = {

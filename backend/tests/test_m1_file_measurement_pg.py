@@ -115,6 +115,19 @@ async def test_measurement_file_storage_driver_is_database_constrained(context):
                 """,
                 uuid.uuid4(), vault_id, f"m1-logical/{uuid.uuid4()}",
             )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO vault_files (
+                    id, vault_id, name, s3_key, mime_type, size_bytes, created_by,
+                    storage_driver, storage_locator, native_resource_id,
+                    native_revision_id
+                ) VALUES ($1, $2, 'null-head.txt', $3, 'text/plain', 1,
+                          'constraint-test', 'native_text', $4, $1, NULL)
+                """,
+                uuid.uuid4(), vault_id, f"m1-logical/{uuid.uuid4()}",
+                f"native-text/{uuid.uuid4()}/missing-head",
+            )
 
 
 @pytest.mark.asyncio
@@ -520,7 +533,8 @@ async def test_native_text_requires_concrete_atomic_result_and_verified_open_del
         )
 
     async def open_text(_vault_id, resource_id, _revision_id):
-        return bodies[resource_id]
+        data = bodies[resource_id]
+        return m1.NativeTextOpenResult(data, hashlib.sha256(data).hexdigest(), len(data))
 
     async def delete_text(_conn, request):
         assert request.actor_id == "tester"
@@ -538,7 +552,7 @@ async def test_native_text_requires_concrete_atomic_result_and_verified_open_del
     download = await service.get_download_url(vault_id, initiated["file_id"])
     assert await service.transfer(_token(download["download_url"]), method="GET") == data
     async def corrupt_open(*_args):
-        return data + b"corrupt"
+        return m1.NativeTextOpenResult(data + b"corrupt", digest, len(data))
 
     m1.register_native_text_file_services(
         publisher=publish, opener=corrupt_open, deleter=delete_text,
@@ -573,7 +587,7 @@ async def test_native_text_noop_publisher_cannot_confirm(context):
         return None
 
     async def noop_open(*_args):
-        return data
+        return m1.NativeTextOpenResult(data, digest, len(data))
 
     async def noop_delete(*_args):
         return None

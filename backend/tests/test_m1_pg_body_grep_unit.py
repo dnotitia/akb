@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
 import uuid
 
@@ -197,6 +198,151 @@ async def test_native_grep_rejects_unbounded_pattern_and_candidate_bytes(monkeyp
     monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SEARCH_BYTES", 8)
     with pytest.raises(ValidationError, match="candidate bytes exceed"):
         await service.grep("x", user_id=uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_native_grep_rejects_file_replace_before_scan_or_mutation(monkeypatch):
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    scanned = False
+
+    async def head_bodies(**_kwargs):
+        nonlocal scanned
+        scanned = True
+        return []
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+
+    with pytest.raises(ValidationError, match="does not support File resources"):
+        await service.grep(
+            "needle",
+            user_id=uuid.uuid4(),
+            replace="replacement",
+            actor="tester",
+            include_text_files=True,
+        )
+    assert scanned is False
+
+
+@pytest.mark.asyncio
+async def test_native_grep_document_replace_remains_supported(monkeypatch):
+    body_bytes = b"---\ntitle: Document\n---\nneedle body\n"
+    body = HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="document",
+        path="notes/document.md",
+        revision_id="a" * 40,
+        digest=hashlib.sha256(body_bytes).hexdigest(),
+        byte_size=len(body_bytes),
+        canonical_bytes=body_bytes,
+    )
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    calls = []
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    async def require_write_access(**_kwargs):
+        return None
+
+    class _Native:
+        async def replace_text(self, **kwargs):
+            calls.append(kwargs)
+            return type("Result", (), {"revision_id": "b" * 40})()
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(service, "_require_write_access", require_write_access)
+    monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
+
+    result = await service.grep(
+        "needle",
+        user_id=uuid.uuid4(),
+        replace="replacement",
+        actor="tester",
+    )
+
+    assert calls[0]["surface"] == "document"
+    assert "replacement body" in calls[0]["payload"]
+    assert result["replaced_resources"] == 1
+
+
+def test_regex_process_start_is_inside_wall_clock_deadline(monkeypatch):
+    release_start = threading.Event()
+    terminated = threading.Event()
+    slot_released = threading.Event()
+
+    class _Slot:
+        releases = 0
+
+        @staticmethod
+        def acquire(*, blocking):
+            assert blocking is False
+            return True
+
+        def release(self):
+            self.releases += 1
+            slot_released.set()
+
+    slot = _Slot()
+
+    class _PipeEnd:
+        def recv_bytes(self):
+            return b'["ok", {}]'
+
+        def send_bytes(self, _message):
+            return None
+
+        def close(self):
+            return None
+
+    class _SlowProcess:
+        def __init__(self, **_kwargs):
+            self.alive = False
+
+        def start(self):
+            release_start.wait(timeout=1)
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+            terminated.set()
+
+        def kill(self):
+            self.terminate()
+
+        def join(self, _timeout=None):
+            return None
+
+    class _Context:
+        @staticmethod
+        def Pipe(*, duplex):
+            assert duplex is False
+            return _PipeEnd(), _PipeEnd()
+
+        @staticmethod
+        def Process(**kwargs):
+            return _SlowProcess(**kwargs)
+
+    monkeypatch.setattr(native_grep.multiprocessing, "get_context", lambda _method: _Context())
+    monkeypatch.setattr(native_grep, "_REGEX_PROCESS_SLOTS", slot)
+    timer = threading.Timer(0.2, release_start.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(native_grep._RegexScanTimedOut):
+            native_grep._run_regex_bounded(lambda: {}, (), {}, 0.03)
+        assert time.monotonic() - started < 0.15
+        assert slot.releases == 0
+    finally:
+        release_start.set()
+        timer.cancel()
+    assert terminated.wait(timeout=1)
+    assert slot_released.wait(timeout=1)
+    assert slot.releases == 1
 
 
 class _Acquire:

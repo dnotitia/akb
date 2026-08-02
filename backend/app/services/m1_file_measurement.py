@@ -37,6 +37,15 @@ class NativeTextPublication:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeTextOpenResult:
+    """Bytes plus integrity facts already verified by the native ledger bridge."""
+
+    data: bytes
+    digest: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class NativeTextPublishRequest:
     vault_id: uuid.UUID
     file_id: uuid.UUID
@@ -49,7 +58,7 @@ class NativeTextPublishRequest:
 
 
 NativeTextPublisher = Callable[[object, NativeTextPublishRequest], Awaitable[NativeTextPublication]]
-NativeTextOpener = Callable[[uuid.UUID, uuid.UUID, str], Awaitable[bytes]]
+NativeTextOpener = Callable[[uuid.UUID, uuid.UUID, str], Awaitable[NativeTextOpenResult]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,13 +523,17 @@ class MeasurementFileService:
         if row["storage_driver"] == "native_text":
             if _native_text_opener is None or row["native_resource_id"] is None or row["native_revision_id"] is None:
                 raise AKBError("native text File open service is not registered", status_code=503)
-            data = await _native_text_opener(
+            opened = await _native_text_opener(
                 row["vault_id"], row["native_resource_id"], row["native_revision_id"],
             )
-            digest = hashlib.sha256(data).hexdigest()
-            if digest != row["content_hash"] or len(data) != row["size_bytes"]:
+            if (
+                not isinstance(opened, NativeTextOpenResult)
+                or opened.digest != row["content_hash"]
+                or opened.size_bytes != row["size_bytes"]
+                or len(opened.data) != opened.size_bytes
+            ):
                 raise AKBError("native text File failed digest/size verification", status_code=502)
-            return data
+            return opened.data
         if row["storage_driver"] not in {"fscas", "s3cas"}:
             raise AKBError("unsupported measurement File storage driver", status_code=500)
         prepared = PreparedBinary(
