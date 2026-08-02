@@ -263,6 +263,35 @@ async def test_declared_text_rejects_non_text_bytes_without_publishing_authority
         ) == 0
 
 
+@pytest.mark.parametrize("filename", ["nested/report.txt", "/absolute.txt"])
+@pytest.mark.asyncio
+async def test_measurement_file_rejects_name_that_is_not_one_segment(
+    context, filename,
+):
+    pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    async with pool.acquire() as conn:
+        before = await conn.fetchval("SELECT count(*) FROM m1_file_transfer_intents")
+
+    with pytest.raises(AKBError, match="single path segment") as error:
+        await service.initiate_upload(
+            vault_name=vault_name,
+            vault_id=vault_id,
+            collection="notes",
+            filename=filename,
+            actor_id="tester",
+            mime_type="text/plain",
+            description="",
+            content_hash=None,
+        )
+
+    assert error.value.status_code == 422
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents"
+        ) == before
+
+
 @pytest.mark.asyncio
 async def test_non_text_mime_with_binary_bytes_remains_binary(context):
     _pool, vault_id, _denied, vault_name = context

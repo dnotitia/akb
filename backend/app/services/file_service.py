@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError, ValidationError
+from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -38,7 +38,6 @@ from app.services.resource_hash import (
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
-from app.util.text import validate_file_name
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -256,11 +255,6 @@ class FileService:
         """
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
-        try:
-            validate_file_name(filename)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
-
         if self._measurement is not None:
             return await self._measurement.initiate_upload(
                 vault_name=vault_name, vault_id=vault_id, collection=collection,

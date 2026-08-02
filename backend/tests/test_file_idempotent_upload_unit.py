@@ -149,29 +149,12 @@ async def test_initiate_upload_rejects_a_malformed_content_hash():
     assert err.value.status_code == 400
 
 
-@pytest.mark.parametrize("filename", ["nested/report.txt", "/absolute.txt"])
-async def test_initiate_upload_rejects_filename_that_is_not_one_segment(
-    filename, monkeypatch,
-):
-    """File name cannot smuggle collection identity into the logical path."""
-    from app.services import file_service as fs
+async def test_legacy_s3_key_keeps_accepting_and_sanitizing_slash_names():
+    """The default s3_current facade keeps its pre-M1 filename behavior."""
+    key = _s3_key("vault", "coll", "nested/report.txt")
 
-    monkeypatch.setattr(
-        fs.s3_adapter,
-        "ensure_bucket",
-        lambda _bucket: pytest.fail("invalid filename reached object storage admission"),
-    )
-
-    with pytest.raises(AKBError, match="single path segment") as err:
-        await FileService().initiate_upload(
-            vault_name="vault",
-            vault_id=uuid.uuid4(),
-            collection="coll",
-            filename=filename,
-            actor_id="tester",
-        )
-
-    assert err.value.status_code == 422
+    assert key.startswith("vault/coll/")
+    assert key.endswith("_nested_report.txt")
 
 
 # ── the constraint itself, against a real Postgres ───────────────
