@@ -161,6 +161,11 @@ class Settings(BaseModel):
     # deployments retain the legacy bare-Git revision behavior by default.
     document_revision_backend: Literal["bare_git_current", "native_ledger_m1"] = "bare_git_current"
     native_revision_m1_measurement_only: bool = False
+    # W4's public File measurement is an opt-in, dedicated-database-only
+    # comparison.  ``s3_current`` leaves the normal File service completely
+    # unchanged; the two CAS choices have no fallback and never dual-write.
+    native_revision_m1_file_driver: Literal["s3_current", "fscas", "s3cas"] = "s3_current"
+    native_revision_m1_file_fscas_root: str = ""
 
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
@@ -230,6 +235,19 @@ class Settings(BaseModel):
                     "native_ledger_m1 requires dedicated measurement database "
                     f"{NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME!r}"
                 )
+
+        if self.native_revision_m1_file_driver != "s3_current":
+            if not self.native_revision_m1_measurement_only:
+                raise ValueError(
+                    "native_revision_m1_file_driver requires native_revision_m1_measurement_only=true"
+                )
+            if self.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
+                raise ValueError(
+                    "native_revision_m1_file_driver requires dedicated measurement database "
+                    f"{NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME!r}"
+                )
+            if self.native_revision_m1_file_driver == "fscas" and not self.native_revision_m1_file_fscas_root:
+                raise ValueError("fscas requires native_revision_m1_file_fscas_root")
 
         if self.model_api_governance_mode != "platform_hard":
             return self

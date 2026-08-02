@@ -37,6 +37,7 @@ from app.services.resource_hash import (
 )
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
+from app.services.m1_file_measurement import create_guarded_measurement_file_facade
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -211,6 +212,10 @@ from app.util.text import normalize_collection_path as _normalize_collection_pat
 class FileService:
     def __init__(self):
         self._bucket = settings.s3_bucket
+        # Normal deployments retain the existing direct-S3 File service.  The
+        # facade can only exist under the config/database guard checked by its
+        # factory, so there is no runtime fallback or dual write.
+        self._measurement = create_guarded_measurement_file_facade()
 
     async def initiate_upload(
         self,
@@ -250,6 +255,20 @@ class FileService:
         """
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+
+        if self._measurement is not None:
+            response = self._measurement.initiate_upload(
+                vault=vault_name, filename=filename, mime_type=mime_type,
+                content_hash=content_hash,
+            )
+            response.update({
+                "uri": file_uri(vault_name, response["file_id"], collection=collection or None),
+                "collection": collection or None,
+                # Kept only for the proxy's historic envelope compatibility;
+                # it is not a storage locator and is never persisted.
+                "s3_key": f"m1-measurement/pending/{response['file_id']}",
+            })
+            return response
 
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
@@ -321,6 +340,9 @@ class FileService:
             )
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+
+        if self._measurement is not None:
+            return self._measurement.confirm_upload(file_id, content_hash=content_hash)
 
         fid = uuid.UUID(file_id)
         pool = await get_pool()
@@ -450,6 +472,8 @@ class FileService:
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
         """Return a presigned GET URL for direct download from S3."""
+        if self._measurement is not None:
+            return self._measurement.get_download_url(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
@@ -549,6 +573,8 @@ class FileService:
         *,
         actor_id: str,
     ) -> dict:
+        if self._measurement is not None:
+            return self._measurement.delete(file_id)
         fid = uuid.UUID(file_id)
         pool = await get_pool()
 
@@ -624,6 +650,22 @@ class FileService:
             "name": row["name"],
             "deleted": True,
         }
+
+    async def transfer_measurement_capability(
+        self, token: str, *, method: str, body: bytes | None = None,
+    ) -> bytes | None:
+        """Serve a guarded FS-CAS PUT/GET capability through the File route.
+
+        This is deliberately unavailable outside M1 measurement mode.  The
+        opaque token itself is process-local and is neither a database value
+        nor part of the measurement receipt.
+        """
+        if self._measurement is None:
+            raise NotFoundError("File transfer", token)
+        return self._measurement.transfer(
+            f"{self._measurement.base_url}{self._measurement.transfer_path}/{token}",
+            body, method=method,
+        )
 
 
 async def index_file_metadata(

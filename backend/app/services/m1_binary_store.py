@@ -66,6 +66,8 @@ class BinaryStore(Protocol):
 
     def stat_verified(self, tenant: str, prepared: PreparedBinary) -> int: ...
 
+    def delete_verified(self, tenant: str, prepared: PreparedBinary) -> None: ...
+
 
 class FilesystemCAS:
     """Content-addressed immutable bytes under one measurement-owned root."""
@@ -174,6 +176,15 @@ class FilesystemCAS:
         if size != prepared.size:
             raise BinaryStoreError("FilesystemCAS object size mismatch")
         return size
+
+    def delete_verified(self, tenant: str, prepared: PreparedBinary) -> None:
+        """Remove only the exact CAS object owned by this measurement run."""
+        path = self._validated_path(tenant, prepared)
+        try:
+            path.unlink()
+        except FileNotFoundError as exc:
+            raise BinaryStoreError("FilesystemCAS object is missing") from exc
+        self._fsync_directory(path.parent)
 
 
 class S3CAS:
@@ -294,3 +305,19 @@ class S3CAS:
         if size != prepared.size:
             raise BinaryStoreError("S3 CAS object size mismatch")
         return size
+
+    def delete_verified(self, tenant: str, prepared: PreparedBinary) -> None:
+        key = self._validated_key(tenant, prepared)
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+            try:
+                self.client.head_object(Bucket=self.bucket, Key=key)
+            except ClientError as exc:
+                if self._is_missing_object(exc):
+                    return
+                raise BinaryStoreError("S3 CAS delete verification failed") from exc
+        except BinaryStoreError:
+            raise
+        except Exception as exc:
+            raise BinaryStoreError("S3 CAS delete failed") from exc
+        raise BinaryStoreError("S3 CAS object remained after delete")
