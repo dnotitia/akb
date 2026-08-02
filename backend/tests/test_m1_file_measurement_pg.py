@@ -43,6 +43,8 @@ async def pool():
     async with pool.acquire() as conn:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
         for filename in (
+            "015_events_outbox.py",
+            "019_s3_delete_outbox.py",
             "048_native_revision_core.py",
             "049_native_revision_m1_pg_body.py",
             "050_native_revision_searchable_derived.py",
@@ -541,3 +543,156 @@ async def test_concrete_native_text_bridge_is_atomic_searchable_and_versioned(
             "SELECT count(*) FROM vault_files WHERE id = $1",
             uuid.UUID(failed["file_id"]),
         ) == 0
+
+
+async def _confirmed_native_text_file(
+    *, vault_id: uuid.UUID, vault_name: str, collection: str, filename: str, body: bytes,
+) -> dict:
+    service = m1.MeasurementFileService()
+    digest = hashlib.sha256(body).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection=collection,
+        filename=filename,
+        actor_id="collection-delete-test",
+        mime_type="text/plain",
+        description="recursive collection delete",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=body)
+    return await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recursive_collection_delete_tombstones_native_text_lineage_and_exact_grep(
+    context, monkeypatch,
+):
+    from app.services import collection_service as collections
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(collections, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    confirmed = await _confirmed_native_text_file(
+        vault_id=vault_id,
+        vault_name=vault_name,
+        collection="doomed/nested",
+        filename="proof.txt",
+        body=b"collection tombstone exact grep token\n",
+    )
+    resource_id = uuid.UUID(confirmed["file_id"])
+    create_revision_id = confirmed["native_revision_id"]
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval("SELECT owner_id FROM vaults WHERE id = $1", vault_id)
+
+    before = await M1NativeGrepService(pool).grep(
+        "collection tombstone exact grep token",
+        user_id=owner_id,
+        resource_id=resource_id,
+        include_text_files=True,
+    )
+    assert before["total_resources"] == 1
+
+    deleted = await collections.CollectionService().delete(
+        vault=vault_name,
+        path="doomed",
+        recursive=True,
+        agent_id="collection-delete-test",
+    )
+    assert deleted["deleted_files"] == 1
+
+    async with pool.acquire() as conn:
+        head = await conn.fetchrow(
+            "SELECT lifecycle, head_revision_id FROM native_resources WHERE resource_id = $1",
+            resource_id,
+        )
+        history = await conn.fetch(
+            """
+            SELECT revision_id, parent_revision_id, action
+              FROM native_revisions
+             WHERE resource_id = $1
+             ORDER BY occurred_at, revision_id
+            """,
+            resource_id,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", resource_id,
+        ) == 0
+    assert head["lifecycle"] == "deleted"
+    assert head["head_revision_id"] != create_revision_id
+    assert [row["action"] for row in history] == ["create", "delete"]
+    assert history[-1]["parent_revision_id"] == create_revision_id
+
+    after = await M1NativeGrepService(pool).grep(
+        "collection tombstone exact grep token",
+        user_id=owner_id,
+        resource_id=resource_id,
+        include_text_files=True,
+    )
+    assert after["searched_resources"] == 0
+    assert after["total_resources"] == 0
+    assert after["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_failure(
+    context, monkeypatch,
+):
+    from app.services import collection_service as collections
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(collections, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    confirmed = await _confirmed_native_text_file(
+        vault_id=vault_id,
+        vault_name=vault_name,
+        collection="rollback/nested",
+        filename="proof.txt",
+        body=b"collection rollback exact grep token\n",
+    )
+    resource_id = uuid.UUID(confirmed["file_id"])
+    create_revision_id = confirmed["native_revision_id"]
+
+    async def fail_event(*_args, **_kwargs):
+        raise RuntimeError("injected downstream collection failure")
+
+    monkeypatch.setattr(collections, "emit_event", fail_event)
+    with pytest.raises(RuntimeError, match="injected downstream collection failure"):
+        await collections.CollectionService().delete(
+            vault=vault_name,
+            path="rollback",
+            recursive=True,
+            agent_id="collection-delete-test",
+        )
+
+    async with pool.acquire() as conn:
+        head = await conn.fetchrow(
+            "SELECT lifecycle, head_revision_id FROM native_resources WHERE resource_id = $1",
+            resource_id,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_revisions WHERE resource_id = $1", resource_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", resource_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM collections WHERE vault_id = $1 AND path = 'rollback/nested'",
+            vault_id,
+        ) == 1
+    assert dict(head) == {
+        "lifecycle": "live",
+        "head_revision_id": create_revision_id,
+    }

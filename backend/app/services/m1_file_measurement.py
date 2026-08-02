@@ -81,6 +81,36 @@ def reset_native_text_file_services_for_tests() -> None:
     _native_text_deleter = None
 
 
+async def _tombstone_native_text_file(
+    conn: object,
+    *,
+    storage_driver: str | None,
+    vault_id: uuid.UUID,
+    native_resource_id: uuid.UUID | None,
+    native_revision_id: str | None,
+    collection: str | None,
+    name: str,
+    actor_id: str,
+) -> bool:
+    """Publish a native File tombstone on the caller-owned transaction."""
+    if storage_driver != "native_text":
+        return False
+    if _native_text_deleter is None or native_resource_id is None or native_revision_id is None:
+        raise AKBError("native text File delete service is not registered", status_code=503)
+    logical_path = f"{collection}/{name}" if collection else name
+    await _native_text_deleter(
+        conn,
+        NativeTextDeleteRequest(
+            vault_id=vault_id,
+            resource_id=native_resource_id,
+            revision_id=native_revision_id,
+            logical_path=logical_path,
+            actor_id=actor_id,
+        ),
+    )
+    return True
+
+
 def _is_native_text(mime_type: str, data: bytes) -> bool:
     if not mime_type.lower().startswith("text/") or b"\x00" in data:
         return False
@@ -416,20 +446,16 @@ class MeasurementFileService:
                 row = await vault_files_repo.find_measurement_by_id(conn, vault_id, fid)
                 if row is None:
                     raise NotFoundError("File", file_id)
-                if row["storage_driver"] == "native_text":
-                    if _native_text_deleter is None or row["native_resource_id"] is None or row["native_revision_id"] is None:
-                        raise AKBError("native text File delete service is not registered", status_code=503)
-                    logical_path = (
-                        f"{row['collection']}/{row['name']}" if row["collection"] else row["name"]
-                    )
-                    await _native_text_deleter(
-                        conn,
-                        NativeTextDeleteRequest(
-                            vault_id=vault_id, resource_id=row["native_resource_id"],
-                            revision_id=row["native_revision_id"],
-                            logical_path=logical_path, actor_id=actor_id,
-                        ),
-                    )
+                await _tombstone_native_text_file(
+                    conn,
+                    storage_driver=row["storage_driver"],
+                    vault_id=vault_id,
+                    native_resource_id=row["native_resource_id"],
+                    native_revision_id=row["native_revision_id"],
+                    collection=row["collection"],
+                    name=row["name"],
+                    actor_id=actor_id,
+                )
                 canonical_uri = file_uri(row["vault_name"], file_id, collection=row["collection"])
                 await conn.execute(
                     "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1", canonical_uri,
