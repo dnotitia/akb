@@ -687,21 +687,26 @@ class NativeDocumentService(DocumentService):
         # These strict same-connection hooks observe the uncommitted catalog
         # row while scoped PAT memberships are computed, and PostgreSQL rolls
         # back both the row and role DDL if either hook fails or is cancelled.
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                vault_id = await vault_repo.create(
-                    name=name,
-                    description=description,
-                    git_path=f"native-ledger://{name}",
-                    owner_id=uid,
-                    public_access=public_access,
-                    conn=conn,
-                )
-                role_sync = get_role_sync()
-                await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
-                await role_sync.on_public_access_change_in_conn(
-                    conn, vault_id, public_access,
-                )
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    vault_id = await vault_repo.create(
+                        name=name,
+                        description=description,
+                        git_path=f"native-ledger://{name}",
+                        owner_id=uid,
+                        public_access=public_access,
+                        conn=conn,
+                    )
+                    role_sync = get_role_sync()
+                    await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
+                    await role_sync.on_public_access_change_in_conn(
+                        conn, vault_id, public_access,
+                    )
+        except asyncpg.UniqueViolationError as exc:
+            if exc.constraint_name == "vaults_name_key":
+                raise ConflictError(f"Vault already exists: {name}") from exc
+            raise
         assert vault_id is not None
         return str(vault_id)
 

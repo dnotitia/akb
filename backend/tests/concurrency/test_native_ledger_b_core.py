@@ -583,7 +583,12 @@ async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkey
     """A one-slot pool proves strict RoleSync never acquires a second slot."""
     async with _fresh_database(pool_max_size=1) as (pool, _):
         from app.services import native_document_service as native_documents
-        from app.services.role_sync import RoleSync, token_role_name, vault_group_role_name
+        from app.services.role_sync import (
+            RoleSync,
+            token_role_name,
+            user_role_name,
+            vault_group_role_name,
+        )
 
         owner_id = uuid.uuid4()
         token_id = uuid.uuid4()
@@ -633,6 +638,88 @@ async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkey
         finally:
             await role_sync.on_vault_delete(vault_id)
             await role_sync.on_token_revoke(token_id)
+            async with pool.acquire() as conn:
+                await role_sync._drop_role_if_present(conn, user_role_name(owner_id))
+
+
+async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent():
+    async with _fresh_database(pool_max_size=4) as (pool, _):
+        from app.services.role_sync import RoleSync, token_role_name, user_role_name
+
+        role_sync = RoleSync(pool)
+        roles = (user_role_name(uuid.uuid4()), token_role_name(uuid.uuid4()))
+        ready = asyncio.Event()
+        waiting = 0
+
+        async def create(role: str) -> None:
+            nonlocal waiting
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    waiting += 1
+                    if waiting == 4:
+                        ready.set()
+                    await ready.wait()
+                    await role_sync._create_role_if_missing(conn, role)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(create(role) for role in roles for _ in range(2))),
+                timeout=5,
+            )
+            async with pool.acquire() as conn:
+                existing = {
+                    row["rolname"]
+                    for row in await conn.fetch(
+                        "SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])",
+                        list(roles),
+                    )
+                }
+            assert existing == set(roles)
+        finally:
+            async with pool.acquire() as conn:
+                for role in roles:
+                    await role_sync._drop_role_if_present(conn, role)
+
+
+async def test_native_vault_create_concurrent_same_name_returns_one_conflict(monkeypatch):
+    async with _fresh_database(pool_max_size=2) as (pool, _):
+        from app.repositories.vault_repo import VaultRepository
+        from app.services import native_document_service as native_documents
+
+        ready = asyncio.Event()
+        waiting = 0
+
+        class _BarrierVaultRepository(VaultRepository):
+            async def get_by_name(self, name: str):
+                nonlocal waiting
+                row = await super().get_by_name(name)
+                if row is None:
+                    waiting += 1
+                    if waiting == 2:
+                        ready.set()
+                    await ready.wait()
+                return row
+
+        class _RoleSync:
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+        monkeypatch.setattr(native_documents, "VaultRepository", _BarrierVaultRepository)
+        monkeypatch.setattr(native_documents, "get_role_sync", _RoleSync)
+        vault_name = f"native-race-{uuid.uuid4().hex}"
+        outcomes = await asyncio.gather(
+            NativeDocumentService(pool=pool).create_vault(vault_name),
+            NativeDocumentService(pool=pool).create_vault(vault_name),
+            return_exceptions=True,
+        )
+
+        assert len([result for result in outcomes if isinstance(result, str)]) == 1
+        assert len([result for result in outcomes if isinstance(result, ConflictError)]) == 1
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 1
 
 
 async def test_public_delete_removes_native_vault_authority_and_derived_state(
@@ -783,6 +870,79 @@ async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_
 
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
+
+
+async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_state(monkeypatch):
+    async with _fresh_database() as (pool, _):
+        from app.services import native_document_service as native_documents
+        from app.services.role_sync import (
+            RoleSync,
+            token_role_name,
+            user_role_name,
+            vault_group_role_name,
+        )
+
+        owner_id = uuid.uuid4()
+        token_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
+                owner_id,
+                f"owner-{owner_id.hex}",
+                f"{owner_id.hex}@example.test",
+                "test",
+            )
+            await conn.execute(
+                """
+                INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, vault_scope)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                token_id,
+                owner_id,
+                f"scoped-{token_id.hex}",
+                token_id.hex,
+                token_id.hex[:8],
+                '{"prefixes":["native-cancel-"],"extra_vaults":[]}',
+            )
+
+        created_roles = asyncio.Event()
+
+        class _CancellingRoleSync(RoleSync):
+            created_vault_id: uuid.UUID | None = None
+
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_user_id=None) -> None:
+                await super().on_vault_create_in_conn(conn, vault_id, owner_user_id)
+                self.created_vault_id = vault_id
+                created_roles.set()
+                await asyncio.Event().wait()
+
+        role_sync = _CancellingRoleSync(pool)
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: role_sync)
+        vault_name = f"native-cancel-{uuid.uuid4().hex}"
+        create_task = asyncio.create_task(
+            NativeDocumentService(pool=pool).create_vault(vault_name, owner_id=str(owner_id))
+        )
+        await created_roles.wait()
+        create_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+        assert role_sync.created_vault_id is not None
+        role_names = [
+            *(vault_group_role_name(role_sync.created_vault_id, scope) for scope in ("reader", "writer", "admin")),
+            user_role_name(owner_id),
+            token_role_name(token_id),
+        ]
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM vaults WHERE name = $1", vault_name) == 0
+            live_roles = {
+                row["rolname"]
+                for row in await conn.fetch(
+                    "SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])",
+                    role_names,
+                )
+            }
+        assert live_roles == set()
 
 
 async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():

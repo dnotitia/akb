@@ -1277,7 +1277,7 @@ class RoleSync:
             f'''DO $$
             BEGIN
                 CREATE ROLE "{role}" NOLOGIN;
-            EXCEPTION WHEN duplicate_object THEN
+            EXCEPTION WHEN duplicate_object OR unique_violation THEN
                 NULL;
             END $$;'''
         )
