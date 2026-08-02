@@ -689,6 +689,22 @@ async def test_recursive_collection_delete_tombstones_native_text_lineage_and_ex
     create_revision_id = confirmed["native_revision_id"]
     async with pool.acquire() as conn:
         owner_id = await conn.fetchval("SELECT owner_id FROM vaults WHERE id = $1", vault_id)
+        related_publication = f"deleted-file-{uuid.uuid4().hex}"
+        unrelated_publication = f"unrelated-file-{uuid.uuid4().hex}"
+        await conn.executemany(
+            """
+            INSERT INTO publications (slug, vault_id, resource_type, resource_uri)
+            VALUES ($1, $2, 'file', $3)
+            """,
+            [
+                (related_publication, vault_id, confirmed["uri"]),
+                (
+                    unrelated_publication,
+                    vault_id,
+                    f"akb://{vault_name}/coll/kept/file/{uuid.uuid4()}",
+                ),
+            ],
+        )
 
     before = await M1NativeGrepService(pool).grep(
         "collection tombstone exact grep token",
@@ -723,6 +739,12 @@ async def test_recursive_collection_delete_tombstones_native_text_lineage_and_ex
         assert await conn.fetchval(
             "SELECT count(*) FROM vault_files WHERE id = $1", resource_id,
         ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM publications WHERE slug = $1", related_publication,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM publications WHERE slug = $1", unrelated_publication,
+        ) == 1
     assert head["lifecycle"] == "deleted"
     assert head["head_revision_id"] != create_revision_id
     assert [row["action"] for row in history] == ["create", "delete"]
@@ -762,6 +784,15 @@ async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_
     )
     resource_id = uuid.UUID(confirmed["file_id"])
     create_revision_id = confirmed["native_revision_id"]
+    publication_slug = f"rollback-file-{uuid.uuid4().hex}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO publications (slug, vault_id, resource_type, resource_uri)
+            VALUES ($1, $2, 'file', $3)
+            """,
+            publication_slug, vault_id, confirmed["uri"],
+        )
 
     async def fail_event(*_args, **_kwargs):
         raise RuntimeError("injected downstream collection failure")
@@ -789,6 +820,9 @@ async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_
         assert await conn.fetchval(
             "SELECT count(*) FROM collections WHERE vault_id = $1 AND path = 'rollback/nested'",
             vault_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM publications WHERE slug = $1", publication_slug,
         ) == 1
     assert dict(head) == {
         "lifecycle": "live",

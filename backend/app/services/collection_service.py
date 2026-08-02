@@ -335,6 +335,14 @@ class CollectionService:
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
                     )
+                    # `publications.resource_uri` intentionally has no File FK,
+                    # so collection cascades must mirror ordinary File deletion
+                    # explicitly. Keep this in the collection transaction: a
+                    # later failure must restore both the File and its links.
+                    await conn.execute(
+                        "DELETE FROM publications WHERE resource_uri = $1",
+                        f_uri,
+                    )
                     try:
                         await delete_file_chunks(conn, file_id)
                     except Exception as e:  # noqa: BLE001
