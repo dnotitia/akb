@@ -35,6 +35,14 @@ from native_revision_m1_adapter import (  # noqa: E402
 PROTOCOL_VERSION = "akb-native-revision-m1-settled-search/v1"
 
 
+def public_search_hit_fact(uri: str, revision: str) -> dict[str, Any]:
+    """Bind the internally verified match without publishing its locator."""
+    return {
+        "resource_binding": receipt_safe_profile({"uri": uri})["binding"],
+        "revision": revision,
+    }
+
+
 def _schema() -> str:
     value = os.environ.get("AKB_NATIVE_REVISION_VECTOR_SCHEMA", "vector_index")
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
@@ -260,7 +268,7 @@ async def run() -> dict[str, Any]:
             "delete_settlement_polling": delete_settlement,
             "cleanup_residue": post_delete,
             "public_operations": operations,
-            "search_hit": {"uri": expected_uri, "revision": current_head},
+            "search_hit": public_search_hit_fact(expected_uri, current_head),
             "assertions": assertions,
         }
     finally:

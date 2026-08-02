@@ -155,6 +155,21 @@ def test_runtime_profile_keeps_coarse_numbers_but_binds_private_inputs():
     assert "secret" not in repr(safe)
 
 
+def test_settled_search_hit_receipt_binds_locator_without_disclosing_it():
+    adapter = _load("settled")
+    locator = "akb://private-vault/doc/private/path.md?X-Amz-Signature=secret"
+
+    fact = adapter.public_search_hit_fact(locator, "a" * 40)
+
+    assert fact == {
+        "resource_binding": adapter.receipt_safe_profile({"uri": locator})["binding"],
+        "revision": "a" * 40,
+    }
+    rendered = repr(fact)
+    for forbidden in ("akb://", "private-vault", "private/path.md", "X-Amz-Signature", "secret"):
+        assert forbidden not in rendered
+
+
 class _Response:
     status_code = 200
 
