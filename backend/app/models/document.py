@@ -301,6 +301,12 @@ class GrepResult(BaseModel):
     vault: str
     path: str
     title: str
+    # Additive native measurement identity. Legacy Document grep leaves these
+    # unset, preserving its frozen response; W3b needs them to distinguish an
+    # admitted searchable text File and bind the result to its current Head.
+    resource_type: str | None = None
+    revision: str | None = None
+    content_hash: str | None = None
     matches: list[GrepMatch] = Field(default_factory=list)
 
 

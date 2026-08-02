@@ -43,6 +43,22 @@ def test_pg_body_candidate_rejects_manifest_drift():
         M1PgBodyStore._verify_row(row)
 
 
+def test_pg_body_receipt_binds_exact_verified_bytes():
+    row = {
+        **_row(b"hello"),
+        "payload_id": uuid.uuid4(),
+        "namespace_id": uuid.uuid4(),
+        "content_profile": "text",
+    }
+
+    receipt = M1PgBodyStore._receipt_from_row(row)
+
+    assert receipt.payload_id == row["payload_id"]
+    assert receipt.digest == row["digest"]
+    assert receipt.byte_size == 5
+    assert receipt.canonical_bytes == b"hello"
+
+
 def test_native_grep_matcher_has_literal_regex_and_case_contract():
     insensitive = M1NativeGrepService._matcher("needle", regex=False, case_sensitive=False)
     sensitive = M1NativeGrepService._matcher("Needle", regex=False, case_sensitive=True)

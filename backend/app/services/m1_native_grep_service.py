@@ -16,6 +16,7 @@ from typing import Any
 import asyncpg
 
 from app.exceptions import ForbiddenError, ValidationError
+from app.services.document_service import _parse_markdown
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
@@ -36,6 +37,19 @@ class HeadBody:
     @property
     def text(self) -> str:
         return self.canonical_bytes.decode("utf-8", errors="strict")
+
+    @property
+    def search_text(self) -> str:
+        if self.surface == "document":
+            return _parse_markdown(self.text)[1]
+        return self.text
+
+    @property
+    def title(self) -> str:
+        if self.surface == "document":
+            metadata, _ = _parse_markdown(self.text)
+            return str(metadata.get("title") or self.path.rsplit("/", 1)[-1])
+        return self.path.rsplit("/", 1)[-1]
 
     @property
     def uri(self) -> str:
@@ -65,7 +79,8 @@ class M1NativeGrepService:
             "pm.selected_placement = 'pg-bodystore-v1'",
             "(v.owner_id = $1 OR EXISTS ("
             "SELECT 1 FROM vault_access va WHERE va.vault_id = v.id AND va.user_id = $1"
-            ") OR v.public_access IN ('reader', 'writer'))",
+            ") OR EXISTS (SELECT 1 FROM users u WHERE u.id = $1 AND u.is_admin = TRUE) "
+            "OR v.public_access IN ('reader', 'writer'))",
         ]
         params: list[Any] = [user_id]
         if vaults:
@@ -212,7 +227,7 @@ class M1NativeGrepService:
         for body in bodies:
             lines = [
                 {"line": number, "text": line.strip()}
-                for number, line in enumerate(body.text.splitlines(), start=1)
+                for number, line in enumerate(body.search_text.splitlines(), start=1)
                 if matcher(line)
             ]
             if lines:
@@ -222,6 +237,7 @@ class M1NativeGrepService:
                         "resource_type": body.surface,
                         "vault": body.vault,
                         "path": body.path,
+                        "title": body.title,
                         "revision": body.revision_id,
                         "content_hash": body.digest,
                         "matches": lines,
@@ -262,13 +278,22 @@ class M1NativeGrepService:
                 head_body: HeadBody = item["_body"]
                 if regex:
                     flags = 0 if case_sensitive else re.IGNORECASE
-                    new_text = re.sub(pattern, replace, head_body.text, flags=flags)
+                    new_search_text = re.sub(pattern, replace, head_body.search_text, flags=flags)
                 elif case_sensitive:
-                    new_text = head_body.text.replace(pattern, replace)
+                    new_search_text = head_body.search_text.replace(pattern, replace)
                 else:
-                    new_text = re.sub(re.escape(pattern), replace, head_body.text, flags=re.IGNORECASE)
-                if new_text == head_body.text:
+                    new_search_text = re.sub(
+                        re.escape(pattern), replace, head_body.search_text, flags=re.IGNORECASE
+                    )
+                if new_search_text == head_body.search_text:
                     continue
+                if head_body.surface == "document":
+                    metadata, _ = _parse_markdown(head_body.text)
+                    from app.services.document_service import _compose_markdown
+
+                    new_text = _compose_markdown(metadata, new_search_text)
+                else:
+                    new_text = new_search_text
                 result = await native.replace_text(
                     namespace_id=head_body.namespace_id,
                     surface=head_body.surface,
@@ -298,3 +323,83 @@ class M1NativeGrepService:
                 {"replace": replace, "replaced_resources": len(replacements), "replacements": replacements}
             )
         return response
+
+    @staticmethod
+    def _public_response(*, pattern: str, regex: bool, native: dict[str, Any]) -> dict[str, Any]:
+        """Translate internal resource-neutral facts to the frozen Document grep shape."""
+        if "by_resource" in native:
+            return {
+                "pattern": pattern,
+                "regex": regex,
+                "total_matches": native["total_matches"],
+                "total_docs": native["total_resources"],
+                "by_doc": native["by_resource"],
+            }
+        if "resources" in native:
+            files = [row["uri"] for row in native["resources"]]
+            return {
+                "pattern": pattern,
+                "regex": regex,
+                "n_files": len(files),
+                "files": files,
+            }
+        clean = []
+        for row in native.get("results", []):
+            clean.append(
+                {
+                    "uri": row["uri"],
+                    "vault": row["vault"],
+                    "path": row["path"],
+                    "title": row["title"],
+                    "resource_type": row.get("resource_type"),
+                    "revision": row.get("revision"),
+                    "content_hash": row.get("content_hash"),
+                    "matches": [
+                        {"section": None, "text": match["text"]}
+                        for match in row["matches"]
+                    ],
+                }
+            )
+        result: dict[str, Any] = {
+            "pattern": pattern,
+            "regex": regex,
+            "returned_docs": native.get("returned_resources", len(clean)),
+            "returned_matches": native.get("returned_matches", 0),
+            "total_docs": native.get("total_resources", 0),
+            "total_matches": native.get("total_matches", 0),
+            "truncated": native.get("truncated", False),
+            "results": clean,
+            # Kept as a compact receipt-oriented mirror for MCP callers. REST
+            # also preserves the additive identity on each GrepResult.
+            "measurement_resources": [
+                {
+                    key: row[key]
+                    for key in ("uri", "resource_type", "revision", "content_hash")
+                    if key in row
+                }
+                for row in native.get("results", [])
+            ],
+        }
+        if "replace" in native:
+            replacements_by_uri = {row["uri"]: row for row in native.get("replacements", [])}
+            result.update(
+                {
+                    "replace": native["replace"],
+                    "replaced_docs": native.get("replaced_resources", 0),
+                    "replacements": [
+                        {
+                            "uri": row["uri"],
+                            "path": row["path"],
+                            "title": row["title"],
+                            "commit": replacements_by_uri[row["uri"]]["revision"],
+                        }
+                        for row in native.get("results", [])
+                        if row["uri"] in replacements_by_uri
+                    ],
+                }
+            )
+        return result
+
+    async def grep_public(self, pattern: str, **kwargs) -> dict[str, Any]:
+        native = await self.grep(pattern, **kwargs)
+        return self._public_response(pattern=pattern, regex=bool(kwargs.get("regex")), native=native)

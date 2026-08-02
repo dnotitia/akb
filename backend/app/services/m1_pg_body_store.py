@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import dataclass
 
 import asyncpg
 
@@ -18,6 +19,19 @@ from app.services.m1_reference_payload_store import PreparedReferencePayload
 
 class PgBodyIntegrityError(RuntimeError):
     """A persisted body no longer agrees with its manifest facts."""
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPgTextBody:
+    """Receipt-quality facts returned only after byte-level verification."""
+
+    payload_id: uuid.UUID
+    namespace_id: uuid.UUID
+    digest: str
+    byte_size: int
+    canonical_bytes: bytes
+    selected_placement: str
+    verification_profile: str
 
 
 class M1PgBodyStore:
@@ -145,6 +159,19 @@ class M1PgBodyStore:
             raise PgBodyIntegrityError("PostgreSQL body verification profile mismatch")
         return canonical
 
+    @classmethod
+    def _receipt_from_row(cls, row) -> VerifiedPgTextBody:
+        canonical = cls._verify_row(row)
+        return VerifiedPgTextBody(
+            payload_id=row["payload_id"],
+            namespace_id=row["namespace_id"],
+            digest=row["digest"],
+            byte_size=row["byte_size"],
+            canonical_bytes=canonical,
+            selected_placement=row["selected_placement"],
+            verification_profile=row["verification_profile"],
+        )
+
     async def open_verified(self, payload_id: uuid.UUID) -> bytes:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -162,3 +189,36 @@ class M1PgBodyStore:
         if row is None:
             raise PgBodyIntegrityError(f"PostgreSQL body is missing: {payload_id}")
         return self._verify_row(row)
+
+    async def open_verified_receipt(self, payload_id: uuid.UUID) -> VerifiedPgTextBody:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT payload_id, namespace_id, content_profile, digest,
+                       byte_size, encoding, selected_placement,
+                       verification_profile, canonical_bytes
+                  FROM m1_reference_payloads
+                 WHERE payload_id = $1 AND selected_placement = $2
+                """,
+                payload_id,
+                self.selected_placement,
+            )
+        if row is None:
+            raise PgBodyIntegrityError(f"PostgreSQL body is missing: {payload_id}")
+        return self._receipt_from_row(row)
+
+    async def namespace_residue(self, namespace_id: uuid.UUID) -> dict[str, int]:
+        """Return bounded residue counts after a measurement namespace cleanup."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COUNT(*)::int AS bodies,
+                       COALESCE(SUM(byte_size), 0)::bigint AS body_bytes,
+                       COUNT(DISTINCT digest)::int AS distinct_digests
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1 AND selected_placement = $2
+                """,
+                namespace_id,
+                self.selected_placement,
+            )
+        return dict(row)

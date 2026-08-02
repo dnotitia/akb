@@ -29,6 +29,36 @@ from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
 
+LEGACY_DOCUMENT_SOURCE = "document"
+NATIVE_DOCUMENT_SOURCE = "native_document"
+NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
+
+
+def active_document_source_type(
+    *,
+    backend: str,
+    measurement_only: bool,
+    database: str,
+) -> str:
+    """Select one Document authority; fail closed on a partial native guard."""
+    if backend == "bare_git_current":
+        return LEGACY_DOCUMENT_SOURCE
+    if backend != "native_ledger_m1":
+        raise RuntimeError(f"unsupported document revision backend: {backend}")
+    if not measurement_only:
+        raise RuntimeError("native ledger requires measurement-only guard")
+    if database != NATIVE_MEASUREMENT_DATABASE:
+        raise RuntimeError("native ledger requires dedicated measurement database")
+    return NATIVE_DOCUMENT_SOURCE
+
+
+def _configured_document_source_type() -> str:
+    return active_document_source_type(
+        backend=settings.document_revision_backend,
+        measurement_only=settings.native_revision_m1_measurement_only,
+        database=settings.db_name,
+    )
+
 # Strips the indexing-time enrichment block emitted by
 # `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
 # at least one more KEY: line and a `\n\n` separator before the body.
@@ -151,6 +181,83 @@ def _normalize_vault_scope(vault: str | list[str] | None) -> list[str] | None:
 
 class SearchService:
 
+    async def _native_document_candidates(
+        self,
+        conn,
+        *,
+        user_uuid: uuid.UUID | None,
+        is_admin: bool,
+        vaults: list[str] | None,
+        collection: str | None,
+        doc_type: str | None,
+        tags: list[str] | None,
+        include_archived: bool,
+        source_uris: list[str] | None,
+    ) -> list[str]:
+        conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
+        params: list = []
+        if vaults:
+            params.append(vaults)
+            conditions.append(f"v.name = ANY(${len(params)})")
+        if collection:
+            params.append(collection)
+            conditions.append(f"r.current_path LIKE ${len(params)} || '%'")
+        if user_uuid is not None and not is_admin:
+            params.append(user_uuid)
+            index = len(params)
+            conditions.append(
+                f"(v.id IN (SELECT vault_id FROM vault_access WHERE user_id = ${index}) "
+                f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
+            )
+        rows = await conn.fetch(
+            f"""
+            SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
+                   p.byte_size, p.encoding, p.selected_placement,
+                   p.verification_profile, p.canonical_bytes
+              FROM native_resources r
+              JOIN vaults v ON v.id = r.namespace_id
+              JOIN native_revisions nr
+                ON nr.resource_id = r.resource_id
+               AND nr.revision_id = r.head_revision_id
+              JOIN native_payload_manifests pm
+                ON pm.payload_manifest_id = nr.payload_manifest_id
+              JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
+             WHERE {' AND '.join(conditions)}
+            """,
+            *params,
+        )
+        allowed_refs: set[tuple[str, str]] | None = None
+        if source_uris:
+            allowed_refs = set()
+            for uri in source_uris:
+                parsed = parse_uri(uri)
+                if parsed is not None and parsed.kind == "doc" and parsed.identifier:
+                    allowed_refs.add((parsed.vault, parsed.identifier))
+        from app.services.document_service import _parse_markdown
+        from app.services.m1_pg_body_store import M1PgBodyStore
+
+        candidates: list[str] = []
+        for row in rows:
+            if allowed_refs is not None and (
+                row["vault_name"], row["current_path"]
+            ) not in allowed_refs and (
+                row["vault_name"], str(row["resource_id"])
+            ) not in allowed_refs:
+                continue
+            metadata, _ = _parse_markdown(
+                M1PgBodyStore._verify_row(row).decode("utf-8", errors="strict")
+            )
+            if doc_type and (metadata.get("type") or "note") != doc_type:
+                continue
+            row_tags = set(metadata.get("tags") or [])
+            if tags and not row_tags.intersection(tags):
+                continue
+            if not include_archived and metadata.get("status", "draft") == "archived":
+                continue
+            candidates.append(str(row["resource_id"]))
+        return candidates
+
     async def search(
         self,
         query: str,
@@ -174,6 +281,8 @@ class SearchService:
         """
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
+
+        document_source = _configured_document_source_type()
 
         rerank_enabled = settings.rerank_enabled if rerank is None else settings.rerank_enabled and rerank
         vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
@@ -320,15 +429,28 @@ class SearchService:
                     conditions.append("d.status != 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
-                rows = await conn.fetch(
-                    f"""
-                    SELECT d.id FROM documents d
-                    JOIN vaults v ON d.vault_id = v.id
-                    WHERE {where_sql}
-                    """,
-                    *params,
-                )
-                candidate_source_ids = [str(r["id"]) for r in rows]
+                if document_source == NATIVE_DOCUMENT_SOURCE:
+                    candidate_source_ids = await self._native_document_candidates(
+                        conn,
+                        user_uuid=user_uuid,
+                        is_admin=is_admin,
+                        vaults=vaults,
+                        collection=collection,
+                        doc_type=doc_type,
+                        tags=tags,
+                        include_archived=include_archived,
+                        source_uris=source_uris,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT d.id FROM documents d
+                        JOIN vaults v ON d.vault_id = v.id
+                        WHERE {where_sql}
+                        """,
+                        *params,
+                    )
+                    candidate_source_ids = [str(r["id"]) for r in rows]
 
                 # Tables (skip when doc_type explicitly constrains to a
                 # non-table source). Tags/collection apply to documents
@@ -568,8 +690,13 @@ class SearchService:
     async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
+        document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
         for h in hits:
+            if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
+                # A selected backend has exactly one Document authority. Old
+                # vector points from the other arm are never hydrated.
+                continue
             if h.source_type not in by_type:
                 unknown_types.add(h.source_type)
                 continue
@@ -601,6 +728,63 @@ class SearchService:
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
                         "collection": r["collection"],
+                    }
+            if by_type[NATIVE_DOCUMENT_SOURCE]:
+                native_hits = {
+                    uuid.UUID(h.chunk_id): h
+                    for h in hits
+                    if h.source_type == NATIVE_DOCUMENT_SOURCE
+                }
+                rows = await conn.fetch(
+                    """
+                    SELECT c.id AS chunk_id, r.resource_id, r.current_path,
+                           r.head_revision_id, v.name AS vault_name,
+                           p.payload_id, p.namespace_id, p.content_profile,
+                           p.digest, p.byte_size, p.encoding,
+                           p.selected_placement, p.verification_profile,
+                           p.canonical_bytes
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_derived_heads dh
+                        ON dh.resource_id = dc.resource_id
+                       AND dh.revision_id = dc.revision_id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.lifecycle = 'live'
+                      JOIN vaults v ON v.id = r.namespace_id
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_document'
+                    """,
+                    list(native_hits),
+                )
+                from app.services.document_service import _parse_markdown
+                from app.services.m1_pg_body_store import M1PgBodyStore
+
+                for r in rows:
+                    # Hydration independently verifies the current Head body;
+                    # the derived chunk is only a candidate, never authority.
+                    metadata, _ = _parse_markdown(
+                        M1PgBodyStore._verify_row(r).decode("utf-8", errors="strict")
+                    )
+                    path = r["current_path"]
+                    collection = path.rsplit("/", 1)[0] if "/" in path else None
+                    meta[(NATIVE_DOCUMENT_SOURCE, str(r["resource_id"]))] = {
+                        "vault": r["vault_name"],
+                        "path": path,
+                        "title": metadata.get("title") or path.rsplit("/", 1)[-1],
+                        "doc_type": metadata.get("type") or "note",
+                        "summary": metadata.get("summary"),
+                        "tags": list(metadata.get("tags") or []),
+                        "collection": collection,
+                        "revision": r["head_revision_id"],
                     }
             if by_type["table"]:
                 rows = await conn.fetch(
@@ -664,7 +848,7 @@ class SearchService:
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
             # encodes it); table/file URIs need it passed in.
-            if h.source_type == "document":
+            if h.source_type in {"document", NATIVE_DOCUMENT_SOURCE}:
                 uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
                 uri = table_uri(m["vault"], m["title"], collection=m.get("collection"))
@@ -674,7 +858,7 @@ class SearchService:
                 continue
             results.append(
                 SearchResult(
-                    source_type=h.source_type,
+                    source_type=("document" if h.source_type == NATIVE_DOCUMENT_SOURCE else h.source_type),
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     collection=m.get("collection"),
@@ -842,6 +1026,25 @@ class SearchService:
 
         # Server-side limit clamp (issue #189) — same ceiling as search().
         limit = clamp_search_limit(limit)
+
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            from app.services.m1_native_grep_service import M1NativeGrepService
+
+            if user_id is None:
+                raise ValidationError("user_id required for native grep")
+            return await M1NativeGrepService(await get_pool()).grep_public(
+                pattern,
+                user_id=uuid.UUID(user_id) if isinstance(user_id, str) else user_id,
+                vaults=vaults,
+                collection=collection,
+                regex=regex,
+                case_sensitive=case_sensitive,
+                replace=replace,
+                actor=agent_id,
+                limit=limit,
+                count_only=count_only,
+                files_with_matches=files_with_matches,
+            )
 
         pool = await get_pool()
         async with pool.acquire() as conn:

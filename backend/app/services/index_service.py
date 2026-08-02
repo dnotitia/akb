@@ -26,10 +26,16 @@ logger = logging.getLogger("akb.index")
 # in sync with the DB CHECK constraint in migration 006. Keep both the
 # tuple (for runtime set-membership) and the Literal (for type checking).
 SOURCE_DOCUMENT: Literal["document"] = "document"
+SOURCE_NATIVE_DOCUMENT: Literal["native_document"] = "native_document"
 SOURCE_TABLE: Literal["table"] = "table"
 SOURCE_FILE: Literal["file"] = "file"
-SOURCE_TYPES: tuple[str, ...] = (SOURCE_DOCUMENT, SOURCE_TABLE, SOURCE_FILE)
-SourceType = Literal["document", "table", "file"]
+SOURCE_TYPES: tuple[str, ...] = (
+    SOURCE_DOCUMENT,
+    SOURCE_NATIVE_DOCUMENT,
+    SOURCE_TABLE,
+    SOURCE_FILE,
+)
+SourceType = Literal["document", "native_document", "table", "file"]
 
 
 @dataclass

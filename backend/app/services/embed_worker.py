@@ -119,6 +119,19 @@ async def _process_once() -> int:
     """Process one batch. Returns successfully-indexed count."""
     pool = await get_pool()
 
+    # The guarded native measurement arm feeds the existing chunk/vector
+    # pipeline from durable native invalidation intents. This hook runs before
+    # the normal claim so newly materialized chunks can be indexed in the same
+    # pass; legacy/default deployments never import or execute the consumer.
+    if (
+        settings.document_revision_backend == "native_ledger_m1"
+        and settings.native_revision_m1_measurement_only
+        and settings.db_name == "akb_revision_m1_measurement"
+    ):
+        from app.services.native_derived_worker import NativeDerivedWorker
+
+        await NativeDerivedWorker(pool).process_once()
+
     # Stage 1: claim. Tiny transaction; commits before any external
     # work begins.
     async with pool.acquire() as conn:
