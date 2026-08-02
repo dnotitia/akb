@@ -29,7 +29,7 @@ _DSN = os.environ.get(
 async def _can_connect() -> bool:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except OSError, asyncpg.PostgresError:
+    except (OSError, asyncpg.PostgresError):
         return False
     await conn.close()
     return True

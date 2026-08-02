@@ -161,9 +161,21 @@ _PRIVATE_RECEIPT_KEY_PARTS = {
     "line", "locator", "match", "name", "password", "path", "secret",
     "token", "url", "uri",
 }
-_SAFE_RECEIPT_TEXT_KEYS = {
-    "dense", "driver", "environment", "load_model", "node_class",
-    "storage_class", "tier", "topology", "vector_driver",
+_SAFE_RECEIPT_TEXT_VALUES = {
+    "dense": {"disabled", "enabled", "not-applicable", "sparse-only"},
+    "driver": {
+        "bare-git-current", "current", "fscas", "native-ledger",
+        "native-ledger-m1", "pgvector", "s3cas",
+    },
+    "environment": {"admin-dev", "ci", "local"},
+    "load_model": {"closed-loop", "paced"},
+    "node_class": {"control-plane", "multi-node", "single-node", "worker"},
+    "storage_class": {
+        "csi-cephfs-sc", "csi-rbd-sc", "filesystem-cas", "rwo", "rwx", "s3-cas",
+    },
+    "tier": {"E0", "E1a", "E1b", "E2", "E3"},
+    "topology": {"cross-vault", "multi-node", "same-vault", "single-node"},
+    "vector_driver": {"disabled", "pgvector", "qdrant", "seahorse"},
 }
 
 
@@ -183,7 +195,10 @@ def receipt_safe_profile(value: dict[str, Any]) -> dict[str, Any]:
                 nested = safe_dict(item)
                 if nested:
                     result[key] = nested
-            elif isinstance(item, str) and lowered in _SAFE_RECEIPT_TEXT_KEYS:
+            elif (
+                isinstance(item, str)
+                and item in _SAFE_RECEIPT_TEXT_VALUES.get(lowered, set())
+            ):
                 result[key] = item
         return result
 

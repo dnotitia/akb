@@ -155,6 +155,21 @@ def test_runtime_profile_keeps_coarse_numbers_but_binds_private_inputs():
     assert "secret" not in repr(safe)
 
 
+def test_runtime_profile_drops_unrecognized_text_even_under_coarse_keys():
+    adapter = _load("text")
+
+    safe = adapter.receipt_safe_profile(
+        {
+            "environment": "prod-private.internal token=secret",
+            "topology": "single-node",
+        }
+    )
+
+    assert safe["coarse"] == {"topology": "single-node"}
+    assert "prod-private" not in repr(safe)
+    assert "secret" not in repr(safe)
+
+
 def test_settled_search_hit_receipt_binds_locator_without_disclosing_it():
     adapter = _load("settled")
     locator = "akb://private-vault/doc/private/path.md?X-Amz-Signature=secret"

@@ -40,6 +40,7 @@ async def test_file_measurement_drains_native_intents_with_legacy_document_backe
 ):
     pool = _Pool()
     calls: list[object] = []
+    processed = iter((1, 1, 0))
 
     async def get_pool():
         return pool
@@ -53,7 +54,7 @@ async def test_file_measurement_drains_native_intents_with_legacy_document_backe
 
         async def process_once(self):
             calls.append(pool)
-            return 1
+            return next(processed)
 
     monkeypatch.setattr(embed_worker, "get_pool", get_pool)
     monkeypatch.setattr(embed_worker, "_claim_batch", claim_no_chunks)
@@ -63,5 +64,9 @@ async def test_file_measurement_drains_native_intents_with_legacy_document_backe
     monkeypatch.setattr(settings, "native_revision_m1_file_driver", "fscas")
     monkeypatch.setattr(settings, "db_name", "akb_revision_m1_measurement")
 
+    # Positive native-only work must keep BackfillRunner hot even when no
+    # chunks were materialized (for example direct-grep and delete intents).
+    assert await embed_worker._process_once() == 1
+    assert await embed_worker._process_once() == 1
     assert await embed_worker._process_once() == 0
-    assert calls == [pool]
+    assert calls == [pool, pool, pool]
