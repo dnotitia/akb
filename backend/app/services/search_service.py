@@ -1064,6 +1064,9 @@ class SearchService:
         """
         import re as _re
 
+        if pattern == "":
+            raise ValidationError("grep pattern must not be empty")
+
         # Mutual exclusion — issue #41.
         if count_only and files_with_matches:
             return {

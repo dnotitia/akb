@@ -861,13 +861,15 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| pattern | ✓ | Text or regex to search for |
+| pattern | ✓ | Non-empty text or regex to search for |
 | vault | | Limit to a specific vault (required for replace) |
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
 | replace | | Replacement string — triggers find-and-replace mode |
 | limit | | Max documents to return (default 20) |
+| count_only | | Return exact per-resource counts without snippets |
+| measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
 
 ## When to use akb_grep vs akb_search
 | Need | Tool |
@@ -901,6 +903,9 @@ Each replaced document gets its own git commit and is re-indexed for search.
 ## Result Structure
 Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
 `{section, text}` showing the section path and matched line.
+File results additionally include `resource_type: "file"`, their canonical URI,
+`revision`, and `content_hash`. If snippets hit response safety bounds,
+`truncated` is true and `truncation` reports the applied match/byte limits.
 When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
 
     "akb_drill_down": """# akb_drill_down — Section-Level Reader

@@ -211,14 +211,29 @@ class _Acquire:
 
 
 class _Conn:
-    def __init__(self, row):
+    def __init__(self, row, *, aggregate=None):
         self.row = row
+        self.aggregate = aggregate or {
+            "resource_count": 1,
+            "total_bytes": row["byte_size"],
+        }
         self.sql = ""
+        self.aggregate_sql = ""
         self.params = ()
+        self.body_fetches = 0
+
+    def transaction(self, **_kwargs):
+        return _Acquire(self)
+
+    async def fetchrow(self, sql, *params):
+        self.aggregate_sql = sql
+        self.params = params
+        return self.aggregate
 
     async def fetch(self, sql, *params):
         self.sql = sql
         self.params = params
+        self.body_fetches += 1
         return [self.row]
 
 
@@ -260,9 +275,37 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
     assert "rs.head_revision_id" in conn.sql
     assert "vault_access" in conn.sql
     assert "pg-bodystore-v1" in conn.sql
+    assert "substring(" in conn.sql
     assert "ESCAPE" in conn.sql
     assert conn.params[3:] == ("src", "src/%", resource_id)
     assert "rs.surface = ANY" in conn.sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("aggregate", "message"),
+    [
+        ({"resource_count": 10_001, "total_bytes": 10_001}, "candidate resources exceed"),
+        ({"resource_count": 1, "total_bytes": 128 * 1024 * 1024 + 1}, "candidate bytes exceed"),
+    ],
+)
+async def test_head_body_query_rejects_aggregate_before_materializing_bodies(
+    aggregate, message,
+):
+    conn = _Conn(_row(), aggregate=aggregate)
+    service = M1NativeGrepService(_Pool(conn))
+
+    with pytest.raises(ValidationError, match=message):
+        await service._head_bodies(
+            user_id=uuid.uuid4(),
+            vaults=None,
+            collection=None,
+            resource_id=None,
+            surfaces=("document", "file"),
+        )
+
+    assert conn.body_fetches == 0
+    assert "canonical_bytes" not in conn.aggregate_sql
 
 
 def test_public_surface_selection_keeps_w3a_document_only_and_guards_w3b():
@@ -271,3 +314,181 @@ def test_public_surface_selection_keeps_w3a_document_only_and_guards_w3b():
         "document",
         "file",
     )
+
+
+def _grep_body(*, text: str, path: str = "bounded.txt") -> HeadBody:
+    body = text.encode()
+    return HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="file",
+        path=path,
+        revision_id="a" * 40,
+        digest=hashlib.sha256(body).hexdigest(),
+        byte_size=len(body),
+        canonical_bytes=body,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("regex", [False, True])
+async def test_native_grep_rejects_empty_patterns_before_scanning(monkeypatch, regex):
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    scanned = False
+
+    async def head_bodies(**_kwargs):
+        nonlocal scanned
+        scanned = True
+        return []
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+
+    with pytest.raises(ValidationError, match="pattern must not be empty"):
+        await service.grep("", user_id=uuid.uuid4(), regex=regex)
+    assert scanned is False
+
+
+@pytest.mark.asyncio
+async def test_literal_grep_caps_materialized_matches_but_keeps_exact_totals(monkeypatch):
+    first = _grep_body(text="needle one\nneedle two\nneedle three\n", path="first.txt")
+    second = _grep_body(text="needle four\nneedle five\nneedle six\n", path="second.txt")
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [first, second]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_MATCHES_PER_RESOURCE", 2)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_TOTAL_MATCHES", 3)
+
+    result = await service.grep(
+        "needle", user_id=uuid.uuid4(), include_text_files=True,
+    )
+
+    assert result["total_resources"] == 2
+    assert result["total_matches"] == 6
+    assert result["returned_matches"] == 3
+    assert [len(row["matches"]) for row in result["results"]] == [2, 1]
+    assert result["truncated"] is True
+    assert result["truncation"]["reasons"] == [
+        "per_resource_match_limit",
+        "total_match_limit",
+    ]
+    assert result["truncation"]["limits"]["matches_per_resource"] == 2
+    assert result["truncation"]["limits"]["total_matches"] == 3
+
+
+@pytest.mark.asyncio
+async def test_grep_caps_each_snippet_and_per_resource_and_total_snippet_bytes(monkeypatch):
+    first = _grep_body(text=("needle " + "x" * 100 + "\n") * 3, path="first.txt")
+    second = _grep_body(text=("needle " + "y" * 100 + "\n") * 3, path="second.txt")
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [first, second]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SNIPPET_BYTES", 8)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SNIPPET_BYTES_PER_RESOURCE", 16)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_TOTAL_SNIPPET_BYTES", 24)
+
+    result = await service.grep(
+        "needle", user_id=uuid.uuid4(), include_text_files=True,
+    )
+    snippets = [
+        match["text"].encode()
+        for row in result["results"]
+        for match in row["matches"]
+    ]
+
+    assert result["total_matches"] == 6
+    assert sum(map(len, snippets)) <= 24
+    assert all(len(snippet) <= 8 for snippet in snippets)
+    assert result["truncation"]["reasons"] == [
+        "per_resource_snippet_byte_limit",
+        "snippet_byte_limit",
+        "total_snippet_byte_limit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_count_only_counts_without_materializing_snippets(monkeypatch):
+    body = _grep_body(text=("needle " + "x" * 10_000 + "\n") * 5)
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_MATCHES_PER_RESOURCE", 0)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_TOTAL_MATCHES", 0)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SNIPPET_BYTES", 0)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SNIPPET_BYTES_PER_RESOURCE", 0)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_TOTAL_SNIPPET_BYTES", 0)
+
+    result = await service.grep(
+        "needle", user_id=uuid.uuid4(), include_text_files=True, count_only=True,
+    )
+
+    assert result == {
+        "pattern": "needle",
+        "regex": False,
+        "searched_resources": 1,
+        "searched_bytes": body.byte_size,
+        "total_resources": 1,
+        "total_matches": 5,
+        "by_resource": {body.uri: 5},
+    }
+
+
+@pytest.mark.asyncio
+async def test_regex_worker_returns_bounded_materialization(monkeypatch):
+    body = _grep_body(text="".join(f"line {number}\n" for number in range(20)))
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_MATCHES_PER_RESOURCE", 2)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_TOTAL_MATCHES", 2)
+
+    result = await service.grep(
+        ".*", user_id=uuid.uuid4(), regex=True, include_text_files=True,
+    )
+
+    assert result["total_matches"] == 20
+    assert result["returned_matches"] == 2
+    assert len(result["results"][0]["matches"]) == 2
+    assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_regex_worker_rejects_serialized_output_over_hard_cap(monkeypatch):
+    body = _grep_body(text="needle\n")
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_CHILD_RESULT_BYTES", 64)
+
+    with pytest.raises(ValidationError, match="bounded worker output"):
+        await service.grep(
+            "needle", user_id=uuid.uuid4(), regex=True, include_text_files=True,
+        )
+
+
+def test_regex_worker_rejects_when_process_slots_are_exhausted(monkeypatch):
+    class NoSlot:
+        def acquire(self, *, blocking):
+            assert blocking is False
+            return False
+
+    monkeypatch.setattr(native_grep, "_REGEX_PROCESS_SLOTS", NoSlot())
+
+    with pytest.raises(AKBError, match="capacity exhausted") as error:
+        native_grep._run_regex_bounded(lambda: None, (), {}, 0.1)
+    assert error.value.status_code == 429

@@ -718,6 +718,7 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         limit=args.get("limit", 20),
         count_only=args.get("count_only", False),
         files_with_matches=args.get("files_with_matches", False),
+        measurement_include_text_files=args.get("measurement_include_text_files", False),
     )
     return result
 
