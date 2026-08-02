@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Any
 import uuid
 
 import asyncpg
@@ -223,6 +224,174 @@ def test_body_is_exact_sized_and_localized_chunk_hashes_reuse_content():
     assert len(before.encode()) == len(after.encode()) == 65_536
     assert set(CAPACITY._chunk_hashes(before)) & set(CAPACITY._chunk_hashes(after))
     assert set(CAPACITY._chunk_hashes(before)) != set(CAPACITY._chunk_hashes(after))
+
+
+class _FakeAcquire:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+
+class _FakePool:
+    def __init__(self) -> None:
+        self.connection = _FakeConnection()
+        self.closed = False
+
+    def acquire(self):
+        return _FakeAcquire(self.connection)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.executed.append((query, args))
+        return "DELETE 1"
+
+
+def _capacity_cell(cell_id: str) -> Any:
+    return CAPACITY.Cell(
+        "test", cell_id, 1, "same-vault", 1024, "localized",
+        "closed-loop", None, 1, CAPACITY.Timing(0, 1, 1, 1, 1, .01),
+    )
+
+
+def _configure_run(monkeypatch, pool: _FakePool, cells: list[Any]) -> None:
+    owner = uuid.uuid4()
+    monkeypatch.setattr(CAPACITY, "load_cells", lambda: (cells, {"test": "hash"}, "matrix-hash"))
+    monkeypatch.setattr(CAPACITY, "_required_pool_max_size", lambda: 24)
+
+    async def setup(_dsn: str, *, pool_max_size: int):
+        assert pool_max_size == 24
+        return pool, "akb_revision_m1_measurement_test", owner, []
+
+    monkeypatch.setattr(CAPACITY, "_setup", setup)
+    monkeypatch.setattr(CAPACITY, "required_environment", lambda name: "measurement-dsn" if name == "AKB_NATIVE_REVISION_MEASUREMENT_DSN" else (_ for _ in ()).throw(AssertionError(name)))
+    monkeypatch.setattr(CAPACITY, "source_revision", lambda: "a" * 40)
+    monkeypatch.setattr(CAPACITY, "run_artifact_path", lambda _name: Path("unused.json"))
+    monkeypatch.setattr(CAPACITY, "write_bound_json", lambda _path, _value: {"path": "unused.json", "sha256": "b" * 64})
+
+
+@pytest.mark.asyncio
+async def test_cell_teardown_deletes_only_its_private_namespace_set():
+    pool = _FakePool()
+    namespaces = [uuid.uuid4(), uuid.uuid4()]
+
+    await CAPACITY._teardown_cell(pool, namespaces)
+
+    assert pool.connection.executed == [
+        ("DELETE FROM vaults WHERE id=ANY($1::uuid[])", (namespaces,)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_tears_down_each_of_seventy_cells_before_starting_the_next_and_keeps_first_namespace_for_provenance(monkeypatch):
+    pool = _FakePool()
+    namespaces = [uuid.uuid4() for _ in range(CAPACITY.EXPECTED_CELL_COUNT)]
+    active: set[uuid.UUID] = set()
+    events: list[tuple[str, uuid.UUID]] = []
+    _configure_run(monkeypatch, pool, [_capacity_cell(f"cell-{index}") for index in range(CAPACITY.EXPECTED_CELL_COUNT)])
+
+    async def run_cell(_pool, _owner, cell, *, run_namespaces, pool_max_size):
+        assert not active, "a cell started before the preceding vault teardown"
+        namespace = namespaces[int(cell.cell_id.removeprefix("cell-"))]
+        run_namespaces.append(namespace)
+        active.add(namespace)
+        events.append(("run", namespace))
+        return {"closed": True}
+
+    async def teardown(_pool, namespaces):
+        assert len(namespaces) == 1
+        namespace = namespaces[0]
+        assert namespace in active
+        active.remove(namespace)
+        events.append(("teardown", namespace))
+
+    observed_provenance: list[uuid.UUID] = []
+
+    def provenance(_revision: str, _database: str, namespace: uuid.UUID):
+        observed_provenance.append(namespace)
+        return ({"source_revision": "a" * 40}, {"storage_profile": {}})
+
+    monkeypatch.setattr(CAPACITY, "_run_cell", run_cell)
+    monkeypatch.setattr(CAPACITY, "_teardown_cell", teardown, raising=False)
+    monkeypatch.setattr(CAPACITY, "receipt_provenance", provenance)
+
+    result = await CAPACITY.run()
+
+    assert events == [(action, namespace) for namespace in namespaces for action in ("run", "teardown")]
+    assert not active
+    assert observed_provenance == [namespaces[0]]
+    assert result["cell_count"] == CAPACITY.EXPECTED_CELL_COUNT
+    assert all("DELETE FROM vaults" not in query for query, _args in pool.connection.executed)
+    assert pool.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_fails_closed_without_artifact_when_cell_teardown_fails(monkeypatch):
+    pool = _FakePool()
+    namespace = uuid.uuid4()
+    artifact_written = False
+    _configure_run(monkeypatch, pool, [_capacity_cell("first"), _capacity_cell("must-not-run")])
+
+    async def run_cell(_pool, _owner, cell, *, run_namespaces, pool_max_size):
+        assert cell.cell_id == "first"
+        run_namespaces.append(namespace)
+        return {"closed": True}
+
+    async def teardown(_pool, namespaces):
+        assert namespaces == [namespace]
+        raise RuntimeError("database cleanup failed")
+
+    def write_artifact(_path, _value):
+        nonlocal artifact_written
+        artifact_written = True
+        return {"path": "unused.json", "sha256": "b" * 64}
+
+    monkeypatch.setattr(CAPACITY, "_run_cell", run_cell)
+    monkeypatch.setattr(CAPACITY, "_teardown_cell", teardown, raising=False)
+    monkeypatch.setattr(CAPACITY, "write_bound_json", write_artifact)
+
+    with pytest.raises(CAPACITY.AdapterError, match="capacity cell teardown failed: test/first"):
+        await CAPACITY.run()
+
+    assert artifact_written is False
+    assert pool.closed is True
+    assert all("DELETE FROM vaults" not in query for query, _args in pool.connection.executed)
+
+
+@pytest.mark.asyncio
+async def test_run_tears_down_partially_allocated_cell_before_propagating_its_failure(monkeypatch):
+    pool = _FakePool()
+    namespace = uuid.uuid4()
+    teardown_calls: list[list[uuid.UUID]] = []
+    _configure_run(monkeypatch, pool, [_capacity_cell("first"), _capacity_cell("must-not-run")])
+
+    async def run_cell(_pool, _owner, cell, *, run_namespaces, pool_max_size):
+        assert cell.cell_id == "first"
+        run_namespaces.append(namespace)
+        raise RuntimeError("cell setup failed after vault allocation")
+
+    async def teardown(_pool, namespaces):
+        teardown_calls.append(namespaces.copy())
+
+    monkeypatch.setattr(CAPACITY, "_run_cell", run_cell)
+    monkeypatch.setattr(CAPACITY, "_teardown_cell", teardown, raising=False)
+
+    with pytest.raises(RuntimeError, match="cell setup failed after vault allocation"):
+        await CAPACITY.run()
+
+    assert teardown_calls == [[namespace]]
+    assert pool.closed is True
 
 
 DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")  # pragma: allowlist secret

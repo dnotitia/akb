@@ -325,6 +325,21 @@ async def _new_vault(pool: asyncpg.Pool, owner: uuid.UUID) -> uuid.UUID:
         return await conn.fetchval("INSERT INTO vaults (name, git_path, owner_id) VALUES ($1, $2, $3) RETURNING id", f"m1-capacity-{uuid.uuid4().hex}", "/tmp/m1-capacity-unused.git", owner)
 
 
+async def _teardown_cell(pool: asyncpg.Pool, namespace_ids: list[uuid.UUID]) -> None:
+    """Remove only one completed cell's private vaults and cascaded history.
+
+    A capacity run can contain many cells, so retaining their complete revision
+    history until the terminal cleanup turns the final DELETE into an unrelated
+    long-running operation.  This statement remains bounded by one cell (at
+    most its cross-vault concurrency), relies on the vault foreign-key
+    cascades, and never reaches another run's random namespace.
+    """
+    if not namespace_ids:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM vaults WHERE id=ANY($1::uuid[])", namespace_ids)
+
+
 async def _pending(pool: asyncpg.Pool, namespace_id: uuid.UUID) -> int:
     async with pool.acquire() as conn:
         return int(await conn.fetchval("SELECT count(*) FROM native_invalidation_intents WHERE namespace_id=$1 AND completed_at IS NULL", namespace_id))
@@ -554,9 +569,15 @@ async def _run_cell(
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> dict[str, Any]:
-    vaults = [await _new_vault(pool, owner) for _ in range(cell.concurrency if cell.topology == "cross-vault" else 1)]
-    if run_namespaces is not None:
-        run_namespaces.extend(vaults)
+    vaults: list[uuid.UUID] = []
+    for _ in range(cell.concurrency if cell.topology == "cross-vault" else 1):
+        namespace = await _new_vault(pool, owner)
+        vaults.append(namespace)
+        # Register every allocation immediately.  If setup fails partway
+        # through a cross-vault cell, run() can still tear down the private
+        # namespaces that were already created.
+        if run_namespaces is not None:
+            run_namespaces.append(namespace)
     store = M1PgBodyStore(pool); service = NativeRevisionService(pool, payload_store=store); grep = M1NativeGrepService(pool, body_store=store)
     states: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
     for index in range(cell.concurrency):
@@ -737,23 +758,45 @@ async def run() -> dict[str, Any]:
     dsn = required_environment("AKB_NATIVE_REVISION_MEASUREMENT_DSN")
     pool_max_size = _required_pool_max_size()
     pool, database, owner, _ = await _setup(dsn, pool_max_size=pool_max_size)
-    namespaces: list[uuid.UUID] = []
+    failure: BaseException | None = None
     try:
         results = []
+        receipt_namespace: uuid.UUID | None = None
         for cell in cells:
-            result = await _run_cell(pool, owner, cell, run_namespaces=namespaces, pool_max_size=pool_max_size); results.append(result)
-            if not result["closed"]:
-                raise AdapterError(f"capacity cell closed unsuccessfully: {cell.matrix}/{cell.cell_id}")
-        revision = source_revision(); runtime, environment = receipt_provenance(revision, database, namespaces[0])
+            cell_namespaces: list[uuid.UUID] = []
+            try:
+                result = await _run_cell(pool, owner, cell, run_namespaces=cell_namespaces, pool_max_size=pool_max_size)
+                results.append(result)
+                if receipt_namespace is None:
+                    if not cell_namespaces:
+                        raise AdapterError(f"capacity cell allocated no vault namespace: {cell.matrix}/{cell.cell_id}")
+                    receipt_namespace = cell_namespaces[0]
+                if not result["closed"]:
+                    raise AdapterError(f"capacity cell closed unsuccessfully: {cell.matrix}/{cell.cell_id}")
+            finally:
+                if cell_namespaces:
+                    try:
+                        await _teardown_cell(pool, cell_namespaces)
+                    except Exception as exc:
+                        raise AdapterError(f"capacity cell teardown failed: {cell.matrix}/{cell.cell_id}") from exc
+        if receipt_namespace is None:
+            raise AdapterError("capacity run allocated no vault namespace")
+        revision = source_revision(); runtime, environment = receipt_provenance(revision, database, receipt_namespace)
         environment["storage_profile"].update({"body_store": "pg-bodystore-v1", "derived_projection": "measurement-only-current-head-coalescing-v1", "claim_scope": "measurement_only", "pool_max_size": pool_max_size})
         artifact = write_bound_json(run_artifact_path("native-capacity-derived-cells"), {"protocol_version": PROTOCOL_VERSION, "matrix_hashes": matrix_hashes, "matrix_set_sha256": matrix_set_hash, "cells": results})
         return {"protocol_version": PROTOCOL_VERSION, "matrix_set_sha256": matrix_set_hash, "matrix_hashes": matrix_hashes, "cell_count": len(results), "closed": all(item["closed"] for item in results), "receipt": {"runtime": runtime, "environment": environment, "resources": {"snapshot": {"cell_count": len(results), "measurement_only": True, "pool_max_size": pool_max_size}}, "requests": {"artifact_digest": artifact["sha256"]}}, "provenance": {"adapter": {"identity": "akb.backend.scripts.native_revision_m1_capacity_adapter", "source_revision": revision}, "cells_artifact": artifact}}
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        async with pool.acquire() as conn:
-            if namespaces:
-                await conn.execute("DELETE FROM vaults WHERE id=ANY($1::uuid[])", namespaces)
-            await conn.execute("DELETE FROM users WHERE id=$1", owner)
-        await pool.close()
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM users WHERE id=$1", owner)
+        except Exception:
+            if failure is None:
+                raise
+        finally:
+            await pool.close()
 
 
 def main() -> int:
