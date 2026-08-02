@@ -12,14 +12,14 @@ from pathlib import Path
 
 from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.services.adapters import s3_adapter
 from app.services.m1_binary_store import BinaryStore, FilesystemCAS, PreparedBinary, S3CAS
 from app.services.resource_hash import HASH_ALGORITHM, is_sha256_hex
 from app.services.uri_service import file_uri
-from app.util.text import normalize_collection_path
+from app.util.text import normalize_collection_path, validate_file_name
 
 
 TRANSFER_TTL_SECONDS = 3600
@@ -112,12 +112,16 @@ async def _tombstone_native_text_file(
 
 
 def _is_native_text(mime_type: str, data: bytes) -> bool:
-    if not mime_type.lower().startswith("text/") or b"\x00" in data:
+    if not mime_type.lower().startswith("text/"):
         return False
+    if b"\x00" in data:
+        raise ValidationError("declared text must be valid UTF-8 text without NUL bytes")
     try:
         data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
+    except UnicodeDecodeError as exc:
+        raise ValidationError(
+            "declared text must be valid UTF-8 text without NUL bytes"
+        ) from exc
     return True
 
 
@@ -178,6 +182,10 @@ class MeasurementFileService:
     ) -> dict:
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        try:
+            validate_file_name(filename)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         token = _new_token()
         requested_file_id = uuid.uuid4()
         collection_path = normalize_collection_path(collection)
@@ -319,7 +327,11 @@ class MeasurementFileService:
             await self._delete_intent(intent["id"])
             raise AKBError("Uploaded file hash mismatch; transfer intent was cleaned up", status_code=409)
 
-        is_text = _is_native_text(intent["mime_type"], data)
+        try:
+            is_text = _is_native_text(intent["mime_type"], data)
+        except ValidationError:
+            await self._delete_intent(intent["id"])
+            raise
         prepared = None if is_text else _store().prepare_verified(str(vault_id), data, digest, len(data))
         async with pool.acquire() as conn:
             async with conn.transaction():

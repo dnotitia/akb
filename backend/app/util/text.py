@@ -146,6 +146,15 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
     return "/".join(parts)
 
 
+def validate_file_name(name: str) -> str:
+    """Require the File identity component to be one logical path segment."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("file name must be a non-empty single path segment")
+    if "/" in name:
+        raise ValueError("file name must be a single path segment")
+    return name
+
+
 _FUZZY_HINT_LIST_LIMIT = 15
 
 

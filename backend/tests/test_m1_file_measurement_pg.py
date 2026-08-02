@@ -220,6 +220,75 @@ async def test_mismatch_expiry_and_failed_publish_leave_no_public_file(context, 
         assert await conn.fetchval("SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", uuid.UUID(failed["file_id"])) == 1
 
 
+@pytest.mark.parametrize("data", [b"declared text\x00body", b"declared text \xff body"])
+@pytest.mark.asyncio
+async def test_declared_text_rejects_non_text_bytes_without_publishing_authority(
+    context, data,
+):
+    pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="notes",
+        filename="invalid.txt",
+        actor_id="tester",
+        mime_type="text/plain",
+        description="",
+        content_hash=digest,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    with pytest.raises(AKBError, match="valid UTF-8 text without NUL") as error:
+        await service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest)
+
+    assert error.value.status_code == 422
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_resources WHERE resource_id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_revisions WHERE resource_id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_reference_payloads WHERE digest = $1", digest,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", file_id,
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_non_text_mime_with_binary_bytes_remains_binary(context):
+    _pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    data = b"real binary\x00\xff"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="",
+        filename="real.bin",
+        actor_id="tester",
+        mime_type="application/octet-stream",
+        description="",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+
+    assert confirmed["storage_driver"] == "fscas"
+    assert confirmed["native_resource_id"] is None
+
+
 @pytest.mark.asyncio
 async def test_native_text_requires_concrete_atomic_result_and_verified_open_delete(context):
     pool, vault_id, _denied, vault_name = context
