@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import time
 import uuid
 
 import pytest
 
-from app.exceptions import ValidationError
-from app.services.m1_native_grep_service import M1NativeGrepService
+from app.exceptions import AKBError, ValidationError
+from app.services import m1_native_grep_service as native_grep
+from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 
 
@@ -70,6 +73,122 @@ def test_native_grep_matcher_has_literal_regex_and_case_contract():
     assert regex("Needful")
     with pytest.raises(ValidationError, match="Invalid regex"):
         M1NativeGrepService._matcher("(", regex=True, case_sensitive=False)
+
+
+@pytest.mark.asyncio
+async def test_adversarial_regex_is_off_loop_and_fails_within_bound(monkeypatch):
+    body = HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="file",
+        path="slow.txt",
+        revision_id="a" * 40,
+        digest="b" * 64,
+        byte_size=27,
+        canonical_bytes=(b"a" * 26) + b"!",
+    )
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_REGEX_TIMEOUT_SECONDS", 0.05)
+    ticks = 0
+    stop = False
+
+    async def heartbeat():
+        nonlocal ticks
+        while not stop:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    ticker = asyncio.create_task(heartbeat())
+    started = time.monotonic()
+    try:
+        with pytest.raises(AKBError, match="timed out") as error:
+            await service.grep(
+                r"(a+)+$", user_id=uuid.uuid4(), regex=True,
+                include_text_files=True,
+            )
+    finally:
+        stop = True
+        await ticker
+
+    assert error.value.status_code == 408
+    assert time.monotonic() - started < 2
+    assert ticks > 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_regex_worker_preserves_exact_match_receipt(monkeypatch):
+    body = HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="file",
+        path="src/main.py",
+        revision_id="a" * 40,
+        digest="b" * 64,
+        byte_size=15,
+        canonical_bytes=b"Needful\nneedle\n",
+    )
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    result = await service.grep(
+        r"need(le|ful)", user_id=uuid.uuid4(), regex=True,
+        include_text_files=True,
+    )
+
+    assert result["searched_bytes"] == body.byte_size
+    assert result["total_matches"] == 2
+    assert result["results"] == [{
+        "uri": body.uri,
+        "resource_type": "file",
+        "vault": "measure",
+        "path": "src/main.py",
+        "title": "main.py",
+        "revision": body.revision_id,
+        "content_hash": body.digest,
+        "matches": [
+            {"line": 1, "text": "Needful"},
+            {"line": 2, "text": "needle"},
+        ],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_native_grep_rejects_unbounded_pattern_and_candidate_bytes(monkeypatch):
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_PATTERN_BYTES", 8)
+
+    with pytest.raises(ValidationError, match="pattern exceeds"):
+        await service.grep("x" * 9, user_id=uuid.uuid4(), regex=True)
+
+    body = HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="document",
+        path="large.md",
+        revision_id="a" * 40,
+        digest="b" * 64,
+        byte_size=9,
+        canonical_bytes=b"123456789",
+    )
+
+    async def head_bodies(**_kwargs):
+        return [body]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SEARCH_BYTES", 8)
+    with pytest.raises(ValidationError, match="candidate bytes exceed"):
+        await service.grep("x", user_id=uuid.uuid4())
 
 
 class _Acquire:

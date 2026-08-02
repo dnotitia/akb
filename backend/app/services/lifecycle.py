@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -148,6 +148,9 @@ def start_workers() -> None:
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
     started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "external_git_poller", "bm25_stats_refresher", "vault_backfill"]
+    if m1_file_transfer_reaper.enabled():
+        m1_file_transfer_reaper.start()
+        started.append("m1_file_transfer_reaper")
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
@@ -209,6 +212,7 @@ def start_workers() -> None:
 
 async def stop_workers() -> None:
     await get_role_sync().stop_reconcile_timer()
+    await m1_file_transfer_reaper.stop()
     await audit_log.stop_uploader()
     await tool_usage.stop()
     await events_publisher.stop()

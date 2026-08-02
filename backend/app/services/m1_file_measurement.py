@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -23,6 +24,7 @@ from app.util.text import normalize_collection_path, validate_file_name
 
 
 TRANSFER_TTL_SECONDS = 3600
+TRANSFER_REAP_BATCH_SIZE = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +131,10 @@ def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _new_token() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
 
@@ -165,10 +171,23 @@ class MeasurementFileService:
         return f"{self._base_url}/api/v1/files/transfer/{token}"
 
     async def reap_transfer_intents(self, conn=None) -> int:
-        """Delete expired tokens and their bounded staging bodies."""
+        """Delete one bounded batch of expired tokens and staging bodies."""
         if conn is not None:
             result = await conn.execute(
-                "DELETE FROM m1_file_transfer_intents WHERE expires_at <= NOW()"
+                """
+                WITH expired AS (
+                    SELECT id
+                      FROM m1_file_transfer_intents
+                     WHERE expires_at <= NOW()
+                     ORDER BY expires_at, id
+                     LIMIT $1
+                     FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM m1_file_transfer_intents AS intent
+                 USING expired
+                 WHERE intent.id = expired.id
+                """,
+                TRANSFER_REAP_BATCH_SIZE,
             )
             return int(result.rsplit(" ", 1)[-1])
         pool = await get_pool()
@@ -247,7 +266,7 @@ class MeasurementFileService:
             raise AKBError("measurement PUT body is required", status_code=400)
         if body is not None and len(body) > settings.native_revision_m1_file_transfer_max_bytes:
             raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
-        actual_digest = hashlib.sha256(body).hexdigest() if body is not None else None
+        actual_digest = await asyncio.to_thread(_sha256_hex, body) if body is not None else None
         mismatch = False
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -318,7 +337,7 @@ class MeasurementFileService:
             raise NotFoundError("File", file_id)
 
         data = bytes(intent["body"])
-        digest = hashlib.sha256(data).hexdigest()
+        digest = await asyncio.to_thread(_sha256_hex, data)
         declared = intent["declared_content_hash"]
         if digest != intent["actual_content_hash"] or len(data) != intent["actual_size"]:
             await self._delete_intent(intent["id"])
@@ -332,7 +351,11 @@ class MeasurementFileService:
         except ValidationError:
             await self._delete_intent(intent["id"])
             raise
-        prepared = None if is_text else _store().prepare_verified(str(vault_id), data, digest, len(data))
+        prepared = None
+        if not is_text:
+            prepared = await asyncio.to_thread(
+                lambda: _store().prepare_verified(str(vault_id), data, digest, len(data)),
+            )
         async with pool.acquire() as conn:
             async with conn.transaction():
                 locked = await conn.fetchrow(
@@ -499,7 +522,9 @@ class MeasurementFileService:
             row["storage_locator"], row["content_hash"], row["size_bytes"],
             "s3" if row["storage_driver"] == "s3cas" else "fscas",
         )
-        return _store().open_verified(str(row["vault_id"]), prepared)
+        return await asyncio.to_thread(
+            lambda: _store().open_verified(str(row["vault_id"]), prepared),
+        )
 
     async def _response(self, row: dict, *, vault_name: str | None = None) -> dict:
         resolved_vault = vault_name or row.get("vault_name")

@@ -8,18 +8,28 @@ Derived chunks, embeddings, and indexes are never result authority.
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
 
-from app.exceptions import ForbiddenError, ValidationError
+from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
+
+
+NATIVE_GREP_MAX_PATTERN_BYTES = 4096
+NATIVE_GREP_MAX_REPLACEMENT_BYTES = 4096
+NATIVE_GREP_MAX_SEARCH_BYTES = 128 * 1024 * 1024
+NATIVE_GREP_REGEX_TIMEOUT_SECONDS = 5.0
+_REGEX_PROCESS_STOP_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +67,149 @@ class HeadBody:
             return doc_uri(self.vault, self.path)
         collection = self.path.rsplit("/", 1)[0] if "/" in self.path else None
         return file_uri(self.vault, str(self.resource_id), collection=collection)
+
+
+def _scan_bodies_sync(
+    bodies: list[HeadBody],
+    pattern: str,
+    *,
+    regex: bool,
+    case_sensitive: bool,
+) -> list[dict[str, Any]]:
+    """Run exact Head matching outside the serving event loop."""
+    matcher = M1NativeGrepService._matcher(
+        pattern, regex=regex, case_sensitive=case_sensitive,
+    )
+    matched: list[dict[str, Any]] = []
+    for body_index, body in enumerate(bodies):
+        search_text = body.search_text
+        lines = [
+            {"line": number, "text": line.strip()}
+            for number, line in enumerate(search_text.splitlines(), start=1)
+            if matcher(line)
+        ]
+        if not lines:
+            continue
+        item: dict[str, Any] = {
+            "uri": body.uri,
+            "resource_type": body.surface,
+            "vault": body.vault,
+            "path": body.path,
+            "title": body.title,
+            "revision": body.revision_id,
+            "content_hash": body.digest,
+            "matches": lines,
+            "_body_index": body_index,
+        }
+        matched.append(item)
+    return matched
+
+
+def _head_bodies_from_rows(rows) -> list[HeadBody]:
+    bodies: list[HeadBody] = []
+    for row in rows:
+        canonical = M1PgBodyStore._verify_row(row)
+        bodies.append(
+            HeadBody(
+                namespace_id=row["namespace_id"],
+                vault=row["vault"],
+                resource_id=row["resource_id"],
+                surface=row["surface"],
+                path=row["current_path"],
+                revision_id=row["head_revision_id"],
+                digest=row["digest"],
+                byte_size=row["byte_size"],
+                canonical_bytes=canonical,
+            )
+        )
+    return bodies
+
+
+def _replace_bodies_sync(
+    bodies: list[HeadBody],
+    pattern: str,
+    replace: str,
+    *,
+    regex: bool,
+    case_sensitive: bool,
+) -> list[str]:
+    replacements = []
+    for body in bodies:
+        search_text = body.search_text
+        if regex:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            replacements.append(re.sub(pattern, replace, search_text, flags=flags))
+        elif case_sensitive:
+            replacements.append(search_text.replace(pattern, replace))
+        else:
+            replacements.append(
+                re.sub(re.escape(pattern), replace, search_text, flags=re.IGNORECASE)
+            )
+    return replacements
+
+
+def _regex_child(connection, operation, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """One-shot spawned worker; the parent kills it if Python ``re`` stalls."""
+    try:
+        result = operation(*args, **kwargs)
+        connection.send(("ok", result))
+    except ValidationError as exc:
+        connection.send(("validation", exc.message))
+    except re.error as exc:
+        connection.send(("validation", f"Invalid regex replacement: {exc}"))
+    except BaseException as exc:  # noqa: BLE001 — isolate worker failures from API process
+        connection.send(("error", type(exc).__name__))
+    finally:
+        connection.close()
+
+
+class _RegexScanTimedOut(RuntimeError):
+    pass
+
+
+def _terminate_regex_process(process) -> None:
+    if not process.is_alive():
+        process.join()
+        return
+    process.terminate()
+    process.join(_REGEX_PROCESS_STOP_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(_REGEX_PROCESS_STOP_SECONDS)
+
+
+def _run_regex_bounded(operation, args: tuple[Any, ...], kwargs: dict[str, Any], timeout: float):
+    """Run one regex operation in a disposable process with a hard wall-clock bound."""
+    context = multiprocessing.get_context("spawn")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_regex_child,
+        args=(sending, operation, args, kwargs),
+        name="m1-native-regex",
+        daemon=True,
+    )
+    deadline = time.monotonic() + timeout
+    started = False
+    try:
+        process.start()
+        started = True
+        sending.close()
+        if not receiving.poll(max(0.0, deadline - time.monotonic())):
+            raise _RegexScanTimedOut
+        try:
+            outcome, payload = receiving.recv()
+        except EOFError as exc:
+            raise RuntimeError("native grep regex worker exited without a result") from exc
+        if outcome == "validation":
+            raise ValidationError(payload)
+        if outcome != "ok":
+            raise RuntimeError(f"native grep regex worker failed ({payload})")
+        return payload
+    finally:
+        receiving.close()
+        sending.close()
+        if started:
+            _terminate_regex_process(process)
 
 
 class M1NativeGrepService:
@@ -127,23 +280,7 @@ class M1NativeGrepService:
                 *params,
             )
 
-        bodies: list[HeadBody] = []
-        for row in rows:
-            canonical = M1PgBodyStore._verify_row(row)
-            bodies.append(
-                HeadBody(
-                    namespace_id=row["namespace_id"],
-                    vault=row["vault"],
-                    resource_id=row["resource_id"],
-                    surface=row["surface"],
-                    path=row["current_path"],
-                    revision_id=row["head_revision_id"],
-                    digest=row["digest"],
-                    byte_size=row["byte_size"],
-                    canonical_bytes=canonical,
-                )
-            )
-        return bodies
+        return await asyncio.to_thread(_head_bodies_from_rows, rows)
 
     async def _require_write_access(
         self,
@@ -224,8 +361,19 @@ class M1NativeGrepService:
             raise ValidationError("actor is required for native grep replacement")
         if limit < 1 or limit > 1000:
             raise ValidationError("limit must be between 1 and 1000")
+        if len(pattern.encode("utf-8")) > NATIVE_GREP_MAX_PATTERN_BYTES:
+            raise ValidationError(
+                f"grep pattern exceeds {NATIVE_GREP_MAX_PATTERN_BYTES} UTF-8 bytes"
+            )
+        if replace is not None and len(replace.encode("utf-8")) > NATIVE_GREP_MAX_REPLACEMENT_BYTES:
+            raise ValidationError(
+                f"grep replacement exceeds {NATIVE_GREP_MAX_REPLACEMENT_BYTES} UTF-8 bytes"
+            )
 
-        matcher = self._matcher(pattern, regex=regex, case_sensitive=case_sensitive)
+        # Compilation is bounded by the pattern limit and preserves the old
+        # fail-fast invalid-pattern response before the candidate query.
+        if regex:
+            self._matcher(pattern, regex=True, case_sensitive=case_sensitive)
         bodies = await self._head_bodies(
             user_id=user_id,
             vaults=vaults,
@@ -233,34 +381,44 @@ class M1NativeGrepService:
             resource_id=resource_id,
             surfaces=self._selected_surfaces(include_text_files=include_text_files),
         )
-        matched: list[dict[str, Any]] = []
-        for body in bodies:
-            lines = [
-                {"line": number, "text": line.strip()}
-                for number, line in enumerate(body.search_text.splitlines(), start=1)
-                if matcher(line)
-            ]
-            if lines:
-                matched.append(
-                    {
-                        "uri": body.uri,
-                        "resource_type": body.surface,
-                        "vault": body.vault,
-                        "path": body.path,
-                        "title": body.title,
-                        "revision": body.revision_id,
-                        "content_hash": body.digest,
-                        "matches": lines,
-                        "_body": body,
-                    }
+        searched_bytes = sum(body.byte_size for body in bodies)
+        if searched_bytes > NATIVE_GREP_MAX_SEARCH_BYTES:
+            raise ValidationError(
+                f"native grep candidate bytes exceed {NATIVE_GREP_MAX_SEARCH_BYTES}"
+            )
+        if regex:
+            try:
+                matched = await asyncio.to_thread(
+                    _run_regex_bounded,
+                    _scan_bodies_sync,
+                    (bodies, pattern),
+                    {"regex": True, "case_sensitive": case_sensitive},
+                    NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
                 )
+            except _RegexScanTimedOut as exc:
+                raise AKBError(
+                    "native grep regex execution timed out",
+                    status_code=408,
+                ) from exc
+        else:
+            # Literal matching is linear but may still traverse the complete
+            # bounded corpus, so keep it off the request event loop too.
+            matched = await asyncio.to_thread(
+                _scan_bodies_sync,
+                bodies,
+                pattern,
+                regex=False,
+                case_sensitive=case_sensitive,
+            )
+        for item in matched:
+            item["_body"] = bodies[item.pop("_body_index")]
 
         total_matches = sum(len(item["matches"]) for item in matched)
         base = {
             "pattern": pattern,
             "regex": regex,
             "searched_resources": len(bodies),
-            "searched_bytes": sum(body.byte_size for body in bodies),
+            "searched_bytes": searched_bytes,
             "total_resources": len(matched),
             "total_matches": total_matches,
         }
@@ -284,17 +442,32 @@ class M1NativeGrepService:
                 namespace_ids={item["_body"].namespace_id for item in selected},
             )
             native = NativeRevisionService(self.pool, payload_store=self.body_store)
-            for item in selected:
-                head_body: HeadBody = item["_body"]
-                if regex:
-                    flags = 0 if case_sensitive else re.IGNORECASE
-                    new_search_text = re.sub(pattern, replace, head_body.search_text, flags=flags)
-                elif case_sensitive:
-                    new_search_text = head_body.search_text.replace(pattern, replace)
-                else:
-                    new_search_text = re.sub(
-                        re.escape(pattern), replace, head_body.search_text, flags=re.IGNORECASE
+            selected_bodies = [item["_body"] for item in selected]
+            if regex:
+                try:
+                    replacement_texts = await asyncio.to_thread(
+                        _run_regex_bounded,
+                        _replace_bodies_sync,
+                        (selected_bodies, pattern, replace),
+                        {"regex": True, "case_sensitive": case_sensitive},
+                        NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
                     )
+                except _RegexScanTimedOut as exc:
+                    raise AKBError(
+                        "native grep regex replacement timed out",
+                        status_code=408,
+                    ) from exc
+            else:
+                replacement_texts = await asyncio.to_thread(
+                    _replace_bodies_sync,
+                    selected_bodies,
+                    pattern,
+                    replace,
+                    regex=False,
+                    case_sensitive=case_sensitive,
+                )
+            for item, new_search_text in zip(selected, replacement_texts, strict=True):
+                head_body: HeadBody = item["_body"]
                 if new_search_text == head_body.search_text:
                     continue
                 if head_body.surface == "document":
@@ -318,7 +491,7 @@ class M1NativeGrepService:
                 replacements.append({"uri": head_body.uri, "revision": result.revision_id})
 
         clean = [
-            {key: value for key, value in item.items() if key != "_body"}
+            {key: value for key, value in item.items() if not key.startswith("_")}
             for item in selected
         ]
         response: dict[str, Any] = {

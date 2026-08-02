@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.util
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from app.config import settings
 from app.exceptions import AKBError, NotFoundError
 from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
+from app.services.m1_binary_store import PreparedBinary
 from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services.native_derived_worker import NativeDerivedWorker
 
@@ -316,6 +318,123 @@ async def test_non_text_mime_with_binary_bytes_remains_binary(context):
 
     assert confirmed["storage_driver"] == "fscas"
     assert confirmed["native_resource_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_binary_confirm_and_open_keep_slow_cas_io_off_the_event_loop(
+    context, monkeypatch,
+):
+    _pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    data = b"slow binary CAS\x00"
+    digest = hashlib.sha256(data).hexdigest()
+    loop_thread = threading.get_ident()
+
+    class SlowStore:
+        driver = "fscas"
+
+        def __init__(self):
+            self.prepare_started = threading.Event()
+            self.prepare_release = threading.Event()
+            self.open_started = threading.Event()
+            self.open_release = threading.Event()
+            self.prepare_thread = None
+            self.open_thread = None
+
+        def prepare_verified(self, _tenant, body, expected_digest, expected_size):
+            self.prepare_thread = threading.get_ident()
+            self.prepare_started.set()
+            assert self.prepare_release.wait(timeout=2)
+            assert body == data
+            return PreparedBinary("test/slow", expected_digest, expected_size, self.driver)
+
+        def open_verified(self, _tenant, prepared):
+            self.open_thread = threading.get_ident()
+            self.open_started.set()
+            assert self.open_release.wait(timeout=2)
+            assert prepared.digest == digest
+            return data
+
+    store = SlowStore()
+    monkeypatch.setattr(m1, "_store", lambda: store)
+    initiated = await service.initiate_upload(
+        vault_name=vault_name, vault_id=vault_id, collection="", filename="slow.bin",
+        actor_id="tester", mime_type="application/octet-stream", description="",
+        content_hash=digest,
+    )
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    confirm = asyncio.create_task(
+        service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest),
+    )
+    while not store.prepare_started.is_set():
+        await asyncio.sleep(0)
+    heartbeat = 0
+    for _ in range(10):
+        await asyncio.sleep(0)
+        heartbeat += 1
+    store.prepare_release.set()
+    confirmed = await confirm
+
+    download = await service.get_download_url(vault_id, confirmed["file_id"])
+    opened = asyncio.create_task(
+        service.transfer(_token(download["download_url"]), method="GET"),
+    )
+    while not store.open_started.is_set():
+        await asyncio.sleep(0)
+    for _ in range(10):
+        await asyncio.sleep(0)
+        heartbeat += 1
+    store.open_release.set()
+
+    assert await opened == data
+    assert heartbeat == 20
+    assert store.prepare_thread != loop_thread
+    assert store.open_thread != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_periodic_reaper_removes_expired_body_without_later_upload(
+    context, monkeypatch,
+):
+    from app.services import m1_file_transfer_reaper
+
+    pool, vault_id, _denied, vault_name = context
+    service = m1.MeasurementFileService()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name, vault_id=vault_id, collection="", filename="idle-expired.bin",
+        actor_id="tester", mime_type="application/octet-stream", description="",
+        content_hash=None,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(
+        _token(initiated["upload_url"]), method="PUT", body=b"expired staging body\x00",
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE m1_file_transfer_intents SET expires_at = NOW() - INTERVAL '1 second' WHERE file_id = $1",
+            file_id,
+        )
+        assert await conn.fetchval(
+            "SELECT octet_length(body) FROM m1_file_transfer_intents WHERE file_id = $1",
+            file_id,
+        ) > 0
+
+    monkeypatch.setattr(m1_file_transfer_reaper._runner, "_idle_secs", 0.01)
+    m1_file_transfer_reaper.start()
+    try:
+        async with asyncio.timeout(2):
+            while True:
+                async with pool.acquire() as conn:
+                    remaining = await conn.fetchval(
+                        "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1",
+                        file_id,
+                    )
+                if remaining == 0:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        assert await m1_file_transfer_reaper.stop(timeout=1)
 
 
 @pytest.mark.asyncio
