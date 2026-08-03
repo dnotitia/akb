@@ -29,6 +29,8 @@ Credential lifecycle, exchange outcomes, and capability decisions emit bounded
 correlation-aware audit metadata without credential, token, cookie, or request
 body content. Existing user authentication and registry rows remain unchanged.
 
+## 0.13.0 — 2026-08-03  *(removes the `todos` stack; fixes account deletion)*
+
 ### Removed the `todos` stack — fixes permanently-failing account deletion
 
 `DELETE /api/v1/my/account` returned 500 and could never succeed for a user
