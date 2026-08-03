@@ -7,6 +7,51 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.12.1 — 2026-08-03  *(test/CI hygiene — no runtime change)*
+
+Marks the external_git mirror tests' fixture credentials with
+`# pragma: allowlist secret` so the detect-secrets static-analysis check passes —
+the fixtures carry fake in-URL credentials to exercise credential redaction and
+are not real secrets. One redaction docstring example is reworded to avoid the
+userinfo pattern. No production code or behavior change from 0.12.0; this is the
+clean-CI release pin for the 0.12 line (0.12.0 shipped with a detect-secrets
+false positive on those test fixtures).
+
+## 0.12.0 — 2026-08-03  *(external_git mirror hardening; app desired-state registry)*
+
+external_git mirror ingestion and reconcile were reworked for robustness and
+operability. Mirror git operations now run through a single runner with an
+explicit minimal environment and pinned resolution, and credentials are carried
+in a request header only — never the URL, argv, or on-disk config. Remote config
+is validated at create time and re-validated on every poll cycle (scheme, host,
+branch), and the canonical URL is stored and returned. A new per-mirror
+sync-state machine (pending_preflight / active / quarantined) with a
+mixed-version-safe rollout fence (migration 049, additive and idempotent) and
+optimistic-concurrency state transitions governs scheduling, and a feature switch
+gates the poller, mirror reads, and the metadata worker. Mirror reads go through
+the runner with size-bounded blob and diff reads. Credential redaction covers
+logs and error paths, and a startup capability check plus a pinned minimum git
+version fail fast on a runtime that cannot enforce the pin. No behavior change for
+manual vaults or well-formed public https mirrors. Migration 049 is additive and
+idempotent; the required rollout order is to drain or scale the old backend to
+zero, apply migration 049, then re-enable — an in-flight operation cannot be
+cancelled by the DB fence.
+
+An additive app desired-state registry now stores stable app definitions,
+immutable versioned release manifests, one installation per app/Vault pair,
+monotonic capability grants, and explicit owned or retained resources. Database
+constraints reject cross-app release pointers, incoherent lifecycle/version
+states, duplicate installations, stale grant generations, and in-place release
+or grant mutation. App keys, installation app/Vault identity, and owned-resource
+identity are immutable, and one physical resource kind/key can belong to only
+one installation in a Vault. Uninstall remains a retained lifecycle state;
+direct registry deletion is rejected, while permanent Vault deletion removes
+only that Vault's installation, grant, and resource registry rows and preserves
+reusable app definitions and releases. A security-invoker installation view
+returns the current registry state in one query, while ordinary Vault SQL roles
+receive no access. Existing users, Vaults, tokens, Vault data, and standalone
+behavior are unchanged.
+
 ## 0.11.0 — 2026-07-29  *(feat — MCP tool-usage analytics, argument-aware write scopes, hardened publication surface)*
 
 AKB can now answer which MCP tool is actually used, by whom, in what order, and

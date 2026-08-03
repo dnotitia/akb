@@ -13,14 +13,17 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.deps import get_current_user, get_optional_user
+from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
+from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
 from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
-from app.services import audit_log, embed_worker, events_publisher, external_git_poller, metadata_worker, tool_usage
+from app.services import audit_log, embed_worker, events_publisher, external_git_poller, external_git_service, metadata_worker, tool_usage
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
+from app.services.external_git_capability import check_external_git_capability
 from app.services.health import vault_health
 from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
 from app.services.vector_store import get_vector_store
@@ -31,13 +34,43 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Install the process-wide secret-aware log filter as early
+# as possible (right after basicConfig configures the root handler), so no log
+# record can carry a credential/URL-userinfo/token to a sink. Re-run in the
+# lifespan too, once uvicorn has installed its own handlers.
+install_secret_redaction()
 logger = logging.getLogger("akb")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting AKB server")
+    # Re-assert the secret-redaction filter now that uvicorn has installed its own
+    # loggers/handlers (uvicorn.access/error don't propagate to the root handler).
+    # Idempotent — already-covered handlers are skipped.
+    install_secret_redaction()
     await init_storage()
+    # Stamp the external-mirror marker on any mirror whose
+    # bare repo predates it, so its reads route through the hermetic runner
+    # (fail-closed) rather than GitPython. Runs AFTER the DB is up (authoritative
+    # mirror list) and BEFORE workers/requests. UNCONDITIONAL — it runs even when
+    # external_git is disabled, because the marker is the fail-closed safety net
+    # that makes the read paths correctly REFUSE a disabled mirror (503) rather
+    # than serve it via GitPython; the kill-switch lives on the poller-start gate
+    # and the read paths, not here. FAIL-FAST: if a marker cannot be written onto
+    # an existing mirror bare (disk/permission), or the mirror list can't be
+    # read, this raises and startup ABORTS rather than serving mirrors that would
+    # fall open. No serving has begun yet, so the fail-open window is zero.
+    marked = await external_git_service.backfill_mirror_markers()
+    if marked:
+        logger.info("Backfilled external-git mirror marker on %d vault(s)", marked)
+    # When the mirror feature is enabled, prove at boot (in a
+    # thread; it runs a git subprocess + loopback socket) that this git build
+    # actually enforces the network controls the hermetic runner depends on
+    # (http.curloptResolve DNS-pin, proxy-off, --config-env) and meets the git
+    # >= 2.37 floor. Fast-fails the boot BEFORE workers/serving start if not; a
+    # no-op when external_git is disabled. No real network (uses a *.invalid host).
+    await asyncio.to_thread(check_external_git_capability, settings)
     start_workers()
     yield
     await stop_workers()

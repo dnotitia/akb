@@ -223,6 +223,9 @@ async def _apply_migrations() -> None:
         "044_vault_write_policy.py",             # vault_write_policy + vault_write_grants: vault-grain token-allowlist substrate
         "045_vault_write_grant_actions.py",      # additive action limits; existing grants backfill to wildcard
         "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
+        "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
+        "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
+        "049_external_git_quarantine.py",        # external_git sync_state machine (pending_preflight/active/quarantined) + rollout fence for the pre-hardening poller
     ):
         if filename in applied:
             continue

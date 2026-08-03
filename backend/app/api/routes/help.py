@@ -4,14 +4,15 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 
-from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE, DocumentService
+from app.services.document_service import VAULT_SKILL_SEED_TEMPLATE
+from app.services.revision_backend import get_document_service
 from app.services.auth_service import AuthenticatedUser
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from mcp_server.help import render_vault_skill_response
 
 router = APIRouter()
-doc_service = DocumentService()
+doc_service = get_document_service()
 
 
 MARKDOWN_RESPONSE: dict[int | str, dict[str, Any]] = {

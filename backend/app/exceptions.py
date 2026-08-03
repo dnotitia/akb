@@ -29,6 +29,30 @@ class NotFoundError(AKBError):
         super().__init__(f"{resource} not found: {identifier}", status_code=404)
 
 
+class MirrorMarkerError(AKBError):
+    """The on-disk external-git mirror marker is in an AMBIGUOUS state → 503.
+
+    Raised when the ``_MIRROR_MARKER`` entry at a bare
+    repo's root is neither cleanly absent (a manual, non-mirror vault) nor a
+    genuine regular-file marker, but something ambiguous — a directory, a
+    symlink (incl. broken), another file type, or an unexpected stat error.
+
+    Collapsing such an entry to "not a mirror" would let the vault's reads fall
+    through to GitPython, re-opening the promisor/rewrite lazy-fetch surface
+    the hermetic-runner routing closes. So the marker check is fail-CLOSED: it
+    raises this rather than returning a boolean, surfacing as a 503 on the read
+    path (and, at startup backfill, as a boot-abort) instead of serving open.
+    The message is value-less (the marker filename only) — no path or secret.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(
+            message,
+            status_code=503,
+            code="external_git_mirror_marker_abnormal",
+        )
+
+
 class ConflictError(AKBError):
     def __init__(self, message: str):
         super().__init__(message, status_code=409)

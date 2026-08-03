@@ -18,7 +18,7 @@ from app.models.document import (
     DocumentUpdateRequest,
 )
 from app.services.auth_service import AuthenticatedUser
-from app.services.document_service import DocumentService
+from app.services.revision_backend import get_document_service
 from app.util.git_refs import HEX_COMMIT_RE
 from app.util.text import to_nfc
 
@@ -37,7 +37,7 @@ class VaultTemplate(BaseModel):
 
 
 router = APIRouter()
-doc_service = DocumentService()
+doc_service = get_document_service()
 
 
 @router.post("/vaults", summary="Create a new vault")

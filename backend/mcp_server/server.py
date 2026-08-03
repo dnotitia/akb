@@ -31,7 +31,8 @@ from mcp.types import TextContent
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
-from app.services.document_service import DocumentService, EditError
+from app.services.document_service import EditError
+from app.services.revision_backend import get_revision_backend
 from app.services.search_service import SearchService
 from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
 from app.services.uri_service import doc_uri, parse_uri, split_uri
@@ -165,7 +166,8 @@ def _session_id() -> str | None:
     except (LookupError, AttributeError):
         pass
     return None
-doc_service = DocumentService()
+revision_backend = get_revision_backend()
+doc_service = revision_backend.document_service
 search_service = SearchService()
 
 
@@ -435,12 +437,35 @@ async def _handle_create_vault(args: dict, uid: str, user: _MCPUser) -> dict:
         "public_access": args.get("public_access", "none"),
     }
     if args.get("external_git"):
-        response["external_git"] = {
-            "url": args["external_git"]["url"],
-            "branch": args["external_git"].get("branch") or "main",
-            "read_only": True,
-        }
+        # Echo the STORED CANONICAL remote, never the caller's raw
+        # input URL. Layer-1 (create_vault) already canonicalized + persisted it
+        # (host lowercased, default port dropped, userinfo rejected outright),
+        # so re-reading the sidecar returns exactly what a later poll will use —
+        # the response can't disagree with what was saved, and can't echo a
+        # credential the input may have embedded.
+        eg = await _external_git_view(vault_id)
+        if eg is not None:
+            response["external_git"] = eg
     return response
+
+
+async def _external_git_view(vault_id: str) -> dict | None:
+    """The credential-free external-git view for a create response: the STORED
+    canonical URL + branch. Reads the persisted sidecar row so the
+    response reflects the canonicalized value, not the caller's raw input.
+    ``remote_url`` is credential-free by construction (userinfo is rejected at
+    validation; a supported token lives in the separate ``auth_token`` column,
+    which is never echoed)."""
+    from app.repositories.vault_external_git_repo import VaultExternalGitRepository
+    pool = await get_pool()
+    row = await VaultExternalGitRepository(pool).get(uuid.UUID(vault_id))
+    if not row:
+        return None
+    return {
+        "url": row["remote_url"],
+        "branch": row["remote_branch"],
+        "read_only": True,
+    }
 
 
 @_h("akb_put")
@@ -521,16 +546,13 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
         # internal-id fields living in old frontmatter (legacy d-prefix)
         # must not leak out of the MCP boundary.
         import frontmatter as _fm
-        doc = await _find_doc(vault, doc_path)
-        if not doc:
+        try:
+            versioned = await revision_backend.document_version(vault, doc_path, version)
+        except NotFoundError:
             return err("Document not found", code=NOT_FOUND)
-        from app.services.git_service import GitService
-        git = GitService()
-        # off-load the git blob read; the un-versioned path already offloads
-        # via doc_service.get, so keep the versioned MCP read off the loop too.
-        raw = await asyncio.to_thread(git.read_file, vault, doc["path"], commit=version)
-        if raw is None:
+        if versioned is None:
             return err(f"Version not found: {version}", code=NOT_FOUND)
+        doc, raw = versioned
         try:
             body = _fm.loads(raw).content
         except Exception:
@@ -879,8 +901,6 @@ def _sub_sections_of(section_paths: list[str], parent: str | None) -> list[str]:
 @_h("akb_activity")
 async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, args["vault"], required_role="reader")
-    from app.services.git_service import GitService
-    git = GitService()
     limit = args.get("limit", 20)
     # Peek one past the limit so we can flag truncation without a
     # separate `git rev-list --count` walk (which would re-traverse the
@@ -889,8 +909,7 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     # post-fetch author filter below — i.e. when truncated=True the
     # caller knows commits exist past the window, but cannot tell
     # without paging whether they would survive the author filter.
-    entries = await asyncio.to_thread(
-        git.vault_log,
+    entries = await revision_backend.vault_activity(
         args["vault"],
         max_count=limit + 1,
         since=args.get("since"),
@@ -922,12 +941,10 @@ async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
             "symbolic refs are not accepted",
             code=INVALID_ARGUMENT,
         )
-    doc = await _find_doc(vault, doc_path)
-    if not doc:
+    result = await revision_backend.document_diff(vault, doc_path, commit)
+    if result is None:
         return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
-    from app.services.git_service import GitService
-    git = GitService()
-    return await asyncio.to_thread(git.file_diff, vault, doc["path"], commit)
+    return result
 
 
 @_h("akb_relations")
@@ -1411,7 +1428,9 @@ async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
     # annotation all live in DocumentService.history() so this tool and
     # GET /history stay byte-for-byte identical. A missing doc raises
     # NotFoundError, mapped to err(code=NOT_FOUND) by exception_envelope.
-    return await doc_service.history(vault, doc_path, limit=args.get("limit", 20))
+    return await revision_backend.document_history(
+        vault, doc_path, limit=args.get("limit", 20),
+    )
 
 
 @_h("akb_export")

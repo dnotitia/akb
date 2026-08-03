@@ -15,10 +15,10 @@ from app.services.collection_service import (
     CollectionService,
     InvalidPathError,
 )
-from app.services.document_service import DocumentService
+from app.services.revision_backend import get_document_service
 
 router = APIRouter()
-doc_service = DocumentService()
+doc_service = get_document_service()
 collection_service = CollectionService()
 
 

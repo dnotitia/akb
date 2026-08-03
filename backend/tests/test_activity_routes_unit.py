@@ -1,6 +1,5 @@
 """Serialization contracts for activity, recent, history, and diff routes."""
 
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,27 +15,13 @@ from app.models.activity import (
 
 @pytest.fixture
 def routes(monkeypatch, tmp_path):
-    """Import the module only after redirecting its module-level GitService."""
+    """Import after redirecting the selected legacy backend's Git storage."""
     from app.config import settings
 
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     from app.api.routes import activity
 
     return activity
-
-
-def _pool_with(*, rows=(), vault_id="vault-id"):
-    conn = MagicMock()
-    conn.fetch = AsyncMock(return_value=rows)
-    conn.fetchrow = AsyncMock(return_value={"id": vault_id})
-
-    @asynccontextmanager
-    async def acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = acquire
-    return pool, conn
 
 
 @pytest.mark.asyncio
@@ -52,7 +37,9 @@ async def test_activity_adds_kind_and_preserves_unresolved_author_absence(monkey
         "files": [{"path": "notes/a.md", "change": "modified"}],
     }
     monkeypatch.setattr(routes, "check_vault_access", AsyncMock())
-    monkeypatch.setattr(routes.git, "vault_log", MagicMock(return_value=[entry]))
+    monkeypatch.setattr(
+        routes.revision_backend, "vault_activity", AsyncMock(return_value=[entry]),
+    )
     monkeypatch.setattr(routes, "_resolve_activity_authors", AsyncMock(return_value=[entry]))
 
     out = await routes.vault_activity(
@@ -66,18 +53,18 @@ async def test_activity_adds_kind_and_preserves_unresolved_author_absence(monkey
 
 @pytest.mark.asyncio
 async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch, routes):
-    rows = [{
-        "id": "uuid-1",
-        "title": "Nullable",
+    changes = [{
+        "doc_id": "d-nullable",
+        "vault": "v",
         "path": "notes/nullable.md",
-        "doc_type": None,
-        "current_commit": None,
-        "updated_at": None,
-        "vault_name": "v",
-        "metadata": {"id": "d-nullable"},
+        "title": "Nullable",
+        "type": "note",
+        "commit": None,
+        "changed_at": None,
     }]
-    pool, _ = _pool_with(rows=rows)
-    monkeypatch.setattr(routes, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(
+        routes.revision_backend, "recent_changes", AsyncMock(return_value=changes),
+    )
 
     out = await routes.recent_changes(vault=None, limit=20, user=MagicMock(user_id="u"))
 
@@ -103,15 +90,12 @@ async def test_recent_adds_kind_and_preserves_explicit_nulls(monkeypatch, routes
 async def test_diff_adds_kind_and_preserves_optional_error(
     monkeypatch, routes, git_result, has_error,
 ):
-    pool, _ = _pool_with()
-    monkeypatch.setattr(routes, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(routes, "check_vault_access", AsyncMock())
     monkeypatch.setattr(
-        routes.DocumentRepository,
-        "find_by_ref_with_conn",
-        AsyncMock(return_value={"path": "a.md"}),
+        routes.revision_backend,
+        "document_diff",
+        AsyncMock(return_value=git_result),
     )
-    monkeypatch.setattr(routes.git, "file_diff", MagicMock(return_value=git_result))
 
     out = await routes.document_diff("v", "a.md", commit=git_result["commit"], user=MagicMock())
 
@@ -131,8 +115,8 @@ async def test_history_adds_kind_without_changing_entries(monkeypatch, routes):
     }
     monkeypatch.setattr(routes, "check_vault_access", AsyncMock())
     monkeypatch.setattr(
-        routes.doc_service,
-        "history",
+        routes.revision_backend,
+        "document_history",
         AsyncMock(return_value={"uri": "akb://v/doc/a.md", "history": [entry]}),
     )
 

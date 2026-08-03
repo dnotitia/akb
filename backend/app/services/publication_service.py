@@ -31,6 +31,7 @@ from app.exceptions import AKBError, NotFoundError
 from app.services import file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
+from app.services.revision_backend import get_document_service
 from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.publications")
@@ -76,7 +77,7 @@ _doc_service: DocumentService | None = None
 def _get_doc_service() -> DocumentService:
     global _doc_service
     if _doc_service is None:
-        _doc_service = DocumentService()
+        _doc_service = get_document_service()
     return _doc_service
 
 
