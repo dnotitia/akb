@@ -651,6 +651,16 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "name": {"type": "string"},
                 "sql_name": {"type": "string"},
                 "description": _nullable_string(),
+                # create only. `created` is true on a real create and false
+                # when if_not_exists=true matched an existing table; `outcome`
+                # appears only on the false branch. `matches_request` /
+                # `mismatches` accompany it ONLY when the caller also holds
+                # READ access — they are schema oracles, so a write-only
+                # credential gets just {kind, name, created, outcome}.
+                "created": {"type": "boolean"},
+                "outcome": {"type": "string"},
+                "matches_request": {"type": "boolean"},
+                "mismatches": {"type": "array", "items": {"type": "string"}},
                 "columns": JSON_OBJECT_ARRAY_SCHEMA,
                 "unique_keys": JSON_OBJECT_ARRAY_SCHEMA,
                 "indexes": JSON_OBJECT_ARRAY_SCHEMA,

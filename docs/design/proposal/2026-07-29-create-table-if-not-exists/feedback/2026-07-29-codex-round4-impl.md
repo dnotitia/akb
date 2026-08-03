@@ -1,0 +1,11 @@
+Not ready to merge. Two blockers remain.
+
+1. **Enum creates are broken.** The real path normalizes at [table_service.py:802](/Users/kwoo2/Desktop/storage/akb/backend/app/services/table_service.py:802), then `_canonical_create_spec` normalizes again at [table_service.py:853](/Users/kwoo2/Desktop/storage/akb/backend/app/services/table_service.py:853). The first pass synthesizes an enum `check`; the second rejects it at [table_data_repo.py:186](/Users/kwoo2/Desktop/storage/akb/backend/app/repositories/table_data_repo.py:186). I reproduced the resulting `ValidationError`. Canonicalize exactly once and add a real-create enum regression test.
+
+2. **The SDK response remains stale.** `CreateTableRequest` is fixed, but the hardcoded `AkbTableEnvelope` generator still lacks `created`, `outcome`, `matches_request`, and `mismatches` at [openapi-codegen.ts:375](/Users/kwoo2/Desktop/storage/akb/packages/akb-client/src/core/openapi-codegen.ts:375), as does [schema.gen.ts:10](/Users/kwoo2/Desktop/storage/akb/packages/akb-client/src/core/schema.gen.ts:10). The catch-all exposes them only as `unknown`, despite these fields being how callers use the feature. Update the generator and regenerate. The unrelated 68/26/2 fixture drift can remain separate.
+
+3. **No remaining enriched-envelope leak found.** Both production boundaries require read scope plus reader ACL, and the service defaults closed. The broader REST OAuth mutation gap is legitimately separate: it predates this feature and does not bypass this projection gate. Track it independently as a security issue.
+
+4. **Concurrency is credible as a combined suite, but the service test alone is timing-dependent.** `asyncio.gather` does not force both calls past a shared race point, so an unlocked implementation can occasionally pass sequentially. The primitive-lock test, ordering unit test, and reported 5/5 falsification make the overall evidence adequate. Restore the mutated `settings.db_*` values in `finally` at [test_table_if_not_exists_e2e.py:207](/Users/kwoo2/Desktop/storage/akb/backend/tests/test_table_if_not_exists_e2e.py:207) to prevent test-order pollution.
+
+The general fixture-drift split is correct. `git diff --cached --check` is clean.

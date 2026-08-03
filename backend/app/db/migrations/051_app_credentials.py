@@ -1,4 +1,4 @@
-"""Migration 048: exchange-only app credentials.
+"""Migration 051: exchange-only app credentials.
 
 Credentials belong to an app deployment, never to a user or Vault membership.
 Only a one-way proof hash and non-secret lifecycle metadata are persisted.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-logger = logging.getLogger("akb.migration.048")
+logger = logging.getLogger("akb.migration.051")
 
 
 async def migrate(conn=None):
@@ -183,7 +183,7 @@ async def _run(conn):
             """
         )
 
-    logger.info("Migration 048 added exchange-only app credentials")
+    logger.info("Migration 051 added exchange-only app credentials")
 
 
 async def _main():

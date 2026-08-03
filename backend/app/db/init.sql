@@ -437,25 +437,12 @@ CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resourc
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================
--- Todos (per-user task assignments)
--- ============================================================
-CREATE TABLE IF NOT EXISTS todos (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    assignee_id UUID NOT NULL REFERENCES users(id),
-    created_by UUID NOT NULL REFERENCES users(id),
-    vault_id UUID REFERENCES vaults(id),
-    title TEXT NOT NULL,
-    note TEXT,
-    ref_doc_id UUID REFERENCES documents(id) ON DELETE SET NULL,
-    priority TEXT DEFAULT 'normal',
-    status TEXT DEFAULT 'open',
-    due_date DATE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_todos_assignee ON todos(assignee_id, status);
-CREATE INDEX IF NOT EXISTS idx_todos_created_by ON todos(created_by);
+-- Todos table removed: the akb_todo/akb_todos/akb_todo_update MCP tools
+-- that were its only entrypoint went in PR #43, leaving the table with no
+-- reader on any surface (no REST router, no UI, no SDK). Migration 050
+-- archives the historic rows to `todos_archive` and drops it. Do NOT
+-- reintroduce a CREATE here: init.sql runs before migrations on every boot,
+-- so it would resurrect an empty table that 050 will never drop again.
 
 -- Agent memories + sessions tables removed in v0.4.0 alongside the
 -- akb_remember/recall/forget MCP tool family. Agent dedicated memory

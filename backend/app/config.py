@@ -16,11 +16,37 @@ k8s operators and the akb-platform control plane can tune the pool
 per deployment without re-rendering config files.
 """
 
+import ipaddress
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Code-owned hard floor for the external-git runner's git version.
+# `http.curloptResolve` — the DNS-pin the hermetic runner depends on — is
+# documented from git 2.37, so a git below this cannot enforce the pin. Operators
+# may raise `external_git_min_git_version` to demand newer, but never lower it
+# past this tuple; both config validation and the startup capability check floor
+# against it. Kept here (not in the capability module) so `config` stays the
+# single source of truth and there is no import cycle.
+EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR: tuple[int, int] = (2, 37)
+
+
+def parse_git_version(text: str) -> tuple[int, int, int] | None:
+    """Extract ``(major, minor, patch)`` from a dotted version string, or None if
+    no leading ``N.N[.N]`` can be found. Tolerates a ``git version `` prefix and a
+    trailing platform suffix (e.g. ``2.39.3 (Apple Git-145)``). Missing patch is 0.
+    """
+    import re
+
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+
+
+NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
 
 
 class AuditSettings(BaseModel):
@@ -122,6 +148,69 @@ class ToolUsageSettings(BaseModel):
     shutdown_deadline_secs: float = Field(default=8.0, ge=0.5, le=60.0)
 
 
+class ExternalGitHostRule(BaseModel):
+    """One internal-exception entry for the external-git host allowlist.
+
+    The default host policy for a mirror remote is fail-closed: every resolved
+    A/AAAA address must be globally-routable unicast. A rule here is the ONLY
+    way to reach a non-global address, and it is a *full pin*, never a host-only
+    bypass:
+
+    - ``host``  — the canonical (IDNA/ASCII, lowercased) hostname this rule
+      applies to, matched exactly against the parsed URL host. Use ASCII hosts
+      (internal names always are).
+    - ``cidrs`` — every resolved IP for ``host`` MUST fall inside one of these
+      networks. A host-only match never exempts the global-unicast check; the
+      CIDR set *is* the constraint. Required (an empty set would allow nothing
+      and is a foot-gun).
+    - ``ports`` — EVERY port this host may be reached on, enumerated explicitly.
+      Unlike a public host (which is implicitly reachable on the scheme's
+      standard port), an internal-exception host has NO implicit port — the
+      scheme's standard port is NOT auto-allowed. List ``443`` (or
+      ``80``) explicitly if the internal host is reached there. At least one port
+      is required (an empty set would allow no connection and is a foot-gun).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    host: str
+    cidrs: list[str] = Field(default_factory=list)
+    ports: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_rule(self) -> "ExternalGitHostRule":
+        host = self.host.strip().lower()
+        if not host:
+            raise ValueError("external_git host allowlist rule: host must not be empty")
+        self.host = host
+
+        if not self.cidrs:
+            raise ValueError(
+                f"external_git host allowlist rule '{host}': at least one CIDR is "
+                "required (a host-only allow is never permitted)"
+            )
+        for cidr in self.cidrs:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as e:
+                raise ValueError(
+                    f"external_git host allowlist rule '{host}': invalid CIDR '{cidr}': {e}"
+                ) from e
+        if not self.ports:
+            raise ValueError(
+                f"external_git host allowlist rule '{host}': at least one port is "
+                "required (the scheme's standard port is not auto-allowed for an "
+                "internal-exception host)"
+            )
+        for port in self.ports:
+            if isinstance(port, bool) or not (1 <= port <= 65535):
+                raise ValueError(
+                    f"external_git host allowlist rule '{host}': "
+                    f"port {port!r} is out of range 1..65535"
+                )
+        return self
+
+
 class Settings(BaseModel):
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
@@ -154,6 +243,11 @@ class Settings(BaseModel):
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 
+    # Native ledger selection is a dedicated M1 measurement path. Normal
+    # deployments retain the legacy bare-Git revision behavior by default.
+    document_revision_backend: Literal["bare_git_current", "native_ledger_m1"] = "bare_git_current"
+    native_revision_m1_measurement_only: bool = False
+
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
     # the entire poller task forever since asyncio.to_thread can't cancel
@@ -164,6 +258,59 @@ class Settings(BaseModel):
     # How long a claimed vault stays "in flight" before peer workers can
     # re-claim. Has to exceed the longest realistic initial bootstrap.
     external_git_claim_lookahead_secs: int = 3600
+
+    # ── External-git transport hardening ──────────────────────────────
+    # Master kill-switch for the mirror feature. When False the poller must not
+    # start, no mirror clone/fetch/ls-remote runs, and create-time validation
+    # rejects an external_git block. OSS defaults on; a managed deployment that
+    # doesn't expose mirroring sets this False.
+    external_git_enabled: bool = True
+    # Scheme policy — the SINGLE source of truth. https is always allowed; http
+    # is permitted only when this is True (plaintext transport is a downgrade,
+    # so it is opt-in). There is deliberately no second "allowed
+    # schemes" list that could drift out of sync with this flag.
+    external_git_allow_http: bool = False
+    # Internal-exception allowlist. Empty (default) = fail-closed: every
+    # resolved mirror IP must be globally-routable unicast. Each entry is a full
+    # (host, CIDR set, ports) pin — see ExternalGitHostRule above.
+    external_git_host_allowlist: list[ExternalGitHostRule] = Field(default_factory=list)
+    # Names that are always cluster-internal and denied regardless of the IP
+    # they resolve to (a public-looking CIDR behind one of these suffixes is
+    # still refused). `localhost` is always denied in addition to these.
+    external_git_cluster_dns_suffixes: list[str] = Field(
+        default_factory=lambda: [".svc", ".svc.cluster.local", ".cluster.local"]
+    )
+    # Operator-supplied pod/service CIDRs (e.g. the cluster pod network and the
+    # service ClusterIP range). Any resolved address inside one of these is
+    # refused BEFORE the host allowlist is consulted, so a pod/service network
+    # can never be admitted by an allowlist rule by accident. Empty by
+    # default; a managed deployment sets its cluster's ranges here.
+    external_git_deny_cidrs: list[str] = Field(default_factory=list)
+    # Hard lifetime (seconds) for a single host resolution. getaddrinfo has no
+    # per-call timeout and is not cancellable, so the resolver runs in a
+    # throwaway worker that is ABANDONED on timeout — the caller never blocks
+    # past this deadline.
+    external_git_resolver_timeout: float = 5.0
+    # Upper bound on concurrent host resolutions (a disposable-resolver pool /
+    # back-pressure knob consumed by the poller-side caller in a later stage).
+    external_git_max_concurrent_resolutions: int = 4
+    # Per-file byte ceiling for a mirrored blob. `git cat-file -s` is checked
+    # before materializing; oversize files are skipped deterministically.
+    external_git_blob_max_bytes: int = 10 * 1024 * 1024
+    # Poll-interval bounds (seconds). The minimum is a code-owned security floor
+    # — an operator may RAISE it but validation never allows a value below 60 (a
+    # tight loop against an upstream is abuse). The maximum bounds absurd values.
+    external_git_poll_interval_min: int = 60
+    external_git_poll_interval_max: int = 86400
+    # Minimum git version the hermetic mirror runner requires. This is a
+    # CODE-OWNED security floor, not a normal tunable: the DNS-pin relies on
+    # git's `http.curloptResolve` (documented since git 2.37), so a
+    # deployment whose git predates that would silently lose the pin. An operator
+    # may RAISE this to demand a newer git, but validation refuses any value BELOW
+    # the hard floor 2.37 — the value is floored again at the check site, so it can
+    # never be lowered past 2.37. The `external_git_capability` startup check
+    # parses the real `git --version` and fast-fails the boot below this.
+    external_git_min_git_version: str = "2.37"
 
     # Embedding — optional since 0.6.2. Unset (empty string) disables the
     # dense leg: `embed_worker` skips the upstream call, every chunk lands
@@ -212,6 +359,17 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":
+        if self.document_revision_backend == "native_ledger_m1":
+            if not self.native_revision_m1_measurement_only:
+                raise ValueError(
+                    "native_ledger_m1 requires native_revision_m1_measurement_only=true"
+                )
+            if self.db_name != NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME:
+                raise ValueError(
+                    "native_ledger_m1 requires dedicated measurement database "
+                    f"{NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME!r}"
+                )
+
         if self.model_api_governance_mode != "platform_hard":
             return self
 
@@ -246,6 +404,58 @@ class Settings(BaseModel):
                 )
             if not key.strip():
                 raise ValueError(f"{key_name} is required in platform_hard mode")
+        return self
+
+    @model_validator(mode="after")
+    def validate_external_git(self) -> "Settings":
+        if self.external_git_poll_interval_min < 60:
+            raise ValueError(
+                "external_git_poll_interval_min must be >= 60 (code-owned security floor)"
+            )
+        if self.external_git_poll_interval_max < self.external_git_poll_interval_min:
+            raise ValueError(
+                "external_git_poll_interval_max must be >= external_git_poll_interval_min"
+            )
+        if self.external_git_resolver_timeout <= 0:
+            raise ValueError("external_git_resolver_timeout must be > 0")
+        if self.external_git_max_concurrent_resolutions < 1:
+            raise ValueError("external_git_max_concurrent_resolutions must be >= 1")
+        if self.external_git_blob_max_bytes < 1:
+            raise ValueError("external_git_blob_max_bytes must be >= 1")
+        # min-git-version is a code-owned security FLOOR: parse it and refuse a
+        # value below the hard floor (an operator may raise it, never lower it).
+        parsed_min = parse_git_version(self.external_git_min_git_version)
+        if parsed_min is None:
+            raise ValueError(
+                "external_git_min_git_version must be a dotted version like '2.37'"
+            )
+        if parsed_min[:2] < EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR:
+            floor = ".".join(str(n) for n in EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR)
+            raise ValueError(
+                f"external_git_min_git_version must be >= {floor} "
+                "(code-owned security floor: the DNS pin needs "
+                "http.curloptResolve, documented since git 2.37)"
+            )
+        for cidr in self.external_git_deny_cidrs:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as e:
+                raise ValueError(
+                    f"external_git_deny_cidrs: invalid CIDR '{cidr}': {e}"
+                ) from e
+        # Coherence: with http disabled, no allowlist rule may open port 80 — an
+        # http-only exception is dead config under an https-only policy.
+        if not self.external_git_allow_http:
+            for rule in self.external_git_host_allowlist:
+                if 80 in rule.ports:
+                    raise ValueError(
+                        f"external_git_allow_http is False but host allowlist rule "
+                        f"'{rule.host}' lists port 80"
+                    )
+        # Normalize cluster suffixes once for case-insensitive suffix matching.
+        self.external_git_cluster_dns_suffixes = [
+            s.strip().lower() for s in self.external_git_cluster_dns_suffixes if s.strip()
+        ]
         return self
 
     # Hard server-side ceiling on a search/grep `limit`. The MCP tool schema

@@ -23,7 +23,7 @@ _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
-    _BACKEND / "app" / "db" / "migrations" / "048_app_credentials.py",
+    _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
 ]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

@@ -7,6 +7,8 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added app identity credential exchange and capability enforcement
+
 System administrators can now issue, list, rotate, and revoke exchange-only app
 credentials independently per app deployment. Credential plaintext is returned
 only by issue and rotation responses; PostgreSQL stores a non-secret prefix,
@@ -26,6 +28,81 @@ are rejected by existing JWT, PAT, service-key, REST, and MCP user-auth paths.
 Credential lifecycle, exchange outcomes, and capability decisions emit bounded
 correlation-aware audit metadata without credential, token, cookie, or request
 body content. Existing user authentication and registry rows remain unchanged.
+
+### Removed the `todos` stack — fixes permanently-failing account deletion
+
+`DELETE /api/v1/my/account` returned 500 and could never succeed for a user
+holding a `todos` row outside their own vaults — the account became permanently
+undeletable. `delete_user_account` wrote `UPDATE todos SET assignee_id = NULL` /
+`created_by = NULL` against columns declared `NOT NULL`; the block has no
+transaction wrapper, so the preceding `vault_access` / `publications` updates
+committed, the `NotNullViolationError` propagated, and the closing
+`DELETE FROM users` never ran. Retrying hit the same wall. The e2e suites call
+the endpoint only as teardown with output discarded, so CI never saw it.
+
+The root cause was an unfinished cleanup: PR #43 removed the `akb_todo` /
+`akb_todos` / `akb_todo_update` MCP tools — the table's only entrypoint — and
+deferred the table and `todo_service` to a "separate cleanup migration" that
+never landed. No product surface has been able to reach the table since: no
+MCP tool, no REST router, no frontend, no SDK, zero `todo_service` importers.
+(Direct SQL remains a writer — an unscoped admin's `akb_sql` runs as the
+connection default role — so migration 050 takes `ACCESS EXCLUSIVE` on the
+table before snapshotting rather than relying on the absence of writers.)
+Migration 050 archives every row to `todos_archive` (a constraint-free,
+FK-free snapshot that no code reads and operators may drop at will) and drops
+`todos`, both in one transaction. `todo_service`, the four remaining query
+sites, and the now-orphaned `NO_OP` error constant are removed with it. The
+agent runtime's default system prompt also stopped telling models they can
+create todos.
+
+The same cleanup also stopped the MCP server advertising the removed tools:
+`INSTRUCTIONS` (sent to every client at `initialize`) named `akb_todo`, the
+root `akb_help` table offered a `todos` topic that never existed as a key, and
+both shipped `session-ingest` plugin skills declared and called all three
+tools. New closure guards assert that every tool name and drill-down topic
+appearing in agent-facing prose — instructions, help, and the distributed
+plugin skills — resolves to a tool that actually exists.
+
+Migration 050 is idempotent and safe to re-run, and fails closed if it finds
+both `todos` and a `todos_archive` it did not create — a pre-existing archive
+is not evidence that the live rows are already saved. `todos` is also gone
+from `init.sql`: it runs before migrations on every boot, so leaving the
+`CREATE` there would resurrect an empty table permanently.
+
+**Not reversible.** Rolling back to an image whose `init.sql` still creates
+`todos` recreates it empty on the next boot, and 050 will not re-run because
+the ledger already records it. The resurrected table is inert — no code reads
+or writes it — but removing it again takes manual DDL.
+
+## 0.12.1 — 2026-08-03  *(test/CI hygiene — no runtime change)*
+
+Marks the external_git mirror tests' fixture credentials with
+`# pragma: allowlist secret` so the detect-secrets static-analysis check passes —
+the fixtures carry fake in-URL credentials to exercise credential redaction and
+are not real secrets. One redaction docstring example is reworded to avoid the
+userinfo pattern. No production code or behavior change from 0.12.0; this is the
+clean-CI release pin for the 0.12 line (0.12.0 shipped with a detect-secrets
+false positive on those test fixtures).
+
+## 0.12.0 — 2026-08-03  *(external_git mirror hardening; app desired-state registry)*
+
+external_git mirror ingestion and reconcile were reworked for robustness and
+operability. Mirror git operations now run through a single runner with an
+explicit minimal environment and pinned resolution, and credentials are carried
+in a request header only — never the URL, argv, or on-disk config. Remote config
+is validated at create time and re-validated on every poll cycle (scheme, host,
+branch), and the canonical URL is stored and returned. A new per-mirror
+sync-state machine (pending_preflight / active / quarantined) with a
+mixed-version-safe rollout fence (migration 049, additive and idempotent) and
+optimistic-concurrency state transitions governs scheduling, and a feature switch
+gates the poller, mirror reads, and the metadata worker. Mirror reads go through
+the runner with size-bounded blob and diff reads. Credential redaction covers
+logs and error paths, and a startup capability check plus a pinned minimum git
+version fail fast on a runtime that cannot enforce the pin. No behavior change for
+manual vaults or well-formed public https mirrors. Migration 049 is additive and
+idempotent; the required rollout order is to drain or scale the old backend to
+zero, apply migration 049, then re-enable — an in-flight operation cannot be
+cancelled by the DB fence.
 
 An additive app desired-state registry now stores stable app definitions,
 immutable versioned release manifests, one installation per app/Vault pair,

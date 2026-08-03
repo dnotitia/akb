@@ -11,7 +11,11 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from app.services.external_git_validation import ValidatedRemote
 
 
 VAULT_SKILL_SEED_TEMPLATE = """# {vault} Guide
@@ -1630,6 +1634,41 @@ class DocumentService:
 
     # ── Vault management ──────────────────────────────────────
 
+    async def _validate_external_git_create(self, external_git: dict) -> "ValidatedRemote":
+        """Layer-1 (create-time) validation of an external-git mirror config.
+        Returns the validator's ``ValidatedRemote`` — the
+        canonical URL + validated branch + resolved host — on success.
+
+        Fail-closed and SIDE-EFFECT-FREE: the caller has created nothing yet, so
+        every reject leaves zero rows (no vault, no sidecar, no poller claim).
+
+        * **kill-switch first** — a deployment with ``external_git_enabled=False``
+          (managed tenants) refuses a mirror outright, without parsing or
+          DNS-resolving the caller-supplied remote.
+        * **shape + policy + DNS host check** then run in ONE ``validate``
+          call OFF the event loop (``asyncio.to_thread``): ``resolve_and_check_host``
+          does blocking, un-cancellable DNS through a bounded disposable resolver,
+          so a wedged upstream resolver can never pin the loop.
+
+        Raises ``ExternalGitPolicyError`` — an IS-A ``ValidationError`` (→ 422)
+        whose message NEVER carries the raw URL, userinfo, or token —
+        on a scheme/userinfo/host/branch/shape violation, and the 503-class
+        ``ExternalGitTransientError`` on a DNS timeout/failure (the caller does
+        not persist a half-validated mirror; the client retries).
+        """
+        from app.config import settings
+        from app.services import external_git_validation as egv
+
+        if not settings.external_git_enabled:
+            raise ValidationError(
+                "external_git mirroring is disabled on this server"
+            )
+        # The whole validator (shape → canonicalize → branch → host) runs in a
+        # worker thread because host resolution is blocking, un-cancellable DNS.
+        return await asyncio.to_thread(
+            egv.validate, external_git, settings=settings, resolve=True
+        )
+
     async def create_vault(
         self,
         name: str,
@@ -1643,6 +1682,16 @@ class DocumentService:
         # 422 with zero side effects.
         validate_vault_name(name)
 
+        # Layer-1 (create-time) external-git validation.
+        # Runs BEFORE any repo/pool/git access so an invalid, malformed, or
+        # disabled remote rejects as a pure ValidationError (422) with ZERO side
+        # effects — no vault row, no external_git sidecar, no poller claim.
+        # `validated_git` carries the canonical URL + validated branch that get
+        # PERSISTED below (never the caller's raw input).
+        validated_git = None
+        if external_git is not None:
+            validated_git = await self._validate_external_git_create(external_git)
+
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         from app.services.access_service import validate_public_access
@@ -1653,9 +1702,11 @@ class DocumentService:
 
         uid = uuid.UUID(owner_id) if owner_id else None
 
-        if external_git:
-            if not external_git.get("url"):
-                raise ValidationError("external_git.url is required")
+        if validated_git is not None:
+            # `validated_git` is set iff `external_git` was provided and passed
+            # Layer-1 (a failed validation raised above), so the token/interval
+            # reads below are on a real dict — narrow it for the type-checker.
+            assert external_git is not None
             # Mirror vaults defer the clone to the external_git_poller so
             # the MCP/HTTP caller doesn't block on multi-hundred-MB
             # network I/O. `git_path` still has to be set — store the
@@ -1664,6 +1715,15 @@ class DocumentService:
             # rollback is needed: the two-row insert is atomic via the
             # PG transaction below, and a failure leaves zero side
             # effects.
+            #
+            # The sidecar is born `sync_state='pending_preflight'` (migration
+            # 046 column DEFAULT) with the legacy scheduler columns at their
+            # fence DEFAULTs — create() writes NEITHER, so the durable rollout
+            # fence CHECK holds and the poller's Layer-2 preflight re-validates
+            # before the row can ever go `active`. The PERSISTED remote is the
+            # validator's canonical URL + branch (userinfo rejected, default
+            # port dropped, host lowercased) — never the caller's raw input —
+            # with the token kept in the SEPARATE auth_token column.
             git_path = str(self.git._bare_path(name))
             pool = await get_pool()
             async with pool.acquire() as conn:
@@ -1674,8 +1734,8 @@ class DocumentService:
                     )
                     await VaultExternalGitRepository(pool).create(
                         vault_id=vault_id,
-                        remote_url=external_git["url"],
-                        remote_branch=external_git.get("branch") or "main",
+                        remote_url=validated_git.canonical_url,
+                        remote_branch=validated_git.branch,
                         auth_token=external_git.get("auth_token"),
                         poll_interval_secs=int(external_git.get("poll_interval_secs") or 300),
                         conn=conn,
@@ -1902,7 +1962,7 @@ class DocumentService:
         vault_tables can never swallow an acknowledged foreign row.
 
         Foreign = any document off the pinned seed path; any file / table /
-        publication / todo (creation makes none of those); any OTHER vault's
+        publication (creation makes none of those); any OTHER vault's
         table_query publication referencing this vault by name
         (query_vault_names); any collection outside ``owned_paths`` (seed
         'overview' + template paths). The remaining vaults-FK tables are
@@ -1947,13 +2007,12 @@ class DocumentService:
                           (SELECT COUNT(*) FROM publications WHERE vault_id = $1) AS pubs,
                           (SELECT COUNT(*) FROM publications
                             WHERE $3 = ANY(query_vault_names)) AS xvault_pubs,
-                          (SELECT COUNT(*) FROM todos WHERE vault_id = $1) AS todos,
                           (SELECT COUNT(*) FROM collections
                             WHERE vault_id = $1 AND path <> ALL($2::text[])) AS colls
                         """,
                         vault_id, list(owned_paths), name,
                     )
-                    foreign_keys = ("docs", "files", "tables", "pubs", "xvault_pubs", "todos", "colls")
+                    foreign_keys = ("docs", "files", "tables", "pubs", "xvault_pubs", "colls")
                     if any(foreign[k] for k in foreign_keys):
                         logger.error(
                             "create_vault rollback for %s ABORTED: the vault already "
@@ -1973,7 +2032,6 @@ class DocumentService:
                     await delete_vault_chunks(conn, vault_id)
                     await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
-                    await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
         except Exception as e:  # noqa: BLE001
