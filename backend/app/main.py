@@ -16,6 +16,7 @@ from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
     access,
     activity,
+    app_inventory,
     agent_sessions,
     app_identity,
     auth,
@@ -267,6 +268,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
+app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
