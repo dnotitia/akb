@@ -435,6 +435,8 @@ async def generate_embeddings(
     """
     if not texts:
         return []
+    if not settings.embed_base_url:
+        return [[] for _ in texts]
 
     client = http_pool.get_client()
     batch_size = 32
