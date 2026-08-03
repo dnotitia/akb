@@ -15,7 +15,7 @@ Usage:
         akb_base_url="http://localhost:8000",
         akb_pat="akb_...",
     )
-    result = await agent.run("Summarise my open todos")
+    result = await agent.run("Summarise this week's design decisions")
 """
 
 from __future__ import annotations
@@ -234,7 +234,8 @@ class AgentRuntime:
     def _default_system(self) -> str:
         return (
             "You are an AKB agent — an AI assistant connected to the AKB knowledge base. "
-            "You have access to MCP tools for managing documents, searching, creating todos, and more. "
+            "You have access to MCP tools for managing documents, tables and files, "
+            "searching, publishing, and more. "
             "Use akb_help() if you need to learn how to use the tools. "
             "Be concise and action-oriented. When you're done, provide a clear summary."
         )

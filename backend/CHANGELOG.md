@@ -7,6 +7,51 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Removed the `todos` stack — fixes permanently-failing account deletion
+
+`DELETE /api/v1/my/account` returned 500 and could never succeed for a user
+holding a `todos` row outside their own vaults — the account became permanently
+undeletable. `delete_user_account` wrote `UPDATE todos SET assignee_id = NULL` /
+`created_by = NULL` against columns declared `NOT NULL`; the block has no
+transaction wrapper, so the preceding `vault_access` / `publications` updates
+committed, the `NotNullViolationError` propagated, and the closing
+`DELETE FROM users` never ran. Retrying hit the same wall. The e2e suites call
+the endpoint only as teardown with output discarded, so CI never saw it.
+
+The root cause was an unfinished cleanup: PR #43 removed the `akb_todo` /
+`akb_todos` / `akb_todo_update` MCP tools — the table's only entrypoint — and
+deferred the table and `todo_service` to a "separate cleanup migration" that
+never landed. No product surface has been able to reach the table since: no
+MCP tool, no REST router, no frontend, no SDK, zero `todo_service` importers.
+(Direct SQL remains a writer — an unscoped admin's `akb_sql` runs as the
+connection default role — so migration 050 takes `ACCESS EXCLUSIVE` on the
+table before snapshotting rather than relying on the absence of writers.)
+Migration 050 archives every row to `todos_archive` (a constraint-free,
+FK-free snapshot that no code reads and operators may drop at will) and drops
+`todos`, both in one transaction. `todo_service`, the four remaining query
+sites, and the now-orphaned `NO_OP` error constant are removed with it. The
+agent runtime's default system prompt also stopped telling models they can
+create todos.
+
+The same cleanup also stopped the MCP server advertising the removed tools:
+`INSTRUCTIONS` (sent to every client at `initialize`) named `akb_todo`, the
+root `akb_help` table offered a `todos` topic that never existed as a key, and
+both shipped `session-ingest` plugin skills declared and called all three
+tools. New closure guards assert that every tool name and drill-down topic
+appearing in agent-facing prose — instructions, help, and the distributed
+plugin skills — resolves to a tool that actually exists.
+
+Migration 050 is idempotent and safe to re-run, and fails closed if it finds
+both `todos` and a `todos_archive` it did not create — a pre-existing archive
+is not evidence that the live rows are already saved. `todos` is also gone
+from `init.sql`: it runs before migrations on every boot, so leaving the
+`CREATE` there would resurrect an empty table permanently.
+
+**Not reversible.** Rolling back to an image whose `init.sql` still creates
+`todos` recreates it empty on the next boot, and 050 will not re-run because
+the ledger already records it. The resurrected table is inert — no code reads
+or writes it — but removing it again takes manual DDL.
+
 ## 0.12.1 — 2026-08-03  *(test/CI hygiene — no runtime change)*
 
 Marks the external_git mirror tests' fixture credentials with

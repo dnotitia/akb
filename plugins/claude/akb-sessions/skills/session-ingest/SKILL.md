@@ -3,7 +3,7 @@ name: session-ingest
 description: Ingest a coding session JSONL into AKB as structured notes — session report + parallel-drafted TIL / task / idea / decision sub-notes. Auto-discovers the current session's JSONL when no positional path is given (Claude / Codex). `--delegate {target}` fires the work to another target's CLI and exits.
 disable-model-invocation: true
 argument-hint: '[<jsonl_path>] --vault {name} [--lang {lang}] [--delegate {target}]'
-allowed-tools: Bash(git *), Bash(claude *), Bash(codex *), Bash(find *), Bash(tr *), Bash(printf *), Bash(nohup *), Read, Edit, Glob, Grep, Agent, mcp__akb__akb_put, mcp__akb__akb_update, mcp__akb__akb_get, mcp__akb__akb_search, mcp__akb__akb_todo, mcp__akb__akb_todos, mcp__akb__akb_todo_update
+allowed-tools: Bash(git *), Bash(claude *), Bash(codex *), Bash(find *), Bash(tr *), Bash(printf *), Bash(nohup *), Read, Edit, Glob, Grep, Agent, mcp__akb__akb_put, mcp__akb__akb_update, mcp__akb__akb_get, mcp__akb__akb_search
 ---
 
 # AKB Session Ingest
@@ -456,21 +456,18 @@ For each sub-note, extract metadata from the draft and call `akb_put(vault="{vau
 
 **Idea notes** — append four namespaced tags to `draft_tags` before put: `category:{draft.category}`, `impact:{draft.impact}`, `effort:{draft.effort}`, `confidence:{draft.confidence}`. Drop duplicates (the drafter may have already emitted some as tags). These four tags are the durable carriers for the external maintenance layer's consolidation synthesis and staleness checks.
 
-**Task notes** — after the task document is created, also create a lightweight todo via `akb_todo(vault="{vault_name}", title=draft.title, priority={P0→urgent, P1→high, P2→normal, P3→low}, ref_doc=task_doc_id, note=draft.summary)`.
-
 **`append` disposition** — the drafter has already merged compiled truth + one new timeline entry. Read the existing document with `akb_get(vault="{vault_name}", doc_id=draft.append_target)`, apply timeline merge **Mode A** against `draft.body`, and `akb_update(vault="{vault_name}", doc_id=draft.append_target, content={merged}, tags=[...existing, ...new from draft], summary=draft.summary, message="Appended from session ingest: {brief description}")`.
 
 **`supersede` disposition (decisions only)** — write the new decision via `akb_put(vault="{vault_name}", ..., tags=[..., "supersedes:{old_doc_id}"])` (tags use bare doc_id; the `:` already binds `key:value`). Capture `new_doc_id` and `new_doc_path`; compose `new_doc_ref = akb://{vault_name}/doc/{new_doc_path}`. Then read the old decision via `akb_get(vault="{vault_name}", doc_id=draft.supersedes)`, apply timeline merge **Mode B** with `new_entry = "- **{today}** | Superseded by {new_title} ({new_doc_ref}). {reason}. [Source: session:{session_id}, {today}]"`, and `akb_update(vault="{vault_name}", doc_id=draft.supersedes, content={merged}, tags=[...old, "superseded-by:{new_doc_id}"], status="superseded", message="Superseded by {new_doc_ref} in session ingest")`. Setting `status="superseded"` removes the old decision from the external maintenance layer's active-document pools.
 
 ### 4-3. Resolve Completed Tasks
 
-If `resolved_tasks` is non-empty, fetch open todos once: `akb_todos(vault="{vault_name}", status="open") → open_todos`. For each resolved task:
+For each task in `resolved_tasks`:
 
-1. Scan `open_todos` in memory for a todo whose `ref_doc` matches the task's `doc_id`. If found, `akb_todo_update(vault="{vault_name}", todo_id={matched}, status="done", note="Resolved in session {session_doc_id}")`.
-2. Read the task document with `akb_get(vault="{vault_name}", doc_id={task_doc_id})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
-3. `akb_update(vault="{vault_name}", doc_id={task_doc_id}, content={merged}, tags=[...existing, "resolved"], status="archived", message="Resolved in session {session_doc_id}")`.
+1. Read the task document with `akb_get(vault="{vault_name}", doc_id={task_doc_id})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
+2. `akb_update(vault="{vault_name}", doc_id={task_doc_id}, content={merged}, tags=[...existing, "resolved"], status="archived", message="Resolved in session {session_doc_id}")`.
 
-If no matching todo is found, still archive the task document. If the up-front `akb_todos` fails, skip all todo updates this ingest but archive the task documents anyway.
+The archived task document is the record of resolution.
 
 ## Error Handling
 

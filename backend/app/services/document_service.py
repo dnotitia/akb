@@ -1962,7 +1962,7 @@ class DocumentService:
         vault_tables can never swallow an acknowledged foreign row.
 
         Foreign = any document off the pinned seed path; any file / table /
-        publication / todo (creation makes none of those); any OTHER vault's
+        publication (creation makes none of those); any OTHER vault's
         table_query publication referencing this vault by name
         (query_vault_names); any collection outside ``owned_paths`` (seed
         'overview' + template paths). The remaining vaults-FK tables are
@@ -2007,13 +2007,12 @@ class DocumentService:
                           (SELECT COUNT(*) FROM publications WHERE vault_id = $1) AS pubs,
                           (SELECT COUNT(*) FROM publications
                             WHERE $3 = ANY(query_vault_names)) AS xvault_pubs,
-                          (SELECT COUNT(*) FROM todos WHERE vault_id = $1) AS todos,
                           (SELECT COUNT(*) FROM collections
                             WHERE vault_id = $1 AND path <> ALL($2::text[])) AS colls
                         """,
                         vault_id, list(owned_paths), name,
                     )
-                    foreign_keys = ("docs", "files", "tables", "pubs", "xvault_pubs", "todos", "colls")
+                    foreign_keys = ("docs", "files", "tables", "pubs", "xvault_pubs", "colls")
                     if any(foreign[k] for k in foreign_keys):
                         logger.error(
                             "create_vault rollback for %s ABORTED: the vault already "
@@ -2033,7 +2032,6 @@ class DocumentService:
                     await delete_vault_chunks(conn, vault_id)
                     await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
-                    await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
         except Exception as e:  # noqa: BLE001

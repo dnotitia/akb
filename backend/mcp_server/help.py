@@ -30,7 +30,6 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
-| `todos` | todo, todos, todo_update | Personal task assignments |
 | `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
 | `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
