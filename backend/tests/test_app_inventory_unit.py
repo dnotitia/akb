@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import uuid
 from datetime import datetime, timezone
 
@@ -83,6 +84,41 @@ def test_cursor_is_opaque_and_bound_to_scope_and_filter():
                 limit=kwargs.get("limit", 50),
                 lifecycle=kwargs.get("lifecycle"),
             )
+
+
+def test_cursor_round_trip_when_signature_contains_separator_byte(monkeypatch):
+    app_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    installation_id = uuid.uuid4()
+    selected_cursor = None
+
+    for attempt in range(4096):
+        secret = f"cursor-separator-regression-{attempt}".encode()
+        monkeypatch.setattr(inventory, "_cursor_secret", lambda secret=secret: secret)
+        cursor = inventory.encode_inventory_cursor(
+            app_id=app_id,
+            scope="admin",
+            limit=20,
+            lifecycle=None,
+            boundary=now,
+            last_created_at=now,
+            last_installation_id=installation_id,
+        )
+        decoded = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        _raw, signature = decoded.split(b".", 1)
+        if b"." in signature:
+            selected_cursor = cursor
+            break
+
+    assert selected_cursor is not None
+    decoded = inventory.decode_inventory_cursor(
+        selected_cursor,
+        app_id=app_id,
+        scope="admin",
+        limit=20,
+        lifecycle=None,
+    )
+    assert decoded["last_installation_id"] == installation_id
 
 
 def test_drift_keeps_missing_observations_and_expected_schema_unknown():

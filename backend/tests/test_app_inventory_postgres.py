@@ -261,3 +261,78 @@ async def test_snapshot_seal_membership_and_stale_target_eligibility(inventory_p
     )
     assert eligibility["state"] == "denied"
     assert eligibility["reason_code"] == "grant_revoked_or_missing"
+
+
+async def test_inventory_cursor_lineage_survives_late_insert_and_existing_update(
+    inventory_pool,
+):
+    app_id = await _app(inventory_pool, "cursor-lineage")
+    release_id = await _release(inventory_pool, app_id)
+    initial_ids = [
+        await _installation(
+            inventory_pool,
+            app_id,
+            await _vault(inventory_pool, f"cursor-{index}"),
+            release_id,
+        )
+        for index in range(65)
+    ]
+
+    first_page = await inventory.list_inventory(app_id, limit=20)
+    assert len(first_page["items"]) == 20
+    assert first_page["next_cursor"] is not None
+
+    late_id = await _installation(
+        inventory_pool,
+        app_id,
+        await _vault(inventory_pool, "cursor-late"),
+        release_id,
+    )
+    existing_id = uuid.UUID(first_page["items"][0]["installation_id"])
+    async with inventory_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE vault_app_installations
+               SET lifecycle = 'blocked', blocked_reason = $2
+             WHERE id = $1
+            """,
+            existing_id,
+            "fixture_b1_updated",
+        )
+
+    original_pages = [first_page]
+    cursor = first_page["next_cursor"]
+    while cursor is not None:
+        page = await inventory.list_inventory(app_id, limit=20, cursor=cursor)
+        original_pages.append(page)
+        cursor = page["next_cursor"]
+
+    original_ids = [
+        item["installation_id"]
+        for page in original_pages
+        for item in page["items"]
+    ]
+    assert len(original_pages) >= 3
+    assert original_pages[-1]["next_cursor"] is None
+    assert len(original_ids) == len(initial_ids) == 65
+    assert len(set(original_ids)) == 65
+    assert str(late_id) not in original_ids
+
+    fresh_pages = []
+    cursor = None
+    while True:
+        page = await inventory.list_inventory(app_id, limit=20, cursor=cursor)
+        fresh_pages.append(page)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+
+    fresh_ids = [
+        item["installation_id"]
+        for page in fresh_pages
+        for item in page["items"]
+    ]
+    assert len(fresh_ids) == 66
+    assert len(set(fresh_ids)) == 66
+    assert fresh_ids.count(str(late_id)) == 1
+    assert [item_id for item_id in fresh_ids if item_id != str(late_id)] == original_ids

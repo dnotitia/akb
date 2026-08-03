@@ -143,7 +143,12 @@ def decode_inventory_cursor(
             raise ValueError
         padded = cursor + "=" * (-len(cursor) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
-        raw, supplied_signature = decoded.rsplit(b".", 1)
+        signature_size = hashlib.sha256().digest_size
+        separator_index = len(decoded) - signature_size - 1
+        if separator_index < 1 or decoded[separator_index] != ord("."):
+            raise ValueError
+        raw = decoded[:separator_index]
+        supplied_signature = decoded[separator_index + 1 :]
         expected_signature = hmac.new(_cursor_secret(), raw, hashlib.sha256).digest()
         if not hmac.compare_digest(supplied_signature, expected_signature):
             raise ValueError
