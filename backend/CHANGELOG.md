@@ -7,6 +7,26 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.12.0 — 2026-08-03  *(external_git mirror hardening; app desired-state registry)*
+
+external_git mirror ingestion and reconcile were reworked for robustness and
+operability. Mirror git operations now run through a single runner with an
+explicit minimal environment and pinned resolution, and credentials are carried
+in a request header only — never the URL, argv, or on-disk config. Remote config
+is validated at create time and re-validated on every poll cycle (scheme, host,
+branch), and the canonical URL is stored and returned. A new per-mirror
+sync-state machine (pending_preflight / active / quarantined) with a
+mixed-version-safe rollout fence (migration 049, additive and idempotent) and
+optimistic-concurrency state transitions governs scheduling, and a feature switch
+gates the poller, mirror reads, and the metadata worker. Mirror reads go through
+the runner with size-bounded blob and diff reads. Credential redaction covers
+logs and error paths, and a startup capability check plus a pinned minimum git
+version fail fast on a runtime that cannot enforce the pin. No behavior change for
+manual vaults or well-formed public https mirrors. Migration 049 is additive and
+idempotent; the required rollout order is to drain or scale the old backend to
+zero, apply migration 049, then re-enable — an in-flight operation cannot be
+cancelled by the DB fence.
+
 An additive app desired-state registry now stores stable app definitions,
 immutable versioned release manifests, one installation per app/Vault pair,
 monotonic capability grants, and explicit owned or retained resources. Database
