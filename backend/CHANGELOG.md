@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.12.1 — 2026-08-03  *(test/CI hygiene — no runtime change)*
+
+Marks the external_git mirror tests' fixture credentials with
+`# pragma: allowlist secret` so the detect-secrets static-analysis check passes —
+the fixtures carry fake in-URL credentials to exercise credential redaction and
+are not real secrets. One redaction docstring example is reworded to avoid the
+userinfo pattern. No production code or behavior change from 0.12.0; this is the
+clean-CI release pin for the 0.12 line (0.12.0 shipped with a detect-secrets
+false positive on those test fixtures).
+
 ## 0.12.0 — 2026-08-03  *(external_git mirror hardening; app desired-state registry)*
 
 external_git mirror ingestion and reconcile were reworked for robustness and
