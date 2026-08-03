@@ -2042,6 +2042,60 @@ async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_
             await store.prepare_text(namespace_id=vault_id, payload=body, expected_size=len(body) + 1)
 
 
+async def test_default_reference_payload_document_is_applied_to_searchable_derived_state():
+    """Default M1 reference placement must be verified by its own adapter."""
+    async with _fresh_database(with_derived=True) as (pool, vault_id):
+        created = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/reference-derived.md",
+            payload="---\ntitle: Reference derived\n---\n# Ready\nreference-token\n",
+            actor="m1-test",
+            mutation_id=uuid.uuid4(),
+        )
+
+        assert await NativeDerivedWorker(pool).process_once() == 1
+
+        async with pool.acquire() as conn:
+            intent = await conn.fetchrow(
+                """
+                SELECT completed_at, delivery_outcome, retry_count, last_error
+                  FROM native_invalidation_intents
+                 WHERE revision_id = $1
+                """,
+                created.revision_id,
+            )
+            assert intent["completed_at"] is not None
+            assert intent["delivery_outcome"] == "applied"
+            assert intent["retry_count"] == 0
+            assert intent["last_error"] is None
+            assert await conn.fetchval(
+                """
+                SELECT selected_placement
+                  FROM native_payload_manifests
+                 WHERE payload_manifest_id = $1
+                """,
+                created.payload_manifest_id,
+            ) == M1ReferencePayloadStore.selected_placement
+            assert await conn.fetchval(
+                """
+                SELECT revision_id
+                  FROM native_derived_heads
+                 WHERE resource_id = $1
+                """,
+                created.resource_id,
+            ) == created.revision_id
+            assert await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                  FROM native_derived_chunks
+                 WHERE resource_id = $1 AND revision_id = $2
+                """,
+                created.resource_id,
+                created.revision_id,
+            ) > 0
+
+
 async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts():
     async with _fresh_database() as (pool, vault_id):
         service = NativeRevisionService(pool)

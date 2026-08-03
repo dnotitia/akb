@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+
+import pytest
+
+from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_derived_worker import (
     NATIVE_DOCUMENT_SOURCE,
+    NativePayloadPlacementError,
+    _verify_native_head_body,
     build_native_document_chunks,
 )
 
@@ -44,3 +52,49 @@ title: Empty
         path="empty.md",
         canonical_text=raw,
     ) == []
+
+
+@pytest.mark.parametrize(
+    "placement",
+    (M1ReferencePayloadStore.selected_placement, M1PgBodyStore.selected_placement),
+)
+def test_native_head_body_verification_dispatches_to_the_manifest_placement(placement):
+    canonical = b"verified native body\n"
+    assert _verify_native_head_body(
+        {
+            "canonical_bytes": canonical,
+            "digest": hashlib.sha256(canonical).hexdigest(),
+            "byte_size": len(canonical),
+            "encoding": "utf-8",
+            "selected_placement": placement,
+            "verification_profile": "sha256-size-utf8-v1",
+        }
+    ) == canonical
+
+
+def test_native_head_body_verification_rejects_an_unknown_manifest_placement():
+    with pytest.raises(NativePayloadPlacementError, match="Unsupported native payload placement"):
+        _verify_native_head_body(
+            {
+                "selected_placement": "unknown-placement-v1",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "placement",
+    (M1ReferencePayloadStore.selected_placement, M1PgBodyStore.selected_placement),
+)
+def test_native_head_body_verification_rejects_a_mismatched_placement_profile(placement):
+    canonical = b"verified native body\n"
+    with pytest.raises(RuntimeError, match="verification profile mismatch"):
+        _verify_native_head_body(
+            {
+                "canonical_bytes": canonical,
+                "digest": hashlib.sha256(canonical).hexdigest(),
+                "byte_size": len(canonical),
+                "encoding": "utf-8",
+                "selected_placement": placement,
+                "verification_profile": "mismatched-profile-v1",
+            }
+        )
