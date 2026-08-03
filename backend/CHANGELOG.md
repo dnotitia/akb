@@ -7,6 +7,8 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.13.0 — 2026-08-03  *(removes the `todos` stack; fixes account deletion)*
+
 ### Removed the `todos` stack — fixes permanently-failing account deletion
 
 `DELETE /api/v1/my/account` returned 500 and could never succeed for a user
