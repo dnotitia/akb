@@ -169,7 +169,10 @@ def decode_inventory_cursor(
             raise ValueError
         boundary = _normalize_datetime(boundary_value, field="cursor")
         last_created_at = _normalize_datetime(last_created_at_value, field="cursor")
-        last_id = _as_uuid(payload.get("id"), field="cursor")
+        cursor_id = payload.get("id")
+        if not isinstance(cursor_id, str):
+            raise ValueError
+        last_id = _as_uuid(cursor_id, field="cursor")
     except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeError):
         raise ValidationError("Invalid inventory cursor") from None
     return {
@@ -353,7 +356,6 @@ def classify_drift(row: Any) -> dict[str, Any]:
         if data["status"] == "unknown"
     ]
     overall = "drifted" if reasons else "unknown" if unknown else "in_sync"
-    dimensions["overall"] = overall
     return {
         "release": dimensions["release"],
         "schema": dimensions["schema"],
