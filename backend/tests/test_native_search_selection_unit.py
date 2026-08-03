@@ -10,6 +10,8 @@ from app.exceptions import ValidationError
 from app.models.document import GrepResponse
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+from app.services.native_derived_worker import NativePayloadPlacementError
 from app.services.search_service import SearchService, active_document_source_type
 from app.services.vector_store import VectorHit
 
@@ -305,7 +307,11 @@ async def test_native_search_rejects_corpus_before_fetching_bodies():
 
 
 @pytest.mark.asyncio
-async def test_native_candidate_verification_and_decode_run_off_event_loop(monkeypatch):
+@pytest.mark.parametrize(
+    "store",
+    (M1ReferencePayloadStore, M1PgBodyStore),
+)
+async def test_native_candidate_verification_and_decode_run_off_event_loop(monkeypatch, store):
     body = b"---\ntitle: Worker\n---\nbody\n"
     row = {
         "resource_id": uuid.uuid4(),
@@ -317,21 +323,21 @@ async def test_native_candidate_verification_and_decode_run_off_event_loop(monke
         "digest": hashlib.sha256(body).hexdigest(),
         "byte_size": len(body),
         "encoding": "utf-8",
-        "selected_placement": "pg-bodystore-v1",
+        "selected_placement": store.selected_placement,
         "verification_profile": "sha256-size-utf8-v1",
         "canonical_bytes": body,
     }
     conn = _CandidateConn(resource_count=1, body_bytes=len(body), rows=[row])
     loop_thread = threading.get_ident()
     verify_threads = []
-    original_verify = M1PgBodyStore._verify_row
+    original_verify = store._verify_row
 
     def guarded_verify(candidate):
         verify_threads.append(threading.get_ident())
         assert threading.get_ident() != loop_thread
         return original_verify(candidate)
 
-    monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
+    monkeypatch.setattr(store, "_verify_row", staticmethod(guarded_verify))
 
     candidates = await SearchService()._native_document_candidates(
         conn,
@@ -382,7 +388,11 @@ class _HydrationPool:
 
 
 @pytest.mark.asyncio
-async def test_native_hydration_verification_and_decode_run_off_event_loop(monkeypatch):
+@pytest.mark.parametrize(
+    "store",
+    (M1ReferencePayloadStore, M1PgBodyStore),
+)
+async def test_native_hydration_verification_and_decode_run_off_event_loop(monkeypatch, store):
     from app.services import search_service
 
     body = b"---\ntitle: Hydrated\n---\nbody\n"
@@ -400,7 +410,7 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
         "digest": hashlib.sha256(body).hexdigest(),
         "byte_size": len(body),
         "encoding": "utf-8",
-        "selected_placement": "pg-bodystore-v1",
+        "selected_placement": store.selected_placement,
         "verification_profile": "sha256-size-utf8-v1",
         "canonical_bytes": body,
     }
@@ -417,14 +427,14 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
     )
     loop_thread = threading.get_ident()
     verify_threads = []
-    original_verify = M1PgBodyStore._verify_row
+    original_verify = store._verify_row
 
     def guarded_verify(candidate):
         verify_threads.append(threading.get_ident())
         assert threading.get_ident() != loop_thread
         return original_verify(candidate)
 
-    monkeypatch.setattr(M1PgBodyStore, "_verify_row", staticmethod(guarded_verify))
+    monkeypatch.setattr(store, "_verify_row", staticmethod(guarded_verify))
     results = await SearchService()._hydrate_hits(
         [
             VectorHit(
@@ -440,3 +450,10 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
 
     assert results[0].title == "Hydrated"
     assert verify_threads
+
+
+def test_native_search_metadata_verification_rejects_unknown_placement():
+    from app.services.search_service import _verified_native_metadata
+
+    with pytest.raises(NativePayloadPlacementError, match="Unsupported native payload placement"):
+        _verified_native_metadata({"selected_placement": "unknown-placement-v1"})
