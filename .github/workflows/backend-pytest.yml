@@ -117,6 +117,7 @@ jobs:
           tests/concurrency/test_native_ledger_b_core.py
           tests/test_file_idempotent_upload_unit.py
           tests/test_app_registry_migration_unit.py
+          tests/test_app_identity_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
           -v --tb=short

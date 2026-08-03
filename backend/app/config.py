@@ -506,6 +506,15 @@ class Settings(BaseModel):
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
 
+    # App principals use a separate exchange-only carrier. Keeping a distinct
+    # signing secret makes an app token cryptographically unusable as a user
+    # session even if an operator accidentally routes it to a user endpoint.
+    # Blank leaves the new app exchange surface unavailable while preserving
+    # existing standalone/user-auth behavior.
+    app_token_secret: str = ""
+    app_token_ttl_seconds: int = Field(default=300, ge=30, le=3600)
+    app_credential_overlap_seconds: int = Field(default=300, ge=0, le=86400)
+
     # Server-side gate for every username/password lifecycle operation.
     # Defaults true so standalone OSS deployments retain registration,
     # login, password change, and administrator/CLI reset behavior. Managed

@@ -227,6 +227,7 @@ async def _apply_migrations() -> None:
         "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
         "049_external_git_quarantine.py",        # external_git sync_state machine (pending_preflight/active/quarantined) + rollout fence for the pre-hardening poller
         "050_drop_todos.py",                     # archive todos → todos_archive, drop todos: entrypoint-less since PR #43 and the source of the NOT NULL account-deletion failure
+        "051_app_credentials.py",                # exchange-only deployment credentials for app principals
     ):
         if filename in applied:
             continue

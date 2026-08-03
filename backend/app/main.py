@@ -13,20 +13,44 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.deps import get_current_user, get_optional_user
+from app.api.routes import (
+    access,
+    activity,
+    agent_sessions,
+    app_identity,
+    auth,
+    collections,
+    documents,
+    files,
+    help as help_routes,
+    knowledge,
+    knowledge_io,
+    oauth_metadata,
+    public,
+    search,
+    tables,
+)
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError
 from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
-from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
-from app.api.routes import access, activity, agent_sessions, auth, documents, files, help as help_routes, oauth_metadata, public, search, collections, knowledge, knowledge_io, tables
-from app.services import audit_log, embed_worker, events_publisher, external_git_poller, external_git_service, metadata_worker, tool_usage
+from app.services import (
+    audit_log,
+    embed_worker,
+    events_publisher,
+    external_git_poller,
+    external_git_service,
+    metadata_worker,
+    tool_usage,
+)
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.external_git_capability import check_external_git_capability
 from app.services.health import vault_health
 from app.services.lifecycle import init_storage, shutdown_storage, start_workers, stop_workers
 from app.services.vector_store import get_vector_store
+from app.util.errors import CONFLICT, INTERNAL, INVALID_ARGUMENT, METHOD_NOT_ALLOWED, NOT_FOUND, PERMISSION_DENIED
 from mcp_server.http_app import mcp_app
 
 logging.basicConfig(
@@ -242,6 +266,7 @@ async def _no_store_public_surfaces(request: Request, call_next):
 
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
+app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])

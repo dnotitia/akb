@@ -133,6 +133,13 @@ s3_region: ""
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 
+# === App identity exchange ===
+# Short-lived app tokens never carry Vaults, installations, or capabilities;
+# every app request rechecks the live registry. The signing secret lives in
+# secret.yaml and must differ from jwt_secret.
+app_token_ttl_seconds: 300
+app_credential_overlap_seconds: 300
+
 # === Auth — Keycloak OIDC (OPTIONAL external IdP; OFF by default) ===
 # Local username/password lifecycle remains enabled by default. Managed SSO-only
 # deployments set this false; keycloak_sso_only alone only changes the login UI.
