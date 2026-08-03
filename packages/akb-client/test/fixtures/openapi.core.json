@@ -1017,6 +1017,11 @@
               }
             ],
             "title": "Indexes"
+          },
+          "if_not_exists": {
+            "type": "boolean",
+            "title": "If Not Exists",
+            "default": false
           }
         },
         "type": "object",

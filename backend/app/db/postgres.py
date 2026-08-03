@@ -71,10 +71,17 @@ async def get_pool() -> asyncpg.Pool:
 
 
 async def close_pool() -> None:
+    """Close the pool and clear the module handle.
+
+    The handle is cleared BEFORE the await on purpose: if `close()` raises
+    or is cancelled, leaving `_pool` set would hand the next `get_pool()` a
+    half-closed pool — and in tests, one still pointing at the previous
+    database.
+    """
     global _pool
     if _pool is not None:
-        await _pool.close()
-        _pool = None
+        pool, _pool = _pool, None
+        await pool.close()
 
 
 async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
