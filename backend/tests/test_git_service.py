@@ -444,7 +444,7 @@ def _repoint_head_to_missing_tree(bare_path) -> str:
     repoint refs/heads/main (HEAD's symref target) at it. tmp_path bare only —
     never a real repo/.git; no chmod, no recursive walk."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    ghost_tree = "0123456789abcdef0123456789abcdef01234567"
+    ghost_tree = "0123456789abcdef0123456789abcdef01234567"  # pragma: allowlist secret
     body = (
         f"tree {ghost_tree}\n"
         "author T <t@akb.local> 0 +0000\n"

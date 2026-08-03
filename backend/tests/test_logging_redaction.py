@@ -22,7 +22,7 @@ from app.logging_redaction import (
 
 # A real base64 of "x-access-token:s3cr3t-token-value" — the shape the runner
 # builds for the Authorization header.
-_B64_CRED = "eC1hY2Nlc3MtdG9rZW46czNjcjN0LXRva2VuLXZhbHVl"
+_B64_CRED = "eC1hY2Nlc3MtdG9rZW46czNjcjN0LXRva2VuLXZhbHVl"  # pragma: allowlist secret
 
 
 # ── redact() — secrets removed ───────────────────────────────────────
@@ -30,7 +30,7 @@ _B64_CRED = "eC1hY2Nlc3MtdG9rZW46czNjcjN0LXRva2VuLXZhbHVl"
     "text, secret",
     [
         (
-            "cloning https://x-access-token:ghp_abcdEFGH1234wxyz@github.com/o/r.git",
+            "cloning https://x-access-token:ghp_abcdEFGH1234wxyz@github.com/o/r.git",  # pragma: allowlist secret
             "ghp_abcdEFGH1234wxyz",
         ),
         (f"header Authorization: Basic {_B64_CRED} sent", _B64_CRED),
@@ -59,7 +59,7 @@ def test_redact_removes_secret(text: str, secret: str) -> None:
 
 
 def test_redact_url_userinfo_keeps_host() -> None:
-    out = redact("fetch https://user:p@ssw0rd@git.example.com/o/r.git failed")
+    out = redact("fetch https://user:p@ssw0rd@git.example.com/o/r.git failed")  # pragma: allowlist secret
     assert "p@ssw0rd" not in out
     assert "user" not in out.split("@")[0].split("://")[1]  # userinfo gone
     assert "git.example.com" in out  # host preserved for diagnostics
@@ -101,7 +101,7 @@ def _record(msg: str, args=None) -> logging.LogRecord:
 
 def test_filter_redacts_arg_rendered_secret() -> None:
     filt = SecretRedactingFilter()
-    rec = _record("cloning %s", ("https://x-access-token:ghp_SECRETtoken1234@h/r.git",))
+    rec = _record("cloning %s", ("https://x-access-token:ghp_SECRETtoken1234@h/r.git",))  # pragma: allowlist secret
     assert filt.filter(rec) is True
     rendered = rec.getMessage()
     assert "ghp_SECRETtoken1234" not in rendered
@@ -127,7 +127,7 @@ def test_filter_leaves_benign_record_lazy() -> None:
 def test_filter_scrubs_cached_exc_text() -> None:
     filt = SecretRedactingFilter()
     rec = _record("operation failed")
-    rec.exc_text = "Traceback: connection to https://tok:ghp_XYZ12345678@h refused"
+    rec.exc_text = "Traceback: connection to https://tok:ghp_XYZ12345678@h refused"  # pragma: allowlist secret
     assert filt.filter(rec) is True
     assert "ghp_XYZ12345678" not in rec.exc_text
 
@@ -149,7 +149,7 @@ def test_filter_redacts_live_exception_traceback() -> None:
         logger = logging.getLogger("akb.exc.redaction_test")
         logger.propagate = True
         logger.setLevel(logging.ERROR)
-        secret_url = "https://x-access-token:ghp_LIVEtoken12345678@github.com/o/r.git"
+        secret_url = "https://x-access-token:ghp_LIVEtoken12345678@github.com/o/r.git"  # pragma: allowlist secret
         try:
             raise RuntimeError(f"clone failed for {secret_url} using Basic {_B64_CRED}")
         except RuntimeError:
@@ -188,7 +188,7 @@ def test_install_covers_child_logger_via_root_handler() -> None:
         child = logging.getLogger("akb.child.redaction_test")
         child.propagate = True
         child.setLevel(logging.INFO)  # else INFO is gated by root's WARNING default
-        child.info("mirror https://x-access-token:ghp_leakME12345678@h/r.git")
+        child.info("mirror https://x-access-token:ghp_leakME12345678@h/r.git")  # pragma: allowlist secret
         handler.flush()
         out = stream.getvalue()
         assert "ghp_leakME12345678" not in out

@@ -61,7 +61,7 @@ def _settings(
         bm25_recompute_interval_secs=3600,
         s3_endpoint_url=None,
         llm_base_url="http://llm.local/v1" if llm_configured else None,
-        llm_api_key="sk-test" if llm_configured else None,
+        llm_api_key="sk-test" if llm_configured else None,  # pragma: allowlist secret
         redis_url=None,
         audit=types.SimpleNamespace(enabled=False, bucket=None),
         tool_usage=types.SimpleNamespace(enabled=False),

@@ -180,28 +180,28 @@ def _reload_row(**overrides) -> dict:
         ("https://github.com/o/r.git", "https://github.com/o/r.git", None, True),
         # The one supported form: x-access-token:TOKEN → token lifted out.
         (
-            "https://x-access-token:ghp_abc@github.com/o/r.git",
+            "https://x-access-token:ghp_abc@github.com/o/r.git",  # pragma: allowlist secret
             "https://github.com/o/r.git",
             "ghp_abc",
             True,
         ),
         # Port + query preserved (so the validator still rejects the query later).
         (
-            "https://x-access-token:tok@host:8443/p?ref=1",
+            "https://x-access-token:tok@host:8443/p?ref=1",  # pragma: allowlist secret
             "https://host:8443/p?ref=1",
             "tok",
             True,
         ),
         # IPv6 literal brackets survive the netloc surgery.
         (
-            "https://x-access-token:tok@[2001:db8::1]:443/r.git",
+            "https://x-access-token:tok@[2001:db8::1]:443/r.git",  # pragma: allowlist secret
             "https://[2001:db8::1]:443/r.git",
             "tok",
             True,
         ),
         # A colon inside the token is preserved (partition on the FIRST ':').
         (
-            "https://x-access-token:to:k@github.com/o/r.git",
+            "https://x-access-token:to:k@github.com/o/r.git",  # pragma: allowlist secret
             "https://github.com/o/r.git",
             "to:k",
             True,
@@ -209,9 +209,9 @@ def _reload_row(**overrides) -> dict:
         # Unscrubbable userinfo forms → not migratable, BUT the returned URL is
         # still credential-free (userinfo stripped) so the caller persists it and
         # leaves no secret in remote_url before quarantining.
-        ("https://user:pass@github.com/o/r.git", "https://github.com/o/r.git", None, False),
+        ("https://user:pass@github.com/o/r.git", "https://github.com/o/r.git", None, False),  # pragma: allowlist secret
         ("https://baretoken@github.com/o/r.git", "https://github.com/o/r.git", None, False),
-        ("https://oauth2:tok@gitlab.com/o/r.git", "https://gitlab.com/o/r.git", None, False),
+        ("https://oauth2:tok@gitlab.com/o/r.git", "https://gitlab.com/o/r.git", None, False),  # pragma: allowlist secret
     ],
 )
 def test_scrub_userinfo(raw, expect_url, expect_token, expect_ok):
@@ -267,7 +267,7 @@ async def test_preflight_moves_url_token_to_column(monkeypatch):
     monkeypatch.setattr(poller, "validate", fake_validate)
     repo = FakeRepo()
     claim = _preflight_claim(
-        remote_url="https://x-access-token:ghp_zzz@github.com/o/r.git",
+        remote_url="https://x-access-token:ghp_zzz@github.com/o/r.git",  # pragma: allowlist secret
         auth_token=None,
     )
     await poller._run_preflight(claim, repo)
@@ -280,7 +280,7 @@ async def test_preflight_moves_url_token_to_column(monkeypatch):
     # then the row is activated with the SAME (scrubbed_url, token) snapshot guard.
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", "ghp_zzz",
-         "https://x-access-token:ghp_zzz@github.com/o/r.git", None),
+         "https://x-access-token:ghp_zzz@github.com/o/r.git", None),  # pragma: allowlist secret
         ("activate", "v-1", "https://github.com/o/r.git", "ghp_zzz", 300,
          "https://github.com/o/r.git", "ghp_zzz"),
     ]
@@ -297,7 +297,7 @@ async def test_preflight_column_token_wins_over_url_token(monkeypatch):
     monkeypatch.setattr(poller, "validate", fake_validate)
     repo = FakeRepo()
     claim = _preflight_claim(
-        remote_url="https://x-access-token:from_url@github.com/o/r.git",
+        remote_url="https://x-access-token:from_url@github.com/o/r.git",  # pragma: allowlist secret
         auth_token="from_column",
     )
     await poller._run_preflight(claim, repo)
@@ -308,7 +308,7 @@ async def test_preflight_column_token_wins_over_url_token(monkeypatch):
     # activate snapshot guard carries (scrubbed_url, column token).
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", "from_column",
-         "https://x-access-token:from_url@github.com/o/r.git", "from_column"),
+         "https://x-access-token:from_url@github.com/o/r.git", "from_column"),  # pragma: allowlist secret
         ("activate", "v-1", "https://github.com/o/r.git", "from_column", 300,
          "https://github.com/o/r.git", "from_column"),
     ]
@@ -340,7 +340,7 @@ async def test_preflight_quarantines_unscrubbable_credential(monkeypatch):
 
     monkeypatch.setattr(poller, "validate", boom)
     repo = FakeRepo()
-    claim = _preflight_claim(remote_url="https://user:pass@github.com/o/r.git")
+    claim = _preflight_claim(remote_url="https://user:pass@github.com/o/r.git")  # pragma: allowlist secret
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 1
@@ -349,7 +349,7 @@ async def test_preflight_quarantines_unscrubbable_credential(monkeypatch):
     # re-auth via a snapshot-CAS on the scrubbed (url, token).
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", None,
-         "https://user:pass@github.com/o/r.git", None),
+         "https://user:pass@github.com/o/r.git", None),  # pragma: allowlist secret
         ("quarantine", "v-1", poller._QUARANTINE_LEGACY_CREDENTIAL, "pending_preflight",
          "https://github.com/o/r.git", None),
     ]
@@ -387,14 +387,14 @@ async def test_preflight_scrubs_before_policy_quarantine(monkeypatch):
     monkeypatch.setattr(poller, "validate", fake_validate)
     repo = FakeRepo()
     claim = _preflight_claim(
-        remote_url="https://x-access-token:ghp_leak@github.com/o/r.git"
+        remote_url="https://x-access-token:ghp_leak@github.com/o/r.git"  # pragma: allowlist secret
     )
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 1
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", "ghp_leak",
-         "https://x-access-token:ghp_leak@github.com/o/r.git", None),
+         "https://x-access-token:ghp_leak@github.com/o/r.git", None),  # pragma: allowlist secret
         ("quarantine", "v-1", poller._QUARANTINE_POLICY, "pending_preflight",
          "https://github.com/o/r.git", "ghp_leak"),
     ]
@@ -410,14 +410,14 @@ async def test_preflight_scrubs_before_transient_backoff(monkeypatch):
     monkeypatch.setattr(poller, "validate", fake_validate)
     repo = FakeRepo()
     claim = _preflight_claim(
-        remote_url="https://x-access-token:ghp_leak@github.com/o/r.git"
+        remote_url="https://x-access-token:ghp_leak@github.com/o/r.git"  # pragma: allowlist secret
     )
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 0
     assert repo.calls[0] == (
         "scrub", "v-1", "https://github.com/o/r.git", "ghp_leak",
-        "https://x-access-token:ghp_leak@github.com/o/r.git", None,
+        "https://x-access-token:ghp_leak@github.com/o/r.git", None,  # pragma: allowlist secret
     )
     assert repo.calls[1][0] == "mark_failure"
     assert repo.calls[1][5] == "pending_preflight"  # backoff stays pending
@@ -443,7 +443,7 @@ async def test_preflight_scrub_zero_row_reloads_and_activates_clean_url(monkeypa
         rows={"v-1": _reload_row(remote_url="https://github.com/o/r.git", auth_token=None)},
     )
     claim = _preflight_claim(
-        remote_url="https://x-access-token:ghp_old@github.com/o/r.git"
+        remote_url="https://x-access-token:ghp_old@github.com/o/r.git"  # pragma: allowlist secret
     )
     rc = await poller._run_preflight(claim, repo)
 
@@ -452,7 +452,7 @@ async def test_preflight_scrub_zero_row_reloads_and_activates_clean_url(monkeypa
     # the CURRENT config, guarded on its own (clean url, None) snapshot.
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", "ghp_old",
-         "https://x-access-token:ghp_old@github.com/o/r.git", None),
+         "https://x-access-token:ghp_old@github.com/o/r.git", None),  # pragma: allowlist secret
         ("get", "v-1"),
         ("activate", "v-1", "https://github.com/o/r.git", None, 300,
          "https://github.com/o/r.git", None),
@@ -472,12 +472,12 @@ async def test_preflight_scrub_zero_row_reloads_and_rescrubs_new_credential(monk
     repo = FakeRepo(
         scrub_results=[False, True],  # claimed scrub 0-row, current re-scrub matches
         rows={"v-1": _reload_row(
-            remote_url="https://x-access-token:ghp_new@github.com/o/r.git",
+            remote_url="https://x-access-token:ghp_new@github.com/o/r.git",  # pragma: allowlist secret
             auth_token=None,
         )},
     )
     claim = _preflight_claim(
-        remote_url="https://x-access-token:ghp_old@github.com/o/r.git"
+        remote_url="https://x-access-token:ghp_old@github.com/o/r.git"  # pragma: allowlist secret
     )
     rc = await poller._run_preflight(claim, repo)
 
@@ -487,13 +487,13 @@ async def test_preflight_scrub_zero_row_reloads_and_rescrubs_new_credential(monk
     # First scrub CAS is guarded on the CLAIMED old values.
     assert scrubs[0] == (
         "scrub", "v-1", "https://github.com/o/r.git", "ghp_old",
-        "https://x-access-token:ghp_old@github.com/o/r.git", None,
+        "https://x-access-token:ghp_old@github.com/o/r.git", None,  # pragma: allowlist secret
     )
     # The reload re-scrub targets the CURRENT dirty value, migrating the current
     # URL token, guarded on the CURRENT (url, token).
     assert scrubs[1] == (
         "scrub", "v-1", "https://github.com/o/r.git", "ghp_new",
-        "https://x-access-token:ghp_new@github.com/o/r.git", None,
+        "https://x-access-token:ghp_new@github.com/o/r.git", None,  # pragma: allowlist secret
     )
     # ...and it activates the CURRENT config under its own snapshot guard.
     assert repo.calls[-1] == (
@@ -612,7 +612,7 @@ async def test_preflight_malformed_url_with_credential_is_redacted(monkeypatch):
     monkeypatch.setattr(poller, "validate", boom)
     repo = FakeRepo()
     # urlsplit raises on this (bad IPv6 literal) even though it carries a token.
-    claim = _preflight_claim(remote_url="https://x-access-token:ghp_leak@[::1")
+    claim = _preflight_claim(remote_url="https://x-access-token:ghp_leak@[::1")  # pragma: allowlist secret
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 1
@@ -621,7 +621,7 @@ async def test_preflight_malformed_url_with_credential_is_redacted(monkeypatch):
     # The claimed_url (CAS guard) is the raw value; the sentinel the repo WRITES is
     # asserted in the repo unit test. The reason code is fixed + secret-free.
     assert call[1:] == (
-        "v-1", "https://x-access-token:ghp_leak@[::1", None,
+        "v-1", "https://x-access-token:ghp_leak@[::1", None,  # pragma: allowlist secret
         poller._QUARANTINE_MALFORMED,
     )
     assert "ghp_leak" not in poller._QUARANTINE_MALFORMED
@@ -638,14 +638,14 @@ async def test_preflight_malformed_hygiene_scrubs_already_quarantined_row(monkey
 
     monkeypatch.setattr(poller, "validate", boom)
     repo = FakeRepo(redact_mq_ok=False, redact_hygiene_ok=True)
-    claim = _preflight_claim(remote_url="https://x-access-token:ghp_leak@[::1")
+    claim = _preflight_claim(remote_url="https://x-access-token:ghp_leak@[::1")  # pragma: allowlist secret
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 0  # hygiene-only, not a fresh quarantine
     assert repo.calls == [
-        ("redact_mq", "v-1", "https://x-access-token:ghp_leak@[::1", None,
+        ("redact_mq", "v-1", "https://x-access-token:ghp_leak@[::1", None,  # pragma: allowlist secret
          poller._QUARANTINE_MALFORMED),
-        ("redact_hygiene", "v-1", "https://x-access-token:ghp_leak@[::1", None),
+        ("redact_hygiene", "v-1", "https://x-access-token:ghp_leak@[::1", None),  # pragma: allowlist secret
     ]
 
 
@@ -689,13 +689,13 @@ async def test_preflight_quarantine_superseded_is_not_counted(monkeypatch):
     # Unscrubbable (user:pass) → the quarantine branch; quarantine returns 0 rows,
     # and the reload shows the row is already quarantined.
     repo = FakeRepo(quarantine_ok=False, rows={"v-1": _reload_row(sync_state="quarantined")})
-    claim = _preflight_claim(remote_url="https://user:pass@github.com/o/r.git")
+    claim = _preflight_claim(remote_url="https://user:pass@github.com/o/r.git")  # pragma: allowlist secret
     rc = await poller._run_preflight(claim, repo)
 
     assert rc == 0  # superseded quarantine is not a processed-work count
     assert repo.calls == [
         ("scrub", "v-1", "https://github.com/o/r.git", None,
-         "https://user:pass@github.com/o/r.git", None),
+         "https://user:pass@github.com/o/r.git", None),  # pragma: allowlist secret
         ("quarantine", "v-1", poller._QUARANTINE_LEGACY_CREDENTIAL, "pending_preflight",
          "https://github.com/o/r.git", None),
         ("get", "v-1"),

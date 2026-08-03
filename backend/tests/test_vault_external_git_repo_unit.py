@@ -157,7 +157,7 @@ async def test_scrub_legacy_credential_persists_credential_free_url():
     vid = uuid.uuid4()
     ok = await repo.scrub_legacy_credential(
         vid, "https://github.com/o/r.git", "ghp_tok",
-        "https://x-access-token:ghp_tok@github.com/o/r.git", None,
+        "https://x-access-token:ghp_tok@github.com/o/r.git", None,  # pragma: allowlist secret
     )
     assert ok is True
     sql, args = conn.executed[0]
@@ -171,7 +171,7 @@ async def test_scrub_legacy_credential_persists_credential_free_url():
     _no_legacy_columns(sql)
     assert args == (
         vid, "https://github.com/o/r.git", "ghp_tok",
-        "https://x-access-token:ghp_tok@github.com/o/r.git", None,
+        "https://x-access-token:ghp_tok@github.com/o/r.git", None,  # pragma: allowlist secret
     )
 
 
@@ -379,7 +379,7 @@ async def test_redact_malformed_and_quarantine_is_atomic_and_credential_free():
     repo, conn = _repo()
     vid = uuid.uuid4()
     ok = await repo.redact_malformed_and_quarantine(
-        vid, "https://x-access-token:ghp_leak@[::1", None, "malformed_url",
+        vid, "https://x-access-token:ghp_leak@[::1", None, "malformed_url",  # pragma: allowlist secret
     )
     assert ok is True
     sql, args = conn.executed[0]
@@ -400,7 +400,7 @@ async def test_redact_malformed_and_quarantine_is_atomic_and_credential_free():
     assert args == (
         vid, _MALFORMED_URL_SENTINEL, "malformed_url",
         "[quarantine] malformed_url",
-        "https://x-access-token:ghp_leak@[::1", None,
+        "https://x-access-token:ghp_leak@[::1", None,  # pragma: allowlist secret
     )
     assert "ghp_leak" not in _MALFORMED_URL_SENTINEL
 
@@ -431,7 +431,7 @@ async def test_redact_malformed_url_if_quarantined_preserves_reason():
     repo, conn = _repo()
     vid = uuid.uuid4()
     ok = await repo.redact_malformed_url_if_quarantined(
-        vid, "https://x-access-token:ghp_leak@[::1", None,
+        vid, "https://x-access-token:ghp_leak@[::1", None,  # pragma: allowlist secret
     )
     assert ok is True
     sql, args = conn.executed[0]
@@ -444,7 +444,7 @@ async def test_redact_malformed_url_if_quarantined_preserves_reason():
     assert "AND auth_token IS NOT DISTINCT FROM $4" in sql
     assert args == (
         vid, _MALFORMED_URL_SENTINEL,
-        "https://x-access-token:ghp_leak@[::1", None,
+        "https://x-access-token:ghp_leak@[::1", None,  # pragma: allowlist secret
     )
 
 

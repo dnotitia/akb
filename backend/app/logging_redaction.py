@@ -20,7 +20,7 @@ AND to every handler currently configured anywhere in the logging tree.
 
 What is redacted (a small set of compiled patterns — kept cheap)
 -----------------------------------------------------------------
-* URL userinfo — ``scheme://user:pass@host`` → ``scheme://<redacted>@host``.
+* URL userinfo — ``scheme://...@host`` → ``scheme://<redacted>@host`` (credentials before ``@`` are dropped).
 * ``Authorization:`` / ``x-access-token:`` header values (any scheme/value).
 * ``Basic``/``Bearer`` credential blobs (the base64 the runner builds is a
   ``Basic <base64>``; a remote can reflect the header value back in a response).

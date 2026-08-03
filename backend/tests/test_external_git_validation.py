@@ -119,8 +119,8 @@ def test_idna_host_is_punycode_encoded():
 @pytest.mark.parametrize(
     "url",
     [
-        "https://user:pass@github.com/r.git",
-        "https://x-access-token:secret@github.com/r.git",
+        "https://user:pass@github.com/r.git",  # pragma: allowlist secret
+        "https://x-access-token:secret@github.com/r.git",  # pragma: allowlist secret
         "https://@github.com/r.git",
     ],
 )
@@ -450,7 +450,7 @@ def test_error_messages_never_contain_url_userinfo_or_token():
     # userinfo path
     with pytest.raises(v.ExternalGitPolicyError) as e1:
         v.validate(
-            {"url": f"https://x-access-token:{marker_userinfo}@evil.example/r.git"},
+            {"url": f"https://x-access-token:{marker_userinfo}@evil.example/r.git"},  # pragma: allowlist secret
             settings=_settings(),
             resolve=False,
         )

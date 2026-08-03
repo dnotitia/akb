@@ -26,7 +26,7 @@ import pytest
 from app.services import external_git_poller as poller
 from app.services._backfill import MAX_RETRIES
 
-_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
+_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")  # pragma: allowlist secret
 
 # The pre-hardening poller's _claim_one, verbatim (migration-010 era). This is
 # the exact query an OLD binary would run during a mixed-version rollout; the
@@ -386,7 +386,7 @@ async def test_scrub_legacy_credential_old_value_cas_on_live_pg():
 
             # ── (a) claim → concurrent quarantine → scrub ────────────
             vid = uuid.uuid4()
-            raw_url = "https://x-access-token:ghp_secret@github.com/o/r.git"
+            raw_url = "https://x-access-token:ghp_secret@github.com/o/r.git"  # pragma: allowlist secret
             await pool.execute("INSERT INTO vaults (id, name) VALUES ($1, 'm')", vid)
             await pool.execute(
                 "INSERT INTO vault_external_git "
@@ -427,16 +427,16 @@ async def test_scrub_legacy_credential_old_value_cas_on_live_pg():
             await pool.execute(
                 "INSERT INTO vault_external_git (vault_id, remote_url, "
                 "remote_branch, auth_token, poll_interval_secs) "
-                "VALUES ($1, 'https://user:pass@h/r.git', 'main', 'col_tok', 300)",
+                "VALUES ($1, 'https://user:pass@h/r.git', 'main', 'col_tok', 300)",  # pragma: allowlist secret
                 vid2,
             )
             # Wrong claimed token → no match, credential stays put (nothing scrubbed).
             assert await ext_repo.scrub_legacy_credential(
-                vid2, "https://h/r.git", "col_tok", "https://user:pass@h/r.git", "WRONG",
+                vid2, "https://h/r.git", "col_tok", "https://user:pass@h/r.git", "WRONG",  # pragma: allowlist secret
             ) is False
             # Correct claimed token → scrub proceeds.
             assert await ext_repo.scrub_legacy_credential(
-                vid2, "https://h/r.git", "col_tok", "https://user:pass@h/r.git", "col_tok",
+                vid2, "https://h/r.git", "col_tok", "https://user:pass@h/r.git", "col_tok",  # pragma: allowlist secret
             ) is True
             assert await pool.fetchval(
                 "SELECT remote_url FROM vault_external_git WHERE vault_id = $1", vid2,
@@ -583,7 +583,7 @@ async def test_redact_malformed_and_quarantine_atomic_on_live_pg():
         pool = await asyncpg.create_pool(f"{base}/{dbname}", min_size=1, max_size=2)
         try:
             ext_repo = VaultExternalGitRepository(pool)
-            malformed = "https://x-access-token:ghp_secret@[::1"
+            malformed = "https://x-access-token:ghp_secret@[::1"  # pragma: allowlist secret
 
             # ── (a) atomic redact + quarantine: no secret in either column ──
             vid = uuid.uuid4()

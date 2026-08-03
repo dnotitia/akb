@@ -97,8 +97,8 @@ _INVALID_REMOTES = {
     "scheme-git": {"url": "git://github.com/o/r.git"},
     "scheme-ssh": {"url": "ssh://git@github.com/o/r.git"},
     "ext-transport": {"url": "ext::sh -c whoami"},
-    "userinfo-pat": {"url": "https://x-access-token:tok@github.com/o/r.git"},
-    "userinfo-basic": {"url": "https://user:pass@github.com/o/r.git"},
+    "userinfo-pat": {"url": "https://x-access-token:tok@github.com/o/r.git"},  # pragma: allowlist secret
+    "userinfo-basic": {"url": "https://user:pass@github.com/o/r.git"},  # pragma: allowlist secret
     "nonglobal-linklocal": {"url": "https://169.254.169.254/o/r.git"},
     "nonglobal-loopback-v4": {"url": "https://127.0.0.1/o/r.git"},
     "nonglobal-loopback-v6": {"url": "https://[::1]/o/r.git"},
@@ -140,7 +140,7 @@ async def test_reject_message_never_leaks_the_raw_url_or_token():
     with pytest.raises(ValidationError) as exc:
         await svc.create_vault(
             "mirror-vault",
-            external_git={"url": "https://s3cr3t-token:p4ss@169.254.169.254/o/r.git"},
+            external_git={"url": "https://s3cr3t-token:p4ss@169.254.169.254/o/r.git"},  # pragma: allowlist secret
         )
     msg = str(exc.value)
     assert "s3cr3t-token" not in msg

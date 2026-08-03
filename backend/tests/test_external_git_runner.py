@@ -625,7 +625,7 @@ def test_structure_findings_are_value_less(tmp_path):
     bare = _init_bare(tmp_path)
     _append_config(
         bare,
-        '\n[remote "https://x-access-token:SEKRIT@evil.example/x.git"]\n'
+        '\n[remote "https://x-access-token:SEKRIT@evil.example/x.git"]\n'  # pragma: allowlist secret
         "\turl = https://evil.example/x.git\n"
         "\tproxy = http://SECRETPROXY:9\n",
     )
@@ -738,7 +738,7 @@ def test_structure_finding_never_echoes_secret_in_config_key(tmp_path):
     bare = _init_bare(tmp_path)
     _append_config(
         bare,
-        "\n[http]\n\thttps://user:SECRETMARKER123@evil.example/x = 1\n"
+        "\n[http]\n\thttps://user:SECRETMARKER123@evil.example/x = 1\n"  # pragma: allowlist secret
         "\n[core]\n\tSECRETMARKER456 = /tmp/evil\n",
     )
     r = ExternalGitRunner(settings=Settings())
@@ -955,7 +955,7 @@ def test_missing_and_duplicate_findings_are_value_less(tmp_path):
         "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
         '[remote "origin"]\n'
         "\turl = https://good.example/x.git\n"
-        "\turl = https://x-access-token:SEKRIT999@evil.example/x.git\n"
+        "\turl = https://x-access-token:SEKRIT999@evil.example/x.git\n"  # pragma: allowlist secret
     )
     r = ExternalGitRunner(settings=Settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
@@ -971,9 +971,9 @@ def test_sanitize_strips_token_base64_and_any_userinfo_url():
     b64 = cred.split(" ", 2)[-1]
     raw = (
         f"fatal: unable to access "
-        f"'https://x-access-token:{token}@evil.example/x.git': HTTP 401\n"
+        f"'https://x-access-token:{token}@evil.example/x.git': HTTP 401\n"  # pragma: allowlist secret
         f"sent header {cred}\n"
-        f"redirected to https://otheruser:otherpass@other.example/y.git\n"
+        f"redirected to https://otheruser:otherpass@other.example/y.git\n"  # pragma: allowlist secret
     )
     out = _sanitize(raw, url="https://evil.example/x.git", cred=cred, token=token)
     assert token not in out
@@ -1036,7 +1036,7 @@ def test_sanitize_does_not_over_redact_query_fragment_path_at(raw, expect_presen
 def test_sanitize_strips_real_userinfo_but_keeps_query_at():
     """A URL with BOTH genuine userinfo AND a query `@`: the userinfo is
     redacted, the host and the query `@` survive."""
-    raw = "fatal: access 'https://user:pass@host.example/x?to=a@b.example' denied"
+    raw = "fatal: access 'https://user:pass@host.example/x?to=a@b.example' denied"  # pragma: allowlist secret
     out = _sanitize(raw, url=None, cred=None, token=None)
     assert "user:pass" not in out and "pass@" not in out
     assert "<redacted>@host.example/x?to=a@b.example" in out, out
@@ -1354,7 +1354,7 @@ def _commit_with_missing_root_tree(bare):
     """Store (loose) a commit object whose ``tree`` points at a NON-EXISTENT oid,
     then return its OID: the commit is present but its root tree is absent, WITHOUT
     disturbing any packed object. tmp_path only."""
-    ghost_tree = "0123456789abcdef0123456789abcdef01234567"
+    ghost_tree = "0123456789abcdef0123456789abcdef01234567"  # pragma: allowlist secret
     body = (
         f"tree {ghost_tree}\n"
         "author T <t@akb.local> 0 +0000\n"
