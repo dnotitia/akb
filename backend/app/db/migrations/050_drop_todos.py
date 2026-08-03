@@ -29,9 +29,15 @@ reader either; operators who no longer want the history can
 ``DROP TABLE todos_archive`` at any time. Operators who want the rows outside
 the database should snapshot the table before upgrading.
 
-Idempotent: re-running is a no-op once `todos` is gone. The archive step is
-skipped if `todos_archive` already exists, so a partial run that created the
-archive and died before the drop resolves correctly on retry.
+Idempotent: re-running is a no-op once `todos` is gone. The archive and the
+drop commit together, so there is no partial state to resolve — if the process
+dies mid-migration the whole thing rolls back and the next boot starts over.
+
+NOT reversible. Rolling back to an image whose `init.sql` still carries the
+`CREATE TABLE todos` will recreate the table empty on the next boot, and this
+migration will not run again because the ledger already records it. The
+resurrected table is inert (no code reads or writes it), but removing it again
+requires manual DDL.
 """
 
 from __future__ import annotations
@@ -58,24 +64,52 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
-    if await conn.fetchval("SELECT to_regclass('public.todos')") is None:
-        logger.info("Migration 050: `todos` already absent — nothing to do.")
-        return
-
-    # Archive + drop as one unit so a crash between them cannot lose rows.
-    # No FK points AT todos, so the drop cannot cascade-break another table;
-    # CASCADE only sheds todos' own indexes.
+    # Everything — the existence checks included — happens inside one
+    # transaction under an ACCESS EXCLUSIVE lock. Two reasons:
+    #
+    #  * TOCTOU: checking outside the transaction lets the answer change
+    #    before the archive is taken.
+    #  * CTAS alone takes only ACCESS SHARE on the source, which does NOT
+    #    block INSERT/UPDATE/DELETE. A row committed between the CTAS
+    #    snapshot and the DROP would be destroyed without ever reaching the
+    #    archive. The MCP tools are gone, but an unscoped admin's `akb_sql`
+    #    runs as the connection default role and permits DML, and operators
+    #    can always attach directly — so "no writer" is a statement about
+    #    the product surfaces, not a guarantee about the database.
     async with conn.transaction():
-        archived = 0
-        if await conn.fetchval("SELECT to_regclass('public.todos_archive')") is None:
-            await conn.execute("CREATE TABLE todos_archive AS SELECT * FROM todos")
-            archived = await conn.fetchval("SELECT COUNT(*) FROM todos_archive")
-        else:
-            logger.warning(
-                "Migration 050: `todos_archive` already exists — keeping it as-is "
-                "and dropping `todos` (partial earlier run)."
+        if await conn.fetchval("SELECT to_regclass('public.todos')") is None:
+            logger.info("Migration 050: `todos` already absent — nothing to do.")
+            return
+
+        # LOCK blocks until it wins or `lock_timeout` (set by the caller)
+        # fires; a timeout aborts this transaction and the runner retries.
+        await conn.execute("LOCK TABLE public.todos IN ACCESS EXCLUSIVE MODE")
+
+        if await conn.fetchval("SELECT to_regclass('public.todos_archive')") is not None:
+            # This migration cannot produce this state: the archive and the
+            # drop commit together, so it can never leave the archive behind
+            # with `todos` still present. Both existing therefore means
+            # something outside this code path created `todos_archive` — a
+            # manual snapshot, a restored dump, or a hand-run of an earlier
+            # revision. Silently keeping that archive and dropping the live
+            # table could discard rows it never contained. Fail closed and
+            # let an operator decide.
+            raise RuntimeError(
+                "Migration 050: both `todos` and `todos_archive` exist. This "
+                "migration never produces that state, so `todos_archive` came "
+                "from outside it and may not contain the rows currently in "
+                "`todos`. Refusing to drop the source. Reconcile the two "
+                "tables by hand (or rename/drop `todos_archive`), then re-run."
             )
-        await conn.execute("DROP TABLE IF EXISTS todos CASCADE")
+
+        await conn.execute("CREATE TABLE public.todos_archive AS SELECT * FROM public.todos")
+        archived = await conn.fetchval("SELECT COUNT(*) FROM public.todos_archive")
+        # Plain DROP, not CASCADE: nothing in this repo depends on `todos`
+        # (no inbound FK, view, or trigger — its own indexes and constraints
+        # go with it either way). RESTRICT semantics mean an unexpected
+        # site-local dependent fails loudly here instead of being silently
+        # deleted.
+        await conn.execute("DROP TABLE public.todos")
 
     logger.info(
         "Migration 050 dropped `todos` (%d row(s) archived to `todos_archive`). "

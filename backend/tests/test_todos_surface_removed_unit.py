@@ -30,8 +30,19 @@ from pathlib import Path
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = _BACKEND / "app" / "db" / "init.sql"
 
-# `FROM todos`, `UPDATE todos`, `INTO todos`, `JOIN todos`, `TABLE todos`.
-_TODOS_SQL = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN|TABLE)\s+todos\b", re.IGNORECASE)
+# `FROM todos`, `UPDATE todos`, `INTO todos`, `JOIN todos`, `TABLE todos`,
+# `TRUNCATE todos` — each also in schema-qualified (`public.todos`) and quoted
+# (`"todos"`) spellings, and tolerating `TABLE ONLY todos`.
+#
+# Known limitation: the scan is line-based, so a statement that splits the verb
+# and the table name across source lines is not matched. Catching that needs a
+# real SQL parser; this guard targets the ordinary single-line
+# `conn.execute("… todos …")` shape that every removed call site used.
+_TODOS_SQL = re.compile(
+    r"\b(?:FROM|INTO|UPDATE|JOIN|TABLE|TRUNCATE)\s+(?:ONLY\s+)?"
+    r"(?:public\s*\.\s*)?\"?todos\"?\b",
+    re.IGNORECASE,
+)
 _TODO_SERVICE = re.compile(r"\btodo_service\b")
 
 # The drop migration is the one place allowed to name the table — that is its

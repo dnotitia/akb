@@ -1501,7 +1501,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
       - edges, chunks (via vector-store outbox + sync vector-store delete in
         index_service.delete_vault_chunks)
       - vault_tables (drops the underlying PG tables)
-      - todos, sessions
       - documents, collections, vault_access
       - the vault row itself
       - git bare repo directory

@@ -102,10 +102,16 @@ jobs:
         # constraint. Asserting that against a mock would only prove the mock
         # agrees with itself, and leaving the file out of this list would let
         # it skip in both jobs — a gate that never fires.
+        #
+        # Migration 050 is destructive (archives then DROPs `todos`), so its
+        # state matrix and its fail-closed guard are pinned against a real PG
+        # for the same reason — and so is the account-deletion regression it
+        # exists to fix, which no other test exercises positively.
         run: >
           pytest
           tests/test_pgvector_ext_bootstrap_e2e.py
           tests/test_migration_037_upgrade_unit.py
+          tests/test_migration_050_drop_todos_unit.py
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
           tests/concurrency/test_native_ledger_b_core.py

@@ -206,9 +206,9 @@ async def delete_vault_route(
     vault: str,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Cascades S3 files, edges, chunks, vault_tables, todos, sessions,
-    documents, collections, vault_access, and the git bare repo. The
-    underlying service requires admin role on the vault (i.e. owner)."""
+    """Cascades S3 files, edges, chunks, vault_tables, documents, collections,
+    vault_access, and the git bare repo. The underlying service requires admin
+    role on the vault (i.e. owner)."""
     return await delete_vault(user.user_id, vault)
 
 

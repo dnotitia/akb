@@ -1962,7 +1962,7 @@ class DocumentService:
         vault_tables can never swallow an acknowledged foreign row.
 
         Foreign = any document off the pinned seed path; any file / table /
-        publication / todo (creation makes none of those); any OTHER vault's
+        publication (creation makes none of those); any OTHER vault's
         table_query publication referencing this vault by name
         (query_vault_names); any collection outside ``owned_paths`` (seed
         'overview' + template paths). The remaining vaults-FK tables are
