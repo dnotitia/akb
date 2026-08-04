@@ -29,6 +29,24 @@ Credential lifecycle, exchange outcomes, and capability decisions emit bounded
 correlation-aware audit metadata without credential, token, cookie, or request
 body content. Existing user authentication and registry rows remain unchanged.
 
+### Added app installation inventory and rollout target snapshots
+
+System administrators and authorized app principals can read a bounded,
+stable-cursor installation inventory. Each item combines desired registry state
+with the latest sanitized worker observation, bounded checkpoint/error summary,
+live grant status, and independent release/schema/grant drift classifications;
+missing observations and absent expected schema fingerprints remain `unknown`.
+
+Workers can replace an observation only when its generation and timestamp are
+at least as new as the stored report. Rollout snapshot creation freezes every
+installation with a desired release in one transaction, seals membership and
+baseline release/grant values, and rechecks live installation, grant, and
+observed-state eligibility before marking a target `running`. Sealed snapshot
+membership and baselines are database-protected from mutation. The REST
+surface reuses the existing system-admin and app-principal boundaries, applies
+`no-store` to reads, and omits credentials, grant provenance, arbitrary Vault
+metadata, and worker payloads from responses and audit metadata.
+
 ## 0.13.0 — 2026-08-03  *(removes the `todos` stack; fixes account deletion)*
 
 ### Removed the `todos` stack — fixes permanently-failing account deletion

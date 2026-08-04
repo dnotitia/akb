@@ -739,3 +739,85 @@ async def authorize_app_request(
         vault_id=vault_id,
         generation=principal.credential_generation,
     )
+
+
+async def authorize_app_capability(
+    principal: AppPrincipal,
+    *,
+    capability: str,
+    correlation_id: str,
+    conn=None,
+) -> None:
+    """Authorize an app-scoped control-plane capability.
+
+    Inventory and rollout reads address an app as a whole rather than one
+    Vault, so the per-installation ``authorize_app_request`` helper cannot be
+    used as their boundary.  This check still binds authority to the live
+    registry: at least one active installation for the token's app must have
+    the current active grant with the requested capability.
+    """
+    if capability not in SUPPORTED_APP_CAPABILITIES:
+        record_app_audit(
+            "app.capability.denied",
+            correlation_id=correlation_id,
+            outcome="error",
+            reason="unsupported_capability",
+            actor=f"app:{principal.app_id}",
+            actor_id=str(principal.app_id),
+            app_id=principal.app_id,
+            deployment=principal.deployment,
+            generation=principal.credential_generation,
+        )
+        raise ForbiddenError("App request denied")
+
+    async def _check(active_conn):
+        return await active_conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM vault_app_installations AS installation
+                  JOIN installation_grants AS grant_row
+                    ON grant_row.installation_id = installation.id
+                   AND grant_row.generation = installation.grant_generation
+                   AND grant_row.status = 'active'
+                 WHERE installation.app_id = $1
+                   AND installation.lifecycle = 'active'
+                   AND $2 = ANY(grant_row.capabilities)
+            )
+            """,
+            principal.app_id,
+            capability,
+        )
+
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as acquired:
+            allowed = await _check(acquired)
+    else:
+        allowed = await _check(conn)
+
+    if not allowed:
+        record_app_audit(
+            "app.capability.denied",
+            correlation_id=correlation_id,
+            outcome="error",
+            reason="capability_not_granted",
+            actor=f"app:{principal.app_id}",
+            actor_id=str(principal.app_id),
+            app_id=principal.app_id,
+            deployment=principal.deployment,
+            generation=principal.credential_generation,
+        )
+        raise ForbiddenError("App request denied")
+
+    record_app_audit(
+        "app.capability.authorized",
+        correlation_id=correlation_id,
+        outcome="ok",
+        reason="authorized",
+        actor=f"app:{principal.app_id}",
+        actor_id=str(principal.app_id),
+        app_id=principal.app_id,
+        deployment=principal.deployment,
+        generation=principal.credential_generation,
+    )
