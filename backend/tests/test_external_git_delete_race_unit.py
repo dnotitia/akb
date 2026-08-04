@@ -20,13 +20,21 @@ from app.services import external_git_service as egs
 
 
 class _FakeState:
-    def __init__(self, row):
+    def __init__(self, row, *, row_path="a.md", vault_name="v"):
         self.row = row  # current documents row dict, or None once deleted
+        # What the LOCKED row says its identity is. The chokepoint derives the
+        # publication URI from this, never from the caller's arguments, so the
+        # fake has to carry it separately to model that at all.
+        self.row_path = row_path
+        self.vault_name = vault_name
         self.select_sqls: list[str] = []
         self.chunk_deletes: list[str] = []
         self.relation_deletes: list[tuple[str, str]] = []
         self.decrements: list = []
         self.events: list[str] = []
+        # (resource_uri, vault_id) per publication DELETE, recorded only when
+        # it ran on THIS connection inside the transaction — see _FakeConn.fetch.
+        self.publication_deletes: list[tuple] = []
 
 
 class _FakeConn:
@@ -34,21 +42,53 @@ class _FakeConn:
         self.state = state
         self._in_tx = in_tx_flag  # single-element list → mutable "are we in a tx"
 
+    def is_in_transaction(self):
+        # `DocumentRepository.delete_with_publications` refuses to run outside
+        # one — the row lock it takes would be released the instant its
+        # autocommit statement returned.
+        return self._in_tx[0]
+
     async def fetchrow(self, sql, *args):
         s = " ".join(sql.split())
+        if s.startswith("SELECT d.path") and "FOR UPDATE OF d" in s:
+            # The repository chokepoint's lock. It reads the row's identity
+            # back under the lock and builds the publication URI from THAT,
+            # so the fake answers with its own stored path/vault rather than
+            # echoing whatever the caller asked to delete.
+            assert self._in_tx[0], "chokepoint FOR UPDATE ran OUTSIDE the transaction"
+            self.state.select_sqls.append(s)
+            if self.state.row is None:
+                return None
+            return {"path": self.state.row_path, "vault_name": self.state.vault_name}
         if "FOR UPDATE" in s:
             # The lock/read MUST happen inside the transaction, not before it.
             assert self._in_tx[0], "FOR UPDATE lookup ran OUTSIDE the transaction"
             self.state.select_sqls.append(s)
             return dict(self.state.row) if self.state.row else None
+        raise AssertionError(f"unexpected fetchrow SQL: {s}")
+
+    async def fetchval(self, sql, *args):
+        s = " ".join(sql.split())
         if s.startswith("DELETE FROM documents") and "RETURNING" in s:
             assert self._in_tx[0]
             row_id = args[0]
             if self.state.row is not None and self.state.row["id"] == row_id:
                 self.state.row = None  # the row dies here (RETURNING → 1 row)
-                return {"id": row_id}
+                return row_id
             return None  # already gone → RETURNING yields nothing
-        raise AssertionError(f"unexpected fetchrow SQL: {s}")
+        raise AssertionError(f"unexpected fetchval SQL: {s}")
+
+    async def fetch(self, sql, *args):
+        s = " ".join(sql.split())
+        if s.startswith("DELETE FROM publications") and "RETURNING" in s:
+            # The tombstone must drop the publication on the SAME connection,
+            # inside the SAME transaction as the documents DELETE. On a
+            # separate connection the two commit independently and a crash
+            # between them orphans a public slug onto a reusable path.
+            assert self._in_tx[0], "publication cleanup ran OUTSIDE the transaction"
+            self.state.publication_deletes.append(tuple(args))
+            return []
+        raise AssertionError(f"unexpected fetch SQL: {s}")
 
     async def execute(self, sql, *args):  # unused by the stubbed helpers
         return "OK"
@@ -145,8 +185,9 @@ async def test_delete_external_path_normal_single_delete(monkeypatch):
     with the lookup locked (FOR UPDATE) inside the transaction."""
     row = _row()
     state = _wire(monkeypatch, row)
+    vault_id = uuid.uuid4()
     outcome = await _svc()._delete_external_path(
-        vault_id=uuid.uuid4(), vault_name="v", path="a.md",
+        vault_id=vault_id, vault_name="v", path="a.md",
         expected_blob=row["external_blob"],
     )
     assert outcome == "deleted"  # explicit outcome for the caller
@@ -156,6 +197,11 @@ async def test_delete_external_path_normal_single_delete(monkeypatch):
     assert state.decrements == [row["collection_id"]]
     assert state.events == ["document.delete"]
     assert state.select_sqls and all("FOR UPDATE" in s for s in state.select_sqls)
+    # The publication cascade is app-level since migration 022 dropped
+    # `publications.document_id`: without it the mirrored path's slug outlives
+    # the doc, and a later upstream commit re-adding that path republishes
+    # whatever now lives there. Vault-bound, canonical URI, same TX.
+    assert state.publication_deletes == [("akb://v/doc/a.md", vault_id)]
 
 
 @pytest.mark.asyncio
@@ -179,6 +225,9 @@ async def test_overlapping_tombstone_decrements_and_emits_exactly_once(monkeypat
     assert state.decrements == [row["collection_id"]]  # exactly one
     assert state.events == ["document.delete"]  # no duplicate
     assert state.chunk_deletes == [str(row["id"])]  # second call bailed early
+    # Gated on a real row deletion, like the decrement and the event: the
+    # loser's DELETE must not re-run the publication cascade either.
+    assert len(state.publication_deletes) == 1
 
 
 @pytest.mark.asyncio
@@ -197,6 +246,9 @@ async def test_expected_blob_mismatch_skips_delete_and_side_effects(monkeypatch)
     assert state.chunk_deletes == []
     assert state.decrements == []
     assert state.events == []
+    # A surviving document keeps its publication — unpublishing a doc we
+    # deliberately did NOT delete would be its own bug.
+    assert state.publication_deletes == []
 
 
 @pytest.mark.asyncio
@@ -211,6 +263,7 @@ async def test_missing_row_is_a_noop(monkeypatch):
     assert state.chunk_deletes == []
     assert state.decrements == []
     assert state.events == []
+    assert state.publication_deletes == []
 
 
 @pytest.mark.asyncio
@@ -219,10 +272,41 @@ async def test_delete_without_expected_blob_still_deletes(monkeypatch):
     row is still tombstoned and the side effects fire once."""
     row = _row()
     state = _wire(monkeypatch, row)
+    vault_id = uuid.uuid4()
     outcome = await _svc()._delete_external_path(
-        vault_id=uuid.uuid4(), vault_name="v", path="a.md",
+        vault_id=vault_id, vault_name="v", path="a.md",
     )
     assert outcome == "deleted"
     assert state.row is None
     assert state.decrements == [row["collection_id"]]
     assert state.events == ["document.delete"]
+    assert state.publication_deletes == [("akb://v/doc/a.md", vault_id)]
+
+
+@pytest.mark.asyncio
+async def test_publication_uri_comes_from_the_locked_row_not_the_caller(monkeypatch):
+    """The chokepoint must build the publication URI from the row it just
+    locked, never from a caller-supplied path.
+
+    A caller can hold a stale path — a collection cascade iterating a
+    snapshot taken before a concurrent move, for instance. Building the URI
+    from that would delete publications for a URI nothing matches, return a
+    silent zero, and then delete the document anyway: the orphan again, out
+    of the one method that exists to prevent it. Here the locked row says it
+    lives at `renamed/b.md` while the caller is tombstoning `a.md`; the
+    cleanup must follow the row.
+    """
+    row = _row()
+    state = _wire(monkeypatch, row)
+    state.row_path = "renamed/b.md"
+    vault_id = uuid.uuid4()
+
+    outcome = await _svc()._delete_external_path(
+        vault_id=vault_id, vault_name="v", path="a.md",
+        expected_blob=row["external_blob"],
+    )
+
+    assert outcome == "deleted"
+    assert state.publication_deletes == [("akb://v/coll/renamed/doc/b.md", vault_id)], (
+        "the cleanup URI must come from the locked row, not the caller's path"
+    )

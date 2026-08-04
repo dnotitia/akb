@@ -107,6 +107,37 @@ jobs:
         # state matrix and its fail-closed guard are pinned against a real PG
         # for the same reason — and so is the account-deletion regression it
         # exists to fix, which no other test exercises positively.
+        #
+        # The concurrency invariants file lands here because what it asserts
+        # is transactional: the publication cleanup helpers must delete inside
+        # the caller's TX, or a crash between the two commits orphans a
+        # publication row and a public slug then reaches a different
+        # document at the reused path. Rollback
+        # semantics are the thing under test, so a mock would prove nothing —
+        # and off this list the file skips in both jobs.
+        #
+        # The orphan-write guard belongs here for the same reason. What it
+        # asserts is that a write onto a path whose publication outlived its
+        # document is REFUSED — and the orphan has to be manufactured through
+        # the real publish path, because a publication whose `resource_uri`
+        # the test assembled by hand would agree with a guard that assembles
+        # it the same wrong way, and the pair would pass while production
+        # matched nothing. Only a real database can hold that state.
+        #
+        # The resolution vault-binding file needs a real PG for the same
+        # reason inverted: it manufactures a publication whose `vault_id`
+        # disagrees with the vault named in its `resource_uri` and asserts
+        # resolution refuses it. That state is two vaults, two documents at
+        # one path, and a row the product will not produce — nothing a mock
+        # can stand in for.
+        #
+        # The external-git cascade file needs a live PG *and* the real git
+        # binary: it drives a reconcile over the in-process smart-HTTP git
+        # fixture, publishes the mirrored document, then pushes an upstream
+        # commit deleting the path and asserts the publication went with it.
+        # The delete path it covers is a tree diff, a row lock and a cascade
+        # across three tables — mock any of it and the test stops covering the
+        # thing that would leak.
         run: >
           pytest
           tests/test_pgvector_ext_bootstrap_e2e.py
@@ -115,6 +146,10 @@ jobs:
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
           tests/concurrency/test_native_ledger_b_core.py
+          tests/concurrency/test_invariants_unit.py
+          tests/test_publication_resolution_vault_binding_unit.py
+          tests/test_publication_path_claim_guard_unit.py
+          tests/test_external_git_cascade_unit.py
           tests/test_file_idempotent_upload_unit.py
           tests/test_app_registry_migration_unit.py
           tests/test_app_identity_postgres.py

@@ -8,9 +8,19 @@ name: e2e
 #
 # Scope: HTTP-only suites — the npm stdio proxy isn't installed so
 # file-tool suites (test_stdio_files_e2e.sh, test_put_file_param_e2e.sh)
-# stay out for now. S3 (MinIO) is intentionally NOT brought up either;
-# none of the suites picked here exercise the file backend. Add a
-# MinIO service container when wiring those tests in.
+# stay out for now. Those need the PROXY, not S3.
+#
+# S3: MinIO IS brought up (see "Start MinIO"), because
+# test_publications_e2e.sh exercises the file backend — file
+# publications, the /raw + /download proxies, and table-query
+# snapshots all round-trip through S3. It runs as a plain
+# `docker run` rather than a `services:` container: the minio image
+# needs the `server /data` ARGUMENT, and a service container can set
+# image/env/ports/options but has no way to pass a command argument.
+# The bucket is created explicitly in that step, mirroring
+# docker-compose.yaml's `minio-bootstrap` sidecar. The image tag is
+# pinned, like pgvector:pg16, so a MinIO release can't turn a green
+# branch red on its own.
 #
 # Embedding: stubbed by `backend/scripts/ci/embed_stub.py`. Suites
 # picked for CI either skip search assertions or tolerate "0 results"
@@ -79,13 +89,64 @@ jobs:
           llm_base_url: ""
           llm_model: ""
           rerank_enabled: false
-          s3_endpoint_url: ""
+          # Backend and curl both run ON the runner, so the internal
+          # endpoint is also reachable by the client following a
+          # presigned URL — s3_public_url can stay unset and fall back
+          # to this one.
+          s3_endpoint_url: http://localhost:9000
+          s3_bucket: akb-files
           YAML
           cat > config/secret.yaml <<'YAML'
           db_password: akb  # pragma: allowlist secret
           jwt_secret: ci-only-jwt-secret-not-for-prod-use  # pragma: allowlist secret
           embed_api_key: ci-stub-no-auth  # pragma: allowlist secret
+          s3_access_key: akb-ci  # pragma: allowlist secret
+          s3_secret_key: akb-ci-secret  # pragma: allowlist secret
           YAML
+
+      - name: Start MinIO (S3 for file publications)
+        # pragma: allowlist secret
+        run: |  # pragma: allowlist secret
+          docker run -d --name akb-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=akb-ci \
+            -e MINIO_ROOT_PASSWORD=akb-ci-secret \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          # Poll the liveness probe rather than sleeping — MinIO is
+          # usually up in ~2s but the image pull dominates and varies.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "minio ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:9000/minio/health/live >/dev/null \
+            || (echo "minio never came up"; docker logs akb-minio; exit 1)
+          # Create the bucket up front, mirroring docker-compose.yaml's
+          # `minio-bootstrap` sidecar. `s3_adapter.ensure_bucket` would
+          # also create it on first miss, but that path calls
+          # create_bucket from inside its own except-handler with no
+          # guard against a concurrent creator, so relying on it makes
+          # bucket setup a race rather than a precondition. boto3 is
+          # already installed by the backend step above, so this needs
+          # no extra image (compose uses minio/mc only because nothing
+          # python is available in that context).
+          python - <<'PY'
+          import boto3, botocore
+          s3 = boto3.client("s3", endpoint_url="http://localhost:9000",
+                            aws_access_key_id="akb-ci",
+                            aws_secret_access_key="akb-ci-secret")  # pragma: allowlist secret
+          try:
+              s3.create_bucket(Bucket="akb-files")
+              print("created bucket akb-files")
+          except botocore.exceptions.ClientError as e:
+              # Idempotent, like `mc mb -p`.
+              if e.response["Error"].get("Code") not in (
+                      "BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                  raise
+              print("bucket akb-files already present")
+          print("buckets:", [b["Name"] for b in s3.list_buckets()["Buckets"]])
+          PY
 
       - name: Start embedding stub (background)
         working-directory: backend
@@ -163,6 +224,20 @@ jobs:
             test_table_constraints_e2e.sh
             test_forbidden_permission_code_e2e.sh
             test_okf_export_import_e2e.sh
+            # Publication resolution regression. Its S3-dependent
+            # sections (T3 file-publication cleanup, T4 failed-confirm
+            # cleanup) now RUN rather than self-skip, alongside the two
+            # document resolution cases (recursive collection delete,
+            # move-onto-orphan). NOTE: CI sums pass/fail only — a suite
+            # that skips a section still reports 0 failed, so the skip
+            # branches there are a fallback, not an accepted outcome.
+            test_publication_resolution_e2e.sh
+            # The publication feature's own suite — 127 assertions over
+            # documents, table queries, snapshots and files. Needs S3
+            # (section 0 uploads a file, and sections 9/13 publish it),
+            # which is why MinIO is brought up above. Nothing else here
+            # is CI-hostile: no proxy, no psql, no embedding assertions.
+            test_publications_e2e.sh
           )
           TOTAL_PASS=0
           TOTAL_FAIL=0

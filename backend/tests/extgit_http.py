@@ -126,6 +126,26 @@ class GitHttpFixture:
         )
         return head
 
+    def remove_path(self, name: str, path: str, branch: str = "main") -> str:
+        """Delete ``path`` upstream and push. Returns the new upstream head SHA.
+
+        The counterpart of ``publish_change``: a reconcile against this head
+        takes the ``local.keys() - remote_tree.keys()`` branch, which is the
+        only way to reach ``_delete_external_path`` — and therefore the
+        publication cascade — with a real git transport.
+        """
+        work = self._works[name]
+        _git("rm", "-q", "--", path, cwd=work)
+        _git("commit", "-m", f"remove {path}", cwd=work)
+        head = _git("rev-parse", f"refs/heads/{branch}", cwd=work)
+        subprocess.run(
+            [GIT, "push", self.bare_path(name), f"{branch}:{branch}"],
+            cwd=work,
+            check=True,
+            capture_output=True,
+        )
+        return head
+
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
