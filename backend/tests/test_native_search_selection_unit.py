@@ -11,7 +11,7 @@ from app.models.document import GrepResponse
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
-from app.services.native_derived_worker import NativePayloadPlacementError
+from app.services.native_payload_verification import NativePayloadPlacementError
 from app.services.search_service import SearchService, active_document_source_type
 from app.services.vector_store import VectorHit
 

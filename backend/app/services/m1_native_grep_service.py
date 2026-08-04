@@ -25,10 +25,9 @@ import asyncpg
 from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
 from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.m1_reference_payload_store import M1ReferencePayloadStore
-from app.services.native_derived_worker import (
-    NativePayloadPlacementError,
-    _verify_native_head_body,
+from app.services.native_payload_verification import (
+    payload_store_for_placement,
+    verify_native_head_body,
 )
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
@@ -261,7 +260,7 @@ def _scan_bodies_sync(
 def _head_bodies_from_rows(rows) -> list[HeadBody]:
     bodies: list[HeadBody] = []
     for row in rows:
-        canonical = _verify_native_head_body(row)
+        canonical = verify_native_head_body(row)
         bodies.append(
             HeadBody(
                 namespace_id=row["namespace_id"],
@@ -620,18 +619,6 @@ class M1NativeGrepService:
     def _selected_surfaces(*, include_text_files: bool) -> tuple[str, ...]:
         return ("document", "file") if include_text_files else ("document",)
 
-    def _payload_store_for_head(
-        self,
-        body: HeadBody,
-    ) -> M1PgBodyStore | M1ReferencePayloadStore:
-        if body.selected_placement == M1PgBodyStore.selected_placement:
-            return self.body_store
-        if body.selected_placement == M1ReferencePayloadStore.selected_placement:
-            return M1ReferencePayloadStore(self.pool)
-        raise NativePayloadPlacementError(
-            f"Unsupported native payload placement: {body.selected_placement!r}"
-        )
-
     async def grep(
         self,
         pattern: str,
@@ -754,7 +741,11 @@ class M1NativeGrepService:
             # mixed placement is permitted across the scan, but an unknown
             # placement must not leave an earlier replacement committed.
             payload_stores = [
-                self._payload_store_for_head(body)
+                payload_store_for_placement(
+                    self.pool,
+                    body.selected_placement,
+                    pg_body_store=self.body_store,
+                )
                 for body in selected_bodies
             ]
             await self._require_write_access(

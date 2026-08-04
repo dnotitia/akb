@@ -14,7 +14,7 @@ from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services import m1_pg_body_store
 from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
-from app.services.native_derived_worker import NativePayloadPlacementError
+from app.services.native_payload_verification import NativePayloadPlacementError
 
 
 def _row(body: bytes = b"hello\nneedle\n") -> dict:

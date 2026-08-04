@@ -191,9 +191,9 @@ def _normalize_vault_scope(vault: str | list[str] | None) -> list[str] | None:
 def _verified_native_metadata(row) -> dict:
     """Verify, decode, and parse one native body on a worker thread."""
     from app.services.document_service import _parse_markdown
-    from app.services.native_derived_worker import _verify_native_head_body
+    from app.services.native_payload_verification import verify_native_head_body
 
-    canonical = _verify_native_head_body(row)
+    canonical = verify_native_head_body(row)
     metadata, _ = _parse_markdown(canonical.decode("utf-8", errors="strict"))
     return metadata
 

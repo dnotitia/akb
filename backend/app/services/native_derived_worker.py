@@ -21,30 +21,13 @@ from app.services import delete_worker
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.document_service import _parse_markdown
 from app.services.index_service import Chunk, build_doc_metadata_header, chunk_markdown
-from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+from app.services.native_payload_verification import verify_native_head_body
 
 logger = logging.getLogger("akb.native_derived_worker")
 
 NATIVE_DOCUMENT_SOURCE = "native_document"
 SELECTED_DELIVERY = "native-searchable-derived-v1"
 DIRECT_GREP_DELIVERY = "native-direct-pg-grep-v1"
-
-
-class NativePayloadPlacementError(RuntimeError):
-    """A native head names no verified body adapter for its placement."""
-
-
-def _verify_native_head_body(head: dict) -> bytes:
-    """Verify a Head body with the adapter selected by its immutable manifest."""
-    selected_placement = head.get("selected_placement")
-    if selected_placement == M1ReferencePayloadStore.selected_placement:
-        return M1ReferencePayloadStore._verify_row(head)
-    if selected_placement == M1PgBodyStore.selected_placement:
-        return M1PgBodyStore._verify_row(head)
-    raise NativePayloadPlacementError(
-        f"Unsupported native payload placement: {selected_placement!r}"
-    )
 
 
 def build_native_document_chunks(
@@ -277,7 +260,7 @@ class NativeDerivedWorker:
 
     async def _apply_live(self, intent: dict, head: dict) -> int:
         def prepare() -> tuple[str, list[Chunk]]:
-            canonical = _verify_native_head_body(head)
+            canonical = verify_native_head_body(head)
             return (
                 hashlib.sha256(canonical).hexdigest(),
                 build_native_document_chunks(
