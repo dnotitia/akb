@@ -7,6 +7,25 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added app installation lifecycle commands and status
+
+System and target Vault administrators can now install, inspect, uninstall,
+restore, or freshly re-provision an app through a Vault-keyed HTTP lifecycle
+surface backed by the existing desired-state registry. Install and fresh
+commands return `installing` after atomic creation of the next active grant;
+identical retries replay the same installation and generation, while
+conflicting release or capability requests fail with no partial mutation.
+Uninstall revokes the current grant and retains owned resources for explicit
+restore compatibility checks. Restore requires matching retained release,
+observed release, and schema fingerprints; fresh refuses retained resources and
+never reuses the old current pointer. App-token reads are limited to the
+principal's own live installation and its current `installation:read` grant.
+
+Responses, projections, and bounded audit metadata omit credentials, tokens,
+grant provenance, arbitrary worker payloads, and unrelated Vault metadata;
+lifecycle responses use `Cache-Control: no-store`. The backend version remains
+0.13.0 and no new migration or command table is introduced.
+
 ### Added app identity credential exchange and capability enforcement
 
 System administrators can now issue, list, rotate, and revoke exchange-only app

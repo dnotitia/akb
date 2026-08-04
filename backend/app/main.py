@@ -17,6 +17,7 @@ from app.api.routes import (
     access,
     activity,
     app_inventory,
+    app_lifecycle,
     agent_sessions,
     app_identity,
     auth,
@@ -263,12 +264,21 @@ async def _no_store_public_surfaces(request: Request, call_next):
         if path == base or path.startswith(base + "/"):
             response.headers["Cache-Control"] = "no-store"
             break
+    if (
+        path.startswith("/api/v1/app/installations/")
+        or (
+            path.startswith("/api/v1/apps/")
+            and "/installations/" in path
+        )
+    ):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
 app.include_router(app_inventory.router, prefix="/api/v1", tags=["app-inventory"])
+app.include_router(app_lifecycle.router, prefix="/api/v1", tags=["app-lifecycle"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])

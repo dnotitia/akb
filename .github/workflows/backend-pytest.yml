@@ -154,6 +154,7 @@ jobs:
           tests/test_app_registry_migration_unit.py
           tests/test_app_identity_postgres.py
           tests/test_app_inventory_postgres.py
+          tests/test_app_lifecycle_postgres.py
           tests/test_tool_usage_e2e.py
           tests/test_table_if_not_exists_e2e.py
           -v --tb=short
