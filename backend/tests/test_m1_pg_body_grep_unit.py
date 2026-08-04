@@ -239,24 +239,19 @@ async def test_native_grep_document_replace_uses_its_head_placement(
     store_type,
 ):
     body_bytes = b"---\ntitle: Document\n---\nneedle body\n"
-    body = HeadBody(
-        namespace_id=uuid.uuid4(),
-        vault="measure",
-        resource_id=uuid.uuid4(),
-        surface="document",
-        path="notes/document.md",
-        revision_id="a" * 40,
-        digest=hashlib.sha256(body_bytes).hexdigest(),
-        byte_size=len(body_bytes),
-        canonical_bytes=body_bytes,
-        selected_placement=selected_placement,
-    )
-    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    row = {
+        **_row(body_bytes),
+        "selected_placement": selected_placement,
+        "namespace_id": uuid.uuid4(),
+        "vault": "measure",
+        "resource_id": uuid.uuid4(),
+        "surface": "document",
+        "current_path": "notes/document.md",
+        "head_revision_id": "a" * 40,
+    }
+    service = M1NativeGrepService(_Pool(_Conn(row)))
     calls = []
     stores = []
-
-    async def head_bodies(**_kwargs):
-        return [body]
 
     async def require_write_access(**_kwargs):
         return None
@@ -270,7 +265,6 @@ async def test_native_grep_document_replace_uses_its_head_placement(
         stores.append(payload_store)
         return _Native()
 
-    monkeypatch.setattr(service, "_head_bodies", head_bodies)
     monkeypatch.setattr(service, "_require_write_access", require_write_access)
     monkeypatch.setattr(native_grep, "NativeRevisionService", native_service)
 
