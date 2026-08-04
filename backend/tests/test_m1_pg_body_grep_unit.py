@@ -13,6 +13,8 @@ from app.services import m1_native_grep_service as native_grep
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 from app.services import m1_pg_body_store
 from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+from app.services.native_derived_worker import NativePayloadPlacementError
 
 
 def _row(body: bytes = b"hello\nneedle\n") -> dict:
@@ -420,11 +422,63 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
     assert bodies[0].text == "needle\n"
     assert "rs.head_revision_id" in conn.sql
     assert "vault_access" in conn.sql
-    assert "pg-bodystore-v1" in conn.sql
+    assert "pm.selected_placement =" not in conn.sql
     assert "substring(" in conn.sql
     assert "ESCAPE" in conn.sql
     assert conn.params[3:] == ("src", "src/%", resource_id)
     assert "rs.surface = ANY" in conn.sql
+
+
+@pytest.mark.asyncio
+async def test_head_body_query_accepts_reference_payload_documents_for_public_grep():
+    """Public native documents may retain the approved reference placement."""
+    body = b"needle\n"
+    row = {
+        **_row(body),
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
+        "namespace_id": uuid.uuid4(),
+        "vault": "engineering",
+        "resource_id": uuid.uuid4(),
+        "surface": "document",
+        "current_path": "r5/literal.md",
+        "head_revision_id": "a" * 40,
+    }
+    conn = _Conn(row)
+    service = M1NativeGrepService(_Pool(conn))
+
+    result = await service.grep_public(
+        "needle",
+        user_id=uuid.uuid4(),
+        vaults=["engineering"],
+        collection=None,
+    )
+
+    assert result["total_docs"] == 1
+    assert [item["path"] for item in result["results"]] == ["r5/literal.md"]
+    assert "pm.selected_placement =" not in conn.sql
+
+
+@pytest.mark.asyncio
+async def test_head_body_query_rejects_unknown_manifest_placement():
+    row = {
+        **_row(),
+        "selected_placement": "unknown-placement-v1",
+        "namespace_id": uuid.uuid4(),
+        "vault": "engineering",
+        "resource_id": uuid.uuid4(),
+        "surface": "document",
+        "current_path": "r5/unknown.md",
+        "head_revision_id": "a" * 40,
+    }
+
+    with pytest.raises(NativePayloadPlacementError, match="Unsupported native payload placement"):
+        await M1NativeGrepService(_Pool(_Conn(row)))._head_bodies(
+            user_id=uuid.uuid4(),
+            vaults=["engineering"],
+            collection=None,
+            resource_id=None,
+            surfaces=("document",),
+        )
 
 
 @pytest.mark.asyncio

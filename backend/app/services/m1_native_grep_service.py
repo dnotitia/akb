@@ -1,7 +1,7 @@
 """Head-pinned direct PostgreSQL grep candidate for M1 B-grep.
 
 The service is deliberately internal and measurement-only.  It scans the
-canonical PG BodyStore representation after applying vault ACL and containment
+canonical native payload representation after applying vault ACL and containment
 filters, then verifies every result against the exact Head bytes in Python.
 Derived chunks, embeddings, and indexes are never result authority.
 """
@@ -25,6 +25,7 @@ import asyncpg
 from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
 from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.native_derived_worker import _verify_native_head_body
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
 
@@ -255,7 +256,7 @@ def _scan_bodies_sync(
 def _head_bodies_from_rows(rows) -> list[HeadBody]:
     bodies: list[HeadBody] = []
     for row in rows:
-        canonical = M1PgBodyStore._verify_row(row)
+        canonical = _verify_native_head_body(row)
         bodies.append(
             HeadBody(
                 namespace_id=row["namespace_id"],
@@ -480,7 +481,6 @@ class M1NativeGrepService:
         conditions = [
             "rs.lifecycle = 'live'",
             "rs.content_profile = 'text'",
-            "pm.selected_placement = 'pg-bodystore-v1'",
             "(v.owner_id = $1 OR EXISTS ("
             "SELECT 1 FROM vault_access va WHERE va.vault_id = v.id AND va.user_id = $1"
             ") OR EXISTS (SELECT 1 FROM users u WHERE u.id = $1 AND u.is_admin = TRUE) "
