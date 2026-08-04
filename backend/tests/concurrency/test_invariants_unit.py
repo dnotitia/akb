@@ -15,9 +15,19 @@ Covers:
 alongside the memory-feature removal — the underlying service no
 longer exists.)
 
+- The publication cleanup helpers' `conn=` contract — the DELETE must
+  run inside the caller's transaction, so a rollback resurrects the
+  publication row.
+
 Talks to a real Postgres via `AKB_TEST_DSN`; skips when unreachable so
 the suite runs unattended on machines without a dev DB. The audit
 Docker stack default is `postgresql://akb:akb@localhost:5433/akb`.
+
+This file is listed in the DB-backed job of `backend-pytest.yml`, which
+sets `AKB_TEST_DSN` and `REQUIRE_REAL_PG=1` — under that flag an
+unreachable DB fails instead of skipping, so the gate cannot go quietly
+green. The `pool` fixture applies init.sql *and* the migrations, because
+CI hands it an empty database.
 """
 
 from __future__ import annotations
@@ -54,6 +64,11 @@ async def _can_connect(dsn: str) -> bool:
 @pytest_asyncio.fixture
 async def pool():
     if not await _can_connect(_DSN):
+        # This file is in the DB-backed CI job, where an unreachable
+        # Postgres means the gate silently stopped firing — fail loudly
+        # rather than skip into a false green. Locally it still skips.
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
     pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
     init_sql = (
@@ -67,6 +82,16 @@ async def pool():
     prev = pg_mod._pool
     pg_mod._pool = pool
     try:
+        # init.sql is only half the schema: `events` (migration 015),
+        # `s3_delete_outbox` (019), `chunks.vault_id` (014) and friends are
+        # created by migrations, and tests below need them. Against the
+        # empty database CI creates, init.sql alone leaves this file red.
+        # Drive the app's own runner rather than a hand-copied DDL list
+        # that would rot the first time someone adds a migration. This has
+        # to run AFTER the _pool wiring above — _apply_migrations resolves
+        # its connection through get_pool(). The schema_migrations ledger
+        # makes every run after the first a single SELECT.
+        await pg_mod._apply_migrations()
         yield pool
     finally:
         pg_mod._pool = prev
@@ -410,20 +435,26 @@ async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
     assert still == 1, "file delete must roll back when chunk delete fails (was swallowed pre-fix)"
 
 
-# ── delete_publications_for_document UUID branch must match canonical URI ──
+# ── The cascade must delete under the CANONICAL URI ──
 
 
 @pytest.mark.asyncio
-async def test_delete_publications_for_document_uuid_canonical(pool):
-    """delete_publications_for_document(UUID) previously built a legacy
-    `akb://V/doc/{coll}/{name}` URI that never matched the canonical
-    `akb://V/coll/{coll}/doc/{name}` stored in publications.resource_uri,
-    so the cascade silently left orphan publications. The UUID branch now
-    builds the URI via doc_uri so the DELETE actually matches.
-    """
-    from app.services.publication_service import delete_publications_for_document
+async def test_chokepoint_materializes_the_canonical_uri(pool):
+    """A caller holding only a document id has to resolve it to the
+    CANONICAL URI — `akb://V/coll/{coll}/doc/{name}` — before the cascade can
+    match. An earlier incident built the pre-0.3.0 legacy shape
+    (`akb://V/doc/{coll}/{name}`), which never equals what
+    `publications.resource_uri` stores, so the cascade silently deleted
+    nothing and left orphans.
 
+    That resolution now lives in `DocumentRepository.delete_with_publications`,
+    which reads the path back from the row it locked and builds the URI with
+    `doc_uri`. (The helper itself no longer accepts ids at all — see
+    `test_delete_publications_for_document_rejects_a_bare_id`.) Driving the
+    chokepoint here tests the path that actually runs in production.
+    """
     vault_repo = VaultRepository(pool)
+    doc_repo = DocumentRepository(pool)
     name = f"_pubdel_{uuid.uuid4().hex[:8]}"
     vid = await vault_repo.create(
         name=name, description="pubdel", git_path=f"/tmp/{name}.git", owner_id=None,
@@ -444,16 +475,241 @@ async def test_delete_publications_for_document_uuid_canonical(pool):
             f"slug{uuid.uuid4().hex[:6]}", vid, canonical,
         )
 
-    deleted = await delete_publications_for_document(did)  # the UUID branch
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await doc_repo.delete_with_publications(conn, doc_id=did, vault_id=vid)
+        await tx.commit()
 
     async with pool.acquire() as conn:
         remaining = await conn.fetchval(
             "SELECT COUNT(*) FROM publications WHERE vault_id = $1", vid,
         )
+        docs_left = await conn.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE id = $1", did,
+        )
         await conn.execute("DELETE FROM vaults WHERE id = $1", vid)
 
-    assert deleted == 1, "UUID branch must materialize the canonical URI and match"
-    assert remaining == 0, "publication should be cascade-deleted, not orphaned"
+    assert deleted is True
+    assert docs_left == 0
+    assert remaining == 0, (
+        "publication should be cascade-deleted, not orphaned — a legacy-shape "
+        "URI would have matched nothing and left it behind"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_publications_for_document_rejects_a_bare_id(pool, vault):
+    """The helper takes a canonical URI and nothing else.
+
+    It used to accept a PG UUID too, resolving it through a join on
+    `documents`. The two input forms had different ordering requirements and
+    the signature said so nowhere: called after the row delete on the same
+    connection, the id form found no row and returned 0 — no error, nothing
+    deleted, publication orphaned. A delete path was correct only by accident
+    of which argument it happened to pass, and "tidying" a call from a URI to
+    `row["id"]` would have silently restored it. Rejecting ids outright
+    is what makes that unrepresentable.
+    """
+    from app.services.publication_service import delete_publications_for_document
+
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    uri = f"akb://{vname}/coll/incidents/doc/report.md"
+    slug = await _seed_publication(pool, vid, uri)
+
+    for bad in (did, str(did), f"akb://{vname}/file/{did}", "not-a-uri", ""):
+        with pytest.raises(ValueError, match="canonical document"):
+            await delete_publications_for_document(bad, expected_vault_id=vid)
+
+    # A rejected call must be a no-op, not a partial delete.
+    assert await _publication_exists(pool, slug)
+    assert await delete_publications_for_document(uri, expected_vault_id=vid) == 1
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_brace_path_document_is_not_blocked_by_uri_validation(
+    pool, vault,
+):
+    """A path `parse_uri` cannot parse must still be deletable.
+
+    `parse_uri` rejects URIs containing braces — they are template
+    placeholders — but external-git accepts upstream paths like
+    `templates/{{cookiecutter.project}}/README.md`, so `doc_uri` can
+    legitimately produce a URI nothing can parse. The delete path must match
+    on equality and never parse: raising instead aborts the tombstone, rolls
+    the transaction back, and holds the external-git sync cursor forever,
+    because a per-file error there is retried and never skipped. One
+    templated file upstream would wedge the entire mirror, and the document
+    it failed to delete stays live and searchable.
+
+    This is why the chokepoint calls `delete_publications_by_doc_uri` rather
+    than the validating entry point.
+    """
+    from app.services.publication_service import delete_publications_by_doc_uri
+    from app.services.uri_service import doc_uri, parse_uri
+
+    vid, vname = vault["id"], vault["name"]
+    path = "templates/{{cookiecutter.project_slug}}/README.md"
+    uri = doc_uri(vname, path)
+
+    # The premise: this URI is genuinely unparseable. If parse_uri ever starts
+    # accepting braces this test still passes, but it stops testing anything —
+    # so assert the premise rather than assuming it.
+    assert parse_uri(uri) is None, "premise broken: parse_uri now accepts braces"
+
+    slug = await _seed_publication(pool, vid, uri)
+    assert await delete_publications_by_doc_uri(uri, expected_vault_id=vid) == 1
+    assert not await _publication_exists(pool, slug)
+
+
+# ── The publication cleanup helpers must join the caller's transaction ──
+#
+# Callers that delete a document/file inside their own explicit TX have to
+# be able to run the publication cleanup on that same connection. If it
+# runs on a separate pool connection the two commits are independent, and
+# a crash between them leaves a publication row pointing at a deleted
+# document — the exact stale row that lets a public slug reach a
+# document at the reused path.
+
+
+async def _seed_publication(
+    pool, vault_id: uuid.UUID, uri: str, resource_type: str = "document",
+) -> str:
+    slug = f"slug{uuid.uuid4().hex[:6]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO publications (id, slug, vault_id, resource_type, resource_uri, created_at) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())",
+            slug, vault_id, resource_type, uri,
+        )
+    return slug
+
+
+async def _publication_exists(pool, slug: str) -> bool:
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval(
+            "SELECT COUNT(*) FROM publications WHERE slug = $1", slug,
+        ))
+
+
+@pytest.mark.asyncio
+async def test_delete_publications_for_document_joins_caller_tx(pool, vault):
+    """`conn=` makes the DELETE part of the caller's transaction: rolling
+    the caller back must resurrect the publication row. Without it the
+    helper commits on its own connection and the rollback is a no-op.
+    """
+    from app.services.publication_service import delete_publications_for_document
+
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    uri = f"akb://{vname}/coll/incidents/doc/report.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, 'incidents/report.md', 'r', 'report', 'draft', NOW(), NOW(), "
+            "'cafef00d', '{}'::text[], '{}'::jsonb)",
+            did, vid,
+        )
+
+    # Rolled back → the row must come back.
+    slug = await _seed_publication(pool, vid, uri)
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await delete_publications_for_document(uri, conn=conn)
+        assert deleted == 1, "helper must still report the row it deleted"
+        await tx.rollback()
+    assert await _publication_exists(pool, slug), (
+        "publication survived only if the DELETE ran inside the caller's TX; "
+        "a separate connection would have committed it independently"
+    )
+
+    # Committed → the row is really gone (guards against a no-op 'fix').
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await delete_publications_for_document(uri, conn=conn)
+        await tx.commit()
+    assert deleted == 1
+    assert not await _publication_exists(pool, slug)
+
+    # expected_vault_id still binds the DELETE on the caller's connection.
+    slug = await _seed_publication(pool, vid, uri)
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await delete_publications_for_document(
+            uri, expected_vault_id=uuid.uuid4(), conn=conn,
+        )
+        await tx.commit()
+    assert deleted == 0, "wrong expected_vault_id must not delete"
+    assert await _publication_exists(pool, slug)
+
+
+@pytest.mark.asyncio
+async def test_delete_publications_for_file_joins_caller_tx(pool, vault):
+    """Same contract for the file helper. File publications carry a UUID
+    so they cannot be reoccupied, but a stale row is still wrong — and the
+    inline collection delete needs to clean them up inside its own TX.
+    """
+    from app.services.publication_service import delete_publications_for_file
+
+    vid, vname = vault["id"], vault["name"]
+    file_id = uuid.uuid4()
+    uri = f"akb://{vname}/file/{file_id}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, name, s3_key, created_at, updated_at) "
+            "VALUES ($1, $2, 'diagram.png', $3, NOW(), NOW())",
+            file_id, vid, f"files/{file_id}",
+        )
+
+    slug = await _seed_publication(pool, vid, uri, resource_type="file")
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await delete_publications_for_file(file_id, vname, conn=conn)
+        assert deleted == 1
+        await tx.rollback()
+    assert await _publication_exists(pool, slug), (
+        "file publication must be deleted inside the caller's TX"
+    )
+
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        deleted = await delete_publications_for_file(file_id, vname, conn=conn)
+        await tx.commit()
+    assert deleted == 1
+    assert not await _publication_exists(pool, slug)
+
+
+@pytest.mark.asyncio
+async def test_delete_publications_for_file_without_conn(pool, vault):
+    """Omitting `conn` keeps the pre-existing self-acquiring behaviour —
+    the documents helper already has coverage above, this pins the file
+    one so the refactor can't regress it.
+    """
+    from app.services.publication_service import delete_publications_for_file
+
+    vid, vname = vault["id"], vault["name"]
+    file_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, name, s3_key, created_at, updated_at) "
+            "VALUES ($1, $2, 'diagram.png', $3, NOW(), NOW())",
+            file_id, vid, f"files/{file_id}",
+        )
+    slug = await _seed_publication(
+        pool, vid, f"akb://{vname}/file/{file_id}", resource_type="file",
+    )
+
+    deleted = await delete_publications_for_file(file_id, vname, expected_vault_id=vid)
+
+    assert deleted == 1
+    assert not await _publication_exists(pool, slug)
 
 
 # ── P2: embedding response reordered by `index`, not array position ──
@@ -699,5 +955,261 @@ async def test_create_with_deleted_collection_raises_conflict(pool, vault):
             path="retire/lost-race.md", title="Doc", doc_type="note",
             status="draft", summary=None, domain=None, created_by=None, now=now,
             commit_hash="0" * 40, content_hash="h", hash_algorithm="sha256",
-            tags=[], metadata={},
+            tags=[], metadata={}, vault_name=vault["name"],
         )
+
+
+# ── The publish/delete TOCTOU: FOR UPDATE at the deletion chokepoint ──
+#
+# `create_publication` takes `FOR SHARE` on the documents row and then
+# INSERTs. The deleter's own serialization is `pg_advisory_xact_lock` over
+# (vault_id, path) — a namespace the publisher never touches, so the two do
+# NOT serialize against each other. With the publication cleanup running
+# before any conflicting row lock there is a window: cleanup finds nothing,
+# the publisher takes FOR SHARE and commits its INSERT, and the deleter's
+# `DELETE FROM documents` — which had been blocked on that share lock —
+# then proceeds over a publication that survives. The orphan resolves by
+# path, and `documents` is UNIQUE(vault_id, path), so the next document at
+# that path is reached through the old slug.
+#
+# `DocumentRepository.delete_with_publications` takes FOR UPDATE *before*
+# the cleanup, which makes both orderings safe.
+
+
+async def _blocked_queries(watch, *, contains: str | None = None) -> list[str]:
+    """Queries of every backend in this database currently waiting on a lock."""
+    rows = await watch.fetch(
+        "SELECT query FROM pg_stat_activity "
+        " WHERE datname = current_database() AND wait_event_type = 'Lock' "
+        "   AND pid <> pg_backend_pid()"
+    )
+    qs = [r["query"] for r in rows]
+    if contains is not None:
+        qs = [q for q in qs if contains.lower() in (q or "").lower()]
+    return qs
+
+
+async def _await_blocked(watch, *, count: int, contains: str | None = None,
+                         what: str, timeout: float = 20.0) -> list[str]:
+    """Block until `count` backends are waiting on a lock (optionally with
+    `contains` in their query text), or fail.
+
+    This is a wait-for-state, not a timing guess: the interleaving itself is
+    pinned by transaction control plus PostgreSQL's lock queue, and each side
+    is only released once the database itself reports it is parked on the
+    lock. A timeout here means the expected contention never happened, which
+    is a real failure, not flake — so it asserts rather than proceeding.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        qs = await _blocked_queries(watch, contains=contains)
+        if len(qs) >= count:
+            return qs
+        if loop.time() > deadline:
+            all_waiting = await _blocked_queries(watch)
+            raise AssertionError(
+                f"timed out waiting for {what}: expected >={count} blocked "
+                f"backend(s)"
+                + (f" matching {contains!r}" if contains else "")
+                + f", saw {len(qs)}. All waiters: {all_waiting}"
+            )
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, monkeypatch):
+    """A publisher that commits *while a delete is in flight* must not leave
+    its publication behind.
+
+    The interleaving is forced, not hoped for. A third connection holds
+    FOR UPDATE on the document row, so both contenders park in PostgreSQL's
+    lock queue in a known order — publisher first, deleter second. Releasing
+    that lock hands the row to the publisher, which inserts and commits, and
+    only then to the deleter.
+
+    Pre-fix this is RED: the deleter's publication cleanup had already run
+    (against an empty table) before it ever queued for the row, so the
+    publication it never saw survived the document it pointed at. With
+    FOR UPDATE taken first, the deleter's cleanup runs downstream of the
+    lock, sees the freshly committed row, and removes it.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/q3.md"
+    uri = f"akb://{vname}/coll/reports/doc/q3.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, $3, 'Q3', 'report', 'draft', NOW(), NOW(), 'cafef00d', "
+            "'{}'::text[], '{}'::jsonb)",
+            did, vid, path,
+        )
+
+    doc_repo = DocumentRepository(pool)
+    blocker = await asyncpg.connect(_DSN)   # holds the row so we can order the queue
+    watch = await asyncpg.connect(_DSN)     # observes who is parked on it
+    pub_result: dict | None = None
+    pub_error: Exception | None = None
+    try:
+        btx = blocker.transaction()
+        await btx.start()
+        await blocker.fetchval(
+            "SELECT id FROM documents WHERE id = $1 FOR UPDATE", did,
+        )
+
+        # 1) Publisher queues FIRST. Its FOR SHARE conflicts with the
+        #    blocker's FOR UPDATE, so it parks before inserting anything.
+        pub_task = asyncio.create_task(create_publication(
+            vault_id=vid, resource_type="document", resource_uri=uri, title="Q3",
+        ))
+        await _await_blocked(
+            watch, count=1, contains="FOR SHARE",
+            what="create_publication to park on the document row",
+        )
+
+        # 2) Deleter queues SECOND, behind the publisher.
+        async def _delete() -> bool:
+            async with pool.acquire() as c:
+                tx = c.transaction()
+                await tx.start()
+                try:
+                    out = await doc_repo.delete_with_publications(
+                        c, doc_id=did, vault_id=vid,
+                    )
+                except BaseException:
+                    await tx.rollback()
+                    raise
+                await tx.commit()
+                return out
+
+        del_task = asyncio.create_task(_delete())
+        # Both contenders now park on the `documents` row: the publisher on
+        # its FOR SHARE, the deleter on the chokepoint's FOR UPDATE (or, in
+        # the pre-fix shape this test is built to catch, on its bare
+        # `DELETE FROM documents`). Matching on the table name covers both
+        # without letting an unrelated waiter satisfy the count.
+        await _await_blocked(
+            watch, count=2, contains="documents",
+            what="the delete to park behind the publisher",
+        )
+
+        # 3) Release. Publisher commits its INSERT, then the deleter runs.
+        await btx.commit()
+        try:
+            pub_result = await pub_task
+        except ValueError as e:          # the publisher may legitimately lose
+            pub_error = e
+        deleted = await del_task
+    finally:
+        if not blocker.is_closed():
+            await blocker.close()
+        await watch.close()
+
+    assert deleted is True, "the delete must have removed the document row"
+    # Pin the interleaving this test exists to exercise. The lock queue is
+    # FIFO, so the publisher — queued first — takes the row first, inserts,
+    # and commits BEFORE the deleter runs. If it ever lost instead, the
+    # orphan assertion below would pass for the wrong reason (that direction
+    # was already safe before this fix), so a losing publisher is a broken
+    # test, not a pass.
+    assert pub_result is not None, (
+        "the publisher was supposed to win the lock queue and commit its "
+        f"INSERT before the delete ran; it failed instead: {pub_error!r}. "
+        "The red interleaving was not exercised."
+    )
+
+    async with pool.acquire() as conn:
+        orphans = await conn.fetch(
+            "SELECT slug FROM publications WHERE resource_uri = $1", uri,
+        )
+        doc_rows = await conn.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE id = $1", did,
+        )
+
+    assert doc_rows == 0, "the document row must be gone"
+    # Whichever side won the row, the invariant is the same: no publication
+    # may outlive the document it points at. Here the publisher wins the
+    # queue, so this is specifically asserting the deleter cleaned up a row
+    # that did not exist when its cleanup would have run pre-fix.
+    assert not orphans, (
+        "ORPHAN PUBLICATION SURVIVED the delete "
+        f"({[r['slug'] for r in orphans]}, publisher "
+        f"{'succeeded' if pub_result else f'failed: {pub_error}'}). "
+        "The next document created at this path would be reachable "
+        "under that slug, reopened by the race."
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeypatch):
+    """The other interleaving: the deleter wins the row, so the publisher's
+    FOR SHARE re-check finds nothing and `create_publication` fails closed
+    instead of inserting a publication for a document that is already gone.
+
+    This direction held before the chokepoint's FOR UPDATE too (the row
+    DELETE takes its own exclusive lock), so it is a contract pin rather
+    than a regression test — it is here so a future change to the publisher's
+    re-check cannot silently turn a hard abort into an orphan.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/q4.md"
+    uri = f"akb://{vname}/coll/reports/doc/q4.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, $3, 'Q4', 'report', 'draft', NOW(), NOW(), 'cafef00d', "
+            "'{}'::text[], '{}'::jsonb)",
+            did, vid, path,
+        )
+
+    doc_repo = DocumentRepository(pool)
+    watch = await asyncpg.connect(_DSN)
+    try:
+        async with pool.acquire() as c:
+            tx = c.transaction()
+            await tx.start()
+            deleted = await doc_repo.delete_with_publications(
+                c, doc_id=did, vault_id=vid,
+            )
+            assert deleted is True
+
+            # Publisher parks on the uncommitted delete.
+            pub_task = asyncio.create_task(create_publication(
+                vault_id=vid, resource_type="document", resource_uri=uri, title="Q4",
+            ))
+            await _await_blocked(
+                watch, count=1, contains="FOR SHARE",
+                what="create_publication to park on the in-flight delete",
+            )
+            await tx.commit()
+
+        with pytest.raises(ValueError, match="deleted concurrently"):
+            await pub_task
+    finally:
+        await watch.close()
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetchval(
+            "SELECT COUNT(*) FROM publications WHERE resource_uri = $1", uri,
+        )
+    assert rows == 0, "a publication must not be created for a deleted document"
