@@ -226,7 +226,18 @@ async def test_native_grep_rejects_file_replace_before_scan_or_mutation(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_native_grep_document_replace_remains_supported(monkeypatch):
+@pytest.mark.parametrize(
+    ("selected_placement", "store_type"),
+    (
+        (M1PgBodyStore.selected_placement, M1PgBodyStore),
+        (M1ReferencePayloadStore.selected_placement, M1ReferencePayloadStore),
+    ),
+)
+async def test_native_grep_document_replace_uses_its_head_placement(
+    monkeypatch,
+    selected_placement,
+    store_type,
+):
     body_bytes = b"---\ntitle: Document\n---\nneedle body\n"
     body = HeadBody(
         namespace_id=uuid.uuid4(),
@@ -238,9 +249,11 @@ async def test_native_grep_document_replace_remains_supported(monkeypatch):
         digest=hashlib.sha256(body_bytes).hexdigest(),
         byte_size=len(body_bytes),
         canonical_bytes=body_bytes,
+        selected_placement=selected_placement,
     )
     service = M1NativeGrepService(object())  # type: ignore[arg-type]
     calls = []
+    stores = []
 
     async def head_bodies(**_kwargs):
         return [body]
@@ -253,9 +266,13 @@ async def test_native_grep_document_replace_remains_supported(monkeypatch):
             calls.append(kwargs)
             return type("Result", (), {"revision_id": "b" * 40})()
 
+    def native_service(_pool, *, payload_store):
+        stores.append(payload_store)
+        return _Native()
+
     monkeypatch.setattr(service, "_head_bodies", head_bodies)
     monkeypatch.setattr(service, "_require_write_access", require_write_access)
-    monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
+    monkeypatch.setattr(native_grep, "NativeRevisionService", native_service)
 
     result = await service.grep(
         "needle",
@@ -266,7 +283,66 @@ async def test_native_grep_document_replace_remains_supported(monkeypatch):
 
     assert calls[0]["surface"] == "document"
     assert "replacement body" in calls[0]["payload"]
+    assert isinstance(stores[0], store_type)
     assert result["replaced_resources"] == 1
+
+
+@pytest.mark.asyncio
+async def test_native_grep_prevalidates_all_head_placements_before_replacing(monkeypatch):
+    body_bytes = b"---\ntitle: Document\n---\nneedle body\n"
+    bodies = [
+        HeadBody(
+            namespace_id=uuid.uuid4(),
+            vault="measure",
+            resource_id=uuid.uuid4(),
+            surface="document",
+            path="notes/first.md",
+            revision_id="a" * 40,
+            digest=hashlib.sha256(body_bytes).hexdigest(),
+            byte_size=len(body_bytes),
+            canonical_bytes=body_bytes,
+            selected_placement=M1PgBodyStore.selected_placement,
+        ),
+        HeadBody(
+            namespace_id=uuid.uuid4(),
+            vault="measure",
+            resource_id=uuid.uuid4(),
+            surface="document",
+            path="notes/unknown.md",
+            revision_id="b" * 40,
+            digest=hashlib.sha256(body_bytes).hexdigest(),
+            byte_size=len(body_bytes),
+            canonical_bytes=body_bytes,
+            selected_placement="unknown-placement-v1",
+        ),
+    ]
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    mutations = []
+
+    async def head_bodies(**_kwargs):
+        return bodies
+
+    async def require_write_access(**_kwargs):
+        return None
+
+    class _Native:
+        async def replace_text(self, **kwargs):
+            mutations.append(kwargs)
+            return type("Result", (), {"revision_id": "c" * 40})()
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(service, "_require_write_access", require_write_access)
+    monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
+
+    with pytest.raises(NativePayloadPlacementError, match="Unsupported native payload placement"):
+        await service.grep(
+            "needle",
+            user_id=uuid.uuid4(),
+            replace="replacement",
+            actor="tester",
+        )
+
+    assert mutations == []
 
 
 def test_regex_process_start_is_inside_wall_clock_deadline(monkeypatch):
@@ -419,6 +495,7 @@ async def test_head_body_query_intersects_acl_and_pins_current_revision():
 
     assert len(bodies) == 1
     assert bodies[0].revision_id == "a" * 40
+    assert bodies[0].selected_placement == M1PgBodyStore.selected_placement
     assert bodies[0].text == "needle\n"
     assert "rs.head_revision_id" in conn.sql
     assert "vault_access" in conn.sql

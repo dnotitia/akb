@@ -25,7 +25,11 @@ import asyncpg
 from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
 from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.native_derived_worker import _verify_native_head_body
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+from app.services.native_derived_worker import (
+    NativePayloadPlacementError,
+    _verify_native_head_body,
+)
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri, file_uri
 
@@ -57,6 +61,7 @@ class HeadBody:
     digest: str
     byte_size: int
     canonical_bytes: bytes
+    selected_placement: str = M1PgBodyStore.selected_placement
 
     @property
     def text(self) -> str:
@@ -268,6 +273,7 @@ def _head_bodies_from_rows(rows) -> list[HeadBody]:
                 digest=row["digest"],
                 byte_size=row["byte_size"],
                 canonical_bytes=canonical,
+                selected_placement=row["selected_placement"],
             )
         )
     return bodies
@@ -614,6 +620,18 @@ class M1NativeGrepService:
     def _selected_surfaces(*, include_text_files: bool) -> tuple[str, ...]:
         return ("document", "file") if include_text_files else ("document",)
 
+    def _payload_store_for_head(
+        self,
+        body: HeadBody,
+    ) -> M1PgBodyStore | M1ReferencePayloadStore:
+        if body.selected_placement == M1PgBodyStore.selected_placement:
+            return self.body_store
+        if body.selected_placement == M1ReferencePayloadStore.selected_placement:
+            return M1ReferencePayloadStore(self.pool)
+        raise NativePayloadPlacementError(
+            f"Unsupported native payload placement: {body.selected_placement!r}"
+        )
+
     async def grep(
         self,
         pattern: str,
@@ -731,12 +749,18 @@ class M1NativeGrepService:
         selected = matched
         replacements: list[dict[str, Any]] = []
         if replace is not None:
+            selected_bodies = [item["_body"] for item in selected]
+            # Validate every matched Head before starting the first mutation:
+            # mixed placement is permitted across the scan, but an unknown
+            # placement must not leave an earlier replacement committed.
+            payload_stores = [
+                self._payload_store_for_head(body)
+                for body in selected_bodies
+            ]
             await self._require_write_access(
                 user_id=user_id,
-                namespace_ids={item["_body"].namespace_id for item in selected},
+                namespace_ids={body.namespace_id for body in selected_bodies},
             )
-            native = NativeRevisionService(self.pool, payload_store=self.body_store)
-            selected_bodies = [item["_body"] for item in selected]
             if regex:
                 try:
                     replacement_texts = await asyncio.to_thread(
@@ -760,7 +784,12 @@ class M1NativeGrepService:
                     regex=False,
                     case_sensitive=case_sensitive,
                 )
-            for item, new_search_text in zip(selected, replacement_texts, strict=True):
+            for item, new_search_text, payload_store in zip(
+                selected,
+                replacement_texts,
+                payload_stores,
+                strict=True,
+            ):
                 head_body: HeadBody = item["_body"]
                 if new_search_text == head_body.search_text:
                     continue
@@ -771,7 +800,10 @@ class M1NativeGrepService:
                     new_text = _compose_markdown(metadata, new_search_text)
                 else:
                     new_text = new_search_text
-                result = await native.replace_text(
+                result = await NativeRevisionService(
+                    self.pool,
+                    payload_store=payload_store,
+                ).replace_text(
                     namespace_id=head_body.namespace_id,
                     surface=head_body.surface,
                     path=head_body.path,
