@@ -16,6 +16,7 @@ def _row(*, observed: bool = True, lifecycle_name: str = "installing") -> dict:
     app_id = uuid.uuid4()
     vault_id = uuid.uuid4()
     release_id = uuid.uuid4()
+    grant_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
     return {
         "installation_id": uuid.uuid4(),
@@ -32,9 +33,11 @@ def _row(*, observed: bool = True, lifecycle_name: str = "installing") -> dict:
         "current_release_id": None if lifecycle_name == "installing" else release_id,
         "current_version": None if lifecycle_name == "installing" else "1.0.0",
         "grant_generation": 1,
+        "latest_grant_id": grant_id,
         "latest_grant_generation": 1,
         "latest_grant_status": "active",
         "latest_grant_capabilities": ["inventory:read", "installation:read"],
+        "latest_active_grant_id": grant_id,
         "latest_active_grant_generation": 1,
         "latest_active_grant_status": "active",
         "latest_active_grant_capabilities": [
@@ -95,6 +98,21 @@ def test_status_projection_redacts_payloads_and_unrelated_metadata():
     assert projected["recent_error"] == {"code": "worker_timeout"}
     assert projected["lifecycle"] == "installing"
     assert projected["current_release"] is None
+    assert projected["latest_grant"]["id"] == str(projected["latest_active_grant"]["id"])
+
+
+def test_status_projection_decodes_asyncpg_jsonb_resources():
+    row = _row()
+    row["resources"] = json.dumps(row["resources"])
+
+    projected = lifecycle.project_installation_status(row)
+
+    assert projected["latest_grant"]["id"] == str(row["latest_grant_id"])
+    assert projected["latest_active_grant"]["id"] == str(row["latest_active_grant_id"])
+    assert projected["resources"] == [
+        {"kind": "collection", "key": "owned-key", "status": "owned"},
+        {"kind": "table", "key": "retained-key", "status": "retained"},
+    ]
 
 
 def test_replay_requires_the_same_desired_release_and_active_grant():

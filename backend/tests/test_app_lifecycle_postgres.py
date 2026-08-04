@@ -270,6 +270,55 @@ async def test_install_is_atomic_and_exact_replay_is_stable(lifecycle_pool):
         ) == 1
 
 
+async def test_status_projects_grant_identity_and_resource_registry(lifecycle_pool):
+    app_id = await _app(lifecycle_pool, "status-projection")
+    vault_id = await _vault(lifecycle_pool, "status-projection")
+    release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    installation_id = await _fixture_installation(
+        lifecycle_pool,
+        app_id,
+        vault_id,
+        release_id,
+        resource=("collection", "lifecycle-resource"),
+    )
+    await _observed(lifecycle_pool, installation_id, app_id, vault_id, release_id)
+
+    async with lifecycle_pool.acquire() as conn:
+        first_grant_id = await conn.fetchval(
+            "SELECT id FROM installation_grants WHERE installation_id = $1 AND generation = 1",
+            installation_id,
+        )
+
+    installed = await lifecycle.get_installation_status(app_id, vault_id)
+    assert installed["latest_grant"]["id"] == str(first_grant_id)
+    assert installed["latest_active_grant"]["id"] == str(first_grant_id)
+    assert installed["resources"] == [
+        {"kind": "collection", "key": "lifecycle-resource", "status": "owned"}
+    ]
+
+    await lifecycle.uninstall_installation(app_id, vault_id, **_actor())
+    uninstalled = await lifecycle.get_installation_status(app_id, vault_id)
+    assert uninstalled["latest_grant"]["id"] == str(first_grant_id)
+    assert uninstalled["latest_active_grant"] is None
+    assert uninstalled["resources"] == [
+        {"kind": "collection", "key": "lifecycle-resource", "status": "retained"}
+    ]
+
+    restored = await _put(lifecycle_pool, app_id, vault_id, release_id, mode="restore")
+    async with lifecycle_pool.acquire() as conn:
+        second_grant_id = await conn.fetchval(
+            "SELECT id FROM installation_grants WHERE installation_id = $1 AND generation = 2",
+            installation_id,
+        )
+    assert restored["latest_grant"]["id"] == str(second_grant_id)
+
+    restored_status = await lifecycle.get_installation_status(app_id, vault_id)
+    assert restored_status["latest_active_grant"]["id"] == str(second_grant_id)
+    assert restored_status["resources"] == [
+        {"kind": "collection", "key": "lifecycle-resource", "status": "owned"}
+    ]
+
+
 async def test_same_request_concurrency_has_one_winner_and_conflict_is_atomic(lifecycle_pool):
     app_id = await _app(lifecycle_pool, "concurrent")
     vault_id = await _vault(lifecycle_pool, "concurrent")

@@ -53,11 +53,25 @@ def _client(
 
 
 def _status(*, replayed: bool = False) -> dict:
+    grant_id = str(uuid.uuid4())
     return {
         "installation_id": str(uuid.uuid4()),
         "app_id": str(uuid.uuid4()),
         "vault_id": str(uuid.uuid4()),
         "lifecycle": "installing",
+        "latest_grant": {
+            "id": grant_id,
+            "generation": 1,
+            "status": "active",
+            "capabilities": ["installation:read"],
+        },
+        "latest_active_grant": {
+            "id": grant_id,
+            "generation": 1,
+            "status": "active",
+            "capabilities": ["installation:read"],
+        },
+        "resources": [{"kind": "table", "key": "owned-key", "status": "owned"}],
         "grant_generation": 1,
         "replayed": replayed,
         "command_status": "already_applied" if replayed else "accepted",
@@ -160,3 +174,25 @@ def test_app_status_uses_token_principal_and_no_store(monkeypatch):
     assert response.headers["cache-control"] == "no-store"
     assert calls[0][0] is principal
     assert calls[0][1] == vault_id
+
+
+def test_admin_status_preserves_grant_identity_and_resources(monkeypatch):
+    expected = _status()
+
+    async def fake_authorize(*_args, **_kwargs):
+        return None
+
+    async def fake_status(*_args, **_kwargs):
+        return expected
+
+    monkeypatch.setattr(app_lifecycle, "authorize_lifecycle_admin", fake_authorize)
+    monkeypatch.setattr(app_lifecycle, "get_installation_status", fake_status)
+    response = _client(user=_user()).get(
+        f"/api/v1/apps/{expected['app_id']}/installations/{expected['vault_id']}"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latest_grant"]["id"] == expected["latest_grant"]["id"]
+    assert body["latest_active_grant"]["id"] == expected["latest_active_grant"]["id"]
+    assert body["resources"] == expected["resources"]

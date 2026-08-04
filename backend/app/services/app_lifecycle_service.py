@@ -97,6 +97,11 @@ def _capabilities(value: Any) -> list[str]:
 
 
 def _resource_payload(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
     if not isinstance(value, list):
         return []
     result = []
@@ -123,6 +128,7 @@ def project_installation_status(row: Any) -> dict[str, Any]:
     latest_grant = None
     if row["latest_grant_generation"] is not None:
         latest_grant = {
+            "id": str(row["latest_grant_id"]),
             "generation": row["latest_grant_generation"],
             "status": row["latest_grant_status"],
             "capabilities": _capabilities(row["latest_grant_capabilities"]),
@@ -131,6 +137,7 @@ def project_installation_status(row: Any) -> dict[str, Any]:
     latest_active_grant = None
     if row["latest_active_grant_generation"] is not None:
         latest_active_grant = {
+            "id": str(row["latest_active_grant_id"]),
             "generation": row["latest_active_grant_generation"],
             "status": row["latest_active_grant_status"],
             "capabilities": _capabilities(row["latest_active_grant_capabilities"]),
@@ -206,9 +213,11 @@ _STATUS_SELECT = """
         installation.current_release_id,
         current_release.version AS current_version,
         installation.grant_generation,
+        latest_grant.id AS latest_grant_id,
         latest_grant.generation AS latest_grant_generation,
         latest_grant.status AS latest_grant_status,
         latest_grant.capabilities AS latest_grant_capabilities,
+        latest_active_grant.id AS latest_active_grant_id,
         latest_active_grant.generation AS latest_active_grant_generation,
         latest_active_grant.status AS latest_active_grant_status,
         latest_active_grant.capabilities AS latest_active_grant_capabilities,
@@ -231,14 +240,16 @@ _STATUS_SELECT = """
       LEFT JOIN app_installation_observed_states AS observed
         ON observed.installation_id = installation.id
       LEFT JOIN LATERAL (
-          SELECT grant_row.generation, grant_row.status, grant_row.capabilities
+          SELECT grant_row.id, grant_row.generation, grant_row.status,
+                 grant_row.capabilities
             FROM installation_grants AS grant_row
            WHERE grant_row.installation_id = installation.id
            ORDER BY grant_row.generation DESC
            LIMIT 1
       ) AS latest_grant ON TRUE
       LEFT JOIN LATERAL (
-          SELECT grant_row.generation, grant_row.status, grant_row.capabilities
+          SELECT grant_row.id, grant_row.generation, grant_row.status,
+                 grant_row.capabilities
             FROM installation_grants AS grant_row
            WHERE grant_row.installation_id = installation.id
              AND grant_row.status = 'active'
