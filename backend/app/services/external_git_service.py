@@ -517,6 +517,7 @@ class ExternalGitService:
                     commit_hash=last_commit,
                     content_hash=compute_text_content_hash(body),
                     hash_algorithm=HASH_ALGORITHM,
+                    vault_name=vault_name,
                     created_by=created_by,
                     conn=conn,
                 )
@@ -587,6 +588,7 @@ class ExternalGitService:
         """
         pool = await get_pool()
         coll_repo = CollectionRepository(pool)
+        doc_repo = DocumentRepository(pool)
         from app.services.kg_service import delete_document_relations
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -612,10 +614,29 @@ class ExternalGitService:
                 # Remove implicit edges anchored on this doc — otherwise
                 # they survive the delete and dangle on the next BFS.
                 await delete_document_relations(conn, vault_name, path)
-                deleted = await conn.fetchrow(
-                    "DELETE FROM documents WHERE id = $1 RETURNING id", row["id"]
+                # The row delete and the publication cascade are one call
+                # through the repository chokepoint. `publications` lost its
+                # `document_id` FK in migration 022, so the tombstone has to
+                # drop the publication itself, on THIS connection: without it,
+                # an upstream commit that removes a mirrored path leaves a
+                # slug that still resolves by path — and a later upstream
+                # commit re-adding that path (a revert, a rename back)
+                # republishes whatever now lives there under the old public
+                # slug. The chokepoint derives that URI from `documents.path`
+                # under its own lock — `documents.path == external_path` for
+                # mirrored docs (see `upsert_external`), so it is the same URI
+                # `emit_event` reports below, but read from the row rather
+                # than from this function's `path` argument.
+                #
+                # The chokepoint re-takes `FOR UPDATE` on the row we already
+                # locked above; on the same transaction that is a no-op, and
+                # keeping it there rather than relying on this caller is the
+                # point — the lock is what closes the publish/delete race, and
+                # it must not depend on every caller remembering.
+                deleted = await doc_repo.delete_with_publications(
+                    conn, doc_id=row["id"], vault_id=vault_id,
                 )
-                if deleted is None:
+                if not deleted:
                     # Unreachable while we hold the row lock (no other tx can
                     # delete it first), but keep the count/event STRICTLY tied to
                     # a real row deletion rather than a stale pre-read. Nothing

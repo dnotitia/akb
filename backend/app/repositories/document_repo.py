@@ -101,13 +101,49 @@ class DocumentRepository:
         tags: list[str],
         metadata: dict,
         *,
+        vault_name: str,
         conn=None,
         doc_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
+        """Insert one ``documents`` row. Raises ``ConflictError`` when the path
+        is taken — by a live document, or by a publication that outlived one.
+
+        ``vault_name`` is required because the second of those needs it: a
+        publication is bound to its document by a path-shaped ``akb://`` URI,
+        which cannot be built from ``vault_id``. Passing the name rather than
+        looking it up here keeps the guard to a single indexed probe, and the
+        one caller (``document_service._put_locked``) already holds it.
+
+        The caller runs the same check earlier, before its git write, so a
+        refusal normally happens with nothing committed anywhere. This copy
+        is the structural backstop: it sits at the one place every creation
+        goes through, so a future caller that forgets the early check is
+        still refused rather than silently allowed. Reaching this raise means
+        the early check was skipped or the row appeared between the two, and
+        a git commit with no ``documents`` row is left behind — invisible,
+        since every read resolves through PostgreSQL, and overwritten by the
+        next write to that path.
+        """
         # Caller may supply the id so a path can embed its short form; else mint one.
         doc_id = doc_id or uuid.uuid4()
 
+        # Imported here, not at module scope: publication_service imports the
+        # document services at import time, so a top-level import cycles.
+        from app.services.publication_service import (
+            assert_no_orphan_publication_for_document,
+        )
+
         async def _insert(c):
+            # Before the row lands, not after: if a publication already claims
+            # this path's canonical URI while no document occupies the path,
+            # refuse rather than let the new document inherit that slug. Runs on
+            # the connection the INSERT runs on, so when that is the caller's
+            # transaction (every production path) the check and the row commit
+            # or roll back together. The existing publication is left in place,
+            # not removed, so its state is preserved for the owner to resolve.
+            await assert_no_orphan_publication_for_document(
+                c, vault_name=vault_name, path=path,
+            )
             try:
                 await c.execute(
                     """
@@ -314,15 +350,111 @@ class DocumentRepository:
             async with self.pool.acquire() as own_conn:
                 await own_conn.execute(sql, *args)
 
-    async def delete(self, doc_id: uuid.UUID, *, conn=None) -> None:
-        """Delete the documents row. When `conn` is provided the DELETE
-        runs on the caller's connection (so it joins the same TX as the
-        cascade in `document_service.delete`)."""
-        if conn is None:
-            async with self.pool.acquire() as own_conn:
-                await own_conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
-        else:
-            await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
+    async def delete_with_publications(
+        self,
+        conn,
+        *,
+        doc_id: uuid.UUID,
+        vault_id: uuid.UUID,
+    ) -> bool:
+        """Delete one ``documents`` row together with the publications bound
+        to it. Returns True when a row was actually removed.
+
+        **This is the only place an ordinary document row may be deleted.**
+        Publications lost their ``document_id`` FK in migration 022, so
+        nothing cascades: a delete that skips the publication cleanup leaves
+        a slug that still resolves *by path*, and because ``documents`` is
+        ``UNIQUE(vault_id, path)`` the next document created at that path
+        would then be reached through that old link. Of the three per-row
+        delete paths, two omitted the cleanup — and they omitted it because
+        the one path that had it kept it as an inline copy rather than
+        something callable. There was no single original to reach for, so
+        writing a new delete path correctly meant knowing to write the
+        second statement at all. Binding the two together in one method
+        means a new delete path can only be wrong by not deleting documents
+        at all.
+        ``tests/test_document_delete_chokepoint_unit.py`` allowlists the
+        remaining ``DELETE FROM documents`` sites so a sixth one fails review.
+
+        ``conn`` is REQUIRED and MUST already be inside a transaction. Both
+        statements have to commit together — on separate connections a crash
+        between them leaves exactly the orphan this exists to prevent — and
+        the row lock below is worthless outside a transaction (it would be
+        released the instant its autocommit statement returned).
+
+        **Lock ordering.** ``FOR UPDATE`` on the resource row comes FIRST,
+        before the publication cleanup, and closes a publish/delete TOCTOU:
+        ``publication_service.create_publication`` takes ``FOR SHARE`` on the
+        same row and then inserts, while the deleter's own serialization is
+        a ``pg_advisory_xact_lock`` over ``(vault_id, path)`` that the
+        publisher never acquires — two lock namespaces that do not serialize
+        against each other. With the cleanup running before any conflicting
+        row lock, a publisher could slip in between: cleanup finds nothing,
+        the publisher takes ``FOR SHARE`` and commits its INSERT, and the
+        deleter's ``DELETE FROM documents`` — which had been blocked on that
+        share lock — then proceeds over a publication that survives. Taking
+        ``FOR UPDATE`` first makes both orderings safe: either the deleter
+        wins and the publisher's ``FOR SHARE`` re-check finds no row and
+        aborts, or the publisher wins and this cleanup, now downstream of the
+        lock, sees the new row and removes it.
+
+        **The URI comes from the locked row, not from the caller.** The same
+        statement that takes the lock reads back the row's current ``path``
+        and its vault's name, and the cleanup URI is built from those. A
+        caller holding a stale path — a collection cascade iterating a
+        snapshot taken before a concurrent move, say — would otherwise delete
+        publications for a URI nothing matches, get a silent zero, and then
+        delete the document anyway: the orphan again, from the one method
+        that exists to prevent it. Identity is established under the lock or
+        not at all, so ``path`` and ``vault_name`` are deliberately NOT
+        parameters.
+
+        The cleanup is then passed that canonical **URI**, not the id, so it
+        never re-reads ``documents`` itself — which is also why running it
+        before the row delete is safe here. (The file helper does re-read
+        ``vault_files``; a caller that inverts that order gets a vault-root
+        URI, zero matches, and a silent no-op. See
+        ``publication_service.delete_publications_for_file``.)
+        """
+        if not conn.is_in_transaction():
+            raise RuntimeError(
+                "delete_with_publications requires a caller-managed transaction: "
+                "the row lock, the publication cleanup and the row delete must "
+                "commit as one unit"
+            )
+        # Imported here, not at module scope: publication_service imports the
+        # document services at import time, so a top-level import cycles.
+        from app.services.publication_service import delete_publications_by_doc_uri
+        from app.services.uri_service import doc_uri
+
+        # `FOR UPDATE OF d` locks the document row only — the joined `vaults`
+        # row is read, not locked, so this cannot contend with vault-level
+        # writers.
+        locked = await conn.fetchrow(
+            """
+            SELECT d.path AS path, v.name AS vault_name
+              FROM documents d JOIN vaults v ON v.id = d.vault_id
+             WHERE d.id = $1 AND d.vault_id = $2
+             FOR UPDATE OF d
+            """,
+            doc_id, vault_id,
+        )
+        if locked is None:
+            # Already gone (or not this vault's): nothing to delete, and no
+            # publication to clean up that a live document isn't backing.
+            return False
+        # The by-URI form, not the validating one: this URI was just built
+        # from the row we hold locked, so there is no caller-supplied string
+        # to guard against — and validating would reject a legitimate path
+        # containing braces, aborting the delete. See that function.
+        await delete_publications_by_doc_uri(
+            doc_uri(locked["vault_name"], locked["path"]),
+            expected_vault_id=vault_id, conn=conn,
+        )
+        deleted = await conn.fetchval(
+            "DELETE FROM documents WHERE id = $1 RETURNING id", doc_id,
+        )
+        return deleted is not None
 
     async def list_by_collection(self, vault_id: uuid.UUID, collection_path: str) -> list[dict]:
         async with self.pool.acquire() as conn:
@@ -466,6 +598,7 @@ class DocumentRepository:
         commit_hash: str | None,
         content_hash: str,
         hash_algorithm: str,
+        vault_name: str,
         created_by: str | None = None,
         conn=None,
     ) -> tuple[uuid.UUID, bool]:
@@ -482,6 +615,12 @@ class DocumentRepository:
         Accepts an optional `conn` so callers that already hold a
         connection (e.g. the reconcile loop doing upsert + chunks in
         one transaction) don't re-acquire.
+
+        `vault_name` is required for the same reason as in `create`: the
+        publication guard below is a URI lookup, and a URI needs the vault's
+        name. An upstream commit that re-adds a path a previous sync deleted
+        is an ordinary INSERT here, which is exactly the shape that re-points a
+        surviving publication.
         """
         sql = """
             INSERT INTO documents
@@ -523,11 +662,29 @@ class DocumentRepository:
             hash_algorithm, tags, dumps_jsonb(metadata),
             external_path, external_blob,
         )
+        from app.services.publication_service import (
+            assert_no_orphan_publication_for_document,
+        )
+
+        async def _upsert(c):
+            # Same guard as `create`, and correct for BOTH arms of the upsert
+            # without knowing in advance which one will run: the helper's
+            # "orphan" test is "a publication exists here AND no document
+            # resolves here", which is false by construction when this
+            # statement is about to take the ON CONFLICT (update) path. So a
+            # re-sync of an already-mirrored — and possibly published —
+            # document is never blocked; only a fresh INSERT onto a path whose
+            # publication outlived its document is.
+            await assert_no_orphan_publication_for_document(
+                c, vault_name=vault_name, path=path,
+            )
+            return await c.fetchrow(sql, *args)
+
         if conn is not None:
-            row = await conn.fetchrow(sql, *args)
+            row = await _upsert(conn)
         else:
             async with self.pool.acquire() as acq:
-                row = await acq.fetchrow(sql, *args)
+                row = await _upsert(acq)
         return row["id"], row["inserted"]
 
     async def mark_llm_metadata_filled(

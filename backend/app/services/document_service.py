@@ -480,6 +480,25 @@ class DocumentService:
             )
         else:
             file_path = base_path
+        # Refuse a claimed path BEFORE the git write, not after. `doc_repo.create`
+        # runs this same check as the structural backstop — it is the chokepoint
+        # every creation goes through — but raising there would leave a commit in
+        # git while this transaction rolls back, and git and PG would then
+        # disagree about whether the document exists. `move` is placed the same
+        # way, for the same reason. `file_path` is final by this point, including
+        # the collision-suffixed form, so this checks the path actually claimed.
+        # `conn` is None only when a test drives this directly with fakes;
+        # every production path arrives holding the `_path_lock` connection.
+        # Skipping then costs nothing — the backstop in `doc_repo.create` is
+        # unconditional, so the write is still refused, just after the commit.
+        if conn is not None:
+            from app.services.publication_service import (
+                assert_no_orphan_publication_for_document,
+            )
+            await assert_no_orphan_publication_for_document(
+                conn, vault_name=req.vault, path=file_path,
+            )
+
         # A real doc now owns this path → clear any stale rename redirect that
         # pointed elsewhere (a reused path's history resets to the live doc).
         await drop_resource_alias(conn, vault_id, "document", file_path)
@@ -523,7 +542,7 @@ class DocumentService:
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
             now=now, commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={}, conn=conn,
-            doc_id=doc_id,
+            doc_id=doc_id, vault_name=req.vault,
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -1003,6 +1022,26 @@ class DocumentService:
             if explicit_slug and new_path != base_new_path:
                 raise ConflictError(f"Document already exists at path: {base_new_path}")
 
+            # The destination has no document (resolved free above) — but it
+            # may still have a PUBLICATION, left behind by a document that was
+            # deleted without its cascade. Publications resolve by path, so
+            # landing here would hand this document the stale public slug —
+            # the same outcome as creating a new document at that path,
+            # reached without creating anything. `move` rewrites publications
+            # at the SOURCE uri further down (they follow the document); it has
+            # never looked at the destination.
+            #
+            # Before the git mv, deliberately. Raising after it would leave the
+            # commit in place while this transaction rolls back — git and PG
+            # would then disagree about where the document lives, which is a
+            # worse state than the write we are refusing.
+            from app.services.publication_service import (
+                assert_no_orphan_publication_for_document,
+            )
+            await assert_no_orphan_publication_for_document(
+                conn, vault_name=vault, path=new_path,
+            )
+
             new_collection_id = (
                 await coll_repo.get_or_create(vault_id, new_coll, conn=conn)
                 if new_coll else None
@@ -1345,15 +1384,6 @@ class DocumentService:
         # pool connection.
         await delete_document_chunks(conn, str(pg_doc_id))
         await delete_document_relations(conn, vault, file_path)
-        # App-level publication cascade. Previously this rode
-        # on `publications.document_id` ON DELETE CASCADE; that
-        # FK column is gone after migration 022, so we wipe
-        # publications by canonical URI before the doc row
-        # itself goes.
-        await conn.execute(
-            "DELETE FROM publications WHERE resource_uri = $1",
-            doc_uri(vault, file_path),
-        )
         # Drop any rename/move redirects that pointed at this doc so no alias
         # outlives the row it targets (a later doc reusing the old path then
         # resolves to itself, not a tombstone).
@@ -1369,7 +1399,18 @@ class DocumentService:
                 "path": file_path,
             },
         )
-        await doc_repo.delete(pg_doc_id, conn=conn)
+        # The row delete and the publication cascade are ONE call. That
+        # cascade used to be an inline DELETE here (publications lost their
+        # `document_id` FK in migration 022, so nothing cascades), and the
+        # two OTHER per-row delete paths — the collection cascade's doc loop
+        # and the external-git tombstone — never got a copy. With no single
+        # original to call, writing a new delete path correctly meant
+        # knowing to write the second statement at all. It now
+        # lives inside `delete_with_publications`, which also takes the row
+        # lock that closes the publish/delete race; see that docstring.
+        await doc_repo.delete_with_publications(
+            conn, doc_id=pg_doc_id, vault_id=vault_id,
+        )
 
         if collection_id:
             await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc), conn=conn)

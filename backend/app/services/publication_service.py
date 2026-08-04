@@ -17,6 +17,7 @@ import math
 import re
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -27,7 +28,7 @@ import frontmatter
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.services import file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
@@ -548,59 +549,275 @@ async def delete_publication(
     return deleted
 
 
+@asynccontextmanager
+async def _connection(conn):
+    """Yield the caller's connection when one is supplied, otherwise a
+    freshly acquired pool connection released on exit.
+
+    The cleanup helpers below run several statements, so the usual
+    ``if conn is None: … else: …`` shape (see ``DocumentRepository.create``)
+    would mean two copies of the body — and one copy silently drifting onto
+    the wrong connection is exactly the bug this parameter exists to
+    prevent. One body, one connection, no drift.
+    """
+    if conn is not None:
+        yield conn
+        return
+    pool = await get_pool()
+    async with pool.acquire() as own_conn:
+        yield own_conn
+
+
 async def delete_publications_for_document(
-    document_id: uuid.UUID | str,
+    resource_uri: str,
     *,
     expected_vault_id: uuid.UUID | None = None,
+    conn=None,
 ) -> int:
-    """Delete all publications for a given document, identified by either
-    its canonical URI (preferred — keeps the URI canonical story end-to-end)
-    or, for backwards compatibility with internal callers that still hold
-    the doc's UUID, the PG UUID. UUID inputs trigger a one-row join to
-    materialize the URI then drive the DELETE.
+    """Delete all publications for a document, identified by its canonical
+    ``akb://`` URI. Returns the number of publications deleted.
+
+    **URI only — deliberately.** This used to accept a PG UUID as well, and
+    the two forms carried *different ordering requirements* that nothing in
+    the signature revealed: the URI form touches no other table and is safe
+    to call at any point, while the UUID form joined ``documents`` to
+    materialize the URI. Called on the same connection after the row was
+    deleted, that join found nothing and the helper returned 0 — no rows
+    removed, no error raised, tests green, publication orphaned. Every
+    delete path was therefore correct only by accident of which argument it
+    happened to pass, and changing a call from a URI to ``row["id"]`` would
+    read as a tidy-up while silently restoring the defect at that path. The
+    ordering requirement is gone because the input form that had one is
+    gone. Callers that hold only an id resolve it themselves *before*
+    deleting — see ``DocumentRepository.delete_with_publications``, which
+    reads the path back from the row it has locked.
 
     ``expected_vault_id`` adds an explicit vault binding to the DELETE,
     matching what ``delete_publication(slug=…, expected_vault_id=…)`` does.
     The URI itself already encodes the vault, so this is belt-and-suspenders
     against any future code path that could fan a URI out across vaults.
 
-    Returns the number of publications deleted.
+    ``conn`` lets a caller that is already deleting the document inside its
+    own transaction run this cleanup on that same connection. That is a
+    correctness requirement, not a convenience: on a separate connection the
+    two deletes commit independently, and a crash in between leaves a
+    publication row pointing at a document that no longer exists. Because
+    ``documents`` is ``UNIQUE(vault_id, path)`` and publications resolve by
+    path, the next document created at that path would then be reached
+    through the old public link.
     """
-    from app.services.uri_service import doc_uri
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if isinstance(document_id, str) and document_id.startswith("akb://"):
-            uri = document_id
-        else:
-            # Materialize the CANONICAL URI from the PG UUID. The old
-            # `'akb://' || v.name || '/doc/' || d.path` produced the
-            # pre-0.3.0 legacy shape (akb://V/doc/{coll}/{name}), which
-            # never matches the canonical publications.resource_uri
-            # (akb://V/coll/{coll}/doc/{name}) — so the cascade silently
-            # deleted nothing and left orphan publications. Build it via
-            # doc_uri so the DELETE actually matches.
-            row = await conn.fetchrow(
-                """
-                SELECT v.name AS vault_name, d.path AS path
-                  FROM documents d JOIN vaults v ON v.id = d.vault_id
-                 WHERE d.id = $1
-                """,
-                document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id)),
-            )
-            if not row:
-                return 0
-            uri = doc_uri(row["vault_name"], row["path"])
+    # Fail loudly rather than deleting nothing. A bare UUID (or any non-doc
+    # URI) matches no `resource_uri` and would otherwise return a perfectly
+    # calm 0 — the exact silent no-op this signature exists to prevent.
+    #
+    # This check is for a CALLER-SUPPLIED string. Internal callers that have
+    # just built the URI from a locked row go through
+    # `delete_publications_by_doc_uri` instead and skip it — see that function
+    # for why parsing there would be actively harmful.
+    parsed = parse_uri(resource_uri) if isinstance(resource_uri, str) else None
+    if parsed is None or parsed.kind != "doc":
+        raise ValueError(
+            "delete_publications_for_document requires a canonical document "
+            f"URI (akb://<vault>/…/doc/<name>), got {resource_uri!r}. "
+            "Resolve an id to its URI BEFORE deleting the row — resolving it "
+            "after leaves the publication behind."
+        )
+    return await delete_publications_by_doc_uri(
+        resource_uri, expected_vault_id=expected_vault_id, conn=conn,
+    )
+
+
+async def delete_publications_by_doc_uri(
+    resource_uri: str,
+    *,
+    expected_vault_id: uuid.UUID | None = None,
+    conn=None,
+) -> int:
+    """Delete by URI equality, without validating the URI.
+
+    For internal callers that just built ``resource_uri`` with ``doc_uri`` from
+    a row they hold a lock on. There is no caller-supplied string to guard
+    against, and the DELETE is an equality match that needs no parse.
+
+    **Do not add a parse here.** ``parse_uri`` rejects URIs containing braces
+    (template placeholders), and external-git accepts upstream paths like
+    ``templates/{{cookiecutter.project}}/README.md`` — so ``doc_uri`` can
+    legitimately produce a URI that ``parse_uri`` refuses. Raising on it would
+    abort the tombstone, roll the transaction back, and hold the external-git
+    sync cursor forever, since a per-file error there is retried and never
+    skipped: one templated file upstream would wedge the whole mirror. The
+    same reasoning is why ``assert_no_orphan_publication_for_document``
+    matches on equality rather than parsing.
+    """
+    async with _connection(conn) as conn:
         if expected_vault_id is not None:
             rows = await conn.fetch(
                 "DELETE FROM publications WHERE resource_uri = $1 AND vault_id = $2 RETURNING id",
-                uri, expected_vault_id,
+                resource_uri, expected_vault_id,
             )
         else:
             rows = await conn.fetch(
                 "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
-                uri,
+                resource_uri,
             )
     return len(rows)
+
+
+async def assert_no_orphan_publication_for_document(
+    conn,
+    *,
+    vault_name: str,
+    path: str,
+) -> None:
+    """Refuse a write that would land a document under a public slug it never
+    earned. Returns silently in the healthy case; raises ``ConflictError``
+    (409) when ``path``'s canonical URI already carries a publication and no
+    document occupies the path.
+
+    **Why a write has to care about publications at all.** A document
+    publication is bound to its document only by a path-shaped URI —
+    migration 022 dropped the ``document_id`` FK — and ``documents`` is
+    ``UNIQUE(vault_id, path)``, so paths are reusable. A publication that
+    outlives its document therefore still claims that path: the next
+    document to occupy it would be reached through the old link.
+    ``DocumentRepository.delete_with_publications`` keeps a delete from
+    leaving one behind. This guard covers the other direction — a write
+    arriving at a path some earlier state already left a claim on — so the
+    two together mean neither end of a path's lifecycle has to trust the
+    other to have been correct.
+
+    **The URI is built HERE, from (vault_name, path) — the caller never
+    assembles one.** Getting the URI right is the whole check: one that is
+    even slightly off-shape matches no publication, the guard silently never
+    fires, and the defect survives with green tests. That is not hypothetical —
+    the prior incident recorded in ``delete_publications_for_document`` was a
+    hand-built legacy URI that never matched what was stored. Its remedy there
+    was to accept *only* a URI and validate it; the remedy here is the mirror
+    image, and stronger: with the construction inside, there is no wrong URI a
+    caller could pass. (The two signatures therefore differ on purpose. Do not
+    "harmonize" them: that helper must not look anything up, because its
+    callers run it against a row they have already locked, while this one runs
+    before a write and has the intended path in hand.)
+
+    **The check is the resolver's own document lookup, inverted.**
+    ``resolve_document_publication`` finds the document behind a slug by
+    ``d.path = <path from the URI>`` under the vault the URI names, so
+    "orphan" here means "the resolver would find nothing" rather than an
+    approximation that could drift from it. Keying the anti-join on the vault
+    NAME also leaves this helper one vault identifier to be wrong about
+    instead of two a caller could pair inconsistently.
+
+    Everything else about the match is a deliberate SUPERSET of what the
+    resolver would serve, because a superset fails closed. Publications are
+    matched by ``resource_uri`` alone — no ``vault_id`` predicate, no
+    ``resource_type`` predicate — so a row stays caught however oddly it is
+    bound.
+
+    That makes this match set WIDER than what the cascade removes, in two
+    ways, and both are intentional. The cascade deletes one URI (the
+    canonical one) bound to one vault; this probes the legacy shape too and
+    ignores ``vault_id``. So a row the cascade cannot reach — a legacy-shape
+    URI, or one whose ``resource_uri`` and ``vault_id`` disagree — is not
+    silently reclaimed here; it blocks the path until someone revokes it.
+    A stuck path is the failure we want over a reused one, but it does mean
+    the two are not interchangeable: the guard is not a preview of what the
+    cascade would delete.
+
+    The resolver has since narrowed — it binds a publication to its own
+    ``vault_id`` (see ``resolve_document_publication``) — so this already
+    refuses a few writes for rows the resolver would no longer serve. Safe
+    direction, and those rows should not exist at all.
+
+    **Which stored URI shapes are matched.** Equality against an index, not a
+    parse of every row — so the shapes have to be enumerated. Two are:
+    the canonical form, and the pre-0.3.0 nested form
+    (``akb://V/doc/reports/q3.md``), which ``parse_uri`` still resolves to the
+    same document and which the resolver would therefore still serve.
+    Migration 026 rewrote every stored URI to the canonical form, so the
+    legacy shape should not exist — but "should not exist" is what left the
+    orphans in the incident this file already records, and the probe is one
+    index lookup either way. What is NOT matched is a hand-inserted URI with
+    trailing slashes (``parse_uri`` strips any number of them, so that family
+    is infinite and unindexable); no writer emits one.
+
+    **A path whose canonical URI is unparseable is not special-cased.**
+    ``parse_uri`` rejects URIs containing braces (they are template
+    placeholders), so a mirrored upstream path like
+    ``{{cookiecutter.project}}/README.md`` — which external-git accepts —
+    produces a URI nothing can parse. Equality needs no parse, so such a path
+    is treated like any other. Deliberately: raising on it instead would hold
+    the external-git sync cursor forever (a per-file error there is retried,
+    never skipped) over a publication that could not be served anyway, since
+    the resolver parses the stored URI too and 404s. The residue is that an
+    orphaned brace-path publication still blocks its path — a false conflict
+    in the strict sense, fail-closed, and resolved by revoking a dead row.
+
+    **Nothing is deleted.** The publication row carries the slug, its
+    creator, its creation time, restrictions and view count — the record an
+    owner needs to decide what to do with it. Silently reclaiming the path
+    would discard that, so the write loses and a human decides.
+
+    ``conn`` is REQUIRED and must be the connection the write runs on, inside
+    the caller's transaction: the check and the write then commit or roll back
+    as one unit. That is atomicity, not isolation — under READ COMMITTED each
+    statement takes its own snapshot, so a publication inserted between this
+    check and the write is not seen.
+
+    What closes that window differs by caller, and not every caller closes it
+    fully. ``put`` and ``move`` hold the ``(vault, path)`` advisory lock, but
+    on the BASE path — a collision-suffixed path from ``_resolve_free_path``
+    is covered by the final ``UNIQUE(vault_id, path)`` rather than the lock.
+    ``upsert_external`` holds neither; the external-git sync is single-poller,
+    so nothing races it today, but that is a property of the caller and not
+    something this helper enforces. The residual race is narrow (a publish
+    landing inside one transaction) and fails toward a stale claim rather
+    than a reused path.
+    """
+    from app.services.uri_service import doc_uri
+
+    candidates = [doc_uri(vault_name, path)]
+    if "/" in path:
+        # Pre-0.3.0 shape: the whole path in the identifier, no `/coll/`
+        # segment. `uri_service` deliberately has no builder for it (nothing
+        # may emit it), but `parse_uri` still accepts it, so a surviving row
+        # in this shape is still servable. Verified against `parse_uri` in
+        # tests/test_publication_path_claim_guard_unit.py rather than
+        # asserted here.
+        candidates.append(f"akb://{vault_name}/doc/{path}")
+    # Indexed probe: `idx_publications_resource_uri` (partial, WHERE
+    # resource_uri IS NOT NULL — non-null literals are passed, so it applies).
+    # The anti-join uses vaults' UNIQUE name and UNIQUE(vault_id, path), and
+    # is only reached for rows the outer probe returns — in a healthy database,
+    # none. That is the cost this pays on every document create.
+    row = await conn.fetchrow(
+        """
+        SELECT p.slug, p.created_at
+          FROM publications p
+         WHERE p.resource_uri = ANY($1::text[])
+           AND NOT EXISTS (
+                   SELECT 1
+                     FROM documents d
+                     JOIN vaults v ON v.id = d.vault_id
+                    WHERE v.name = $2 AND d.path = $3
+               )
+         ORDER BY p.created_at
+         LIMIT 1
+        """,
+        candidates, vault_name, path,
+    )
+    if row is None:
+        return
+    raise ConflictError(
+        f"Refusing to write {path!r} in vault {vault_name!r}: the path is "
+        f"claimed by a public link whose document no longer exists "
+        f"(publication slug {row['slug']}, created "
+        f"{row['created_at'].isoformat()}). A document written here would be "
+        f"reachable through that link. The publication is left in place "
+        f"rather than removed — review it, then "
+        f"revoke it (akb_unpublish slug={row['slug']}, or "
+        f"DELETE /api/v1/publications/{vault_name}/{row['slug']}) before "
+        f"reusing this path."
+    )
 
 
 async def delete_publications_for_file(
@@ -608,17 +825,32 @@ async def delete_publications_for_file(
     vault_name: str,
     *,
     expected_vault_id: uuid.UUID | None = None,
+    conn=None,
 ) -> int:
     """Delete all publications for a given file. Looks up the file's
     collection so the URI matches the canonical form stored in the
     ``publications.resource_uri`` column.
 
+    **CALL THIS BEFORE DELETING THE ``vault_files`` ROW.** The lookup below
+    reads ``vault_files``; run on the caller's connection after the row is
+    deleted, the row is already invisible inside that transaction, so the
+    helper builds a *vault-root* URI, matches nothing, and returns 0 — no
+    rows removed, no error, tests green. Note this is only wrong for files
+    that live in a collection: a vault-root file's root-form URI is correct
+    either way, so a call site with the ordering wrong still looks right
+    until someone puts a file in a folder. Every deleting caller today
+    passes ``conn`` and runs before its row delete; keep it that way.
+
     ``expected_vault_id`` adds an explicit vault binding to the DELETE
     (see ``delete_publications_for_document`` for rationale).
+
+    ``conn`` runs the lookup and the DELETE inside the caller's transaction
+    (same rationale as ``delete_publications_for_document``): on a separate
+    connection the two commit independently, and a crash between them leaves
+    the orphan the deleting caller is trying to avoid.
     """
     from app.services.uri_service import file_uri
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with _connection(conn) as conn:
         coll_row = await conn.fetchrow(
             """
             SELECT c.path AS collection
@@ -829,9 +1061,19 @@ async def resolve_document_publication(publication: dict) -> dict:
             -- user_directory.resolve_display_names.
             LEFT JOIN users u
                 ON u.id::text = d.created_by OR u.username = d.created_by
-            WHERE v.name = $1 AND d.path = $2
+            -- Bind to the publication's own vault_id (not the vault NAME
+            -- parsed out of resource_uri) so this can't be satisfied by a
+            -- same-path document in another vault (cross-vault IDOR) — the
+            -- same binding `resolve_file_publication` puts on vault_files.
+            -- `v.name = $3` is then the cross-check, not the lookup key: v is
+            -- joined on the pinned vault_id, so requiring it to equal the
+            -- URI's vault name means a row whose resource_uri disagrees with
+            -- its vault_id matches nothing and 404s. Fail closed — serving
+            -- the publication's own document at that path instead would be a
+            -- silent partial success on a row that is, either way, corrupt.
+            WHERE d.vault_id = $1 AND d.path = $2 AND v.name = $3
             """,
-            uri_vault, doc_path,
+            to_uuid(publication["vault_id"]), doc_path, uri_vault,
         )
         if doc_row is None:
             raise NotFoundError("Document", str(uri))

@@ -17,7 +17,7 @@ import asyncpg
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
-from app.repositories.document_repo import CollectionRepository
+from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_repo import VaultRepository
 from app.services.git_service import GitService
@@ -25,6 +25,7 @@ from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
 )
 from app.services.kg_service import delete_document_relations
+from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri, table_uri
 from app.services.write_lane import run_git_write, write_lane
@@ -224,6 +225,7 @@ class CollectionService:
             raise NotFoundError("Vault", vault)
 
         pool = await get_pool()
+        doc_repo = DocumentRepository(pool)
         docs_count = 0
         files_count = 0
         sub_count = 0
@@ -299,11 +301,26 @@ class CollectionService:
                 # blocks on multi-second worktree I/O. Under load
                 # that pins connection-pool slots and starves
                 # concurrent writers across the entire vault.
+
+                # The row delete goes through the repository chokepoint, which
+                # carries the publication cascade with it. `publications` lost
+                # its `document_id` FK in migration 022, so nothing cascades —
+                # and this loop, deleting the rows by hand, is where that was
+                # first forgotten: the orphaned publication's slug still
+                # resolved by path, and since `documents` is
+                # UNIQUE(vault_id, path), the next document created (or moved)
+                # onto that path would be reached through the old public
+                # link.
                 for d in docs:
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
-                    await conn.execute(
-                        "DELETE FROM documents WHERE id = $1", d["id"],
+                    # The URI for the publication cleanup is derived from
+                    # the row under its lock, NOT from `d["path"]` — this
+                    # snapshot was taken without a document row lock
+                    # (`list_docs_under`), so a concurrent move could have
+                    # changed the path since. See the method's docstring.
+                    await doc_repo.delete_with_publications(
+                        conn, doc_id=d["id"], vault_id=vault_id,
                     )
 
                 # Per-file cost: edges + chunk outbox + s3 outbox +
@@ -323,6 +340,16 @@ class CollectionService:
                     await conn.execute(
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
+                    )
+                    # Same cascade gap as the document loop above. A file
+                    # URI carries a UUID, so a stale row here cannot be reoccupied
+                    # onto a new resource — but it stays live in the
+                    # owner's publication list pointing at nothing. Must
+                    # run BEFORE `vault_files_repo.delete`: the helper
+                    # re-reads the file's collection to build the
+                    # canonical URI and sees no row once it is gone.
+                    await delete_publications_for_file(
+                        file_id, vault, expected_vault_id=vault_id, conn=conn,
                     )
                     try:
                         await delete_file_chunks(conn, file_id)
