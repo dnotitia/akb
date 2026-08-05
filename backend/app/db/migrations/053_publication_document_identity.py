@@ -185,14 +185,28 @@ _DOC_UNIQUE = "documents_id_vault_id_key"
 _PUB_FK = "publications_document_fk"
 _PUB_INDEX = "idx_publications_document_id"
 
-# Expected definitions, exactly as `pg_get_constraintdef` renders them. The
-# idempotency guards compare against these rather than against a name, so a
-# constraint that merely borrowed the name cannot pass for the real thing.
-_DOC_UNIQUE_DEF = "UNIQUE (id, vault_id)"
-_PUB_FK_DEF = (
-    "FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id) "
-    "ON DELETE CASCADE"
+# What the guards below require of an existing constraint, read out of the
+# catalog rather than out of `pg_get_constraintdef`. The deparsed text would be
+# easier to compare and is the wrong thing to compare: it is a reconstruction
+# whose relation names are qualified according to the session's search_path, so
+# the identical constraint can render as `REFERENCES documents(…)` or
+# `REFERENCES public.documents(…)` — and a guard that refuses the second one
+# would fail a boot over a formatting difference. Catalog columns do not move.
+#
+# (contype, referenced table, local cols, referenced cols, on-delete,
+#  on-update, match type, validated)
+_DOC_UNIQUE_SHAPE = ("u", None, ["id", "vault_id"], None, " ", " ", " ", True)
+_PUB_FK_SHAPE = (
+    "f", "documents", ["document_id", "vault_id"], ["id", "vault_id"],
+    # c = CASCADE on delete; a = NO ACTION on update (so the vault half of the
+    # key cannot be moved out from under the pairing); s = MATCH SIMPLE (so a
+    # NULL document_id is exempt — see the module docstring).
+    "c", "a", "s", True,
 )
+# Substring of `pg_get_indexdef` that pins the cascade index's columns and
+# predicate. Only the parts that carry meaning — the access method and schema
+# qualification in that string are formatting, and the table it sits on is
+# checked against the catalog separately.
 _PUB_INDEX_COLS = "(document_id, vault_id) WHERE (document_id IS NOT NULL)"
 
 # Rows per UPDATE. Keeps any single statement well inside the pool's 30s
@@ -221,37 +235,59 @@ async def _column_exists(conn, table: str, column: str) -> bool:
     ))
 
 
-async def _constraint_def(conn, table: str, name: str) -> str | None:
-    """The constraint's definition, or None if there is no constraint by that
-    name on that table.
+async def _constraint_shape(conn, table: str, name: str) -> tuple | None:
+    """The constraint's structure as the catalog records it, or None if no
+    constraint of that name exists on that table.
 
-    Definition rather than existence on purpose. A name-only check would let a
-    CHECK constraint, an unvalidated FK, or an FK on the wrong columns wearing
-    the right name satisfy the idempotency guard — the migration would return
-    happily, get recorded in the ledger, and leave the guarantee it advertises
-    uninstalled. Comparing what the database actually built means a re-run
-    either finds the real thing or says so.
+    Structure rather than existence on purpose. A name-only check would let a
+    CHECK constraint, an unvalidated FK, or an FK over the wrong columns
+    wearing the right name satisfy the idempotency guard — the migration would
+    return happily, get recorded in the ledger, and leave the guarantee it
+    advertises uninstalled.
     """
-    return await conn.fetchval(
+    row = await conn.fetchrow(
         """
-        SELECT pg_get_constraintdef(oid) FROM pg_constraint
-         WHERE conname::text = $2::text
-           AND conrelid = to_regclass('public.' || $1::text)
+        SELECT c.contype::text                                   AS contype,
+               (SELECT relname::text FROM pg_class
+                 WHERE oid = NULLIF(c.confrelid, 0))             AS target,
+               (SELECT array_agg(a.attname::text ORDER BY k.ord)
+                  FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS local_cols,
+               (SELECT array_agg(a.attname::text ORDER BY k.ord)
+                  FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_attribute a
+                    ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS target_cols,
+               c.confdeltype::text                               AS on_delete,
+               c.confupdtype::text                               AS on_update,
+               c.confmatchtype::text                             AS match_type,
+               c.convalidated                                    AS validated
+          FROM pg_constraint c
+         WHERE c.conname::text = $2::text
+           AND c.conrelid = to_regclass('public.' || $1::text)
         """,
         table, name,
     )
+    if row is None:
+        return None
+    return (
+        row["contype"], row["target"], row["local_cols"], row["target_cols"],
+        row["on_delete"], row["on_update"], row["match_type"], row["validated"],
+    )
 
 
-async def _already_correct(conn, table: str, name: str, expected: str) -> bool:
+async def _already_correct(conn, table: str, name: str, expected: tuple) -> bool:
     """True when `name` is already the constraint we would create; raises when
     something else is wearing the name."""
-    found = await _constraint_def(conn, table, name)
+    found = await _constraint_shape(conn, table, name)
     if found is None:
         return False
     if found != expected:
         raise RuntimeError(
             f"{table} already has a constraint named {name}, but it is not the "
             f"one migration 053 installs.\n  found:    {found}\n  expected: {expected}\n"
+            "(fields: contype, referenced table, local columns, referenced "
+            "columns, on-delete, on-update, match type, validated)\n"
             "Migration 053 will not silently accept it — inspect the constraint, "
             "then drop or rename it and re-run."
         )
@@ -265,7 +301,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
     operator may have run ahead of time (or had cancelled underneath them):
     no index, a valid index of the right shape, or an invalid leftover.
     """
-    if await _already_correct(conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_DEF):
+    if await _already_correct(conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_SHAPE):
         return
 
     existing = await conn.fetchrow(
@@ -342,7 +378,7 @@ async def _ensure_publication_identity(conn) -> None:
     them, and a great deal worth preserving by not leaving that window open.
     """
     have_column = await _column_exists(conn, "publications", "document_id")
-    have_fk = await _already_correct(conn, "publications", _PUB_FK, _PUB_FK_DEF)
+    have_fk = await _already_correct(conn, "publications", _PUB_FK, _PUB_FK_SHAPE)
     if have_column and have_fk:
         return
 
@@ -354,7 +390,8 @@ async def _ensure_publication_identity(conn) -> None:
             try:
                 await conn.execute(
                     f"ALTER TABLE publications ADD CONSTRAINT {_PUB_FK} "
-                    f"{_PUB_FK_DEF}"
+                    "FOREIGN KEY (document_id, vault_id) "
+                    "REFERENCES documents (id, vault_id) ON DELETE CASCADE"
                 )
             except asyncpg.ForeignKeyViolationError as e:
                 raise RuntimeError(
@@ -383,23 +420,37 @@ async def _ensure_publication_document_index(conn) -> None:
     NULL after this migration and the cascade probe (``document_id = $1``)
     implies NOT NULL, so the planner can still use it.
 
-    Checked by definition rather than by `IF NOT EXISTS` alone, for the same
-    reason as the constraints: a same-named index over different columns would
-    otherwise be accepted silently.
+    Checked structurally rather than by `IF NOT EXISTS` alone, for the same
+    reason as the constraints. Index names are unique per schema, not per
+    table, so "a relation of this name exists" says nothing on its own: it
+    could be an index on another table, or an invalid leftover from a
+    cancelled concurrent build that enforces and accelerates nothing while
+    `IF NOT EXISTS` steps over it forever.
     """
-    found = await conn.fetchval(
-        "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
-        "WHERE indexrelid = to_regclass('public.' || $1::text)",
+    found = await conn.fetchrow(
+        """
+        SELECT i.indisvalid                          AS is_valid,
+               i.indrelid = to_regclass('public.publications') AS on_publications,
+               pg_get_indexdef(i.indexrelid)         AS definition
+          FROM pg_index i
+         WHERE i.indexrelid = to_regclass('public.' || $1::text)
+        """,
         _PUB_INDEX,
     )
     if found is not None:
-        if _PUB_INDEX_COLS not in found:
+        if not found["on_publications"] or _PUB_INDEX_COLS not in found["definition"]:
             raise RuntimeError(
                 f"An index named {_PUB_INDEX} already exists but is not the "
-                f"cascade index migration 053 creates.\n  found: {found}\n"
+                f"cascade index migration 053 creates.\n  found: {found['definition']}\n"
                 "Inspect it, then drop or rename it and re-run."
             )
-        return
+        if found["is_valid"]:
+            return
+        logger.warning(
+            "Migration 053: found an INVALID index named %s; dropping it before "
+            "rebuilding", _PUB_INDEX,
+        )
+        await conn.execute(f"DROP INDEX IF EXISTS {_PUB_INDEX}")
     await conn.execute(
         f"CREATE INDEX {_PUB_INDEX} "
         "ON publications (document_id, vault_id) WHERE document_id IS NOT NULL"
@@ -419,6 +470,12 @@ async def _backfill(conn) -> None:
     how many publications a deployment has accumulated. Rows bound by an
     earlier page drop out of the predicate rather than shifting the window, so
     the key order stays stable across pages.
+
+    Publication ids are random, so a row inserted concurrently below the
+    cursor is not visited by this run. That is not a defect to work around:
+    an unvisited row is simply an unbound row, which is a state this migration
+    already leaves behind by design and which resolution handles the same way
+    it does today.
     """
     already_bound = await conn.fetchval(
         "SELECT COUNT(*) FROM publications "
@@ -434,9 +491,13 @@ async def _backfill(conn) -> None:
     path_reused = 0
     no_document = 0
     vault_mismatch: list = []
-    after = uuid_mod.UUID(int=0)
+    after: uuid_mod.UUID | None = None
 
     while True:
+        # `after IS NULL` for the first page rather than starting from the
+        # all-zero UUID: nothing generates that id, but the column accepts it,
+        # and a sentinel that is also a legal key value would silently skip
+        # the one row that used it.
         page = await conn.fetch(
             """
             SELECT p.id, p.resource_uri, v.name AS vault_name
@@ -444,7 +505,7 @@ async def _backfill(conn) -> None:
               JOIN vaults v ON v.id = p.vault_id
              WHERE p.resource_type = 'document'
                AND p.document_id IS NULL
-               AND p.id > $1
+               AND ($1::uuid IS NULL OR p.id > $1)
              ORDER BY p.id
              LIMIT $2
             """,

@@ -203,6 +203,11 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
         name == "documents_id_vault_id_key" and "UNIQUE (id, vault_id)" in definition
         for _, name, definition, _ in expected["constraints"]
     )
+    assert any(
+        "idx_publications_document_id" in definition
+        and "(document_id, vault_id) WHERE (document_id IS NOT NULL)" in definition
+        for _, definition, _ in expected["indexes"]
+    )
     assert all(valid for *_, valid in expected["indexes"])
     assert all(validated for *_, validated in expected["constraints"])
 
@@ -453,6 +458,124 @@ async def test_an_unrelated_index_wearing_the_name_fails_loudly():
         )
         with pytest.raises(RuntimeError, match="will not repurpose it"):
             await _apply(conn)
+
+
+async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
+    """Idempotency is not "something by that name exists". Index and constraint
+    names are unique per schema, not per table, so a name says nothing about
+    what is behind it."""
+    # A CHECK constraint wearing the FK's name.
+    async with _fresh_database(undo_053=True) as conn:
+        await conn.execute(
+            "ALTER TABLE publications ADD COLUMN document_id UUID, "
+            "ADD CONSTRAINT publications_document_fk CHECK (view_count >= 0)"
+        )
+        with pytest.raises(RuntimeError, match="not the one migration 053 installs"):
+            await _apply(conn)
+
+    # An FK of the right name on the right table, but single-column — the
+    # shape this whole change exists to replace.
+    async with _fresh_database(undo_053=True) as conn:
+        await conn.execute(
+            "ALTER TABLE publications ADD COLUMN document_id UUID, "
+            "ADD CONSTRAINT publications_document_fk "
+            "FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE"
+        )
+        with pytest.raises(RuntimeError, match="not the one migration 053 installs"):
+            await _apply(conn)
+
+    # An index of the right name and columns, but on another table.
+    async with _fresh_database(undo_053=True) as conn:
+        await conn.execute(
+            "CREATE TABLE decoy (document_id UUID, vault_id UUID); "
+            "CREATE INDEX idx_publications_document_id "
+            "ON decoy (document_id, vault_id) WHERE document_id IS NOT NULL"
+        )
+        with pytest.raises(RuntimeError, match="not the cascade index"):
+            await _apply(conn)
+
+
+async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over():
+    async with _fresh_database(undo_053=True) as conn:
+        await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
+        await conn.execute(
+            "CREATE INDEX idx_publications_document_id "
+            "ON publications (document_id, vault_id) WHERE document_id IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE pg_index SET indisvalid = false "
+            "WHERE indexrelid = 'idx_publications_document_id'::regclass"
+        )
+
+        await _apply(conn)
+
+        assert await conn.fetchval(
+            "SELECT indisvalid FROM pg_index "
+            "WHERE indexrelid = 'idx_publications_document_id'::regclass"
+        ) is True
+
+
+async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_it():
+    """If document_id already holds a value the composite key would reject, the
+    migration fails loudly and changes nothing. Blanking or deleting those rows
+    is a decision for a human, not a side effect of a boot."""
+    async with _fresh_database(undo_053=True) as conn:
+        vault_a = await _vault(conn, f"bad-a-{uuid.uuid4().hex[:8]}")
+        vault_b = await _vault(conn, f"bad-b-{uuid.uuid4().hex[:8]}")
+        other_doc = await _document(conn, vault_b, "notes.md")
+        await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
+        pub = await _publication(conn, vault_a, "akb://x/doc/notes.md")
+        await conn.execute(
+            "UPDATE publications SET document_id = $2 WHERE id = $1", pub, other_doc
+        )
+
+        with pytest.raises(RuntimeError, match="does not name a document"):
+            await _apply(conn)
+
+        # The row is untouched and the connection is still usable.
+        assert await conn.fetchval(
+            "SELECT document_id FROM publications WHERE id = $1", pub
+        ) == other_doc
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM pg_constraint WHERE conname = 'publications_document_fk'"
+        ) == 0
+
+
+async def test_the_backfill_pages_through_more_rows_than_one_batch():
+    """_BATCH is 500; the paging loop has to visit everything, exactly once."""
+    module = _load("053_publication_document_identity.py")
+    total = module._BATCH * 2 + 7
+
+    async with _fresh_database(undo_053=True) as conn:
+        name = f"paged-{uuid.uuid4().hex[:8]}"
+        vault = await _vault(conn, name)
+        await conn.execute(
+            "INSERT INTO documents (vault_id, path, title) "
+            "SELECT $1, 'p/' || g || '.md', 'doc' FROM generate_series(1, $2) g",
+            vault, total,
+        )
+        await conn.execute(
+            "INSERT INTO publications (slug, vault_id, resource_type, resource_uri) "
+            "SELECT 'slug-' || g, $1, 'document', $2 || '/coll/p/doc/' || g || '.md' "
+            "  FROM generate_series(1, $3) g",
+            vault, f"akb://{name}", total,
+        )
+
+        await _apply(conn)
+
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM publications WHERE document_id IS NULL"
+        ) == 0
+        # Each publication bound to its OWN document, not to some other page's.
+        assert await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM publications p JOIN documents d ON d.id = p.document_id
+             WHERE p.resource_uri <> 'akb://' || $1 || '/coll/p/doc/' ||
+                   split_part(d.path, '/', 2)
+            """,
+            name,
+        ) == 0
+        assert await conn.fetchval("SELECT COUNT(DISTINCT document_id) FROM publications") == total
 
 
 async def test_migration_022_does_not_drop_the_identity_column():
