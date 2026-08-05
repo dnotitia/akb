@@ -89,7 +89,7 @@ class M1ReferencePayloadStore:
                     selected_placement, verification_profile, canonical_bytes
                 )
                 VALUES ($1, 'text', $2, $3, 'utf-8', $4, $5, $6)
-                ON CONFLICT (namespace_id, digest, byte_size, selected_placement) DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING payload_id, namespace_id, content_profile, digest,
                           byte_size, encoding, selected_placement,
                           verification_profile, canonical_bytes

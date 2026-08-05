@@ -4,8 +4,10 @@
 This entrypoint is deliberately a measurement tool, not an AKB public API.  It
 only accepts an explicitly named measurement database, creates one fresh vault
 namespace per run, and drives :class:`NativeRevisionService` directly.  The
-workbench owns the receipt; this program writes only its concrete observation
-and the two SHA-256-bound artifacts required by that receipt.
+database is isolated and forward-only under one exact candidate image; rolling
+back the binary requires recreating the measurement database.  The workbench
+owns the receipt; this program writes only its concrete observation and the two
+SHA-256-bound artifacts required by that receipt.
 """
 
 from __future__ import annotations

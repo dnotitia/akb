@@ -6,6 +6,13 @@ PostgreSQL BodyStore are independent Resources, so their verified payloads
 must coexist even when their canonical bytes are identical.  The manifest's
 existing composite foreign key keeps each Resource pinned to its exact
 placement-specific payload facts.
+
+This contract is intentionally limited to the disposable M1 measurement
+database (and its isolated, suffixed test derivatives).  That database is
+forward-only and owned by one exact candidate image: rollback to an older
+binary requires recreating the measurement database, never reusing a schema
+to which this migration was applied.  Normal AKB databases retain the
+pre-053 schema.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger("akb.migration.053")
+MEASUREMENT_DATABASE_PREFIX = "akb_revision_m1_measurement"
 
 
 async def migrate(conn=None):
@@ -27,6 +35,13 @@ async def migrate(conn=None):
 
 
 async def _run(conn):
+    database = await conn.fetchval("SELECT current_database()")
+    if not isinstance(database, str) or not (
+        database == MEASUREMENT_DATABASE_PREFIX
+        or database.startswith(MEASUREMENT_DATABASE_PREFIX + "_")
+    ):
+        logger.info("Migration 053: non-measurement database left unchanged")
+        return
     async with conn.transaction():
         await conn.execute(
             """
