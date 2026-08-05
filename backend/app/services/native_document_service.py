@@ -208,13 +208,16 @@ class NativeDocumentService(DocumentService):
         current_fm, _ = _parse_markdown(current.text)
         _, selected_body = _parse_markdown(selected.text)
         created_by = current_fm.get("created_by")
-        # Two independent single-row reads on separate connections; run them
-        # together rather than paying two serialized pool checkouts per
-        # document read.
-        public_slug, created_by_name = await asyncio.gather(
-            self._public_slug(vault_id, vault, current.path),
-            self._created_by_name(created_by),
-        )
+        # Sequential on purpose. These two reads are independent and a
+        # `gather` would save one round trip, but each takes its own pool
+        # connection, so overlapping them doubles this path's peak checkouts
+        # per document read to buy a saving that is worth nothing here — this
+        # arm is measurement-only and is not the default backend. It also
+        # changes failure behaviour: under `gather` a raise in one no longer
+        # stops the other, which runs on to completion with its result (or its
+        # own exception) discarded. Not worth either, for zero live gain.
+        public_slug = await self._public_slug(vault_id, vault, current.path)
+        created_by_name = await self._created_by_name(created_by)
         return DocumentResponse(
             uri=doc_uri(vault, current.path),
             vault=vault,
