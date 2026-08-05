@@ -1036,7 +1036,7 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
 
     **What this test stopped proving.** The publication it creates is now
     bound (`document_id` is required for a document publication), so
-    migration 053's ON DELETE CASCADE removes it too — the final assertion
+    migration 058's ON DELETE CASCADE removes it too — the final assertion
     below holds even with the explicit cleanup deleted outright. Verified,
     not assumed. So this is now a test of the END STATE, and the FK is what
     guarantees it. The lock ordering and the explicit cleanup are what a
@@ -1169,7 +1169,7 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
 ):
     """The same lock-ordering proof, on the one population the FK is blind to.
 
-    Migration 053's ON DELETE CASCADE only reaches publications that carry a
+    Migration 058's ON DELETE CASCADE only reaches publications that carry a
     `document_id`, and the column is nullable precisely because the backfill
     could not bind every pre-existing row. For a row it left NULL, the
     deleter's explicit publication cleanup is the ONLY thing that removes it
@@ -1179,7 +1179,7 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     The publisher here is hand-rolled rather than `create_publication`: that
     function now refuses to create an unbound document publication, which is
     the point of the change, so the legacy shape has to be written directly.
-    What it reproduces is exactly the pre-053 publisher — take `FOR SHARE`
+    What it reproduces is exactly the pre-058 publisher — take `FOR SHARE`
     on the document row, then INSERT — so the lock choreography under test is
     the real one.
 
@@ -1361,7 +1361,7 @@ async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeyp
 # are reusable, so "the document at path P" is not a stable name for a
 # document — the publisher could resolve one document and publish another.
 # Now the resolved id crosses, the re-check keys on it, and the row stores
-# it (`publications.document_id`, migration 053).
+# it (`publications.document_id`, migration 058).
 #
 # The interleaving is injected by wrapping `create_publication` itself: the
 # wrapper runs at exactly the moment the resolve has finished and the INSERT

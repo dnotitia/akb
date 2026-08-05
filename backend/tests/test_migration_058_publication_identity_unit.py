@@ -1,6 +1,6 @@
-"""Live-PostgreSQL contract for migration 053 (publication document identity).
+"""Live-PostgreSQL contract for migration 058 (publication document identity).
 
-What 053 adds is a *database* guarantee — a composite FK with ON DELETE
+What 058 adds is a *database* guarantee — a composite FK with ON DELETE
 CASCADE — so every assertion here goes through SQL that bypasses the
 application entirely. That is the point of the change: the Python-level
 cleanup paths already work, and a test that drove them would prove nothing
@@ -63,10 +63,10 @@ _DSN = os.environ.get(
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 
-# The additions 053 makes. Dropping these from an init.sql database
-# reconstructs the pre-053 shape, which is what the migration has to turn
-# back into the post-053 shape.
-_UNDO_053 = """
+# The additions 058 makes. Dropping these from an init.sql database
+# reconstructs the pre-058 shape, which is what the migration has to turn
+# back into the post-058 shape.
+_UNDO_058 = """
 ALTER TABLE publications DROP CONSTRAINT publications_document_fk;
 DROP INDEX idx_publications_document_id;
 ALTER TABLE publications DROP COLUMN document_id;
@@ -95,7 +95,7 @@ def _load(filename: str):
 
 
 @asynccontextmanager
-async def _fresh_database(*, undo_053: bool = False):
+async def _fresh_database(*, undo_058: bool = False):
     if not await _can_connect(_DSN):
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
@@ -107,8 +107,8 @@ async def _fresh_database(*, undo_053: bool = False):
     conn = await asyncpg.connect(f"{base}/{name}")
     try:
         await conn.execute(_INIT_SQL)
-        if undo_053:
-            await conn.execute(_UNDO_053)
+        if undo_058:
+            await conn.execute(_UNDO_058)
         yield conn
     finally:
         await conn.close()
@@ -118,7 +118,7 @@ async def _fresh_database(*, undo_053: bool = False):
 
 async def _apply(conn) -> dict:
     """Apply the migration, returning the backfill's per-category counts."""
-    return await _load("053_publication_document_identity.py").migrate(conn=conn)
+    return await _load("058_publication_document_identity.py").migrate(conn=conn)
 
 
 # ------------------------------------------------------------------
@@ -197,8 +197,8 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
     async with _fresh_database() as fresh:
         expected = await _shape(fresh)
 
-    async with _fresh_database(undo_053=True) as migrated:
-        # Sanity: the undo really did reconstruct a pre-053 shape.
+    async with _fresh_database(undo_058=True) as migrated:
+        # Sanity: the undo really did reconstruct a pre-058 shape.
         assert await _shape(migrated) != expected
         await _apply(migrated)
         assert await _shape(migrated) == expected
@@ -226,7 +226,7 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
 async def test_init_sql_still_runs_against_a_database_that_predates_the_migration():
     """The boot loop the document_id guard in init.sql exists to prevent — see
     the note at that guard for why an unguarded statement there is fatal."""
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         assert await conn.fetchval(
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'publications' "
             "AND column_name = 'document_id'"
@@ -270,7 +270,7 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
 # file's recorded history — which is why the judgement-based derivation above
 # is not redundant with the replay.
 _MIGRATION_ADDED_COLUMNS = [
-    ("publications", "document_id", "idx_publications_document_id"),   # 053
+    ("publications", "document_id", "idx_publications_document_id"),   # 058
     ("publications", "resource_uri", "idx_publications_resource_uri"),  # 022
     ("chunks", "vector_indexed_at", "idx_chunks_indexing_queue"),       # 009
     ("vault_tables", "collection_id", "idx_vault_tables_collection"),   # 020
@@ -318,7 +318,7 @@ async def test_a_document_cannot_be_moved_out_from_under_a_publication():
 
 
 async def test_deleting_the_document_row_in_sql_takes_the_publication_with_it():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         vault = await _vault(conn, f"cascade-{uuid.uuid4().hex[:8]}")
         doc = await _document(conn, vault, "reports/q3.md")
         pub = await _publication(
@@ -376,7 +376,7 @@ async def test_composite_fk_refuses_a_document_from_another_vault():
 
 
 async def test_backfill_binds_only_unambiguous_rows_and_deletes_nothing():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         own = f"own-{uuid.uuid4().hex[:8]}"
         elsewhere = f"elsewhere-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
@@ -454,7 +454,7 @@ async def test_the_backfill_reports_a_count_for_every_category(caplog):
     different decisions. Asserting only that unbindable rows end up NULL
     cannot tell those apart.
     """
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         own = f"counts-{uuid.uuid4().hex[:8]}"
         elsewhere = f"counts-other-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
@@ -482,7 +482,7 @@ async def test_the_backfill_reports_a_count_for_every_category(caplog):
             conn, vault, f"akb://{own}/file/{uuid.uuid4()}", resource_type="file"
         )
 
-        with caplog.at_level("INFO", logger="akb.migration.053"):
+        with caplog.at_level("INFO", logger="akb.migration.058"):
             first = await _apply(conn)
 
         assert first == {
@@ -513,7 +513,7 @@ async def test_the_backfill_reports_a_count_for_every_category(caplog):
 
 
 async def test_rerunning_changes_nothing():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         own = f"idem-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
         await _document(conn, vault, "notes.md")
@@ -531,7 +531,7 @@ async def test_rerunning_changes_nothing():
 
 
 async def test_index_left_invalid_by_a_cancelled_build_is_replaced():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "CREATE UNIQUE INDEX documents_id_vault_id_key ON documents (id, vault_id)"
         )
@@ -555,7 +555,7 @@ async def test_index_left_invalid_by_a_cancelled_build_is_replaced():
 
 
 async def test_a_valid_index_built_out_of_band_is_adopted_not_rebuilt():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "CREATE UNIQUE INDEX documents_id_vault_id_key ON documents (id, vault_id)"
         )
@@ -576,7 +576,7 @@ async def test_a_valid_index_built_out_of_band_is_adopted_not_rebuilt():
 
 
 async def test_an_unrelated_index_wearing_the_name_fails_loudly():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "CREATE INDEX documents_id_vault_id_key ON documents (vault_id, path)"
         )
@@ -597,7 +597,7 @@ async def test_an_index_of_that_name_on_another_table_is_never_touched(
     decoy and reported success. Every combination is checked because the
     branch taken depends on both validity and shape.
     """
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         columns = "(id, vault_id)" if right_shape else "(vault_id, path)"
         await conn.execute(
             "CREATE TABLE decoy (id UUID, vault_id UUID, path TEXT)"
@@ -629,27 +629,27 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
     names are unique per schema, not per table, so a name says nothing about
     what is behind it."""
     # A CHECK constraint wearing the FK's name.
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "ALTER TABLE publications ADD COLUMN document_id UUID, "
             "ADD CONSTRAINT publications_document_fk CHECK (view_count >= 0)"
         )
-        with pytest.raises(RuntimeError, match="not the one migration 053 installs"):
+        with pytest.raises(RuntimeError, match="not the one migration 058 installs"):
             await _apply(conn)
 
     # An FK of the right name on the right table, but single-column — the
     # shape this whole change exists to replace.
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "ALTER TABLE publications ADD COLUMN document_id UUID, "
             "ADD CONSTRAINT publications_document_fk "
             "FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE"
         )
-        with pytest.raises(RuntimeError, match="not the one migration 053 installs"):
+        with pytest.raises(RuntimeError, match="not the one migration 058 installs"):
             await _apply(conn)
 
     # An index of the right name and columns, but on another table.
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute(
             "CREATE TABLE decoy (document_id UUID, vault_id UUID); "
             "CREATE INDEX idx_publications_document_id "
@@ -660,7 +660,7 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
 
     # Right name, right table, right columns — but UNIQUE, which would let a
     # document be published exactly once.
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
         await conn.execute(
             "CREATE UNIQUE INDEX idx_publications_document_id "
@@ -671,7 +671,7 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
 
 
 async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over():
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
         await conn.execute(
             "CREATE INDEX idx_publications_document_id "
@@ -694,7 +694,7 @@ async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_i
     """If document_id already holds a value the composite key would reject, the
     migration fails loudly and changes nothing. Blanking or deleting those rows
     is a decision for a human, not a side effect of a boot."""
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         vault_a = await _vault(conn, f"bad-a-{uuid.uuid4().hex[:8]}")
         vault_b = await _vault(conn, f"bad-b-{uuid.uuid4().hex[:8]}")
         other_doc = await _document(conn, vault_b, "notes.md")
@@ -723,11 +723,11 @@ async def test_the_backfill_pages_through_more_rows_than_one_batch():
     the column accepts it, and a cursor that started from it with a strict `>`
     would skip exactly that row — silently, since every other row still binds.
     """
-    module = _load("053_publication_document_identity.py")
+    module = _load("058_publication_document_identity.py")
     total = module._BATCH * 2 + 7
     zero_id = uuid.UUID(int=0)
 
-    async with _fresh_database(undo_053=True) as conn:
+    async with _fresh_database(undo_058=True) as conn:
         name = f"paged-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, name)
         await conn.execute(
@@ -775,7 +775,7 @@ async def test_the_backfill_pages_through_more_rows_than_one_batch():
 
 
 async def test_migration_022_does_not_drop_the_identity_column():
-    """022 drops a column called document_id. 053 adds a different one, and
+    """022 drops a column called document_id. 058 adds a different one, and
     init.sql declares it — so on a fresh database 022 runs against a table
     that already has one. It must leave it alone."""
     async with _fresh_database() as conn:

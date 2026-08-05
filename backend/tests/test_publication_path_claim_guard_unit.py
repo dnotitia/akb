@@ -177,7 +177,7 @@ async def _orphan_the_publication(pool, doc_id: uuid.UUID) -> None:
     was resolved from, under a composite FK with ON DELETE CASCADE — so even
     the raw DELETE below takes the publication with it, and no orphan
     results. What survives a document is a row whose `document_id` is NULL: a
-    publication predating migration 053 that the backfill could not bind
+    publication predating migration 058 that the backfill could not bind
     unambiguously, which is exempt from the FK. Clearing the column is how
     this manufactures one, and those legacy rows are the population this
     guard still exists for. The guard stops being reachable at all once the

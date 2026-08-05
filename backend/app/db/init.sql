@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS documents (
     -- required all the same: publications reference (id, vault_id) as a pair
     -- so the vault match is structural, and PostgreSQL will not accept a
     -- composite FK without a unique constraint on exactly that column pair.
-    -- Named explicitly because migration 053 looks it up by name.
+    -- Named explicitly because migration 058 looks it up by name.
     CONSTRAINT documents_id_vault_id_key UNIQUE (id, vault_id)
 );
 
@@ -460,7 +460,7 @@ CREATE TABLE IF NOT EXISTS publications (
     -- The published document, when the publication has one.
     --
     -- NULLABLE, and that is not a placeholder for future tightening: rows
-    -- that predate migration 053 are bound only if the binding is
+    -- that predate migration 058 are bound only if the binding is
     -- unambiguous, so "every document publication has a document_id" is a
     -- property of rows created after the publish path started recording it,
     -- not a schema invariant. table_query and file publications leave it
@@ -528,7 +528,7 @@ END $$;
 --
 -- Guarded on the column, and that guard is load-bearing. This file is
 -- re-executed IN FULL on every boot, BEFORE any migration runs. On a database
--- that has not reached migration 053 yet, the CREATE TABLE above is inert (the
+-- that has not reached migration 058 yet, the CREATE TABLE above is inert (the
 -- table exists) so `document_id` is absent — and a bare CREATE INDEX on it
 -- raises UndefinedColumn, which aborts init.sql and means the migration that
 -- would have added the column never runs. Every boot, forever. Any future

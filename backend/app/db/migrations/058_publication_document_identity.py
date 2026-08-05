@@ -1,4 +1,4 @@
-"""Migration 053: give document publications a database-enforced identity.
+"""Migration 058: give document publications a database-enforced identity.
 
 What this adds
 --------------
@@ -176,7 +176,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from app.db.postgres import close_pool, get_pool, init_db
 from app.services.uri_service import parse_uri
 
-logger = logging.getLogger("akb.migration.053")
+logger = logging.getLogger("akb.migration.058")
 
 _DOC_UNIQUE = "documents_id_vault_id_key"
 _PUB_FK = "publications_document_fk"
@@ -334,10 +334,10 @@ async def _already_correct(
         definition = await _constraint_def(conn, table, name)
         raise RuntimeError(
             f"{table} already has a constraint named {name}, but it is not the "
-            "one migration 053 installs.\n"
+            "one migration 058 installs.\n"
             f"  found:    {definition}\n"
             f"  expected: {ddl}\n"
-            "Migration 053 will not silently accept it — inspect the constraint, "
+            "Migration 058 will not silently accept it — inspect the constraint, "
             "then drop or rename it and re-run."
         )
     return True
@@ -393,7 +393,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
             )
             raise RuntimeError(
                 f"The name {_DOC_UNIQUE} is already taken in schema public by "
-                f"{what}, not by an index on documents. Migration 053 needs that "
+                f"{what}, not by an index on documents. Migration 058 needs that "
                 "name for the documents identity constraint — rename or drop the "
                 "other object and re-run. Nothing has been changed."
             )
@@ -413,14 +413,14 @@ async def _ensure_documents_identity_unique(conn) -> None:
                 f"An index named {_DOC_UNIQUE} already exists on documents but is "
                 "not a plain UNIQUE index on exactly (id, vault_id).\n"
                 f"  found: {definition}\n"
-                "Migration 053 will not repurpose it — inspect it, then either "
+                "Migration 058 will not repurpose it — inspect it, then either "
                 "drop it or add the constraint by hand."
             )
         if existing["is_valid"]:
             # Adopt it: the constraint takes the index's name and no rebuild
             # happens. This is the out-of-band build path documented above.
             logger.info(
-                "Migration 053: adopting the pre-existing valid index %s as the "
+                "Migration 058: adopting the pre-existing valid index %s as the "
                 "documents identity constraint (no rebuild)", _DOC_UNIQUE,
             )
             await conn.execute(
@@ -439,7 +439,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
         # transaction at all. All to avoid a brief lock while removing an
         # index that is invalid, and therefore in use by nothing.
         logger.warning(
-            "Migration 053: found an INVALID index named %s (a cancelled "
+            "Migration 058: found an INVALID index named %s (a cancelled "
             "CREATE INDEX CONCURRENTLY leaves one behind); dropping it before "
             "building the constraint", _DOC_UNIQUE,
         )
@@ -452,7 +452,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
     # as "blocked on a lock" — which is not what happened. This line is then
     # the last thing in the log before the stall, and it carries the remedy.
     logger.info(
-        "Migration 053: building %s on documents (id, vault_id). This holds "
+        "Migration 058: building %s on documents (id, vault_id). This holds "
         "ACCESS EXCLUSIVE on documents for the duration of an index build. If "
         "it is cancelled at the 30s statement timeout and the migration keeps "
         "retrying, build the index out of band and re-run — this migration "
@@ -463,7 +463,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
     await conn.execute(
         f"ALTER TABLE documents ADD CONSTRAINT {_DOC_UNIQUE} {_DOC_UNIQUE_DDL}"
     )
-    logger.info("Migration 053: added %s on documents (id, vault_id)", _DOC_UNIQUE)
+    logger.info("Migration 058: added %s on documents (id, vault_id)", _DOC_UNIQUE)
 
 
 async def _ensure_publication_identity(conn) -> None:
@@ -494,7 +494,7 @@ async def _ensure_publication_identity(conn) -> None:
     async with conn.transaction():
         if not have_column:
             await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
-            logger.info("Migration 053: added publications.document_id (nullable)")
+            logger.info("Migration 058: added publications.document_id (nullable)")
         if not have_fk:
             try:
                 await conn.execute(
@@ -502,7 +502,7 @@ async def _ensure_publication_identity(conn) -> None:
                 )
             except asyncpg.ForeignKeyViolationError as e:
                 raise RuntimeError(
-                    "Migration 053 cannot add the publication identity constraint: "
+                    "Migration 058 cannot add the publication identity constraint: "
                     "publications already holds a document_id that does not name a "
                     "document in that publication's own vault. Nothing here will "
                     "delete or blank those rows — that is a decision for a human. "
@@ -514,7 +514,7 @@ async def _ensure_publication_identity(conn) -> None:
                     f"underlying error: {e}"
                 ) from e
             logger.info(
-                "Migration 053: added %s — (document_id, vault_id) → "
+                "Migration 058: added %s — (document_id, vault_id) → "
                 "documents (id, vault_id) ON DELETE CASCADE", _PUB_FK,
             )
 
@@ -556,13 +556,13 @@ async def _ensure_publication_document_index(conn) -> None:
         ):
             raise RuntimeError(
                 f"An index named {_PUB_INDEX} already exists but is not the "
-                f"cascade index migration 053 creates.\n  found: {found['definition']}\n"
+                f"cascade index migration 058 creates.\n  found: {found['definition']}\n"
                 "Inspect it, then drop or rename it and re-run."
             )
         if found["is_valid"]:
             return
         logger.warning(
-            "Migration 053: found an INVALID index named %s; dropping it before "
+            "Migration 058: found an INVALID index named %s; dropping it before "
             "rebuilding", _PUB_INDEX,
         )
         await conn.execute(f"DROP INDEX IF EXISTS public.{_PUB_INDEX}")
@@ -574,7 +574,7 @@ async def _ensure_publication_document_index(conn) -> None:
     # during the documents index build and a run that died entering the
     # backfill leave identical logs.
     logger.info(
-        "Migration 053: created %s — the cascade's lookup path on the "
+        "Migration 058: created %s — the cascade's lookup path on the "
         "referencing side", _PUB_INDEX,
     )
 
@@ -632,7 +632,7 @@ def _log_backfill_summary(counts: dict, mismatch_sample: list) -> None:
     very different databases.
     """
     logger.info(
-        "Migration 053 backfill: bound=%d, no_document=%d, path_reused=%d, "
+        "Migration 058 backfill: bound=%d, no_document=%d, path_reused=%d, "
         "unreadable_uri=%d, vault_mismatch=%d, changed_underfoot=%d, "
         "already_bound=%d, non_document_publications=%d (of %d document "
         "publications examined this run)",
@@ -646,7 +646,7 @@ def _log_backfill_summary(counts: dict, mismatch_sample: list) -> None:
         # URI names is not the vault the row belongs to. Ids only — enough to
         # pull the rows with a SELECT, without putting names or paths in a log.
         logger.warning(
-            "Migration 053: %d document publication(s) name a vault other than "
+            "Migration 058: %d document publication(s) name a vault other than "
             "their own and were left unbound. publication id(s): %s%s",
             counts["vault_mismatch"], ", ".join(str(i) for i in mismatch_sample),
             "" if counts["vault_mismatch"] <= _MISMATCH_SAMPLE
@@ -658,7 +658,7 @@ def _log_backfill_summary(counts: dict, mismatch_sample: list) -> None:
     )
     if unbound:
         logger.warning(
-            "Migration 053: %d document publication(s) left unbound "
+            "Migration 058: %d document publication(s) left unbound "
             "(no_document=%d, path_reused=%d, unreadable_uri=%d, "
             "changed_underfoot=%d). They keep working through resource_uri; "
             "document_id stays NULL until they are re-published.",

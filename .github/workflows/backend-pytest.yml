@@ -159,7 +159,7 @@ jobs:
         # one path, and a row the product will not produce — nothing a mock
         # can stand in for.
         #
-        # Migration 053's whole product is a database guarantee — a composite
+        # Migration 058's whole product is a database guarantee — a composite
         # FK with ON DELETE CASCADE — so its tests issue raw SQL that bypasses
         # every application-level defence. There is nothing for a mock to
         # stand in for: the assertions are what PostgreSQL does with a DELETE
@@ -179,7 +179,7 @@ jobs:
           tests/test_pgvector_ext_bootstrap_e2e.py
           tests/test_migration_037_upgrade_unit.py
           tests/test_migration_050_drop_todos_unit.py
-          tests/test_migration_053_publication_identity_unit.py
+          tests/test_migration_058_publication_identity_unit.py
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
           tests/concurrency/test_native_ledger_b_core.py

@@ -234,7 +234,7 @@ async def _mismatch(pool, vaults, path: str) -> tuple[str, str]:
     another vault is refused by PostgreSQL, because `far`'s document is not in
     `home`. So a bound row simply cannot reach the mismatched state below.
     What can is a row whose `document_id` is NULL — a publication predating
-    migration 053 that the backfill could not bind unambiguously, which is
+    migration 058 that the backfill could not bind unambiguously, which is
     exempt from the FK. Clearing the column is how this manufactures one, and
     those legacy rows are exactly the population the read-side vault binding
     still has to refuse. It stops being reachable at all once the last NULL
@@ -513,7 +513,7 @@ async def test_oembed_follows_the_document_not_the_stale_path(pool, vaults, path
 
 # ── The legacy branch still works, and is still vault-scoped ─────
 #
-# `document_id` is nullable: rows predating migration 053 that the backfill
+# `document_id` is nullable: rows predating migration 058 that the backfill
 # could not bind unambiguously are exempt from the FK and carry NULL. For
 # those the URI is still the only handle, so the path branch has to keep
 # working — and keep its vault-name cross-check, which is what the two

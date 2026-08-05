@@ -304,7 +304,7 @@ class CollectionService:
                 # concurrent writers across the entire vault.
 
                 # The row delete goes through the repository chokepoint, which
-                # carries the publication cascade with it. Migration 053's FK
+                # carries the publication cascade with it. Migration 058's FK
                 # cascades only publications that carry a `document_id`, so a
                 # legacy row the backfill left NULL still needs the explicit
                 # cleanup — and this loop, deleting the rows by hand, is where that was

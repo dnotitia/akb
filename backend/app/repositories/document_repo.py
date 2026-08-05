@@ -361,7 +361,7 @@ class DocumentRepository:
         to it. Returns True when a row was actually removed.
 
         **This is the only place an ordinary document row may be deleted.**
-        Migration 053 restored a database cascade, but only for publications
+        Migration 058 restored a database cascade, but only for publications
         that carry a ``document_id``; the column is nullable and rows the
         backfill could not bind unambiguously are exempt from the FK. For
         those, nothing cascades: a delete that skips the publication cleanup

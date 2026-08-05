@@ -774,7 +774,7 @@ async def assert_no_orphan_publication_for_document(
     (409) when ``path``'s canonical URI already carries a publication and no
     document occupies the path.
 
-    **Why a write has to care about publications at all.** Migration 053
+    **Why a write has to care about publications at all.** Migration 058
     gave document publications a ``document_id`` under a composite FK with
     ``ON DELETE CASCADE``, and every publication created since carries one —
     those rows cannot outlive their document, with no code involved. But the
@@ -1144,7 +1144,7 @@ async def resolve_document_publication(publication: dict) -> dict:
         raise PublicationError("Not a document publication", status_code=400)
 
     # **Which document this slug serves is decided by `document_id`.** Since
-    # migration 053 that column is the publication's binding to its document,
+    # migration 058 that column is the publication's binding to its document,
     # under a composite FK (document_id, vault_id) → documents(id, vault_id),
     # so a bound row names one document and that document is in the
     # publication's own vault. Reading it here is the point of having it:
@@ -1197,7 +1197,7 @@ async def resolve_document_publication(publication: dict) -> dict:
             -- whose URI drifted into a 404 instead of resolving it to the
             -- document its publisher chose.
             --
-            -- The path branch is for rows the migration-053 backfill could
+            -- The path branch is for rows the migration-058 backfill could
             -- not bind (document_id IS NULL), where the URI is still the
             -- only handle. There `v.name = $4` remains the cross-check, not
             -- the lookup key: v is joined on the pinned vault_id, so a row

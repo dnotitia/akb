@@ -1088,7 +1088,7 @@ async def oembed(url: str, format: str = "json"):
         title: str | None = "Protected AKB publication"
     else:
         # Resolve a useful title. Documents are found by `publications.
-        # document_id` (migration 053); the URI is parsed only for the file
+        # document_id` (migration 058); the URI is parsed only for the file
         # branch and for the legacy rows that column could not be backfilled
         # for. An unfurl that titled the card from whatever now occupies the
         # published path would name a document nobody published.

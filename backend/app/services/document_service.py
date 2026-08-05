@@ -245,13 +245,13 @@ def _certified_content_hash(md_content: str) -> str:
 # Newest publication slug for one document — the reverse of publication
 # resolution, and the query behind `is_public` / `public_slug`.
 #
-# Keyed on `publications.document_id`, which since migration 053 is the
+# Keyed on `publications.document_id`, which since migration 058 is the
 # binding for a document publication: a UUID under a composite
 # FK (document_id, vault_id) → documents(id, vault_id). Matching that
 # cannot answer with a publication belonging to some other document, and
 # cannot answer with one belonging to some other vault.
 #
-# The `resource_uri` branch is a FALLBACK, and only for rows the 053
+# The `resource_uri` branch is a FALLBACK, and only for rows the 058
 # backfill could not bind unambiguously (`document_id IS NULL`). It is kept
 # on purpose: without it those publications would report `is_public: false`
 # on a document whose slug still serves its body — telling an author their
@@ -1169,7 +1169,7 @@ class DocumentService:
             # path-shaped `resource_uri` the API returns and the cleanup /
             # orphan-guard helpers match on — from going stale. Matching on
             # the old URI rather than on `document_id` is deliberate: it also
-            # catches rows the migration-053 backfill left with a NULL
+            # catches rows the migration-058 backfill left with a NULL
             # `document_id`, which are precisely the ones nothing else keeps
             # current.
             await conn.execute(
@@ -1472,9 +1472,9 @@ class DocumentService:
         )
         # The row delete and the publication cascade are ONE call. That
         # cascade used to be an inline DELETE here (between migrations 022
-        # and 053 publications had no `document_id`, so nothing cascaded),
+        # and 058 publications had no `document_id`, so nothing cascaded),
         # and the two OTHER per-row delete paths — the collection cascade's
-        # doc loop and the external-git tombstone — never got a copy. 053
+        # doc loop and the external-git tombstone — never got a copy. 058
         # restored a database cascade, but only for rows that carry a
         # `document_id`; rows it could not bind are still removed by this
         # call alone. With no single

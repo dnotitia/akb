@@ -20,7 +20,7 @@ After
         -- NULL                                              for table_query
     -- legacy document_id / file_id FK columns dropped.
 
-Migration 053 later re-introduces a `document_id` — not this one. It is an
+Migration 058 later re-introduces a `document_id` — not this one. It is an
 identity column with a composite (document_id, vault_id) FK, added alongside
 `resource_uri` rather than replacing it. `_already_applied` below is written
 so this migration cannot mistake that column for the one it removed.
@@ -98,10 +98,10 @@ async def _already_applied(conn) -> bool:
     """Applied ⇔ resource_uri exists and file_id is gone.
 
     `document_id` is deliberately NOT part of this test, even though this
-    migration drops a column by that name. Migration 053 adds a *different*
+    migration drops a column by that name. Migration 058 adds a *different*
     document_id — an identity column with a composite FK — and init.sql
     declares it, so on a fresh database this migration runs after a table
-    that already has one. Keying on document_id here would make 022 drop 053's
+    that already has one. Keying on document_id here would make 022 drop 058's
     column on every fresh boot, to be re-added seconds later; a run that
     stopped in between would leave the schema short a column that init.sql
     says is there.
@@ -114,7 +114,7 @@ async def _already_applied(conn) -> bool:
     The one state it reads differently is a hand-built one: resource_uri
     present, file_id gone, and a LEGACY single-column document_id still
     there. This migration is transactional, so no ordinary history produces
-    it. If it somehow exists, 053 will try to add its composite FK over
+    it. If it somehow exists, 058 will try to add its composite FK over
     whatever those legacy values are — and either every one of them names a
     document in the publication's own vault, in which case the pre-022
     bindings were right and are now enforced, or the constraint is refused

@@ -27,7 +27,7 @@ see Boundaries.
 
 ## What changes
 
-1. **A document identity column with a composite foreign key.** Migration 053
+1. **A document identity column with a composite foreign key.** Migration 058
    adds `publications.document_id`, a `UNIQUE (id, vault_id)` constraint on
    `documents` to serve as the reference target, and
 
