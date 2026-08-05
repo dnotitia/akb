@@ -70,7 +70,6 @@ CREDENTIAL_VARIABLES = (
     "AKB_E2E_WRITER_TOKEN",
     "AKB_E2E_FOREIGN_VAULT_ADMIN_TOKEN",
     "AKB_E2E_PRIMARY_APP_CREDENTIAL",
-    "AKB_E2E_PRIMARY_APP_TOKEN",
     "AKB_E2E_FOREIGN_APP_CREDENTIAL",
 )
 
@@ -786,12 +785,11 @@ async def _seed_app_lifecycle(
                         "conflict": primary_conflict_release,
                     },
                     "credential_env": CREDENTIAL_VARIABLES[5],
-                    "token_env": CREDENTIAL_VARIABLES[6],
                 },
                 "foreign": {
                     **foreign_app,
                     "releases": {"primary": foreign_release},
-                    "credential_env": CREDENTIAL_VARIABLES[7],
+                    "credential_env": CREDENTIAL_VARIABLES[6],
                 },
             },
             "vaults": {
@@ -877,12 +875,14 @@ async def _seed_app_lifecycle(
                 "app_status": {
                     "method": "GET",
                     "path": f"/api/v1/app/installations/{active_path}",
-                    "credential_env": CREDENTIAL_VARIABLES[6],
+                    "credential_env": CREDENTIAL_VARIABLES[5],
+                    "credential_exchange_task": "credential_exchange",
                 },
                 "foreign_app_status": {
                     "method": "GET",
                     "path": f"/api/v1/app/installations/{installations['foreign_active']['vault_id']}",
-                    "credential_env": CREDENTIAL_VARIABLES[7],
+                    "credential_env": CREDENTIAL_VARIABLES[6],
+                    "credential_exchange_task": "credential_exchange",
                 },
                 "credential_exchange": {
                     "method": "POST",
@@ -897,29 +897,11 @@ async def _seed_app_lifecycle(
             CREDENTIAL_VARIABLES[3]: writer_token,
             CREDENTIAL_VARIABLES[4]: foreign_token,
             CREDENTIAL_VARIABLES[5]: primary_credential,
-            CREDENTIAL_VARIABLES[7]: foreign_credential,
+            CREDENTIAL_VARIABLES[6]: foreign_credential,
         }
         return manifest, credentials
     finally:
         await connection.close()
-
-
-def _exchange_fixture_app_token(origin: str, credential: str) -> str:
-    request = Request(
-        f"{origin}/api/v1/auth/app-token",
-        data=json.dumps({"credential": credential}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=10) as response:  # nosec B310
-            payload = json.loads(response.read(65536))
-    except (HTTPError, OSError, URLError, ValueError) as exc:
-        raise RuntimeError("fixture app token exchange failed") from exc
-    access_token = payload.get("access_token") if isinstance(payload, dict) else None
-    if not isinstance(access_token, str) or not access_token:
-        raise RuntimeError("fixture app token exchange returned no token")
-    return access_token
 
 
 def seed_scenario(settings: RuntimeSettings) -> tuple[dict[str, object] | None, dict[str, str] | None]:
@@ -934,10 +916,6 @@ def seed_scenario(settings: RuntimeSettings) -> tuple[dict[str, object] | None, 
             origin=settings.origin,
             fixture_origin=settings.fixture_origin,
         )
-    )
-    credentials[CREDENTIAL_VARIABLES[6]] = _exchange_fixture_app_token(
-        settings.origin,
-        credentials[CREDENTIAL_VARIABLES[5]],
     )
     return manifest, credentials
 

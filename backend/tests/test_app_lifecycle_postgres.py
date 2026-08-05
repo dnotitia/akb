@@ -624,7 +624,6 @@ async def test_runtime_seed_passes_registry_triggers_and_rotates_runtime_artifac
         first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[5]],
         correlation_id="runtime-seed-proof",
     )
-    first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] = first_token["access_token"]
     e2e_runtime.write_fixture_artifacts(settings, first_manifest, first_credentials)
     e2e_runtime.write_ready_file(settings.ready_file, e2e_runtime.ready_payload(settings))
 
@@ -661,7 +660,7 @@ async def test_runtime_seed_passes_registry_triggers_and_rotates_runtime_artifac
         second_credentials[e2e_runtime.CREDENTIAL_VARIABLES[5]],
         correlation_id="runtime-reset-proof",
     )
-    second_credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] = second_token["access_token"]
+    assert isinstance(second_token["access_token"], str)
     e2e_runtime.write_fixture_artifacts(settings, second_manifest, second_credentials)
     e2e_runtime.write_ready_file(settings.ready_file, e2e_runtime.ready_payload(settings))
 

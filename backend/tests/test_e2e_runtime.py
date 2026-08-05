@@ -88,10 +88,10 @@ def test_app_lifecycle_credentials_use_project_neutral_names() -> None:
         "AKB_E2E_WRITER_TOKEN",
         "AKB_E2E_FOREIGN_VAULT_ADMIN_TOKEN",
         "AKB_E2E_PRIMARY_APP_CREDENTIAL",
-        "AKB_E2E_PRIMARY_APP_TOKEN",
         "AKB_E2E_FOREIGN_APP_CREDENTIAL",
     )
     assert all(name.startswith("AKB_E2E_") for name in e2e_runtime.CREDENTIAL_VARIABLES)
+    assert all(not name.endswith("_APP_TOKEN") for name in e2e_runtime.CREDENTIAL_VARIABLES)
 
 
 def test_empty_scenario_keeps_the_original_ready_and_reset_shapes(tmp_path: Path) -> None:
@@ -153,6 +153,8 @@ def test_fixture_artifacts_rotate_together_and_keep_credentials_private(tmp_path
     manifest_path, profile_path = e2e_runtime.fixture_artifact_paths(settings)
     assert json.loads(manifest_path.read_text())["namespace"] == "first"
     assert first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[1]] in profile_path.read_text()
+    profile_names = {line.split("=", 1)[0] for line in profile_path.read_text().splitlines()}
+    assert profile_names == set(e2e_runtime.CREDENTIAL_VARIABLES)
     assert os.stat(manifest_path).st_mode & 0o777 == 0o600
     assert os.stat(profile_path).st_mode & 0o777 == 0o600
 
@@ -185,17 +187,12 @@ def test_seed_scenario_rotates_app_lifecycle_artifacts_without_db_access(
         }
 
     monkeypatch.setattr(e2e_runtime, "_seed_app_lifecycle", fake_seed)
-    monkeypatch.setattr(
-        e2e_runtime,
-        "_exchange_fixture_app_token",
-        lambda _origin, _credential: "fixture-app-token",
-    )
     manifest, credentials = e2e_runtime.seed_scenario(settings)
 
     assert calls == [(e2e_runtime.DEFAULT_DATABASE_URL, settings.origin, settings.fixture_origin)]
     assert manifest == {"schema_version": 1, "scenario": "app_lifecycle"}
     assert credentials is not None
-    assert credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] == "fixture-app-token"
+    assert set(credentials) == set(e2e_runtime.CREDENTIAL_VARIABLES)
 
 
 def test_app_lifecycle_seed_is_transactional_and_manifest_is_redacted(
@@ -250,14 +247,10 @@ def test_app_lifecycle_seed_is_transactional_and_manifest_is_redacted(
     assert connection.closed is True
     assert len(connection.statements) >= 30
     assert manifest["scenario"] == e2e_runtime.APP_LIFECYCLE_SCENARIO
-    assert set(credentials) == (
-        set(e2e_runtime.CREDENTIAL_VARIABLES)
-        - {e2e_runtime.CREDENTIAL_VARIABLES[6]}
-    )
+    assert set(credentials) == set(e2e_runtime.CREDENTIAL_VARIABLES)
     assert all(
         credentials[name] not in serialized_manifest
         for name in e2e_runtime.CREDENTIAL_VARIABLES
-        if name != e2e_runtime.CREDENTIAL_VARIABLES[6]
     )
     for forbidden_field in (
         "credential_hash",
@@ -268,7 +261,11 @@ def test_app_lifecycle_seed_is_transactional_and_manifest_is_redacted(
     ):
         assert forbidden_field not in serialized_manifest
     assert manifest["actors"]["writer"]["token_env"] == e2e_runtime.CREDENTIAL_VARIABLES[3]  # type: ignore[index]
-    assert manifest["apps"]["primary"]["token_env"] == e2e_runtime.CREDENTIAL_VARIABLES[6]  # type: ignore[index]
+    assert manifest["apps"]["primary"]["credential_env"] == e2e_runtime.CREDENTIAL_VARIABLES[5]  # type: ignore[index]
+    assert "token_env" not in manifest["apps"]["primary"]  # type: ignore[operator]
+    assert manifest["apps"]["foreign"]["credential_env"] == e2e_runtime.CREDENTIAL_VARIABLES[6]  # type: ignore[index]
+    assert manifest["endpoint_tasks"]["app_status"]["credential_exchange_task"] == "credential_exchange"  # type: ignore[index]
+    assert manifest["endpoint_tasks"]["foreign_app_status"]["credential_exchange_task"] == "credential_exchange"  # type: ignore[index]
     assert len(manifest["installations"]) >= 7  # type: ignore[index]
 
 
