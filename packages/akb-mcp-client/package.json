@@ -1,10 +1,13 @@
 {
   "name": "akb-mcp",
-  "version": "2.0.4",
+  "version": "2.1.0",
   "mcpName": "io.github.dnotitia/akb",
   "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
   "bin": {
     "akb-mcp": "./bin/akb-mcp.mjs"
+  },
+  "scripts": {
+    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs"
   },
   "type": "module",
   "files": ["bin/", "lib/", "CHANGELOG.md"],

@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.1.0 — survive backend/VPN outages without a session restart
+
+Resilience fix for the failure mode where a long VPN/backend outage
+silently drops the AKB server from a client's tool namespace for the rest
+of the session.
+
+**Root cause**: `initialize` used to round-trip to the backend. If the
+backend was unreachable at handshake time (VPN down at startup), the
+handshake failed and the MCP client dropped the whole server for the
+session — so even after connectivity returned, `mcp__akb__*` tools stayed
+gone until the client/session was restarted. The proxy process itself was
+alive the whole time; the coupling of *client-visible liveness* to
+*backend reachability* was the bug.
+
+**What changed** — client-visible liveness is now decoupled from backend
+reachability:
+
+- **`initialize` is answered locally.** The server always registers, even
+  with the backend down. It echoes the client's protocol version and
+  advertises `tools.listChanged`.
+- **`tools/list` degrades gracefully.** With the backend unreachable and
+  nothing cached, it serves the local file tools only (a valid, if partial,
+  response) instead of erroring. The backend tool list is cached on first
+  success and served thereafter.
+- **A background reconnect monitor** re-establishes the backend session
+  with exponential backoff (1s → 30s cap), effectively forever while the
+  client stays connected. On recovery from a degraded list it pushes
+  `notifications/tools/list_changed`, so the full toolset reappears
+  **without a session restart**.
+- **Tool calls never kill the proxy.** A connection error marks the backend
+  not-ready, kicks the monitor, and retries; a persistent outage surfaces a
+  normal JSON-RPC error for that one call rather than tearing anything down.
+- **A short connect-phase timeout** (`AKB_MCP_CONNECT_TIMEOUT_MS`, default
+  10s) detects a blackholed connection quickly, separate from the generous
+  5-min response timeout kept for legitimately slow operations
+  (`akb_delete_vault` on large vaults).
+
+No changes to tool behavior, auth, or the file-transfer path. Fully
+backward compatible.
+
+**Known limitation**: if the backend goes silent mid-session on an already
+*established* keep-alive socket (no RST), the *first* in-flight tool call
+can wait up to the response timeout before the retry/monitor kick in;
+subsequent calls fail fast because the monitor has flipped the ready flag.
+
 ## 2.0.4 — MCP Registry: add `mcpName`
 
 No code change. Adds `"mcpName": "io.github.dnotitia/akb"` to
