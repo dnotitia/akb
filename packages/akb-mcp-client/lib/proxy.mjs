@@ -216,6 +216,16 @@ const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
 // Tools where proxy injects a `file` param as alternative to `content`
 const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 
+// Kept in sync with package.json `version`. Reported to the client in the
+// local `initialize` response, so it must not silently drift on a proxy
+// behaviour change. There is no import of package.json here to keep lib/
+// zero-dependency and load-safe across Node versions.
+const PROXY_VERSION = "2.1.0";
+
+// Fallback MCP protocol version echoed to the client when its `initialize`
+// request omits one. We otherwise echo the client's requested version.
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
 export class AKBProxy {
   constructor({ url, pat, insecure = false }) {
     this.url = new URL(url);
@@ -224,6 +234,31 @@ export class AKBProxy {
     this.sessionId = null;
     this.msgId = 0;
     this._initialized = false;
+    // ── Backend-liveness state (decoupled from client liveness) ──────
+    // The client's view of this server must NOT depend on backend
+    // reachability: a stdio MCP server that fails `initialize` is dropped
+    // by the client for the whole session (the VPN-down-at-startup bug).
+    // So we answer `initialize` locally and manage the backend session
+    // out of band via a background monitor.
+    this._clientInitParams = null; // client initialize params, replayed to backend
+    this._backendReady = false; // backend MCP session established
+    this._connecting = null; // in-flight backend-connect promise (single-flight lock)
+    this._cachedTools = null; // last successful backend tools/list result (raw)
+    this._servedDegraded = false; // client was handed a fallback (file-tools-only) list
+    this._monitorRunning = false; // background reconnect monitor active
+    this._closed = false; // stdin closed / shutting down
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Short timeout for backend liveness probes (initialize / tools-list) so
+  // the reconnect monitor cycles quickly and a single tool call fails fast
+  // when the backend is unreachable, instead of blocking on the generous
+  // per-request timeout used for legitimately slow operations.
+  _probeTimeoutMs() {
+    return Number(process.env.AKB_MCP_CONNECT_TIMEOUT_MS) || 10000;
   }
 
   async start() {
@@ -250,6 +285,9 @@ export class AKBProxy {
         this._writeError(msg.id, -32603, err.message);
       }
     }
+    // stdin closed → client disconnected. Stop the background monitor so
+    // the process can exit cleanly instead of looping forever.
+    this._closed = true;
   }
 
   async _handle(msg) {
@@ -307,29 +345,88 @@ export class AKBProxy {
   }
 
   async _initialize(id, params) {
-    const resp = await this._rpc("initialize", params);
+    // Answer the handshake LOCALLY — never round-trip to the backend here.
+    // This is the crux of the reconnect fix: the client considers this MCP
+    // server initialized (and keeps it registered for the whole session)
+    // regardless of whether the backend is reachable right now. If the VPN
+    // is down at startup, the server still registers; tools recover once
+    // connectivity returns (see the monitor + tools/list_changed path).
+    this._clientInitParams = params || null;
     this._initialized = true;
-    return { jsonrpc: "2.0", id, result: resp };
+    // Kick off the backend session + tool prefetch in the background.
+    this._startBackendMonitor();
+
+    const protocolVersion =
+      (params && typeof params.protocolVersion === "string" && params.protocolVersion) ||
+      MCP_PROTOCOL_VERSION;
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion,
+        // Advertise listChanged so we can push the real toolset after a
+        // degraded (backend-unreachable) tools/list is recovered.
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "akb-mcp", version: PROXY_VERSION },
+      },
+    };
+  }
+
+  // Decorate a raw backend tools/list result with the proxy-local file
+  // tools and the injected `file` param. Never mutates the cached result.
+  _decorateTools(resp) {
+    const tools = (resp.tools || []).map((t) => {
+      if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
+        return {
+          ...t,
+          inputSchema: {
+            ...t.inputSchema,
+            properties: {
+              ...t.inputSchema.properties,
+              file: {
+                type: "string",
+                description:
+                  "Local file path to read as document body (alternative to content). " +
+                  "Provide either file or content, not both.",
+              },
+            },
+          },
+        };
+      }
+      return { ...t };
+    });
+    tools.push(...FILE_TOOLS);
+    return { ...resp, tools };
   }
 
   async _toolsList(id, params) {
-    const resp = await this._rpc("tools/list", params || {});
-    const tools = resp.tools || [];
-
-    // Inject `file` param into tools that support local file → content resolution
-    for (const tool of tools) {
-      if (FILE_CONTENT_TOOLS.has(tool.name) && tool.inputSchema?.properties) {
-        tool.inputSchema.properties.file = {
-          type: "string",
-          description:
-            "Local file path to read as document body (alternative to content). " +
-            "Provide either file or content, not both.",
-        };
+    // Serve a live or cached backend tool list. If the backend is
+    // unreachable and nothing is cached, degrade to the local file tools
+    // only — a valid (partial) response the client can register — and mark
+    // the list stale so the monitor re-lists it on recovery. Never error
+    // the whole tools/list on backend unreachability.
+    let resp = this._cachedTools;
+    if (!resp) {
+      const ok = await this._ensureBackend();
+      if (ok) {
+        try {
+          resp = await this._syncTools();
+        } catch {
+          resp = null;
+        }
       }
     }
 
-    tools.push(...FILE_TOOLS);
-    return { jsonrpc: "2.0", id, result: { ...resp, tools } };
+    if (!resp) {
+      this._servedDegraded = true;
+      this._startBackendMonitor();
+      process.stderr.write(
+        "[akb-mcp] backend unreachable — serving file tools only; will re-list on recovery\n",
+      );
+      return { jsonrpc: "2.0", id, result: { tools: [...FILE_TOOLS] } };
+    }
+
+    return { jsonrpc: "2.0", id, result: this._decorateTools(resp) };
   }
 
   // ── File-to-content resolution ─────────────────────────
@@ -621,7 +718,7 @@ export class AKBProxy {
 
   // ── AKB HTTP helper ───────────────────────────────────────
 
-  _http(method, path, body = null, extraHeaders = {}) {
+  _http(method, path, body = null, extraHeaders = {}, opts = {}) {
     return new Promise((resolve, reject) => {
       const isHttps = this.url.protocol === "https:";
       const doRequest = isHttps ? httpsRequest : httpRequest;
@@ -647,7 +744,22 @@ export class AKBProxy {
       };
       if (isHttps && this.insecure) opts.rejectUnauthorized = false;
 
+      // Connect-phase timeout, separate from the (long) response timeout.
+      // A VPN blackhole leaves a brand-new socket stuck in `connecting`;
+      // without this the request would hang until the 5-min response
+      // timeout. We only arm it for sockets still connecting — reused
+      // keep-alive sockets are already established.
+      let connectTimer = null;
+      const connectMs = this._probeTimeoutMs();
+      const clearConnectTimer = () => {
+        if (connectTimer) {
+          clearTimeout(connectTimer);
+          connectTimer = null;
+        }
+      };
+
       const req = doRequest(opts, (res) => {
+        clearConnectTimer();
         let data = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => (data += chunk));
@@ -660,17 +772,117 @@ export class AKBProxy {
         });
       });
 
-      req.on("error", reject);
+      req.on("socket", (socket) => {
+        if (socket.connecting) {
+          connectTimer = setTimeout(() => {
+            req.destroy(new Error(`Connect timeout (${Math.round(connectMs / 1000)}s)`));
+          }, connectMs);
+          socket.once("connect", clearConnectTimer);
+        }
+      });
+
+      req.on("error", (err) => {
+        clearConnectTimer();
+        reject(err);
+      });
       // Default 5 min — destructive ops like `akb_delete_vault` on
       // large vaults (7K+ docs) take well over 30s for the backend
       // cascade (chunks + vector outbox + git cleanup). Hardcoding
       // 30s caused the client to abort while the backend continued
       // processing, leaving the operator with a misleading timeout
-      // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`.
-      const reqTimeoutMs = Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
+      // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`, or per-call via
+      // `opts.timeoutMs` (liveness probes use the short probe timeout).
+      const reqTimeoutMs =
+        opts.timeoutMs || Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
       req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout (${Math.round(reqTimeoutMs / 1000)}s)`)));
       if (body) req.write(body);
       req.end();
+    });
+  }
+
+  // ── Backend session + reconnect monitor ───────────────────
+
+  // A connection/session failure that a background reconnect can recover
+  // from — as opposed to a genuine application error we must surface.
+  _isConnError(message) {
+    return /session|404|ECONNREFUSED|ECONNRESET|socket hang up|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENOTFOUND|EPIPE|timeout|unreachable/i.test(
+      message || "",
+    );
+  }
+
+  // Establish the backend MCP session (the `initialize` handshake that
+  // yields an mcp-session-id) if not already up. Single-flight: concurrent
+  // callers share one in-flight attempt. Returns true on success, false on
+  // failure — never throws — so callers can degrade gracefully.
+  async _ensureBackend() {
+    if (this._backendReady) return true;
+    if (this._connecting) return this._connecting;
+    this._connecting = (async () => {
+      try {
+        const initParams = this._clientInitParams || {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "akb-mcp-client", version: PROXY_VERSION },
+        };
+        await this._rpc("initialize", initParams, { timeoutMs: this._probeTimeoutMs() });
+        this._backendReady = true;
+        return true;
+      } catch {
+        this._backendReady = false;
+        return false;
+      } finally {
+        this._connecting = null;
+      }
+    })();
+    return this._connecting;
+  }
+
+  // Fetch and cache the backend tool list. Caller is responsible for having
+  // an established session. Uses the short probe timeout.
+  async _syncTools() {
+    const resp = await this._rpc("tools/list", {}, { timeoutMs: this._probeTimeoutMs() });
+    this._cachedTools = resp;
+    return resp;
+  }
+
+  // Background loop that keeps trying to (re)establish the backend session
+  // with exponential backoff — effectively forever while the client is
+  // connected. On (re)connect it refreshes the tool cache and, if the
+  // client was previously handed a degraded list, pushes a
+  // tools/list_changed notification so the full toolset reappears WITHOUT a
+  // session restart. Idempotent: at most one loop runs at a time.
+  _startBackendMonitor() {
+    if (this._monitorRunning || this._closed) return;
+    this._monitorRunning = true;
+
+    const loop = async () => {
+      let delay = 1000;
+      const maxDelay = 30000;
+      while (!this._closed) {
+        const ok = await this._ensureBackend();
+        if (ok) {
+          try {
+            await this._syncTools();
+            if (this._servedDegraded) {
+              this._servedDegraded = false;
+              this._notify("notifications/tools/list_changed", {});
+              process.stderr.write("[akb-mcp] backend recovered — re-listing tools\n");
+            }
+            break; // connected + synced; idle until a forward detects a drop
+          } catch {
+            // initialize succeeded but tools/list failed — treat as not
+            // ready and keep retrying.
+            this._backendReady = false;
+          }
+        }
+        await this._sleep(delay);
+        delay = Math.min(maxDelay, delay * 2);
+      }
+      this._monitorRunning = false;
+    };
+
+    loop().catch(() => {
+      this._monitorRunning = false;
     });
   }
 
@@ -681,37 +893,26 @@ export class AKBProxy {
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
+        if (!this._backendReady) {
+          const ok = await this._ensureBackend();
+          if (!ok) throw new Error("backend unreachable");
+        }
         const resp = await this._rpc(msg.method, msg.params || {});
         return { jsonrpc: "2.0", id: msg.id, result: resp };
       } catch (err) {
-        const isSessionError =
-          err.message.includes("session") ||
-          err.message.includes("Session") ||
-          err.message.includes("404") ||
-          err.message.includes("ECONNREFUSED") ||
-          err.message.includes("ECONNRESET") ||
-          err.message.includes("socket hang up");
-
-        if (isSessionError && attempt < maxRetries) {
-          process.stderr.write(
-            `[akb-mcp] Connection lost, reconnecting (attempt ${attempt + 1})...\n`
-          );
+        if (this._isConnError(err.message)) {
+          // Drop the dead session and let the background monitor restore
+          // it. The proxy process and the client-visible server stay
+          // alive, so calls recover once connectivity returns.
+          this._backendReady = false;
           this.sessionId = null;
-          this._initialized = false;
+          this._startBackendMonitor();
 
-          try {
-            await this._rpc("initialize", {
-              protocolVersion: "2025-03-26",
-              capabilities: {},
-              clientInfo: { name: "akb-mcp-client", version: "2.0.0" },
-            });
-            this._initialized = true;
-            process.stderr.write("[akb-mcp] Reconnected.\n");
-            continue;
-          } catch (reconnectErr) {
+          if (attempt < maxRetries) {
             process.stderr.write(
-              `[akb-mcp] Reconnect failed: ${reconnectErr.message}\n`
+              `[akb-mcp] backend unreachable, retrying (attempt ${attempt + 1})...\n`,
             );
+            continue;
           }
         }
         throw err;
@@ -719,7 +920,7 @@ export class AKBProxy {
     }
   }
 
-  async _rpc(method, params) {
+  async _rpc(method, params, rpcOpts = {}) {
     this.msgId++;
     const body = JSON.stringify({
       jsonrpc: "2.0",
@@ -737,7 +938,13 @@ export class AKBProxy {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    const resp = await this._http("POST", this.url.pathname, Buffer.from(body), headers);
+    const resp = await this._http(
+      "POST",
+      this.url.pathname,
+      Buffer.from(body),
+      headers,
+      { timeoutMs: rpcOpts.timeoutMs },
+    );
 
     if (resp.headers["mcp-session-id"]) {
       this.sessionId = resp.headers["mcp-session-id"];
@@ -761,6 +968,12 @@ export class AKBProxy {
 
   _write(obj) {
     process.stdout.write(JSON.stringify(obj) + "\n");
+  }
+
+  // Emit a JSON-RPC notification (no id) to the client. Used for
+  // notifications/tools/list_changed after a backend recovery.
+  _notify(method, params) {
+    this._write({ jsonrpc: "2.0", method, params: params || {} });
   }
 
   _writeError(id, code, message) {
