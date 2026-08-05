@@ -212,7 +212,7 @@ async def _publication_row(pool, slug: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def _publish_mirrored(mirror, path: str) -> str:
+async def _publish_mirrored(pool, mirror, path: str) -> str:
     """Publish a mirrored document.
 
     Deliberately `create_publication` and not the REST/MCP surface: publishing
@@ -220,12 +220,18 @@ async def _publish_mirrored(mirror, path: str) -> str:
     user (invariant 1, pinned below). The service function has no mirror check,
     which is exactly why the cascade has to be correct anyway — this is the one
     seam through which a mirror publication could ever exist.
+
+    The document's id is read back and passed: a document publication is bound
+    by `document_id`, and `create_publication` refuses one without it.
     """
     from app.services.publication_service import create_publication
+    row = await _doc_row(pool, mirror.vault_id, path)
+    assert row is not None, f"no mirrored document at {path!r} to publish"
     pub = await create_publication(
         vault_id=mirror.vault_id,
         resource_type="document",
         resource_uri=doc_uri(mirror.name, path),
+        document_id=row["id"],
         title="Q3 (public)",
     )
     return pub["slug"]
@@ -287,7 +293,7 @@ async def test_upstream_delete_takes_the_publication_with_the_document(
         f"the row at {_MIRRORED_PATH} did not come from the mirror import: {indexed}"
     )
 
-    slug = await _publish_mirrored(mirror, _MIRRORED_PATH)
+    slug = await _publish_mirrored(pool, mirror, _MIRRORED_PATH)
 
     # The link is genuinely live before the delete — if it were not, the
     # assertions after the delete would prove nothing.
@@ -349,7 +355,7 @@ async def test_an_upstream_revert_cannot_resurrect_the_old_slug(
     assert first["added"] == 1, first
     before = await _doc_row(pool, mirror.vault_id, _MIRRORED_PATH)
     assert before is not None
-    slug = await _publish_mirrored(mirror, _MIRRORED_PATH)
+    slug = await _publish_mirrored(pool, mirror, _MIRRORED_PATH)
 
     mirror.fixture.remove_path(mirror.repo_name, _MIRRORED_PATH)
     second = await mirror.svc.reconcile(mirror.vault_id, mirror.name)
@@ -384,8 +390,8 @@ async def test_an_untouched_publication_survives_an_unrelated_upstream_delete(
         files={_MIRRORED_PATH: _MIRRORED_BODY, other: "# Q2\n\nStill here.\n"},
     )
     await mirror.svc.reconcile(mirror.vault_id, mirror.name)
-    keep_slug = await _publish_mirrored(mirror, other)
-    drop_slug = await _publish_mirrored(mirror, _MIRRORED_PATH)
+    keep_slug = await _publish_mirrored(pool, mirror, other)
+    drop_slug = await _publish_mirrored(pool, mirror, _MIRRORED_PATH)
 
     mirror.fixture.remove_path(mirror.repo_name, _MIRRORED_PATH)
     result = await mirror.svc.reconcile(mirror.vault_id, mirror.name)

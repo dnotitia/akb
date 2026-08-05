@@ -33,6 +33,7 @@ from app.services.document_service import (
     _certified_content_hash,
     _compose_markdown,
     _parse_markdown,
+    newest_public_slug,
 )
 from app.services.native_revision_service import NativeRevisionService, NativeRevisionSnapshot
 from app.services.resource_hash import HASH_ALGORITHM
@@ -167,17 +168,27 @@ class NativeDocumentService(DocumentService):
             )
 
     async def _public_slug(self, vault: str, path: str) -> str | None:
+        """Newest publication slug for the document at ``path``, or None.
+
+        Shares one query with the legacy arm (``newest_public_slug``) instead
+        of keeping a second copy — the two copies had drifted into the same
+        defect, a ``resource_uri`` match with no ``vault_id`` predicate, which
+        told a reader that another vault carries a publication for the same
+        path and handed over its slug.
+
+        ``document_id=None`` is passed deliberately. This arm does not write
+        the legacy ``documents`` projection, so there is no id to name here;
+        the vault-scoped ``resource_uri`` fallback is what answers, and it is
+        scoped either way.
+        """
+        vault_id = await self._vault_id(vault)
         pool = await self._pool()
         async with pool.acquire() as conn:
-            return await conn.fetchval(
-                """
-                SELECT slug
-                  FROM publications
-                 WHERE resource_uri = $1 AND resource_type = 'document'
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                doc_uri(vault, path),
+            return await newest_public_slug(
+                conn,
+                vault_id=vault_id,
+                document_id=None,
+                resource_uri=doc_uri(vault, path),
             )
 
     async def _response(

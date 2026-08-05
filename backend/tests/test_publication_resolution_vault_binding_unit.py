@@ -221,6 +221,19 @@ async def _mismatch(pool, vaults, path: str) -> tuple[str, str]:
     A document at `path` exists in BOTH vaults. The publication is created
     against `far` — so its URI names `far` — and then reassigned to `home`.
     Returns (slug, far_title).
+
+    **`document_id` is cleared first, and that is the whole story of which
+    rows this guard still protects.** A publication created today carries the
+    id of the document it was resolved from, under a composite
+    FK (document_id, vault_id) → documents(id, vault_id): moving the row to
+    another vault is refused by PostgreSQL, because `far`'s document is not in
+    `home`. So a bound row simply cannot reach the mismatched state below.
+    What can is a row whose `document_id` is NULL — a publication predating
+    migration 053 that the backfill could not bind unambiguously, which is
+    exempt from the FK. Clearing the column is how this manufactures one, and
+    those legacy rows are exactly the population the read-side vault binding
+    still has to refuse. It stops being reachable at all once the last NULL
+    is gone.
     """
     far_title = "Far vault original"
     await _create_doc(pool, vaults["far"], path, title=far_title)
@@ -228,7 +241,8 @@ async def _mismatch(pool, vaults, path: str) -> tuple[str, str]:
     slug = await _publish(vaults["far"]["name"], path)
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE publications SET vault_id = $1 WHERE slug = $2",
+            "UPDATE publications SET document_id = NULL, vault_id = $1 "
+            " WHERE slug = $2",
             vaults["home"]["id"], slug,
         )
     return slug, far_title
