@@ -392,6 +392,51 @@ def test_runtime_failure_diagnostic_is_phase_and_sqlstate_only() -> None:
     assert "credential-marker" not in diagnostic
 
 
+def test_reset_handler_reports_safe_failure_and_preserves_response_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeResetError(Exception):
+        sqlstate = "23514"
+        constraint_name = None
+        table_name = "installation_grants"
+        column_name = None
+
+    class FakeRuntime:
+        phase = "database_reset"
+        settings = e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+        )
+
+        def reset(self) -> None:
+            raise FakeResetError(
+                "credential-value-marker token-value-marker password-value-marker "
+                "database-url-marker sql-arg-marker"
+            )
+
+    handler = object.__new__(e2e_runtime._ControlHandler)
+    handler.path = "/__e2e/reset"
+    handler.runtime = FakeRuntime()
+    responses: list[tuple[int, dict[str, object]]] = []
+    handler._json = lambda status, payload: responses.append((status, dict(payload)))
+
+    handler.do_POST()
+
+    assert responses == [(500, {"status": "reset_failed"})]
+    diagnostic = capsys.readouterr().err
+    assert diagnostic == (
+        "e2e runtime failed phase=database_reset category=FakeResetError "
+        "source=postgres sqlstate=23514 table=installation_grants\n"
+    )
+    for marker in (
+        "credential-value-marker",
+        "token-value-marker",
+        "password-value-marker",
+        "database-url-marker",
+        "sql-arg-marker",
+    ):
+        assert marker not in diagnostic
+
+
 def test_database_reset_is_schema_neutral_and_does_not_embed_a_url() -> None:
     sql = e2e_runtime.render_database_reset_sql()
 

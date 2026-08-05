@@ -1532,7 +1532,11 @@ class _ControlHandler(BaseHTTPRequestHandler):
         if path == "/__e2e/reset":
             try:
                 self.runtime.reset()
-            except BaseException:
+            except BaseException as exc:
+                print(
+                    format_runtime_failure(self.runtime.phase, exc),
+                    file=sys.stderr,
+                )
                 self._json(500, {"status": "reset_failed"})
                 return
             self._json(200, reset_payload(self.runtime.settings))
