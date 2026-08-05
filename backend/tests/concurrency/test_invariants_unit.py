@@ -1190,14 +1190,10 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     did = uuid.uuid4()
     path = "reports/legacy.md"
     uri = f"akb://{vname}/coll/reports/doc/legacy.md"
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
-            "created_at, updated_at, current_commit, tags, metadata) VALUES "
-            "($1, $2, $3, 'Legacy', 'report', 'draft', NOW(), NOW(), 'cafef00d', "
-            "'{}'::text[], '{}'::jsonb)",
-            did, vid, path,
-        )
+    # Only the publication's NULL `document_id` below is load-bearing here —
+    # the document itself is ordinary, so it goes through the shared helper
+    # rather than a hand-written INSERT that would read as deliberate.
+    await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Legacy")
 
     doc_repo = DocumentRepository(pool)
     blocker = await asyncpg.connect(_DSN)

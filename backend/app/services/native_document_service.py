@@ -167,7 +167,9 @@ class NativeDocumentService(DocumentService):
                 created_by,
             )
 
-    async def _public_slug(self, vault: str, path: str) -> str | None:
+    async def _public_slug(
+        self, vault_id: uuid.UUID, vault: str, path: str
+    ) -> str | None:
         """Newest publication slug for the document at ``path``, or None.
 
         Shares one query with the legacy arm (``newest_public_slug``) instead
@@ -176,12 +178,15 @@ class NativeDocumentService(DocumentService):
         told a reader that another vault carries a publication for the same
         path and handed over its slug.
 
+        ``vault_id`` is passed in rather than resolved here: every caller has
+        already resolved it through ``_current``, and ``_vault_id`` is an
+        uncached pool checkout plus a query.
+
         ``document_id=None`` is passed deliberately. This arm does not write
         the legacy ``documents`` projection, so there is no id to name here;
         the vault-scoped ``resource_uri`` fallback is what answers, and it is
         scoped either way.
         """
-        vault_id = await self._vault_id(vault)
         pool = await self._pool()
         async with pool.acquire() as conn:
             return await newest_public_slug(
@@ -195,6 +200,7 @@ class NativeDocumentService(DocumentService):
         self,
         *,
         vault: str,
+        vault_id: uuid.UUID,
         current: NativeRevisionSnapshot,
         selected: NativeRevisionSnapshot | None = None,
     ) -> DocumentResponse:
@@ -202,7 +208,13 @@ class NativeDocumentService(DocumentService):
         current_fm, _ = _parse_markdown(current.text)
         _, selected_body = _parse_markdown(selected.text)
         created_by = current_fm.get("created_by")
-        public_slug = await self._public_slug(vault, current.path)
+        # Two independent single-row reads on separate connections; run them
+        # together rather than paying two serialized pool checkouts per
+        # document read.
+        public_slug, created_by_name = await asyncio.gather(
+            self._public_slug(vault_id, vault, current.path),
+            self._created_by_name(created_by),
+        )
         return DocumentResponse(
             uri=doc_uri(vault, current.path),
             vault=vault,
@@ -213,7 +225,7 @@ class NativeDocumentService(DocumentService):
             summary=current_fm.get("summary"),
             domain=current_fm.get("domain"),
             created_by=created_by,
-            created_by_name=await self._created_by_name(created_by),
+            created_by_name=created_by_name,
             created_at=current_fm.get("created_at") or current.resource_created_at,
             updated_at=current.resource_updated_at,
             current_commit=selected.revision_id,
@@ -301,8 +313,8 @@ class NativeDocumentService(DocumentService):
         )
 
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
-        _, current = await self._current(vault, doc_ref)
-        return await self._response(vault=vault, current=current)
+        vault_id, current = await self._current(vault, doc_ref)
+        return await self._response(vault=vault, vault_id=vault_id, current=current)
 
     async def get_at_commit(
         self,
@@ -319,7 +331,9 @@ class NativeDocumentService(DocumentService):
             reference=current.path,
             revision_id=version,
         )
-        return await self._response(vault=vault, current=current, selected=selected)
+        return await self._response(
+            vault=vault, vault_id=vault_id, current=current, selected=selected,
+        )
 
     async def update(
         self,
