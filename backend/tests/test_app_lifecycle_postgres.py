@@ -15,8 +15,10 @@ import asyncpg
 import pytest
 
 from app.exceptions import ConflictError, ForbiddenError, ValidationError
+from app.services import app_identity_service
 from app.services import app_lifecycle_service as lifecycle
 from app.services.app_identity_service import AppPrincipal
+from scripts.ci import e2e_runtime
 
 pytestmark = pytest.mark.asyncio
 
@@ -56,7 +58,7 @@ def _load_migration(path: Path):
 
 
 @asynccontextmanager
-async def _fresh_database():
+async def _fresh_database(*, include_dsn: bool = False):
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
@@ -70,7 +72,7 @@ async def _fresh_database():
             await conn.execute(_INIT_SQL)
             for path in _MIGRATIONS:
                 await _load_migration(path).migrate(conn=conn)
-        yield pool
+        yield (pool, _database_dsn(name)) if include_dsn else pool
     finally:
         await pool.close()
         await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
@@ -82,6 +84,18 @@ async def lifecycle_pool(monkeypatch):
     async with _fresh_database() as pool:
         monkeypatch.setattr(lifecycle, "get_pool", lambda: pool)
         yield pool
+
+
+@pytest.fixture
+async def runtime_database(monkeypatch):
+    async with _fresh_database(include_dsn=True) as database:
+        pool, dsn = database
+
+        async def get_pool():
+            return pool
+
+        monkeypatch.setattr(app_identity_service, "get_pool", get_pool)
+        yield pool, dsn
 
 
 async def _app(pool, label: str) -> uuid.UUID:
@@ -580,3 +594,82 @@ async def test_fresh_without_retained_resources_clears_old_current_pointer(lifec
         assert row["desired_release_id"] == new_release
         assert row["current_release_id"] is None
         assert row["lifecycle"] == "installing"
+
+
+async def test_runtime_seed_passes_registry_triggers_and_rotates_runtime_artifacts(
+    runtime_database,
+    monkeypatch,
+    tmp_path,
+):
+    pool, dsn = runtime_database
+    git_root = tmp_path / "vaults"
+    monkeypatch.setattr(e2e_runtime, "GIT_FIXTURE_ROOT", git_root)
+    monkeypatch.setattr(
+        app_identity_service,
+        "_configured_app_secret",
+        lambda: "test-app-signing-key",
+    )
+    settings = e2e_runtime.RuntimeSettings(
+        database_url=dsn,
+        scenario=e2e_runtime.APP_LIFECYCLE_SCENARIO,
+        ready_file=tmp_path / "ready.json",
+    )
+
+    first_manifest, first_credentials = await e2e_runtime._seed_app_lifecycle(
+        dsn,
+        origin=settings.origin,
+        fixture_origin=settings.fixture_origin,
+    )
+    first_token = await app_identity_service.exchange_app_credential(
+        first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[5]],
+        correlation_id="runtime-seed-proof",
+    )
+    first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] = first_token["access_token"]
+    e2e_runtime.write_fixture_artifacts(settings, first_manifest, first_credentials)
+    e2e_runtime.write_ready_file(settings.ready_file, e2e_runtime.ready_payload(settings))
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT i.lifecycle, i.grant_generation, g.generation, g.status
+              FROM vault_app_installations AS i
+              JOIN installation_grants AS g ON g.installation_id = i.id
+             ORDER BY i.id, g.generation
+            """
+        )
+    assert len(rows) == 8
+    assert all(row["generation"] == 1 for row in rows)
+    assert sum(row["status"] == "active" for row in rows) == 3
+    assert sum(row["status"] == "revoked" for row in rows) == 5
+    assert all(row["grant_generation"] == 1 for row in rows)
+    assert isinstance(first_token["access_token"], str)
+    assert settings.ready_file.exists()
+
+    first_namespace = first_manifest["namespace"]
+    first_profile = e2e_runtime.credential_profile_path(settings.ready_file).read_text()
+    e2e_runtime.remove_ready_file(settings.ready_file)
+    e2e_runtime.remove_fixture_artifacts(settings)
+    await e2e_runtime._reset_database(dsn)
+    e2e_runtime.clear_git_fixture_root(git_root)
+
+    second_manifest, second_credentials = await e2e_runtime._seed_app_lifecycle(
+        dsn,
+        origin=settings.origin,
+        fixture_origin=settings.fixture_origin,
+    )
+    second_token = await app_identity_service.exchange_app_credential(
+        second_credentials[e2e_runtime.CREDENTIAL_VARIABLES[5]],
+        correlation_id="runtime-reset-proof",
+    )
+    second_credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] = second_token["access_token"]
+    e2e_runtime.write_fixture_artifacts(settings, second_manifest, second_credentials)
+    e2e_runtime.write_ready_file(settings.ready_file, e2e_runtime.ready_payload(settings))
+
+    manifest_path, profile_path = e2e_runtime.fixture_artifact_paths(settings)
+    assert second_manifest["namespace"] != first_namespace
+    assert json.loads(manifest_path.read_text())["namespace"] == second_manifest["namespace"]
+    assert first_namespace not in manifest_path.read_text()
+    assert first_profile != profile_path.read_text()
+    assert os.stat(manifest_path).st_mode & 0o777 == 0o600
+    assert os.stat(profile_path).st_mode & 0o777 == 0o600
+    assert os.stat(settings.ready_file).st_mode & 0o777 == 0o600

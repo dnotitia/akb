@@ -370,6 +370,28 @@ def test_reset_response_matches_the_shared_fixture_contract() -> None:
     assert e2e_runtime.reset_payload(settings) == {"ok": True, "scenario": "empty"}
 
 
+def test_runtime_failure_diagnostic_is_phase_and_sqlstate_only() -> None:
+    class FakePostgresError(Exception):
+        sqlstate = "23514"
+        constraint_name = None
+        table_name = "installation_grants"
+        column_name = None
+
+        def __str__(self) -> str:
+            return "postgresql://db.invalid/akb credential-marker"
+
+    diagnostic = e2e_runtime.format_runtime_failure(
+        "seed_scenario",
+        FakePostgresError("not emitted"),
+    )
+
+    assert diagnostic == (
+        "e2e runtime failed phase=seed_scenario category=FakePostgresError "
+        "source=postgres sqlstate=23514 table=installation_grants"
+    )
+    assert "credential-marker" not in diagnostic
+
+
 def test_database_reset_is_schema_neutral_and_does_not_embed_a_url() -> None:
     sql = e2e_runtime.render_database_reset_sql()
 

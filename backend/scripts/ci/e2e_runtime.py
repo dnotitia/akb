@@ -458,7 +458,7 @@ async def _seed_app_lifecycle(
                         id, app_id, vault_id, desired_release_id,
                         current_release_id, lifecycle, blocked_reason,
                         grant_generation
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
                     """,
                     installation_id,
                     uuid.UUID(app["id"]),
@@ -469,22 +469,28 @@ async def _seed_app_lifecycle(
                     blocked_reason,
                 )
                 grant_id = uuid.uuid4()
-                grant_status = "revoked" if lifecycle == "uninstalled" else "active"
                 await connection.execute(
                     """
                     INSERT INTO installation_grants (
                         id, installation_id, generation, status,
                         capabilities, issuer, provenance, revoked_at
                     ) VALUES (
-                        $1, $2, 1, $3, $4, 'fixture', '{}'::jsonb,
-                        CASE WHEN $3 = 'revoked' THEN NOW() ELSE NULL END
+                        $1, $2, 1, 'active', $3, 'fixture', '{}'::jsonb, NULL
                     )
                     """,
                     grant_id,
                     installation_id,
-                    grant_status,
                     ["installation:read", "inventory:read"],
                 )
+                if lifecycle == "uninstalled":
+                    await connection.execute(
+                        """
+                        UPDATE installation_grants
+                           SET status = 'revoked', revoked_at = NOW()
+                         WHERE id = $1
+                        """,
+                        grant_id,
+                    )
                 resource_entry: dict[str, str] | None = None
                 if resource is not None:
                     resource_entry = {
@@ -1168,6 +1174,7 @@ class E2ERuntime:
         self.reset_lock = threading.Lock()
         self.ready = False
         self.failed = False
+        self.phase = "initialization"
 
     @property
     def backend_command(self) -> list[str]:
@@ -1357,19 +1364,31 @@ class E2ERuntime:
 
     def start(self) -> None:
         try:
+            self.phase = "remove_stale_artifacts"
             remove_ready_file(self.settings.ready_file)
             remove_fixture_artifacts(self.settings)
             if self.settings.manage_postgres:
+                self.phase = "postgres_start"
                 self._compose_up()
+            self.phase = "git_fixture_reset"
             clear_git_fixture_root()
+            self.phase = "database_reset"
             reset_database(self.settings.database_url)
+            self.phase = "config_write"
             write_runtime_config(self.settings, self.repo_root)
+            self.phase = "control_plane_start"
             self._start_control_server()
+            self.phase = "embedding_start"
             self.embed_process = self._start_process(self.embed_command, self.repo_root / "backend", EMBED_LOG)
+            self.phase = "embedding_ready"
             self._wait_for_embed()
+            self.phase = "backend_start"
             self._start_backend()
+            self.phase = "seed_scenario"
             manifest, credentials = seed_scenario(self.settings)
+            self.phase = "fixture_artifacts_write"
             write_fixture_artifacts(self.settings, manifest, credentials)
+            self.phase = "ready_file_write"
             self._write_ready()
         except BaseException:
             self.shutdown()
@@ -1377,14 +1396,21 @@ class E2ERuntime:
 
     def reset(self) -> None:
         with self.reset_lock:
+            self.phase = "backend_stop_for_reset"
             self._stop_backend()
             remove_fixture_artifacts(self.settings)
             try:
+                self.phase = "database_reset"
                 reset_database(self.settings.database_url)
+                self.phase = "git_fixture_reset"
                 clear_git_fixture_root()
+                self.phase = "backend_restart"
                 self._start_backend()
+                self.phase = "seed_scenario"
                 manifest, credentials = seed_scenario(self.settings)
+                self.phase = "fixture_artifacts_write"
                 write_fixture_artifacts(self.settings, manifest, credentials)
+                self.phase = "ready_file_write"
                 self._write_ready()
             except BaseException:
                 self._stop_backend()
@@ -1518,6 +1544,32 @@ class _ControlHandler(BaseHTTPRequestHandler):
         self._json(404, {"status": "not_found"})
 
 
+_SAFE_FAILURE_LABEL = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+def format_runtime_failure(phase: str, error: BaseException) -> str:
+    """Return stable diagnostics without serializing exception messages."""
+
+    safe_phase = phase if _SAFE_FAILURE_LABEL.fullmatch(phase) else "unknown"
+    error_class = type(error).__name__
+    safe_class = error_class if _SAFE_FAILURE_LABEL.fullmatch(error_class) else "Error"
+    fields = [f"phase={safe_phase}", f"category={safe_class}"]
+    sqlstate = getattr(error, "sqlstate", None)
+    if isinstance(sqlstate, str) and _SAFE_SQLSTATE.fullmatch(sqlstate):
+        fields.append("source=postgres")
+        fields.append(f"sqlstate={sqlstate}")
+        for attribute, label in (
+            ("constraint_name", "constraint"),
+            ("table_name", "table"),
+            ("column_name", "column"),
+        ):
+            value = getattr(error, attribute, None)
+            if isinstance(value, str) and _SAFE_FAILURE_LABEL.fullmatch(value):
+                fields.append(f"{label}={value}")
+    return "e2e runtime failed " + " ".join(fields)
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         settings = resolve_settings(argv)
@@ -1539,8 +1591,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             runtime.wait()
             exit_code = 1 if runtime.failed else 0
-    except Exception:
-        print("e2e runtime failed", file=sys.stderr)
+    except Exception as exc:
+        print(format_runtime_failure(runtime.phase, exc), file=sys.stderr)
         exit_code = 1
     finally:
         if not runtime.shutdown() and exit_code == 0:
