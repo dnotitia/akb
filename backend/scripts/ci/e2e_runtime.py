@@ -1001,7 +1001,10 @@ DECLARE
     table_name text;
 BEGIN
     FOR table_name IN
-        SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+        SELECT tablename
+          FROM pg_tables
+         WHERE schemaname = 'public'
+           AND tablename <> 'schema_migrations'
     LOOP
         EXECUTE format('TRUNCATE TABLE public.%I RESTART IDENTITY CASCADE', table_name);
     END LOOP;

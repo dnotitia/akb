@@ -438,6 +438,7 @@ def test_database_reset_is_schema_neutral_and_does_not_embed_a_url() -> None:
     sql = e2e_runtime.render_database_reset_sql()
 
     assert "TRUNCATE TABLE public.%I RESTART IDENTITY CASCADE" in sql
+    assert "tablename <> 'schema_migrations'" in sql
     assert "DROP SCHEMA IF EXISTS vector_index CASCADE" in sql
     assert e2e_runtime.DEFAULT_DATABASE_URL not in sql
 
