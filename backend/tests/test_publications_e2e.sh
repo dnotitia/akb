@@ -67,9 +67,12 @@ R=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT" -H "Content-Type: application
 [ -n "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)" ] \
   && pass "Table created" || fail "Table create" "$R"
 
-acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
-  -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('Apple', 'food', 1), ('Bagel', 'food', 2), ('Chair', 'furniture', 50), ('Desk', 'furniture', 200)\"}" >/dev/null
-pass "Table seeded"
+# Seed rows. Every later table_query assertion counts on exactly these 4 rows,
+# so a silent seed failure must fail here rather than skew a row count downstream.
+SEED=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
+  -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('Apple', 'food', 1), ('Bagel', 'food', 2), ('Chair', 'furniture', 50), ('Desk', 'furniture', 200)\"}")
+SEEDED=$(echo "$SEED" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("affected_rows"))' 2>/dev/null)
+[ "$SEEDED" = "4" ] && pass "Table seeded (4 rows)" || fail "Table seed" "affected_rows=$SEEDED: $SEED"
 
 # Upload a JSON file. The init response surfaces only `uri`; the file UUID
 # (required by the confirm round-trip) is the trailing segment.
@@ -93,13 +96,19 @@ DOC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).g
 [ -n "$DOC_SLUG" ] && pass "Create document publication" || fail "Create doc pub" "$R"
 
 # Response shape: canonical public dict only — no internal/legacy fields.
+# The "PARSED:" marker is what makes this an absence assertion rather than a
+# silence assertion: an unparsable body prints nothing and an error body has no
+# `slug`, so neither can read as "no internal fields present".
 LEAKS=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 forbidden = ["id", "publication_id", "public_url", "public_url_full",
              "public_base", "snapshot_s3_key", "password_hash", "vault_id"]
-print(",".join(k for k in forbidden if k in d))' 2>/dev/null)
-[ -z "$LEAKS" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "leaks $LEAKS"
+found = [k for k in forbidden if k in d]
+if "slug" not in d:
+    found.append("<not-a-publication-response>")
+print("PARSED:" + ",".join(found))' 2>/dev/null)
+[ "$LEAKS" = "PARSED:" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "${LEAKS:-unparsable body}: $R"
 
 # share_url is always absolute (AKB_PUBLIC_BASE_URL is startup-required).
 SU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("share_url",""))' 2>/dev/null)
@@ -396,9 +405,17 @@ SS_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(
 [ "$SS_MODE" = "snapshot" ] && pass "Snapshot response mode=snapshot" || fail "Snapshot mode" "$SS_MODE"
 [ -n "$SS_AT" ] && pass "Snapshot response carries snapshot_at" || fail "Snapshot at" "$SS_AT"
 
-# Snapshot response must not leak the internal s3 key
-HAS_S3=$(echo "$R" | python3 -c 'import json,sys; print("yes" if "snapshot_s3_key" in json.load(sys.stdin) else "no")' 2>/dev/null)
-[ "$HAS_S3" = "no" ] && pass "Snapshot response hides snapshot_s3_key" || fail "Snapshot leak" "exposes s3 key"
+# Snapshot response must not leak the internal s3 key. Establish the body is a
+# real snapshot response first — a failed snapshot call carries no s3 key either,
+# and that must not read as "the key is correctly hidden".
+HAS_S3=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("mode") != "snapshot":
+    print("not-a-snapshot-response")
+else:
+    print("yes" if "snapshot_s3_key" in d else "no")' 2>/dev/null)
+[ "$HAS_S3" = "no" ] && pass "Snapshot response hides snapshot_s3_key" || fail "Snapshot leak" "${HAS_S3:-unparsable body}: $R"
 
 # After snapshot, /public returns mode=snapshot
 R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
@@ -409,8 +426,21 @@ MODE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("
 acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
   -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('SnapTest', 'food', 999)\"}" >/dev/null
 R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
-ROWS=$(echo "$R" | python3 -c 'import json,sys; rows=json.load(sys.stdin).get("rows",[]); print(",".join(r["name"] for r in rows))' 2>/dev/null)
-echo "$ROWS" | grep -q "SnapTest" && fail "Snapshot freeze" "leaked new data" || pass "Snapshot freezes data (no SnapTest)"
+# The frozen result set must still BE a result set. An error body or an empty
+# `rows` also contains no "SnapTest", so require the served snapshot rows first.
+ROWS=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = d.get("rows")
+if d.get("mode") != "snapshot" or not rows:
+    print("BAD")
+else:
+    print("ROWS:" + ",".join(r["name"] for r in rows))' 2>/dev/null)
+case "$ROWS" in
+  ROWS:*SnapTest*) fail "Snapshot freeze" "serves post-snapshot INSERT: $ROWS" ;;
+  ROWS:*)          pass "Snapshot freezes data (no SnapTest)" ;;
+  *)               fail "Snapshot freeze" "no usable snapshot rows to check: $R" ;;
+esac
 
 # snapshot only supported for table_query
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -438,8 +468,16 @@ MIME=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("
 # proxied same-origin via /raw, so the vault name embedded in the S3 key can't
 # leak and the view stays counted + revocable.
 R=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG")
-DLURL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("download_url",""))' 2>/dev/null)
-[ -z "$DLURL" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "$DLURL"
+# "OK:" only prints for a body that really is a resolved file publication, so a
+# 404/410 or an unparsable body cannot read as "download_url correctly absent".
+DL=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("resource_type") != "file" or not d.get("mime_type"):
+    print("BAD:not-a-file-publication-response")
+else:
+    print("OK:" + str(d.get("download_url", "")))' 2>/dev/null)
+[ "$DL" = "OK:" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "${DL:-unparsable body}: $R"
 
 # /raw proxies content (CORS-safe for browser)
 RAW=$(curl -sk "$BASE_URL/api/v1/public/$FILE_SLUG/raw")
@@ -456,14 +494,24 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SL
 # Cross-vault file IDOR: publishing ANOTHER vault's file UUID through my own vault
 # must be REJECTED at create time (else an anonymous viewer could read that vault's
 # file bytes through my publication).
-IDOR_V="pubidor_$RANDOM"
-acurl -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor" >/dev/null
+# The setup is asserted step by step: if no file row is ever created in the
+# second vault, the publish below is refused for "no such file" and that would
+# read as the vault binding working. The name must fit the vault grammar
+# (`document_service._VAULT_NAME_RE`: lowercase alnum with single hyphens) —
+# an underscore here 422s and leaves the whole section with nothing to publish.
+IDOR_V="pubidor-$(date +%s)-$RANDOM"
+CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor")
+[ "$CODE" = "200" ] && pass "second vault created" || fail "second vault create" "HTTP $CODE"
 IINIT=$(acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/upload?filename=secret.txt&collection=s&mime_type=text/plain")
 IURI=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
 IFID=$(printf '%s' "$IURI" | uri_file_id)
 IURL=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["upload_url"])' 2>/dev/null)
-printf 'top-secret-from-vault-B' | curl -sk -X PUT "$IURL" -H "Content-Type: text/plain" --data-binary @- >/dev/null
-acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/$IFID/confirm" >/dev/null
+[ -n "$IFID" ] && [ -n "$IURL" ] && pass "second-vault upload initialized" || fail "second-vault upload init" "$IINIT"
+CODE=$(printf 'bytes-that-live-in-the-second-vault' | curl -sk -o /dev/null -w "%{http_code}" \
+  -X PUT "$IURL" -H "Content-Type: text/plain" --data-binary @-)
+[ "$CODE" = "200" ] && pass "second-vault file bytes uploaded (200)" || fail "second-vault upload PUT" "HTTP $CODE"
+CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/files/$IDOR_V/$IFID/confirm")
+[ "$CODE" = "200" ] && pass "second-vault file confirmed (200)" || fail "second-vault confirm" "HTTP $CODE"
 # attacker (owner of $VAULT) tries to publish vault-B's file UUID through $VAULT
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}")
@@ -504,7 +552,13 @@ echo ""
 # ── 10. Embed + oEmbed ────────────────────────────────────
 echo "▸ 10. Embed + oEmbed"
 
-R=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed" 2>&1 || true)
+# Document /embed: same payload as the page GET, plus embed: true.
+CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
+[ "$CODE" = "200" ] && pass "document /embed returns 200" || fail "document /embed" "HTTP $CODE"
+R=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
+DEMB=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("embed"), d.get("title","")))' 2>/dev/null)
+[ "$DEMB" = "True|Pub Doc" ] && pass "document /embed carries embed=true + doc title" || fail "document /embed body" "${DEMB:-unparsable body}: $R"
+
 # embed returns the same shape with embed: true
 CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG/embed")
 [ "$CODE" = "200" ] && pass "/embed returns 200 for allowed publication" || fail "/embed" "HTTP $CODE"
@@ -732,6 +786,8 @@ MV0_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).g
 if [ -n "$MV0_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$MV0_SLUG")
   [ "$CODE" = "410" ] && pass "max_views=0 → immediately 410" || fail "max_views=0" "HTTP $CODE"
+else
+  fail "max_views=0" "publish returned no slug, nothing to request: $R"
 fi
 
 # F4: images render inline through the same-origin /raw proxy (200 + image/png),
@@ -856,8 +912,14 @@ R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type
   -d "{\"resource_type\":\"file\",\"uri\":\"$FILE_URI\"}")
 CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 acurl -X DELETE "$BASE_URL/api/v1/files/$VAULT/$FID" > /dev/null
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLUG")
-[ "$CODE" = "404" ] && pass "File delete cascades publications (404)" || fail "File cascade" "HTTP $CODE"
+# An empty slug would request /public/ — 404 by routing, which is exactly what
+# "the publication was cascaded away" asserts. Require a real slug to check.
+if [ -n "$CSC_SLUG" ]; then
+  CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLUG")
+  [ "$CODE" = "404" ] && pass "File delete cascades publications (404)" || fail "File cascade" "HTTP $CODE"
+else
+  fail "File cascade" "no publication slug to check the cascade against: $R"
+fi
 
 # Cascade: document delete → publications cascade
 R=$(acurl -X POST "$BASE_URL/api/v1/documents" -H "Content-Type: application/json" \
@@ -867,12 +929,17 @@ R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type
   -d "{\"resource_type\":\"document\",\"uri\":\"akb://$VAULT/doc/$CASCADE_DOC\"}")
 DOC_CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 acurl -X DELETE "$BASE_URL/api/v1/documents/$VAULT/$CASCADE_DOC" > /dev/null
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_CSC_SLUG")
-[ "$CODE" = "404" ] && pass "Document delete cascades publications (404)" || fail "Doc cascade" "HTTP $CODE"
+if [ -n "$DOC_CSC_SLUG" ]; then
+  CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_CSC_SLUG")
+  [ "$CODE" = "404" ] && pass "Document delete cascades publications (404)" || fail "Doc cascade" "HTTP $CODE"
+else
+  fail "Doc cascade" "no publication slug to check the cascade against: $R"
+fi
 
 # Cascade: empty vault delete
-mcp 90 akb_delete_vault "{\"vault\":\"${VAULT}-empty\"}" >/dev/null 2>&1
-pass "Empty vault deleted (cleanup)"
+DELV=$(mcp 90 akb_delete_vault "{\"vault\":\"${VAULT}-empty\"}" | mcp_text)
+DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
+[ "$DELOK" = "True" ] && pass "Empty vault deleted" || fail "Empty vault delete" "$DELV"
 
 # section_not_found field is True when filter missing
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
@@ -885,8 +952,11 @@ echo ""
 
 # ── 99. Cleanup ───────────────────────────────────────────
 echo "▸ 99. Cleanup"
-mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
-pass "Cleanup done"
+# Deleting the loaded vault is also the cascade check for a vault that still owns
+# publications, tables and files — so inspect the result instead of assuming it.
+DELV=$(mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_text)
+DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
+[ "$DELOK" = "True" ] && pass "Cleanup: test vault deleted" || fail "Cleanup vault delete" "$DELV"
 
 # Terminate MCP session
 curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $TOKEN" -H "Mcp-Session-Id: $SESS" >/dev/null 2>&1
