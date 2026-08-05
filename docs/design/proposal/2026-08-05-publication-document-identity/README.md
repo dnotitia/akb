@@ -89,8 +89,10 @@ here.
 
 **`document_id` cannot be `NOT NULL` yet.** "Every document publication points
 at a document" is enforced in code, not in the schema, for as long as one
-backfilled NULL remains. Three code sites and two tests exist only for that
-population and become unreachable when it empties. Nothing currently detects
+backfilled NULL remains. Three code sites and seven tests across three files
+exist only for that population and become unreachable when it empties — the
+tests are the sharper cost, because they will keep passing green while
+exercising a shape that no longer occurs. Nothing currently detects
 that day — a follow-up should count the population and install the CHECK when
 it reaches zero, so the cleanup has one trigger rather than several independent
 judgment calls.
@@ -100,11 +102,14 @@ database it knows nothing about, and safe means it declines to guess rather
 than that its answers are confirmed. Confirming them is an operational step
 that belongs to whoever runs it.
 
-**Two guards from the previous item narrowed.** The orphan-write guard and the
-explicit cleanup in the delete chokepoint now protect only unbound rows; the
-foreign key covers the rest. Their tests had to clear `document_id` to
-reproduce the state at all, which is the honest reproduction rather than a
-weakened assertion.
+**Two guards from the previous item are now unreachable for bound rows.**
+Neither the orphan-write guard nor the explicit cleanup in the delete
+chokepoint changed — both still match on `resource_uri`, with no reference to
+`document_id`. What changed is the state space around them: a bound row cannot
+reach the orphaned condition either one exists to catch, because the foreign
+key removes it first. So in practice only unbound rows reach them. Their tests
+clear `document_id` to reproduce the pre-key state, which is the honest
+reproduction rather than a weakened assertion.
 
 ## Boundaries
 
@@ -112,7 +117,9 @@ weakened assertion.
 so an orphaned file publication fails closed rather than resolving onto a
 different resource — the defect shape does not carry over. The cost of the
 asymmetry sits on the cleanup side instead, where a canonical URI is
-reconstructed from three mutable inputs and matched as text; the open backlog
+reconstructed from three inputs — one of which drifts underfoot, since a
+file's collection can be cleared out from under it — and matched as text; the
+open backlog
 items about file publication URIs and cleanup normalisation are instances of
 that. A `file_id` column would collapse them and would need no judgment in its
 backfill, which makes it the cheaper half of the same idea — but it is a second

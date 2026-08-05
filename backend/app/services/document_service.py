@@ -261,11 +261,11 @@ def _certified_content_hash(md_content: str) -> str:
 # `create_publication` refuses a document publication without an id.
 #
 # `vault_id = $1` scopes BOTH branches, and is the part that was missing:
-# the previous query matched `resource_uri` across every vault, so a reader
-# holding a document at path P learned that some other vault carries a
-# publication for P, and got its slug. `document_id = $2` alone would have
-# been enough for the primary branch (the composite FK pins the vault), but
-# the predicate sits on the query so the fallback cannot be wrong either.
+# the previous query matched `resource_uri` with no vault predicate at all,
+# so its answer was not scoped to the vault being asked about.
+# `document_id = $2` alone would have been enough for the primary branch (the
+# composite FK pins the vault), but the predicate sits on the query so the
+# fallback cannot be wrong either.
 #
 # ORDER BY created_at DESC matches `publishDoc()` in the frontend, which
 # reuses the first entry `listPublications` returns.

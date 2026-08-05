@@ -29,8 +29,8 @@ Reviews conducted on this item, in order:
   described in the rounds notes.
 
 - **Quality pass over the finished branch**, along four independent angles
-  (reuse, simplification, efficiency, depth). The depth angle produced the
-  forward-path correction. The efficiency angle measured rather than reasoned:
+  (reuse, simplification, efficiency, altitude). The altitude angle produced
+  the forward-path correction. The efficiency angle measured rather than reasoned:
   it confirmed the fallback query still uses the new partial index under a
   forced generic plan, which is what matters given every statement is prepared,
   and it found one redundant lookup this item had introduced.

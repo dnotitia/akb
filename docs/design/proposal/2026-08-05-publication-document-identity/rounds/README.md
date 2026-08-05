@@ -43,7 +43,8 @@ one round that reopened a decision after implementation.
   this class on the authenticated read path; the public one had not been. The
   same pin was applied.
 
-- **Cleanup round.** Four review angles over the finished branch produced a
+- **Cleanup round**, interleaved with the corrections above rather than
+  strictly after them. Four review angles over the finished branch produced a
   sixth unguarded reference in `init.sql` to a column that arrives with a
   migration (found by reading migrations, not by the replay technique
   documented alongside the guards, which is structurally blind to columns older
