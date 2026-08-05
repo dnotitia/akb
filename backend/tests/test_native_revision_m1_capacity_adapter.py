@@ -466,15 +466,53 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
         assert false_green["derived_boundary"]["failure_retry_projection_exact_current_head"] is False
         assert false_green["closed"] is False
         mixed_profile_vault = await CAPACITY._new_vault(pool, owner)
-        await M1ReferencePayloadStore(pool).prepare_text(
+        reference_store = M1ReferencePayloadStore(pool)
+        pg_store = M1PgBodyStore(pool)
+        shared_payload = "placement-scoped shared body"
+
+        reference = await reference_store.prepare_text(
             namespace_id=mixed_profile_vault,
-            payload="reference placement",
+            payload=shared_payload,
         )
-        with pytest.raises(asyncpg.CheckViolationError, match="cannot mix"):
-            await M1PgBodyStore(pool).prepare_text(
-                namespace_id=mixed_profile_vault,
-                payload="different PostgreSQL body placement",
+        reference_replay = await reference_store.prepare_text(
+            namespace_id=mixed_profile_vault,
+            payload=shared_payload,
+        )
+        pg_body = await pg_store.prepare_text(
+            namespace_id=mixed_profile_vault,
+            payload=shared_payload,
+        )
+        pg_replay = await pg_store.prepare_text(
+            namespace_id=mixed_profile_vault,
+            payload=shared_payload,
+        )
+        pg_different_body = await pg_store.prepare_text(
+            namespace_id=mixed_profile_vault,
+            payload="different PostgreSQL body placement",
+        )
+
+        assert reference.payload_id == reference_replay.payload_id
+        assert pg_body.payload_id == pg_replay.payload_id
+        assert reference.payload_id != pg_body.payload_id
+        assert pg_body.payload_id != pg_different_body.payload_id
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT selected_placement, digest, byte_size
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1
+                 ORDER BY selected_placement, digest
+                """,
+                mixed_profile_vault,
             )
+        assert {
+            (row["selected_placement"], row["digest"], row["byte_size"])
+            for row in rows
+        } == {
+            (M1ReferencePayloadStore.selected_placement, reference.digest, reference.byte_size),
+            (M1PgBodyStore.selected_placement, pg_different_body.digest, pg_different_body.byte_size),
+            (M1PgBodyStore.selected_placement, pg_body.digest, pg_body.byte_size),
+        }
     finally:
         if pool is not None:
             await pool.close()

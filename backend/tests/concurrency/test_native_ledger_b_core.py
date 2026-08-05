@@ -41,6 +41,7 @@ _INDEXABLE_MIGRATIONS = (
     _BACKEND / "app" / "db" / "migrations" / "006_indexable_chunks.py",
 )
 _BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "049_native_revision_m1_pg_body.py"
+_PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_payload_placement.py"
 _DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "050_native_revision_searchable_derived.py"
 _WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
 _DSN = os.environ.get(
@@ -88,11 +89,12 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
         migration = _load_migration()
         await migration.migrate(conn=conn)
         await migration.migrate(conn=conn)  # idempotent startup/retry
+        await _load_migration(_BODY_MIGRATION).migrate(conn=conn)
+        await _load_migration(_PLACEMENT_MIGRATION).migrate(conn=conn)
         if with_derived:
             for path in _INDEXABLE_MIGRATIONS:
                 await _load_migration(path).migrate(conn=conn)
             await _load_migration(_WRITE_POLICY_MIGRATION).migrate(conn=conn)
-            await _load_migration(_BODY_MIGRATION).migrate(conn=conn)
             await _load_migration(_DERIVED_MIGRATION).migrate(conn=conn)
         await conn.close()
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size)

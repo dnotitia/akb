@@ -20,7 +20,10 @@ from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
 from app.services.m1_binary_store import PreparedBinary
 from app.services.m1_native_grep_service import M1NativeGrepService
+from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_derived_worker import NativeDerivedWorker
+from app.services.native_revision_service import NativeRevisionService
 
 
 _DSN = os.environ.get("AKB_M1_FILE_TEST_DSN")
@@ -53,6 +56,7 @@ async def pool():
             "050_native_revision_searchable_derived.py",
             "051_native_revision_m1_file_storage.py",
             "052_native_revision_m1_file_constraints.py",
+            "053_native_revision_m1_payload_placement.py",
         ):
             await _migration(filename).migrate(conn)
     try:
@@ -840,6 +844,129 @@ async def test_concrete_native_text_bridge_is_atomic_searchable_and_versioned(
             "SELECT count(*) FROM vault_files WHERE id = $1",
             uuid.UUID(failed["file_id"]),
         ) == 0
+
+
+@pytest.mark.asyncio
+async def test_reference_document_and_native_text_file_deduplicate_per_placement(
+    context, monkeypatch,
+):
+    """The same text can have one verified body per selected placement."""
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+
+    data = b"same canonical text across placements\n"
+    digest = hashlib.sha256(data).hexdigest()
+    reference_store = M1ReferencePayloadStore(pool)
+    document_service = NativeRevisionService(pool, payload_store=reference_store)
+    document = await document_service.create_text(
+        namespace_id=vault_id,
+        surface="document",
+        path="notes/shared.md",
+        payload=data,
+        actor="placement-test",
+        mutation_id=uuid.uuid4(),
+        expected_digest=digest,
+        expected_size=len(data),
+    )
+    reference = await reference_store.prepare_text(
+        namespace_id=vault_id,
+        payload=data,
+    )
+
+    file_service = m1.MeasurementFileService()
+    initiated = await file_service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="notes",
+        filename="shared.txt",
+        actor_id="placement-test",
+        mime_type="text/plain",
+        description="same canonical body",
+        content_hash=digest,
+    )
+    await file_service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+    confirmed = await file_service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    pg_store = M1PgBodyStore(pool)
+    pg_body = await pg_store.prepare_text(namespace_id=vault_id, payload=data)
+
+    assert reference.payload_id != pg_body.payload_id
+    assert reference.payload_id == (
+        await reference_store.prepare_text(namespace_id=vault_id, payload=data)
+    ).payload_id
+    assert pg_body.payload_id == (
+        await pg_store.prepare_text(namespace_id=vault_id, payload=data)
+    ).payload_id
+
+    document_snapshot = await document_service.get_resource_revision(
+        namespace_id=vault_id,
+        surface="document",
+        resource_id=document.resource_id,
+        revision_id=document.revision_id,
+    )
+    file_resource_id = uuid.UUID(confirmed["native_resource_id"])
+    file_snapshot = await NativeRevisionService(
+        pool, payload_store=pg_store,
+    ).get_resource_revision(
+        namespace_id=vault_id,
+        surface="file",
+        resource_id=file_resource_id,
+        revision_id=confirmed["native_revision_id"],
+    )
+    assert (document_snapshot.payload_bytes, document_snapshot.selected_placement) == (
+        data,
+        M1ReferencePayloadStore.selected_placement,
+    )
+    assert (file_snapshot.payload_bytes, file_snapshot.selected_placement) == (
+        data,
+        M1PgBodyStore.selected_placement,
+    )
+
+    async with pool.acquire() as conn:
+        payload_rows = await conn.fetch(
+            """
+            SELECT selected_placement, count(*)::int AS count
+              FROM m1_reference_payloads
+             WHERE namespace_id = $1 AND digest = $2 AND byte_size = $3
+             GROUP BY selected_placement
+            """,
+            vault_id,
+            digest,
+            len(data),
+        )
+        manifest_rows = await conn.fetch(
+            """
+            SELECT r.surface, m.selected_placement, m.private_locator
+              FROM native_resources r
+              JOIN native_revisions v
+                ON v.resource_id = r.resource_id AND v.revision_id = r.head_revision_id
+              JOIN native_payload_manifests m
+                ON m.payload_manifest_id = v.payload_manifest_id
+             WHERE r.resource_id = ANY($1::uuid[])
+            """,
+            [document.resource_id, file_resource_id],
+        )
+    assert {
+        row["selected_placement"]: row["count"] for row in payload_rows
+    } == {
+        M1ReferencePayloadStore.selected_placement: 1,
+        M1PgBodyStore.selected_placement: 1,
+    }
+    assert {
+        row["surface"]: (row["selected_placement"], row["private_locator"])
+        for row in manifest_rows
+    } == {
+        "document": (M1ReferencePayloadStore.selected_placement, reference.payload_id),
+        "file": (M1PgBodyStore.selected_placement, pg_body.payload_id),
+    }
 
 
 async def _confirmed_native_text_file(

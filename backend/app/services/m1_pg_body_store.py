@@ -100,7 +100,7 @@ class M1PgBodyStore:
                     selected_placement, verification_profile, canonical_bytes
                 )
                 VALUES ($1, 'text', $2, $3, 'utf-8', $4, $5, $6)
-                ON CONFLICT (namespace_id, digest, byte_size) DO NOTHING
+                ON CONFLICT (namespace_id, digest, byte_size, selected_placement) DO NOTHING
                 RETURNING payload_id, namespace_id, content_profile, digest,
                           byte_size, encoding, selected_placement,
                           verification_profile, canonical_bytes
@@ -123,15 +123,17 @@ class M1PgBodyStore:
                        AND digest = $2
                        AND byte_size = $3
                        AND selected_placement = $4
+                       AND verification_profile = $5
                     """,
                     namespace_id,
                     digest,
                     len(canonical),
                     self.selected_placement,
+                    self.verification_profile,
                 )
         if row is None:
             raise PgBodyIntegrityError(
-                "namespace already contains the same body under a different measurement placement"
+                "PostgreSQL body disappeared during placement-scoped deduplication"
             )
         await asyncio.to_thread(self._verify_row, row, expected=canonical)
         return PreparedReferencePayload(

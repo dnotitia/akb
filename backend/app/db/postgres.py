@@ -222,6 +222,7 @@ async def _apply_migrations() -> None:
         "050_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
         "051_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
         "052_native_revision_m1_file_constraints.py", # M1 File placement discriminator integrity
+        "053_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
     ):
         if filename in applied:
             continue
