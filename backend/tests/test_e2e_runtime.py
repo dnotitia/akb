@@ -556,6 +556,124 @@ def test_managed_suite_environment_derives_compose_exec_for_psql(tmp_path: Path)
     assert e2e_runtime.DEFAULT_DATABASE_URL not in environment["AKB_PG_EXEC"]
 
 
+def test_postgres_probe_opens_and_closes_a_real_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+
+    class Connection:
+        async def close(self) -> None:
+            events.append(("close",))
+
+    async def fake_connect(database_url: str, *, timeout: int) -> Connection:
+        events.append(("connect", database_url, timeout))
+        return Connection()
+
+    monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=fake_connect))
+
+    assert e2e_runtime._postgres_connection_ready(e2e_runtime.DEFAULT_DATABASE_URL) is True
+    assert events == [
+        ("connect", e2e_runtime.DEFAULT_DATABASE_URL, e2e_runtime.POSTGRES_PROBE_TIMEOUT),
+        ("close",),
+    ]
+
+
+def test_wait_for_postgres_waits_for_published_dsn_after_container_health(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+            manage_postgres=True,
+            compose_project="akb-e2e-unit",
+        )
+    )
+    probe_results = iter([False, True])
+    waits: list[int] = []
+    compose_calls: list[tuple[str, ...]] = []
+    docker_calls: list[tuple[str, ...]] = []
+
+    class Completed:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    monkeypatch.setattr(
+        runtime,
+        "_run_compose",
+        lambda *args: compose_calls.append(args) or Completed("postgres-container\n"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_run_docker",
+        lambda *args: docker_calls.append(args) or Completed("healthy\n"),
+    )
+    monkeypatch.setattr(
+        e2e_runtime,
+        "_postgres_connection_ready",
+        lambda database_url: next(probe_results),
+    )
+    monkeypatch.setattr(runtime.stop_event, "wait", lambda seconds: waits.append(seconds))
+
+    runtime._wait_for_postgres()
+
+    assert len(compose_calls) == 2
+    assert len(docker_calls) == 2
+    assert waits == [e2e_runtime.POSTGRES_READY_INTERVAL]
+
+
+def test_wait_for_postgres_has_bounded_timeout_when_published_dsn_stays_unready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+            manage_postgres=True,
+            compose_project="akb-e2e-unit",
+        )
+    )
+
+    class Completed:
+        stdout = "healthy\n"
+
+    monkeypatch.setattr(e2e_runtime, "POSTGRES_READY_ATTEMPTS", 2)
+    monkeypatch.setattr(runtime, "_run_compose", lambda *_args: Completed())
+    monkeypatch.setattr(runtime, "_run_docker", lambda *_args: Completed())
+    monkeypatch.setattr(e2e_runtime, "_postgres_connection_ready", lambda _url: False)
+    monkeypatch.setattr(runtime.stop_event, "wait", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="PostgreSQL Compose service") as error:
+        runtime._wait_for_postgres()
+
+    assert e2e_runtime.DEFAULT_DATABASE_URL not in str(error.value)
+
+
+def test_wait_for_postgres_stops_before_connecting_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+            manage_postgres=True,
+            compose_project="akb-e2e-unit",
+        )
+    )
+    runtime.request_stop()
+    monkeypatch.setattr(
+        e2e_runtime,
+        "_postgres_connection_ready",
+        lambda _url: pytest.fail("connection probe must not run after stop"),
+    )
+
+    with pytest.raises(RuntimeError, match="runtime stopped"):
+        runtime._wait_for_postgres()
+
+
 def test_start_failure_cleans_up_partial_compose_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = e2e_runtime.E2ERuntime(
         e2e_runtime.RuntimeSettings(

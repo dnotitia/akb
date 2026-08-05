@@ -51,6 +51,9 @@ RUNTIME_TMP = Path(tempfile.gettempdir())
 DEFAULT_READY_FILE = str(RUNTIME_TMP / "akb-e2e-ready.json")
 EMBED_PORT = 8888
 BACKEND_PORT = 8000
+POSTGRES_READY_ATTEMPTS = 60
+POSTGRES_READY_INTERVAL = 1
+POSTGRES_PROBE_TIMEOUT = 2
 GIT_FIXTURE_ROOT = RUNTIME_TMP / "akb-vaults"
 EMBED_LOG = RUNTIME_TMP / "embed-stub.log"
 BACKEND_LOG = RUNTIME_TMP / "backend.log"
@@ -1044,6 +1047,24 @@ def reset_database(database_url: str) -> None:
     asyncio.run(_reset_database(database_url))
 
 
+async def _probe_postgres_connection(database_url: str) -> bool:
+    try:
+        import asyncpg
+
+        connection = await asyncpg.connect(database_url, timeout=POSTGRES_PROBE_TIMEOUT)
+    except Exception:
+        return False
+    try:
+        await connection.close()
+    except Exception:
+        return False
+    return True
+
+
+def _postgres_connection_ready(database_url: str) -> bool:
+    return asyncio.run(_probe_postgres_connection(database_url))
+
+
 def clear_git_fixture_root(root: Path = GIT_FIXTURE_ROOT) -> None:
     """Empty only the runtime-owned fixture directory, preserving the root."""
 
@@ -1246,7 +1267,7 @@ class E2ERuntime:
         )
 
     def _wait_for_postgres(self) -> None:
-        for _ in range(60):
+        for _ in range(POSTGRES_READY_ATTEMPTS):
             if self.stop_event.is_set():
                 raise RuntimeError("runtime stopped")
             containers = self._run_compose("ps", "-q", "postgres")
@@ -1259,10 +1280,11 @@ class E2ERuntime:
                     container_id,
                 )
                 if health.stdout.strip() == "healthy":
-                    return
+                    if _postgres_connection_ready(self.settings.database_url):
+                        return
                 if health.stdout.strip() in {"unhealthy", "exited", "dead"}:
                     break
-            self.stop_event.wait(1)
+            self.stop_event.wait(POSTGRES_READY_INTERVAL)
         raise RuntimeError("PostgreSQL Compose service did not become healthy")
 
     def _compose_up(self) -> None:
