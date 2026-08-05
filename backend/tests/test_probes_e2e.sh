@@ -92,11 +92,11 @@ awk -v m="$max" 'BEGIN { exit !(m+0 < 3.0) }' \
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "───────────────────────────────────────────"
-echo "  passed: $PASS"
-echo "  failed: $FAIL"
 if [[ $FAIL -gt 0 ]]; then
-  echo ""
   echo "Failures:"
   for e in "${ERRORS[@]}"; do echo "  - $e"; done
-  exit 1
+  echo ""
 fi
+# Canonical summary — the CI runner parses this line for the counts.
+echo "  Results: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]] || exit 1

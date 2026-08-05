@@ -400,9 +400,10 @@ echo ""
 echo "═══════════════════════════════════"
 if [ $FAIL -eq 0 ]; then
   echo "✓ All $PASS tests passed"
-  exit 0
 else
   echo "✗ $FAIL failures (of $((PASS+FAIL)) total)"
   printf '  - %s\n' "${ERRORS[@]}"
-  exit 1
 fi
+# Canonical summary — the CI runner parses this line for the counts.
+echo "  Results: $PASS passed, $FAIL failed"
+[ $FAIL -eq 0 ] || exit 1

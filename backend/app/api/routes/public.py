@@ -295,6 +295,22 @@ async def list_publications_route(
     resource_type: str | None = None,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    """List every publication in the vault. Unpaginated by contract.
+
+    Two callers depend on the response being complete, and a `limit`/`offset`
+    pair added here would break them in opposite ways:
+
+    - `frontend/src/lib/api.ts` `listPublications` renders the vault's
+      publication list from one unbounded response, so a bound would silently
+      hide rows from the owner.
+    - `backend/tests/test_publications_e2e.sh` asserts the cascade on document
+      and file delete by counting matching rows here. A surviving row that fell
+      off the first page would count as zero and read as "cascade removed it" —
+      the assertion would pass for the wrong reason rather than fail, which is
+      the one failure mode a test cannot report on itself.
+
+    Paginating is fine; doing it without changing both is not.
+    """
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     publications = await publication_service.list_publications(access["vault_id"], resource_type)
     return {"publications": publications}

@@ -210,6 +210,11 @@ jobs:
           #     model now rejects as extra_forbidden ("mode" is
           #     output-only since the live/snapshot rewrite). Fix the
           #     test in its own PR, then re-enable.
+          # Registering a suite here requires it to print a
+          # "Results: N passed, M failed" line — the gate below rejects a
+          # suite whose count it cannot parse. Several unregistered
+          # suites do not print one yet and would have to be adapted
+          # first.
           SUITES=(
             test_probes_e2e.sh
             test_mcp_e2e.sh
@@ -232,13 +237,25 @@ jobs:
             # that skips a section still reports 0 failed, so the skip
             # branches there are a fallback, not an accepted outcome.
             test_publication_resolution_e2e.sh
-            # The publication feature's own suite — 127 assertions over
+            # The publication feature's own suite — 134 assertions over
             # documents, table queries, snapshots and files. Needs S3
             # (section 0 uploads a file, and sections 9/13 publish it),
             # which is why MinIO is brought up above. Nothing else here
             # is CI-hostile: no proxy, no psql, no embedding assertions.
             test_publications_e2e.sh
           )
+          # Suites allowed to report no assertion count. Adding an entry
+          # is a tracked decision (it means that suite's coverage stops
+          # being measured), not a way to quiet the gate — fix the
+          # suite's summary line instead.
+          EMPTY_COUNT_ALLOWED=()
+          is_empty_allowed() {
+            local suite="$1" allowed
+            for allowed in "${EMPTY_COUNT_ALLOWED[@]}"; do
+              [ "$allowed" = "$suite" ] && return 0
+            done
+            return 1
+          }
           TOTAL_PASS=0
           TOTAL_FAIL=0
           FAILED=()
@@ -246,10 +263,23 @@ jobs:
             echo "::group::$s"
             OUT=$(bash "backend/tests/$s" 2>&1) && RC=0 || RC=$?
             echo "$OUT" | tail -80
-            # Match both summary styles: some suites prefix with a
-            # box-drawing "║ Results:" line, others use bare "Results:"
-            # with leading whitespace. tail -1 picks the final summary.
-            SUMMARY=$(echo "$OUT" | grep -E '(║.*)?Results: *[0-9]+ passed' | tail -1)
+            # A suite's assertion count comes from a line containing
+            # "Results: N passed, M failed". Unanchored, so whatever a
+            # suite wraps that phrase in is irrelevant. BOTH counts are
+            # required: a line carrying only the passed count leaves F
+            # silently zero, so it matches nothing here and lands on the
+            # "no parsable count" branch below. Suites print other output
+            # after the summary (frame edges, skip notes, error dumps),
+            # so this takes the LAST matching line, not the last line of
+            # output — the count a suite reports last is the one that
+            # counts.
+            # `|| true` is inert today and deliberate: the pipeline's
+            # status is tail's, which is 0 even when grep matched
+            # nothing. It only does work if pipefail is ever enabled on
+            # this step, where grep's exit 1 would otherwise abort it.
+            # Unlike the `|| echo 0` below, which IS load-bearing today —
+            # those pipelines end in a grep that returns 1 on no match.
+            SUMMARY=$(echo "$OUT" | grep -E 'Results: *[0-9]+ passed, *[0-9]+ failed' | tail -1 || true)
             P=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)
             F=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '^[0-9]+' || echo 0)
             TOTAL_PASS=$((TOTAL_PASS + ${P:-0}))
@@ -257,6 +287,18 @@ jobs:
             echo "::endgroup::"
             echo "▸ $s: ${P:-0} passed, ${F:-0} failed (rc=$RC)"
             if [ "$RC" != "0" ] || [ "${F:-0}" != "0" ]; then
+              FAILED+=("$s")
+            elif [ "${P:-0}" = "0" ] && ! is_empty_allowed "$s"; then
+              # rc=0 with no assertions counted. A suite that returned
+              # early without asserting anything looks exactly like one
+              # that ran and passed, so fail the build rather than let
+              # it read as a pass. (The 0 is already in the total above;
+              # this is what stops the total being believed.)
+              if [ -z "$SUMMARY" ]; then
+                echo "::error::$s produced no parsable assertion count: no line matching 'Results: N passed, M failed' — a summary carrying only one of the two counts does not parse"
+              else
+                echo "::error::$s produced no parsable assertion count: summary line reported 0 passed ($SUMMARY)"
+              fi
               FAILED+=("$s")
             fi
           done

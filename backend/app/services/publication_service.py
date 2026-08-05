@@ -887,7 +887,11 @@ _PUBLICATION_SELECT = (
 
 
 async def list_publications(vault_id: uuid.UUID, resource_type: str | None = None) -> list[dict]:
-    """List active publications for a vault. Returns public dicts."""
+    """List active publications for a vault. Returns public dicts.
+
+    Returns every row, unpaginated. That is a contract two callers rely on —
+    see `list_publications_route` before adding a page bound.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if resource_type:

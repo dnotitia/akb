@@ -228,5 +228,7 @@ R=$(mcp "$PAT" "$SID" akb_delete_vault "{\"vault\":\"$VAULT\"}")
 assert_ok "$R" "cleanup: ephemeral vault + tables deleted"
 
 echo ""
-echo "── #215 e2e: $PASS passed, $FAIL failed ──"
-if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${ERRORS[@]}"; exit 1; fi
+if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${ERRORS[@]}"; fi
+# Canonical summary — the CI runner parses this line for the counts.
+echo "── #215 e2e — Results: $PASS passed, $FAIL failed ──"
+[ "$FAIL" -eq 0 ] || exit 1
