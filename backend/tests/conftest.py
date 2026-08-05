@@ -16,6 +16,7 @@ import.
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,13 @@ _EXAMPLE_APP_YAML = _REPO_ROOT / "config" / "app.yaml.example"
 
 if not _BACKEND_APP_YAML.exists() and _EXAMPLE_APP_YAML.exists():
     _BACKEND_CFG_DIR.mkdir(parents=True, exist_ok=True)
-    _BACKEND_APP_YAML.write_text(_EXAMPLE_APP_YAML.read_text())
+    _BACKEND_APP_YAML.write_text(
+        _EXAMPLE_APP_YAML.read_text().replace(
+            "git_storage_path: /data/vaults",
+            f"git_storage_path: {tempfile.mkdtemp(prefix='akb-test-vaults-')}",
+            1,
+        )
+    )
 
 
 @pytest.fixture
