@@ -51,6 +51,23 @@ R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=Pub%20test")
 uri_file_id() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.rsplit('/',1)[-1] if u else '')"; }
 uri_doc_path() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.split('/doc/',1)[1] if '/doc/' in u else '')"; }
 
+# Helpers: split one `curl -w '\n%{http_code}'` response into its two halves, so
+# a status and a body can be asserted without paying for a second request. The
+# status is the last line; the body is everything before it, and `sed '$d'` drops
+# that appended line even when the body itself ends without a newline. A
+# transport failure yields code 000 and an empty body, which fails both
+# assertions rather than passing either.
+http_status() { printf '%s' "$1" | tail -1; }
+http_body()   { printf '%s' "$1" | sed '$d'; }
+
+# Helper: count the publications in a listing body that carry a given slug.
+# Reads the body on stdin and takes the slug via argv — this is the one value in
+# the suite that would otherwise be interpolated into python source, where a
+# quote in a slug would be a SyntaxError rather than a wrong answer.
+pub_rows_with_slug() {
+  python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin)["publications"] if p.get("slug") == sys.argv[1]))' "$1" 2>/dev/null
+}
+
 # Create a doc. Backend response carries `uri` + `path` only — there is no
 # legacy `doc_id` field. REST routes that take a `doc_id` accept the doc
 # path verbatim via document_repo.find_by_ref().
@@ -96,19 +113,22 @@ DOC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).g
 [ -n "$DOC_SLUG" ] && pass "Create document publication" || fail "Create doc pub" "$R"
 
 # Response shape: canonical public dict only — no internal/legacy fields.
-# The "PARSED:" marker is what makes this an absence assertion rather than a
-# silence assertion: an unparsable body prints nothing and an error body has no
-# `slug`, so neither can read as "no internal fields present".
+# Convention used by every absence assertion in this suite: the parser prints
+# `OK:` only when the body is the real response AND the field is absent, and
+# `BAD:<reason>` when the body is not that response at all. An unparsable body
+# prints nothing. All three are compared against the fixed string "OK:", so no
+# error path can read as "the field is correctly absent".
 LEAKS=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 forbidden = ["id", "publication_id", "public_url", "public_url_full",
              "public_base", "snapshot_s3_key", "password_hash", "vault_id"]
-found = [k for k in forbidden if k in d]
 if not d.get("slug"):
-    found.append("<not-a-publication-response>")
-print("PARSED:" + ",".join(found))' 2>/dev/null)
-[ "$LEAKS" = "PARSED:" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "${LEAKS:-unparsable body}: $R"
+    print("BAD:not-a-publication-response")
+else:
+    found = [k for k in forbidden if k in d]
+    print("OK:leaked=" + ",".join(found) if found else "OK:")' 2>/dev/null)
+[ "$LEAKS" = "OK:" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "${LEAKS:-unparsable body}: $R"
 
 # share_url is always absolute (AKB_PUBLIC_BASE_URL is startup-required).
 SU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("share_url",""))' 2>/dev/null)
@@ -140,7 +160,8 @@ d = json.load(sys.stdin)
 if d.get("resource_type") != "document" or not d.get("title"):
     print("BAD:not-a-document-publication-response")
 else:
-    print("OK:" + ",".join(k for k in ("created_by", "status", "created_at") if k in d))' 2>/dev/null)
+    leaked = [k for k in ("created_by", "status", "created_at") if k in d]
+    print("OK:leaked=" + ",".join(leaked) if leaked else "OK:")' 2>/dev/null)
 [ "$F8" = "OK:" ] && pass "F8: doc response omits created_by/status/created_at" || fail "F8 metadata leak" "${F8:-unparsable body}: $R"
 
 # F6: owner-capability probe — anonymous can't edit; the authenticated owner can.
@@ -416,14 +437,14 @@ SS_AT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(
 # Snapshot response must not leak the internal s3 key. Establish the body is a
 # real snapshot response first — a failed snapshot call carries no s3 key either,
 # and that must not read as "the key is correctly hidden".
-HAS_S3=$(echo "$R" | python3 -c '
+SS_LEAK=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 if d.get("mode") != "snapshot":
-    print("not-a-snapshot-response")
+    print("BAD:not-a-snapshot-response")
 else:
-    print("yes" if "snapshot_s3_key" in d else "no")' 2>/dev/null)
-[ "$HAS_S3" = "no" ] && pass "Snapshot response hides snapshot_s3_key" || fail "Snapshot leak" "${HAS_S3:-unparsable body}: $R"
+    print("OK:leaks-snapshot_s3_key" if "snapshot_s3_key" in d else "OK:")' 2>/dev/null)
+[ "$SS_LEAK" = "OK:" ] && pass "Snapshot response hides snapshot_s3_key" || fail "Snapshot leak" "${SS_LEAK:-unparsable body}: $R"
 
 # After snapshot, /public returns mode=snapshot
 R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
@@ -444,14 +465,16 @@ ROWS=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 rows = d.get("rows")
-if d.get("mode") != "snapshot" or not rows:
-    print("BAD")
+if d.get("mode") != "snapshot":
+    print("BAD:mode=" + str(d.get("mode")))
+elif not rows:
+    print("BAD:no-rows")
 else:
-    print("ROWS:" + ",".join(r["name"] for r in rows))' 2>/dev/null)
+    print("OK:" + ",".join(r["name"] for r in rows))' 2>/dev/null)
 case "$ROWS" in
-  ROWS:*SnapTest*) fail "Snapshot freeze" "serves post-snapshot INSERT: $ROWS" ;;
-  ROWS:*)          pass "Snapshot freezes data (no SnapTest)" ;;
-  *)               fail "Snapshot freeze" "no usable snapshot rows to check: $R" ;;
+  OK:*SnapTest*) fail "Snapshot freeze" "serves post-snapshot INSERT: $ROWS" ;;
+  OK:*)          pass "Snapshot freezes data (no SnapTest)" ;;
+  *)             fail "Snapshot freeze" "no usable snapshot rows to check: ${ROWS:-unparsable body}: $R" ;;
 esac
 
 # snapshot only supported for table_query
@@ -488,7 +511,7 @@ d = json.load(sys.stdin)
 if d.get("resource_type") != "file" or not d.get("mime_type"):
     print("BAD:not-a-file-publication-response")
 else:
-    print("OK:present" if "download_url" in d else "OK:")' 2>/dev/null)
+    print("OK:download_url-present" if "download_url" in d else "OK:")' 2>/dev/null)
 [ "$DL" = "OK:" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "${DL:-unparsable body}: $R"
 
 # /raw proxies content (CORS-safe for browser)
@@ -512,8 +535,11 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FILE_SL
 # (`document_service._VAULT_NAME_RE`: lowercase alnum with single hyphens) —
 # an underscore here 422s and leaves the whole section with nothing to publish.
 IDOR_V="pubidor-$(date +%s)-$RANDOM"
-CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor")
-[ "$CODE" = "200" ] && pass "second vault created" || fail "second vault create" "HTTP $CODE"
+# Body kept, not discarded: this is the step that silently 422'd on the old
+# underscore name, and the 422 detail names the offending field.
+R=$(acurl -w '\n%{http_code}' -X POST "$BASE_URL/api/v1/vaults?name=$IDOR_V&description=idor")
+CODE=$(http_status "$R")
+[ "$CODE" = "200" ] && pass "second vault created" || fail "second vault create" "HTTP $CODE: $(http_body "$R")"
 IINIT=$(acurl -X POST "$BASE_URL/api/v1/files/$IDOR_V/upload?filename=secret.txt&collection=s&mime_type=text/plain")
 IURI=$(echo "$IINIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])' 2>/dev/null)
 IFID=$(printf '%s' "$IURI" | uri_file_id)
@@ -527,8 +553,8 @@ CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/files/$IDO
 # attacker (owner of $VAULT) tries to publish vault-B's file UUID through $VAULT
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}" -w '\n%{http_code}')
-IDOR_CODE=$(printf '%s' "$R" | tail -1)
-IDOR_SLUG=$(printf '%s' "$R" | sed '$d' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+IDOR_CODE=$(http_status "$R")
+IDOR_SLUG=$(http_body "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
 # An absent slug alone would also be satisfied by a 500 or an unparsable body, so
 # the expected 400 refusal is asserted alongside it.
 [ "$IDOR_CODE" = "400" ] && [ -z "$IDOR_SLUG" ] \
@@ -574,8 +600,8 @@ echo "▸ 10. Embed + oEmbed"
 # fetching twice to read the status and the body separately would spend two views
 # on this publication and any later max_views on it would look like a product bug.
 R=$(curl -sk -w '\n%{http_code}' "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
-CODE=$(printf '%s' "$R" | tail -1)
-DEMB=$(printf '%s' "$R" | sed '$d' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("embed"), d.get("title","")))' 2>/dev/null)
+CODE=$(http_status "$R")
+DEMB=$(http_body "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("embed"), d.get("title","")))' 2>/dev/null)
 [ "$CODE" = "200" ] && pass "document /embed returns 200" || fail "document /embed" "HTTP $CODE"
 [ "$DEMB" = "True|Pub Doc" ] && pass "document /embed carries embed=true + doc title" || fail "document /embed body" "${DEMB:-unparsable body}: $R"
 
@@ -724,17 +750,19 @@ case "$MCP_SHARE" in
   http://*|https://*) pass "MCP akb_publish: share_url absolute" ;;
   *) fail "MCP share_url" "$MCP_SHARE" ;;
 esac
-# Same absence-assertion shape as the REST check above: an error body and an
-# unparsable body both carry no legacy fields, so require a real publication.
+# Same OK:/BAD: absence-assertion shape as the REST check in section 1: an error
+# body and an unparsable body both carry no legacy fields, so require a real
+# publication before reading the absence as meaningful.
 LEAKS=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 forbidden = ["publication_id","public_url","public_url_full","public_base"]
-found = [k for k in forbidden if k in d]
 if not d.get("slug"):
-    found.append("<not-a-publication-response>")
-print("PARSED:" + ",".join(found))' 2>/dev/null)
-[ "$LEAKS" = "PARSED:" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "${LEAKS:-unparsable body}: $R"
+    print("BAD:not-a-publication-response")
+else:
+    found = [k for k in forbidden if k in d]
+    print("OK:leaked=" + ",".join(found) if found else "OK:")' 2>/dev/null)
+[ "$LEAKS" = "OK:" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "${LEAKS:-unparsable body}: $R"
 
 # akb_unpublish by FILE uri — the bug case that 0.5.x silently rejected.
 FU_RES=$(mcp 18 akb_publish "{\"uri\":\"$FILE_URI\",\"resource_type\":\"file\"}" | mcp_text)
@@ -943,12 +971,11 @@ acurl -X DELETE "$BASE_URL/api/v1/files/$VAULT/$FID" > /dev/null
 # also 404s. The owner's list is the condition — the row itself must be gone.
 if [ -n "$CSC_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLUG")
-  LEFT=$(acurl "$BASE_URL/api/v1/publications/$VAULT" | python3 -c "
-import json, sys
-print(sum(1 for p in json.load(sys.stdin)['publications'] if p.get('slug') == '$CSC_SLUG'))" 2>/dev/null)
+  PUBS=$(acurl "$BASE_URL/api/v1/publications/$VAULT")
+  LEFT=$(printf '%s' "$PUBS" | pub_rows_with_slug "$CSC_SLUG")
   [ "$CODE" = "404" ] && [ "$LEFT" = "0" ] \
     && pass "File delete cascades publications (404 + row removed)" \
-    || fail "File cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}"
+    || fail "File cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}: $PUBS"
 else
   fail "File cascade" "no publication slug to check the cascade against: $R"
 fi
@@ -963,12 +990,11 @@ DOC_CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdi
 acurl -X DELETE "$BASE_URL/api/v1/documents/$VAULT/$CASCADE_DOC" > /dev/null
 if [ -n "$DOC_CSC_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_CSC_SLUG")
-  LEFT=$(acurl "$BASE_URL/api/v1/publications/$VAULT" | python3 -c "
-import json, sys
-print(sum(1 for p in json.load(sys.stdin)['publications'] if p.get('slug') == '$DOC_CSC_SLUG'))" 2>/dev/null)
+  PUBS=$(acurl "$BASE_URL/api/v1/publications/$VAULT")
+  LEFT=$(printf '%s' "$PUBS" | pub_rows_with_slug "$DOC_CSC_SLUG")
   [ "$CODE" = "404" ] && [ "$LEFT" = "0" ] \
     && pass "Document delete cascades publications (404 + row removed)" \
-    || fail "Doc cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}"
+    || fail "Doc cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}: $PUBS"
 else
   fail "Doc cascade" "no publication slug to check the cascade against: $R"
 fi
