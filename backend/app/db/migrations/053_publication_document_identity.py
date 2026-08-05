@@ -218,12 +218,18 @@ _MISMATCH_SAMPLE = 20
 
 
 async def migrate(conn=None):
+    """Apply the migration. Returns the backfill's per-category counts.
+
+    The runner ignores the return value; it exists so the counts are a value
+    the caller can assert on rather than only a line in a log. What an
+    operator reads to decide whether a backfill can be trusted should be
+    something a test can hold to account.
+    """
     if conn is None:
         pool = await get_pool()
         async with pool.acquire() as new_conn:
-            await _run(new_conn)
-    else:
-        await _run(conn)
+            return await _run(new_conn)
+    return await _run(conn)
 
 
 async def _column_exists(conn, table: str, column: str) -> bool:
@@ -356,12 +362,19 @@ async def _ensure_documents_identity_unique(conn) -> None:
         # Invalid: the remains of a cancelled CONCURRENTLY build. It enforces
         # nothing and `IF NOT EXISTS` would step over it silently, so drop it
         # and build for real below.
+        #
+        # A plain DROP, not CONCURRENTLY. Dropping concurrently waits for every
+        # transaction that could be using the index — a wait `lock_timeout`
+        # does not bound, which makes it the statement here most likely to be
+        # cancelled at the pool's 30s limit — and it cannot run inside a
+        # transaction at all. All to avoid a brief lock while removing an
+        # index that is invalid, and therefore in use by nothing.
         logger.warning(
             "Migration 053: found an INVALID index named %s (a cancelled "
             "CREATE INDEX CONCURRENTLY leaves one behind); dropping it before "
             "building the constraint", _DOC_UNIQUE,
         )
-        await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_DOC_UNIQUE}")
+        await conn.execute(f"DROP INDEX IF EXISTS {_DOC_UNIQUE}")
 
     await conn.execute(
         f"ALTER TABLE documents ADD CONSTRAINT {_DOC_UNIQUE} UNIQUE (id, vault_id)"
@@ -433,6 +446,7 @@ async def _ensure_publication_document_index(conn) -> None:
     found = await conn.fetchrow(
         """
         SELECT i.indisvalid                          AS is_valid,
+               i.indisunique                         AS is_unique,
                i.indrelid = to_regclass('public.publications') AS on_publications,
                pg_get_indexdef(i.indexrelid)         AS definition
           FROM pg_index i
@@ -441,7 +455,14 @@ async def _ensure_publication_document_index(conn) -> None:
         _PUB_INDEX,
     )
     if found is not None:
-        if not found["on_publications"] or _PUB_INDEX_COLS not in found["definition"]:
+        # `is_unique` is checked for the same reason the documents guard checks
+        # it, inverted: this one must NOT be unique. Adopting a UNIQUE index of
+        # that name would quietly forbid a second publication of one document.
+        if (
+            not found["on_publications"]
+            or found["is_unique"]
+            or _PUB_INDEX_COLS not in found["definition"]
+        ):
             raise RuntimeError(
                 f"An index named {_PUB_INDEX} already exists but is not the "
                 f"cascade index migration 053 creates.\n  found: {found['definition']}\n"
@@ -460,9 +481,10 @@ async def _ensure_publication_document_index(conn) -> None:
     )
 
 
-async def _backfill(conn) -> None:
+async def _backfill(conn) -> dict:
     """Bind existing document publications to their document, where that is
-    unambiguous. See the module docstring for the conditions.
+    unambiguous. See the module docstring for the conditions. Returns the
+    per-category counts it logs.
 
     Re-runnable: only rows with ``document_id IS NULL`` are considered, so a
     second run binds nothing and reports the already-bound rows under their
@@ -493,6 +515,7 @@ async def _backfill(conn) -> None:
     unreadable_uri = 0
     path_reused = 0
     no_document = 0
+    changed_underfoot = 0
     vault_mismatch = 0
     # Bounded sample, not every id: the log names a handful so an operator can
     # pull the rows, and the count carries the rest. A per-row list would be
@@ -585,31 +608,65 @@ async def _backfill(conn) -> None:
         bound += len(updated)
 
         done = {r["id"] for r in updated}
-        left_ids = [i for i in ids if i not in done]
-        left_paths = [p for i, p in zip(ids, paths, strict=True) if i not in done]
-        if left_ids:
-            # Split the leftovers: a path with no document at all versus a
-            # path now occupied by a document the publication predates.
-            occupied = await conn.fetchval(
+        left = [
+            (i, p, u, v)
+            for i, p, u, v in zip(ids, paths, uris, vaults, strict=True)
+            if i not in done
+        ]
+        if left:
+            # Why each leftover was left. The UPDATE can decline a row for four
+            # reasons and the counts are only worth reading if they name the
+            # right one, so this re-checks the same predicates rather than
+            # asking the weaker question "is anything at that path now" — which
+            # would file a row that moved underfoot as a reused path.
+            split = await conn.fetchrow(
                 """
-                SELECT COUNT(*)
-                  FROM unnest($1::uuid[], $2::text[]) AS c(pub_id, doc_path)
-                  JOIN publications p ON p.id = c.pub_id
-                  JOIN documents d
-                    ON d.vault_id = p.vault_id AND d.path = c.doc_path
+                WITH candidate AS (
+                    SELECT pub_id, doc_path, uri, uri_vault
+                      FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[])
+                        AS t(pub_id, doc_path, uri, uri_vault)
+                ), state AS (
+                    SELECT (p.id IS NOT NULL
+                            AND p.document_id IS NULL
+                            AND p.resource_uri IS NOT DISTINCT FROM c.uri
+                            AND v.name IS NOT DISTINCT FROM c.uri_vault) AS unchanged,
+                           d.id IS NOT NULL AS path_occupied
+                      FROM candidate c
+                      LEFT JOIN publications p ON p.id = c.pub_id
+                      LEFT JOIN vaults v ON v.id = p.vault_id
+                      LEFT JOIN documents d
+                        ON d.vault_id = p.vault_id AND d.path = c.doc_path
+                )
+                SELECT COUNT(*) FILTER (WHERE NOT unchanged)             AS changed,
+                       COUNT(*) FILTER (WHERE unchanged AND NOT path_occupied) AS absent,
+                       COUNT(*) FILTER (WHERE unchanged AND path_occupied)     AS reused
+                  FROM state
                 """,
-                left_ids, left_paths,
+                [r[0] for r in left], [r[1] for r in left],
+                [r[2] for r in left], [r[3] for r in left],
             )
-            path_reused += occupied
-            no_document += len(left_ids) - occupied
+            changed_underfoot += split["changed"]
+            no_document += split["absent"]
+            path_reused += split["reused"]
 
+    counts = {
+        "examined": examined,
+        "bound": bound,
+        "no_document": no_document,
+        "path_reused": path_reused,
+        "unreadable_uri": unreadable_uri,
+        "vault_mismatch": vault_mismatch,
+        "changed_underfoot": changed_underfoot,
+        "already_bound": already_bound or 0,
+        "non_document_publications": skipped_by_design or 0,
+    }
     logger.info(
         "Migration 053 backfill: bound=%d, no_document=%d, path_reused=%d, "
-        "unreadable_uri=%d, vault_mismatch=%d, already_bound=%d, "
-        "non_document_publications=%d (of %d document publications examined "
-        "this run)",
+        "unreadable_uri=%d, vault_mismatch=%d, changed_underfoot=%d, "
+        "already_bound=%d, non_document_publications=%d (of %d document "
+        "publications examined this run)",
         bound, no_document, path_reused, unreadable_uri, vault_mismatch,
-        already_bound or 0, skipped_by_design or 0, examined,
+        changed_underfoot, already_bound or 0, skipped_by_design or 0, examined,
     )
     if vault_mismatch:
         # The most interesting rows in the table if they exist: the vault the
@@ -622,15 +679,16 @@ async def _backfill(conn) -> None:
             "" if vault_mismatch <= _MISMATCH_SAMPLE
             else f" (first {_MISMATCH_SAMPLE} shown)",
         )
-    if no_document or path_reused or unreadable_uri:
+    unbound = no_document + path_reused + unreadable_uri + changed_underfoot
+    if unbound:
         logger.warning(
             "Migration 053: %d document publication(s) left unbound "
-            "(no_document=%d, path_reused=%d, unreadable_uri=%d). They keep "
-            "working through resource_uri; document_id stays NULL until they "
-            "are re-published.",
-            no_document + path_reused + unreadable_uri,
-            no_document, path_reused, unreadable_uri,
+            "(no_document=%d, path_reused=%d, unreadable_uri=%d, "
+            "changed_underfoot=%d). They keep working through resource_uri; "
+            "document_id stays NULL until they are re-published.",
+            unbound, no_document, path_reused, unreadable_uri, changed_underfoot,
         )
+    return counts
 
 
 async def _run(conn):
@@ -645,7 +703,7 @@ async def _run(conn):
     await _ensure_documents_identity_unique(conn)
     await _ensure_publication_identity(conn)
     await _ensure_publication_document_index(conn)
-    await _backfill(conn)
+    return await _backfill(conn)
 
 
 async def _main():

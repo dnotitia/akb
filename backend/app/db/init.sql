@@ -248,9 +248,25 @@ CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_id);
 -- index is enough; we used to keep idx_chunks_vector_pending alongside
 -- this for vector_next_attempt_at, but the planner was selecting the
 -- ORDER-BY-aligned index anyway, so the second one was dead weight.
-CREATE INDEX IF NOT EXISTS idx_chunks_indexing_queue
-    ON chunks (created_at DESC, id)
- WHERE vector_indexed_at IS NULL;
+-- Guarded on the column: `vector_indexed_at` arrives with migration 009, and
+-- this file runs before any migration, so an unguarded reference would abort
+-- init.sql on a database that predates it — see the note just below, which is
+-- the same hazard handled by leaving idx_chunks_vault_id to migration 014.
+-- Dead in practice (009 is applied everywhere), guarded so the pattern in this
+-- file is uniform.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chunks'
+           AND column_name = 'vector_indexed_at'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_chunks_indexing_queue
+            ON chunks (created_at DESC, id)
+         WHERE vector_indexed_at IS NULL;
+    END IF;
+END $$;
 -- idx_chunks_vault_id is created by migration 014 because on a pre-existing
 -- DB the chunks table is older than the vault_id column. Putting the index
 -- here would fail on the very first init.sql pass after upgrade (column
@@ -295,7 +311,19 @@ CREATE TABLE IF NOT EXISTS vault_migrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_tables_vault ON vault_tables(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
+-- Guarded on the column: `vault_tables.collection_id` arrives with migration 020. Dead in practice, guarded so every
+-- statement in this file that names a migration-added column follows one rule.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'vault_tables'
+           AND column_name = 'collection_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_table ON vault_table_rows(table_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_data ON vault_table_rows USING gin(data);
 CREATE INDEX IF NOT EXISTS idx_vault_migrations_vault_applied
@@ -389,7 +417,19 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
+-- Guarded on the column: `vault_files.collection_id` arrives with migration 020. Dead in practice, guarded so every
+-- statement in this file that names a migration-added column follows one rule.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'vault_files'
+           AND column_name = 'collection_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
+    END IF;
+END $$;
 
 -- ============================================================
 -- Publications (unified public-link feature for documents, tables, files)
@@ -458,7 +498,22 @@ CREATE TABLE IF NOT EXISTS publications (
 
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
-CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
+-- Guarded on the column for the same reason as the cascade index below:
+-- `resource_uri` arrives with migration 022. Dead in practice (022 is applied
+-- everywhere) — guarded so every statement in this file that names a
+-- migration-added column follows one rule.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'publications'
+           AND column_name = 'resource_uri'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_publications_resource_uri
+            ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
+    END IF;
+END $$;
 -- Referencing side of publications_document_fk: without it, every document
 -- delete seq-scans this table to find the rows to cascade. Partial because
 -- most rows are NULL and `document_id = $1` implies NOT NULL, so the cascade

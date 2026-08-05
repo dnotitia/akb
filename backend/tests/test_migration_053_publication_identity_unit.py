@@ -106,8 +106,9 @@ async def _fresh_database(*, undo_053: bool = False):
         await admin.close()
 
 
-async def _apply(conn) -> None:
-    await _load("053_publication_document_identity.py").migrate(conn=conn)
+async def _apply(conn) -> dict:
+    """Apply the migration, returning the backfill's per-category counts."""
+    return await _load("053_publication_document_identity.py").migrate(conn=conn)
 
 
 # ------------------------------------------------------------------
@@ -241,6 +242,38 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
         shape = await _shape(conn)
         await conn.execute(_INIT_SQL)
         assert await _shape(conn) == shape
+
+
+# Every column named by a STANDALONE statement in init.sql that some
+# migration adds. A database that predates the migration has the table but not
+# the column, and init.sql runs first, so each of these needs a guard or the
+# boot aborts before migrations can fix anything.
+_MIGRATION_ADDED_COLUMNS = [
+    ("publications", "document_id", "idx_publications_document_id"),   # 053
+    ("publications", "resource_uri", "idx_publications_resource_uri"),  # 022
+    ("chunks", "vector_indexed_at", "idx_chunks_indexing_queue"),       # 009
+    ("vault_tables", "collection_id", "idx_vault_tables_collection"),   # 020
+    ("vault_files", "collection_id", "idx_vault_files_collection"),     # 020
+]
+
+
+@pytest.mark.parametrize("table,column,index", _MIGRATION_ADDED_COLUMNS)
+async def test_init_sql_survives_a_database_missing_a_migration_added_column(
+    table, column, index,
+):
+    """The boot-loop class, as a rule rather than one instance of it.
+
+    All but the first are dead in practice — their migrations are applied
+    everywhere — and they are checked anyway, because the cost of the rule
+    being unevenly applied is that the next person reads the guarded
+    statements as optional.
+    """
+    async with _fresh_database() as conn:
+        await conn.execute(f"ALTER TABLE {table} DROP COLUMN {column} CASCADE")
+
+        await conn.execute(_INIT_SQL)  # must not raise
+
+        assert await conn.fetchval(f"SELECT to_regclass('public.{index}')") is None
 
 
 async def test_a_document_cannot_be_moved_out_from_under_a_publication():
@@ -388,6 +421,74 @@ async def test_backfill_binds_only_unambiguous_rows_and_deletes_nothing():
         assert await conn.fetchval("SELECT COUNT(*) FROM publications") == before
 
 
+async def test_the_backfill_reports_a_count_for_every_category(caplog):
+    """The per-category counts are a contract, not debug output.
+
+    They are what an operator reads to decide whether a backfill can be
+    trusted, so a row landing in the wrong bucket is a real defect even when
+    the end state is right — "48 bound, 1 path reused" and "48 bound, 1 vault
+    mismatch" describe very different databases and would prompt very
+    different decisions. Asserting only that unbindable rows end up NULL
+    cannot tell those apart.
+    """
+    async with _fresh_database(undo_053=True) as conn:
+        own = f"counts-{uuid.uuid4().hex[:8]}"
+        elsewhere = f"counts-other-{uuid.uuid4().hex[:8]}"
+        vault = await _vault(conn, own)
+        other_vault = await _vault(conn, elsewhere)
+
+        # bound
+        await _document(conn, vault, "keep.md")
+        await _publication(conn, vault, f"akb://{own}/doc/keep.md")
+        # no_document
+        await _publication(conn, vault, f"akb://{own}/doc/gone.md")
+        # path_reused — document postdates the publication
+        older = await conn.fetchval("SELECT NOW() - INTERVAL '1 hour'")
+        await _publication(conn, vault, f"akb://{own}/doc/reused.md", created_at=older)
+        await _document(conn, vault, "reused.md")
+        # vault_mismatch — with a same-path document in the row's OWN vault, so
+        # only the vault-name comparison can refuse it
+        await _document(conn, vault, "both.md")
+        await _document(conn, other_vault, "both.md")
+        await _publication(conn, vault, f"akb://{elsewhere}/doc/both.md")
+        # unreadable_uri
+        await _publication(conn, vault, f"akb://{own}/doc/{{template}}.md")
+        # non_document_publications
+        await _publication(conn, vault, None, resource_type="table_query")
+        await _publication(
+            conn, vault, f"akb://{own}/file/{uuid.uuid4()}", resource_type="file"
+        )
+
+        with caplog.at_level("INFO", logger="akb.migration.053"):
+            first = await _apply(conn)
+
+        assert first == {
+            "examined": 5,
+            "bound": 1,
+            "no_document": 1,
+            "path_reused": 1,
+            "unreadable_uri": 1,
+            "vault_mismatch": 1,
+            "changed_underfoot": 0,
+            "already_bound": 0,
+            "non_document_publications": 2,
+        }
+        # The log an operator reads carries the same figures as the return
+        # value a test can assert on — otherwise only one of them is checked.
+        summary = next(
+            r.getMessage() for r in caplog.records if "backfill:" in r.getMessage()
+        )
+        for key, value in first.items():
+            if key == "examined":
+                continue
+            assert f"{key}={value}" in summary, f"{key} missing from {summary!r}"
+
+        # Re-run: the bound row moves into already_bound and is not counted
+        # again, and every refusal is reported identically.
+        second = await _apply(conn)
+        assert second == {**first, "examined": 4, "bound": 0, "already_bound": 1}
+
+
 async def test_rerunning_changes_nothing():
     async with _fresh_database(undo_053=True) as conn:
         own = f"idem-{uuid.uuid4().hex[:8]}"
@@ -494,6 +595,17 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
         with pytest.raises(RuntimeError, match="not the cascade index"):
             await _apply(conn)
 
+    # Right name, right table, right columns — but UNIQUE, which would let a
+    # document be published exactly once.
+    async with _fresh_database(undo_053=True) as conn:
+        await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
+        await conn.execute(
+            "CREATE UNIQUE INDEX idx_publications_document_id "
+            "ON publications (document_id, vault_id) WHERE document_id IS NOT NULL"
+        )
+        with pytest.raises(RuntimeError, match="not the cascade index"):
+            await _apply(conn)
+
 
 async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over():
     async with _fresh_database(undo_053=True) as conn:
@@ -542,9 +654,15 @@ async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_i
 
 
 async def test_the_backfill_pages_through_more_rows_than_one_batch():
-    """_BATCH is 500; the paging loop has to visit everything, exactly once."""
+    """_BATCH is 500; the paging loop has to visit everything, exactly once.
+
+    Including the row whose id is all zeroes. Nothing generates that id, but
+    the column accepts it, and a cursor that started from it with a strict `>`
+    would skip exactly that row — silently, since every other row still binds.
+    """
     module = _load("053_publication_document_identity.py")
     total = module._BATCH * 2 + 7
+    zero_id = uuid.UUID(int=0)
 
     async with _fresh_database(undo_053=True) as conn:
         name = f"paged-{uuid.uuid4().hex[:8]}"
@@ -560,22 +678,37 @@ async def test_the_backfill_pages_through_more_rows_than_one_batch():
             "  FROM generate_series(1, $3) g",
             vault, f"akb://{name}", total,
         )
+        # The lowest possible key, sorting before every generated one.
+        zero_doc = await _document(conn, vault, "zero.md")
+        await conn.execute(
+            "INSERT INTO publications (id, slug, vault_id, resource_type, resource_uri) "
+            "VALUES ($1, 'slug-zero', $2, 'document', $3)",
+            zero_id, vault, f"akb://{name}/doc/zero.md",
+        )
 
         await _apply(conn)
 
         assert await conn.fetchval(
+            "SELECT document_id FROM publications WHERE id = $1", zero_id
+        ) == zero_doc
+        assert await conn.fetchval(
             "SELECT COUNT(*) FROM publications WHERE document_id IS NULL"
         ) == 0
         # Each publication bound to its OWN document, not to some other page's.
+        # (The root-level `zero.md` row is asserted separately above; this
+        # covers the generated in-collection ones.)
         assert await conn.fetchval(
             """
             SELECT COUNT(*) FROM publications p JOIN documents d ON d.id = p.document_id
-             WHERE p.resource_uri <> 'akb://' || $1 || '/coll/p/doc/' ||
+             WHERE d.path LIKE 'p/%'
+               AND p.resource_uri <> 'akb://' || $1 || '/coll/p/doc/' ||
                    split_part(d.path, '/', 2)
             """,
             name,
         ) == 0
-        assert await conn.fetchval("SELECT COUNT(DISTINCT document_id) FROM publications") == total
+        assert await conn.fetchval(
+            "SELECT COUNT(DISTINCT document_id) FROM publications"
+        ) == total + 1
 
 
 async def test_migration_022_does_not_drop_the_identity_column():
