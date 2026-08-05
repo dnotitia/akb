@@ -671,6 +671,181 @@ def test_wait_for_postgres_stops_before_connecting_when_requested(
         runtime._wait_for_postgres()
 
 
+def test_backend_readiness_requires_the_ready_api_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+        )
+    )
+    responses = iter(
+        [
+            (200, b'{"status":"not_ready"}'),
+            (200, b'{"status":"ready"}'),
+        ]
+    )
+    requests: list[str] = []
+
+    class AliveProcess:
+        def poll(self) -> None:
+            return None
+
+    def fake_get(url: str) -> tuple[int, bytes]:
+        requests.append(url)
+        return next(responses)
+
+    runtime.backend_process = AliveProcess()  # type: ignore[assignment]
+    monkeypatch.setattr(e2e_runtime, "_http_get", fake_get)
+    monkeypatch.setattr(runtime.stop_event, "wait", lambda _seconds: False)
+
+    runtime._wait_for_backend()
+
+    assert requests == [f"{runtime.settings.origin}/readyz"] * 2
+
+
+def test_start_publishes_ready_only_after_fixture_reset_and_api_health(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready_file = tmp_path / "ready.json"
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=ready_file,
+        ),
+        repo_root=tmp_path,
+    )
+    events: list[str] = []
+
+    class AliveProcess:
+        def poll(self) -> None:
+            return None
+
+    def fixture_reset() -> None:
+        assert not ready_file.exists()
+        events.append("fixture_reset")
+
+    def api_health() -> None:
+        assert not ready_file.exists()
+        events.append("api_health")
+
+    real_write_ready_file = e2e_runtime.write_ready_file
+
+    def publish_ready(path: Path, payload: dict[str, object]) -> None:
+        assert events == ["git_reset", "fixture_reset", "api_health", "fixtures_written"]
+        real_write_ready_file(path, payload)
+        events.append("ready_published")
+
+    monkeypatch.setattr(e2e_runtime, "clear_git_fixture_root", lambda: events.append("git_reset"))
+    monkeypatch.setattr(e2e_runtime, "reset_database", lambda _url: fixture_reset())
+    monkeypatch.setattr(e2e_runtime, "write_runtime_config", lambda *_args: None)
+    monkeypatch.setattr(runtime, "_start_control_server", lambda: None)
+    monkeypatch.setattr(runtime, "_start_process", lambda *_args: AliveProcess())
+    monkeypatch.setattr(runtime, "_wait_for_embed", lambda: None)
+    monkeypatch.setattr(runtime, "_wait_for_backend", api_health)
+    monkeypatch.setattr(e2e_runtime, "seed_scenario", lambda _settings: (None, None))
+    monkeypatch.setattr(
+        e2e_runtime,
+        "write_fixture_artifacts",
+        lambda *_args: events.append("fixtures_written"),
+    )
+    monkeypatch.setattr(e2e_runtime, "write_ready_file", publish_ready)
+
+    runtime.start()
+
+    assert events[-1] == "ready_published"
+    assert json.loads(ready_file.read_text())["status"] == "ready"
+
+
+def test_fixture_reset_failure_never_leaves_a_ready_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready_file = tmp_path / "ready.json"
+    ready_file.write_text('{"status":"stale"}')
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=ready_file,
+        )
+    )
+
+    monkeypatch.setattr(e2e_runtime, "clear_git_fixture_root", lambda: None)
+    monkeypatch.setattr(
+        e2e_runtime,
+        "reset_database",
+        lambda _url: (_ for _ in ()).throw(RuntimeError("reset failed")),
+    )
+    monkeypatch.setattr(runtime, "shutdown", lambda: True)
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        runtime.start()
+
+    assert not ready_file.exists()
+    assert runtime.ready is False
+
+
+def test_backend_exit_invalidates_ready_and_marks_the_supervisor_failed(tmp_path: Path) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+        )
+    )
+
+    class Process:
+        def __init__(self, returncode: int | None) -> None:
+            self.returncode = returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    runtime.embed_process = Process(None)  # type: ignore[assignment]
+    runtime.backend_process = Process(1)  # type: ignore[assignment]
+    runtime._write_ready()
+
+    assert runtime._dependencies_alive() is False
+    assert runtime.failed is True
+    assert runtime.phase == "backend_runtime"
+    assert runtime.stop_event.is_set()
+    assert not runtime.settings.ready_file.exists()
+
+
+def test_managed_postgres_exit_invalidates_ready_and_marks_the_supervisor_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+            manage_postgres=True,
+            compose_project="akb-e2e-unit",
+        )
+    )
+
+    class AliveProcess:
+        def poll(self) -> None:
+            return None
+
+    class NoContainers:
+        stdout = ""
+
+    runtime.embed_process = AliveProcess()  # type: ignore[assignment]
+    runtime.backend_process = AliveProcess()  # type: ignore[assignment]
+    runtime._write_ready()
+    monkeypatch.setattr(runtime, "_run_compose", lambda *_args: NoContainers())
+
+    assert runtime._dependencies_alive() is False
+    assert runtime.failed is True
+    assert runtime.phase == "postgres_runtime"
+    assert runtime.stop_event.is_set()
+    assert not runtime.settings.ready_file.exists()
+
+
 def test_start_failure_cleans_up_partial_compose_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = e2e_runtime.E2ERuntime(
         e2e_runtime.RuntimeSettings(
@@ -751,6 +926,43 @@ def test_run_suites_calls_the_repository_owned_runner(monkeypatch: pytest.Monkey
     assert command == ["bash", str(tmp_path / "backend/scripts/ci/run_e2e_suites.sh")]
     assert options["cwd"] == tmp_path
     assert options["start_new_session"] is True
+
+
+def test_run_suites_returns_nonzero_when_a_dependency_dies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Process:
+        def __init__(self, returncode: int | None) -> None:
+            self.returncode = returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    suite_process = Process(None)
+    monkeypatch.setattr(e2e_runtime.subprocess, "Popen", lambda *_args, **_kwargs: suite_process)
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        e2e_runtime,
+        "_terminate_process_group",
+        lambda process: terminated.append(process),
+    )
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            ready_file=tmp_path / "ready.json",
+            run_suites=True,
+        ),
+        repo_root=tmp_path,
+    )
+    runtime.embed_process = Process(None)  # type: ignore[assignment]
+    runtime.backend_process = Process(1)  # type: ignore[assignment]
+    runtime._write_ready()
+
+    assert runtime.run_suites() == 1
+    assert runtime.failed is True
+    assert terminated == [suite_process]
+    assert not runtime.settings.ready_file.exists()
 
 
 def test_process_teardown_targets_the_child_process_group(monkeypatch: pytest.MonkeyPatch) -> None:

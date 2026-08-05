@@ -1339,7 +1339,8 @@ class E2ERuntime:
             status, body = _http_get(f"{self.settings.origin}/readyz")
             if status == 200:
                 try:
-                    if isinstance(json.loads(body), dict) and "status" in json.loads(body):
+                    payload = json.loads(body)
+                    if isinstance(payload, dict) and payload.get("status") == "ready":
                         return
                 except (TypeError, ValueError):
                     pass
@@ -1361,6 +1362,35 @@ class E2ERuntime:
         remove_ready_file(self.settings.ready_file)
         _terminate_process_group(self.backend_process)
         self.backend_process = None
+
+    def _managed_postgres_alive(self) -> bool:
+        containers = self._run_compose("ps", "-q", "postgres")
+        container_id = containers.stdout.strip()
+        if not container_id:
+            return False
+        state = self._run_docker(
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.Health.Status}}",
+            container_id,
+        )
+        return state.stdout.strip() == "running healthy"
+
+    def _dependencies_alive(self) -> bool:
+        with self.reset_lock:
+            if self.embed_process is None or self.embed_process.poll() is not None:
+                self.phase = "embedding_runtime"
+            elif self.backend_process is None or self.backend_process.poll() is not None:
+                self.phase = "backend_runtime"
+            elif self.settings.manage_postgres and not self._managed_postgres_alive():
+                self.phase = "postgres_runtime"
+            else:
+                return True
+            self.failed = True
+            self.ready = False
+            remove_ready_file(self.settings.ready_file)
+            self.stop_event.set()
+            return False
 
     def start(self) -> None:
         try:
@@ -1448,6 +1478,9 @@ class E2ERuntime:
         )
         try:
             while self.suite_process.poll() is None:
+                if not self._dependencies_alive():
+                    _terminate_process_group(self.suite_process)
+                    return 1
                 if self.stop_event.wait(0.5):
                     _terminate_process_group(self.suite_process)
                     return 130
@@ -1457,11 +1490,8 @@ class E2ERuntime:
 
     def wait(self) -> None:
         while not self.stop_event.wait(0.5):
-            for process in (self.embed_process, self.backend_process):
-                if process is not None and process.poll() is not None:
-                    self.failed = True
-                    self.stop_event.set()
-                    break
+            if not self._dependencies_alive():
+                return
 
     def shutdown(self) -> bool:
         cleanup_ok = True
