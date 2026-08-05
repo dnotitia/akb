@@ -171,8 +171,24 @@ async def _orphan_the_publication(pool, doc_id: uuid.UUID) -> None:
     Deliberately NOT `delete_with_publications` — this reproduces what the
     pre-fix delete paths did, which is the only way to reach the state the
     guard exists for now that the product refuses to produce it.
+
+    **`document_id` is cleared first, and that narrows what an orphan can
+    now be.** A publication created today carries the id of the document it
+    was resolved from, under a composite FK with ON DELETE CASCADE — so even
+    the raw DELETE below takes the publication with it, and no orphan
+    results. What survives a document is a row whose `document_id` is NULL: a
+    publication predating migration 058 that the backfill could not bind
+    unambiguously, which is exempt from the FK. Clearing the column is how
+    this manufactures one, and those legacy rows are the population this
+    guard still exists for. The guard stops being reachable at all once the
+    last NULL is gone; until then it is the only thing standing between such
+    a row and the next document to occupy its path.
     """
     async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE publications SET document_id = NULL WHERE document_id = $1",
+            doc_id,
+        )
         await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
 
 

@@ -304,9 +304,10 @@ class CollectionService:
                 # concurrent writers across the entire vault.
 
                 # The row delete goes through the repository chokepoint, which
-                # carries the publication cascade with it. `publications` lost
-                # its `document_id` FK in migration 022, so nothing cascades —
-                # and this loop, deleting the rows by hand, is where that was
+                # carries the publication cascade with it. Migration 058's FK
+                # cascades only publications that carry a `document_id`, so a
+                # legacy row the backfill left NULL still needs the explicit
+                # cleanup — and this loop, deleting the rows by hand, is where that was
                 # first forgotten: the orphaned publication's slug still
                 # resolved by path, and since `documents` is
                 # UNIQUE(vault_id, path), the next document created (or moved)

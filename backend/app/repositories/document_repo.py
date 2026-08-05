@@ -361,9 +361,11 @@ class DocumentRepository:
         to it. Returns True when a row was actually removed.
 
         **This is the only place an ordinary document row may be deleted.**
-        Publications lost their ``document_id`` FK in migration 022, so
-        nothing cascades: a delete that skips the publication cleanup leaves
-        a slug that still resolves *by path*, and because ``documents`` is
+        Migration 058 restored a database cascade, but only for publications
+        that carry a ``document_id``; the column is nullable and rows the
+        backfill could not bind unambiguously are exempt from the FK. For
+        those, nothing cascades: a delete that skips the publication cleanup
+        leaves a slug that still resolves *by path*, and because ``documents`` is
         ``UNIQUE(vault_id, path)`` the next document created at that path
         would then be reached through that old link. Of the three per-row
         delete paths, two omitted the cleanup — and they omitted it because

@@ -117,7 +117,7 @@ async def test_document_get_computes_body_hash_and_repairs_projection(monkeypatc
     async def fake_repos():
         return _FakeVaultRepo(vault_id), doc_repo, object()
 
-    async def fake_public_slug(vault: str, path: str) -> None:
+    async def fake_public_slug(row: dict) -> None:
         return None
 
     monkeypatch.setattr(service, "_repos", fake_repos)
@@ -168,7 +168,7 @@ async def test_document_get_hashes_empty_body_as_valid_content(monkeypatch) -> N
     async def fake_repos():
         return _FakeVaultRepo(vault_id), doc_repo, object()
 
-    async def fake_public_slug(vault: str, path: str) -> None:
+    async def fake_public_slug(row: dict) -> None:
         return None
 
     monkeypatch.setattr(service, "_repos", fake_repos)
@@ -274,7 +274,7 @@ async def test_document_get_reads_body_at_current_commit_not_head(monkeypatch) -
     async def fake_repos():
         return _FakeVaultRepo(uuid.uuid4()), _FakeDocRepo(row), object()
 
-    async def fake_public_slug(vault: str, path: str) -> None:
+    async def fake_public_slug(row: dict) -> None:
         return None
 
     monkeypatch.setattr(service, "_repos", fake_repos)
@@ -471,7 +471,7 @@ async def test_get_after_put_confirms_hash_and_self_heal_is_noop(monkeypatch) ->
     async def fake_repos():
         return _FakeVaultRepo(uuid.uuid4()), get_repo, object()
 
-    async def fake_public_slug(vault: str, path: str) -> None:
+    async def fake_public_slug(row: dict) -> None:
         return None
 
     monkeypatch.setattr(service, "_repos", fake_repos)

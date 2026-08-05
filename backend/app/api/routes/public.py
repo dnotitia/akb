@@ -1103,36 +1103,51 @@ async def oembed(url: str, format: str = "json"):
         # bypass — return a generic card and skip every DB title lookup.
         title: str | None = "Protected AKB publication"
     else:
-        # Resolve a useful title. Parse the canonical URI to recover the
-        # resource handle — there are no separate id columns anymore.
+        # Resolve a useful title. Documents are found by `publications.
+        # document_id` (migration 058); the URI is parsed only for the file
+        # branch and for the legacy rows that column could not be backfilled
+        # for. An unfurl that titled the card from whatever now occupies the
+        # published path would name a document nobody published.
         from app.services.uri_service import parse_uri
         parsed = parse_uri(publication.get("resource_uri") or "")
         title = publication.get("title")
         if not title:
-            if rt == ResourceType.DOCUMENT and parsed and parsed.kind == "doc":
-                uri_vault, doc_path = parsed.vault, parsed.identifier
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    doc_row = await conn.fetchrow(
-                        """
-                        SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
-                         -- Bound to the publication's OWN vault_id, with the URI's
-                         -- vault name demoted to a cross-check — the same binding
-                         -- `resolve_document_publication` carries, and the one the
-                         -- file branch below has always had. Keyed on the URI's
-                         -- vault name alone, this returned the title of a document
-                         -- in whatever vault the URI named, which need not be this
-                         -- publication's vault. F1 above protects the publisher,
-                         -- who chose a password; nothing protected the third-party
-                         -- vault, which published nothing at all. No row leaves
-                         -- `title` None and the response falls through to the
-                         -- generic card below — fail closed.
-                         WHERE d.vault_id = $1 AND d.path = $2 AND v.name = $3
-                        """,
-                        to_uuid(publication["vault_id"]), doc_path, uri_vault,
-                    )
-                    if doc_row:
-                        title = doc_row["title"]
+            if rt == ResourceType.DOCUMENT:
+                doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
+                uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
+                raw_doc_id = publication.get("document_id")
+                doc_uuid = to_uuid(raw_doc_id) if raw_doc_id else None
+                if doc_uuid is not None or doc_path is not None:
+                    pool = await get_pool()
+                    async with pool.acquire() as conn:
+                        doc_row = await conn.fetchrow(
+                            """
+                            SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
+                             -- Same two branches, same order of authority, as
+                             -- `resolve_document_publication` — the card and the
+                             -- body it previews must not be able to name
+                             -- different documents.
+                             --
+                             -- $2 (document_id) keys bound rows; the composite FK
+                             -- pins the vault, so no `v.name` cross-check there.
+                             -- The path branch is for backfill-NULL rows only,
+                             -- and keeps the cross-check: keyed on the URI's vault
+                             -- name alone this returned the title of a document in
+                             -- whatever vault the URI named, which need not be this
+                             -- publication's vault. F1 above protects the
+                             -- publisher, who chose a password; nothing protected
+                             -- the third-party vault, which published nothing at
+                             -- all. No row leaves `title` None and the response
+                             -- falls through to the generic card below — fail
+                             -- closed.
+                             WHERE d.vault_id = $1
+                               AND ( d.id = $2::uuid
+                                  OR ($2::uuid IS NULL AND d.path = $3 AND v.name = $4) )
+                            """,
+                            to_uuid(publication["vault_id"]), doc_uuid, doc_path, uri_vault,
+                        )
+                        if doc_row:
+                            title = doc_row["title"]
             elif rt == ResourceType.FILE and parsed and parsed.kind == "file":
                 file_uuid_str = parsed.identifier
                 pool = await get_pool()

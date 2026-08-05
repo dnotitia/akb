@@ -33,7 +33,7 @@ from app.services import file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
 from app.services.revision_backend import get_document_service
-from app.services.uri_service import parse_uri
+from app.services.uri_service import doc_uri, parse_uri
 
 logger = logging.getLogger("akb.publications")
 
@@ -266,6 +266,7 @@ async def create_publication(
     vault_id: uuid.UUID,
     resource_type: str,
     resource_uri: str | None = None,
+    document_id: uuid.UUID | None = None,
     query_sql: str | None = None,
     query_vault_names: list[str] | None = None,
     query_params: dict | None = None,
@@ -290,16 +291,41 @@ async def create_publication(
     option, which keeps the create surface free of a field that means
     nothing for document/file publications.
 
-    `resource_uri` is the canonical handle for the publishable resource.
-    Required for `resource_type ∈ {document, file}`. For `table_query`,
-    `resource_uri` stays None — the publishable surface is the SQL itself.
+    **Which column binds a document publication to its document.**
+    ``document_id`` does, and only it: a UUID under a composite
+    ``FOREIGN KEY (document_id, vault_id) REFERENCES documents (id, vault_id)
+    ON DELETE CASCADE``, so a bound row cannot name a document outside its
+    own vault and cannot outlive that document. It is REQUIRED for
+    ``resource_type='document'``.
+
+    ``resource_uri`` is retained and still written, but for documents it is
+    DERIVED — the path-shaped rendering of the same binding, kept current by
+    the ``move``-time rewrite in ``document_service.move``. It stays because
+    ``table_query`` publications have no resource id at all, because it is
+    part of the API response shape, and because the cleanup and guard helpers
+    that predate ``document_id`` match on it. Read identity off
+    ``document_id``; read the human-facing location off ``resource_uri``.
+    Never resolve one from the other's path — carrying both and re-deriving
+    the id from the path is exactly what let a publication bind to a document
+    its publisher never chose.
+
+    For ``file`` the URI is still the only handle (``file_id`` is out of
+    scope here). For ``table_query`` both stay None — the publishable
+    surface is the SQL itself.
     """
     if resource_type not in ResourceType.ALL:
         raise ValueError(f"Invalid resource_type: {resource_type}")
 
     # Validate that the right resource fields are present
-    if resource_type == ResourceType.DOCUMENT and not resource_uri:
-        raise ValueError("resource_uri is required for resource_type='document'")
+    if resource_type == ResourceType.DOCUMENT:
+        if not resource_uri:
+            raise ValueError("resource_uri is required for resource_type='document'")
+        # Refused here rather than defaulted to NULL. The column is nullable
+        # only because rows predating it exist; nothing created from here on
+        # may add another unbound one, and a caller that cannot name the
+        # document it resolved has no business publishing it.
+        if document_id is None:
+            raise ValueError("document_id is required for resource_type='document'")
     if resource_type == ResourceType.FILE and not resource_uri:
         raise ValueError("resource_uri is required for resource_type='file'")
     if resource_type == ResourceType.TABLE_QUERY:
@@ -337,8 +363,7 @@ async def create_publication(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Re-check resource existence INSIDE the publish TX, against
-            # the canonical resource_uri the caller resolved. Closes the
+            # Re-check resource existence INSIDE the publish TX. Closes the
             # publish/delete race: without this, `document_service.delete`
             # could cascade-clean publications (zero rows) before we
             # INSERT below, leaving an orphan publication that points
@@ -349,20 +374,82 @@ async def create_publication(
             # after our INSERT commits — meaning either the publication
             # lands first and delete cleans it, or delete commits first
             # and we abort with ResourceVanished.
-            if resource_type == ResourceType.DOCUMENT and resource_uri:
-                parsed = parse_uri(resource_uri)
-                doc_path_for_check = (
-                    parsed.identifier if parsed and parsed.kind == "doc" else None
+            #
+            # **For documents the predicate is the id, not the path.** The
+            # caller resolved a specific document one connection ago and
+            # handed us its `document_id`; re-finding "whatever occupies
+            # that path now" would silently accept a different document,
+            # because `documents` is UNIQUE(vault_id, path) and a path is
+            # reusable. That window is small — two `pool.acquire()` calls
+            # inside one request — but the structural point stands on its
+            # own: the row we lock, the row we verify, and the row we store
+            # are one row, named the same way throughout, and re-deriving
+            # identity from a path is what made two of them able to differ.
+            # `FOR SHARE` is unchanged and load-bearing: it is what makes a
+            # concurrent delete queue behind this INSERT rather than race it
+            # (see `DocumentRepository.delete_with_publications`).
+            if resource_type == ResourceType.DOCUMENT:
+                # Read the vault NAME back through the same locked read, so
+                # the URI this compares against is rendered from the document
+                # row itself rather than from anything the caller assembled.
+                # `FOR SHARE OF d` locks only `documents` — taking a lock on
+                # `vaults` too would serialize this against unrelated writes
+                # across the whole vault.
+                bound = await conn.fetchrow(
+                    """
+                    SELECT d.path, v.name AS vault_name
+                      FROM documents d
+                      JOIN vaults v ON v.id = d.vault_id
+                     WHERE d.id = $1 AND d.vault_id = $2
+                     FOR SHARE OF d
+                    """,
+                    document_id, vault_id,
                 )
-                if doc_path_for_check is not None:
-                    found = await conn.fetchval(
-                        "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2 FOR SHARE",
-                        vault_id, doc_path_for_check,
+                if bound is None:
+                    raise ValueError(
+                        f"Document not found (resource was deleted concurrently): {resource_uri}"
                     )
-                    if not found:
+                # Compared as rendered URIs, not by parsing the caller's.
+                # `parse_uri` refuses paths containing braces, which
+                # external-git mirrors legitimately carry (see
+                # `delete_publications_by_doc_uri`) — parsing would turn
+                # those into a hard failure at publish. Rendering instead
+                # needs no grammar to hold, and it checks the vault name in
+                # the URI at the same time: `resource_uri` and the row's own
+                # (vault, path) agree, or nothing is written.
+                expected_uri = doc_uri(bound["vault_name"], bound["path"])
+                if resource_uri != expected_uri:
+                    # Two different failures, and they are worth separating
+                    # because they ask the caller for different things. A
+                    # vault name has no `/` in its grammar, so the prefix
+                    # test tells them apart without a parse.
+                    if not (resource_uri or "").startswith(
+                        f"akb://{bound['vault_name']}/"
+                    ):
+                        # The URI names a vault other than the one this row
+                        # is being stored against. Caller bug, not a race:
+                        # every production caller builds the URI from the
+                        # same vault it passes. Refusing at the write is the
+                        # point — resolution already declines to SERVE such a
+                        # row, so without this the table could hold one that
+                        # nothing will ever answer for.
                         raise ValueError(
-                            f"Document not found (resource was deleted concurrently): {resource_uri}"
+                            f"Publication vault does not match its document "
+                            f"(document is {expected_uri}): {resource_uri}"
                         )
+                    # The document still exists — it moved. Distinguishable
+                    # only now that the check knows which document it is
+                    # looking for; by path this was indistinguishable from
+                    # the delete above, or worse, satisfied by whatever moved
+                    # onto the vacated path. Fail rather than store the stale
+                    # URI: for documents `resource_uri` is derived from
+                    # `document_id`, and resolution still reads the URI — a
+                    # row where the two disagree does not just look wrong, it
+                    # serves wrong.
+                    raise ValueError(
+                        f"Document moved concurrently (it is now {expected_uri}); "
+                        f"publish again: {resource_uri}"
+                    )
             elif resource_type == ResourceType.FILE and resource_uri:
                 file_uuid_for_check = resource_uri.rsplit("/", 1)[-1]
                 try:
@@ -385,19 +472,19 @@ async def create_publication(
                 """
                 WITH inserted AS (
                     INSERT INTO publications (
-                        slug, vault_id, resource_type, resource_uri,
+                        slug, vault_id, resource_type, resource_uri, document_id,
                         query_sql, query_vault_names, query_params,
                         password_hash, max_views, expires_at,
                         mode, section_filter, allow_embed, title, created_by
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                            'live', $11, $12, $13, $14)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                            'live', $12, $13, $14, $15)
                     RETURNING *
                 )
                 SELECT p.*, v.name AS vault
                   FROM inserted p JOIN vaults v ON v.id = p.vault_id
                 """,
-                slug, vault_id, resource_type, resource_uri,
+                slug, vault_id, resource_type, resource_uri, document_id,
                 query_sql, query_vault_names, json.dumps(query_params or {}),
                 pwd_hash, max_views, expires_at,
                 section_filter, allow_embed, title, created_by,
@@ -429,6 +516,12 @@ async def create_publication_for_vault(
     Resolves vault name → vault_id, doc_id → document UUID, validates
     file_id format, parses expires_in, then delegates to create_publication.
     Raises ValueError for any invalid input (caller maps to HTTP/MCP error).
+
+    **The document UUID this resolves is what gets stored**, not just the
+    path rendered from it. `create_publication` re-verifies by that id under
+    a row lock, so the document the caller asked for is the document the
+    publication ends up bound to. Passing only the path made those two
+    separable.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -440,20 +533,26 @@ async def create_publication_for_vault(
     from app.services.uri_service import doc_uri, file_uri
 
     resource_uri: str | None = None
+    resolved_document_id: uuid.UUID | None = None
     resolved_query_vaults = query_vault_names
 
     if resource_type == ResourceType.DOCUMENT:
         if not doc_id:
             raise ValueError("doc_id required for resource_type='document'")
         # Resolve the caller's `doc_id` (path, UUID, or d-prefix id —
-        # find_by_ref_with_conn handles all three) to the canonical
-        # path under this vault, then build the URI.
+        # find_by_ref_with_conn handles all three) to a document row under
+        # this vault. Keep BOTH halves of what that lookup found: the id is
+        # the binding `create_publication` stores and re-verifies under its
+        # row lock, the path is only how the URI renders. Keeping the path
+        # alone is what let the publication land on a different document
+        # than the one resolved here.
         from app.repositories.document_repo import DocumentRepository
         doc_repo = DocumentRepository(pool)
         async with pool.acquire() as conn:
             doc_row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_id)
         if not doc_row:
             raise ValueError(f"Document not found: {doc_id}")
+        resolved_document_id = doc_row["id"]
         resource_uri = doc_uri(vault_name, doc_row["path"])
     elif resource_type == ResourceType.FILE:
         if not file_id:
@@ -498,6 +597,7 @@ async def create_publication_for_vault(
         vault_id=vault_id,
         resource_type=resource_type,
         resource_uri=resource_uri,
+        document_id=resolved_document_id,
         query_sql=query_sql,
         query_vault_names=resolved_query_vaults,
         query_params=query_params,
@@ -674,17 +774,22 @@ async def assert_no_orphan_publication_for_document(
     (409) when ``path``'s canonical URI already carries a publication and no
     document occupies the path.
 
-    **Why a write has to care about publications at all.** A document
-    publication is bound to its document only by a path-shaped URI —
-    migration 022 dropped the ``document_id`` FK — and ``documents`` is
-    ``UNIQUE(vault_id, path)``, so paths are reusable. A publication that
-    outlives its document therefore still claims that path: the next
-    document to occupy it would be reached through the old link.
+    **Why a write has to care about publications at all.** Migration 058
+    gave document publications a ``document_id`` under a composite FK with
+    ``ON DELETE CASCADE``, and every publication created since carries one —
+    those rows cannot outlive their document, with no code involved. But the
+    column is nullable, because rows that predate it could not all be bound
+    unambiguously; a row left NULL is still held to its document by nothing
+    but a path-shaped ``resource_uri``, and ``documents`` is
+    ``UNIQUE(vault_id, path)``, so paths are reusable. Such a publication
+    outliving its document still claims that path: the next document to
+    occupy it would be reached through the old link.
     ``DocumentRepository.delete_with_publications`` keeps a delete from
     leaving one behind. This guard covers the other direction — a write
     arriving at a path some earlier state already left a claim on — so the
     two together mean neither end of a path's lifecycle has to trust the
-    other to have been correct.
+    other to have been correct. Both remain necessary for exactly as long as
+    one NULL ``document_id`` remains.
 
     **The URI is built HERE, from (vault_name, path) — the caller never
     assembles one.** Getting the URI right is the whole check: one that is
@@ -1042,13 +1147,30 @@ async def resolve_document_publication(publication: dict) -> dict:
     if publication["resource_type"] != ResourceType.DOCUMENT:
         raise PublicationError("Not a document publication", status_code=400)
 
-    # Parse the canonical URI to find the underlying doc row.
+    # **Which document this slug serves is decided by `document_id`.** Since
+    # migration 058 that column is the publication's binding to its document,
+    # under a composite FK (document_id, vault_id) → documents(id, vault_id),
+    # so a bound row names one document and that document is in the
+    # publication's own vault. Reading it here is the point of having it:
+    # `resource_uri` is a path, `documents` is UNIQUE(vault_id, path), and a
+    # path is reusable, so resolving by path asks "what lives there now?"
+    # rather than "what was published?". Those two questions had the same
+    # answer only for as long as one UPDATE — the move-time URI rewrite in
+    # `document_service.move` — was never missed. A constraint the read path
+    # does not read protects nothing.
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
+    raw_doc_id = publication.get("document_id")
+    doc_uuid = to_uuid(raw_doc_id) if raw_doc_id else None
+
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed.kind != "doc":
+    doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
+    uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
+    if doc_uuid is None and doc_path is None:
+        # Only the legacy branch needs a readable URI. A bound row resolves
+        # without one, which also means a mirrored document whose path
+        # contains braces — a URI `parse_uri` refuses — is now servable.
         raise NotFoundError("Document", str(uri))
-    uri_vault, doc_path = parsed.vault, parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1056,6 +1178,7 @@ async def resolve_document_publication(publication: dict) -> dict:
             """
             SELECT d.path, d.title, d.doc_type, d.status, d.summary, d.domain,
                    d.created_by, d.created_at, d.updated_at, d.tags,
+                   d.current_commit,
                    v.name AS vault_name,
                    COALESCE(u.display_name, u.username) AS created_by_name
             FROM documents d
@@ -1065,19 +1188,32 @@ async def resolve_document_publication(publication: dict) -> dict:
             -- user_directory.resolve_display_names.
             LEFT JOIN users u
                 ON u.id::text = d.created_by OR u.username = d.created_by
-            -- Bind to the publication's own vault_id (not the vault NAME
-            -- parsed out of resource_uri) so this can't be satisfied by a
-            -- same-path document in another vault (cross-vault IDOR) — the
-            -- same binding `resolve_file_publication` puts on vault_files.
-            -- `v.name = $3` is then the cross-check, not the lookup key: v is
-            -- joined on the pinned vault_id, so requiring it to equal the
-            -- URI's vault name means a row whose resource_uri disagrees with
-            -- its vault_id matches nothing and 404s. Fail closed — serving
-            -- the publication's own document at that path instead would be a
-            -- silent partial success on a row that is, either way, corrupt.
-            WHERE d.vault_id = $1 AND d.path = $2 AND v.name = $3
+            -- Bound to the publication's own vault_id in BOTH branches, so
+            -- neither can be satisfied by a same-path document in another
+            -- vault — the same binding `resolve_file_publication` puts on
+            -- vault_files.
+            --
+            -- $2 (document_id) is the lookup key when the row carries one.
+            -- No `v.name` cross-check on that branch, deliberately: the FK
+            -- already pins the document to this vault, so the URI's vault
+            -- name adds nothing — and requiring it to agree would re-break
+            -- exactly what keying on the id fixes, turning a publication
+            -- whose URI drifted into a 404 instead of resolving it to the
+            -- document its publisher chose.
+            --
+            -- The path branch is for rows the migration-058 backfill could
+            -- not bind (document_id IS NULL), where the URI is still the
+            -- only handle. There `v.name = $4` remains the cross-check, not
+            -- the lookup key: v is joined on the pinned vault_id, so a row
+            -- whose resource_uri disagrees with its vault_id matches nothing
+            -- and 404s. Fail closed — nothing identifies the intended
+            -- document on that branch, so serving whatever sits at the path
+            -- would be a silent partial success on a corrupt row.
+            WHERE d.vault_id = $1
+              AND ( d.id = $2::uuid
+                 OR ($2::uuid IS NULL AND d.path = $3 AND v.name = $4) )
             """,
-            to_uuid(publication["vault_id"]), doc_path, uri_vault,
+            to_uuid(publication["vault_id"]), doc_uuid, doc_path, uri_vault,
         )
         if doc_row is None:
             raise NotFoundError("Document", str(uri))
@@ -1087,8 +1223,24 @@ async def resolve_document_publication(publication: dict) -> dict:
     try:
         # Git read is blocking filesystem I/O — offload it so a document page
         # open / download never stalls the single event loop (503 risk class).
+        #
+        # **Read at the row's own commit, not the floating vault HEAD.** The
+        # query above establishes identity by `document_id`; reading HEAD at
+        # `d.path` would hand it straight back, because the connection is
+        # released first and a path is reusable. A move plus a new document
+        # onto the vacated path between the two would serve that document's
+        # BYTES under this publication's title, tags and author attribution —
+        # the same substitution the id lookup exists to prevent, re-entered
+        # one statement later. Pinning the commit makes the body and the
+        # metadata come from one document by construction.
+        #
+        # `DocumentService.get` pins the same way and for the same reason
+        # (recorded there as E03); the anonymous path is the one that had not.
+        # A NULL `current_commit` (legacy rows) falls back to HEAD inside
+        # `read_file`, which is the pre-existing behaviour for those rows.
         raw = await asyncio.to_thread(
-            _get_doc_service().git.read_file, doc_row["vault_name"], doc_row["path"]
+            _get_doc_service().git.read_file,
+            doc_row["vault_name"], doc_row["path"], doc_row["current_commit"],
         )
         if raw:
             body = frontmatter.loads(raw).content

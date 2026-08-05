@@ -192,7 +192,13 @@ CREATE TABLE IF NOT EXISTS documents (
     content_hash_commit TEXT,          -- commit the content_hash projection was computed from
     tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}',       -- extended metadata from frontmatter
-    UNIQUE(vault_id, path)
+    UNIQUE(vault_id, path),
+    -- Redundant as a guarantee about documents (id is already the PK), and
+    -- required all the same: publications reference (id, vault_id) as a pair
+    -- so the vault match is structural, and PostgreSQL will not accept a
+    -- composite FK without a unique constraint on exactly that column pair.
+    -- Named explicitly because migration 058 looks it up by name.
+    CONSTRAINT documents_id_vault_id_key UNIQUE (id, vault_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_vault ON documents(vault_id);
@@ -236,15 +242,40 @@ CREATE TABLE IF NOT EXISTS chunks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_id);
+-- Guarded: `source_type` and `source_id` arrive together with migration 006;
+-- see the note at the publications document_id guard below. 006 creates this
+-- index itself, so the boot that skips it here does not go without it.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chunks'
+           AND column_name = 'source_type'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_id);
+    END IF;
+END $$;
 -- Indexing-queue claim order (newest chunks first; see embed_worker._claim_batch).
 -- Also covers the retry-eligibility WHERE filter — a single partial
 -- index is enough; we used to keep idx_chunks_vector_pending alongside
 -- this for vector_next_attempt_at, but the planner was selecting the
 -- ORDER-BY-aligned index anyway, so the second one was dead weight.
-CREATE INDEX IF NOT EXISTS idx_chunks_indexing_queue
-    ON chunks (created_at DESC, id)
- WHERE vector_indexed_at IS NULL;
+-- Guarded: `vector_indexed_at` arrives with migration 009; see the note at the
+-- publications document_id guard below.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chunks'
+           AND column_name = 'vector_indexed_at'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_chunks_indexing_queue
+            ON chunks (created_at DESC, id)
+         WHERE vector_indexed_at IS NULL;
+    END IF;
+END $$;
 -- idx_chunks_vault_id is created by migration 014 because on a pre-existing
 -- DB the chunks table is older than the vault_id column. Putting the index
 -- here would fail on the very first init.sql pass after upgrade (column
@@ -289,7 +320,19 @@ CREATE TABLE IF NOT EXISTS vault_migrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_tables_vault ON vault_tables(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
+-- Guarded: `vault_tables.collection_id` arrives with migration 020; see the
+-- note at the publications document_id guard below.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'vault_tables'
+           AND column_name = 'collection_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_vault_tables_collection ON vault_tables(collection_id);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_table ON vault_table_rows(table_id);
 CREATE INDEX IF NOT EXISTS idx_vault_table_rows_data ON vault_table_rows USING gin(data);
 CREATE INDEX IF NOT EXISTS idx_vault_migrations_vault_applied
@@ -383,7 +426,19 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
+-- Guarded: `vault_files.collection_id` arrives with migration 020; see the
+-- note at the publications document_id guard below.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'vault_files'
+           AND column_name = 'collection_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_vault_files_collection ON vault_files(collection_id);
+    END IF;
+END $$;
 
 -- ============================================================
 -- Publications (unified public-link feature for documents, tables, files)
@@ -397,12 +452,31 @@ CREATE TABLE IF NOT EXISTS publications (
 
     -- Canonical resource handle — `akb://{vault}/{type}/{identifier}`.
     -- NULL only for table_query publications, which surface a SQL query
-    -- rather than a single addressable resource. The cascade on
-    -- vault/document/file delete still works because vault_id has
-    -- ON DELETE CASCADE; document/file deletion bumps publications
-    -- via app-level cleanup (delete_publications_for_document /
-    -- delete_publications_for_file).
+    -- rather than a single addressable resource. This is the handle every
+    -- surface displays and the API returns; it is NOT the identity binding
+    -- (see document_id below) because a path is reusable.
     resource_uri TEXT,
+
+    -- The published document, when the publication has one.
+    --
+    -- NULLABLE, and that is not a placeholder for future tightening: rows
+    -- that predate migration 058 are bound only if the binding is
+    -- unambiguous, so "every document publication has a document_id" is a
+    -- property of rows created after the publish path started recording it,
+    -- not a schema invariant. table_query and file publications leave it
+    -- NULL by definition — file cleanup is still app-level
+    -- (delete_publications_for_file).
+    --
+    -- The FK is composite on purpose. Referencing documents(id) alone would
+    -- promise only that the document exists; pairing vault_id in makes "the
+    -- document is in the publication's own vault" structural instead of a
+    -- rule each write has to remember. Match type is the default (MATCH
+    -- SIMPLE) so a NULL document_id is exempt even though vault_id is NOT
+    -- NULL — MATCH FULL would forbid the NULL and is wrong here.
+    document_id UUID,
+    CONSTRAINT publications_document_fk
+        FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id)
+        ON DELETE CASCADE,
 
     -- For table_query type: stored canned SQL with :param placeholders
     query_sql TEXT,
@@ -433,7 +507,45 @@ CREATE TABLE IF NOT EXISTS publications (
 
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
-CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
+-- Guarded: `resource_uri` arrives with migration 022; see the note at the
+-- document_id guard below.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'publications'
+           AND column_name = 'resource_uri'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_publications_resource_uri
+            ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
+    END IF;
+END $$;
+-- Referencing side of publications_document_fk: without it, every document
+-- delete seq-scans this table to find the rows to cascade. Partial because
+-- most rows are NULL and `document_id = $1` implies NOT NULL, so the cascade
+-- probe can still use it.
+--
+-- Guarded on the column, and that guard is load-bearing. This file is
+-- re-executed IN FULL on every boot, BEFORE any migration runs. On a database
+-- that has not reached migration 058 yet, the CREATE TABLE above is inert (the
+-- table exists) so `document_id` is absent — and a bare CREATE INDEX on it
+-- raises UndefinedColumn, which aborts init.sql and means the migration that
+-- would have added the column never runs. Every boot, forever. Any future
+-- index or ALTER here that names a column added by a migration needs the same
+-- treatment.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'publications'
+           AND column_name = 'document_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_publications_document_id
+            ON publications(document_id, vault_id) WHERE document_id IS NOT NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================

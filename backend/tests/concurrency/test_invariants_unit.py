@@ -1033,6 +1033,18 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
     publication it never saw survived the document it pointed at. With
     FOR UPDATE taken first, the deleter's cleanup runs downstream of the
     lock, sees the freshly committed row, and removes it.
+
+    **What this test stopped proving.** The publication it creates is now
+    bound (`document_id` is required for a document publication), so
+    migration 058's ON DELETE CASCADE removes it too — the final assertion
+    below holds even with the explicit cleanup deleted outright. Verified,
+    not assumed. So this is now a test of the END STATE, and the FK is what
+    guarantees it. The lock ordering and the explicit cleanup are what a
+    publication the FK cannot reach still depends on, and that is pinned
+    separately by
+    ``test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_reach``
+    below. Do not delete this one in favour of that: between them they say
+    the invariant holds for both populations.
     """
     from app.services import publication_service
     from app.services.publication_service import create_publication
@@ -1070,7 +1082,8 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
         # 1) Publisher queues FIRST. Its FOR SHARE conflicts with the
         #    blocker's FOR UPDATE, so it parks before inserting anything.
         pub_task = asyncio.create_task(create_publication(
-            vault_id=vid, resource_type="document", resource_uri=uri, title="Q3",
+            vault_id=vid, resource_type="document", resource_uri=uri,
+            document_id=did, title="Q3",
         ))
         await _await_blocked(
             watch, count=1, contains="FOR SHARE",
@@ -1151,6 +1164,120 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
 
 
 @pytest.mark.asyncio
+async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_reach(
+    pool, vault,
+):
+    """The same lock-ordering proof, on the one population the FK is blind to.
+
+    Migration 058's ON DELETE CASCADE only reaches publications that carry a
+    `document_id`, and the column is nullable precisely because the backfill
+    could not bind every pre-existing row. For a row it left NULL, the
+    deleter's explicit publication cleanup is the ONLY thing that removes it
+    — so this is where the FOR UPDATE-before-cleanup ordering still has to
+    be correct, and the only place a test can still tell.
+
+    The publisher here is hand-rolled rather than `create_publication`: that
+    function now refuses to create an unbound document publication, which is
+    the point of the change, so the legacy shape has to be written directly.
+    What it reproduces is exactly the pre-058 publisher — take `FOR SHARE`
+    on the document row, then INSERT — so the lock choreography under test is
+    the real one.
+
+    RED if the cleanup runs before the row lock, and equally RED if the
+    cleanup is removed: nothing else can delete this row.
+    """
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/legacy.md"
+    uri = f"akb://{vname}/coll/reports/doc/legacy.md"
+    # Only the publication's NULL `document_id` below is load-bearing here —
+    # the document itself is ordinary, so it goes through the shared helper
+    # rather than a hand-written INSERT that would read as deliberate.
+    await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Legacy")
+
+    doc_repo = DocumentRepository(pool)
+    blocker = await asyncpg.connect(_DSN)
+    watch = await asyncpg.connect(_DSN)
+    try:
+        btx = blocker.transaction()
+        await btx.start()
+        await blocker.fetchval(
+            "SELECT id FROM documents WHERE id = $1 FOR UPDATE", did,
+        )
+
+        async def _publish_unbound() -> None:
+            async with pool.acquire() as c:
+                tx = c.transaction()
+                await tx.start()
+                try:
+                    await c.fetchval(
+                        "SELECT 1 FROM documents WHERE id = $1 AND vault_id = $2 "
+                        "FOR SHARE",
+                        did, vid,
+                    )
+                    await c.execute(
+                        "INSERT INTO publications (slug, vault_id, resource_type, "
+                        "resource_uri, document_id, mode, allow_embed, query_params) "
+                        "VALUES ($1, $2, 'document', $3, NULL, 'live', true, "
+                        "'{}'::jsonb)",
+                        "legacyslug000001", vid, uri,
+                    )
+                except BaseException:
+                    await tx.rollback()
+                    raise
+                await tx.commit()
+
+        # Publisher queues FIRST, deleter SECOND — same order as the bound
+        # case above, so the deleter's cleanup is the side under test.
+        pub_task = asyncio.create_task(_publish_unbound())
+        await _await_blocked(
+            watch, count=1, contains="FOR SHARE",
+            what="the legacy publisher to park on the document row",
+        )
+
+        async def _delete() -> bool:
+            async with pool.acquire() as c:
+                tx = c.transaction()
+                await tx.start()
+                try:
+                    out = await doc_repo.delete_with_publications(
+                        c, doc_id=did, vault_id=vid,
+                    )
+                except BaseException:
+                    await tx.rollback()
+                    raise
+                await tx.commit()
+                return out
+
+        del_task = asyncio.create_task(_delete())
+        await _await_blocked(
+            watch, count=2, contains="documents",
+            what="the delete to park behind the legacy publisher",
+        )
+
+        await btx.commit()
+        await pub_task
+        deleted = await del_task
+    finally:
+        if not blocker.is_closed():
+            await blocker.close()
+        await watch.close()
+
+    assert deleted is True, "the delete must have removed the document row"
+
+    async with pool.acquire() as conn:
+        orphans = await conn.fetch(
+            "SELECT slug, document_id FROM publications WHERE resource_uri = $1", uri,
+        )
+    assert not orphans, (
+        "ORPHAN PUBLICATION SURVIVED the delete "
+        f"({[dict(r) for r in orphans]}). Its `document_id` is NULL, so the "
+        "foreign key could not take it — the deleter's own cleanup, running "
+        "downstream of the row lock, is the only thing that removes it."
+    )
+
+
+@pytest.mark.asyncio
 async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeypatch):
     """The other interleaving: the deleter wins the row, so the publisher's
     FOR SHARE re-check finds nothing and `create_publication` fails closed
@@ -1195,7 +1322,8 @@ async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeyp
 
             # Publisher parks on the uncommitted delete.
             pub_task = asyncio.create_task(create_publication(
-                vault_id=vid, resource_type="document", resource_uri=uri, title="Q4",
+                vault_id=vid, resource_type="document", resource_uri=uri,
+                document_id=did, title="Q4",
             ))
             await _await_blocked(
                 watch, count=1, contains="FOR SHARE",
@@ -1213,3 +1341,301 @@ async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeyp
             "SELECT COUNT(*) FROM publications WHERE resource_uri = $1", uri,
         )
     assert rows == 0, "a publication must not be created for a deleted document"
+
+
+# ── The publisher's own handoff: resolve → INSERT ─────────────────────
+#
+# `create_publication_for_vault` resolves the caller's doc_id to a document
+# on one pooled connection, and `create_publication` INSERTs on another.
+# Nothing spans the two — no transaction, no lock, no snapshot — so the
+# document is unheld in between. That gap is milliseconds wide and lives
+# inside a single request; the two interleaving tests below force it open on
+# purpose rather than waiting for it, because what is being pinned is not the
+# odds of hitting it but which value carries identity across it. The first
+# test takes no interleaving at all — it is the positive statement that the
+# binding gets written on the ordinary path, without which the other two
+# could be satisfied by a publisher that never succeeds.
+#
+# Before this change only the PATH crossed the gap, and the INSERT re-found
+# the document by that path. `documents` is UNIQUE(vault_id, path) and paths
+# are reusable, so "the document at path P" is not a stable name for a
+# document — the publisher could resolve one document and publish another.
+# Now the resolved id crosses, the re-check keys on it, and the row stores
+# it (`publications.document_id`, migration 058).
+#
+# The interleaving is injected by wrapping `create_publication` itself: the
+# wrapper runs at exactly the moment the resolve has finished and the INSERT
+# has not started, which is the window, and then calls the real function
+# with the arguments the resolve produced. Those arguments are captured, so
+# a test cannot pass by the resolve having quietly seen the *new* document.
+
+
+async def _insert_doc(pool, *, doc_id, vault_id, path, title) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, $3, $4, 'report', 'draft', NOW(), NOW(), 'cafef00d', "
+            "'{}'::text[], '{}'::jsonb)",
+            doc_id, vault_id, path, title,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publish_binds_the_publication_to_the_document_it_resolved(
+    pool, vault, monkeypatch,
+):
+    """The invariant, stated positively: a publication created from here on
+    carries the id of the document its publisher resolved.
+
+    No interleaving — this is the ordinary path. It is the test that says the
+    binding is written at all, so the two failure tests below cannot both be
+    satisfied by a publisher that simply never succeeds.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication_for_vault
+    from app.services.uri_service import doc_uri
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/q5.md"
+    await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Q5")
+
+    pub = await create_publication_for_vault(
+        vault_name=vname, resource_type="document", doc_id=path,
+        title="Q5 (public)",
+    )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT document_id, vault_id, resource_uri FROM publications "
+            " WHERE slug = $1",
+            pub["slug"],
+        )
+
+    assert row is not None, "the publication row is missing"
+    assert row["document_id"] == did, (
+        "the publication is not bound to the document that was resolved "
+        f"(document_id={row['document_id']}, expected {did}). A NULL here "
+        "means the identity was dropped between resolve and INSERT and the "
+        "row is held to its document by a reusable path alone."
+    )
+    # The composite FK already forbids a cross-vault pair; asserting it keeps
+    # the expectation visible next to the id.
+    assert row["vault_id"] == vid
+    # `resource_uri` is retained and still written — derived, for documents,
+    # from the same binding.
+    assert row["resource_uri"] == doc_uri(vname, path)
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_when_another_document_takes_the_resolved_path(
+    pool, vault, monkeypatch,
+):
+    """Document A is resolved, then deleted, and B is created at A's path —
+    all before the INSERT. The publisher must fail, not publish B.
+
+    The delete is clean (through the chokepoint, publications and all), so
+    nothing earlier on this branch catches it: there is no orphan for the
+    write-side guard to refuse, the delete had no publication to cascade, and
+    B is in the same vault so the resolution binding is satisfied. The only
+    thing that can tell A from B here is the id the publisher resolved.
+
+    Pre-change this is RED: `create_publication` re-found the document by
+    path, found B, and published it under a link the caller asked for A.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication_for_vault
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid, vname = vault["id"], vault["name"]
+    did_a, did_b = uuid.uuid4(), uuid.uuid4()
+    path = "reports/q6.md"
+    await _insert_doc(pool, doc_id=did_a, vault_id=vid, path=path, title="A")
+
+    doc_repo = DocumentRepository(pool)
+    real_create = publication_service.create_publication
+    handed_off: dict = {}
+
+    async def _swap_the_document_then_insert(**kwargs):
+        handed_off.update(kwargs)
+        async with pool.acquire() as c:
+            tx = c.transaction()
+            await tx.start()
+            await doc_repo.delete_with_publications(c, doc_id=did_a, vault_id=vid)
+            await tx.commit()
+        await _insert_doc(pool, doc_id=did_b, vault_id=vid, path=path, title="B")
+        return await real_create(**kwargs)
+
+    monkeypatch.setattr(
+        publication_service, "create_publication", _swap_the_document_then_insert,
+    )
+
+    with pytest.raises(ValueError, match="deleted concurrently"):
+        await create_publication_for_vault(
+            vault_name=vname, resource_type="document", doc_id=path,
+            title="A (public)",
+        )
+
+    # Pin that the resolve really did see A. Without this the test could pass
+    # for the wrong reason — a resolve that ran late and never held A at all.
+    assert handed_off.get("document_id") == did_a, (
+        "the resolve did not hand A's id to the INSERT "
+        f"(got {handed_off.get('document_id')!r}); the window this test "
+        "exists to force was not exercised."
+    )
+
+    async with pool.acquire() as conn:
+        pubs = await conn.fetch(
+            "SELECT slug, document_id FROM publications WHERE vault_id = $1", vid,
+        )
+        b_still_there = await conn.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE id = $1", did_b,
+        )
+    assert b_still_there == 1, "B should be untouched — it was never the target"
+    assert not pubs, (
+        f"a publication was created anyway: {[dict(r) for r in pubs]}. "
+        "Whoever wrote B never asked for it to be publicly readable."
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_when_the_resolved_document_moves_off_its_path(
+    pool, vault, monkeypatch,
+):
+    """The other half of the same gap: A is not deleted, it MOVES, and B
+    lands on the path A vacated.
+
+    By path this was indistinguishable from a plain delete — worse, it was
+    satisfied by B and published it. By id it is now its own case, and the
+    error says so, because "your document moved, publish again" and "your
+    document is gone" ask the caller for different things.
+
+    It also pins that a stale URI is never stored: `document_id` and
+    `resource_uri` describe the same document or the publication is not
+    written.
+
+    Pre-change this is RED for the same reason as the test above.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication_for_vault
+    from app.services.uri_service import doc_uri
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid, vname = vault["id"], vault["name"]
+    did_a, did_b = uuid.uuid4(), uuid.uuid4()
+    path = "reports/q7.md"
+    moved_to = "archive/q7.md"
+    await _insert_doc(pool, doc_id=did_a, vault_id=vid, path=path, title="A")
+
+    real_create = publication_service.create_publication
+    handed_off: dict = {}
+
+    async def _move_a_then_insert(**kwargs):
+        handed_off.update(kwargs)
+        async with pool.acquire() as c:
+            await c.execute(
+                "UPDATE documents SET path = $1 WHERE id = $2", moved_to, did_a,
+            )
+        await _insert_doc(pool, doc_id=did_b, vault_id=vid, path=path, title="B")
+        return await real_create(**kwargs)
+
+    monkeypatch.setattr(
+        publication_service, "create_publication", _move_a_then_insert,
+    )
+
+    with pytest.raises(ValueError, match="moved concurrently"):
+        await create_publication_for_vault(
+            vault_name=vname, resource_type="document", doc_id=path,
+            title="A (public)",
+        )
+
+    assert handed_off.get("document_id") == did_a, (
+        "the resolve did not hand A's id to the INSERT "
+        f"(got {handed_off.get('document_id')!r}); the window this test "
+        "exists to force was not exercised."
+    )
+    # The URI that crossed the gap is A's ORIGINAL path — the stale one. That
+    # is what makes this the move case and not the delete case: the id is
+    # still live, and it is the id/URI disagreement that has to be caught.
+    assert handed_off.get("resource_uri") == doc_uri(vname, path), (
+        f"the resolve handed over {handed_off.get('resource_uri')!r}, not the "
+        "pre-move URI; this is not the interleaving the test describes."
+    )
+
+    async with pool.acquire() as conn:
+        a_now, b_now = await conn.fetchval(
+            "SELECT path FROM documents WHERE id = $1", did_a,
+        ), await conn.fetchval(
+            "SELECT path FROM documents WHERE id = $1", did_b,
+        )
+        pubs = await conn.fetch(
+            "SELECT slug, document_id, resource_uri FROM publications "
+            " WHERE vault_id = $1",
+            vid,
+        )
+    assert (a_now, b_now) == (moved_to, path), (
+        f"setup did not hold: A is at {a_now!r} and B at {b_now!r}; the test "
+        "needs A moved off the path and B sitting on it."
+    )
+    assert not pubs, (
+        f"a publication was created anyway: {[dict(r) for r in pubs]}. "
+        "Either it points at B — which nobody published — or it points at A "
+        "under the path A no longer occupies."
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_a_uri_that_names_another_vault(
+    pool, vault, monkeypatch,
+):
+    """The same comparison, reached from the caller's side rather than a race.
+
+    `create_publication` is the low-level function; it does no vault-access
+    check of its own and no production caller reaches it directly. Verifying
+    the stored URI against the one the LOCKED document row renders means it
+    can no longer persist a row whose two vault identifiers disagree —
+    resolution already declines to serve such a row, so the write is where
+    it should have been refused.
+
+    The document is real and in this vault; only the URI's vault component
+    is wrong, which is the whole point: the id being valid is not enough.
+    """
+    from app.services import publication_service
+    from app.services.publication_service import create_publication
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+
+    vid = vault["id"]
+    did = uuid.uuid4()
+    path = "reports/q8.md"
+    await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Q8")
+
+    with pytest.raises(ValueError, match="vault does not match"):
+        await create_publication(
+            vault_id=vid, resource_type="document",
+            resource_uri="akb://some-other-vault/coll/reports/doc/q8.md",
+            document_id=did, title="Q8",
+        )
+
+    async with pool.acquire() as conn:
+        pubs = await conn.fetchval(
+            "SELECT COUNT(*) FROM publications WHERE vault_id = $1", vid,
+        )
+    assert pubs == 0, "a vault-mismatched publication must not be stored"

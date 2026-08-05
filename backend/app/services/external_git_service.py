@@ -615,9 +615,11 @@ class ExternalGitService:
                 # they survive the delete and dangle on the next BFS.
                 await delete_document_relations(conn, vault_name, path)
                 # The row delete and the publication cascade are one call
-                # through the repository chokepoint. `publications` lost its
-                # `document_id` FK in migration 022, so the tombstone has to
-                # drop the publication itself, on THIS connection: without it,
+                # through the repository chokepoint. Migration 058's FK only
+                # cascades rows that carry a `document_id`, which the
+                # backfill could not give every legacy row, so the tombstone
+                # still has to drop the publication itself, on THIS
+                # connection: without it,
                 # an upstream commit that removes a mirrored path leaves a
                 # slug that still resolves by path — and a later upstream
                 # commit re-adding that path (a revert, a rename back)

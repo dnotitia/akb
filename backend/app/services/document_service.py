@@ -242,6 +242,67 @@ def _certified_content_hash(md_content: str) -> str:
     return _body_content_hash(canonical_body)
 
 
+# Newest publication slug for one document — the reverse of publication
+# resolution, and the query behind `is_public` / `public_slug`.
+#
+# Keyed on `publications.document_id`, which since migration 058 is the
+# binding for a document publication: a UUID under a composite
+# FK (document_id, vault_id) → documents(id, vault_id). Matching that
+# cannot answer with a publication belonging to some other document, and
+# cannot answer with one belonging to some other vault.
+#
+# The `resource_uri` branch is a FALLBACK, and only for rows the 058
+# backfill could not bind unambiguously (`document_id IS NULL`). It is kept
+# on purpose: without it those publications would report `is_public: false`
+# on a document whose slug still serves its body — telling an author their
+# document is private while it is reachable is a worse answer than the
+# imprecision the fallback carries. It disappears on its own as those rows
+# are re-published or removed; nothing new lands in it, because
+# `create_publication` refuses a document publication without an id.
+#
+# `vault_id = $1` scopes BOTH branches, and is the part that was missing:
+# the previous query matched `resource_uri` with no vault predicate at all,
+# so its answer was not scoped to the vault being asked about.
+# `document_id = $2` alone would have been enough for the primary branch (the
+# composite FK pins the vault), but the predicate sits on the query so the
+# fallback cannot be wrong either.
+#
+# ORDER BY created_at DESC matches `publishDoc()` in the frontend, which
+# reuses the first entry `listPublications` returns.
+_PUBLIC_SLUG_SQL = """
+    SELECT slug
+      FROM publications
+     WHERE vault_id = $1
+       AND resource_type = 'document'
+       AND (
+             document_id = $2::uuid
+          OR (document_id IS NULL AND resource_uri = $3)
+       )
+     ORDER BY created_at DESC
+     LIMIT 1
+"""
+
+
+async def newest_public_slug(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    document_id: uuid.UUID | None,
+    resource_uri: str,
+) -> str | None:
+    """Newest publication slug bound to one document, or None.
+
+    ``document_id`` may be None for a caller that has no ``documents`` row to
+    name (the native-ledger arm keeps no legacy projection). The primary
+    branch then matches nothing — ``document_id = NULL`` is NULL, not true —
+    and the vault-scoped URI fallback answers. See ``_PUBLIC_SLUG_SQL``.
+
+    One function rather than one query per service on purpose: these were two
+    copies, and both carried the same missing ``vault_id`` predicate.
+    """
+    return await conn.fetchval(_PUBLIC_SLUG_SQL, vault_id, document_id, resource_uri)
+
+
 # Vault-name grammar: lowercase alphanumeric segments joined by SINGLE
 # hyphens (no leading / trailing / consecutive hyphens). The physical name
 # of a vault table is `vt_{sanitize(vault)}__{sanitize(table)}` where
@@ -625,10 +686,9 @@ class DocumentService:
         _, body = _parse_markdown(content)
         content_hash, hash_algorithm = await self._ensure_document_hash(doc_repo, row, body)
 
-        # Derive published state from the publications table. We pick the
-        # newest matching publication so the UI is consistent with publishDoc()
-        # which reuses the first entry returned by listPublications (DESC order).
-        public_slug = await self._get_public_slug(row["vault_name"], row["path"])
+        # Derive published state from the publications table, keyed on this
+        # document's own id.
+        public_slug = await self._get_public_slug(row)
 
         return DocumentResponse(
             uri=doc_uri(row["vault_name"], row["path"]),
@@ -687,7 +747,7 @@ class DocumentService:
                 flags=_re.DOTALL,
             )
 
-        public_slug = await self._get_public_slug(row["vault_name"], row["path"])
+        public_slug = await self._get_public_slug(row)
         content_hash = _body_content_hash(body)
 
         return DocumentResponse(
@@ -770,20 +830,22 @@ class DocumentService:
                 e["author_name"] = name
         return entries
 
-    async def _get_public_slug(self, vault_name: str, doc_path: str) -> str | None:
-        """Return the newest publication slug for a document, or None.
-        Looks up by the canonical resource_uri rather than the dropped
-        `publications.document_id` FK column."""
+    async def _get_public_slug(self, row: dict) -> str | None:
+        """Newest publication slug for the document `row`, or None.
+
+        Takes the whole row rather than (vault, path): the lookup keys on
+        `publications.document_id`, so it needs the identity the caller
+        already resolved, and re-deriving it from a path here would put back
+        the indirection this keys on the id to avoid. See
+        `newest_public_slug`.
+        """
         pool = await get_pool()
         async with pool.acquire() as conn:
-            return await conn.fetchval(
-                """
-                SELECT slug FROM publications
-                WHERE resource_uri = $1 AND resource_type = 'document'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                doc_uri(vault_name, doc_path),
+            return await newest_public_slug(
+                conn,
+                vault_id=row["vault_id"],
+                document_id=row["id"],
+                resource_uri=doc_uri(row["vault_name"], row["path"]),
             )
 
     # ── Update ────────────────────────────────────────────────
@@ -1101,6 +1163,15 @@ class DocumentService:
             new_uri = doc_uri(vault, new_path)
             await self._relink_edges(conn, vault_id, "source_uri", old_uri, new_uri)
             await self._relink_edges(conn, vault_id, "target_uri", old_uri, new_uri)
+            # A move does NOT change which document a publication is bound to:
+            # `publications.document_id` is the binding and identity is what a
+            # move preserves. This rewrite keeps the DERIVED half — the
+            # path-shaped `resource_uri` the API returns and the cleanup /
+            # orphan-guard helpers match on — from going stale. Matching on
+            # the old URI rather than on `document_id` is deliberate: it also
+            # catches rows the migration-058 backfill left with a NULL
+            # `document_id`, which are precisely the ones nothing else keeps
+            # current.
             await conn.execute(
                 "UPDATE publications SET resource_uri = $1 WHERE vault_id = $2 AND resource_uri = $3",
                 new_uri, vault_id, old_uri,
@@ -1400,10 +1471,13 @@ class DocumentService:
             },
         )
         # The row delete and the publication cascade are ONE call. That
-        # cascade used to be an inline DELETE here (publications lost their
-        # `document_id` FK in migration 022, so nothing cascades), and the
-        # two OTHER per-row delete paths — the collection cascade's doc loop
-        # and the external-git tombstone — never got a copy. With no single
+        # cascade used to be an inline DELETE here (between migrations 022
+        # and 058 publications had no `document_id`, so nothing cascaded),
+        # and the two OTHER per-row delete paths — the collection cascade's
+        # doc loop and the external-git tombstone — never got a copy. 058
+        # restored a database cascade, but only for rows that carry a
+        # `document_id`; rows it could not bind are still removed by this
+        # call alone. With no single
         # original to call, writing a new delete path correctly meant
         # knowing to write the second statement at all. It now
         # lives inside `delete_with_publications`, which also takes the row

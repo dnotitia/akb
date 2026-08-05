@@ -34,6 +34,7 @@ from app.services.document_service import (
     _certified_content_hash,
     _compose_markdown,
     _parse_markdown,
+    newest_public_slug,
     validate_vault_name,
 )
 from app.services.native_revision_service import NativeRevisionService, NativeRevisionSnapshot
@@ -169,24 +170,40 @@ class NativeDocumentService(DocumentService):
                 created_by,
             )
 
-    async def _public_slug(self, vault: str, path: str) -> str | None:
+    async def _public_slug(
+        self, vault_id: uuid.UUID, vault: str, path: str
+    ) -> str | None:
+        """Newest publication slug for the document at ``path``, or None.
+
+        Shares one query with the legacy arm (``newest_public_slug``) instead
+        of keeping a second copy — the two copies had drifted into the same
+        defect, a ``resource_uri`` match with no ``vault_id`` predicate, which
+        told a reader that another vault carries a publication for the same
+        path and handed over its slug.
+
+        ``vault_id`` is passed in rather than resolved here: every caller has
+        already resolved it through ``_current``, and ``_vault_id`` is an
+        uncached pool checkout plus a query.
+
+        ``document_id=None`` is passed deliberately. This arm does not write
+        the legacy ``documents`` projection, so there is no id to name here;
+        the vault-scoped ``resource_uri`` fallback is what answers, and it is
+        scoped either way.
+        """
         pool = await self._pool()
         async with pool.acquire() as conn:
-            return await conn.fetchval(
-                """
-                SELECT slug
-                  FROM publications
-                 WHERE resource_uri = $1 AND resource_type = 'document'
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                doc_uri(vault, path),
+            return await newest_public_slug(
+                conn,
+                vault_id=vault_id,
+                document_id=None,
+                resource_uri=doc_uri(vault, path),
             )
 
     async def _response(
         self,
         *,
         vault: str,
+        vault_id: uuid.UUID,
         current: NativeRevisionSnapshot,
         selected: NativeRevisionSnapshot | None = None,
     ) -> DocumentResponse:
@@ -194,7 +211,16 @@ class NativeDocumentService(DocumentService):
         current_fm, _ = _parse_markdown(current.text)
         _, selected_body = _parse_markdown(selected.text)
         created_by = current_fm.get("created_by")
-        public_slug = await self._public_slug(vault, current.path)
+        # Sequential on purpose. These two reads are independent and a
+        # `gather` would save one round trip, but each takes its own pool
+        # connection, so overlapping them doubles this path's peak checkouts
+        # per document read to buy a saving that is worth nothing here — this
+        # arm is measurement-only and is not the default backend. It also
+        # changes failure behaviour: under `gather` a raise in one no longer
+        # stops the other, which runs on to completion with its result (or its
+        # own exception) discarded. Not worth either, for zero live gain.
+        public_slug = await self._public_slug(vault_id, vault, current.path)
+        created_by_name = await self._created_by_name(created_by)
         return DocumentResponse(
             uri=doc_uri(vault, current.path),
             vault=vault,
@@ -205,7 +231,7 @@ class NativeDocumentService(DocumentService):
             summary=current_fm.get("summary"),
             domain=current_fm.get("domain"),
             created_by=created_by,
-            created_by_name=await self._created_by_name(created_by),
+            created_by_name=created_by_name,
             created_at=current_fm.get("created_at") or current.resource_created_at,
             updated_at=current.resource_updated_at,
             current_commit=selected.revision_id,
@@ -293,8 +319,8 @@ class NativeDocumentService(DocumentService):
         )
 
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
-        _, current = await self._current(vault, doc_ref)
-        return await self._response(vault=vault, current=current)
+        vault_id, current = await self._current(vault, doc_ref)
+        return await self._response(vault=vault, vault_id=vault_id, current=current)
 
     async def get_at_commit(
         self,
@@ -311,7 +337,9 @@ class NativeDocumentService(DocumentService):
             reference=current.path,
             revision_id=version,
         )
-        return await self._response(vault=vault, current=current, selected=selected)
+        return await self._response(
+            vault=vault, vault_id=vault_id, current=current, selected=selected,
+        )
 
     async def update(
         self,
