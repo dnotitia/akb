@@ -132,8 +132,16 @@ CU=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("co
 
 # F8: anonymous doc response must not leak the raw creator id, internal workflow
 # status, or created_at — only the resolved author display name is exposed.
-echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); leaked=[k for k in ("created_by","status","created_at") if k in d]; sys.exit(1 if leaked else 0)' \
-  && pass "F8: doc response omits created_by/status/created_at" || fail "F8 metadata leak" "$R"
+# An error body carries none of those three either, so the response is first
+# established as a resolved document publication.
+F8=$(echo "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("resource_type") != "document" or not d.get("title"):
+    print("BAD:not-a-document-publication-response")
+else:
+    print("OK:" + ",".join(k for k in ("created_by", "status", "created_at") if k in d))' 2>/dev/null)
+[ "$F8" = "OK:" ] && pass "F8: doc response omits created_by/status/created_at" || fail "F8 metadata leak" "${F8:-unparsable body}: $R"
 
 # F6: owner-capability probe — anonymous can't edit; the authenticated owner can.
 CE=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG/capabilities" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("can_edit"))' 2>/dev/null)
@@ -561,11 +569,14 @@ echo ""
 # ── 10. Embed + oEmbed ────────────────────────────────────
 echo "▸ 10. Embed + oEmbed"
 
-# Document /embed: same payload as the page GET, plus embed: true.
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
+# Document /embed: same payload as the page GET, plus embed: true. Deliberately
+# ONE request — /embed re-resolves through the counted path (public.py), so
+# fetching twice to read the status and the body separately would spend two views
+# on this publication and any later max_views on it would look like a product bug.
+R=$(curl -sk -w '\n%{http_code}' "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
+CODE=$(printf '%s' "$R" | tail -1)
+DEMB=$(printf '%s' "$R" | sed '$d' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("embed"), d.get("title","")))' 2>/dev/null)
 [ "$CODE" = "200" ] && pass "document /embed returns 200" || fail "document /embed" "HTTP $CODE"
-R=$(curl -sk "$BASE_URL/api/v1/public/$DOC_SLUG_FOR_SNAP/embed")
-DEMB=$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s|%s" % (d.get("embed"), d.get("title","")))' 2>/dev/null)
 [ "$DEMB" = "True|Pub Doc" ] && pass "document /embed carries embed=true + doc title" || fail "document /embed body" "${DEMB:-unparsable body}: $R"
 
 # embed returns the same shape with embed: true
@@ -713,12 +724,17 @@ case "$MCP_SHARE" in
   http://*|https://*) pass "MCP akb_publish: share_url absolute" ;;
   *) fail "MCP share_url" "$MCP_SHARE" ;;
 esac
+# Same absence-assertion shape as the REST check above: an error body and an
+# unparsable body both carry no legacy fields, so require a real publication.
 LEAKS=$(echo "$R" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 forbidden = ["publication_id","public_url","public_url_full","public_base"]
-print(",".join(k for k in forbidden if k in d))' 2>/dev/null)
-[ -z "$LEAKS" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "$LEAKS"
+found = [k for k in forbidden if k in d]
+if not d.get("slug"):
+    found.append("<not-a-publication-response>")
+print("PARSED:" + ",".join(found))' 2>/dev/null)
+[ "$LEAKS" = "PARSED:" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "${LEAKS:-unparsable body}: $R"
 
 # akb_unpublish by FILE uri — the bug case that 0.5.x silently rejected.
 FU_RES=$(mcp 18 akb_publish "{\"uri\":\"$FILE_URI\",\"resource_type\":\"file\"}" | mcp_text)
