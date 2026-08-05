@@ -889,12 +889,8 @@ _PUBLICATION_SELECT = (
 async def list_publications(vault_id: uuid.UUID, resource_type: str | None = None) -> list[dict]:
     """List active publications for a vault. Returns public dicts.
 
-    Returns every row, unpaginated. `test_publications_e2e.sh` asserts the
-    cascade on document/file delete by counting the rows this returns, so
-    adding a page bound here would let a surviving row fall off the first
-    page and be read as "cascade removed it" — the assertion would pass for
-    the wrong reason rather than fail. Bound this and that test needs a
-    matching change.
+    Returns every row, unpaginated. That is a contract two callers rely on —
+    see `list_publications_route` before adding a page bound.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
