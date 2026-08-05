@@ -86,7 +86,7 @@ jobs:
 
       - name: Create isolated M1 measurement database
         working-directory: backend
-        run: |
+        run: |  # pragma: allowlist secret
           python - <<'PY'
           import asyncio
 
