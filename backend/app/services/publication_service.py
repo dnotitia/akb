@@ -1143,13 +1143,30 @@ async def resolve_document_publication(publication: dict) -> dict:
     if publication["resource_type"] != ResourceType.DOCUMENT:
         raise PublicationError("Not a document publication", status_code=400)
 
-    # Parse the canonical URI to find the underlying doc row.
+    # **Which document this slug serves is decided by `document_id`.** Since
+    # migration 053 that column is the publication's binding to its document,
+    # under a composite FK (document_id, vault_id) → documents(id, vault_id),
+    # so a bound row names one document and that document is in the
+    # publication's own vault. Reading it here is the point of having it:
+    # `resource_uri` is a path, `documents` is UNIQUE(vault_id, path), and a
+    # path is reusable, so resolving by path asks "what lives there now?"
+    # rather than "what was published?". Those two questions had the same
+    # answer only for as long as one UPDATE — the move-time URI rewrite in
+    # `document_service.move` — was never missed. A constraint the read path
+    # does not read protects nothing.
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
+    raw_doc_id = publication.get("document_id")
+    doc_uuid = to_uuid(raw_doc_id) if raw_doc_id else None
+
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed.kind != "doc":
+    doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
+    uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
+    if doc_uuid is None and doc_path is None:
+        # Only the legacy branch needs a readable URI. A bound row resolves
+        # without one, which also means a mirrored document whose path
+        # contains braces — a URI `parse_uri` refuses — is now servable.
         raise NotFoundError("Document", str(uri))
-    uri_vault, doc_path = parsed.vault, parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1166,19 +1183,32 @@ async def resolve_document_publication(publication: dict) -> dict:
             -- user_directory.resolve_display_names.
             LEFT JOIN users u
                 ON u.id::text = d.created_by OR u.username = d.created_by
-            -- Bind to the publication's own vault_id (not the vault NAME
-            -- parsed out of resource_uri) so this can't be satisfied by a
-            -- same-path document in another vault (cross-vault IDOR) — the
-            -- same binding `resolve_file_publication` puts on vault_files.
-            -- `v.name = $3` is then the cross-check, not the lookup key: v is
-            -- joined on the pinned vault_id, so requiring it to equal the
-            -- URI's vault name means a row whose resource_uri disagrees with
-            -- its vault_id matches nothing and 404s. Fail closed — serving
-            -- the publication's own document at that path instead would be a
-            -- silent partial success on a row that is, either way, corrupt.
-            WHERE d.vault_id = $1 AND d.path = $2 AND v.name = $3
+            -- Bound to the publication's own vault_id in BOTH branches, so
+            -- neither can be satisfied by a same-path document in another
+            -- vault — the same binding `resolve_file_publication` puts on
+            -- vault_files.
+            --
+            -- $2 (document_id) is the lookup key when the row carries one.
+            -- No `v.name` cross-check on that branch, deliberately: the FK
+            -- already pins the document to this vault, so the URI's vault
+            -- name adds nothing — and requiring it to agree would re-break
+            -- exactly what keying on the id fixes, turning a publication
+            -- whose URI drifted into a 404 instead of resolving it to the
+            -- document its publisher chose.
+            --
+            -- The path branch is for rows the migration-053 backfill could
+            -- not bind (document_id IS NULL), where the URI is still the
+            -- only handle. There `v.name = $4` remains the cross-check, not
+            -- the lookup key: v is joined on the pinned vault_id, so a row
+            -- whose resource_uri disagrees with its vault_id matches nothing
+            -- and 404s. Fail closed — nothing identifies the intended
+            -- document on that branch, so serving whatever sits at the path
+            -- would be a silent partial success on a corrupt row.
+            WHERE d.vault_id = $1
+              AND ( d.id = $2::uuid
+                 OR ($2::uuid IS NULL AND d.path = $3 AND v.name = $4) )
             """,
-            to_uuid(publication["vault_id"]), doc_path, uri_vault,
+            to_uuid(publication["vault_id"]), doc_uuid, doc_path, uri_vault,
         )
         if doc_row is None:
             raise NotFoundError("Document", str(uri))
