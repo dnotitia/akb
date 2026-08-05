@@ -27,7 +27,10 @@ for s in "${SUITES[@]}"; do
   echo "═══ $s ═══"
   OUT=$(bash "backend/tests/$s" 2>&1)
   RC=$?
-  SUMMARY=$(echo "$OUT" | grep -E '^║.*Results:|^Results:' | tail -1)
+  # Same summary pattern as .github/workflows/e2e.yml — unanchored and
+  # requiring both counts, so a suite that indents or wraps its summary
+  # line still reports here.
+  SUMMARY=$(echo "$OUT" | grep -E 'Results: *[0-9]+ passed, *[0-9]+ failed' | tail -1)
   echo "$SUMMARY"
   P=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)
   F=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '^[0-9]+' || echo 0)

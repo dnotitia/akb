@@ -84,7 +84,6 @@ echo "$R" | field "['code']" | grep -q . && fail "admin alter regression" "$R" |
 
 echo ""
 if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${ERRORS[@]}"; fi
-# Canonical summary, last line on both paths: the CI runner parses it
-# to tell "ran and passed" apart from "asserted nothing".
+# Canonical summary — the CI runner parses this line for the counts.
 echo "── #221 e2e — Results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

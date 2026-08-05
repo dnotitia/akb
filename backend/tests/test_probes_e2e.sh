@@ -97,7 +97,6 @@ if [[ $FAIL -gt 0 ]]; then
   for e in "${ERRORS[@]}"; do echo "  - $e"; done
   echo ""
 fi
-# Canonical summary, last line on both paths: the CI runner parses it
-# to tell "ran and passed" apart from "asserted nothing".
+# Canonical summary — the CI runner parses this line for the counts.
 echo "  Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1
