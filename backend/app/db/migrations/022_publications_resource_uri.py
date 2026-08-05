@@ -20,6 +20,11 @@ After
         -- NULL                                              for table_query
     -- legacy document_id / file_id FK columns dropped.
 
+Migration 053 later re-introduces a `document_id` — not this one. It is an
+identity column with a composite (document_id, vault_id) FK, added alongside
+`resource_uri` rather than replacing it. `_already_applied` below is written
+so this migration cannot mistake that column for the one it removed.
+
 Migration logic
 ---------------
 1.  ALTER TABLE publications ADD COLUMN resource_uri TEXT (idempotent).
@@ -90,10 +95,25 @@ async def _column_exists(conn, table: str, column: str) -> bool:
 
 
 async def _already_applied(conn) -> bool:
+    """Applied ⇔ resource_uri exists and file_id is gone.
+
+    `document_id` is deliberately NOT part of this test, even though this
+    migration drops a column by that name. Migration 053 adds a *different*
+    document_id — an identity column with a composite FK — and init.sql
+    declares it, so on a fresh database this migration runs after a table
+    that already has one. Keying on document_id here would make 022 drop 053's
+    column on every fresh boot, to be re-added seconds later; a run that
+    stopped in between would leave the schema short a column that init.sql
+    says is there.
+
+    `file_id` is the safe marker: only this migration ever removed it and
+    nothing re-adds it, so its absence alongside resource_uri means the
+    collapse has happened. This is strictly more conservative than the
+    previous test — every database it skipped before, it still skips.
+    """
     has_uri = await _column_exists(conn, "publications", "resource_uri")
-    has_document_id = await _column_exists(conn, "publications", "document_id")
     has_file_id = await _column_exists(conn, "publications", "file_id")
-    return bool(has_uri and not has_document_id and not has_file_id)
+    return bool(has_uri and not has_file_id)
 
 
 async def _run(conn):

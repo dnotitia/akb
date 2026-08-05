@@ -229,6 +229,7 @@ async def _apply_migrations() -> None:
         "050_drop_todos.py",                     # archive todos → todos_archive, drop todos: entrypoint-less since PR #43 and the source of the NOT NULL account-deletion failure
         "051_app_credentials.py",                # exchange-only deployment credentials for app principals
         "052_app_inventory.py",                  # observed installation state and sealed rollout snapshots
+        "053_publication_document_identity.py",  # publications.document_id + composite FK (document_id, vault_id) → documents(id, vault_id) ON DELETE CASCADE; conservative backfill
     ):
         if filename in applied:
             continue

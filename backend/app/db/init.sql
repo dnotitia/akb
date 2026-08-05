@@ -192,7 +192,13 @@ CREATE TABLE IF NOT EXISTS documents (
     content_hash_commit TEXT,          -- commit the content_hash projection was computed from
     tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}',       -- extended metadata from frontmatter
-    UNIQUE(vault_id, path)
+    UNIQUE(vault_id, path),
+    -- Redundant as a guarantee about documents (id is already the PK), and
+    -- required all the same: publications reference (id, vault_id) as a pair
+    -- so the vault match is structural, and PostgreSQL will not accept a
+    -- composite FK without a unique constraint on exactly that column pair.
+    -- Named explicitly because migration 053 looks it up by name.
+    CONSTRAINT documents_id_vault_id_key UNIQUE (id, vault_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_vault ON documents(vault_id);
@@ -397,12 +403,31 @@ CREATE TABLE IF NOT EXISTS publications (
 
     -- Canonical resource handle — `akb://{vault}/{type}/{identifier}`.
     -- NULL only for table_query publications, which surface a SQL query
-    -- rather than a single addressable resource. The cascade on
-    -- vault/document/file delete still works because vault_id has
-    -- ON DELETE CASCADE; document/file deletion bumps publications
-    -- via app-level cleanup (delete_publications_for_document /
-    -- delete_publications_for_file).
+    -- rather than a single addressable resource. This is the handle every
+    -- surface displays and the API returns; it is NOT the identity binding
+    -- (see document_id below) because a path is reusable.
     resource_uri TEXT,
+
+    -- The published document, when the publication has one.
+    --
+    -- NULLABLE, and that is not a placeholder for future tightening: rows
+    -- that predate migration 053 are bound only if the binding is
+    -- unambiguous, so "every document publication has a document_id" is a
+    -- property of rows created after the publish path started recording it,
+    -- not a schema invariant. table_query and file publications leave it
+    -- NULL by definition — file cleanup is still app-level
+    -- (delete_publications_for_file).
+    --
+    -- The FK is composite on purpose. Referencing documents(id) alone would
+    -- promise only that the document exists; pairing vault_id in makes "the
+    -- document is in the publication's own vault" structural instead of a
+    -- rule each write has to remember. Match type is the default (MATCH
+    -- SIMPLE) so a NULL document_id is exempt even though vault_id is NOT
+    -- NULL — MATCH FULL would forbid the NULL and is wrong here.
+    document_id UUID,
+    CONSTRAINT publications_document_fk
+        FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id)
+        ON DELETE CASCADE,
 
     -- For table_query type: stored canned SQL with :param placeholders
     query_sql TEXT,
@@ -434,6 +459,11 @@ CREATE TABLE IF NOT EXISTS publications (
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
 CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resource_uri) WHERE resource_uri IS NOT NULL;
+-- Referencing side of publications_document_fk: without it, every document
+-- delete seq-scans this table to find the rows to cascade. Partial because
+-- most rows are NULL and `document_id = $1` implies NOT NULL, so the cascade
+-- probe can still use it.
+CREATE INDEX IF NOT EXISTS idx_publications_document_id ON publications(document_id, vault_id) WHERE document_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================
