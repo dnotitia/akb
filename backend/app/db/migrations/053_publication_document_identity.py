@@ -213,6 +213,9 @@ _PUB_INDEX_COLS = "(document_id, vault_id) WHERE (document_id IS NOT NULL)"
 # cancel regardless of how many publications a deployment has accumulated.
 _BATCH = 500
 
+# How many vault-mismatch publication ids the log names individually.
+_MISMATCH_SAMPLE = 20
+
 
 async def migrate(conn=None):
     if conn is None:
@@ -490,7 +493,11 @@ async def _backfill(conn) -> None:
     unreadable_uri = 0
     path_reused = 0
     no_document = 0
-    vault_mismatch: list = []
+    vault_mismatch = 0
+    # Bounded sample, not every id: the log names a handful so an operator can
+    # pull the rows, and the count carries the rest. A per-row list would be
+    # the one structure here whose size still tracked the table's.
+    mismatch_sample: list = []
     after: uuid_mod.UUID | None = None
 
     while True:
@@ -532,7 +539,9 @@ async def _backfill(conn) -> None:
                 # this row, and "some document exists at that path somewhere"
                 # is not evidence about which document this publication was
                 # made for.
-                vault_mismatch.append(row["id"])
+                vault_mismatch += 1
+                if len(mismatch_sample) < _MISMATCH_SAMPLE:
+                    mismatch_sample.append(row["id"])
                 continue
             ids.append(row["id"])
             paths.append(parsed.identifier)
@@ -599,19 +608,19 @@ async def _backfill(conn) -> None:
         "unreadable_uri=%d, vault_mismatch=%d, already_bound=%d, "
         "non_document_publications=%d (of %d document publications examined "
         "this run)",
-        bound, no_document, path_reused, unreadable_uri, len(vault_mismatch),
+        bound, no_document, path_reused, unreadable_uri, vault_mismatch,
         already_bound or 0, skipped_by_design or 0, examined,
     )
     if vault_mismatch:
         # The most interesting rows in the table if they exist: the vault the
         # URI names is not the vault the row belongs to. Ids only — enough to
         # pull the rows with a SELECT, without putting names or paths in a log.
-        shown = [str(i) for i in vault_mismatch[:20]]
         logger.warning(
             "Migration 053: %d document publication(s) name a vault other than "
             "their own and were left unbound. publication id(s): %s%s",
-            len(vault_mismatch), ", ".join(shown),
-            "" if len(vault_mismatch) <= 20 else " (first 20 shown)",
+            vault_mismatch, ", ".join(str(i) for i in mismatch_sample),
+            "" if vault_mismatch <= _MISMATCH_SAMPLE
+            else f" (first {_MISMATCH_SAMPLE} shown)",
         )
     if no_document or path_reused or unreadable_uri:
         logger.warning(
