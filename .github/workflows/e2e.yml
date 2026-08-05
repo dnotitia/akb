@@ -237,7 +237,7 @@ jobs:
             # that skips a section still reports 0 failed, so the skip
             # branches there are a fallback, not an accepted outcome.
             test_publication_resolution_e2e.sh
-            # The publication feature's own suite — 127 assertions over
+            # The publication feature's own suite — 134 assertions over
             # documents, table queries, snapshots and files. Needs S3
             # (section 0 uploads a file, and sections 9/13 publish it),
             # which is why MinIO is brought up above. Nothing else here
