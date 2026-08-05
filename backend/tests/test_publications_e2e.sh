@@ -105,7 +105,7 @@ d = json.load(sys.stdin)
 forbidden = ["id", "publication_id", "public_url", "public_url_full",
              "public_base", "snapshot_s3_key", "password_hash", "vault_id"]
 found = [k for k in forbidden if k in d]
-if "slug" not in d:
+if not d.get("slug"):
     found.append("<not-a-publication-response>")
 print("PARSED:" + ",".join(found))' 2>/dev/null)
 [ "$LEAKS" = "PARSED:" ] && pass "Response excludes legacy/internal fields" || fail "Response shape" "${LEAKS:-unparsable body}: $R"
@@ -422,9 +422,13 @@ R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
 MODE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode",""))' 2>/dev/null)
 [ "$MODE" = "snapshot" ] && pass "Mode flipped to snapshot" || fail "Snapshot mode" "$MODE"
 
-# Insert new data — snapshot must NOT reflect it
-acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
-  -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('SnapTest', 'food', 999)\"}" >/dev/null
+# Insert new data — snapshot must NOT reflect it. The INSERT is asserted: if it
+# never lands there is nothing for the snapshot to fail to reflect, and the
+# freeze assertion below would pass without exercising anything.
+POST_SNAP=$(acurl -X POST "$BASE_URL/api/v1/tables/$VAULT/sql" -H "Content-Type: application/json" \
+  -d "{\"sql\":\"INSERT INTO products (name, category, price) VALUES ('SnapTest', 'food', 999)\"}")
+PS_ROWS=$(echo "$POST_SNAP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("affected_rows"))' 2>/dev/null)
+[ "$PS_ROWS" = "1" ] && pass "post-snapshot row inserted" || fail "post-snapshot insert" "affected_rows=$PS_ROWS: $POST_SNAP"
 R=$(curl -sk "$BASE_URL/api/v1/public/$TQ_SLUG")
 # The frozen result set must still BE a result set. An error body or an empty
 # `rows` also contains no "SnapTest", so require the served snapshot rows first.
@@ -476,7 +480,7 @@ d = json.load(sys.stdin)
 if d.get("resource_type") != "file" or not d.get("mime_type"):
     print("BAD:not-a-file-publication-response")
 else:
-    print("OK:" + str(d.get("download_url", "")))' 2>/dev/null)
+    print("OK:present" if "download_url" in d else "OK:")' 2>/dev/null)
 [ "$DL" = "OK:" ] && pass "F4: no presigned download_url in file response" || fail "F4 download_url absent" "${DL:-unparsable body}: $R"
 
 # /raw proxies content (CORS-safe for browser)
@@ -514,9 +518,14 @@ CODE=$(acurl -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/v1/files/$IDO
 [ "$CODE" = "200" ] && pass "second-vault file confirmed (200)" || fail "second-vault confirm" "HTTP $CODE"
 # attacker (owner of $VAULT) tries to publish vault-B's file UUID through $VAULT
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
-  -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}")
-IDOR_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-[ -z "$IDOR_SLUG" ] && pass "cross-vault file publish REJECTED at create (IDOR closed)" || fail "cross-vault file IDOR" "created slug=$IDOR_SLUG"
+  -d "{\"resource_type\":\"file\",\"uri\":\"akb://$VAULT/file/$IFID\"}" -w '\n%{http_code}')
+IDOR_CODE=$(printf '%s' "$R" | tail -1)
+IDOR_SLUG=$(printf '%s' "$R" | sed '$d' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+# An absent slug alone would also be satisfied by a 500 or an unparsable body, so
+# the expected 400 refusal is asserted alongside it.
+[ "$IDOR_CODE" = "400" ] && [ -z "$IDOR_SLUG" ] \
+  && pass "cross-vault file publish REJECTED at create (IDOR closed)" \
+  || fail "cross-vault file IDOR" "HTTP $IDOR_CODE, slug=${IDOR_SLUG:-<none>}: $R"
 acurl -X DELETE "$BASE_URL/api/v1/vaults/$IDOR_V" >/dev/null 2>&1
 
 # File view-count model (hard cap via view-grant): a page open counts one view
@@ -914,9 +923,16 @@ CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["
 acurl -X DELETE "$BASE_URL/api/v1/files/$VAULT/$FID" > /dev/null
 # An empty slug would request /public/ — 404 by routing, which is exactly what
 # "the publication was cascaded away" asserts. Require a real slug to check.
+# The public 404 is only the symptom: a publication row that outlived its file
+# also 404s. The owner's list is the condition — the row itself must be gone.
 if [ -n "$CSC_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$CSC_SLUG")
-  [ "$CODE" = "404" ] && pass "File delete cascades publications (404)" || fail "File cascade" "HTTP $CODE"
+  LEFT=$(acurl "$BASE_URL/api/v1/publications/$VAULT" | python3 -c "
+import json, sys
+print(sum(1 for p in json.load(sys.stdin)['publications'] if p.get('slug') == '$CSC_SLUG'))" 2>/dev/null)
+  [ "$CODE" = "404" ] && [ "$LEFT" = "0" ] \
+    && pass "File delete cascades publications (404 + row removed)" \
+    || fail "File cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}"
 else
   fail "File cascade" "no publication slug to check the cascade against: $R"
 fi
@@ -931,7 +947,12 @@ DOC_CSC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdi
 acurl -X DELETE "$BASE_URL/api/v1/documents/$VAULT/$CASCADE_DOC" > /dev/null
 if [ -n "$DOC_CSC_SLUG" ]; then
   CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$DOC_CSC_SLUG")
-  [ "$CODE" = "404" ] && pass "Document delete cascades publications (404)" || fail "Doc cascade" "HTTP $CODE"
+  LEFT=$(acurl "$BASE_URL/api/v1/publications/$VAULT" | python3 -c "
+import json, sys
+print(sum(1 for p in json.load(sys.stdin)['publications'] if p.get('slug') == '$DOC_CSC_SLUG'))" 2>/dev/null)
+  [ "$CODE" = "404" ] && [ "$LEFT" = "0" ] \
+    && pass "Document delete cascades publications (404 + row removed)" \
+    || fail "Doc cascade" "HTTP $CODE, rows still listed=${LEFT:-unparsable}"
 else
   fail "Doc cascade" "no publication slug to check the cascade against: $R"
 fi
@@ -952,8 +973,9 @@ echo ""
 
 # ── 99. Cleanup ───────────────────────────────────────────
 echo "▸ 99. Cleanup"
-# Deleting the loaded vault is also the cascade check for a vault that still owns
-# publications, tables and files — so inspect the result instead of assuming it.
+# Deleting a vault that still owns publications, tables and files must at least
+# report success — inspect the result instead of assuming it. This checks the
+# acknowledgement only; it is not a check of the downstream cascade.
 DELV=$(mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_text)
 DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DELOK" = "True" ] && pass "Cleanup: test vault deleted" || fail "Cleanup vault delete" "$DELV"
