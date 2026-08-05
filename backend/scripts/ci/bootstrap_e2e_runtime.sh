@@ -5,9 +5,14 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 readonly UV_VERSION="0.12.1"
+readonly UV_VERSION_PATTERN="^uv ${UV_VERSION//./\\.}( \\([^[:space:]]+\\))?$"
 readonly DATA_ROOT="${AKB_E2E_BOOTSTRAP_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/akb-e2e-bootstrap}"
 readonly UV_BIN="$DATA_ROOT/bin/uv"
 readonly VENV="$DATA_ROOT/venv"
+
+uv_version_is_expected() {
+  [[ "$1" =~ $UV_VERSION_PATTERN ]]
+}
 
 if ! command -v curl >/dev/null 2>&1 \
   || ! command -v docker >/dev/null 2>&1 \
@@ -35,11 +40,13 @@ if [[ -z "${AKB_E2E_DOCKER_ARGV:-}" ]]; then
 fi
 
 mkdir -p "$DATA_ROOT/bin" "$DATA_ROOT/python" "$DATA_ROOT/cache"
-if [[ "$($UV_BIN --version 2>/dev/null || true)" != "uv $UV_VERSION" ]]; then
+uv_output="$($UV_BIN --version 2>/dev/null || true)"
+if ! uv_version_is_expected "$uv_output"; then
   curl --proto '=https' --tlsv1.2 -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" \
     | env UV_UNMANAGED_INSTALL="$DATA_ROOT/bin" sh
 fi
-if [[ "$($UV_BIN --version)" != "uv $UV_VERSION" ]]; then
+uv_output="$($UV_BIN --version 2>/dev/null || true)"
+if ! uv_version_is_expected "$uv_output"; then
   echo "expected uv $UV_VERSION at $UV_BIN" >&2
   exit 1
 fi

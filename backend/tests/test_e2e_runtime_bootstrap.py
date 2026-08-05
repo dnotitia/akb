@@ -40,7 +40,7 @@ def test_bootstrap_prepares_locked_python_314_environment_and_execs_runtime(tmp_
     _write_executable(
         data_root / "bin/uv",
         "#!/usr/bin/env bash\n"
-        "if [[ \"${1:-}\" == --version ]]; then echo 'uv 0.12.1'; exit 0; fi\n"
+        "if [[ \"${1:-}\" == --version ]]; then echo 'uv 0.12.1 (aarch64-unknown-linux-gnu)'; exit 0; fi\n"
         "printf '%s\\n' \"$*\" >>\"$AKB_TEST_UV_LOG\"\n"
         "if [[ \"${1:-}\" == venv ]]; then\n"
         "  target=\"${!#}\"\n"
