@@ -1,4 +1,4 @@
-"""Migration 050: guarded native searchable-document derived state.
+"""Migration 054: guarded native searchable-document derived state.
 
 The native ledger remains authoritative.  These relations only bind rebuildable
 chunk ids to the exact native Revision consumed from a durable invalidation
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("akb.migration.050")
+logger = logging.getLogger("akb.migration.054")
 
 
 async def migrate(conn=None):
@@ -112,4 +112,4 @@ async def _run(conn):
                 ON native_derived_chunks(resource_id, revision_id);
             """
         )
-    logger.info("Migration 050: native searchable derived state ready")
+    logger.info("Migration 054: native searchable derived state ready")

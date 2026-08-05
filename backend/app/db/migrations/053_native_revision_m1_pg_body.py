@@ -1,4 +1,4 @@
-"""Migration 049: add the explicit M1 PostgreSQL BodyStore candidate.
+"""Migration 053: add the explicit M1 PostgreSQL BodyStore candidate.
 
 Migration 048 deliberately labelled its BYTEA payload as a reference adapter so
 the B-core experiment could not accidentally select a physical text profile.
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("akb.migration.049")
+logger = logging.getLogger("akb.migration.053")
 
 
 async def migrate(conn=None):
@@ -70,4 +70,4 @@ async def _run(conn):
                 EXECUTE FUNCTION akb_m1_enforce_namespace_payload_placement();
             """
         )
-    logger.info("Migration 049: explicit M1 PostgreSQL BodyStore candidate ready")
+    logger.info("Migration 053: explicit M1 PostgreSQL BodyStore candidate ready")

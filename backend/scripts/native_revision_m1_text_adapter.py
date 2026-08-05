@@ -66,8 +66,8 @@ async def run() -> dict[str, Any]:
         await conn.execute((BACKEND / "app" / "db" / "init.sql").read_text())
         for filename in (
             "048_native_revision_core.py",
-            "049_native_revision_m1_pg_body.py",
-            "053_native_revision_m1_payload_placement.py",
+            "053_native_revision_m1_pg_body.py",
+            "057_native_revision_m1_payload_placement.py",
         ):
             await _migration(conn, filename)
         namespace_id = await conn.fetchval(

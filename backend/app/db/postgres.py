@@ -71,10 +71,17 @@ async def get_pool() -> asyncpg.Pool:
 
 
 async def close_pool() -> None:
+    """Close the pool and clear the module handle.
+
+    The handle is cleared BEFORE the await on purpose: if `close()` raises
+    or is cancelled, leaving `_pool` set would hand the next `get_pool()` a
+    half-closed pool — and in tests, one still pointing at the previous
+    database.
+    """
     global _pool
     if _pool is not None:
-        await _pool.close()
-        _pool = None
+        pool, _pool = _pool, None
+        await pool.close()
 
 
 async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
@@ -218,11 +225,15 @@ async def _apply_migrations() -> None:
         "046_tool_usage.py",                     # tool_calls + tool_usage_daily: MCP usage analytics (inert until enabled)
         "047_app_registry.py",                    # app definitions, immutable releases, installations, grants, and owned resources
         "048_native_revision_core.py",             # M1 PostgreSQL-native resource/revision ledger + reference payload substrate
-        "049_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
-        "050_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
-        "051_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
-        "052_native_revision_m1_file_constraints.py", # M1 File placement discriminator integrity
-        "053_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
+        "049_external_git_quarantine.py",        # external_git sync_state machine (pending_preflight/active/quarantined) + rollout fence for the pre-hardening poller
+        "050_drop_todos.py",                     # archive todos → todos_archive, drop todos: entrypoint-less since PR #43 and the source of the NOT NULL account-deletion failure
+        "051_app_credentials.py",                # exchange-only deployment credentials for app principals
+        "052_app_inventory.py",                  # observed installation state and sealed rollout snapshots
+        "053_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
+        "054_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
+        "055_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
+        "056_native_revision_m1_file_constraints.py", # M1 File placement discriminator integrity
+        "057_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
     ):
         if filename in applied:
             continue

@@ -206,6 +206,33 @@ def _content_key_honors_hash(s3_key: str, content_hash: str) -> bool:
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
 
 
+async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> None:
+    """Drop this file's publications on the CALLER's connection, before its
+    `vault_files` row goes.
+
+    A file becomes publishable the moment `initiate_upload` writes its row —
+    `create_publication` only checks `SELECT 1 FROM vault_files WHERE id=$1
+    AND vault_id=$2`, with no confirmed/hash predicate. So a file can be
+    published while the upload is still outstanding, and the two
+    `confirm_upload` failure paths that clean up the row (S3 object missing,
+    declared-bytes mismatch) would otherwise leave the publication behind:
+    a live slug in the owner's list pointing at a resource that no longer
+    exists. A file URI carries a UUID, so this cannot be reoccupied the way
+    a document path can — the row is simply stale, not reachable as
+    something else.
+
+    Takes `vault_id` because `confirm_upload` never resolves the vault NAME,
+    which the shared helper needs to build the canonical URI.
+    """
+    from app.services.publication_service import delete_publications_for_file
+    vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
+    if not vault_row:
+        return
+    await delete_publications_for_file(
+        file_id, vault_row["name"], expected_vault_id=vault_id, conn=conn,
+    )
+
+
 # ── File domain service ──────────────────────────────────────────
 
 
@@ -351,7 +378,11 @@ class FileService:
             size_bytes = meta["ContentLength"]
         except NotFoundError:
             async with pool.acquire() as conn:
-                await vault_files_repo.delete(conn, fid)
+                # One transaction so the publication cannot outlive the row
+                # it points at — the same atomicity the delete paths need.
+                async with conn.transaction():
+                    await _delete_file_publications(conn, vault_id, file_id)
+                    await vault_files_repo.delete(conn, fid)
             logger.warning("Orphan file record deleted: %s (S3 object missing)", file_id)
             raise AKBError(
                 f"Upload not found in storage — file record cleaned up: {file_id}",
@@ -378,6 +409,7 @@ class FileService:
         if stored_bytes_disowned:
             async with pool.acquire() as conn:
                 async with conn.transaction():
+                    await _delete_file_publications(conn, vault_id, file_id)
                     await vault_files_repo.delete(conn, fid)
                     await _enqueue_s3_delete(conn, row["s3_key"])
             raise AKBError(
@@ -590,20 +622,31 @@ class FileService:
         # missing-blob row). The outbox row carries the s3_key.
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await vault_files_repo.delete(conn, fid)
-
                 if vault_name:
                     f_uri = file_uri(vault_name, file_id, collection=row["collection"])
+                    # App-level publication cascade — `publications.
+                    # file_id` FK is gone after migration 022. Goes through
+                    # the shared helper instead of an inline DELETE (see
+                    # `delete_publications_for_document` for why there is
+                    # exactly one implementation), and runs BEFORE the
+                    # `vault_files` row is removed: the helper re-derives
+                    # the file's collection from `vault_files JOIN
+                    # collections`, and inside this transaction an
+                    # already-deleted row is invisible to it — it would
+                    # build a vault-root URI and match nothing.
+                    from app.services.publication_service import (
+                        delete_publications_for_file,
+                    )
+                    await delete_publications_for_file(
+                        file_id, vault_name,
+                        expected_vault_id=vault_id, conn=conn,
+                    )
                     await conn.execute(
                         "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                         f_uri,
                     )
-                    # App-level publication cascade — `publications.
-                    # file_id` FK is gone after migration 022.
-                    await conn.execute(
-                        "DELETE FROM publications WHERE resource_uri = $1",
-                        f_uri,
-                    )
+
+                await vault_files_repo.delete(conn, fid)
 
                 # Drop the metadata chunk (outbox-driven vector-store delete).
                 # delete_file_chunks → _drop_source_chunks_with_outbox is

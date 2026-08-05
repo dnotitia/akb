@@ -1,4 +1,4 @@
-"""Migration 053: scope M1 payload deduplication to its selected placement.
+"""Migration 057: scope M1 payload deduplication to its selected placement.
 
 M1 initially admitted only one measured payload placement per namespace.  A
 native document using the reference adapter and a native text File using the
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("akb.migration.053")
+logger = logging.getLogger("akb.migration.057")
 MEASUREMENT_DATABASE_PREFIX = "akb_revision_m1_measurement"
 
 
@@ -40,7 +40,7 @@ async def _run(conn):
         database == MEASUREMENT_DATABASE_PREFIX
         or database.startswith(MEASUREMENT_DATABASE_PREFIX + "_")
     ):
-        logger.info("Migration 053: non-measurement database left unchanged")
+        logger.info("Migration 057: non-measurement database left unchanged")
         return
     async with conn.transaction():
         await conn.execute(
@@ -56,4 +56,4 @@ async def _run(conn):
                 UNIQUE (namespace_id, digest, byte_size, selected_placement);
             """
         )
-    logger.info("Migration 053: M1 payload deduplication is placement-scoped")
+    logger.info("Migration 057: M1 payload deduplication is placement-scoped")

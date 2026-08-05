@@ -68,6 +68,13 @@ async def test_create_table_route_forwards_plain_schema_with_legacy_defaults(mon
         "collection": None,
         "unique_keys": [{"columns": ["state"], "vendor_extension": "keep"}],
         "indexes": [{"columns": [{"name": "state", "order": "desc"}]}],
+        # Omitted by the caller → the route still forwards the explicit
+        # default, so the service never has to infer intent from absence.
+        "if_not_exists": False,
+        # Read authority is resolved at this boundary and passed down as a
+        # capability. False here because the stub user has no reader role —
+        # which is the fail-closed default the projection depends on.
+        "can_read_existing": False,
     }
 
 

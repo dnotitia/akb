@@ -299,8 +299,8 @@ async def _setup(dsn: str, *, pool_max_size: int = 24) -> tuple[asyncpg.Pool, st
         await conn.execute((BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
         for filename in (
             "048_native_revision_core.py",
-            "049_native_revision_m1_pg_body.py",
-            "053_native_revision_m1_payload_placement.py",
+            "053_native_revision_m1_pg_body.py",
+            "057_native_revision_m1_payload_placement.py",
         ):
             path = BACKEND / "app" / "db" / "migrations" / filename
             spec = importlib.util.spec_from_file_location("m1_capacity_" + filename.replace(".", "_"), path)

@@ -1501,7 +1501,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
       - edges, chunks (via vector-store outbox + sync vector-store delete in
         index_service.delete_vault_chunks)
       - vault_tables (drops the underlying PG tables)
-      - todos, sessions
       - documents, collections, vault_access
       - the vault row itself
       - git bare repo directory
@@ -1603,7 +1602,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 await conn.execute(f"DROP TABLE IF EXISTS {pg_name} CASCADE")
             await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
 
-            await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
@@ -1659,11 +1657,19 @@ async def delete_user_account(user_id: str) -> dict:
     Order:
       1. Delete each owned vault via `delete_vault` (full cascade).
       2. Clear residual FK references from other vaults this user may have
-         touched: todos they authored/are assigned, vault_access grants they
-         made, publications they created. SET NULL rather than deleting the
-         artifacts — those belong to other users' vaults.
+         touched: vault_access grants they made, publications they created.
+         SET NULL rather than deleting the artifacts — those belong to other
+         users' vaults.
       3. DELETE users row. CASCADE clears `tokens` and `vault_access`
          rows keyed on user_id.
+
+    Both SET NULL targets are declared nullable. A third one used to live
+    here — `todos.assignee_id` / `.created_by` — against columns declared
+    NOT NULL; since this block has no transaction wrapper, the two updates
+    above committed and the NotNullViolationError then skipped the DELETE
+    below, so the account could never be deleted. The `todos` stack was
+    removed in migration 050 (see the guards in
+    tests/test_todos_surface_removed_unit.py).
     """
     uid = uuid.UUID(user_id)
     pool = await get_pool()
@@ -1687,8 +1693,6 @@ async def delete_user_account(user_id: str) -> dict:
         # Detach residual references rather than deleting the artifacts
         await conn.execute("UPDATE vault_access SET granted_by = NULL WHERE granted_by = $1", uid)
         await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
-        await conn.execute("UPDATE todos SET assignee_id = NULL WHERE assignee_id = $1", uid)
-        await conn.execute("UPDATE todos SET created_by = NULL WHERE created_by = $1", uid)
         # CASCADE handles tokens + vault_access.user_id
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
 

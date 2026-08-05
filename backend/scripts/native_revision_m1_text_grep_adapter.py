@@ -103,8 +103,8 @@ async def initialise(
         validate_measurement_database(database)
         await conn.execute((BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
         await _load_migration(conn, "048_native_revision_core.py")
-        await _load_migration(conn, "049_native_revision_m1_pg_body.py")
-        await _load_migration(conn, "053_native_revision_m1_payload_placement.py")
+        await _load_migration(conn, "053_native_revision_m1_pg_body.py")
+        await _load_migration(conn, "057_native_revision_m1_payload_placement.py")
         suffix = uuid.uuid4().hex
         owner_id = await conn.fetchval(
             """

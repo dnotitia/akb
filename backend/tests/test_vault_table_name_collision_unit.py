@@ -91,7 +91,8 @@ class _FakeConn:
         self._vault_name = vault_name
         self._taken = taken
 
-    def transaction(self):
+    def transaction(self, **kwargs):
+        # create_table pins isolation="read_committed"
         return _AsyncCtx()
 
     async def fetchrow(self, sql: str, *params):
@@ -100,6 +101,11 @@ class _FakeConn:
         return None  # find_by_name → no same-vault duplicate
 
     async def fetchval(self, sql: str, *params):
+        # create_table serialises same-(vault, table) creates on an xact
+        # advisory lock before the existence check; it is not part of what
+        # these tests assert, but it does reach the fake.
+        if "pg_advisory" in sql:
+            return None
         assert "to_regclass" in sql, f"unexpected fetchval: {sql}"
         return self._taken
 

@@ -56,7 +56,7 @@ async def _create_database(admin: asyncpg.Connection, name: str) -> str:
     try:
         await conn.execute(INIT_SQL)
         await _migration("048_native_revision_core.py").migrate(conn=conn)
-        await _migration("049_native_revision_m1_pg_body.py").migrate(conn=conn)
+        await _migration("053_native_revision_m1_pg_body.py").migrate(conn=conn)
     finally:
         await conn.close()
     return dsn
@@ -101,7 +101,7 @@ async def test_seeded_049_database_upgrades_idempotently_and_deduplicates_per_pl
         pool = None
         conn = await asyncpg.connect(dsn)
         try:
-            placement = _migration("053_native_revision_m1_payload_placement.py")
+            placement = _migration("057_native_revision_m1_payload_placement.py")
             await placement.migrate(conn=conn)
             await placement.migrate(conn=conn)
         finally:
@@ -190,7 +190,7 @@ async def test_placement_migration_leaves_non_measurement_database_unchanged():
                    AND conname = 'm1_reference_payloads_dedup_key'
                 """
             )
-            await _migration("053_native_revision_m1_payload_placement.py").migrate(conn=conn)
+            await _migration("057_native_revision_m1_payload_placement.py").migrate(conn=conn)
             after = await conn.fetchval(
                 """
                 SELECT pg_get_constraintdef(oid)

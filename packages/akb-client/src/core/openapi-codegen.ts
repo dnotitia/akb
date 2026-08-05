@@ -380,6 +380,17 @@ function schemaLines(): string[] {
     "  name?: string;",
     "  sql_name?: string;",
     "  description?: string | null;",
+    // create only. `created` is `true` on a real create and `false` when
+    // if_not_exists=true matched an existing table. `outcome` appears ONLY on
+    // the `false` branch ("already_exists"); a real create has no `outcome`.
+    // `matches_request` / `mismatches` describe how the stored table differs
+    // from the request, and are omitted — along with the schema itself — for
+    // a caller without READ authority on the vault, since they are schema
+    // oracles. Their absence means "not disclosed", NOT "no divergence".
+    "  created?: boolean;",
+    "  outcome?: string;",
+    "  matches_request?: boolean;",
+    "  mismatches?: string[];",
     "  columns?: AkbJsonObjectArray;",
     "  unique_keys?: AkbJsonObjectArray;",
     "  indexes?: AkbJsonObjectArray;",

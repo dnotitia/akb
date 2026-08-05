@@ -52,11 +52,11 @@ async def pool():
             "015_events_outbox.py",
             "019_s3_delete_outbox.py",
             "048_native_revision_core.py",
-            "049_native_revision_m1_pg_body.py",
-            "050_native_revision_searchable_derived.py",
-            "051_native_revision_m1_file_storage.py",
-            "052_native_revision_m1_file_constraints.py",
-            "053_native_revision_m1_payload_placement.py",
+            "053_native_revision_m1_pg_body.py",
+            "054_native_revision_searchable_derived.py",
+            "055_native_revision_m1_file_storage.py",
+            "056_native_revision_m1_file_constraints.py",
+            "057_native_revision_m1_payload_placement.py",
         ):
             await _migration(filename).migrate(conn)
     try:

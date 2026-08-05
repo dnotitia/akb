@@ -8,7 +8,7 @@ from pydantic_core import to_json
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
-from app.services.auth_service import AuthenticatedUser
+from app.services.auth_service import AuthenticatedUser, token_has_scope
 from app.services import (
     table_migration_service,
     table_row_query,
@@ -113,6 +113,14 @@ class CreateTableRequest(NFCModel):
     # from the service map to 422/409 via the global AKBError handler.
     unique_keys: list[TableUniqueKeySpec] | None = None
     indexes: list[TableIndexSpec] | None = None
+    # Opt-in idempotent create: an existing table is reported as
+    # created=false instead of raising 409. The STORED schema and the
+    # matches_request/mismatches divergence report accompany it only for a
+    # caller that also holds READ access to the vault. Only a
+    # same-vault (vault, name) row is suppressed — cross-vault physical-name
+    # fusion still conflicts, because reporting it as a no-op would disclose
+    # another tenant's schema.
+    if_not_exists: bool = False
 
 
 class AlterTableRequest(NFCModel):
@@ -258,6 +266,29 @@ class TableQueryResponse(NFCModel):
     total: int
 
 
+async def _can_read_vault(user: AuthenticatedUser, vault: str) -> bool:
+    """READ authority on `vault` for this credential — see the MCP twin in
+    `mcp_server/server.py`. Fail-closed: this gates a projection, never an
+    action, so refusing it can only under-disclose.
+
+    BOTH scope systems must be consulted. `token_has_scope(None, ...)` is
+    True by design — `None` means an unscoped credential, i.e. a JWT login.
+    But an OAuth credential ALSO carries `token_scopes=None` and keeps its
+    grants in `oauth_scopes`, so checking only the former waves through an
+    OAuth token holding nothing but `akb:vault:write`.
+    """
+    oauth = getattr(user, "oauth_scopes", None)
+    if oauth is not None and "akb:vault:read" not in oauth:
+        return False
+    if not token_has_scope(getattr(user, "token_scopes", None), "read"):
+        return False
+    try:
+        await check_vault_access(user.user_id, vault, required_role="reader")
+    except Exception:  # noqa: BLE001 — any failure means "no read authority"
+        return False
+    return True
+
+
 @router.post("/tables/{vault}", summary="Create a table in a vault")
 async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedUser = Depends(get_current_user)):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
@@ -267,6 +298,12 @@ async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedU
         actor_id=user.username, description=payload.get("description", req.description),
         collection=payload.get("collection"),
         unique_keys=payload.get("unique_keys"), indexes=payload.get("indexes"),
+        if_not_exists=payload.get("if_not_exists", False),
+        # Write authority does not imply read (token_has_scope has no
+        # implication, and a managed wildcard grant can authorise a write
+        # without reader membership), so the no-op projection is gated on
+        # READ authority resolved here. Fail-closed: any failure → False.
+        can_read_existing=await _can_read_vault(user, vault),
     )
 
 

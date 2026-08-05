@@ -15,6 +15,10 @@ export interface AkbTableEnvelope {
   name?: string;
   sql_name?: string;
   description?: string | null;
+  created?: boolean;
+  outcome?: string;
+  matches_request?: boolean;
+  mismatches?: string[];
   columns?: AkbJsonObjectArray;
   unique_keys?: AkbJsonObjectArray;
   indexes?: AkbJsonObjectArray;
@@ -455,7 +459,7 @@ export type LinkRequest = { source: string; target: string; relation: "depends_o
 
 export type CreateCollectionRequest = { path: string; summary?: string | null };
 
-export type CreateTableRequest = { name: string; description?: string; columns: TableColumnSpec[]; collection?: string | null; unique_keys?: TableUniqueKeySpec[] | null; indexes?: TableIndexSpec[] | null };
+export type CreateTableRequest = { name: string; description?: string; columns: TableColumnSpec[]; collection?: string | null; unique_keys?: TableUniqueKeySpec[] | null; indexes?: TableIndexSpec[] | null; if_not_exists?: boolean };
 
 export type AlterTableRequest = { add_columns?: TableColumnSpec[] | null; alter_columns?: TableAlterColumnSpec[] | null; drop_columns?: string[] | null; rename_columns?: { [key: string]: string } | null; add_unique_keys?: TableUniqueKeySpec[] | null; drop_unique_keys?: string[] | null; add_indexes?: TableIndexSpec[] | null; drop_indexes?: string[] | null };
 

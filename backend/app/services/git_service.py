@@ -13,27 +13,111 @@ the object store with bare, so commits in the worktree update the bare's
 refs directly. Concurrent writes against the same worktree are serialized
 by a per-vault threading lock.
 
-Remote ops (clone_mirror / fetch_remote / ls_remote_head) inject the auth
-token into the URL only at command-invocation time and never persist it
-to the bare repo's `.git/config`. That keeps the on-disk surface free of
-secrets even when callers handed us a plaintext PAT.
+Every external-mirror git command — the three network sinks (clone_mirror /
+fetch_remote / ls_remote_head) *and* every local read on a mirror bare repo
+(ls_tree / cat_blob / last_commit_for_path / is_healthy_repo) — is executed
+through the single hermetic `ExternalGitRunner` boundary. The auth
+token is passed only as an `Authorization` header via `--config-env`, never in
+the URL, argv, or the bare's `.git/config`; the runner also seals the child
+environment, pins DNS, and blocks non-https transports. See
+`app/services/external_git_runner.py`.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import stat
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit, quote
 
-from git import Blob, Repo, cmd as git_cmd
+from git import Blob, Repo
 from git.exc import GitError
 
 from app.config import settings
+from app.exceptions import AKBError, MirrorMarkerError
+from app.services.external_git_runner import ExternalGitRunner
+from app.services.external_git_validation import validate_branch
 
 logger = logging.getLogger("akb.git")
+
+# Sentinel file dropped at the bare-repo root by ``clone_mirror`` to mark a vault
+# as an external-git mirror. It is written by us — never by upstream
+# repo content, which can only populate git objects/refs, not arbitrary files at
+# the bare root — so it is an unforgeable, DB-free signal that lets EVERY
+# GitService read path self-route to the hermetic runner for mirror vaults with
+# no per-call DB lookup. It travels with the repo through the atomic
+# clone/rename and is removed with it by ``cleanup_vault_dirs``. The name is not
+# a git-recognised file, so it never perturbs git operations or the structure
+# default-deny inspector.
+_MIRROR_MARKER = "akb-external-mirror"
+
+# Slack over ``external_git_blob_max_bytes`` for the runner's STREAMING output
+# cap. The per-blob size pre-check already refuses an
+# over-cap blob, so a passed blob's streamed read is at most ``cap`` bytes; this
+# margin only keeps a blob sized EXACTLY at the cap from tripping the
+# strictly-greater-than backstop. A diff is bounded separately (see below), plus
+# this margin.
+_OUTPUT_MARGIN_BYTES = 64 * 1024
+
+# Multiplier for a RENDERED unified diff's streaming cap. A unified diff
+# prefixes EVERY line with one byte (`+`/`-`/` `), and a
+# full rewrite renders BOTH the pre- AND the post-image. Worst case per side is
+# `cap` content bytes plus one prefix byte per line (≤`cap` lines) = 2×cap; both
+# sides = 4×cap. The diff/index/`---`/`+++`/`@@` headers (a few path-length lines
+# plus one hunk header for a full rewrite) fit comfortably inside
+# ``_OUTPUT_MARGIN_BYTES``. The old 2×cap bound counted only the content, not the
+# per-line prefixes, so a near-cap file of many SHORT lines rendered a legitimate
+# full-rewrite diff above 2×cap and was falsely 413'd; 4×cap+margin never
+# false-trips a legitimate diff of two ≤cap images while still bounding memory.
+# The per-image size checks refuse genuinely oversized content up front; this
+# streaming cap stays the backstop for a pathological many-hunk patch.
+_DIFF_OUTPUT_FACTOR = 4
+
+
+def _marker_state(marker: Path) -> str:
+    """Classify the on-disk ``_MIRROR_MARKER`` entry, fail-CLOSED.
+
+    Returns ``"absent"`` when nothing exists at the marker path (the normal
+    manual-vault shape — a non-mirror vault has no entry here) or ``"valid"``
+    when it is a regular, non-symlink file (a genuine marker). ANY other
+    entry — a directory, a symlink (including a broken one), a device / fifo /
+    socket, or an unexpected ``OSError`` while stat-ing — is AMBIGUOUS and
+    therefore fail-closed: it raises :class:`MirrorMarkerError` rather than
+    being collapsed to a boolean, so a planted / abnormal entry can never make
+    a mirror read silently fall through to GitPython (the fail-OPEN gap this
+    closes).
+
+    ``os.lstat`` (never ``os.stat``) so a symlink is detected, not followed —
+    a symlink planted here must be a finding, not silently resolved.
+    """
+    try:
+        st = os.lstat(marker)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as e:
+        raise MirrorMarkerError(
+            f"external-git mirror marker {marker.name!r} is unreadable "
+            f"({e.__class__.__name__})"
+        ) from e
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        raise MirrorMarkerError(
+            f"external-git mirror marker {marker.name!r} is a symlink"
+        )
+    if stat.S_ISDIR(mode):
+        raise MirrorMarkerError(
+            f"external-git mirror marker {marker.name!r} is a directory"
+        )
+    if not stat.S_ISREG(mode):
+        raise MirrorMarkerError(
+            f"external-git mirror marker {marker.name!r} is not a regular file"
+        )
+    return "valid"
 
 
 # Per-vault serialization for worktree writes. asyncio.to_thread dispatches
@@ -65,25 +149,258 @@ def _write_kt() -> dict:
     return {"kill_after_timeout": settings.git_write_timeout_secs}
 
 
+class ExternalGitOversizedError(AKBError):
+    """A mirror blob exceeds ``external_git_blob_max_bytes`` and must NOT be
+    materialized on a READ path.
+
+    The reconciler SKIPS/tombstones an oversized blob before it is ever read,
+    so it never reaches a read here; this is the READ-side backstop. A direct
+    ``cat_blob`` / historical ``read_file`` / root-commit ``file_diff`` on an
+    over-cap blob is REFUSED before its bytes are read into memory, so an
+    oversized upstream file cannot blow up memory through an on-demand read
+    (the reconcile gate is only an ingestion gate). Unlike the reconcile skip
+    (silent, internal), a read refusal is surfaced to the caller as a clean
+    413. The message is value-less (byte counts only) — safe to log."""
+
+    def __init__(self, size: int, max_bytes: int):
+        super().__init__(
+            f"external-git mirror blob is {size} bytes, over the "
+            f"{max_bytes}-byte cap; refusing to materialize it on a read",
+            status_code=413,
+            code="external_git_blob_oversized",
+        )
+
 
 class GitService:
-    def __init__(self, storage_path: str | None = None):
+    def __init__(
+        self,
+        storage_path: str | None = None,
+        *,
+        ext_runner: ExternalGitRunner | None = None,
+    ):
         self.storage_path = Path(storage_path or settings.git_storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.worktrees_path = self.storage_path / "_worktrees"
         self.worktrees_path.mkdir(parents=True, exist_ok=True)
+        # The sole hermetic execution boundary for external-mirror git commands.
+        # Injectable so tests can supply a policy/resolver that
+        # accepts a local fixture host.
+        self._ext_runner = ext_runner or ExternalGitRunner()
 
     def _bare_path(self, vault_name: str) -> Path:
+        # Path-safety backstop on EVERY entry that resolves a bare path from a
+        # DB-derived name: the cheap name guard here is the
+        # single choke-point that every marker/clone/fetch/read path shares, so a
+        # traversal / absolute / separator-bearing name can never interpolate OUT
+        # of the storage root — not only at cleanup. Legitimate (incl. underscored
+        # legacy/test) names pass unchanged; the deeper resolve-under-root check
+        # (``_contained``) is applied at the create/write/rename points.
+        self._require_safe_vault_name(vault_name)
         return self.storage_path / f"{vault_name}.git"
 
     def _worktree_path(self, vault_name: str) -> Path:
+        # Same universal name guard as ``_bare_path``.
+        self._require_safe_vault_name(vault_name)
         return self.worktrees_path / vault_name
+
+    def _mirror_bare(self, vault_name: str) -> Path:
+        """Resolve a mirror's bare path for a READ, fail-CLOSED on a symlinked
+        bare (partial containment).
+
+        A bare that is — or was swapped to be — a symlink could redirect a mirror
+        read OUT of the storage root (a restored / tampered layout, or a
+        post-startup swap of the bare for an external symlink). Reject it rather
+        than read through it. ``os.lstat`` (never ``stat``) so the link is
+        DETECTED, not followed. An ABSENT bare is returned unchanged — the
+        caller's own ``exists()`` handles the not-yet-cloned / 404 case; only a
+        PRESENT symlink is refused. This is the cheap read-side half of the
+        containment work; the full openat2/O_NOFOLLOW binding of the
+        clone-rename / fetch-write TOCTOU is a deferred follow-up."""
+        bare = self._bare_path(vault_name)
+        try:
+            st = os.lstat(bare)
+        except FileNotFoundError:
+            return bare
+        except OSError as e:
+            raise MirrorMarkerError(
+                f"external-git mirror bare for {vault_name!r} is unreadable "
+                f"({e.__class__.__name__})"
+            ) from e
+        if stat.S_ISLNK(st.st_mode):
+            raise MirrorMarkerError(
+                f"external-git mirror bare for {vault_name!r} is a symlink; "
+                "refusing to read through it"
+            )
+        return bare
+
+    # ── Containment backstop ────────────────────────────
+    @staticmethod
+    def _require_safe_vault_name(vault_name: str) -> str:
+        """Reject a vault name that could traverse OUT of the storage root when
+        interpolated into ``_bare_path`` / ``_worktree_path``.
+
+        This is a PATH-SAFETY guard for the DIRECT DB / restore / cleanup
+        backstops — an entry that may not have passed the MCP create-time
+        validator (``document_service.validate_vault_name``) but still drives a
+        destructive filesystem op (rmtree / rename). It is deliberately MORE
+        permissive than that create policy: the git layer has always accepted
+        names the MCP grammar rejects (underscored test / legacy vaults), so this
+        must refuse ONLY traversal shapes — an empty name, ``.`` / ``..``, an
+        absolute / rooted name, an embedded path separator, or a NUL / control
+        character — never tighten the naming grammar itself. ``_contained`` is the
+        definitive backstop behind it (resolve-under-root)."""
+        if (
+            not vault_name
+            or vault_name in (".", "..")
+            or os.path.isabs(vault_name)
+            or os.path.basename(vault_name) != vault_name
+            or any(ord(ch) < 0x20 for ch in vault_name)
+        ):
+            raise ValueError(
+                f"unsafe vault name for a storage-path operation: {vault_name!r}"
+            )
+        return vault_name
+
+    def _contained(self, path: Path) -> Path:
+        """Resolve ``path`` and confirm it stays INSIDE ``storage_path``
+        (storage-root containment). Rejects a ``..`` segment, an absolute
+        segment, and a symlink whose target redirects the resolved path
+        out of the storage root. Returns the resolved path for the caller to act
+        on; raises :class:`ValueError` otherwise. This is the defence-in-depth
+        backstop behind :meth:`_require_safe_vault_name` — even if a name check is
+        bypassed, a destructive op never lands outside the storage root."""
+        root = self.storage_path.resolve()
+        resolved = path.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(
+                f"path {path} resolves outside the storage root {root}"
+            )
+        return resolved
 
     def _get_repo(self, vault_name: str) -> Repo:
         bare_path = self._bare_path(vault_name)
         if not bare_path.exists():
             raise FileNotFoundError(f"Vault repo not found: {vault_name}")
         return Repo(str(bare_path))
+
+    def _is_mirror(self, vault_name: str) -> bool:
+        """True iff this vault is an external-git mirror (a regular-file marker
+        sits at the bare-repo root — see ``_MIRROR_MARKER``).
+
+        Fail-CLOSED: the marker is resolved with ``os.lstat`` via
+        :func:`_marker_state`, which RAISES :class:`MirrorMarkerError` for any
+        ambiguous entry (a directory, a symlink incl. broken, another type, or
+        an unexpected stat error) — it never collapses those to ``False``. A
+        manual (non-mirror) vault has NO entry at the marker path, so it reads
+        cleanly as ``False`` with no false positive. Mirror reads MUST route
+        through the hermetic runner, never GitPython, so a planted
+        promisor/rewrite config cannot re-open lazy-fetch on a plain public
+        READ; returning ``False`` on an ambiguous entry would re-open exactly
+        that (fail-open), hence the raise."""
+        return _marker_state(self._bare_path(vault_name) / _MIRROR_MARKER) == "valid"
+
+    def _use_mirror_reader(self, vault_name: str) -> bool:
+        """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
+
+        Returns True to route through the hermetic runner (an external-git
+        mirror) or False for a plain GitPython read (a manual vault). It folds
+        the whole kill-switch contract into one place so every
+        read path shares it:
+
+        * an ABNORMAL marker entry makes ``_is_mirror`` RAISE
+          (:class:`MirrorMarkerError`) — never a silent GitPython fallback;
+        * a genuine mirror while the feature is DISABLED
+          (``external_git_enabled`` False) is REFUSED with a 503 rather than
+          served by ANY path (runner or GitPython), so a kill-switched
+          deployment performs zero mirror I/O;
+        * a manual (non-mirror) vault is unaffected — it reads via GitPython
+          whether the feature is on or off (no regression)."""
+        is_mirror = self._is_mirror(vault_name)
+        if is_mirror and not settings.external_git_enabled:
+            raise AKBError(
+                "external-git mirror reads are disabled",
+                status_code=503,
+                code="external_git_disabled",
+            )
+        return is_mirror
+
+    def mark_as_mirror(self, vault_name: str) -> bool:
+        """Backfill the ``_MIRROR_MARKER`` onto an existing bare repo the DB
+        already knows to be an external-git mirror but that predates the marker.
+
+        ``clone_mirror`` only writes the marker on a *fresh* clone, so a mirror
+        created before the marker existed carries none — leaving ``_is_mirror``
+        False and letting its reads fall through to GitPython (the fail-open
+        gap this closes). This re-establishes the on-disk signal from the
+        authoritative DB record (``vault_external_git``); see
+        ``external_git_service.backfill_mirror_markers``.
+
+        Returns True when it wrote the marker, False when nothing needed doing
+        (the bare repo is absent, or a VALID regular-file marker already exists
+        — idempotent). Fail-CLOSED: an ABNORMAL pre-existing entry
+        at the marker path (a directory, a symlink, or any non-regular file)
+        raises :class:`MirrorMarkerError` rather than being skipped — a skipped
+        abnormal entry is precisely the fail-open the caller's backfill
+        fail-fast must catch (`_stamp_mirror_markers` collects it).
+
+        No-clobber and TOCTOU-free: the marker is created with
+        ``os.open(O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW)`` — an entry that
+        appears in the race window makes the create fail (``FileExistsError``)
+        and is re-classified rather than overwritten, and ``O_NOFOLLOW`` refuses
+        to write through a symlink planted at the marker path. Holds the
+        per-vault lock so it serializes with any concurrent clone/fetch/cleanup.
+        The bare dir itself is lstat-checked (a symlinked bare could redirect
+        the write out of the storage root). The marker lives at the bare root, a
+        location upstream repo content can never populate, so it stays
+        unforgeable.
+        """
+        bare = self._bare_path(vault_name)
+        with _vault_lock(vault_name):
+            # Absent bare → nothing to do; a bare that exists but is NOT a real
+            # directory (a symlink, or a plain file) is fail-closed — a
+            # symlinked bare could redirect the marker write out of storage.
+            try:
+                bare_st = os.lstat(bare)
+            except FileNotFoundError:
+                return False
+            if stat.S_ISLNK(bare_st.st_mode) or not stat.S_ISDIR(bare_st.st_mode):
+                raise MirrorMarkerError(
+                    f"external-git mirror bare path for {vault_name!r} is not a "
+                    "real directory"
+                )
+            # Containment backstop: confirm the bare resolves
+            # INSIDE the storage root before we write the marker into it. The name
+            # guard in ``_bare_path`` already blocks traversal via the NAME; this
+            # resolve-under-root catches a parent-dir symlink that would redirect
+            # the marker write out of storage on a restored/tampered layout.
+            self._contained(bare)
+            marker = bare / _MIRROR_MARKER
+            if _marker_state(marker) == "valid":
+                return False  # already a valid marker — idempotent no-op
+            # marker is "absent": create atomically, no-clobber, no symlink-follow.
+            try:
+                fd = os.open(
+                    marker,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                    0o644,
+                )
+            except FileExistsError as e:
+                # An entry appeared between the lstat and here. Re-classify: a
+                # VALID regular-file marker is an idempotent no-op; anything else
+                # is abnormal → fail-closed (never clobbered). _marker_state
+                # itself raises for the abnormal shapes.
+                if _marker_state(marker) == "valid":
+                    return False
+                raise MirrorMarkerError(
+                    f"external-git mirror marker for {vault_name!r} raced an "
+                    "abnormal entry"
+                ) from e
+            try:
+                os.write(fd, b"akb external-git mirror\n")
+            finally:
+                os.close(fd)
+            logger.info("Backfilled external-git mirror marker for vault %s", vault_name)
+            return True
 
     @staticmethod
     def _git_author_env(author_name: str, author_email: str) -> dict[str, str]:
@@ -183,22 +500,39 @@ class GitService:
 
     def is_healthy_repo(self, vault_name: str) -> bool:
         """Cheap structural soundness check on the bare repo: does it exist
-        as a git repo whose HEAD resolves to a real commit?
+        as a git repo whose HEAD resolves to a real commit AND whose root
+        tree object is present?
 
         Catches the gross corruption a partial clone, partial fetch, disk
         error, or non-git leftover dir produces (no valid HEAD, missing
-        root object). Fine-grained missing-blob corruption is caught
-        downstream by the reconciler's per-file error handling. Used to
+        root commit OR root tree object). Fine-grained missing-blob corruption
+        is caught downstream by the reconciler's per-file error handling. Used to
         decide self-heal-by-reclone vs. a normal fetch — and it never
         false-positives a transient network fetch failure as corruption,
         because it only inspects local on-disk state.
+
+        Resolved through :meth:`_mirror_bare` (not the unchecked ``_bare_path``)
+        so a symlinked bare fails CLOSED with :class:`MirrorMarkerError` BEFORE
+        the ``rev-parse`` reads git/config through it (every mirror read
+        — poll-path and on-demand — shares the one symlink-checking resolver).
+        The raise happens outside the ``try`` below, so it propagates rather than
+        being swallowed into a benign "not sound" False.
         """
-        bare = self._bare_path(vault_name)
+        bare = self._mirror_bare(vault_name)
         if not bare.exists():
             return False
         try:
             with _vault_lock(vault_name):
-                Repo(str(bare)).git.rev_parse("--verify", "HEAD^{commit}")
+                # Through the hermetic runner so GIT_NO_REPLACE_OBJECTS / sealed
+                # env apply on the mirror path — never a raw
+                # GitPython Repo on an external mirror. HEAD must resolve to a real
+                # commit AND its ROOT TREE object must be present: a commit whose
+                # tree is lost (partial fetch / disk error) passes the commit check
+                # yet fails every blob read, so the self-heal re-clone would never
+                # converge. The ``^{tree}`` peel forces the root tree to be read,
+                # so its loss surfaces as unhealthy → re-clone.
+                self._ext_runner.rev_parse(str(bare), "HEAD^{commit}")
+                self._ext_runner.rev_parse(str(bare), "HEAD^{tree}")
             return True
         except Exception:  # noqa: BLE001 — any failure means "not sound"
             return False
@@ -239,7 +573,21 @@ class GitService:
         if not self.storage_path.exists():
             return cleared
         for bare in self.storage_path.iterdir():
-            if not bare.is_dir() or not bare.name.endswith(".git"):
+            # lstat (never is_dir(), which FOLLOWS a symlink): a symlinked
+            # `<name>.git` planted in the storage root could point OUT of it, so
+            # enumerating / unlinking "index.lock" under it would act outside the
+            # storage root (partial containment). Only a REAL
+            # directory is a vault bare; a symlink (or any non-dir) is skipped,
+            # never followed.
+            try:
+                bare_st = os.lstat(bare)
+            except OSError:
+                continue
+            if (
+                stat.S_ISLNK(bare_st.st_mode)
+                or not stat.S_ISDIR(bare_st.st_mode)
+                or not bare.name.endswith(".git")
+            ):
                 continue
             vault_name = bare.name[: -len(".git")]
             if not vault_name:
@@ -254,12 +602,20 @@ class GitService:
                 # quickly if the parent isn't a directory.
                 if not lock.parent.is_dir():
                     continue
-                if not lock.exists() or lock.is_dir():
-                    continue
+                # lstat (never stat): classify the lock WITHOUT following a
+                # symlink (symlink-safe cleanup). A symlinked or
+                # directory `index.lock` is not something git writes — never read
+                # a symlink TARGET's mtime for the age gate (an age-check bypass)
+                # nor act through it; skip it. A regular file's own mtime governs.
                 try:
-                    age = time.time() - lock.stat().st_mtime
+                    st = os.lstat(lock)
+                except FileNotFoundError:
+                    continue
                 except OSError:
                     continue
+                if stat.S_ISLNK(st.st_mode) or stat.S_ISDIR(st.st_mode):
+                    continue
+                age = time.time() - st.st_mtime
                 if age < max_age_seconds:
                     continue
                 try:
@@ -302,31 +658,40 @@ class GitService:
         broken repo, failing every retry). No caller holds the lock when
         invoking this (delete_vault, create-vault rollback, rename
         rollback), so re-entry is safe.
+
+        Containment backstop: this is a DIRECT DB / restore / admin
+        entry to a destructive rmtree, so the vault name is re-validated for
+        path-safety and each artefact is confirmed to resolve INSIDE the storage
+        root before removal. Removal is symlink-safe — a symlink at the bare /
+        worktree path is never rmtree'd THROUGH (which would delete its target,
+        possibly outside the storage root); the link itself is removed instead.
         """
-        import shutil
+        self._require_safe_vault_name(vault_name)
         with _vault_lock(vault_name):
             for path in (self._bare_path(vault_name), self._worktree_path(vault_name)):
-                if path.exists():
+                # lstat (never stat): classify the artefact WITHOUT following a
+                # symlink at the final component.
+                try:
+                    st = os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    logger.warning(
+                        "vault path %s is a symlink; removing the link, not its target",
+                        path,
+                    )
+                    path.unlink()
+                    continue
+                # Only act on a real target that resolves inside the storage root.
+                self._contained(path)
+                if stat.S_ISDIR(st.st_mode):
                     shutil.rmtree(path)
+                else:
+                    # A stray non-dir artefact at the vault path — remove it too so
+                    # cleanup stays idempotent (a same-named recreate is unblocked).
+                    path.unlink()
 
-    # ── External remote operations ───────────────────────────
-
-    @staticmethod
-    def _with_auth(remote_url: str, auth_token: str | None) -> str:
-        """Inject `x-access-token:<token>` into the URL's userinfo, only
-        for the duration of one git command. Returns the URL unchanged
-        when no token is supplied or when the URL is already authenticated.
-        """
-        if not auth_token:
-            return remote_url
-        parts = urlsplit(remote_url)
-        if parts.scheme not in ("http", "https"):
-            return remote_url
-        if "@" in parts.netloc:
-            return remote_url
-        userinfo = f"x-access-token:{quote(auth_token, safe='')}"
-        netloc = f"{userinfo}@{parts.netloc}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    # ── External remote operations (all via ExternalGitRunner) ───────
 
     def clone_mirror(
         self,
@@ -336,30 +701,52 @@ class GitService:
         auth_token: str | None = None,
         timeout: int | None = None,
     ) -> str:
-        """Clone an external repo as the vault's bare repo. The on-disk
-        remote URL is stored without auth so the token never touches
-        `.git/config`. Subsequent fetches re-inject auth at invocation.
-        `timeout` is in seconds (defaults to settings.external_git_clone_timeout);
-        if the clone hasn't finished, git is killed so the worker can
-        back off instead of hanging.
+        """Clone an external repo as the vault's bare repo via the hermetic
+        runner and return the LOCAL materialized SHA of `branch`.
+
+        The token is passed only as an `Authorization` header (never in the
+        URL or the resulting `.git/config`), and the transport / DNS / scheme
+        are locked down by the runner. The clone lands in a unique temp dir
+        first and is renamed onto the final bare path atomically on success;
+        any partial dir is removed on failure/timeout WITHOUT re-acquiring the
+        (non-reentrant) vault lock.
         """
         bare_path = self._bare_path(vault_name)
         if bare_path.exists():
             raise FileExistsError(f"Vault already exists: {vault_name}")
-        timeout = timeout or settings.external_git_clone_timeout
         with _vault_lock(vault_name):
-            authed = self._with_auth(remote_url, auth_token)
-            git_cmd.Git().clone(
-                "--bare", "--single-branch", "--branch", branch,
-                authed, str(bare_path),
-                kill_after_timeout=timeout,
-            )
-            # Strip auth from stored remote URL so the token isn't on disk.
-            Repo(str(bare_path)).git.remote("set-url", "origin", remote_url)
-        # Log hostname only; caller may have embedded a PAT in the URL.
-        host = urlsplit(remote_url).hostname or "unknown"
-        logger.info("Mirror cloned: vault=%s host=%s branch=%s", vault_name, host, branch)
-        return str(bare_path)
+            # Age-qualified sweep INSIDE the lock: only reap leftover
+            # temp clone dirs older than the clone timeout, so a concurrent
+            # same-vault clone's ACTIVE temp is never deleted. Same-vault clones
+            # serialize on this lock; the per-vault prefix isolates other vaults.
+            self._sweep_clone_tmp(vault_name)
+            tmp = self.storage_path / f".extgit-clone-{vault_name}-{uuid.uuid4().hex}"
+            try:
+                sha = self._ext_runner.clone_bare(
+                    remote_url, branch, auth_token, tmp, timeout=timeout
+                )
+                # Mark the fresh bare as a mirror BEFORE the atomic rename so the
+                # marker appears together with the repo.
+                (Path(tmp) / _MIRROR_MARKER).write_text(
+                    "akb external-git mirror\n", encoding="utf-8"
+                )
+                # Containment backstop: confirm the rename
+                # TARGET resolves inside the storage root before we materialize a
+                # bare there. The name guard in ``_bare_path`` blocks a traversal
+                # NAME; this catches a parent-dir symlink that would land the clone
+                # outside storage. ``bare_path`` doesn't exist yet — ``_contained``
+                # resolves its existing parents lexically, which is what we want.
+                self._contained(bare_path)
+                # Atomic within storage_path (same filesystem). bare_path was
+                # asserted absent above / removed by a sterile re-clone caller.
+                os.rename(tmp, bare_path)
+            except BaseException:
+                # Inline cleanup — MUST NOT call cleanup_vault_dirs() here, it
+                # re-acquires _vault_lock (non-reentrant → deadlock).
+                self._rmtree_quiet(tmp)
+                raise
+        logger.info("Mirror cloned: vault=%s branch=%s", vault_name, branch)
+        return sha
 
     def fetch_remote(
         self,
@@ -369,45 +756,39 @@ class GitService:
         auth_token: str | None = None,
         timeout: int | None = None,
     ) -> str:
-        """Fetch the remote branch into the bare repo. Updates the local
-        ref `refs/heads/<branch>` to whatever the remote currently is
-        (force — mirrors track upstream literally). Returns the new SHA.
+        """Fetch `branch` from the remote into the bare repo and return the
+        LOCAL materialized SHA of `refs/heads/<branch>` (force — mirrors track
+        upstream literally).
 
-        Lock discipline: the network fetch itself runs **outside** the
-        per-vault lock — it can take minutes on a slow upstream and
-        holding the worktree-write lock that long blocks every
-        concurrent commit on this vault. The fetch lands new objects in
-        the bare's shared object store (idempotent and append-only;
-        safe to race), then we briefly acquire the lock for the
-        local-ref update + rev_parse, which is the only shared-state
-        mutation that needs serialization with worktree commits.
+        Lock discipline unchanged: the network fetch runs **outside** the
+        per-vault lock (it can take minutes; objects land append-only in the
+        shared object store), then a brief critical section promotes the tmp
+        ref onto the branch ref and reads the materialized SHA.
         """
         bare_path = self._bare_path(vault_name)
         if not bare_path.exists():
             raise FileNotFoundError(f"Vault repo not found: {vault_name}")
-        timeout = timeout or settings.external_git_fetch_timeout
+        # Containment backstop: confirm the existing bare
+        # resolves inside the storage root before a network fetch writes objects
+        # into it — a bare that was replaced by a symlink out of root (restore /
+        # tamper) is refused here, not fetched through.
+        self._contained(bare_path)
 
-        # Network I/O outside the lock. We fetch to a temporary ref so
-        # the local branch ref is updated only inside the lock below.
-        repo = Repo(str(bare_path))
-        authed = self._with_auth(remote_url, auth_token)
-        tmp_ref = f"refs/akb/fetch-tmp/{branch}"
-        repo.git.fetch(
-            authed, f"+refs/heads/{branch}:{tmp_ref}",
-            kill_after_timeout=timeout,
+        # `branch` is re-validated (with DNS) inside the runner; validate the
+        # pure ref shape here too so the ref names we build below are safe.
+        vbranch = validate_branch(branch)
+        tmp_ref = f"refs/akb/fetch-tmp/{vbranch}"
+
+        # Network I/O outside the lock, into a temporary ref.
+        self._ext_runner.fetch_to_ref(
+            bare_path, remote_url, branch, auth_token, tmp_ref, timeout=timeout
         )
 
-        # Brief critical section: move tmp ref onto the canonical
-        # branch ref and read the resulting sha. Both ops are local
-        # and millisecond-scale.
+        # Brief critical section: promote tmp ref → branch ref, read the sha.
         with _vault_lock(vault_name):
-            repo.git.update_ref(f"refs/heads/{branch}", tmp_ref)
-            try:
-                repo.git.update_ref("-d", tmp_ref)
-            except GitError:
-                # Best-effort cleanup; leftover tmp refs are harmless.
-                pass
-            return repo.git.rev_parse(f"refs/heads/{branch}")
+            self._ext_runner.update_ref(bare_path, f"refs/heads/{vbranch}", tmp_ref)
+            self._ext_runner.delete_ref_quiet(bare_path, tmp_ref)
+            return self._ext_runner.rev_parse(bare_path, f"refs/heads/{vbranch}")
 
     def ls_remote_head(
         self,
@@ -416,40 +797,104 @@ class GitService:
         auth_token: str | None = None,
         timeout: int | None = None,
     ) -> str | None:
-        """Return the SHA of the remote branch HEAD without fetching
-        objects. Cheap network round-trip used by the poller to decide
-        whether a full fetch is worthwhile. Returns None if the branch
-        doesn't exist on the remote.
+        """Return the SHA of the remote branch tip without fetching objects.
+
+        A cheap change-detection HINT for the poller only — never used as a
+        materialized cursor. Returns None if the branch is absent.
+        The runner compares `refs/heads/<branch>` EXACTLY and requires a 40-hex
+        OID before returning it.
         """
-        authed = self._with_auth(remote_url, auth_token)
-        timeout = timeout or settings.external_git_lsremote_timeout
-        out = git_cmd.Git().ls_remote(authed, branch, kill_after_timeout=timeout)
-        if not out:
-            return None
-        # Output: "<sha>\trefs/heads/<branch>" (possibly multiple lines).
-        for line in out.splitlines():
-            sha, _, ref = line.partition("\t")
-            if ref.endswith(f"refs/heads/{branch}"):
-                return sha.strip()
-        return None
+        return self._ext_runner.ls_remote_sha(
+            remote_url, branch, auth_token, timeout=timeout
+        )
+
+    def materialized_sha(self, vault_name: str, branch: str) -> str:
+        """Read the LOCAL `refs/heads/<branch>` SHA from the mirror bare repo.
+
+        This is the authoritative materialized SHA the reconciler keys on:
+        the ls-remote SHA is only a change hint, so tree / per-file
+        attribution / cursor must all derive from what actually landed on disk.
+
+        Through :meth:`_mirror_bare` so a symlinked bare fails CLOSED
+        (:class:`MirrorMarkerError`) before the ``rev-parse`` reads through it
+        (shared symlink-checking resolver).
+        """
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
+            raise FileNotFoundError(f"Vault repo not found: {vault_name}")
+        return self._ext_runner.rev_parse(
+            bare_path, f"refs/heads/{validate_branch(branch)}"
+        )
+
+    def inspect_mirror_structure(
+        self, vault_name: str, remote_url: str | None = None, branch: str | None = None
+    ) -> list[str]:
+        """Structural default-deny check on the mirror bare repo.
+
+        Returns a list of value-less findings (empty = clean). Any finding makes
+        the repo untrusted for a network fetch; the caller re-clones sterilely
+        instead. ``branch`` lets the origin fetch refspec be validated exactly.
+
+        Through :meth:`_mirror_bare` so a symlinked bare fails CLOSED
+        (:class:`MirrorMarkerError`) before the inspector reads its config/refs
+        through the link — an absent bare still returns ``[]`` (shared
+        symlink-checking resolver).
+        """
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
+            return []
+        return self._ext_runner.inspect_structure(bare_path, remote_url, branch)
+
+    def _sweep_clone_tmp(self, vault_name: str) -> None:
+        """Reap temp clone dirs left by a hard-crashed prior clone of THIS vault
+        (SIGKILL / OOM / container-restart; in-process failures are cleaned
+        inline). Age-qualified so a concurrent clone's ACTIVE temp is never
+        removed; callers hold the vault lock. Best-effort.
+        """
+        prefix = f".extgit-clone-{vault_name}-"
+        try:
+            entries = list(self.storage_path.iterdir())
+        except OSError:
+            return
+        # Only sweep temps older than the clone timeout — anything younger could
+        # be an in-flight clone (belt-and-suspenders atop the per-vault lock).
+        cutoff = time.time() - max(60.0, float(settings.external_git_clone_timeout))
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue  # too young — could be an active clone
+            except OSError:
+                continue
+            self._rmtree_quiet(entry)
+
+    @staticmethod
+    def _rmtree_quiet(path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as e:
+            logger.warning("failed to remove external-git temp path %s: %s", path, e)
 
     def ls_tree(self, vault_name: str, sha: str) -> dict[str, str]:
         """Return `{path: blob_sha}` for every blob reachable from `sha`.
         Used by the reconciler to compare upstream tree against local
         documents.external_blob without parsing diff status codes.
+
+        Routed through the hermetic runner (`git ls-tree`), never a GitPython
+        `commit.tree.traverse()` on a mirror — the sealed env +
+        GIT_NO_REPLACE_OBJECTS + GIT_NO_LAZY_FETCH + GIT_LITERAL_PATHSPECS must
+        apply. Resolved through :meth:`_mirror_bare` so a
+        symlinked bare fails CLOSED (:class:`MirrorMarkerError`) before ls-tree
+        reads through it (shared symlink-checking resolver).
         """
-        repo = self._get_repo(vault_name)
-        commit = repo.commit(sha)
-        out: dict[str, str] = {}
-        # tree.traverse() yields Tree | Blob | Submodule | tuple; we only
-        # want blobs. `isinstance(item, Blob)` narrows the union for the
-        # type checker AND skips submodule pointers / nested trees at
-        # runtime (the `item.type == "blob"` check left both to mypy's
-        # imagination).
-        for item in commit.tree.traverse():
-            if isinstance(item, Blob):
-                out[str(item.path)] = item.hexsha
-        return out
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
+            raise FileNotFoundError(f"Vault repo not found: {vault_name}")
+        return self._ext_runner.ls_tree(bare_path, sha)
 
     def last_commit_for_path(
         self, vault_name: str, path: str, rev: str | None = None
@@ -457,37 +902,84 @@ class GitService:
         """Hex sha of the most recent commit that touched `path`. Used to
         stamp `documents.current_commit` per-file so mirror docs don't
         all share the reconcile-time HEAD sha. Returns None when the
-        path has no commits (should not happen for a path we just
-        read from the tree).
+        path has no commits.
 
-        `rev` pins the walk to a specific tip. The external_git reconciler
-        passes the tree-sha it just synced so attribution can't drift past
-        the snapshot it's writing — without it a concurrent fetch can
-        return a commit not yet reflected in `documents.current_commit`,
-        and that commit may not even contain `path` on the new tip.
+        `rev` pins the walk to a specific tip (the materialized SHA), so
+        attribution can't drift past the snapshot being written. Routed
+        through the hermetic runner (`git log`), never GitPython
+        `iter_commits` on a mirror. Resolved through :meth:`_mirror_bare` so a
+        symlinked bare fails CLOSED (:class:`MirrorMarkerError`) before the log
+        reads through it — an absent bare still returns None (shared
+        symlink-checking resolver).
         """
-        repo = self._get_repo(vault_name)
-        try:
-            # Branched calls — gitpython's iter_commits stub forbids
-            # **kwargs splatting (each named param is typed
-            # individually). Spell out the two argument shapes
-            # explicitly.
-            if rev is not None:
-                commits = list(repo.iter_commits(rev, paths=path, max_count=1))
-            else:
-                commits = list(repo.iter_commits(paths=path, max_count=1))
-        except (ValueError, GitError):
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
             return None
-        return commits[0].hexsha if commits else None
+        return self._ext_runner.last_commit_for_path(bare_path, path, rev)
 
     def cat_blob(self, vault_name: str, blob_sha: str) -> bytes:
         """Read a blob's raw bytes from the object store by sha. Works
         regardless of whether the blob is currently reachable from HEAD.
-        `cat-file blob` (not `-p`) so the output is the literal blob
-        contents, unaffected by git's pretty-printer for non-blob types.
+
+        Routed through the hermetic runner (`git cat-file blob`), never
+        GitPython on a mirror — so the sealed env + GIT_NO_REPLACE_OBJECTS
+        apply and a replaced/grafted object can't substitute contents.
+
+        Kill-switch choke-point: this is the lowest-level
+        mirror-object read, funnelled through by the reconciler AND by
+        metadata_worker (and any future indexer). Gating it here means a
+        disabled deployment performs zero mirror I/O no matter which caller
+        reaches it — the enabled-gated reconciler today, or a caller that
+        forgets its own gate tomorrow. ``_use_mirror_reader`` raises a 503 for
+        a disabled mirror and propagates :class:`MirrorMarkerError` for an
+        abnormal marker (never a silent GitPython fallback); an enabled mirror
+        or a manual (non-mirror) vault is unaffected.
         """
-        repo = self._get_repo(vault_name)
-        return repo.git.cat_file("blob", blob_sha, stdout_as_string=False)
+        self._use_mirror_reader(vault_name)
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
+            raise FileNotFoundError(f"Vault repo not found: {vault_name}")
+        # Oversized gate: size the blob with the bounded
+        # ``cat-file -s`` primitive and REFUSE it before materializing content, so
+        # an over-cap blob never explodes memory on a read (the reconcile gate is
+        # an ingestion gate only). Same cap choke-point as ``blob_exceeds_max``
+        # (module ``settings``), so reconcile's own pre-check leaves the normal
+        # path unaffected: a blob it already passed re-sizes IDENTICALLY here
+        # (content-addressed, deterministic), so the guard never fires for it.
+        # ``blob_sha`` is already an EXACT immutable OID (from ls_tree), so the
+        # size check and the read bind to the same object — no size↔read TOCTOU;
+        # the streamed ``max_output_bytes`` is a defence-in-depth backstop.
+        cap = settings.external_git_blob_max_bytes
+        size = self._ext_runner.blob_size(bare_path, blob_sha)
+        if size > cap:
+            raise ExternalGitOversizedError(size, cap)
+        return self._ext_runner.cat_blob(
+            bare_path, blob_sha, max_output_bytes=cap + _OUTPUT_MARGIN_BYTES
+        )
+
+    def blob_exceeds_max(self, vault_name: str, blob_sha: str) -> tuple[int, bool]:
+        """``(size_bytes, oversized)`` for a mirror blob — its ``git cat-file -s``
+        size (via the hermetic runner, WITHOUT reading the content) and whether
+        that size exceeds ``settings.external_git_blob_max_bytes``.
+
+        The reconciler's oversized-blob gate calls this BEFORE
+        :meth:`cat_blob` so a blob over the cap is never materialized into memory:
+        it uses ``oversized`` to skip / tombstone the path and ``size`` for the
+        operational log line. Deciding the cap HERE (git_service already owns
+        ``settings`` for storage config) keeps ``external_git_service`` free of a
+        module-level ``settings`` dependency — the backfill-unconditional
+        invariant (a kill-switched deployment must still stamp mirror markers).
+
+        Shares :meth:`cat_blob`'s kill-switch choke-point: ``_use_mirror_reader``
+        raises a 503 for a disabled mirror and propagates
+        :class:`MirrorMarkerError` for an abnormal marker (never a silent
+        fallback), so a disabled deployment performs zero mirror I/O here too."""
+        self._use_mirror_reader(vault_name)
+        bare_path = self._mirror_bare(vault_name)
+        if not bare_path.exists():
+            raise FileNotFoundError(f"Vault repo not found: {vault_name}")
+        size = self._ext_runner.blob_size(bare_path, blob_sha)
+        return size, size > settings.external_git_blob_max_bytes
 
     # ── Read operations ──────────────────────────────────────
 
@@ -498,7 +990,13 @@ class GitService:
         :func:`is_valid_commit_hash` before reaching here; we still catch
         BadName/BadObject defensively so an unexpected ref string surfaces
         as 404 rather than a 500.
+
+        A mirror vault is read through the hermetic runner, never GitPython, so
+        a planted promisor/rewrite config cannot trigger lazy-fetch on this
+        public read.
         """
+        if self._use_mirror_reader(vault_name):
+            return self._read_file_mirror(vault_name, file_path, commit)
         repo = self._get_repo(vault_name)
         from git.exc import BadName, BadObject
         try:
@@ -512,8 +1010,166 @@ class GitService:
         except (KeyError, TypeError):
             return None
 
+    # ── Mirror read variants (hermetic runner) ───────────
+    def _read_file_mirror(
+        self, vault_name: str, file_path: str, commit: str | None
+    ) -> str | None:
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return None
+        rev = "HEAD"
+        if commit:
+            c = commit.strip().lower()
+            # Resolve the caller's commit (short OR full 40-hex) to a full OID
+            # hermetically. A genuinely unknown / malformed / corrupt commit is a
+            # not-found → 404 (None) here, NOT the 502 that ``resolve_blob_oid``
+            # now raises for an UNRESOLVABLE rev (MAJOR fail-closed, fix-4): a full
+            # 40-hex that is absent used to bypass this resolve and reach
+            # ``resolve_blob_oid`` directly, so the fail-closed contract would turn
+            # a plain not-found into a 502. A present OID resolves to itself, so
+            # the exact-OID binding below is unchanged; ``^{commit}`` +
+            # ``--end-of-options`` keep the ref from being option/pathspec-parsed.
+            try:
+                rev = self._ext_runner.rev_parse(bare, f"{c}^{{commit}}")
+            except Exception:  # noqa: BLE001 — unknown / malformed / corrupt commit
+                return None
+        # Exact-OID binding: resolve ``<rev>:<path>`` to
+        # the immutable blob OID ONCE, then size AND read THAT oid. Sizing and
+        # reading the same content-addressed object closes the "``HEAD`` promoted
+        # by a concurrent fetch between the size check and the read" TOCTOU — a
+        # small sized blob can no longer be swapped for a large materialized one.
+        # A missing rev/path resolves to None → 404 (None), unchanged; an over-cap
+        # blob is REFUSED before materializing, surfacing the same clean refusal
+        # as ``cat_blob``; the streamed ``max_output_bytes`` is a backstop.
+        oid = self._ext_runner.resolve_blob_oid(bare, rev, file_path)
+        if oid is None:
+            return None
+        cap = settings.external_git_blob_max_bytes
+        size = self._ext_runner.blob_size(bare, oid)
+        if size > cap:
+            raise ExternalGitOversizedError(size, cap)
+        raw = self._ext_runner.cat_blob(
+            bare, oid, max_output_bytes=cap + _OUTPUT_MARGIN_BYTES
+        )
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def _file_log_mirror(
+        self, vault_name: str, file_path: str, max_count: int, since_epoch: int | None
+    ) -> list[dict]:
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return []
+        out: list[dict] = []
+        for e in self._ext_runner.log_for_path(bare, file_path, max_count):
+            if since_epoch is not None and e["committed_epoch"] < since_epoch:
+                continue
+            out.append(
+                {
+                    "hash": e["hash"][:12],
+                    "message": e["message"].strip(),
+                    "author": e["author"],
+                    "date": datetime.fromtimestamp(
+                        e["committed_epoch"], tz=timezone.utc
+                    ).isoformat(),
+                }
+            )
+        return out
+
+    def _vault_log_mirror(
+        self, vault_name: str, max_count: int, since: str | None, path: str | None
+    ) -> list[dict]:
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return []
+        results: list[dict] = []
+        for e in self._ext_runner.vault_log_entries(
+            bare, max_count=max_count, since=since, path=path
+        ):
+            meta: dict[str, str] = {}
+            for bl in (line.strip() for line in e["body"].split("\n")):
+                if bl and ":" in bl:
+                    k, val = bl.split(":", 1)
+                    meta[k.strip().lower()] = val.strip()
+            results.append(
+                {
+                    "hash": e["hash"][:12],
+                    "subject": e["subject"],
+                    "author": e["author"],
+                    "date": datetime.fromtimestamp(
+                        e["committed_epoch"], tz=timezone.utc
+                    ).isoformat(),
+                    "action": meta.get("action", ""),
+                    "summary": meta.get("summary", ""),
+                    "agent": meta.get("agent", e["author"]),
+                    "files": e["files"],
+                }
+            )
+        return results
+
+    def _file_diff_mirror(
+        self, vault_name: str, file_path: str, commit_hash: str
+    ) -> dict:
+        base = {"file": file_path, "commit": commit_hash}
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return {**base, "type": "unknown", "diff": "", "error": "commit not found"}
+        cap = settings.external_git_blob_max_bytes
+        # Resolve the (possibly abbreviated) commit to ONE full OID up front. An
+        # unknown/malformed commit yields the SAME "commit not found" result the
+        # renderer would return — decided here so the size checks AND the read all
+        # bind to this single resolved OID (exact-OID binding).
+        try:
+            full = self._ext_runner.rev_parse(bare, f"{commit_hash}^{{commit}}")
+        except Exception:  # noqa: BLE001 — unknown/malformed commit
+            full = None
+        if full is None:
+            return {**base, "type": "unknown", "diff": "", "error": "commit not found"}
+        # Oversized gate: a diff materializes file
+        # content — a root-commit / addition renders the FULL post-image via
+        # ``cat_path``, and a ``diff-tree -p`` buffers BOTH the post-image AND the
+        # PRE-image (so a commit that shrinks or DELETES a large file, whose
+        # post-image is small/absent, would still buffer the large pre-image).
+        # Size BOTH images against the RESOLVED full OID and refuse if EITHER is
+        # over the cap, before any patch is materialized. ``path_size`` now
+        # PROPAGATES a real sizing failure instead of masking it as "absent",
+        # so a corrupt object surfaces here rather than silently
+        # skipping the oversized gate; a genuinely absent path still sizes as None.
+        post = self._ext_runner.path_size(bare, full, file_path)
+        if post is not None and post > cap:
+            raise ExternalGitOversizedError(post, cap)
+        parent = self._ext_runner.first_parent_oid(bare, full)
+        if parent is not None:
+            pre = self._ext_runner.path_size(bare, parent, file_path)
+            if pre is not None and pre > cap:
+                raise ExternalGitOversizedError(pre, cap)
+        # Render the diff bound to the SAME full OID the size checks used — pass
+        # ``full``, never the abbreviated ``commit_hash`` the renderer would
+        # re-resolve, so checked OID == read OID. The streaming cap is a
+        # conservative backstop for a pathological many-hunk patch that renders
+        # more than the two ≤cap images imply; the per-image size checks
+        # above are the primary oversized gate.
+        result = self._ext_runner.file_diff_entry(
+            bare,
+            full,
+            file_path,
+            max_output_bytes=_DIFF_OUTPUT_FACTOR * cap + _OUTPUT_MARGIN_BYTES,
+        )
+        if result["type"] == "unknown":
+            return {**base, "type": "unknown", "diff": "", "error": "commit not found"}
+        return {**base, "type": result["type"], "diff": result["diff"]}
+
     def list_files(self, vault_name: str, directory: str = "", extension: str = ".md") -> list[str]:
-        """List files under a directory in HEAD."""
+        """List files under a directory in HEAD.
+
+        Mirror vaults are read through the hermetic runner so a
+        planted promisor/rewrite config cannot re-open lazy-fetch on this
+        read.
+        """
+        if self._use_mirror_reader(vault_name):
+            return self._list_files_mirror(vault_name, directory, extension)
         repo = self._get_repo(vault_name)
         try:
             tree = repo.head.commit.tree
@@ -538,8 +1194,37 @@ class GitService:
             elif item.type == "tree":
                 self._walk_tree(item, rel_path, extension, results)
 
+    def _list_files_mirror(
+        self, vault_name: str, directory: str, extension: str
+    ) -> list[str]:
+        """Hermetic-runner equivalent of ``list_files`` for a mirror: derive the
+        blob paths from a single recursive ``ls-tree`` at HEAD (sealed env +
+        GIT_NO_LAZY_FETCH), filtering to those under ``directory`` ending in
+        ``extension``. Paths carry the ``directory`` prefix, matching the
+        GitPython walk (``_walk_tree``)."""
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return []
+        try:
+            head = self._ext_runner.rev_parse(bare, "HEAD")
+        except Exception:  # noqa: BLE001 — empty repo / no HEAD → nothing to list
+            return []
+        prefix = f"{directory}/" if directory else ""
+        results: list[str] = []
+        for path in self._ext_runner.ls_tree(bare, head):
+            if prefix and not path.startswith(prefix):
+                continue
+            if path.endswith(extension):
+                results.append(path)
+        return results
+
     def list_directories(self, vault_name: str, parent: str = "") -> list[str]:
-        """List immediate subdirectories under a path in HEAD."""
+        """List immediate subdirectories under a path in HEAD.
+
+        Mirror vaults are read through the hermetic runner.
+        """
+        if self._use_mirror_reader(vault_name):
+            return self._list_directories_mirror(vault_name, parent)
         repo = self._get_repo(vault_name)
         try:
             tree = repo.head.commit.tree
@@ -557,6 +1242,31 @@ class GitService:
             for item in tree
             if item.type == "tree" and not item.name.startswith(".")
         ]
+
+    def _list_directories_mirror(self, vault_name: str, parent: str) -> list[str]:
+        """Hermetic-runner equivalent of ``list_directories`` for a mirror: the
+        recursive ``ls-tree`` at HEAD carries no tree entries, so derive the
+        IMMEDIATE subdirectory names under ``parent`` from the blob paths (a path
+        with a further ``/`` after the ``parent`` prefix implies a subdirectory).
+        Dot-directories are skipped, mirroring the GitPython path; results are
+        sorted for a deterministic order."""
+        bare = self._mirror_bare(vault_name)
+        if not bare.exists():
+            return []
+        try:
+            head = self._ext_runner.rev_parse(bare, "HEAD")
+        except Exception:  # noqa: BLE001 — empty repo / no HEAD
+            return []
+        prefix = f"{parent}/" if parent else ""
+        dirs: set[str] = set()
+        for path in self._ext_runner.ls_tree(bare, head):
+            if prefix and not path.startswith(prefix):
+                continue
+            rest = path[len(prefix):]
+            seg, slash, _rest = rest.partition("/")
+            if slash and seg and not seg.startswith("."):
+                dirs.add(seg)
+        return sorted(dirs)
 
     # ── Write operations ─────────────────────────────────────
 
@@ -681,7 +1391,18 @@ class GitService:
     def current_commit(self, vault_name: str) -> str | None:
         """Return the vault's current HEAD commit hash, or None if the bare repo
         has no commits yet. Used to reconcile DB state after a crash-recovery
-        move where the git mv already committed."""
+        move where the git mv already committed.
+
+        Mirror vaults resolve HEAD through the hermetic runner.
+        """
+        if self._use_mirror_reader(vault_name):
+            bare = self._mirror_bare(vault_name)
+            if not bare.exists():
+                return None
+            try:
+                return self._ext_runner.rev_parse(bare, "HEAD")
+            except Exception:  # noqa: BLE001 — no HEAD yet / unreadable
+                return None
         try:
             return self._get_repo(vault_name).head.commit.hexsha
         except Exception:  # noqa: BLE001 — repo missing or no HEAD yet (empty repo)
@@ -824,7 +1545,11 @@ class GitService:
         clean from the current document's ``created_at`` — pre-fix, commits
         from a since-deleted prior document leaked into the new doc's
         history because git keys by path, not by document identity.
+
+        Mirror vaults are read through the hermetic runner.
         """
+        if self._use_mirror_reader(vault_name):
+            return self._file_log_mirror(vault_name, file_path, max_count, since_epoch)
         repo = self._get_repo(vault_name)
         try:
             commits = list(repo.iter_commits(paths=file_path, max_count=max_count))
@@ -849,7 +1574,11 @@ class GitService:
 
         Like `git log -- <path>`: Git natively filters to only commits
         that touched files under the given path. No post-filter limit issue.
+
+        Mirror vaults are read through the hermetic runner.
         """
+        if self._use_mirror_reader(vault_name):
+            return self._vault_log_mirror(vault_name, max_count, since, path)
         repo = self._get_repo(vault_name)
         try:
             # gitpython's iter_commits stub forbids **kwargs splatting
@@ -935,7 +1664,11 @@ class GitService:
         unknown / malformed commit hash surfaces as a clean
         ``{"type":"unknown"}`` response rather than propagating as an
         unhandled 500.
+
+        Mirror vaults are read through the hermetic runner.
         """
+        if self._use_mirror_reader(vault_name):
+            return self._file_diff_mirror(vault_name, file_path, commit_hash)
         from git.exc import BadName, BadObject
         repo = self._get_repo(vault_name)
         try:
@@ -982,6 +1715,20 @@ class GitService:
 
     def diff(self, vault_name: str, from_commit: str, to_commit: str | None = None) -> str:
         """Get diff between two commits, or from a commit to HEAD."""
+        if self._use_mirror_reader(vault_name):
+            # A two-commit, whole-repo diff has no ExternalGitRunner primitive
+            # yet (the runner exposes only the single-file ``file_diff_entry``).
+            # Falling back to GitPython on a mirror would re-open the lazy-fetch /
+            # replace-object surface this hardening closes, so refuse
+            # the operation instead of failing open. No caller reaches this on a
+            # mirror today (Finding #5); an unexpected call gets a clean 4xx (not
+            # a 500). A hermetic ``diff_between`` runner method is the follow-up
+            # (owned by external_git_runner.py).
+            raise AKBError(
+                "whole-repo diff is not supported on an external-git mirror vault",
+                status_code=400,
+                code="external_git_mirror_diff_unsupported",
+            )
         repo = self._get_repo(vault_name)
         base = repo.commit(from_commit)
         head = repo.commit(to_commit) if to_commit else repo.head.commit

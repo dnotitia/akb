@@ -1100,9 +1100,20 @@ async def oembed(url: str, format: str = "json"):
                     doc_row = await conn.fetchrow(
                         """
                         SELECT d.title FROM documents d JOIN vaults v ON v.id = d.vault_id
-                         WHERE v.name = $1 AND d.path = $2
+                         -- Bound to the publication's OWN vault_id, with the URI's
+                         -- vault name demoted to a cross-check — the same binding
+                         -- `resolve_document_publication` carries, and the one the
+                         -- file branch below has always had. Keyed on the URI's
+                         -- vault name alone, this returned the title of a document
+                         -- in whatever vault the URI named, which need not be this
+                         -- publication's vault. F1 above protects the publisher,
+                         -- who chose a password; nothing protected the third-party
+                         -- vault, which published nothing at all. No row leaves
+                         -- `title` None and the response falls through to the
+                         -- generic card below — fail closed.
+                         WHERE d.vault_id = $1 AND d.path = $2 AND v.name = $3
                         """,
-                        uri_vault, doc_path,
+                        to_uuid(publication["vault_id"]), doc_path, uri_vault,
                     )
                     if doc_row:
                         title = doc_row["title"]

@@ -40,9 +40,9 @@ _INDEXABLE_MIGRATIONS = (
     _BACKEND / "app" / "db" / "migrations" / "005_qdrant_index.py",
     _BACKEND / "app" / "db" / "migrations" / "006_indexable_chunks.py",
 )
-_BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "049_native_revision_m1_pg_body.py"
-_PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_payload_placement.py"
-_DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "050_native_revision_searchable_derived.py"
+_BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_pg_body.py"
+_PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "057_native_revision_m1_payload_placement.py"
+_DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "054_native_revision_searchable_derived.py"
 _WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

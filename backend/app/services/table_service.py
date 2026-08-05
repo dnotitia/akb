@@ -554,6 +554,224 @@ async def delete_table_index(table_id: str) -> None:
 # ── CRUD ─────────────────────────────────────────────────────────
 
 
+def _normalize_column_specs(columns: list[dict]) -> list[dict]:
+    """Validate + normalize a caller's column list.
+
+    Extracted so the `if_not_exists` no-op can normalize the REQUEST the
+    same way the stored row was normalized at its own create — comparing a
+    raw request against a normalized row would report a mismatch on every
+    table.
+    """
+    seen: set[str] = set()
+    normalized: list[dict] = []
+    for col in columns:
+        if not isinstance(col, dict) or "name" not in col:
+            raise ValidationError(
+                f"Each column must be an object with a 'name' field; got {col!r}."
+            )
+        cname = col["name"]
+        _validate_column_name(cname)
+        key = cname.lower()
+        if key in seen:
+            raise ValidationError(
+                f"Duplicate column name {cname!r}. Column names must be "
+                f"unique (case-insensitive) and must not collide with "
+                f"reserved names {sorted(_RESERVED)}."
+            )
+        seen.add(key)
+        normalized.append(_normalize_column_spec(col))
+    return normalized
+
+
+def _canonical_create_spec(
+    *,
+    vault_name: str,
+    name: str,
+    columns: list[dict],
+    unique_keys: list[dict] | None,
+    indexes: list[dict] | None,
+    normalize_columns: bool = True,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Canonicalize a create request the way a create would store it.
+
+    One canonicalizer for both branches. The no-op compares the REQUEST
+    against the STORED row, and the stored row went through exactly these
+    steps at its own create — comparing anything less would report a
+    mismatch on tables that in fact match, and (worse) report a match on
+    tables whose keys/indexes differ.
+
+    It also means a malformed `unique_keys`/`indexes` payload is still a 422
+    on the no-op path: "ensure a table matching this spec" is not satisfiable
+    by a spec that is not valid.
+
+    `normalize_columns=False` when the caller already normalized. Column
+    normalization is NOT idempotent — it SYNTHESIZES a CHECK for an enum
+    column and then rejects a column that already carries one, so running it
+    twice turns every enum create into a 422.
+    """
+    cols = _normalize_column_specs(columns) if normalize_columns else list(columns)
+    pg_name = table_data_repo.pg_table_name(vault_name, name)
+    uks = _inline_unique_keys(cols, pg_name) + _resolve_unique_keys(
+        unique_keys, cols, pg_name,
+    )
+    idxs = _inline_indexes(cols, pg_name) + _resolve_indexes(
+        indexes, cols, pg_name,
+    )
+    _reject_duplicate_meta_names(uks, label="unique-key")
+    _reject_duplicate_meta_names(idxs, label="index")
+    return cols, uks, idxs
+
+
+#: Boolean flags where `false` is indistinguishable from omitting the field.
+#: A caller may write `required: false` or leave it out; normalization keeps
+#: whichever spelling arrived, so the two forms produce unequal dicts for the
+#: same column.
+_COLUMN_NOOP_WHEN_FALSE = ("required", "unique", "index")
+
+#: Fields where only NULL means "absent". `default` is deliberately NOT in
+#: the set above: a boolean column with `default: false` generates
+#: `BOOLEAN DEFAULT FALSE`, which is a different table from plain `BOOLEAN`.
+#: The rest are `X | None = None` on `TableColumnSpec`, so REST accepts an
+#: explicit null, and an explicit null produces the same DDL as omitting it.
+_COLUMN_NOOP_WHEN_NULL = (
+    "default", "check", "enum", "references", "on_delete",
+)
+
+
+def _typed(value):
+    """Recursively tag values with their type for comparison.
+
+    Python equality says `False == 0` and `True == 1`. JSONB and the
+    generated DDL disagree — `DEFAULT FALSE` is not `DEFAULT 0` — so a plain
+    `==` on two column specs silently HIDES that divergence, including
+    nested inside a `check` spec. Comparing the tagged form makes the
+    distinction survive.
+    """
+    if isinstance(value, bool):          # before int: bool IS an int
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        return ("float", value)
+    if isinstance(value, str):
+        return ("str", value)
+    if value is None:
+        return ("null",)
+    if isinstance(value, (list, tuple)):
+        return ("list", [_typed(v) for v in value])
+    if isinstance(value, dict):
+        return ("dict", sorted((k, _typed(v)) for k, v in value.items()))
+    return ("other", repr(value))
+
+
+def _comparable(specs: list[dict]) -> list[dict]:
+    """Drop no-op spellings so two descriptions of the SAME schema compare equal.
+
+    Used ONLY for the `if_not_exists` comparison — never for what is stored.
+    The stored row was normalized from whatever spelling its own creator used,
+    which may differ from this caller's, and reporting that as a mismatch
+    would send the caller off to alter a table that already matches. A false
+    mismatch is worse than no signal.
+
+    Only genuinely absent-equivalent values are dropped, and the rule differs
+    per field: `False` counts as absent for the boolean flags, but for
+    `default` only NULL does — `default: false` on a boolean column is a real
+    `DEFAULT FALSE`. `required: true` likewise still differs from omitting it.
+    """
+    def _absent(k, v) -> bool:
+        if k in _COLUMN_NOOP_WHEN_FALSE:
+            return v is False or v is None
+        if k in _COLUMN_NOOP_WHEN_NULL:
+            return v is None
+        return False
+
+    out = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            out.append(_typed(spec))
+            continue
+        out.append(_typed(
+            {k: v for k, v in spec.items() if not _absent(k, v)}))
+    return out
+
+
+def _existing_table_envelope(
+    existing: dict,
+    *,
+    vault_name: str,
+    name: str,
+    requested_columns: list[dict],
+    requested_unique_keys: list[dict],
+    requested_indexes: list[dict],
+    requested_collection: str | None,
+    requested_description: str,
+    can_read_existing: bool,
+) -> dict:
+    """Envelope for `if_not_exists=True` against a table that already exists.
+
+    Reports the STORED state, never the request's — the `create_collection`
+    contract ("report what's in the DB") applied to tables. `matches_request`
+    plus `mismatches` make divergence machine-explicit: a success-looking
+    `created=false` must not let a caller assume the columns it asked for are
+    the columns that exist.
+
+    Comparison is exact canonical equality. Anything looser ("compatible")
+    would reopen schema-diff policy, which `ensure_table` owns and this does
+    not.
+    """
+    if not can_read_existing:
+        # Write authority does not confer read authority — `token_has_scope`
+        # is `"admin" in granted or required in granted`, with no
+        # write->read implication, and `akb_create_table` is write-scoped
+        # while `akb_browse` is read-scoped. So a write-only credential must
+        # not learn the stored URI, collection or schema from a no-op.
+        # `matches_request` / `mismatches` are withheld for the same reason:
+        # they are schema oracles — repeated probing reconstructs the stored
+        # schema without ever returning it.
+        return {
+            "kind": "table",
+            "name": name,
+            "created": False,
+            "outcome": "already_exists",
+        }
+
+    stored_columns = table_registry_repo.parse_columns(existing.get("columns"))
+    stored_uks = table_registry_repo.parse_json_list(existing.get("unique_keys"))
+    stored_idxs = table_registry_repo.parse_json_list(existing.get("indexes"))
+    stored_collection = existing.get("collection") or None
+
+    # All five fields the envelope promises are compared. Returning a value
+    # without comparing it is how `matches_request` becomes a lie.
+    mismatches: list[str] = []
+    if _comparable(stored_columns) != _comparable(requested_columns):
+        mismatches.append("columns")
+    # Type-tagged here too: these carry nested column specs, and `False == 0`
+    # would hide a divergence in any of them just as it would in `columns`.
+    if _typed(stored_uks) != _typed(requested_unique_keys):
+        mismatches.append("unique_keys")
+    if _typed(stored_idxs) != _typed(requested_indexes):
+        mismatches.append("indexes")
+    if stored_collection != (requested_collection or None):
+        mismatches.append("collection")
+    if (existing.get("description") or "") != (requested_description or ""):
+        mismatches.append("description")
+
+    return {
+        "kind": "table",
+        "uri": table_uri(vault_name, name, collection=stored_collection),
+        "vault": vault_name,
+        "collection": stored_collection,
+        "name": name,
+        "created": False,
+        "outcome": "already_exists",
+        "matches_request": not mismatches,
+        "mismatches": mismatches,
+        "columns": stored_columns,
+        "unique_keys": stored_uks,
+        "indexes": stored_idxs,
+    }
+
+
 async def create_table(
     vault_id: uuid.UUID,
     name: str,
@@ -564,6 +782,8 @@ async def create_table(
     collection: str | None = None,
     unique_keys: list[dict] | None = None,
     indexes: list[dict] | None = None,
+    if_not_exists: bool = False,
+    can_read_existing: bool = False,
 ) -> dict:
     """Create a vault-scoped table inside an optional collection.
 
@@ -571,6 +791,20 @@ async def create_table(
     NULL / empty → vault root. The path is normalized and the matching
     `collections` row is auto-created via `CollectionRepository.get_or_create`
     if it doesn't exist yet.
+
+    `if_not_exists=True` changes the request from "create this table" to
+    "ensure this table exists": an existing table is reported as
+    `created=False` instead of raising 409 — with the stored schema only
+    when `can_read_existing` says the caller may see it. It
+    suppresses EXACTLY ONE conflict — a `(vault_id, name)` row in this vault.
+    Cross-vault physical-name fusion (issue #285) raises unchanged; those
+    sites share the `ConflictError` type but mean another tenant's table, and
+    reporting it as a no-op would disclose that tenant's schema.
+
+    `can_read_existing` is the caller's READ authority, resolved at the
+    REST/MCP authorization boundary and handed down as a capability — never
+    raw scopes. It defaults to False so a caller that forgets to pass it
+    receives the minimal envelope rather than the stored schema.
     """
     # pg_table_name maps any punctuation to underscore — allowing hyphens
     # would let `mcp-items` and `mcp_items` collide on the PG side.
@@ -584,34 +818,72 @@ async def create_table(
     collection_path = _normalize_collection_path(collection)
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        # READ COMMITTED explicitly: the advisory lock only helps if the
+        # loser can SEE the winner's row after the wait. Under REPEATABLE
+        # READ the vault lookup below would fix a snapshot BEFORE the lock
+        # wait, so the loser would still miss the winner and fall through
+        # to a constraint violation it cannot recover from. The pool pins
+        # no isolation level (app/db/postgres.py), so a deployment-level
+        # default must not be able to break this.
+        async with conn.transaction(isolation="read_committed"):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
+            # Serialize on the logical identity BEFORE looking it up, so a
+            # concurrent create of the same (vault, table) queues instead of
+            # racing. Without this there are two further windows in which a
+            # winner can commit — the to_regclass preflight and the CREATE
+            # TABLE itself — each surfacing as a different exception.
+            # (The registry insert is not a third window for the same
+            # logical table: the loser's CREATE TABLE fails before it.)
+            # Recovering from them after the fact is not possible:
+            # by then the transaction has hit a constraint violation and is
+            # aborted, so a re-read of the winner's row cannot run on this
+            # connection. Precedent: table_migration_service's per-(vault,key)
+            # xact lock. Taken on BOTH paths — the race predates the flag.
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                # Domain-prefixed: table_migration_service calls the same
+                # function with an UNPREFIXED f"{vault_id}:{key}", so a
+                # migration key equal to a table name would alias onto this
+                # exact lock — harmless for correctness, needless blocking.
+                f"table-create:{vault_id}:{name}",
+            )
+
             existing = await table_registry_repo.find_by_name(conn, vault_id, name)
             if existing:
+                if if_not_exists:
+                    # Canonicalize the REQUEST so it is compared like-for-like
+                    # against the stored row, which went through exactly these
+                    # steps at its own create. This also means an invalid spec
+                    # is still a 422 here. The strict path deliberately keeps
+                    # its original order (409 before validation) so its
+                    # behaviour is unchanged.
+                    req_cols, req_uks, req_idxs = _canonical_create_spec(
+                        vault_name=vault["name"], name=name, columns=columns,
+                        unique_keys=unique_keys, indexes=indexes,
+                    )
+                    # Parity with the real create: a reference to a missing,
+                    # non-unique or wrong-typed target is a 422 either way.
+                    # Without this the SAME request is an error against an
+                    # absent table and a quiet no-op against a present one —
+                    # the flag would change what counts as a valid spec.
+                    await _validate_column_references(conn, vault_id, req_cols)
+                    return _existing_table_envelope(
+                        existing,
+                        vault_name=vault["name"],
+                        name=name,
+                        requested_columns=req_cols,
+                        requested_unique_keys=req_uks,
+                        requested_indexes=req_idxs,
+                        requested_collection=collection_path,
+                        requested_description=description,
+                        can_read_existing=can_read_existing,
+                    )
                 raise ConflictError(f"Table already exists: {name}")
 
-            seen: set[str] = set()
-            normalized_columns: list[dict] = []
-            for col in columns:
-                if not isinstance(col, dict) or "name" not in col:
-                    raise ValidationError(
-                        f"Each column must be an object with a 'name' field; got {col!r}."
-                    )
-                cname = col["name"]
-                _validate_column_name(cname)
-                key = cname.lower()
-                if key in seen:
-                    raise ValidationError(
-                        f"Duplicate column name {cname!r}. Column names must be "
-                        f"unique (case-insensitive) and must not collide with "
-                        f"reserved names {sorted(_RESERVED)}."
-                    )
-                seen.add(key)
-                normalized_columns.append(_normalize_column_spec(col))
-            columns = normalized_columns
+            columns = _normalize_column_specs(columns)
 
             collection_id = None
             if collection_path:
@@ -656,14 +928,18 @@ async def create_table(
             # DDL so a bad spec rolls back with zero schema change. On a
             # freshly-created (empty) table there is no duplicate-preflight
             # to run — a later duplicate INSERT surfaces PG 23505 via akb_sql.
-            resolved_uks = _inline_unique_keys(columns, pg_name) + _resolve_unique_keys(
-                unique_keys, columns, pg_name,
+            #
+            # Same canonicalizer the no-op comparison uses. Sharing it is what
+            # makes `matches_request` meaningful: if the two branches derived
+            # keys/indexes differently, a no-op could report a mismatch the
+            # real create would never have produced, or a match it would not
+            # have accepted. `columns` is already normalized above.
+            _, resolved_uks, resolved_idxs = _canonical_create_spec(
+                vault_name=vault["name"], name=name, columns=columns,
+                unique_keys=unique_keys, indexes=indexes,
+                # already normalized above; re-running would 422 every enum
+                normalize_columns=False,
             )
-            resolved_idxs = _inline_indexes(columns, pg_name) + _resolve_indexes(
-                indexes, columns, pg_name,
-            )
-            _reject_duplicate_meta_names(resolved_uks, label="unique-key")
-            _reject_duplicate_meta_names(resolved_idxs, label="index")
             await _validate_column_references(conn, vault_id, columns)
 
             try:
@@ -727,8 +1003,10 @@ async def create_table(
             ) as e:
                 raise ValidationError(_foreign_key_validation_message(name, e)) from e
             except asyncpg.UniqueViolationError as e:
-                # Concurrent create past the find_by_name check races on
-                # UNIQUE(vault_tables) or pg_type. Surface as 409.
+                # Defensive: for two concurrent creates of the SAME (vault,
+                # name) the loser cannot reach here — its CREATE TABLE fails
+                # first. This covers a registry row that arrived by another
+                # route. Surface as 409 either way.
                 raise ConflictError(f"Table already exists: {name}") from e
             # Grant inside the TX so akb_sql can address the table the
             # instant the create commits (no "exists but 42501" window).
@@ -770,6 +1048,10 @@ async def create_table(
         "vault": vault["name"],
         "collection": collection_path or None,
         "name": name,
+        # Present on BOTH branches so a caller never has to read absence as
+        # meaning anything. Additive to the envelope — see the contract
+        # surfaces listed in the design doc.
+        "created": True,
         "columns": columns,
         "unique_keys": resolved_uks,
         "indexes": resolved_idxs,

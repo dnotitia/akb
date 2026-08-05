@@ -77,7 +77,6 @@ UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"                      # version / expected-state mismatch
 WRITE_BUSY = "write_busy"                  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"      # PG 23505 — INSERT/UPDATE breaks a unique key
-NO_OP = "no_op"                            # nothing to update / already in state
 EDIT_FAILED = "edit_failed"                # akb_edit: old_string match / uniqueness failure
 
 # SQL surface — `akb_sql`

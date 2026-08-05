@@ -275,8 +275,8 @@ async def initialise_measurement_database(dsn: str) -> tuple[asyncpg.Pool, uuid.
         await conn.execute(init_sql)
         for filename in (
             "048_native_revision_core.py",
-            "049_native_revision_m1_pg_body.py",
-            "053_native_revision_m1_payload_placement.py",
+            "053_native_revision_m1_pg_body.py",
+            "057_native_revision_m1_payload_placement.py",
         ):
             migration_path = BACKEND / "app" / "db" / "migrations" / filename
             spec = importlib.util.spec_from_file_location(
