@@ -12,7 +12,7 @@ database (and its isolated, suffixed test derivatives).  That database is
 forward-only and owned by one exact candidate image: rollback to an older
 binary requires recreating the measurement database, never reusing a schema
 to which this migration was applied.  Normal AKB databases retain the
-pre-053 schema.
+pre-057 schema.
 """
 
 from __future__ import annotations

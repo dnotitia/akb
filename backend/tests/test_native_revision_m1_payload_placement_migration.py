@@ -63,7 +63,7 @@ async def _create_database(admin: asyncpg.Connection, name: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_seeded_049_database_upgrades_idempotently_and_deduplicates_per_placement():
+async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_per_placement():
     if not await _reachable():
         pytest.skip("Postgres is not reachable for the M1 placement upgrade test")
 

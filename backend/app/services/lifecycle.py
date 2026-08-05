@@ -74,7 +74,7 @@ async def init_storage() -> None:
     logger.info("Database initialized")
     if settings.native_revision_m1_file_driver != "s3_current":
         # Text Files share the native ledger and PostgreSQL BodyStore with the
-        # guarded M1 grep arm.  Install only after 048-051 are durable; normal
+        # guarded M1 grep arm. Install only after 048 and 053-057 are durable; normal
         # deployments never import or compose this measurement path.
         from app.services.m1_native_text_file_bridge import (
             install_m1_native_text_file_bridge,
