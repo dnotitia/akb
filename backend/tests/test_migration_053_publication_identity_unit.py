@@ -224,14 +224,8 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
 
 
 async def test_init_sql_still_runs_against_a_database_that_predates_the_migration():
-    """init.sql is re-executed IN FULL on every boot, BEFORE any migration.
-
-    So every statement in it has to be inert against a database that has not
-    reached 053 yet. `CREATE TABLE IF NOT EXISTS` is; a bare `CREATE INDEX` on
-    the new column is not — it raises UndefinedColumn, aborts init_db(), and
-    the migration that would have added the column never runs. Every boot,
-    forever. This test is the reason that statement is guarded.
-    """
+    """The boot loop the document_id guard in init.sql exists to prevent — see
+    the note at that guard for why an unguarded statement there is fatal."""
     async with _fresh_database(undo_053=True) as conn:
         assert await conn.fetchval(
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'publications' "
@@ -254,10 +248,9 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
         assert await _shape(conn) == shape
 
 
-# Every column named by a STANDALONE statement in init.sql that some
-# migration adds. A database that predates the migration has the table but not
-# the column, and init.sql runs first, so each of these needs a guard or the
-# boot aborts before migrations can fix anything.
+# Every column named by a STANDALONE statement in init.sql that some migration
+# adds — each needs a guard, or the boot aborts before migrations can fix
+# anything (see the note at the document_id guard in init.sql).
 #
 # Hand-maintained, so it catches a guard being REMOVED, not a new unguarded
 # statement being added. To re-derive it: for every standalone statement in
@@ -267,14 +260,22 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
 # version, which needs no judgement: replay every historical `init.sql` in this
 # repo's history against the current one and look for errors —
 # `git log --format=%h -- backend/app/db/init.sql`, apply each to a fresh
-# database, then apply HEAD's over it. That is how the last two entries here
-# were found.
+# database, then apply HEAD's over it. That is how two of these entries were
+# found.
+#
+# Do NOT read that replay as exhaustive. It cannot find the `chunks` entry:
+# every recorded revision of init.sql already declares `source_type` inline in
+# `CREATE TABLE chunks`, so no replay produces a database missing it. Migration
+# 006 is the only surviving evidence that such tables exist, from before this
+# file's recorded history — which is why the judgement-based derivation above
+# is not redundant with the replay.
 _MIGRATION_ADDED_COLUMNS = [
     ("publications", "document_id", "idx_publications_document_id"),   # 053
     ("publications", "resource_uri", "idx_publications_resource_uri"),  # 022
     ("chunks", "vector_indexed_at", "idx_chunks_indexing_queue"),       # 009
     ("vault_tables", "collection_id", "idx_vault_tables_collection"),   # 020
     ("vault_files", "collection_id", "idx_vault_files_collection"),     # 020
+    ("chunks", "source_type", "idx_chunks_source"),                     # 006
 ]
 
 
@@ -282,7 +283,8 @@ _MIGRATION_ADDED_COLUMNS = [
 async def test_init_sql_survives_a_database_missing_a_migration_added_column(
     table, column, index,
 ):
-    """The boot-loop class, as a rule rather than one instance of it.
+    """The boot-loop class (see the note at init.sql's document_id guard), as a
+    rule rather than one instance of it.
 
     All but the first are dead in practice — their migrations are applied
     everywhere — and they are checked anyway, because the cost of the rule

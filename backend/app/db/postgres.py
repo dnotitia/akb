@@ -139,12 +139,6 @@ async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, 
     until the lock clears (the server also kills idle-in-transaction holders
     at 60s). The pooled connection's state is reset on release, so the
     per-migration `SET lock_timeout` does not leak to other callers.
-
-    A migration may return a summary dict — what it examined, changed and
-    declined to change. Most return nothing; one that does gets it recorded
-    here, so a data-touching migration's outcome is in the boot log next to
-    the line saying it ran, rather than only wherever that migration chose to
-    log it. Returning None stays the norm.
     """
     import logging
     log = logging.getLogger("akb.migrations")
@@ -152,9 +146,7 @@ async def _run_one_migration(pool, filename: str, module, *, retries: int = 10, 
         try:
             async with pool.acquire() as conn:
                 await conn.execute("SET lock_timeout = '5s'")
-                summary = await module.migrate(conn=conn)
-                if summary is not None:
-                    log.info("Migration %s summary: %s", filename, summary)
+                await module.migrate(conn=conn)
                 await conn.execute(
                     "INSERT INTO schema_migrations (filename) VALUES ($1) "
                     "ON CONFLICT (filename) DO NOTHING",

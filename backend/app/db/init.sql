@@ -242,18 +242,27 @@ CREATE TABLE IF NOT EXISTS chunks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_id);
+-- Guarded: `source_type` and `source_id` arrive together with migration 006;
+-- see the note at the publications document_id guard below. 006 creates this
+-- index itself, so the boot that skips it here does not go without it.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'chunks'
+           AND column_name = 'source_type'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_id);
+    END IF;
+END $$;
 -- Indexing-queue claim order (newest chunks first; see embed_worker._claim_batch).
 -- Also covers the retry-eligibility WHERE filter — a single partial
 -- index is enough; we used to keep idx_chunks_vector_pending alongside
 -- this for vector_next_attempt_at, but the planner was selecting the
 -- ORDER-BY-aligned index anyway, so the second one was dead weight.
--- Guarded on the column: `vector_indexed_at` arrives with migration 009, and
--- this file runs before any migration, so an unguarded reference would abort
--- init.sql on a database that predates it — see the note just below, which is
--- the same hazard handled by leaving idx_chunks_vault_id to migration 014.
--- Dead in practice (009 is applied everywhere), guarded so the pattern in this
--- file is uniform.
+-- Guarded: `vector_indexed_at` arrives with migration 009; see the note at the
+-- publications document_id guard below.
 DO $$
 BEGIN
     IF EXISTS (
@@ -311,8 +320,8 @@ CREATE TABLE IF NOT EXISTS vault_migrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_tables_vault ON vault_tables(vault_id);
--- Guarded on the column: `vault_tables.collection_id` arrives with migration 020. Dead in practice, guarded so every
--- statement in this file that names a migration-added column follows one rule.
+-- Guarded: `vault_tables.collection_id` arrives with migration 020; see the
+-- note at the publications document_id guard below.
 DO $$
 BEGIN
     IF EXISTS (
@@ -417,8 +426,8 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
--- Guarded on the column: `vault_files.collection_id` arrives with migration 020. Dead in practice, guarded so every
--- statement in this file that names a migration-added column follows one rule.
+-- Guarded: `vault_files.collection_id` arrives with migration 020; see the
+-- note at the publications document_id guard below.
 DO $$
 BEGIN
     IF EXISTS (
@@ -498,10 +507,8 @@ CREATE TABLE IF NOT EXISTS publications (
 
 CREATE INDEX IF NOT EXISTS idx_publications_slug ON publications(slug);
 CREATE INDEX IF NOT EXISTS idx_publications_vault ON publications(vault_id);
--- Guarded on the column for the same reason as the cascade index below:
--- `resource_uri` arrives with migration 022. Dead in practice (022 is applied
--- everywhere) — guarded so every statement in this file that names a
--- migration-added column follows one rule.
+-- Guarded: `resource_uri` arrives with migration 022; see the note at the
+-- document_id guard below.
 DO $$
 BEGIN
     IF EXISTS (

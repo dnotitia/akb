@@ -156,12 +156,9 @@ This migration adopts a pre-existing valid index of that name via
 ``ADD CONSTRAINT … UNIQUE USING INDEX`` instead of rebuilding it, and drops
 one left invalid by an interrupted build before trying again.
 
-init.sql keeps the same shape, and has to stay runnable against a database
-that has NOT reached this migration yet: it is re-executed in full on every
-boot, before any migration. ``CREATE TABLE IF NOT EXISTS`` is inert on an
-existing table, but a bare ``CREATE INDEX`` on the new column is not — it
-raises ``UndefinedColumn`` and the boot never reaches the migrations. The
-index statement there is therefore guarded on the column's existence.
+init.sql keeps the same shape, with its ``document_id`` index guarded on the
+column's existence — see the note at that guard in ``init.sql`` for why an
+unguarded statement there is a boot loop.
 """
 
 from __future__ import annotations
@@ -203,6 +200,16 @@ _PUB_FK_SHAPE = (
     # see "Why the FK is composite" in the module docstring.
     "c", "a", "s", True,
 )
+
+# The DDL each shape above describes. Used both to install the constraint and
+# to say what was expected when something else is wearing its name, so the two
+# cannot drift apart.
+_DOC_UNIQUE_DDL = "UNIQUE (id, vault_id)"
+_PUB_FK_DDL = (
+    "FOREIGN KEY (document_id, vault_id) "
+    "REFERENCES documents (id, vault_id) ON DELETE CASCADE"
+)
+
 # Substring of `pg_get_indexdef` that pins the cascade index's columns and
 # predicate. Only the parts that carry meaning — the access method and schema
 # qualification in that string are formatting, and the table it sits on is
@@ -308,31 +315,18 @@ async def _constraint_shape(conn, table: str, name: str) -> tuple | None:
     )
 
 
-# Catalog codes → the words an operator would use. The raw tuple is what the
-# comparison needs; a raw tuple is not what someone reading a failed boot at
-# 3am should have to decode.
-_CONTYPE = {"f": "foreign key", "u": "unique", "p": "primary key", "c": "check"}
-_ACTION = {"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL",
-           "d": "SET DEFAULT", " ": "n/a"}
-_MATCH = {"f": "MATCH FULL", "p": "MATCH PARTIAL", "s": "MATCH SIMPLE", " ": "n/a"}
-
-
-def _describe_shape(shape: tuple) -> str:
-    contype, target, local_cols, target_cols, on_del, on_upd, match, valid = shape
-    return (
-        f"{_CONTYPE.get(contype, contype)} "
-        f"({', '.join(local_cols or [])})"
-        + (f" -> {target}({', '.join(target_cols or [])})" if target else "")
-        + f", on delete {_ACTION.get(on_del, on_del)}"
-        f", on update {_ACTION.get(on_upd, on_upd)}"
-        f", {_MATCH.get(match, match)}"
-        f", {'validated' if valid else 'NOT VALIDATED'}"
-    )
-
-
-async def _already_correct(conn, table: str, name: str, expected: tuple) -> bool:
+async def _already_correct(
+    conn, table: str, name: str, expected: tuple, ddl: str,
+) -> bool:
     """True when `name` is already the constraint we would create; raises when
-    something else is wearing the name."""
+    something else is wearing the name.
+
+    The two lines of the message are rendered differently on purpose: `found`
+    is PostgreSQL's own deparse of what is there, `expected` is the literal DDL
+    this migration would have run. Whitespace between them is not the
+    difference — the comparison above is over catalog columns, so if it fired,
+    something structural differs.
+    """
     found = await _constraint_shape(conn, table, name)
     if found is None:
         return False
@@ -341,9 +335,8 @@ async def _already_correct(conn, table: str, name: str, expected: tuple) -> bool
         raise RuntimeError(
             f"{table} already has a constraint named {name}, but it is not the "
             "one migration 053 installs.\n"
-            f"  found:    {_describe_shape(found)}\n"
-            f"  expected: {_describe_shape(expected)}\n"
-            f"  as declared: {definition}\n"
+            f"  found:    {definition}\n"
+            f"  expected: {ddl}\n"
             "Migration 053 will not silently accept it — inspect the constraint, "
             "then drop or rename it and re-run."
         )
@@ -357,7 +350,9 @@ async def _ensure_documents_identity_unique(conn) -> None:
     operator may have run ahead of time (or had cancelled underneath them):
     no index, a valid index of the right shape, or an invalid leftover.
     """
-    if await _already_correct(conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_SHAPE):
+    if await _already_correct(
+        conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_SHAPE, _DOC_UNIQUE_DDL,
+    ):
         return
 
     # Anything already wearing the name, whatever it is. Relation names are
@@ -466,7 +461,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
         _DOC_UNIQUE, _DOC_UNIQUE,
     )
     await conn.execute(
-        f"ALTER TABLE documents ADD CONSTRAINT {_DOC_UNIQUE} UNIQUE (id, vault_id)"
+        f"ALTER TABLE documents ADD CONSTRAINT {_DOC_UNIQUE} {_DOC_UNIQUE_DDL}"
     )
     logger.info("Migration 053: added %s on documents (id, vault_id)", _DOC_UNIQUE)
 
@@ -490,7 +485,9 @@ async def _ensure_publication_identity(conn) -> None:
     the query that lists the rows, and nothing is deleted or blanked.
     """
     have_column = await _column_exists(conn, "publications", "document_id")
-    have_fk = await _already_correct(conn, "publications", _PUB_FK, _PUB_FK_SHAPE)
+    have_fk = await _already_correct(
+        conn, "publications", _PUB_FK, _PUB_FK_SHAPE, _PUB_FK_DDL,
+    )
     if have_column and have_fk:
         return
 
@@ -501,9 +498,7 @@ async def _ensure_publication_identity(conn) -> None:
         if not have_fk:
             try:
                 await conn.execute(
-                    f"ALTER TABLE publications ADD CONSTRAINT {_PUB_FK} "
-                    "FOREIGN KEY (document_id, vault_id) "
-                    "REFERENCES documents (id, vault_id) ON DELETE CASCADE"
+                    f"ALTER TABLE publications ADD CONSTRAINT {_PUB_FK} {_PUB_FK_DDL}"
                 )
             except asyncpg.ForeignKeyViolationError as e:
                 raise RuntimeError(
@@ -737,10 +732,9 @@ async def _backfill(conn) -> dict:
         after = page[-1]["id"]
         examined += len(page)
 
-        ids: list = []
-        paths: list[str] = []
-        uris: list[str] = []
-        vaults: list[str] = []
+        # One row per candidate — (id, path, uri, vault_name) — rather than
+        # four lists that have to be kept the same length by hand.
+        candidates: list[tuple] = []
         for row in page:
             uri = row["resource_uri"]
             parsed = parse_uri(uri) if uri else None
@@ -757,12 +751,9 @@ async def _backfill(conn) -> dict:
                 if len(mismatch_sample) < _MISMATCH_SAMPLE:
                     mismatch_sample.append(row["id"])
                 continue
-            ids.append(row["id"])
-            paths.append(parsed.identifier)
-            uris.append(uri)
-            vaults.append(parsed.vault)
+            candidates.append((row["id"], parsed.identifier, uri, parsed.vault))
 
-        if not ids:
+        if not candidates:
             continue
 
         # The parse happened in Python a moment ago; the row can have moved
@@ -792,18 +783,14 @@ async def _backfill(conn) -> dict:
                AND d.created_at <= p.created_at
             RETURNING p.id
             """,
-            ids, paths, uris, vaults,
+            *[list(col) for col in zip(*candidates)],
         )
         # `updated_at` is deliberately not touched: this is a schema backfill,
         # not an edit anyone made to the publication.
         bound += len(updated)
 
         done = {r["id"] for r in updated}
-        left = [
-            (i, p, u, v)
-            for i, p, u, v in zip(ids, paths, uris, vaults, strict=True)
-            if i not in done
-        ]
+        left = [c for c in candidates if c[0] not in done]
         if left:
             changed, absent, reused = await _classify_leftovers(conn, left)
             changed_underfoot += changed
