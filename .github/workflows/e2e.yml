@@ -239,6 +239,18 @@ jobs:
             # is CI-hostile: no proxy, no psql, no embedding assertions.
             test_publications_e2e.sh
           )
+          # Suites allowed to report no assertion count. Adding an entry
+          # is a tracked decision (it means that suite's coverage stops
+          # being measured), not a way to quiet the gate — fix the
+          # suite's summary line instead. Intentionally empty.
+          EMPTY_COUNT_ALLOWED=()
+          is_empty_allowed() {
+            local suite="$1" allowed
+            for allowed in ${EMPTY_COUNT_ALLOWED[@]+"${EMPTY_COUNT_ALLOWED[@]}"}; do
+              [ "$allowed" = "$suite" ] && return 0
+            done
+            return 1
+          }
           TOTAL_PASS=0
           TOTAL_FAIL=0
           FAILED=()
@@ -246,10 +258,18 @@ jobs:
             echo "::group::$s"
             OUT=$(bash "backend/tests/$s" 2>&1) && RC=0 || RC=$?
             echo "$OUT" | tail -80
-            # Match both summary styles: some suites prefix with a
-            # box-drawing "║ Results:" line, others use bare "Results:"
-            # with leading whitespace. tail -1 picks the final summary.
-            SUMMARY=$(echo "$OUT" | grep -E '(║.*)?Results: *[0-9]+ passed' | tail -1)
+            # A suite's assertion count comes from a line containing
+            # "Results: N passed, M failed", optionally inside a
+            # box-drawing frame. BOTH counts are required: a line that
+            # carries only the passed count would leave F silently zero,
+            # which is the same dead gate half this check exists to
+            # close. Suites print other output after the summary (frame
+            # edges, skip notes, error dumps), so this takes the LAST
+            # matching line, not the last line of output — the count a
+            # suite reports last is the one that counts.
+            # `|| true`: no match is a real outcome the gate below
+            # reports on, not a reason to abort the step.
+            SUMMARY=$(echo "$OUT" | grep -E '(║.*)?Results: *[0-9]+ passed, *[0-9]+ failed' | tail -1 || true)
             P=$(echo "$SUMMARY" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '^[0-9]+' || echo 0)
             F=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '^[0-9]+' || echo 0)
             TOTAL_PASS=$((TOTAL_PASS + ${P:-0}))
@@ -257,6 +277,17 @@ jobs:
             echo "::endgroup::"
             echo "▸ $s: ${P:-0} passed, ${F:-0} failed (rc=$RC)"
             if [ "$RC" != "0" ] || [ "${F:-0}" != "0" ]; then
+              FAILED+=("$s")
+            elif [ "${P:-0}" = "0" ] && ! is_empty_allowed "$s"; then
+              # rc=0 with no assertions counted. A suite that returned
+              # early without asserting anything looks exactly like one
+              # that passed, so treat it as a failure rather than
+              # folding a silent 0 into the total.
+              if [ -z "$SUMMARY" ]; then
+                echo "::error::$s produced no parsable assertion count: no line matching 'Results: N passed, M failed' — a summary carrying only one of the two counts does not parse"
+              else
+                echo "::error::$s produced no parsable assertion count: summary line reported 0 passed ($SUMMARY)"
+              fi
               FAILED+=("$s")
             fi
           done

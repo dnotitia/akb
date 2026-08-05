@@ -92,11 +92,12 @@ awk -v m="$max" 'BEGIN { exit !(m+0 < 3.0) }' \
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "───────────────────────────────────────────"
-echo "  passed: $PASS"
-echo "  failed: $FAIL"
 if [[ $FAIL -gt 0 ]]; then
-  echo ""
   echo "Failures:"
   for e in "${ERRORS[@]}"; do echo "  - $e"; done
-  exit 1
+  echo ""
 fi
+# Canonical summary, last line on both paths: the CI runner parses it
+# to tell "ran and passed" apart from "asserted nothing".
+echo "  Results: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]] || exit 1

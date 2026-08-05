@@ -400,9 +400,11 @@ echo ""
 echo "═══════════════════════════════════"
 if [ $FAIL -eq 0 ]; then
   echo "✓ All $PASS tests passed"
-  exit 0
 else
   echo "✗ $FAIL failures (of $((PASS+FAIL)) total)"
   printf '  - %s\n' "${ERRORS[@]}"
-  exit 1
 fi
+# Canonical summary, last line on both paths: the CI runner parses it
+# to tell "ran and passed" apart from "asserted nothing".
+echo "  Results: $PASS passed, $FAIL failed"
+[ $FAIL -eq 0 ] || exit 1
