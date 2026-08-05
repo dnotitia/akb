@@ -301,6 +301,12 @@ class GrepResult(BaseModel):
     vault: str
     path: str
     title: str
+    # Additive native measurement identity. Legacy Document grep leaves these
+    # unset, preserving its frozen response; W3b needs them to distinguish an
+    # admitted searchable text File and bind the result to its current Head.
+    resource_type: str | None = None
+    revision: str | None = None
+    content_hash: str | None = None
     matches: list[GrepMatch] = Field(default_factory=list)
 
 
@@ -312,6 +318,24 @@ class GrepReplacement(BaseModel):
     title: str | None = None
     commit: str | None = None
     error: str | None = None
+
+
+class GrepTruncationLimits(BaseModel):
+    """Bounded native grep materialization limits exposed by REST."""
+
+    resources: int
+    matches_per_resource: int
+    total_matches: int
+    snippet_bytes: int
+    snippet_bytes_per_resource: int
+    total_snippet_bytes: int
+
+
+class GrepTruncation(BaseModel):
+    """Why a native grep response was truncated and the applied ceilings."""
+
+    reasons: list[str] = Field(default_factory=list)
+    limits: GrepTruncationLimits
 
 
 class GrepResponse(BaseModel):
@@ -331,6 +355,7 @@ class GrepResponse(BaseModel):
     total_docs: int | None = None
     total_matches: int | None = None
     truncated: bool | None = None
+    truncation: GrepTruncation | None = None
     hint: str | None = None
     results: list[GrepResult] | None = None
     by_doc: dict[str, int] | None = None

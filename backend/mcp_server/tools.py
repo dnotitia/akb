@@ -413,6 +413,9 @@ TOOLS = [
         name="akb_grep",
         description=(
             "Search for exact text or regex patterns across document content. "
+            "On the guarded native measurement backend, optionally include admitted "
+            "searchable text Files with `measurement_include_text_files=true`; binary "
+            "Files remain excluded. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
             "Returns matching documents (each with its `uri`) and matched lines. "
@@ -421,13 +424,14 @@ TOOLS = [
             "(grep -c — per-doc counts + total, no snippets), `files_with_matches=true` "
             "(grep -l — just the URIs that contain the pattern). "
             "The default shape always reports BOTH `returned_*` (what fit under `limit`) "
-            "and `total_*` (full corpus matches) plus a `truncated` flag — if truncated, "
-            "switch to count_only/files_with_matches for the full picture instead of bumping `limit`."
+            "and `total_*` (full corpus matches) plus a `truncated` flag. When response "
+            "safety bounds truncate snippets, the `truncation` object names the applied "
+            "resource, match, and byte limits; use count_only for exact counts without snippets."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Search pattern. By default matched as literal text (ILIKE) — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true to enable PostgreSQL regex (required for alternation and wildcards)."},
+                "pattern": {"type": "string", "minLength": 1, "description": "Non-empty search pattern. By default matched as literal text (ILIKE) — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true to enable PostgreSQL regex (required for alternation and wildcards)."},
                 "vault": {"type": "string", "description": "Limit to a specific vault"},
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
                 "regex": {"type": "boolean", "default": False, "description": "Treat pattern as PostgreSQL regex. REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
@@ -436,6 +440,17 @@ TOOLS = [
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return"},
                 "count_only": {"type": "boolean", "default": False, "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."},
                 "files_with_matches": {"type": "boolean", "default": False, "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."},
+                "measurement_include_text_files": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Guarded native M1 W3b measurement mode: include admitted searchable "
+                        "text Files as well as Documents. File results include resource_type=file, "
+                        "their canonical akb:// URI, revision, and content_hash. Binary Files are "
+                        "never searchable. Rejected unless the exact native measurement backend "
+                        "and dedicated database guard are active."
+                    ),
+                },
             },
             "required": ["pattern"],
         },

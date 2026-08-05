@@ -149,6 +149,29 @@ async def test_initiate_upload_rejects_a_malformed_content_hash():
     assert err.value.status_code == 400
 
 
+async def test_default_s3_facade_keeps_accepting_slash_names(monkeypatch):
+    """The default facade must reach its unchanged legacy storage path."""
+    from app.services import file_service as fs
+
+    class ReachedLegacyStorage(Exception):
+        pass
+
+    def reached_legacy_storage(_bucket):
+        raise ReachedLegacyStorage
+
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", reached_legacy_storage)
+
+    with pytest.raises(ReachedLegacyStorage):
+        await fs.FileService().initiate_upload(
+            vault_name="vault",
+            vault_id=uuid.uuid4(),
+            collection="coll",
+            filename="nested/report.txt",
+            actor_id="tester",
+        )
+
+
 # ── the constraint itself, against a real Postgres ───────────────
 
 

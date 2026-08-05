@@ -91,12 +91,17 @@ async def grep_documents(
     limit: int = Query(20, ge=1, le=100),
     count_only: bool = Query(False, description="grep -c — per-doc counts + total"),
     files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
+    measurement_include_text_files: bool = Query(
+        False,
+        description="Guarded native M1 W3b mode: include admitted searchable text Files.",
+    ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     response = await search_service.grep(
         pattern=q, vault=vault, collection=collection,
         regex=regex, case_sensitive=case_sensitive, limit=limit,
         count_only=count_only, files_with_matches=files_with_matches,
+        measurement_include_text_files=measurement_include_text_files,
         user_id=user.user_id,
     )
     response.setdefault("regex", regex)

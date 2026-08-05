@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from app.config import settings
+from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
 from app.db.postgres import get_pool
 from app.services import sparse_encoder
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
@@ -118,6 +118,22 @@ async def _mark_failure(pool, chunk_id, retry_count: int, error: str) -> None:
 async def _process_once() -> int:
     """Process one batch. Returns successfully-indexed count."""
     pool = await get_pool()
+    native_processed = 0
+
+    # The guarded native measurement arm feeds the existing chunk/vector
+    # pipeline from durable native invalidation intents. This hook runs before
+    # the normal claim so newly materialized chunks can be indexed in the same
+    # pass; unguarded/default deployments never import or execute the consumer.
+    native_document_measurement = settings.document_revision_backend == "native_ledger_m1"
+    native_file_measurement = settings.native_revision_m1_file_driver != "s3_current"
+    if (
+        (native_document_measurement or native_file_measurement)
+        and settings.native_revision_m1_measurement_only
+        and settings.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME
+    ):
+        from app.services.native_derived_worker import NativeDerivedWorker
+
+        native_processed = await NativeDerivedWorker(pool).process_once()
 
     # Stage 1: claim. Tiny transaction; commits before any external
     # work begins.
@@ -125,7 +141,7 @@ async def _process_once() -> int:
         async with conn.transaction():
             batch = await _claim_batch(conn)
     if not batch:
-        return 0
+        return native_processed
 
     # Stage 2: embedding API. Outside any PG transaction — the conn
     # pool stays free during the network round-trip. Three failure
@@ -249,7 +265,7 @@ async def _process_once() -> int:
             # so we don't hammer it. Remaining rows already have
             # next_attempt_at set by _claim_batch.
             logger.info("vector store unavailable; backing off batch: %s", e)
-            return succeeded
+            return native_processed + succeeded
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"], str(e),
@@ -257,7 +273,7 @@ async def _process_once() -> int:
             continue
 
         succeeded += 1
-    return succeeded
+    return native_processed + succeeded
 
 
 _runner = BackfillRunner(

@@ -229,6 +229,11 @@ async def _apply_migrations() -> None:
         "050_drop_todos.py",                     # archive todos → todos_archive, drop todos: entrypoint-less since PR #43 and the source of the NOT NULL account-deletion failure
         "051_app_credentials.py",                # exchange-only deployment credentials for app principals
         "052_app_inventory.py",                  # observed installation state and sealed rollout snapshots
+        "053_native_revision_m1_pg_body.py",        # explicit M1 PostgreSQL BodyStore candidate profile
+        "054_native_revision_searchable_derived.py", # M1 searchable derived state + durable invalidation delivery
+        "055_native_revision_m1_file_storage.py",    # M1 confirmed-only File transfer/CAS metadata
+        "056_native_revision_m1_file_constraints.py", # M1 File placement discriminator integrity
+        "057_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
     ):
         if filename in applied:
             continue

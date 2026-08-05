@@ -6,6 +6,10 @@
 // Run with: node packages/akb-mcp-client/test/contract.test.mjs
 
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AKBProxy } from "../lib/proxy.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -18,6 +22,14 @@ function it(name, fn) {
     fail++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
+}
+
+const pending = [];
+function itAsync(name, fn) {
+  pending.push(fn().then(
+    () => { pass++; console.log(`  ✓ ${name}`); },
+    (e) => { fail++; console.log(`  ✗ ${name}: ${e.message}`); },
+  ));
 }
 
 // ── Fixtures: representative backend envelope responses ──────────
@@ -107,8 +119,58 @@ it("envelope adds kind without breaking legacy fields", () => {
   }
 });
 
+itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical confirm shape", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-mcp-contract-"));
+  const filePath = join(directory, "proxy.bin");
+  const data = Buffer.from("proxy upload payload");
+  const digest = "d".repeat(64);
+  const fileId = "11111111-2222-3333-4444-555555555555";
+  const canonical = {
+    kind: "file",
+    uri: `akb://myvault/coll/proof/file/${fileId}`,
+    file_id: fileId,
+    vault: "myvault",
+    collection: "proof",
+    name: "proxy.bin",
+    content_hash: digest,
+    hash_algorithm: "sha256",
+    storage_driver: "fscas",
+  };
+  await writeFile(filePath, data);
+  try {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const calls = [];
+    proxy._http = async (method, path) => {
+      calls.push({ method, path });
+      if (calls.length === 1) {
+        return { text: JSON.stringify({
+          kind: "file", uri: canonical.uri, upload_url: "http://transfer.test/put",
+        }) };
+      }
+      return { text: JSON.stringify(canonical) };
+    };
+    const uploads = [];
+    proxy._uploadToS3 = async (...args) => { uploads.push(args); };
+
+    const result = await proxy._putFile({ vault: "myvault", collection: "proof", file_path: filePath });
+
+    assert.deepEqual(result, canonical);
+    assert.equal(uploads.length, 1);
+    assert.deepEqual(uploads[0], ["http://transfer.test/put", filePath, data.length, "application/octet-stream"]);
+    assert.equal(calls[0].method, "POST");
+    assert.match(calls[0].path, /^\/api\/v1\/files\/myvault\/upload\?/);
+    assert.ok(!new URL(`http://test${calls[0].path}`).searchParams.has("content_hash"));
+    const confirm = new URL(`http://test${calls[1].path}`);
+    assert.equal(confirm.searchParams.get("content_hash"), await proxy._sha256File(filePath));
+    assert.equal(confirm.searchParams.get("hash_algorithm"), "sha256");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 
+await Promise.all(pending);
 console.log("");
 console.log(`  Passed: ${pass}   Failed: ${fail}`);
 process.exit(fail > 0 ? 1 : 0);

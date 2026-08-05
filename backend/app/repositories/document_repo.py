@@ -897,10 +897,7 @@ class CollectionRepository:
         bare = path.rstrip("/")
         like = self._like_escape(bare) + "/%"
         sql = (
-            "SELECT vf.id, vf.vault_id, vf.collection_id, "
-            "       c.path AS collection, vf.name, vf.s3_key, vf.mime_type, "
-            "       vf.size_bytes, vf.description, vf.created_by, "
-            "       vf.created_at, vf.updated_at "
+            "SELECT vf.*, c.path AS collection "
             "  FROM vault_files vf "
             "  JOIN collections c ON c.id = vf.collection_id "
             " WHERE vf.vault_id = $1 "
