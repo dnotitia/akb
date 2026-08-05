@@ -198,15 +198,24 @@ _PUB_INDEX = "idx_publications_document_id"
 _DOC_UNIQUE_SHAPE = ("u", None, ["id", "vault_id"], None, " ", " ", " ", True)
 _PUB_FK_SHAPE = (
     "f", "documents", ["document_id", "vault_id"], ["id", "vault_id"],
-    # c = CASCADE on delete; a = NO ACTION on update (so the vault half of the
-    # key cannot be moved out from under the pairing); s = MATCH SIMPLE (so a
-    # NULL document_id is exempt — see the module docstring).
+    # c = ON DELETE CASCADE, a = ON UPDATE NO ACTION, s = MATCH SIMPLE. Pinned
+    # rather than left to the defaults, because all three are load-bearing —
+    # see "Why the FK is composite" in the module docstring.
     "c", "a", "s", True,
 )
 # Substring of `pg_get_indexdef` that pins the cascade index's columns and
 # predicate. Only the parts that carry meaning — the access method and schema
 # qualification in that string are formatting, and the table it sits on is
 # checked against the catalog separately.
+#
+# Why this guard reads deparsed text while the documents one compares attnums:
+# a partial index's predicate has no catalog column to compare, only
+# `pg_get_indexdef` renders it, and the predicate is half of what makes this
+# index the right one. The constraint guards avoid the deparsed form because
+# there it would introduce a search_path dependency for no gain; here the
+# search_path-sensitive part (schema qualification) is excluded from the match
+# and the owning table is checked against the catalog instead. Neither is
+# legacy — they differ because the objects differ.
 _PUB_INDEX_COLS = "(document_id, vault_id) WHERE (document_id IS NOT NULL)"
 
 # Rows per UPDATE. Keeps any single statement well inside the pool's 30s
@@ -242,6 +251,20 @@ async def _column_exists(conn, table: str, column: str) -> bool:
         """,
         table, column,
     ))
+
+
+async def _constraint_def(conn, table: str, name: str) -> str | None:
+    """The constraint as PostgreSQL would declare it. Used only in error text —
+    the comparison itself goes through `_constraint_shape`, because this string
+    is search_path-dependent (see `_PUB_FK_SHAPE`)."""
+    return await conn.fetchval(
+        """
+        SELECT pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conname::text = $2::text
+           AND conrelid = to_regclass('public.' || $1::text)
+        """,
+        table, name,
+    )
 
 
 async def _constraint_shape(conn, table: str, name: str) -> tuple | None:
@@ -285,6 +308,28 @@ async def _constraint_shape(conn, table: str, name: str) -> tuple | None:
     )
 
 
+# Catalog codes → the words an operator would use. The raw tuple is what the
+# comparison needs; a raw tuple is not what someone reading a failed boot at
+# 3am should have to decode.
+_CONTYPE = {"f": "foreign key", "u": "unique", "p": "primary key", "c": "check"}
+_ACTION = {"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL",
+           "d": "SET DEFAULT", " ": "n/a"}
+_MATCH = {"f": "MATCH FULL", "p": "MATCH PARTIAL", "s": "MATCH SIMPLE", " ": "n/a"}
+
+
+def _describe_shape(shape: tuple) -> str:
+    contype, target, local_cols, target_cols, on_del, on_upd, match, valid = shape
+    return (
+        f"{_CONTYPE.get(contype, contype)} "
+        f"({', '.join(local_cols or [])})"
+        + (f" -> {target}({', '.join(target_cols or [])})" if target else "")
+        + f", on delete {_ACTION.get(on_del, on_del)}"
+        f", on update {_ACTION.get(on_upd, on_upd)}"
+        f", {_MATCH.get(match, match)}"
+        f", {'validated' if valid else 'NOT VALIDATED'}"
+    )
+
+
 async def _already_correct(conn, table: str, name: str, expected: tuple) -> bool:
     """True when `name` is already the constraint we would create; raises when
     something else is wearing the name."""
@@ -292,11 +337,13 @@ async def _already_correct(conn, table: str, name: str, expected: tuple) -> bool
     if found is None:
         return False
     if found != expected:
+        definition = await _constraint_def(conn, table, name)
         raise RuntimeError(
             f"{table} already has a constraint named {name}, but it is not the "
-            f"one migration 053 installs.\n  found:    {found}\n  expected: {expected}\n"
-            "(fields: contype, referenced table, local columns, referenced "
-            "columns, on-delete, on-update, match type, validated)\n"
+            "one migration 053 installs.\n"
+            f"  found:    {_describe_shape(found)}\n"
+            f"  expected: {_describe_shape(expected)}\n"
+            f"  as declared: {definition}\n"
             "Migration 053 will not silently accept it — inspect the constraint, "
             "then drop or rename it and re-run."
         )
@@ -313,26 +360,48 @@ async def _ensure_documents_identity_unique(conn) -> None:
     if await _already_correct(conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_SHAPE):
         return
 
+    # Anything already wearing the name, whatever it is. Relation names are
+    # unique per SCHEMA, not per table, so "an index called X exists" says
+    # nothing about which table it indexes — and the three branches below all
+    # act on `documents`. Read the owning table first, or an index belonging
+    # to some other table gets adopted, misreported, or dropped.
     existing = await conn.fetchrow(
         """
-        SELECT i.indisvalid                AS is_valid,
-               i.indisunique               AS is_unique,
-               i.indpred IS NOT NULL       AS is_partial,
-               i.indexprs IS NOT NULL      AS is_expression,
-               i.indkey::text              AS indkey,
+        SELECT c.relkind::text              AS relkind,
+               (SELECT t.relname::text FROM pg_class t
+                 WHERE t.oid = i.indrelid)  AS on_table,
+               i.indisvalid                 AS is_valid,
+               i.indisunique                AS is_unique,
+               i.indpred IS NOT NULL        AS is_partial,
+               i.indexprs IS NOT NULL       AS is_expression,
+               i.indkey::text               AS indkey,
                (SELECT a.attnum FROM pg_attribute a
                  WHERE a.attrelid = i.indrelid AND a.attname = 'id') AS id_attnum,
                (SELECT a.attnum FROM pg_attribute a
                  WHERE a.attrelid = i.indrelid AND a.attname = 'vault_id') AS vault_attnum
-          FROM pg_index i
-          JOIN pg_class c ON c.oid = i.indexrelid
-         WHERE c.relname = $1
-           AND c.relnamespace = 'public'::regnamespace
+          FROM pg_class c
+          LEFT JOIN pg_index i ON i.indexrelid = c.oid
+         WHERE c.oid = to_regclass('public.' || $1::text)
         """,
         _DOC_UNIQUE,
     )
 
     if existing is not None:
+        if existing["relkind"] != "i" or existing["on_table"] != "documents":
+            # Named, but not an index on documents. Falling through would hand
+            # the operator a bare "relation already exists" from the ALTER,
+            # with nothing to say which object is in the way.
+            what = (
+                f"an index on {existing['on_table']}"
+                if existing["relkind"] == "i"
+                else f"a relation of kind '{existing['relkind']}'"
+            )
+            raise RuntimeError(
+                f"The name {_DOC_UNIQUE} is already taken in schema public by "
+                f"{what}, not by an index on documents. Migration 053 needs that "
+                "name for the documents identity constraint — rename or drop the "
+                "other object and re-run. Nothing has been changed."
+            )
         expected_key = f"{existing['id_attnum']} {existing['vault_attnum']}"
         right_shape = (
             existing["is_unique"]
@@ -341,11 +410,16 @@ async def _ensure_documents_identity_unique(conn) -> None:
             and existing["indkey"] == expected_key
         )
         if not right_shape:
+            definition = await conn.fetchval(
+                "SELECT pg_get_indexdef(to_regclass('public.' || $1::text))",
+                _DOC_UNIQUE,
+            )
             raise RuntimeError(
                 f"An index named {_DOC_UNIQUE} already exists on documents but is "
-                "not a plain UNIQUE index on exactly (id, vault_id). Migration 053 "
-                "will not repurpose it — inspect it, then either drop it or add the "
-                "constraint by hand."
+                "not a plain UNIQUE index on exactly (id, vault_id).\n"
+                f"  found: {definition}\n"
+                "Migration 053 will not repurpose it — inspect it, then either "
+                "drop it or add the constraint by hand."
             )
         if existing["is_valid"]:
             # Adopt it: the constraint takes the index's name and no rebuild
@@ -374,8 +448,23 @@ async def _ensure_documents_identity_unique(conn) -> None:
             "CREATE INDEX CONCURRENTLY leaves one behind); dropping it before "
             "building the constraint", _DOC_UNIQUE,
         )
-        await conn.execute(f"DROP INDEX IF EXISTS {_DOC_UNIQUE}")
+        await conn.execute(f"DROP INDEX IF EXISTS public.{_DOC_UNIQUE}")
 
+    # Say this BEFORE the statement, not after. It is the one statement here
+    # whose cost scales with the table, it holds ACCESS EXCLUSIVE on documents
+    # while it builds, and if it exceeds the pool's 30s cancel the operator
+    # sees a crashlooping pod and a QueryCanceledError that the runner reports
+    # as "blocked on a lock" — which is not what happened. This line is then
+    # the last thing in the log before the stall, and it carries the remedy.
+    logger.info(
+        "Migration 053: building %s on documents (id, vault_id). This holds "
+        "ACCESS EXCLUSIVE on documents for the duration of an index build. If "
+        "it is cancelled at the 30s statement timeout and the migration keeps "
+        "retrying, build the index out of band and re-run — this migration "
+        "adopts an existing valid one instead of rebuilding: "
+        "CREATE UNIQUE INDEX CONCURRENTLY %s ON documents (id, vault_id);",
+        _DOC_UNIQUE, _DOC_UNIQUE,
+    )
     await conn.execute(
         f"ALTER TABLE documents ADD CONSTRAINT {_DOC_UNIQUE} UNIQUE (id, vault_id)"
     )
@@ -389,9 +478,16 @@ async def _ensure_publication_identity(conn) -> None:
     an unconstrained UUID column on a live table, and anything that wrote a
     dangling or cross-vault value into that window would make every later
     attempt to add the constraint fail. The pair costs nothing to redo — the
-    column add is a catalog write and the FK's validation scan runs against
-    all-NULL data — so there is no progress worth preserving by splitting
-    them, and a great deal worth preserving by not leaving that window open.
+    column add is a catalog write, and when the column is new the FK's
+    validation scan runs against all-NULL data — so there is no progress worth
+    preserving by splitting them, and a great deal worth preserving by not
+    leaving that window open.
+
+    The one state where that scan is not free is a database that arrived here
+    with a `document_id` this migration did not add (see migration 022's
+    `_already_applied`). There the scan checks real values, and if any of them
+    fails the composite key the constraint is refused — reported below with
+    the query that lists the rows, and nothing is deleted or blanked.
     """
     have_column = await _column_exists(conn, "publications", "document_id")
     have_fk = await _already_correct(conn, "publications", _PUB_FK, _PUB_FK_SHAPE)
@@ -474,11 +570,106 @@ async def _ensure_publication_document_index(conn) -> None:
             "Migration 053: found an INVALID index named %s; dropping it before "
             "rebuilding", _PUB_INDEX,
         )
-        await conn.execute(f"DROP INDEX IF EXISTS {_PUB_INDEX}")
+        await conn.execute(f"DROP INDEX IF EXISTS public.{_PUB_INDEX}")
     await conn.execute(
         f"CREATE INDEX {_PUB_INDEX} "
         "ON publications (document_id, vault_id) WHERE document_id IS NOT NULL"
     )
+    # Every other step says what it did. Without this one, a run that died
+    # during the documents index build and a run that died entering the
+    # backfill leave identical logs.
+    logger.info(
+        "Migration 053: created %s — the cascade's lookup path on the "
+        "referencing side", _PUB_INDEX,
+    )
+
+
+async def _classify_leftovers(conn, left: list[tuple]) -> tuple[int, int, int]:
+    """Why the UPDATE declined these rows, as ``(changed, absent, reused)``.
+
+    Three categories, and they are only worth reading if a row lands in the
+    right one: ``changed`` — the row is no longer what was parsed (its URI or
+    its vault name moved, or something else bound it); ``absent`` — the URI
+    still stands and no document occupies that path; ``reused`` — a document
+    occupies it but postdates the publication. That is the whole space,
+    because a row satisfying all of those would have been bound.
+
+    So this re-checks the UPDATE's own predicates instead of asking the weaker
+    "is anything at that path now", which would file a row that moved
+    underfoot as a reused path — a materially different thing to read in a log.
+    """
+    split = await conn.fetchrow(
+        """
+        WITH candidate AS (
+            SELECT pub_id, doc_path, uri, uri_vault
+              FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[])
+                AS t(pub_id, doc_path, uri, uri_vault)
+        ), state AS (
+            SELECT (p.id IS NOT NULL
+                    AND p.document_id IS NULL
+                    AND p.resource_type = 'document'
+                    AND p.resource_uri IS NOT DISTINCT FROM c.uri
+                    AND v.name IS NOT DISTINCT FROM c.uri_vault) AS unchanged,
+                   d.id IS NOT NULL AS path_occupied
+              FROM candidate c
+              LEFT JOIN publications p ON p.id = c.pub_id
+              LEFT JOIN vaults v ON v.id = p.vault_id
+              LEFT JOIN documents d
+                ON d.vault_id = p.vault_id AND d.path = c.doc_path
+        )
+        SELECT COUNT(*) FILTER (WHERE NOT unchanged)                    AS changed,
+               COUNT(*) FILTER (WHERE unchanged AND NOT path_occupied)  AS absent,
+               COUNT(*) FILTER (WHERE unchanged AND path_occupied)      AS reused
+          FROM state
+        """,
+        [r[0] for r in left], [r[1] for r in left],
+        [r[2] for r in left], [r[3] for r in left],
+    )
+    return split["changed"], split["absent"], split["reused"]
+
+
+def _log_backfill_summary(counts: dict, mismatch_sample: list) -> None:
+    """Report what the backfill did, by category.
+
+    Someone reads this to decide whether the result is trustworthy, so the
+    categories are named and counted separately rather than rolled into a
+    total — "bound=N, path_reused=1" and "bound=N, vault_mismatch=1" describe
+    very different databases.
+    """
+    logger.info(
+        "Migration 053 backfill: bound=%d, no_document=%d, path_reused=%d, "
+        "unreadable_uri=%d, vault_mismatch=%d, changed_underfoot=%d, "
+        "already_bound=%d, non_document_publications=%d (of %d document "
+        "publications examined this run)",
+        counts["bound"], counts["no_document"], counts["path_reused"],
+        counts["unreadable_uri"], counts["vault_mismatch"],
+        counts["changed_underfoot"], counts["already_bound"],
+        counts["non_document_publications"], counts["examined"],
+    )
+    if counts["vault_mismatch"]:
+        # The most interesting rows in the table if they exist: the vault the
+        # URI names is not the vault the row belongs to. Ids only — enough to
+        # pull the rows with a SELECT, without putting names or paths in a log.
+        logger.warning(
+            "Migration 053: %d document publication(s) name a vault other than "
+            "their own and were left unbound. publication id(s): %s%s",
+            counts["vault_mismatch"], ", ".join(str(i) for i in mismatch_sample),
+            "" if counts["vault_mismatch"] <= _MISMATCH_SAMPLE
+            else f" (first {_MISMATCH_SAMPLE} shown)",
+        )
+    unbound = (
+        counts["no_document"] + counts["path_reused"]
+        + counts["unreadable_uri"] + counts["changed_underfoot"]
+    )
+    if unbound:
+        logger.warning(
+            "Migration 053: %d document publication(s) left unbound "
+            "(no_document=%d, path_reused=%d, unreadable_uri=%d, "
+            "changed_underfoot=%d). They keep working through resource_uri; "
+            "document_id stays NULL until they are re-published.",
+            unbound, counts["no_document"], counts["path_reused"],
+            counts["unreadable_uri"], counts["changed_underfoot"],
+        )
 
 
 async def _backfill(conn) -> dict:
@@ -614,40 +805,10 @@ async def _backfill(conn) -> dict:
             if i not in done
         ]
         if left:
-            # Why each leftover was left. The UPDATE can decline a row for four
-            # reasons and the counts are only worth reading if they name the
-            # right one, so this re-checks the same predicates rather than
-            # asking the weaker question "is anything at that path now" — which
-            # would file a row that moved underfoot as a reused path.
-            split = await conn.fetchrow(
-                """
-                WITH candidate AS (
-                    SELECT pub_id, doc_path, uri, uri_vault
-                      FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[])
-                        AS t(pub_id, doc_path, uri, uri_vault)
-                ), state AS (
-                    SELECT (p.id IS NOT NULL
-                            AND p.document_id IS NULL
-                            AND p.resource_uri IS NOT DISTINCT FROM c.uri
-                            AND v.name IS NOT DISTINCT FROM c.uri_vault) AS unchanged,
-                           d.id IS NOT NULL AS path_occupied
-                      FROM candidate c
-                      LEFT JOIN publications p ON p.id = c.pub_id
-                      LEFT JOIN vaults v ON v.id = p.vault_id
-                      LEFT JOIN documents d
-                        ON d.vault_id = p.vault_id AND d.path = c.doc_path
-                )
-                SELECT COUNT(*) FILTER (WHERE NOT unchanged)             AS changed,
-                       COUNT(*) FILTER (WHERE unchanged AND NOT path_occupied) AS absent,
-                       COUNT(*) FILTER (WHERE unchanged AND path_occupied)     AS reused
-                  FROM state
-                """,
-                [r[0] for r in left], [r[1] for r in left],
-                [r[2] for r in left], [r[3] for r in left],
-            )
-            changed_underfoot += split["changed"]
-            no_document += split["absent"]
-            path_reused += split["reused"]
+            changed, absent, reused = await _classify_leftovers(conn, left)
+            changed_underfoot += changed
+            no_document += absent
+            path_reused += reused
 
     counts = {
         "examined": examined,
@@ -660,34 +821,7 @@ async def _backfill(conn) -> dict:
         "already_bound": already_bound or 0,
         "non_document_publications": skipped_by_design or 0,
     }
-    logger.info(
-        "Migration 053 backfill: bound=%d, no_document=%d, path_reused=%d, "
-        "unreadable_uri=%d, vault_mismatch=%d, changed_underfoot=%d, "
-        "already_bound=%d, non_document_publications=%d (of %d document "
-        "publications examined this run)",
-        bound, no_document, path_reused, unreadable_uri, vault_mismatch,
-        changed_underfoot, already_bound or 0, skipped_by_design or 0, examined,
-    )
-    if vault_mismatch:
-        # The most interesting rows in the table if they exist: the vault the
-        # URI names is not the vault the row belongs to. Ids only — enough to
-        # pull the rows with a SELECT, without putting names or paths in a log.
-        logger.warning(
-            "Migration 053: %d document publication(s) name a vault other than "
-            "their own and were left unbound. publication id(s): %s%s",
-            vault_mismatch, ", ".join(str(i) for i in mismatch_sample),
-            "" if vault_mismatch <= _MISMATCH_SAMPLE
-            else f" (first {_MISMATCH_SAMPLE} shown)",
-        )
-    unbound = no_document + path_reused + unreadable_uri + changed_underfoot
-    if unbound:
-        logger.warning(
-            "Migration 053: %d document publication(s) left unbound "
-            "(no_document=%d, path_reused=%d, unreadable_uri=%d, "
-            "changed_underfoot=%d). They keep working through resource_uri; "
-            "document_id stays NULL until they are re-published.",
-            unbound, no_document, path_reused, unreadable_uri, changed_underfoot,
-        )
+    _log_backfill_summary(counts, mismatch_sample)
     return counts
 
 

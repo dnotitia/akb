@@ -30,6 +30,16 @@ Runs in a disposable database so it never touches a dev DB's data. Registered
 in the `pgvector e2e (live DB)` CI job, which sets `AKB_TEST_DSN` and
 `REQUIRE_REAL_PG=1`; without that registration it would skip in both jobs and
 be a gate that never fires.
+
+Two environment requirements, neither of which degrades to a skip — on a
+database that does not grant them these fail with an unrelated permission
+error rather than saying what is missing:
+
+  * CREATEDB, for the disposable database every test runs in;
+  * superuser, for the two invalid-index tests. There is no supported way to
+    ask PostgreSQL for an invalid index, so they write `pg_index.indisvalid`
+    directly. Both the dev compose stack and the CI service container run as
+    the database owner, which has it.
 """
 
 from __future__ import annotations
@@ -248,6 +258,17 @@ async def test_init_sql_still_runs_against_a_database_that_predates_the_migratio
 # migration adds. A database that predates the migration has the table but not
 # the column, and init.sql runs first, so each of these needs a guard or the
 # boot aborts before migrations can fix anything.
+#
+# Hand-maintained, so it catches a guard being REMOVED, not a new unguarded
+# statement being added. To re-derive it: for every standalone statement in
+# init.sql (anything outside a `CREATE TABLE IF NOT EXISTS` body — those are
+# inert on an existing table), check whether the columns it names are added by
+# a migration rather than present since that table's creation. The empirical
+# version, which needs no judgement: replay every historical `init.sql` in this
+# repo's history against the current one and look for errors —
+# `git log --format=%h -- backend/app/db/init.sql`, apply each to a fresh
+# database, then apply HEAD's over it. That is how the last two entries here
+# were found.
 _MIGRATION_ADDED_COLUMNS = [
     ("publications", "document_id", "idx_publications_document_id"),   # 053
     ("publications", "resource_uri", "idx_publications_resource_uri"),  # 022
@@ -559,6 +580,46 @@ async def test_an_unrelated_index_wearing_the_name_fails_loudly():
         )
         with pytest.raises(RuntimeError, match="will not repurpose it"):
             await _apply(conn)
+
+
+@pytest.mark.parametrize("valid", [True, False])
+@pytest.mark.parametrize("right_shape", [True, False])
+async def test_an_index_of_that_name_on_another_table_is_never_touched(
+    valid, right_shape,
+):
+    """Relation names are unique per schema, not per table.
+
+    All three branches of the documents guard act on `documents`, so reading a
+    decoy on another table as though it were the real one is not one bug but
+    three — and the worst of them is silent: the invalid branch DROPPED the
+    decoy and reported success. Every combination is checked because the
+    branch taken depends on both validity and shape.
+    """
+    async with _fresh_database(undo_053=True) as conn:
+        columns = "(id, vault_id)" if right_shape else "(vault_id, path)"
+        await conn.execute(
+            "CREATE TABLE decoy (id UUID, vault_id UUID, path TEXT)"
+        )
+        await conn.execute(
+            f"CREATE {'UNIQUE ' if right_shape else ''}INDEX "
+            f"documents_id_vault_id_key ON decoy {columns}"
+        )
+        if not valid:
+            await conn.execute(
+                "UPDATE pg_index SET indisvalid = false "
+                "WHERE indexrelid = 'documents_id_vault_id_key'::regclass"
+            )
+
+        with pytest.raises(RuntimeError, match="not by an index on documents"):
+            await _apply(conn)
+
+        # The decoy is untouched — same object, same validity.
+        survivor = await conn.fetchrow(
+            "SELECT i.indrelid::regclass::text AS tbl, i.indisvalid FROM pg_index i "
+            "WHERE i.indexrelid = 'documents_id_vault_id_key'::regclass"
+        )
+        assert survivor["tbl"] == "decoy"
+        assert survivor["indisvalid"] is valid
 
 
 async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
