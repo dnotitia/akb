@@ -5,6 +5,7 @@ This module intentionally has no public route or compatibility composition.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 import asyncpg
 
@@ -26,6 +28,19 @@ from app.services.m1_reference_payload_store import (
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
+
+
+class TextPayloadStore(Protocol):
+    async def prepare_text(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        payload: str | bytes,
+        expected_digest: str | None = None,
+        expected_size: int | None = None,
+    ) -> PreparedReferencePayload: ...
+
+    async def open_verified(self, payload_id: uuid.UUID) -> bytes: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +77,15 @@ class NativeRevisionSnapshot:
     text: str
 
 
+def _verify_snapshot_payload(payload_bytes: bytes, row: dict) -> str:
+    """Bind verified payload bytes to manifest facts without blocking asyncio."""
+    if len(payload_bytes) != row["byte_size"]:
+        raise ReferencePayloadIntegrityError("Head manifest byte size mismatch")
+    if hashlib.sha256(payload_bytes).hexdigest() != row["digest"]:
+        raise ReferencePayloadIntegrityError("Head manifest digest mismatch")
+    return payload_bytes.decode(row["encoding"], errors="strict")
+
+
 class NativeRevisionService:
     """Publish one Resource mutation as one PostgreSQL authority transaction."""
 
@@ -70,7 +94,7 @@ class NativeRevisionService:
         pool: asyncpg.Pool,
         *,
         repository: NativeRevisionRepository | None = None,
-        payload_store: M1ReferencePayloadStore | None = None,
+        payload_store: TextPayloadStore | None = None,
         failpoint: Failpoint | None = None,
     ):
         """Build the internal substrate.
@@ -1179,11 +1203,7 @@ class NativeRevisionService:
         if row["payload_manifest_id"] is None or row["private_locator"] is None:
             raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
         payload_bytes = await self.payload_store.open_verified(row["private_locator"])
-        if len(payload_bytes) != row["byte_size"]:
-            raise ReferencePayloadIntegrityError("Head manifest byte size mismatch")
-        if hashlib.sha256(payload_bytes).hexdigest() != row["digest"]:
-            raise ReferencePayloadIntegrityError("Head manifest digest mismatch")
-        text = payload_bytes.decode(row["encoding"], errors="strict")
+        text = await asyncio.to_thread(_verify_snapshot_payload, payload_bytes, row)
         return NativeRevisionSnapshot(
             resource_id=row["resource_id"],
             revision_id=row["revision_id"],

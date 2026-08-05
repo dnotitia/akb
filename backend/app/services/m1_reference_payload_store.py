@@ -89,7 +89,7 @@ class M1ReferencePayloadStore:
                     selected_placement, verification_profile, canonical_bytes
                 )
                 VALUES ($1, 'text', $2, $3, 'utf-8', $4, $5, $6)
-                ON CONFLICT (namespace_id, digest, byte_size) DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING payload_id, namespace_id, content_profile, digest,
                           byte_size, encoding, selected_placement,
                           verification_profile, canonical_bytes
@@ -108,13 +108,22 @@ class M1ReferencePayloadStore:
                            byte_size, encoding, selected_placement,
                            verification_profile, canonical_bytes
                       FROM m1_reference_payloads
-                     WHERE namespace_id = $1 AND digest = $2 AND byte_size = $3
+                     WHERE namespace_id = $1
+                       AND digest = $2
+                       AND byte_size = $3
+                       AND selected_placement = $4
+                       AND verification_profile = $5
                     """,
                     namespace_id,
                     observed_digest,
                     len(canonical),
+                    self.selected_placement,
+                    self.verification_profile,
                 )
-        assert row is not None
+        if row is None:
+            raise ReferencePayloadIntegrityError(
+                "Reference payload disappeared during placement-scoped deduplication"
+            )
         self._verify_row(row, expected=canonical)
         return PreparedReferencePayload(
             payload_id=row["payload_id"],

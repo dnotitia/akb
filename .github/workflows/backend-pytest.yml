@@ -84,11 +84,39 @@ jobs:
           pip install --upgrade pip
           pip install -e '.[dev]'
 
+      - name: Create isolated M1 measurement database
+        working-directory: backend
+        run: |  # pragma: allowlist secret
+          python - <<'PY'
+          import asyncio
+
+          import asyncpg
+
+
+          async def main():
+              conn = await asyncpg.connect(
+                  "postgresql://akb:akb@localhost:15432/akb"  # pragma: allowlist secret
+              )
+              try:
+                  await conn.execute(
+                      'CREATE DATABASE "akb_revision_m1_measurement_ci"'
+                  )
+              finally:
+                  await conn.close()
+
+
+          asyncio.run(main())
+          PY
+
       - name: Run pgvector DB-backed e2e tests
         working-directory: backend
         env:
           # Matches the fixture default + the dev compose override.
           AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+          # Migration 057 is deliberately measurement-database-only. Keep
+          # generic DB tests on `akb`, and run the M1 File contract in its
+          # isolated disposable database so both safety boundaries execute.
+          AKB_M1_FILE_TEST_DSN: postgresql://akb:akb@localhost:15432/akb_revision_m1_measurement_ci  # pragma: allowlist secret
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
@@ -155,6 +183,8 @@ jobs:
           tests/test_index_order_unit.py
           tests/concurrency/test_alter_unique_race_unit.py
           tests/concurrency/test_native_ledger_b_core.py
+          tests/test_m1_file_measurement_pg.py
+          tests/test_native_revision_m1_payload_placement_migration.py
           tests/concurrency/test_invariants_unit.py
           tests/test_publication_resolution_vault_binding_unit.py
           tests/test_publication_path_claim_guard_unit.py

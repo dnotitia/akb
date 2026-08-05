@@ -4,8 +4,10 @@
 This entrypoint is deliberately a measurement tool, not an AKB public API.  It
 only accepts an explicitly named measurement database, creates one fresh vault
 namespace per run, and drives :class:`NativeRevisionService` directly.  The
-workbench owns the receipt; this program writes only its concrete observation
-and the two SHA-256-bound artifacts required by that receipt.
+database is isolated and forward-only under one exact candidate image; rolling
+back the binary requires recreating the measurement database.  The workbench
+owns the receipt; this program writes only its concrete observation and the two
+SHA-256-bound artifacts required by that receipt.
 """
 
 from __future__ import annotations
@@ -32,10 +34,12 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from app.exceptions import ConflictError, NotFoundError  # noqa: E402
+from app.services.m1_native_grep_service import M1NativeGrepService  # noqa: E402
+from app.services.m1_pg_body_store import M1PgBodyStore  # noqa: E402
 from app.services.native_revision_service import NativeRevisionService  # noqa: E402
 
 
-PROTOCOL_VERSION = "akb-native-revision-m1-b-core/v1"
+PROTOCOL_VERSION = "akb-native-revision-m1-b-core/v2"
 MEASUREMENT_DATABASE_PREFIX = "akb_revision_m1_measurement"
 PRECOMMIT_BOUNDARIES = (
     "payload_prepare",
@@ -112,7 +116,7 @@ def source_revision() -> str:
             capture_output=True,
             text=True,
         )
-    except OSError, subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         # Immutable production-style images normally contain no checkout.  The
         # image build/deploy pipeline must inject its exact source commit rather
         # than the adapter guessing a release version or using a mutable tag.
@@ -152,6 +156,58 @@ def bounded_json_object(name: str, *, required: bool) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterError(f"{name} must be a JSON object")
     return value
+
+
+_PRIVATE_RECEIPT_KEY_PARTS = {
+    "body", "chunk", "content", "credential", "dsn", "host", "id",
+    "line", "locator", "match", "name", "password", "path", "secret",
+    "token", "url", "uri",
+}
+_SAFE_RECEIPT_TEXT_VALUES = {
+    "dense": {"disabled", "enabled", "not-applicable", "sparse-only"},
+    "driver": {
+        "bare-git-current", "current", "fscas", "native-ledger",
+        "native-ledger-m1", "pgvector", "s3cas",
+    },
+    "environment": {"admin-dev", "ci", "local"},
+    "load_model": {"closed-loop", "paced"},
+    "node_class": {"control-plane", "multi-node", "single-node", "worker"},
+    "storage_class": {
+        "csi-cephfs-sc", "csi-rbd-sc", "filesystem-cas", "rwo", "rwx", "s3-cas",
+    },
+    "tier": {"E0", "E1a", "E1b", "E2", "E3"},
+    "topology": {"cross-vault", "multi-node", "same-vault", "single-node"},
+    "vector_driver": {"disabled", "pgvector", "qdrant", "seahorse"},
+}
+
+
+def receipt_safe_profile(value: dict[str, Any]) -> dict[str, Any]:
+    """Bind a supplied profile while exposing only coarse, non-locating facts."""
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    def safe_dict(raw: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in raw.items():
+            lowered = key.lower()
+            if any(part in lowered for part in _PRIVATE_RECEIPT_KEY_PARTS):
+                continue
+            if isinstance(item, bool) or isinstance(item, (int, float)):
+                result[key] = item
+            elif isinstance(item, dict):
+                nested = safe_dict(item)
+                if nested:
+                    result[key] = nested
+            elif (
+                isinstance(item, str)
+                and item in _SAFE_RECEIPT_TEXT_VALUES.get(lowered, set())
+            ):
+                result[key] = item
+        return result
+
+    return {
+        "binding": {"sha256": sha256_bytes(encoded), "byte_size": len(encoded)},
+        "coarse": safe_dict(value),
+    }
 
 
 def receipt_provenance(revision: str, database: str, namespace_id: uuid.UUID) -> tuple[dict[str, str], dict[str, Any]]:
@@ -217,13 +273,20 @@ async def initialise_measurement_database(dsn: str) -> tuple[asyncpg.Pool, uuid.
         validate_measurement_database(str(database))
         init_sql = (BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
         await conn.execute(init_sql)
-        migration_path = BACKEND / "app" / "db" / "migrations" / "048_native_revision_core.py"
-        spec = importlib.util.spec_from_file_location("akb_native_revision_m1_migration", migration_path)
-        if spec is None or spec.loader is None:
-            raise AdapterError("cannot load native revision migration")
-        migration = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(migration)
-        await migration.migrate(conn=conn)
+        for filename in (
+            "048_native_revision_core.py",
+            "053_native_revision_m1_pg_body.py",
+            "057_native_revision_m1_payload_placement.py",
+        ):
+            migration_path = BACKEND / "app" / "db" / "migrations" / filename
+            spec = importlib.util.spec_from_file_location(
+                f"akb_native_revision_m1_{filename.replace('.', '_')}", migration_path
+            )
+            if spec is None or spec.loader is None:
+                raise AdapterError(f"cannot load native revision migration: {filename}")
+            migration = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(migration)
+            await migration.migrate(conn=conn)
         namespace = await conn.fetchval(
             "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
             f"m1-native-{uuid.uuid4().hex}",
@@ -498,6 +561,149 @@ async def workload_independent(
     }
 
 
+async def workload_isolation(
+    pool: asyncpg.Pool,
+    hot_namespace_id: uuid.UUID,
+    requests: list[dict[str, Any]],
+    cleanup_namespaces: list[uuid.UUID],
+    cleanup_users: list[uuid.UUID],
+) -> dict[str, Any]:
+    """Hold one hot-vault authority TX while cold get/grep complete.
+
+    This is a bounded correctness/non-starvation probe. It does not claim a
+    throughput curve, queue-free execution, or horizontal scale-out.
+    """
+    suffix = uuid.uuid4().hex
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES ($1, $2, 'm1-measurement-disabled') RETURNING id
+            """,
+            f"m1-isolation-{suffix}",
+            f"m1-isolation-{suffix}@invalid.example",
+        )
+        await conn.execute("UPDATE vaults SET owner_id = $1 WHERE id = $2", owner_id, hot_namespace_id)
+        cold_namespace_id = await conn.fetchval(
+            """
+            INSERT INTO vaults (name, git_path, owner_id)
+            VALUES ($1, '/tmp/m1-native-measurement-unused.git', $2) RETURNING id
+            """,
+            f"m1-cold-{suffix}",
+            owner_id,
+        )
+        cleanup_users.append(owner_id)
+        cleanup_namespaces.append(cold_namespace_id)
+
+    store = M1PgBodyStore(pool)
+    service = NativeRevisionService(pool, payload_store=store)
+    cold = await service.create_text(
+        namespace_id=cold_namespace_id,
+        surface="document",
+        path="cold.md",
+        payload="cold-authoritative needle\n",
+        actor="m1-isolation",
+        mutation_id=mutation_id(),
+    )
+    hot = await service.create_text(
+        namespace_id=hot_namespace_id,
+        surface="document",
+        path="hot.md",
+        payload="hot-before\n",
+        actor="m1-isolation",
+        mutation_id=mutation_id(),
+    )
+    async with pool.acquire() as conn:
+        activity_before_cold_reads = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM native_revision_activity WHERE namespace_id = ANY($1::uuid[])",
+                [hot_namespace_id, cold_namespace_id],
+            )
+        )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_hot(name: str) -> None:
+        if name == "authority.after_manifest":
+            entered.set()
+            await asyncio.wait_for(release.wait(), timeout=10)
+
+    hot_service = NativeRevisionService(pool, payload_store=store, failpoint=hold_hot)
+    hot_task = asyncio.create_task(
+        hot_service.replace_text(
+            namespace_id=hot_namespace_id,
+            surface="document",
+            path="hot.md",
+            payload="hot-after\n",
+            actor="m1-isolation",
+            mutation_id=mutation_id(),
+            expected_revision_id=hot.revision_id,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    requests.append(request_record("isolation-hot-write", path="hot.md", state="authority_tx_active"))
+    get_started = time.perf_counter()
+    cold_get = await asyncio.wait_for(
+        service.get_current(namespace_id=cold_namespace_id, surface="document", path="cold.md"),
+        timeout=5,
+    )
+    get_ms = round((time.perf_counter() - get_started) * 1000, 3)
+    grep_started = time.perf_counter()
+    cold_grep = await asyncio.wait_for(
+        M1NativeGrepService(pool, body_store=store).grep(
+            "needle",
+            user_id=owner_id,
+            resource_id=cold.resource_id,
+        ),
+        timeout=5,
+    )
+    grep_ms = round((time.perf_counter() - grep_started) * 1000, 3)
+    async with pool.acquire() as conn:
+        activity_after_cold_reads = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM native_revision_activity WHERE namespace_id = ANY($1::uuid[])",
+                [hot_namespace_id, cold_namespace_id],
+            )
+        )
+    completed_before_hot_drain = not hot_task.done()
+    release.set()
+    published_hot = await asyncio.wait_for(hot_task, timeout=10)
+    requests.extend(
+        [
+            request_record("isolation-cold-get", status="pass", latency_ms=get_ms),
+            request_record("isolation-cold-grep", status="pass", latency_ms=grep_ms),
+        ]
+    )
+    expected_digest = hashlib.sha256(b"cold-authoritative needle\n").hexdigest()
+    return {
+            "C4": {
+                "isolation": {
+                    "hot_writes": {"published": 1, "active_when_cold_issued": True},
+                    "cold_get": {
+                        "issued_while_hot_active": True,
+                        "completed_before_hot_drain": completed_before_hot_drain,
+                        "status": "pass" if cold_get.digest == expected_digest else "fail",
+                        "response_digest": cold_get.digest,
+                        "latency_ms": get_ms,
+                    },
+                    "cold_grep": {
+                        "issued_while_hot_active": True,
+                        "completed_before_hot_drain": completed_before_hot_drain,
+                        "status": "pass" if cold_grep["total_resources"] == 1 else "fail",
+                        "response_digest": cold_grep["results"][0]["content_hash"],
+                        "latency_ms": grep_ms,
+                    },
+                    "final_authority": {
+                        "hot_head_revision": published_hot.revision_id,
+                        "cold_head_revision": cold_get.revision_id,
+                        "unexpected_activity_delta": activity_after_cold_reads
+                        - activity_before_cold_reads,
+                    },
+                }
+            }
+        }
+
+
 async def workload_conflict(
     service: NativeRevisionService, namespace_id: uuid.UUID, requests: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -760,7 +966,13 @@ async def workload_failpoint(
 async def run() -> dict[str, Any]:
     contract = load_contract()
     workload = required_environment("AKB_NATIVE_REVISION_WORKLOAD")
-    expected_cases = {"W1-lifecycle": "C2,C6", "W2-independent": "C4", "W2-conflict": "C4", "W2-failpoint": "C5"}
+    expected_cases = {
+        "W1-lifecycle": "C2,C6",
+        "W2-independent": "C4",
+        "W2-conflict": "C4",
+        "W2-isolation": "C4",
+        "W2-failpoint": "C5",
+    }
     if workload not in expected_cases:
         raise AdapterError(f"unsupported native M1 workload: {workload}")
     if required_environment("AKB_NATIVE_REVISION_NATIVE_CASE_IDS") != expected_cases[workload]:
@@ -768,6 +980,8 @@ async def run() -> dict[str, Any]:
     dsn = required_environment("AKB_NATIVE_REVISION_MEASUREMENT_DSN")
     pool, namespace_id, database = await initialise_measurement_database(dsn)
     requests: list[dict[str, Any]] = []
+    cleanup_namespaces = [namespace_id]
+    cleanup_users: list[uuid.UUID] = []
     started = time.perf_counter()
     try:
         service = NativeRevisionService(pool)
@@ -777,10 +991,22 @@ async def run() -> dict[str, Any]:
             cases = await workload_independent(service, namespace_id, requests)
         elif workload == "W2-conflict":
             cases = await workload_conflict(service, namespace_id, requests)
+        elif workload == "W2-isolation":
+            cases = await workload_isolation(
+                pool,
+                namespace_id,
+                requests,
+                cleanup_namespaces,
+                cleanup_users,
+            )
         else:
             cases = await workload_failpoint(service, namespace_id, requests)
         authority = await authority_snapshot(pool, namespace_id)
     finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", cleanup_namespaces)
+            if cleanup_users:
+                await conn.execute("DELETE FROM users WHERE id = ANY($1::uuid[])", cleanup_users)
         await pool.close()
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
     revision = source_revision()

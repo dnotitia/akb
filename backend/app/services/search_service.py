@@ -11,6 +11,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -28,6 +29,39 @@ from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
+
+LEGACY_DOCUMENT_SOURCE = "document"
+NATIVE_DOCUMENT_SOURCE = "native_document"
+NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
+NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
+NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
+NATIVE_SEARCH_MAX_SOURCE_URIS = 200
+
+
+def active_document_source_type(
+    *,
+    backend: str,
+    measurement_only: bool,
+    database: str,
+) -> str:
+    """Select one Document authority; fail closed on a partial native guard."""
+    if backend == "bare_git_current":
+        return LEGACY_DOCUMENT_SOURCE
+    if backend != "native_ledger_m1":
+        raise RuntimeError(f"unsupported document revision backend: {backend}")
+    if not measurement_only:
+        raise RuntimeError("native ledger requires measurement-only guard")
+    if database != NATIVE_MEASUREMENT_DATABASE:
+        raise RuntimeError("native ledger requires dedicated measurement database")
+    return NATIVE_DOCUMENT_SOURCE
+
+
+def _configured_document_source_type() -> str:
+    return active_document_source_type(
+        backend=settings.document_revision_backend,
+        measurement_only=settings.native_revision_m1_measurement_only,
+        database=settings.db_name,
+    )
 
 # Strips the indexing-time enrichment block emitted by
 # `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
@@ -102,6 +136,11 @@ def vault_path_eligible(
     return (
         settings.vault_filter_enabled
         and supports_vault_filter(get_vector_store())
+        # The vector-store vault filter cannot yet constrain source_type.
+        # Under the native arm, stale legacy Document points could consume the
+        # complete top-K before hydration drops them, suppressing valid native
+        # hits. Use the source-id path until the driver accepts that predicate.
+        and _configured_document_source_type() == LEGACY_DOCUMENT_SOURCE
         and not (collection or doc_type or tags or source_uris)
     )
 
@@ -149,7 +188,124 @@ def _normalize_vault_scope(vault: str | list[str] | None) -> list[str] | None:
     return [v for v in (vault or []) if v] or None
 
 
+def _verified_native_metadata(row) -> dict:
+    """Verify, decode, and parse one native body on a worker thread."""
+    from app.services.document_service import _parse_markdown
+    from app.services.native_payload_verification import verify_native_head_body
+
+    canonical = verify_native_head_body(row)
+    metadata, _ = _parse_markdown(canonical.decode("utf-8", errors="strict"))
+    return metadata
+
+
 class SearchService:
+
+    async def _native_document_candidates(
+        self,
+        conn,
+        *,
+        user_uuid: uuid.UUID | None,
+        is_admin: bool,
+        vaults: list[str] | None,
+        collection: str | None,
+        doc_type: str | None,
+        tags: list[str] | None,
+        include_archived: bool,
+        source_uris: list[str] | None,
+    ) -> list[str]:
+        conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
+        params: list = []
+        if vaults:
+            params.append(vaults)
+            conditions.append(f"v.name = ANY(${len(params)})")
+        if collection:
+            prefix = collection.strip("/")
+            escaped_prefix = (
+                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            params.extend([prefix, f"{escaped_prefix}/%"])
+            conditions.append(
+                f"(r.current_path = ${len(params) - 1} OR "
+                f"r.current_path LIKE ${len(params)} ESCAPE '\\')"
+            )
+        if user_uuid is not None and not is_admin:
+            params.append(user_uuid)
+            index = len(params)
+            conditions.append(
+                f"(v.id IN (SELECT vault_id FROM vault_access WHERE user_id = ${index}) "
+                f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
+            )
+        if source_uris:
+            if len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+                raise ValidationError(
+                    f"native search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                )
+            source_clauses: list[str] = []
+            for uri in source_uris:
+                parsed = parse_uri(uri)
+                if parsed is None or parsed.kind != "doc" or not parsed.identifier:
+                    continue
+                params.extend([parsed.vault, parsed.identifier])
+                source_clauses.append(
+                    f"(v.name = ${len(params) - 1} AND "
+                    f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
+                )
+            if not source_clauses:
+                return []
+            conditions.append("(" + " OR ".join(source_clauses) + ")")
+
+        joins = """
+              FROM native_resources r
+              JOIN vaults v ON v.id = r.namespace_id
+              JOIN native_revisions nr
+                ON nr.resource_id = r.resource_id
+               AND nr.revision_id = r.head_revision_id
+              JOIN native_payload_manifests pm
+                ON pm.payload_manifest_id = nr.payload_manifest_id
+              JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
+        """
+        where_sql = " AND ".join(conditions)
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            scope = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*)::bigint AS resource_count,
+                       COALESCE(SUM(p.byte_size), 0)::bigint AS body_bytes
+                  {joins}
+                 WHERE {where_sql}
+                """,
+                *params,
+            )
+            if (
+                scope["resource_count"] > NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES
+                or scope["body_bytes"] > NATIVE_SEARCH_MAX_BODY_BYTES
+            ):
+                raise ValidationError(
+                    "native search scope exceeds the bounded candidate corpus"
+                )
+            rows = await conn.fetch(
+                f"""
+            SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
+                   p.byte_size, p.encoding, p.selected_placement,
+                   p.verification_profile, p.canonical_bytes
+              {joins}
+             WHERE {where_sql}
+             ORDER BY r.resource_id
+                """,
+                *params,
+            )
+        candidates: list[str] = []
+        for row in rows:
+            metadata = await asyncio.to_thread(_verified_native_metadata, row)
+            if doc_type and (metadata.get("type") or "note") != doc_type:
+                continue
+            row_tags = set(metadata.get("tags") or [])
+            if tags and not row_tags.intersection(tags):
+                continue
+            if not include_archived and metadata.get("status", "draft") == "archived":
+                continue
+            candidates.append(str(row["resource_id"]))
+        return candidates
 
     async def search(
         self,
@@ -174,6 +330,12 @@ class SearchService:
         """
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
+        if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+            raise ValidationError(
+                f"search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+            )
+
+        document_source = _configured_document_source_type()
 
         rerank_enabled = settings.rerank_enabled if rerank is None else settings.rerank_enabled and rerank
         vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
@@ -320,15 +482,28 @@ class SearchService:
                     conditions.append("d.status != 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
-                rows = await conn.fetch(
-                    f"""
-                    SELECT d.id FROM documents d
-                    JOIN vaults v ON d.vault_id = v.id
-                    WHERE {where_sql}
-                    """,
-                    *params,
-                )
-                candidate_source_ids = [str(r["id"]) for r in rows]
+                if document_source == NATIVE_DOCUMENT_SOURCE:
+                    candidate_source_ids = await self._native_document_candidates(
+                        conn,
+                        user_uuid=user_uuid,
+                        is_admin=is_admin,
+                        vaults=vaults,
+                        collection=collection,
+                        doc_type=doc_type,
+                        tags=tags,
+                        include_archived=include_archived,
+                        source_uris=source_uris,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT d.id FROM documents d
+                        JOIN vaults v ON d.vault_id = v.id
+                        WHERE {where_sql}
+                        """,
+                        *params,
+                    )
+                    candidate_source_ids = [str(r["id"]) for r in rows]
 
                 # Tables (skip when doc_type explicitly constrains to a
                 # non-table source). Tags/collection apply to documents
@@ -568,8 +743,13 @@ class SearchService:
     async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
+        document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
         for h in hits:
+            if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
+                # A selected backend has exactly one Document authority. Old
+                # vector points from the other arm are never hydrated.
+                continue
             if h.source_type not in by_type:
                 unknown_types.add(h.source_type)
                 continue
@@ -601,6 +781,83 @@ class SearchService:
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
                         "collection": r["collection"],
+                    }
+            if by_type[NATIVE_DOCUMENT_SOURCE]:
+                native_hits = {
+                    uuid.UUID(h.chunk_id): h
+                    for h in hits
+                    if h.source_type == NATIVE_DOCUMENT_SOURCE
+                }
+                native_body_bytes = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(p.byte_size), 0)::bigint
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.lifecycle = 'live'
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_document'
+                    """,
+                    list(native_hits),
+                )
+                if native_body_bytes > NATIVE_SEARCH_MAX_BODY_BYTES:
+                    raise ValidationError(
+                        "native search hydration exceeds the bounded body corpus"
+                    )
+                rows = await conn.fetch(
+                    """
+                    SELECT c.id AS chunk_id, r.resource_id, r.current_path,
+                           r.head_revision_id, v.name AS vault_name,
+                           p.payload_id, p.namespace_id, p.content_profile,
+                           p.digest, p.byte_size, p.encoding,
+                           p.selected_placement, p.verification_profile,
+                           p.canonical_bytes
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_derived_heads dh
+                        ON dh.resource_id = dc.resource_id
+                       AND dh.revision_id = dc.revision_id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.lifecycle = 'live'
+                      JOIN vaults v ON v.id = r.namespace_id
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_document'
+                    """,
+                    list(native_hits),
+                )
+                for r in rows:
+                    # Hydration independently verifies the current Head body;
+                    # the derived chunk is only a candidate, never authority.
+                    metadata = await asyncio.to_thread(_verified_native_metadata, r)
+                    path = r["current_path"]
+                    collection = path.rsplit("/", 1)[0] if "/" in path else None
+                    meta[(NATIVE_DOCUMENT_SOURCE, str(r["resource_id"]))] = {
+                        "vault": r["vault_name"],
+                        "path": path,
+                        "title": metadata.get("title") or path.rsplit("/", 1)[-1],
+                        "doc_type": metadata.get("type") or "note",
+                        "summary": metadata.get("summary"),
+                        "tags": list(metadata.get("tags") or []),
+                        "collection": collection,
+                        "revision": r["head_revision_id"],
                     }
             if by_type["table"]:
                 rows = await conn.fetch(
@@ -664,7 +921,7 @@ class SearchService:
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
             # encodes it); table/file URIs need it passed in.
-            if h.source_type == "document":
+            if h.source_type in {"document", NATIVE_DOCUMENT_SOURCE}:
                 uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
                 uri = table_uri(m["vault"], m["title"], collection=m.get("collection"))
@@ -674,7 +931,7 @@ class SearchService:
                 continue
             results.append(
                 SearchResult(
-                    source_type=h.source_type,
+                    source_type=("document" if h.source_type == NATIVE_DOCUMENT_SOURCE else h.source_type),
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     collection=m.get("collection"),
@@ -791,6 +1048,7 @@ class SearchService:
         limit: int = 20,
         count_only: bool = False,
         files_with_matches: bool = False,
+        measurement_include_text_files: bool = False,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -807,6 +1065,9 @@ class SearchService:
         valid with the default response shape).
         """
         import re as _re
+
+        if pattern == "":
+            raise ValidationError("grep pattern must not be empty")
 
         # Mutual exclusion — issue #41.
         if count_only and files_with_matches:
@@ -842,6 +1103,31 @@ class SearchService:
 
         # Server-side limit clamp (issue #189) — same ceiling as search().
         limit = clamp_search_limit(limit)
+
+        document_source = _configured_document_source_type()
+        if measurement_include_text_files and document_source != NATIVE_DOCUMENT_SOURCE:
+            raise ValidationError(
+                "measurement_include_text_files requires the guarded native measurement backend"
+            )
+        if document_source == NATIVE_DOCUMENT_SOURCE:
+            from app.services.m1_native_grep_service import M1NativeGrepService
+
+            if user_id is None:
+                raise ValidationError("user_id required for native grep")
+            return await M1NativeGrepService(await get_pool()).grep_public(
+                pattern,
+                user_id=uuid.UUID(user_id) if isinstance(user_id, str) else user_id,
+                vaults=vaults,
+                collection=collection,
+                regex=regex,
+                case_sensitive=case_sensitive,
+                replace=replace,
+                actor=agent_id,
+                limit=limit,
+                count_only=count_only,
+                files_with_matches=files_with_matches,
+                include_text_files=measurement_include_text_files,
+            )
 
         pool = await get_pool()
         async with pool.acquire() as conn:

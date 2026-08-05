@@ -1510,7 +1510,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     """
     from app.config import settings
     from app.repositories import table_data_repo
-    from app.services.git_service import GitService
     from app.services.index_service import delete_vault_chunks
 
     # Deletion is a lifecycle op that must work on archived vaults (you
@@ -1520,10 +1519,13 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
+        vault = await conn.fetchrow(
+            "SELECT id, git_path FROM vaults WHERE name = $1", vault_name,
+        )
         if not vault:
             return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
         vault_id = vault["id"]
+        is_native_ledger_vault = str(vault["git_path"]).startswith("native-ledger://")
 
         # Delete S3 files BEFORE the DB cascade — this part cannot be
         # transactional with PG (S3 is out-of-band), so we accept the
@@ -1585,8 +1587,8 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 
             # Drop table metadata chunks BEFORE the registry DELETE so the
             # outbox is enqueued against the still-extant source_id.
-            # delete_vault_chunks only handles source_type='document';
-            # tables/files need explicit cleanup because chunks.source_id
+            # delete_vault_chunks handles legacy and native documents;
+            # tables/files still need explicit cleanup because chunks.source_id
             # has no FK (polymorphic source) and would orphan otherwise.
             vtables = await conn.fetch(
                 "SELECT id, name FROM vault_tables WHERE vault_id = $1",
@@ -1605,9 +1607,10 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
 
-    # On-disk cleanup: bare repo + persistent worktree. Both must go,
-    # otherwise a same-named recreate hits stale state on its second
-    # commit (the first that materialises the worktree).
+    # Legacy on-disk cleanup: bare repo + persistent worktree. Both must go,
+    # otherwise a same-named recreate hits stale state on its second commit.
+    # Native-ledger sentinel vaults have no filesystem authority, so even
+    # constructing GitService would create unwanted storage directories.
     #
     # Commit executor, NOT inline: cleanup_vault_dirs blocks on the
     # per-vault threading.Lock and then rmtree's the whole repo —
@@ -1622,10 +1625,13 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     # A cancellation surfaced AFTER the cleanup completed must not skip
     # the role cleanup below either — park it, finish, then re-raise.
     pending_cancel: BaseException | None = None
-    try:
-        await run_git_write(GitService().cleanup_vault_dirs, vault_name, must_complete=True)
-    except asyncio.CancelledError as ce:
-        pending_cancel = ce  # cleanup DID complete (must_complete)
+    if not is_native_ledger_vault:
+        from app.services.git_service import GitService
+
+        try:
+            await run_git_write(GitService().cleanup_vault_dirs, vault_name, must_complete=True)
+        except asyncio.CancelledError as ce:
+            pending_cancel = ce  # cleanup DID complete (must_complete)
 
     # PG-native RBAC: drop the three vault group roles. Memberships
     # auto-clean as part of DROP ROLE. run_compensation: a cancel mid-DDL

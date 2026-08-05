@@ -37,6 +37,7 @@ from app.services.resource_hash import (
 )
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
+from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -238,6 +239,10 @@ async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> 
 class FileService:
     def __init__(self):
         self._bucket = settings.s3_bucket
+        # Normal deployments retain the existing direct-S3 File service.  The
+        # facade can only exist under the config/database guard checked by its
+        # factory, so there is no runtime fallback or dual write.
+        self._measurement = MeasurementFileService() if measurement_enabled() else None
 
     async def initiate_upload(
         self,
@@ -277,6 +282,12 @@ class FileService:
         """
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        if self._measurement is not None:
+            return await self._measurement.initiate_upload(
+                vault_name=vault_name, vault_id=vault_id, collection=collection,
+                filename=filename, actor_id=actor_id, mime_type=mime_type,
+                description=description, content_hash=content_hash,
+            )
 
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
@@ -348,6 +359,9 @@ class FileService:
             )
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+
+        if self._measurement is not None:
+            return await self._measurement.confirm_upload(vault_id, file_id, content_hash=content_hash)
 
         fid = uuid.UUID(file_id)
         pool = await get_pool()
@@ -482,6 +496,8 @@ class FileService:
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
         """Return a presigned GET URL for direct download from S3."""
+        if self._measurement is not None:
+            return await self._measurement.get_download_url(vault_id, file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
@@ -530,6 +546,8 @@ class FileService:
         path = vault root) are returned. The path is resolved to a
         collection_id at query time. `vault_name` is required so each
         row's canonical `uri` can be built without a second join."""
+        if self._measurement is not None:
+            return await self._measurement.list_files(vault_id, vault_name, collection, limit)
         pool = await get_pool()
         async with pool.acquire() as conn:
             if collection is None:
@@ -581,6 +599,8 @@ class FileService:
         *,
         actor_id: str,
     ) -> dict:
+        if self._measurement is not None:
+            return await self._measurement.delete(vault_id, file_id, actor_id=actor_id)
         fid = uuid.UUID(file_id)
         pool = await get_pool()
 
@@ -667,6 +687,19 @@ class FileService:
             "name": row["name"],
             "deleted": True,
         }
+
+    async def transfer_measurement_capability(
+        self, token: str, *, method: str, body: bytes | None = None,
+    ) -> bytes | None:
+        """Serve a guarded FS-CAS PUT/GET capability through the File route.
+
+        This is deliberately unavailable outside M1 measurement mode.  The
+        opaque token itself is process-local and is neither a database value
+        nor part of the measurement receipt.
+        """
+        if self._measurement is None:
+            raise NotFoundError("File transfer", token)
+        return await self._measurement.transfer(token, body=body, method=method)
 
 
 async def index_file_metadata(

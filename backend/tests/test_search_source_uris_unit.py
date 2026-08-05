@@ -14,6 +14,8 @@ import uuid
 
 import pytest
 
+from app.exceptions import ValidationError
+from app.services import search_service
 from app.services.search_service import SearchService
 
 pytestmark = pytest.mark.asyncio
@@ -79,3 +81,19 @@ async def test_resolve_skips_unknown_vault_and_bad_file_uuid():
     assert doc_ids == []
     assert table_ids == []
     assert file_ids == []
+
+
+async def test_search_rejects_source_uri_overflow_before_pool_or_embedding(monkeypatch):
+    async def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("source URI overflow must fail before unbounded work")
+
+    monkeypatch.setattr(search_service, "get_pool", unexpected_call)
+    monkeypatch.setattr(search_service, "generate_embeddings", unexpected_call)
+
+    with pytest.raises(ValidationError, match="at most 200 source URIs"):
+        await SearchService().search(
+            "needle",
+            vault="measure",
+            user_id=str(uuid.uuid4()),
+            source_uris=[f"akb://measure/doc/{number}.md" for number in range(201)],
+        )
