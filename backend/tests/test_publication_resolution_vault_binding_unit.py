@@ -172,13 +172,18 @@ def _git_content(monkeypatch):
     mask a positive assertion on content, so return a body keyed by
     (vault, path) instead — which also makes "whose document came back"
     checkable from the content itself, not just the title.
+
+    The body echoes the `commit` argument too, so a test can tell a read
+    pinned to the document's own commit from one that floated to the vault
+    HEAD. `commit` defaults to None so a caller that stops passing it fails
+    an assertion rather than a signature check.
     """
     from app.services import publication_service
 
     class _Git:
         @staticmethod
-        def read_file(vault_name: str, path: str) -> str:
-            return f"# body\n\nvault={vault_name} path={path}\n"
+        def read_file(vault_name: str, path: str, commit: str | None = None) -> str:
+            return f"# body\n\nvault={vault_name} path={path} commit={commit}\n"
 
     class _DocService:
         git = _Git()
@@ -484,12 +489,19 @@ async def test_oembed_follows_the_document_not_the_stale_path(pool, vaults, path
     """
     from app.api.routes.public import oembed
 
-    slug, _published_id, _squatter_id = await _desync_uri_from_document(
+    from app.services.uri_service import doc_uri
+
+    slug, published_id, _squatter_id = await _desync_uri_from_document(
         pool, vaults, path, "archive/moved-away.md",
     )
     publication = await _internal(slug)
     assert not publication.get("title"), "the fixture must force the DB lookup"
     assert not publication.get("password_hash"), "F1 would short-circuit the lookup"
+    # Same setup guards the content test carries: the row must be BOUND and
+    # its URI STALE, or a green run here says nothing about which branch
+    # answered.
+    assert publication["document_id"] == str(published_id)
+    assert publication["resource_uri"] == doc_uri(vaults["home"]["name"], path)
 
     card = await oembed(url=f"https://vault-binding.test.local/p/{slug}")
 
@@ -535,3 +547,65 @@ async def test_a_legacy_unbound_publication_still_resolves_by_path(pool, vaults,
     assert f"vault={vaults['home']['name']}" in data["content"], (
         "the legacy branch must still be scoped to the publication's own vault"
     )
+
+
+async def test_resolution_reads_the_body_at_the_documents_own_commit(pool, vaults):
+    """Selecting the right row is only half of serving the right document.
+
+    The query establishes identity by `document_id`, then the connection is
+    released and the body is read from Git. Reading the floating vault HEAD at
+    `d.path` hands the identity straight back: a path is reusable, so a move
+    plus a new document onto the vacated path between the two reads serves
+    THAT document's bytes under this publication's title, tags and author.
+
+    `DocumentService.get` pins its read to the row's `current_commit` for the
+    same reason, recorded there as E03. The anonymous path is the one that did
+    not, which is the read that needs it most.
+
+    Pre-change this is RED with `commit=None` — the tell for a HEAD read.
+    """
+    from app.services.publication_service import resolve_document_publication
+
+    path = "reports/q3.md"
+    await _create_doc(pool, vaults["home"], path, title="The published document")
+    slug = await _publish(vaults["home"]["name"], path)
+
+    data = await resolve_document_publication(await _internal(slug))
+
+    # `_create_doc` writes commit_hash="c" * 40, so that is this document's
+    # recorded commit — and the fake Git echoes whatever the resolver asked
+    # for. `commit=None` means the body came from wherever the vault HEAD
+    # happened to be, which is not necessarily this document at all.
+    assert f"commit={'c' * 40}" in data["content"], (
+        "the body must be read at the document's recorded commit, not the "
+        f"floating vault HEAD — got {data['content']!r}"
+    )
+
+
+async def test_a_bound_publication_never_falls_back_to_the_path(pool, vaults):
+    """The two branches must be mutually exclusive, not merely ordered.
+
+    A bound row whose `document_id` finds nothing must 404 rather than serve
+    whatever occupies its published path. Note this state is UNREACHABLE in
+    the table — the composite FK cascades the publication away with its
+    document, which is the point of having it — so the publication dict is
+    doctored directly. That makes this a test of the predicate rather than of
+    a live shape: it fails if the `$2::uuid IS NULL` guard is ever dropped,
+    which would make both branches eligible and leave which document gets
+    served up to whichever row PostgreSQL happened to return first.
+    """
+    from app.services.publication_service import resolve_document_publication
+
+    path = "reports/q3.md"
+    await _create_doc(pool, vaults["home"], path, title="The path occupant")
+    slug = await _publish(vaults["home"]["name"], path)
+
+    publication = dict(await _internal(slug))
+    publication["document_id"] = str(uuid.uuid4())  # names no document
+
+    with pytest.raises(NotFoundError):
+        data = await resolve_document_publication(publication)
+        pytest.fail(
+            "a bound publication whose document_id matches nothing must 404; "
+            f"it fell back to the path and served {data.get('title')!r}"
+        )

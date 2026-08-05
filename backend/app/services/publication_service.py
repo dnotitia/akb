@@ -1174,6 +1174,7 @@ async def resolve_document_publication(publication: dict) -> dict:
             """
             SELECT d.path, d.title, d.doc_type, d.status, d.summary, d.domain,
                    d.created_by, d.created_at, d.updated_at, d.tags,
+                   d.current_commit,
                    v.name AS vault_name,
                    COALESCE(u.display_name, u.username) AS created_by_name
             FROM documents d
@@ -1218,8 +1219,24 @@ async def resolve_document_publication(publication: dict) -> dict:
     try:
         # Git read is blocking filesystem I/O — offload it so a document page
         # open / download never stalls the single event loop (503 risk class).
+        #
+        # **Read at the row's own commit, not the floating vault HEAD.** The
+        # query above establishes identity by `document_id`; reading HEAD at
+        # `d.path` would hand it straight back, because the connection is
+        # released first and a path is reusable. A move plus a new document
+        # onto the vacated path between the two would serve that document's
+        # BYTES under this publication's title, tags and author attribution —
+        # the same substitution the id lookup exists to prevent, re-entered
+        # one statement later. Pinning the commit makes the body and the
+        # metadata come from one document by construction.
+        #
+        # `DocumentService.get` pins the same way and for the same reason
+        # (recorded there as E03); the anonymous path is the one that had not.
+        # A NULL `current_commit` (legacy rows) falls back to HEAD inside
+        # `read_file`, which is the pre-existing behaviour for those rows.
         raw = await asyncio.to_thread(
-            _get_doc_service().git.read_file, doc_row["vault_name"], doc_row["path"]
+            _get_doc_service().git.read_file,
+            doc_row["vault_name"], doc_row["path"], doc_row["current_commit"],
         )
         if raw:
             body = frontmatter.loads(raw).content
