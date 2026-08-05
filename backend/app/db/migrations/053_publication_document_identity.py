@@ -68,13 +68,25 @@ A row is bound only when all of the following hold:
      (guaranteed to be at most one by ``UNIQUE (vault_id, path)``).
   4. That document is not newer than the publication. A publication cannot
      have been created for a document that did not exist yet, so a newer
-     document at the path means the path was reused and the original target
-     is gone. This predicate can only refuse a binding, never invent one.
+     document at the path is proof the path was reused. Be clear about what
+     this is: a filter that removes some wrong answers, NOT proof that the
+     surviving ones are right. An *older* document moved onto the path after
+     the original was deleted would pass it. (The current write path refuses
+     a move onto a path some publication still claims, so that shape should
+     not be produced any more — but this migration is written for a database
+     whose history nobody has re-verified.) The predicate can only refuse a
+     binding, never invent one, which is the whole reason to keep it.
      Note that ``documents.created_at`` is written by the application and
      ``publications.created_at`` by the database, so the comparison inherits
      any clock skew between them: a publication created within that skew of
      its own document may be left NULL. That is the safe direction, and a
      NULL row keeps working exactly as it does today.
+
+Everything the parse produced is re-asserted inside the UPDATE — the row's
+``resource_uri`` must still be the string that was parsed, and its vault must
+still carry the name that string named. A publication moved, or a vault
+renamed, between the read and the write therefore leaves the row unbound
+rather than bound to what its old URI used to mean.
 
 Consequence, stated plainly: because NULL is allowed, "every document
 publication points at a document" is NOT a schema invariant after this
@@ -99,23 +111,39 @@ re-enters and completes, and a partially-bound table is a legitimate resting
 state, not damage.
 
 ``ADD CONSTRAINT … NOT VALID`` + ``VALIDATE CONSTRAINT`` was considered and
-rejected. It would save the initial scan of ``publications`` — a table with
-one row per published link — while still taking the same ACCESS EXCLUSIVE
-lock to write the catalog entry, and it would leave behind a constraint that
-is enforced but unverified if the second step never ran. The saving is not
-worth a state where the schema looks stronger than it is. (If ``publications``
-ever grew to a size where that scan mattered, this is the decision to revisit.)
+rejected. Adding the FK takes SHARE ROW EXCLUSIVE on both ``publications`` and
+``documents`` — measured, not assumed — which blocks writes to both for the
+duration of the validation scan. ``NOT VALID`` would take the same lock and
+skip the scan, so what it buys is exactly the length of one sequential scan of
+``publications``, a table with one row per published link. Against that it
+leaves a constraint that is enforced for new rows but unverified for old ones
+if the second step never ran, and a schema that looks stronger than it is is
+the failure mode this whole change is trying to remove. If ``publications``
+ever grows to where that scan is a real outage window, this is the decision to
+revisit — the split is mechanical.
 
 Locks and timeouts
 ------------------
 The runner sets ``lock_timeout = '5s'`` and the pool cancels any statement at
-30s, and both apply here. The one statement that does real work proportional
-to table size is the unique index behind ``documents_id_vault_id_key``; it is
-built plainly, not CONCURRENTLY, because a plain build inside its own implicit
-transaction leaves nothing behind when it is cancelled, whereas a cancelled
-CONCURRENTLY build leaves an *invalid* index that ``IF NOT EXISTS`` would then
-skip over forever. Failing loudly and retrying beats a schema that quietly
-believes it has an index.
+30s, and both apply here. ``lock_timeout`` bounds only the wait to ACQUIRE a
+lock, not how long one is held once acquired; the 30s cancel is what bounds
+the latter.
+
+Every statement in the backfill is bounded to ``_BATCH`` rows, so its cost
+does not scale with the table. Two DDL statements do scale:
+
+  * ``ALTER TABLE documents ADD CONSTRAINT documents_id_vault_id_key UNIQUE``
+    builds an index over ``documents`` while holding ACCESS EXCLUSIVE. This is
+    the worst statement here, and on a large enough table it will be cancelled
+    at 30s, roll back, and make no progress across retries.
+  * the FK's validation scan over ``publications``, under SHARE ROW EXCLUSIVE
+    on both tables.
+
+The index is built plainly, not CONCURRENTLY, because a plain build inside its
+own implicit transaction leaves nothing behind when it is cancelled, whereas a
+cancelled CONCURRENTLY build leaves an *invalid* index that ``IF NOT EXISTS``
+would then skip over forever. Failing loudly and retrying beats a schema that
+quietly believes it has an index.
 
 If ``documents`` is ever large enough that the in-line build cannot finish
 inside the 30s cancel, the escape hatch is to build the index out of band and
@@ -127,6 +155,13 @@ re-run:
 This migration adopts a pre-existing valid index of that name via
 ``ADD CONSTRAINT … UNIQUE USING INDEX`` instead of rebuilding it, and drops
 one left invalid by an interrupted build before trying again.
+
+init.sql keeps the same shape, and has to stay runnable against a database
+that has NOT reached this migration yet: it is re-executed in full on every
+boot, before any migration. ``CREATE TABLE IF NOT EXISTS`` is inert on an
+existing table, but a bare ``CREATE INDEX`` on the new column is not — it
+raises ``UndefinedColumn`` and the boot never reaches the migrations. The
+index statement there is therefore guarded on the column's existence.
 """
 
 from __future__ import annotations
@@ -134,7 +169,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import uuid as uuid_mod
 from pathlib import Path
+
+import asyncpg
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -146,6 +184,16 @@ logger = logging.getLogger("akb.migration.053")
 _DOC_UNIQUE = "documents_id_vault_id_key"
 _PUB_FK = "publications_document_fk"
 _PUB_INDEX = "idx_publications_document_id"
+
+# Expected definitions, exactly as `pg_get_constraintdef` renders them. The
+# idempotency guards compare against these rather than against a name, so a
+# constraint that merely borrowed the name cannot pass for the real thing.
+_DOC_UNIQUE_DEF = "UNIQUE (id, vault_id)"
+_PUB_FK_DEF = (
+    "FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id) "
+    "ON DELETE CASCADE"
+)
+_PUB_INDEX_COLS = "(document_id, vault_id) WHERE (document_id IS NOT NULL)"
 
 # Rows per UPDATE. Keeps any single statement well inside the pool's 30s
 # cancel regardless of how many publications a deployment has accumulated.
@@ -173,15 +221,41 @@ async def _column_exists(conn, table: str, column: str) -> bool:
     ))
 
 
-async def _constraint_exists(conn, table: str, name: str) -> bool:
-    return bool(await conn.fetchval(
+async def _constraint_def(conn, table: str, name: str) -> str | None:
+    """The constraint's definition, or None if there is no constraint by that
+    name on that table.
+
+    Definition rather than existence on purpose. A name-only check would let a
+    CHECK constraint, an unvalidated FK, or an FK on the wrong columns wearing
+    the right name satisfy the idempotency guard — the migration would return
+    happily, get recorded in the ledger, and leave the guarantee it advertises
+    uninstalled. Comparing what the database actually built means a re-run
+    either finds the real thing or says so.
+    """
+    return await conn.fetchval(
         """
-        SELECT 1 FROM pg_constraint
+        SELECT pg_get_constraintdef(oid) FROM pg_constraint
          WHERE conname::text = $2::text
            AND conrelid = to_regclass('public.' || $1::text)
         """,
         table, name,
-    ))
+    )
+
+
+async def _already_correct(conn, table: str, name: str, expected: str) -> bool:
+    """True when `name` is already the constraint we would create; raises when
+    something else is wearing the name."""
+    found = await _constraint_def(conn, table, name)
+    if found is None:
+        return False
+    if found != expected:
+        raise RuntimeError(
+            f"{table} already has a constraint named {name}, but it is not the "
+            f"one migration 053 installs.\n  found:    {found}\n  expected: {expected}\n"
+            "Migration 053 will not silently accept it — inspect the constraint, "
+            "then drop or rename it and re-run."
+        )
+    return True
 
 
 async def _ensure_documents_identity_unique(conn) -> None:
@@ -191,7 +265,7 @@ async def _ensure_documents_identity_unique(conn) -> None:
     operator may have run ahead of time (or had cancelled underneath them):
     no index, a valid index of the right shape, or an invalid leftover.
     """
-    if await _constraint_exists(conn, "documents", _DOC_UNIQUE):
+    if await _already_correct(conn, "documents", _DOC_UNIQUE, _DOC_UNIQUE_DEF):
         return
 
     existing = await conn.fetchrow(
@@ -256,25 +330,49 @@ async def _ensure_documents_identity_unique(conn) -> None:
     logger.info("Migration 053: added %s on documents (id, vault_id)", _DOC_UNIQUE)
 
 
-async def _ensure_publication_document_column(conn) -> None:
-    if await _column_exists(conn, "publications", "document_id"):
-        return
-    await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
-    logger.info("Migration 053: added publications.document_id (nullable)")
+async def _ensure_publication_identity(conn) -> None:
+    """Add the column and its foreign key as ONE unit.
 
-
-async def _ensure_publication_document_fk(conn) -> None:
-    if await _constraint_exists(conn, "publications", _PUB_FK):
+    Together, not one after the other: a column that exists without its FK is
+    an unconstrained UUID column on a live table, and anything that wrote a
+    dangling or cross-vault value into that window would make every later
+    attempt to add the constraint fail. The pair costs nothing to redo — the
+    column add is a catalog write and the FK's validation scan runs against
+    all-NULL data — so there is no progress worth preserving by splitting
+    them, and a great deal worth preserving by not leaving that window open.
+    """
+    have_column = await _column_exists(conn, "publications", "document_id")
+    have_fk = await _already_correct(conn, "publications", _PUB_FK, _PUB_FK_DEF)
+    if have_column and have_fk:
         return
-    await conn.execute(
-        f"ALTER TABLE publications ADD CONSTRAINT {_PUB_FK} "
-        "FOREIGN KEY (document_id, vault_id) REFERENCES documents (id, vault_id) "
-        "ON DELETE CASCADE"
-    )
-    logger.info(
-        "Migration 053: added %s — (document_id, vault_id) → documents (id, vault_id) "
-        "ON DELETE CASCADE", _PUB_FK,
-    )
+
+    async with conn.transaction():
+        if not have_column:
+            await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
+            logger.info("Migration 053: added publications.document_id (nullable)")
+        if not have_fk:
+            try:
+                await conn.execute(
+                    f"ALTER TABLE publications ADD CONSTRAINT {_PUB_FK} "
+                    f"{_PUB_FK_DEF}"
+                )
+            except asyncpg.ForeignKeyViolationError as e:
+                raise RuntimeError(
+                    "Migration 053 cannot add the publication identity constraint: "
+                    "publications already holds a document_id that does not name a "
+                    "document in that publication's own vault. Nothing here will "
+                    "delete or blank those rows — that is a decision for a human. "
+                    "List them with:\n"
+                    "  SELECT p.id, p.vault_id, p.document_id FROM publications p\n"
+                    "   WHERE p.document_id IS NOT NULL AND NOT EXISTS (\n"
+                    "     SELECT 1 FROM documents d\n"
+                    "      WHERE d.id = p.document_id AND d.vault_id = p.vault_id);\n"
+                    f"underlying error: {e}"
+                ) from e
+            logger.info(
+                "Migration 053: added %s — (document_id, vault_id) → "
+                "documents (id, vault_id) ON DELETE CASCADE", _PUB_FK,
+            )
 
 
 async def _ensure_publication_document_index(conn) -> None:
@@ -284,20 +382,43 @@ async def _ensure_publication_document_index(conn) -> None:
     to cascade. Partial on ``document_id IS NOT NULL`` because most rows are
     NULL after this migration and the cascade probe (``document_id = $1``)
     implies NOT NULL, so the planner can still use it.
+
+    Checked by definition rather than by `IF NOT EXISTS` alone, for the same
+    reason as the constraints: a same-named index over different columns would
+    otherwise be accepted silently.
     """
+    found = await conn.fetchval(
+        "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+        "WHERE indexrelid = to_regclass('public.' || $1::text)",
+        _PUB_INDEX,
+    )
+    if found is not None:
+        if _PUB_INDEX_COLS not in found:
+            raise RuntimeError(
+                f"An index named {_PUB_INDEX} already exists but is not the "
+                f"cascade index migration 053 creates.\n  found: {found}\n"
+                "Inspect it, then drop or rename it and re-run."
+            )
+        return
     await conn.execute(
-        f"CREATE INDEX IF NOT EXISTS {_PUB_INDEX} "
+        f"CREATE INDEX {_PUB_INDEX} "
         "ON publications (document_id, vault_id) WHERE document_id IS NOT NULL"
     )
 
 
 async def _backfill(conn) -> None:
     """Bind existing document publications to their document, where that is
-    unambiguous. See the module docstring for the four conditions.
+    unambiguous. See the module docstring for the conditions.
 
     Re-runnable: only rows with ``document_id IS NULL`` are considered, so a
     second run binds nothing and reports the already-bound rows under their
     own count instead of adding them to this run's total.
+
+    Paged by primary key. Every statement here is bounded by ``_BATCH`` rows
+    so that neither the pool's 30s cancel nor this process's memory depends on
+    how many publications a deployment has accumulated. Rows bound by an
+    earlier page drop out of the predicate rather than shifting the window, so
+    the key order stays stable across pages.
     """
     already_bound = await conn.fetchval(
         "SELECT COUNT(*) FROM publications "
@@ -307,88 +428,110 @@ async def _backfill(conn) -> None:
         "SELECT COUNT(*) FROM publications WHERE resource_type <> 'document'"
     )
 
-    rows = await conn.fetch(
-        """
-        SELECT p.id, p.resource_uri, v.name AS vault_name
-          FROM publications p
-          JOIN vaults v ON v.id = p.vault_id
-         WHERE p.resource_type = 'document'
-           AND p.document_id IS NULL
-        """
-    )
-
-    candidate_ids: list = []
-    candidate_paths: list[str] = []
-    unreadable_uri = 0
-    vault_mismatch: list = []
-
-    for row in rows:
-        uri = row["resource_uri"]
-        parsed = parse_uri(uri) if uri else None
-        if parsed is None or parsed.kind != "doc" or not parsed.identifier:
-            unreadable_uri += 1
-            continue
-        if parsed.vault != row["vault_name"]:
-            # The URI names one vault and the row belongs to another. Do not
-            # bind it to anything: resolution already refuses to serve this
-            # row, and "some document exists at that path somewhere" is not
-            # evidence about which document this publication was made for.
-            vault_mismatch.append(row["id"])
-            continue
-        candidate_ids.append(row["id"])
-        candidate_paths.append(parsed.identifier)
-
+    examined = 0
     bound = 0
-    unbound_ids: list = []
-    unbound_paths: list[str] = []
-    for start in range(0, len(candidate_ids), _BATCH):
-        ids = candidate_ids[start:start + _BATCH]
-        paths = candidate_paths[start:start + _BATCH]
+    unreadable_uri = 0
+    path_reused = 0
+    no_document = 0
+    vault_mismatch: list = []
+    after = uuid_mod.UUID(int=0)
+
+    while True:
+        page = await conn.fetch(
+            """
+            SELECT p.id, p.resource_uri, v.name AS vault_name
+              FROM publications p
+              JOIN vaults v ON v.id = p.vault_id
+             WHERE p.resource_type = 'document'
+               AND p.document_id IS NULL
+               AND p.id > $1
+             ORDER BY p.id
+             LIMIT $2
+            """,
+            after, _BATCH,
+        )
+        if not page:
+            break
+        after = page[-1]["id"]
+        examined += len(page)
+
+        ids: list = []
+        paths: list[str] = []
+        uris: list[str] = []
+        vaults: list[str] = []
+        for row in page:
+            uri = row["resource_uri"]
+            parsed = parse_uri(uri) if uri else None
+            if parsed is None or parsed.kind != "doc" or not parsed.identifier:
+                unreadable_uri += 1
+                continue
+            if parsed.vault != row["vault_name"]:
+                # The URI names one vault and the row belongs to another. Do
+                # not bind it to anything: resolution already refuses to serve
+                # this row, and "some document exists at that path somewhere"
+                # is not evidence about which document this publication was
+                # made for.
+                vault_mismatch.append(row["id"])
+                continue
+            ids.append(row["id"])
+            paths.append(parsed.identifier)
+            uris.append(uri)
+            vaults.append(parsed.vault)
+
+        if not ids:
+            continue
+
+        # The parse happened in Python a moment ago; the row can have moved
+        # since. `p.resource_uri = c.uri` and `v.name = c.uri_vault` re-assert
+        # both inputs to that parse inside the same statement that writes the
+        # binding, so a URI rewritten by a concurrent move — or a vault renamed
+        # underneath it — leaves the row unbound instead of binding it to what
+        # its old URI used to mean. A later run re-reads it and decides again.
         updated = await conn.fetch(
             """
             WITH candidate AS (
-                SELECT pub_id, doc_path
-                  FROM unnest($1::uuid[], $2::text[]) AS t(pub_id, doc_path)
+                SELECT pub_id, doc_path, uri, uri_vault
+                  FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[])
+                    AS t(pub_id, doc_path, uri, uri_vault)
             )
             UPDATE publications p
                SET document_id = d.id
-              FROM candidate c, documents d
+              FROM candidate c, documents d, vaults v
              WHERE p.id = c.pub_id
                AND p.document_id IS NULL
                AND p.resource_type = 'document'
+               AND p.resource_uri = c.uri
+               AND v.id = p.vault_id
+               AND v.name = c.uri_vault
                AND d.vault_id = p.vault_id
                AND d.path = c.doc_path
                AND d.created_at <= p.created_at
             RETURNING p.id
             """,
-            ids, paths,
+            ids, paths, uris, vaults,
         )
         # `updated_at` is deliberately not touched: this is a schema backfill,
         # not an edit anyone made to the publication.
         bound += len(updated)
-        done = {r["id"] for r in updated}
-        for pub_id, path in zip(ids, paths, strict=True):
-            if pub_id not in done:
-                unbound_ids.append(pub_id)
-                unbound_paths.append(path)
 
-    # Split the leftovers: a path with no document at all versus a path now
-    # occupied by a document that postdates the publication.
-    path_reused = 0
-    for start in range(0, len(unbound_ids), _BATCH):
-        ids = unbound_ids[start:start + _BATCH]
-        paths = unbound_paths[start:start + _BATCH]
-        path_reused += await conn.fetchval(
-            """
-            SELECT COUNT(*)
-              FROM unnest($1::uuid[], $2::text[]) AS c(pub_id, doc_path)
-              JOIN publications p ON p.id = c.pub_id
-              JOIN documents d
-                ON d.vault_id = p.vault_id AND d.path = c.doc_path
-            """,
-            ids, paths,
-        )
-    no_document = len(unbound_ids) - path_reused
+        done = {r["id"] for r in updated}
+        left_ids = [i for i in ids if i not in done]
+        left_paths = [p for i, p in zip(ids, paths, strict=True) if i not in done]
+        if left_ids:
+            # Split the leftovers: a path with no document at all versus a
+            # path now occupied by a document the publication predates.
+            occupied = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                  FROM unnest($1::uuid[], $2::text[]) AS c(pub_id, doc_path)
+                  JOIN publications p ON p.id = c.pub_id
+                  JOIN documents d
+                    ON d.vault_id = p.vault_id AND d.path = c.doc_path
+                """,
+                left_ids, left_paths,
+            )
+            path_reused += occupied
+            no_document += len(left_ids) - occupied
 
     logger.info(
         "Migration 053 backfill: bound=%d, no_document=%d, path_reused=%d, "
@@ -396,7 +539,7 @@ async def _backfill(conn) -> None:
         "non_document_publications=%d (of %d document publications examined "
         "this run)",
         bound, no_document, path_reused, unreadable_uri, len(vault_mismatch),
-        already_bound or 0, skipped_by_design or 0, len(rows),
+        already_bound or 0, skipped_by_design or 0, examined,
     )
     if vault_mismatch:
         # The most interesting rows in the table if they exist: the vault the
@@ -421,13 +564,16 @@ async def _backfill(conn) -> None:
 
 
 async def _run(conn):
-    # No enclosing transaction. Each step is idempotent on its own, so a run
-    # cancelled between steps re-enters and finishes; wrapping them together
-    # would instead throw away a completed index build because a later lock
-    # wait timed out.
-    await _ensure_publication_document_column(conn)
+    # No enclosing transaction over the whole migration. Each step is
+    # idempotent on its own, so a run cancelled between steps re-enters and
+    # finishes; wrapping everything together would instead throw away a
+    # completed index build because a later lock wait timed out.
+    #
+    # The FK target has to exist before the FK, and the column and the FK are
+    # added together (see `_ensure_publication_identity`) so no window opens
+    # in which the column exists unconstrained.
     await _ensure_documents_identity_unique(conn)
-    await _ensure_publication_document_fk(conn)
+    await _ensure_publication_identity(conn)
     await _ensure_publication_document_index(conn)
     await _backfill(conn)
 

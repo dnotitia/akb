@@ -207,6 +207,55 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
     assert all(validated for *_, validated in expected["constraints"])
 
 
+async def test_init_sql_still_runs_against_a_database_that_predates_the_migration():
+    """init.sql is re-executed IN FULL on every boot, BEFORE any migration.
+
+    So every statement in it has to be inert against a database that has not
+    reached 053 yet. `CREATE TABLE IF NOT EXISTS` is; a bare `CREATE INDEX` on
+    the new column is not — it raises UndefinedColumn, aborts init_db(), and
+    the migration that would have added the column never runs. Every boot,
+    forever. This test is the reason that statement is guarded.
+    """
+    async with _fresh_database(undo_053=True) as conn:
+        assert await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = 'publications' "
+            "AND column_name = 'document_id'"
+        ) is None
+
+        await conn.execute(_INIT_SQL)  # must not raise
+
+        # It must also not have invented the index on a column that is absent.
+        assert await conn.fetchval(
+            "SELECT to_regclass('public.idx_publications_document_id')"
+        ) is None
+
+        await _apply(conn)
+
+        # And once the column is there, a later boot's init.sql is a clean
+        # no-op over the shape the migration built.
+        shape = await _shape(conn)
+        await conn.execute(_INIT_SQL)
+        assert await _shape(conn) == shape
+
+
+async def test_a_document_cannot_be_moved_out_from_under_a_publication():
+    """The FK's ON UPDATE is NO ACTION (the default), so the vault half of the
+    key cannot be changed to break the pairing either."""
+    async with _fresh_database() as conn:
+        vault_a = await _vault(conn, f"stay-{uuid.uuid4().hex[:8]}")
+        vault_b = await _vault(conn, f"move-{uuid.uuid4().hex[:8]}")
+        doc = await _document(conn, vault_a, "notes.md")
+        pub = await _publication(conn, vault_a, "akb://x/doc/notes.md")
+        await conn.execute(
+            "UPDATE publications SET document_id = $2 WHERE id = $1", pub, doc
+        )
+
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "UPDATE documents SET vault_id = $2 WHERE id = $1", doc, vault_b
+            )
+
+
 async def test_deleting_the_document_row_in_sql_takes_the_publication_with_it():
     async with _fresh_database(undo_053=True) as conn:
         vault = await _vault(conn, f"cascade-{uuid.uuid4().hex[:8]}")

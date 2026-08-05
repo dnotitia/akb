@@ -110,6 +110,16 @@ async def _already_applied(conn) -> bool:
     nothing re-adds it, so its absence alongside resource_uri means the
     collapse has happened. This is strictly more conservative than the
     previous test — every database it skipped before, it still skips.
+
+    The one state it reads differently is a hand-built one: resource_uri
+    present, file_id gone, and a LEGACY single-column document_id still
+    there. This migration is transactional, so no ordinary history produces
+    it. If it somehow exists, 053 will try to add its composite FK over
+    whatever those legacy values are — and either every one of them names a
+    document in the publication's own vault, in which case the pre-022
+    bindings were right and are now enforced, or the constraint is refused
+    and the boot fails loudly with the rows to inspect. Neither outcome
+    silently discards data, which the old guard's `DROP COLUMN` would have.
     """
     has_uri = await _column_exists(conn, "publications", "resource_uri")
     has_file_id = await _column_exists(conn, "publications", "file_id")

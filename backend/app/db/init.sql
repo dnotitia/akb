@@ -463,7 +463,27 @@ CREATE INDEX IF NOT EXISTS idx_publications_resource_uri ON publications(resourc
 -- delete seq-scans this table to find the rows to cascade. Partial because
 -- most rows are NULL and `document_id = $1` implies NOT NULL, so the cascade
 -- probe can still use it.
-CREATE INDEX IF NOT EXISTS idx_publications_document_id ON publications(document_id, vault_id) WHERE document_id IS NOT NULL;
+--
+-- Guarded on the column, and that guard is load-bearing. This file is
+-- re-executed IN FULL on every boot, BEFORE any migration runs. On a database
+-- that has not reached migration 053 yet, the CREATE TABLE above is inert (the
+-- table exists) so `document_id` is absent — and a bare CREATE INDEX on it
+-- raises UndefinedColumn, which aborts init.sql and means the migration that
+-- would have added the column never runs. Every boot, forever. Any future
+-- index or ALTER here that names a column added by a migration needs the same
+-- treatment.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'publications'
+           AND column_name = 'document_id'
+    ) THEN
+        CREATE INDEX IF NOT EXISTS idx_publications_document_id
+            ON publications(document_id, vault_id) WHERE document_id IS NOT NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_publications_expires ON publications(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================
