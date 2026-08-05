@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
 import signal
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -68,9 +71,225 @@ def test_managed_settings_reject_unsafe_project() -> None:
         )
 
 
-def test_only_empty_scenario_is_supported() -> None:
+def test_supported_scenarios_include_app_lifecycle_and_reject_unknown() -> None:
+    settings = e2e_runtime.resolve_settings(["--scenario", "app_lifecycle"], {})
+
+    assert settings.scenario == e2e_runtime.APP_LIFECYCLE_SCENARIO
+    assert e2e_runtime.APP_LIFECYCLE_SCENARIO in e2e_runtime.SUPPORTED_SCENARIOS
     with pytest.raises(ValueError, match="unsupported"):
         e2e_runtime.resolve_settings(["--scenario", "other"], {})
+
+
+def test_app_lifecycle_credentials_use_project_neutral_names() -> None:
+    assert e2e_runtime.CREDENTIAL_VARIABLES == (
+        "AKB_E2E_SYSTEM_ADMIN_TOKEN",
+        "AKB_E2E_TARGET_VAULT_ADMIN_TOKEN",
+        "AKB_E2E_READER_TOKEN",
+        "AKB_E2E_WRITER_TOKEN",
+        "AKB_E2E_FOREIGN_VAULT_ADMIN_TOKEN",
+        "AKB_E2E_PRIMARY_APP_CREDENTIAL",
+        "AKB_E2E_PRIMARY_APP_TOKEN",
+        "AKB_E2E_FOREIGN_APP_CREDENTIAL",
+    )
+    assert all(name.startswith("AKB_E2E_") for name in e2e_runtime.CREDENTIAL_VARIABLES)
+
+
+def test_empty_scenario_keeps_the_original_ready_and_reset_shapes(tmp_path: Path) -> None:
+    settings = e2e_runtime.RuntimeSettings(
+        database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+        ready_file=tmp_path / "ready.json",
+    )
+
+    assert e2e_runtime.ready_payload(settings)["scenario"] == "empty"
+    assert set(e2e_runtime.ready_payload(settings)) == {
+        "schema_version",
+        "status",
+        "origin",
+        "fixture_origin",
+        "reset_url",
+        "scenario",
+    }
+    assert e2e_runtime.reset_payload(settings) == {"ok": True, "scenario": "empty"}
+
+
+def test_app_lifecycle_ready_and_reset_expose_only_safe_artifact_metadata(tmp_path: Path) -> None:
+    settings = e2e_runtime.RuntimeSettings(
+        database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+        scenario=e2e_runtime.APP_LIFECYCLE_SCENARIO,
+        ready_file=tmp_path / "ready.json",
+    )
+
+    ready = e2e_runtime.ready_payload(settings)
+    reset = e2e_runtime.reset_payload(settings)
+    manifest_path, profile_path = e2e_runtime.fixture_artifact_paths(settings)
+
+    assert ready["fixture_manifest"] == str(manifest_path)
+    assert ready["credential_profile"] == str(profile_path)
+    assert ready["credential_variables"] == list(e2e_runtime.CREDENTIAL_VARIABLES)
+    assert reset["fixture_manifest"] == str(manifest_path)
+    assert reset["credential_profile"] == str(profile_path)
+    assert e2e_runtime.DEFAULT_DATABASE_URL not in json.dumps(ready)
+    assert e2e_runtime.DEFAULT_DATABASE_URL not in json.dumps(reset)
+
+
+def test_fixture_artifacts_rotate_together_and_keep_credentials_private(tmp_path: Path) -> None:
+    settings = e2e_runtime.RuntimeSettings(
+        database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+        scenario=e2e_runtime.APP_LIFECYCLE_SCENARIO,
+        ready_file=tmp_path / "ready.json",
+    )
+    first_value = "fixture-value-one"
+    second_value = "fixture-value-two"
+    first_manifest = {"schema_version": 1, "namespace": "first", "id": "first-id"}
+    second_manifest = {"schema_version": 1, "namespace": "second", "id": "second-id"}
+    first_credentials = {
+        name: first_value + name[-1] for name in e2e_runtime.CREDENTIAL_VARIABLES
+    }
+    second_credentials = {
+        name: second_value + name[-1] for name in e2e_runtime.CREDENTIAL_VARIABLES
+    }
+
+    e2e_runtime.write_fixture_artifacts(settings, first_manifest, first_credentials)
+    manifest_path, profile_path = e2e_runtime.fixture_artifact_paths(settings)
+    assert json.loads(manifest_path.read_text())["namespace"] == "first"
+    assert first_credentials[e2e_runtime.CREDENTIAL_VARIABLES[1]] in profile_path.read_text()
+    assert os.stat(manifest_path).st_mode & 0o777 == 0o600
+    assert os.stat(profile_path).st_mode & 0o777 == 0o600
+
+    e2e_runtime.write_fixture_artifacts(settings, second_manifest, second_credentials)
+    assert json.loads(manifest_path.read_text())["namespace"] == "second"
+    assert second_credentials[e2e_runtime.CREDENTIAL_VARIABLES[1]] in profile_path.read_text()
+    assert first_value not in profile_path.read_text()
+    assert first_value not in manifest_path.read_text()
+
+    e2e_runtime.remove_fixture_artifacts(settings)
+    assert not manifest_path.exists()
+    assert not profile_path.exists()
+
+
+def test_seed_scenario_rotates_app_lifecycle_artifacts_without_db_access(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = e2e_runtime.RuntimeSettings(
+        database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+        scenario=e2e_runtime.APP_LIFECYCLE_SCENARIO,
+        ready_file=tmp_path / "ready.json",
+    )
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_seed(database_url: str, *, origin: str, fixture_origin: str):
+        calls.append((database_url, origin, fixture_origin))
+        return {"schema_version": 1, "scenario": "app_lifecycle"}, {
+            name: "fixture-value-" + name[-1] for name in e2e_runtime.CREDENTIAL_VARIABLES
+        }
+
+    monkeypatch.setattr(e2e_runtime, "_seed_app_lifecycle", fake_seed)
+    monkeypatch.setattr(
+        e2e_runtime,
+        "_exchange_fixture_app_token",
+        lambda _origin, _credential: "fixture-app-token",
+    )
+    manifest, credentials = e2e_runtime.seed_scenario(settings)
+
+    assert calls == [(e2e_runtime.DEFAULT_DATABASE_URL, settings.origin, settings.fixture_origin)]
+    assert manifest == {"schema_version": 1, "scenario": "app_lifecycle"}
+    assert credentials is not None
+    assert credentials[e2e_runtime.CREDENTIAL_VARIABLES[6]] == "fixture-app-token"
+
+
+def test_app_lifecycle_seed_is_transactional_and_manifest_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTransaction:
+        entered = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.transaction_context = FakeTransaction()
+            self.statements: list[tuple[str, tuple[object, ...]]] = []
+            self.closed = False
+
+        def transaction(self) -> FakeTransaction:
+            return self.transaction_context
+
+        async def execute(self, statement: str, *args: object) -> None:
+            self.statements.append((statement, args))
+
+        async def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    async def fake_connect(_database_url: str, *, timeout: int):
+        assert timeout == 15
+        return connection
+
+    monkeypatch.setitem(
+        sys.modules,
+        "asyncpg",
+        types.SimpleNamespace(connect=fake_connect),
+    )
+    manifest, credentials = asyncio.run(
+        e2e_runtime._seed_app_lifecycle(
+            e2e_runtime.DEFAULT_DATABASE_URL,
+            origin="http://localhost:8000",
+            fixture_origin="http://localhost:8889",
+        )
+    )
+
+    serialized_manifest = json.dumps(manifest)
+    assert connection.transaction_context.entered is True
+    assert connection.closed is True
+    assert len(connection.statements) >= 30
+    assert manifest["scenario"] == e2e_runtime.APP_LIFECYCLE_SCENARIO
+    assert set(credentials) == (
+        set(e2e_runtime.CREDENTIAL_VARIABLES)
+        - {e2e_runtime.CREDENTIAL_VARIABLES[6]}
+    )
+    assert all(
+        credentials[name] not in serialized_manifest
+        for name in e2e_runtime.CREDENTIAL_VARIABLES
+        if name != e2e_runtime.CREDENTIAL_VARIABLES[6]
+    )
+    for forbidden_field in (
+        "credential_hash",
+        "token_hash",
+        "password_hash",
+        "provenance",
+        "grant_id",
+    ):
+        assert forbidden_field not in serialized_manifest
+    assert manifest["actors"]["writer"]["token_env"] == e2e_runtime.CREDENTIAL_VARIABLES[3]  # type: ignore[index]
+    assert manifest["apps"]["primary"]["token_env"] == e2e_runtime.CREDENTIAL_VARIABLES[6]  # type: ignore[index]
+    assert len(manifest["installations"]) >= 7  # type: ignore[index]
+
+
+def test_child_environment_does_not_forward_fixture_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = "fixture-value-not-forwarded"
+    monkeypatch.setenv(e2e_runtime.CREDENTIAL_VARIABLES[1], marker)
+    runtime = e2e_runtime.E2ERuntime(
+        e2e_runtime.RuntimeSettings(
+            database_url=e2e_runtime.DEFAULT_DATABASE_URL,
+            scenario=e2e_runtime.APP_LIFECYCLE_SCENARIO,
+            ready_file=tmp_path / "ready.json",
+        )
+    )
+
+    child_environment = runtime._child_environment()
+
+    assert e2e_runtime.CREDENTIAL_VARIABLES[1] not in child_environment
+    assert marker not in child_environment.values()
 
 
 def test_generated_config_contains_fields_not_the_database_url(tmp_path: Path) -> None:

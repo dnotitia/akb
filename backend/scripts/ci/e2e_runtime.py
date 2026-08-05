@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +45,7 @@ DEFAULT_DATABASE_URL = "postgresql://akb:akb@localhost:15432/akb"  # pragma: all
 DEFAULT_ORIGIN = "http://localhost:8000"
 DEFAULT_FIXTURE_ORIGIN = "http://localhost:8889"
 DEFAULT_SCENARIO = "empty"
+APP_LIFECYCLE_SCENARIO = "app_lifecycle"
 DEFAULT_S3_BUCKET = "akb-files"
 RUNTIME_TMP = Path(tempfile.gettempdir())
 DEFAULT_READY_FILE = str(RUNTIME_TMP / "akb-e2e-ready.json")
@@ -55,7 +58,18 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = Path(__file__).resolve().with_name("e2e-postgres.compose.yml")
 DEFAULT_DOCKER_ARGV = "docker"
 COMPOSE_PROJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
-SUPPORTED_SCENARIOS = frozenset({DEFAULT_SCENARIO})
+SUPPORTED_SCENARIOS = frozenset({DEFAULT_SCENARIO, APP_LIFECYCLE_SCENARIO})
+FIXTURE_MANIFEST_SCHEMA_VERSION = 1
+CREDENTIAL_VARIABLES = (
+    "AKB_E2E_SYSTEM_ADMIN_TOKEN",
+    "AKB_E2E_TARGET_VAULT_ADMIN_TOKEN",
+    "AKB_E2E_READER_TOKEN",
+    "AKB_E2E_WRITER_TOKEN",
+    "AKB_E2E_FOREIGN_VAULT_ADMIN_TOKEN",
+    "AKB_E2E_PRIMARY_APP_CREDENTIAL",
+    "AKB_E2E_PRIMARY_APP_TOKEN",
+    "AKB_E2E_FOREIGN_APP_CREDENTIAL",
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +96,7 @@ class RuntimeSettings:
     s3_bucket: str = ""
     s3_access_key: str = field(default="", repr=False)
     s3_secret_key: str = field(default="", repr=False)
+    app_token_secret: str = field(default="", repr=False)
 
 
 def parse_database_url(database_url: str) -> DatabaseSettings:
@@ -196,6 +211,7 @@ def render_secret_config(
     database: DatabaseSettings,
     s3_access_key: str = "",
     s3_secret_key: str = "",
+    app_token_secret: str = "",
 ) -> str:
     """Render the existing CI-only secrets without the source database URL."""
 
@@ -203,6 +219,7 @@ def render_secret_config(
         f"db_password: {_yaml_scalar(database.password)}  # pragma: allowlist secret",
         "jwt_secret: ci-only-jwt-secret-not-for-prod-use  # pragma: allowlist secret",
         "embed_api_key: ci-stub-no-auth  # pragma: allowlist secret",
+        f"app_token_secret: {_yaml_scalar(app_token_secret)}  # pragma: allowlist secret",
     ]
     if s3_access_key and s3_secret_key:
         lines.extend(
@@ -248,13 +265,701 @@ def write_runtime_config(settings: RuntimeSettings, repo_root: Path = REPO_ROOT)
     )
     _atomic_write(
         config_dir / "secret.yaml",
-        render_secret_config(database, settings.s3_access_key, settings.s3_secret_key),
+        render_secret_config(
+            database,
+            settings.s3_access_key,
+            settings.s3_secret_key,
+            settings.app_token_secret or secrets.token_urlsafe(32),
+        ),
         0o600,
     )
 
 
+def fixture_manifest_path(ready_file: Path) -> Path:
+    return ready_file.with_name(f"{ready_file.stem}.fixtures.json")
+
+
+def credential_profile_path(ready_file: Path) -> Path:
+    return ready_file.with_name(f"{ready_file.stem}.credentials.env")
+
+
+def fixture_artifact_paths(settings: RuntimeSettings) -> tuple[Path, Path]:
+    return (
+        fixture_manifest_path(settings.ready_file),
+        credential_profile_path(settings.ready_file),
+    )
+
+
+def remove_fixture_artifacts(settings: RuntimeSettings) -> None:
+    for path in fixture_artifact_paths(settings):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _fixture_material(prefix: str) -> tuple[str, str, str]:
+    raw = prefix + secrets.token_urlsafe(32)
+    return raw, hashlib.sha256(raw.encode()).hexdigest(), raw[:16]
+
+
+async def _seed_app_lifecycle(
+    database_url: str,
+    *,
+    origin: str,
+    fixture_origin: str,
+) -> tuple[dict[str, object], dict[str, str]]:
+    """Seed the small public lifecycle matrix in one database transaction."""
+
+    import asyncpg
+
+    namespace = secrets.token_hex(8)
+    connection = await asyncpg.connect(database_url, timeout=15)
+    try:
+        async with connection.transaction():
+            async def create_user(label: str, *, is_admin: bool = False) -> dict[str, str]:
+                user_id = uuid.uuid4()
+                username = f"e2e-{label}-{namespace}"
+                await connection.execute(
+                    """
+                    INSERT INTO users (
+                        id, username, email, password_hash, display_name,
+                        is_admin, account_status, account_kind
+                    ) VALUES ($1, $2, $3, 'fixture-disabled', $4, $5, 'active', 'human')
+                    """,
+                    user_id,
+                    username,
+                    f"{username}@example.invalid",
+                    label,
+                    is_admin,
+                )
+                return {"id": str(user_id), "username": username}
+
+            async def create_pat(
+                user: dict[str, str],
+                label: str,
+                scopes: list[str],
+            ) -> tuple[str, dict[str, str]]:
+                raw, token_hash, token_prefix = _fixture_material("akb_")
+                token_id = uuid.uuid4()
+                await connection.execute(
+                    """
+                    INSERT INTO tokens (
+                        id, user_id, name, token_hash, token_prefix,
+                        scopes, vault_scope, key_class
+                    ) VALUES ($1, $2, $3, $4, $5, $6, NULL, 'pat')
+                    """,
+                    token_id,
+                    uuid.UUID(user["id"]),
+                    f"e2e-{label}-{namespace}",
+                    token_hash,
+                    token_prefix,
+                    scopes,
+                )
+                return raw, {"id": str(token_id), "name": label}
+
+            async def create_vault(label: str, owner: dict[str, str]) -> dict[str, str]:
+                vault_id = uuid.uuid4()
+                name = f"e2e-{label}-{namespace}"
+                await connection.execute(
+                    """
+                    INSERT INTO vaults (id, name, git_path, owner_id)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    vault_id,
+                    name,
+                    str(GIT_FIXTURE_ROOT / f"{name}.git"),
+                    uuid.UUID(owner["id"]),
+                )
+                return {"id": str(vault_id), "name": name, "owner_id": owner["id"]}
+
+            async def grant_vault(
+                vault: dict[str, str],
+                user: dict[str, str],
+                role: str,
+            ) -> None:
+                await connection.execute(
+                    """
+                    INSERT INTO vault_access (vault_id, user_id, role, granted_by)
+                    VALUES ($1, $2, $3, $2)
+                    ON CONFLICT (vault_id, user_id) DO UPDATE SET role = EXCLUDED.role
+                    """,
+                    uuid.UUID(vault["id"]),
+                    uuid.UUID(user["id"]),
+                    role,
+                )
+
+            async def create_app(label: str) -> dict[str, str]:
+                app_id = uuid.uuid4()
+                app_key = f"e2e-{label}-{namespace}"
+                await connection.execute(
+                    """
+                    INSERT INTO app_definitions (id, app_key, display_name, description)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    app_id,
+                    app_key,
+                    f"E2E {label}",
+                    "Repository E2E lifecycle fixture",
+                )
+                return {"id": str(app_id), "app_key": app_key}
+
+            async def create_release(
+                app: dict[str, str],
+                version: str,
+                fingerprint: str,
+            ) -> dict[str, str]:
+                release_id = uuid.uuid4()
+                manifest = json.dumps(
+                    {
+                        "steps": [{"id": "prepare"}],
+                        "expected_schema_fingerprint": fingerprint,
+                    },
+                    separators=(",", ":"),
+                )
+                checksum = hashlib.sha256(manifest.encode()).hexdigest()
+                await connection.execute(
+                    """
+                    INSERT INTO app_releases (
+                        id, app_id, version, manifest, manifest_checksum
+                    ) VALUES ($1, $2, $3, $4::jsonb, $5)
+                    """,
+                    release_id,
+                    uuid.UUID(app["id"]),
+                    version,
+                    manifest,
+                    checksum,
+                )
+                return {
+                    "id": str(release_id),
+                    "version": version,
+                    "schema_fingerprint": fingerprint,
+                }
+
+            async def create_installation(
+                app: dict[str, str],
+                vault: dict[str, str],
+                release: dict[str, str],
+                *,
+                lifecycle: str,
+                resource: tuple[str, str] | None = None,
+                observed: bool = False,
+                observed_fingerprint: str | None = None,
+                blocked_reason: str | None = None,
+            ) -> dict[str, object]:
+                installation_id = uuid.uuid4()
+                desired_release_id = (
+                    uuid.UUID(release["id"]) if lifecycle != "uninstalled" else None
+                )
+                current_release_id = uuid.UUID(release["id"])
+                await connection.execute(
+                    """
+                    INSERT INTO vault_app_installations (
+                        id, app_id, vault_id, desired_release_id,
+                        current_release_id, lifecycle, blocked_reason,
+                        grant_generation
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+                    """,
+                    installation_id,
+                    uuid.UUID(app["id"]),
+                    uuid.UUID(vault["id"]),
+                    desired_release_id,
+                    current_release_id,
+                    lifecycle,
+                    blocked_reason,
+                )
+                grant_id = uuid.uuid4()
+                grant_status = "revoked" if lifecycle == "uninstalled" else "active"
+                await connection.execute(
+                    """
+                    INSERT INTO installation_grants (
+                        id, installation_id, generation, status,
+                        capabilities, issuer, provenance, revoked_at
+                    ) VALUES (
+                        $1, $2, 1, $3, $4, 'fixture', '{}'::jsonb,
+                        CASE WHEN $3 = 'revoked' THEN NOW() ELSE NULL END
+                    )
+                    """,
+                    grant_id,
+                    installation_id,
+                    grant_status,
+                    ["installation:read", "inventory:read"],
+                )
+                resource_entry: dict[str, str] | None = None
+                if resource is not None:
+                    resource_entry = {
+                        "kind": resource[0],
+                        "key": resource[1],
+                        "status": "retained" if lifecycle == "uninstalled" else "owned",
+                    }
+                    await connection.execute(
+                        """
+                        INSERT INTO app_owned_resources (
+                            installation_id, vault_id, resource_kind,
+                            resource_key, status
+                        ) VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        installation_id,
+                        uuid.UUID(vault["id"]),
+                        resource_entry["kind"],
+                        resource_entry["key"],
+                        resource_entry["status"],
+                    )
+                if observed:
+                    await connection.execute(
+                        """
+                        INSERT INTO app_installation_observed_states (
+                            installation_id, app_id, vault_id, observed_generation,
+                            observed_at, observed_release_id, observed_release_version,
+                            schema_fingerprint, observed_grant_generation,
+                            checkpoint, recent_error
+                        ) VALUES (
+                            $1, $2, $3, 1, NOW(), $4, $5, $6, 1,
+                            '{"phase":"ready"}'::jsonb, NULL
+                        )
+                        """,
+                        installation_id,
+                        uuid.UUID(app["id"]),
+                        uuid.UUID(vault["id"]),
+                        uuid.UUID(release["id"]),
+                        release["version"],
+                        observed_fingerprint or release["schema_fingerprint"],
+                    )
+                return {
+                    "id": str(installation_id),
+                    "app_id": app["id"],
+                    "vault_id": vault["id"],
+                    "release_id": release["id"],
+                    "lifecycle": lifecycle,
+                    "resource": resource_entry,
+                    "observed": observed,
+                    "observed_fingerprint": (
+                        observed_fingerprint or release["schema_fingerprint"]
+                        if observed
+                        else None
+                    ),
+                }
+
+            async def create_app_credential(
+                app: dict[str, str],
+                deployment: str,
+                *,
+                status: str = "active",
+            ) -> tuple[str | None, dict[str, str]]:
+                raw, credential_hash, credential_prefix = _fixture_material("akb_app_")
+                credential_id = uuid.uuid4()
+                await connection.execute(
+                    """
+                    INSERT INTO app_credentials (
+                        id, app_id, deployment, generation, credential_hash,
+                        credential_prefix, status, overlap_until, revoked_at
+                    ) VALUES (
+                        $1, $2, $3, 1, $4, $5, $6,
+                        CASE WHEN $6 = 'rotated' THEN NOW() - INTERVAL '1 second' ELSE NULL END,
+                        CASE WHEN $6 = 'revoked' THEN NOW() ELSE NULL END
+                    )
+                    """,
+                    credential_id,
+                    uuid.UUID(app["id"]),
+                    deployment,
+                    credential_hash,
+                    credential_prefix,
+                    status,
+                )
+                metadata = {
+                    "id": str(credential_id),
+                    "app_id": app["id"],
+                    "deployment": deployment,
+                    "status": status,
+                }
+                return (raw if status == "active" else None), metadata
+
+            system_admin = await create_user("system-admin", is_admin=True)
+            vault_admin = await create_user("vault-admin")
+            reader = await create_user("reader")
+            writer = await create_user("writer")
+            foreign_admin = await create_user("foreign-admin")
+
+            system_token, system_token_meta = await create_pat(
+                system_admin, "system-admin", ["read", "write", "admin"]
+            )
+            vault_token, vault_token_meta = await create_pat(
+                vault_admin, "vault-admin", ["read", "write", "admin"]
+            )
+            reader_token, reader_token_meta = await create_pat(
+                reader, "reader", ["read"]
+            )
+            writer_token, writer_token_meta = await create_pat(
+                writer, "writer", ["read", "write"]
+            )
+            foreign_token, foreign_token_meta = await create_pat(
+                foreign_admin, "foreign-admin", ["read", "write", "admin"]
+            )
+
+            target_active = await create_vault("target-active", vault_admin)
+            target_install = await create_vault("target-install", vault_admin)
+            target_blocked = await create_vault("target-blocked", vault_admin)
+            target_restore_compatible = await create_vault("target-restore-compatible", vault_admin)
+            target_restore_mismatch = await create_vault("target-restore-mismatch", vault_admin)
+            target_restore_unknown = await create_vault("target-restore-unknown", vault_admin)
+            target_fresh_collision = await create_vault("target-fresh-collision", vault_admin)
+            target_fresh_empty = await create_vault("target-fresh-empty", vault_admin)
+            foreign_vault = await create_vault("foreign", foreign_admin)
+            for vault in (
+                target_active,
+                target_install,
+                target_blocked,
+                target_restore_compatible,
+                target_restore_mismatch,
+                target_restore_unknown,
+                target_fresh_collision,
+                target_fresh_empty,
+            ):
+                await grant_vault(vault, reader, "reader")
+                await grant_vault(vault, writer, "writer")
+
+            primary_app = await create_app("primary")
+            foreign_app = await create_app("foreign")
+            primary_release = await create_release(primary_app, "1.0.0", "a" * 64)
+            primary_conflict_release = await create_release(primary_app, "2.0.0", "a" * 64)
+            foreign_release = await create_release(foreign_app, "1.0.0", "b" * 64)
+
+            installations = {
+                "active": await create_installation(
+                    primary_app,
+                    target_active,
+                    primary_release,
+                    lifecycle="active",
+                    resource=("managed_table", f"owned-{namespace}"),
+                    observed=True,
+                ),
+                "blocked": await create_installation(
+                    primary_app,
+                    target_blocked,
+                    primary_release,
+                    lifecycle="blocked",
+                    resource=("managed_table", f"blocked-{namespace}"),
+                    observed=True,
+                    blocked_reason="worker_timeout",
+                ),
+                "restore_compatible": await create_installation(
+                    primary_app,
+                    target_restore_compatible,
+                    primary_release,
+                    lifecycle="uninstalled",
+                    resource=("managed_table", f"restore-compatible-{namespace}"),
+                    observed=True,
+                ),
+                "restore_mismatch": await create_installation(
+                    primary_app,
+                    target_restore_mismatch,
+                    primary_release,
+                    lifecycle="uninstalled",
+                    resource=("managed_table", f"restore-mismatch-{namespace}"),
+                    observed=True,
+                    observed_fingerprint="c" * 64,
+                ),
+                "restore_unknown": await create_installation(
+                    primary_app,
+                    target_restore_unknown,
+                    primary_release,
+                    lifecycle="uninstalled",
+                    resource=("managed_table", f"restore-unknown-{namespace}"),
+                ),
+                "fresh_retained": await create_installation(
+                    primary_app,
+                    target_fresh_collision,
+                    primary_release,
+                    lifecycle="uninstalled",
+                    resource=("managed_table", f"fresh-retained-{namespace}"),
+                ),
+                "fresh_empty": await create_installation(
+                    primary_app,
+                    target_fresh_empty,
+                    primary_release,
+                    lifecycle="uninstalled",
+                ),
+                "foreign_active": await create_installation(
+                    foreign_app,
+                    foreign_vault,
+                    foreign_release,
+                    lifecycle="active",
+                    resource=("managed_table", f"foreign-{namespace}"),
+                    observed=True,
+                ),
+            }
+
+            primary_credential, primary_credential_meta = await create_app_credential(
+                primary_app, "production"
+            )
+            foreign_credential, foreign_credential_meta = await create_app_credential(
+                foreign_app, "production"
+            )
+            _, stale_credential_meta = await create_app_credential(
+                primary_app, "stale", status="rotated"
+            )
+            _, revoked_credential_meta = await create_app_credential(
+                primary_app, "revoked", status="revoked"
+            )
+
+        assert primary_credential is not None
+        assert foreign_credential is not None
+        primary_app_path = primary_app["id"]
+        install_path = target_install["id"]
+        active_path = target_active["id"]
+        manifest: dict[str, object] = {
+            "schema_version": FIXTURE_MANIFEST_SCHEMA_VERSION,
+            "scenario": APP_LIFECYCLE_SCENARIO,
+            "namespace": namespace,
+            "origin": origin,
+            "fixture_origin": fixture_origin,
+            "reset_url": f"{fixture_origin}/__e2e/reset",
+            "credential_variables": list(CREDENTIAL_VARIABLES),
+            "actors": {
+                "system_admin": {
+                    **system_admin,
+                    "token_env": CREDENTIAL_VARIABLES[0],
+                    "roles": ["system_admin"],
+                    "token_id": system_token_meta["id"],
+                },
+                "vault_admin": {
+                    **vault_admin,
+                    "token_env": CREDENTIAL_VARIABLES[1],
+                    "roles": ["owner", "admin", "writer"],
+                    "token_id": vault_token_meta["id"],
+                    "vault_ids": [
+                        target_active["id"],
+                        target_install["id"],
+                        target_blocked["id"],
+                        target_restore_compatible["id"],
+                        target_restore_mismatch["id"],
+                        target_restore_unknown["id"],
+                        target_fresh_collision["id"],
+                        target_fresh_empty["id"],
+                    ],
+                },
+                "reader": {
+                    **reader,
+                    "token_env": CREDENTIAL_VARIABLES[2],
+                    "roles": ["reader"],
+                    "token_id": reader_token_meta["id"],
+                    "vault_ids": [target_active["id"], target_install["id"]],
+                },
+                "writer": {
+                    **writer,
+                    "token_env": CREDENTIAL_VARIABLES[3],
+                    "roles": ["writer"],
+                    "token_id": writer_token_meta["id"],
+                    "vault_ids": [
+                        target_active["id"],
+                        target_install["id"],
+                        target_blocked["id"],
+                        target_restore_compatible["id"],
+                        target_restore_mismatch["id"],
+                        target_restore_unknown["id"],
+                        target_fresh_collision["id"],
+                        target_fresh_empty["id"],
+                    ],
+                },
+                "foreign_admin": {
+                    **foreign_admin,
+                    "token_env": CREDENTIAL_VARIABLES[4],
+                    "roles": ["owner", "admin", "writer"],
+                    "token_id": foreign_token_meta["id"],
+                    "vault_ids": [foreign_vault["id"]],
+                },
+            },
+            "apps": {
+                "primary": {
+                    **primary_app,
+                    "releases": {
+                        "primary": primary_release,
+                        "conflict": primary_conflict_release,
+                    },
+                    "credential_env": CREDENTIAL_VARIABLES[5],
+                    "token_env": CREDENTIAL_VARIABLES[6],
+                },
+                "foreign": {
+                    **foreign_app,
+                    "releases": {"primary": foreign_release},
+                    "credential_env": CREDENTIAL_VARIABLES[7],
+                },
+            },
+            "vaults": {
+                "active": target_active,
+                "install": target_install,
+                "blocked": target_blocked,
+                "restore_compatible": target_restore_compatible,
+                "restore_mismatch": target_restore_mismatch,
+                "restore_unknown": target_restore_unknown,
+                "fresh_retained": target_fresh_collision,
+                "fresh_empty": target_fresh_empty,
+                "foreign": foreign_vault,
+            },
+            "installations": installations,
+            "credentials": {
+                "primary": primary_credential_meta,
+                "foreign": foreign_credential_meta,
+                "stale": stale_credential_meta,
+                "revoked": revoked_credential_meta,
+            },
+            "endpoint_tasks": {
+                "install": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{install_path}",
+                    "release_id": primary_release["id"],
+                    "capabilities": ["installation:read"],
+                },
+                "replay": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{install_path}",
+                    "release_id": primary_release["id"],
+                    "capabilities": ["installation:read"],
+                },
+                "conflict": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{install_path}",
+                    "release_id": primary_conflict_release["id"],
+                    "capabilities": ["installation:read"],
+                },
+                "active_status": {
+                    "method": "GET",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{active_path}",
+                },
+                "uninstall": {
+                    "method": "DELETE",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{active_path}",
+                },
+                "restore_compatible": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{installations['restore_compatible']['vault_id']}",
+                    "release_id": primary_release["id"],
+                    "capabilities": ["installation:read"],
+                    "mode": "restore",
+                },
+                "restore_mismatch": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{installations['restore_mismatch']['vault_id']}",
+                    "release_id": primary_release["id"],
+                    "capabilities": ["installation:read"],
+                    "mode": "restore",
+                },
+                "restore_unknown": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{installations['restore_unknown']['vault_id']}",
+                    "release_id": primary_release["id"],
+                    "capabilities": ["installation:read"],
+                    "mode": "restore",
+                },
+                "fresh_retained": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{installations['fresh_retained']['vault_id']}",
+                    "release_id": primary_conflict_release["id"],
+                    "capabilities": ["installation:read"],
+                    "mode": "fresh",
+                },
+                "fresh_empty": {
+                    "method": "PUT",
+                    "path": f"/api/v1/apps/{primary_app_path}/installations/{installations['fresh_empty']['vault_id']}",
+                    "release_id": primary_conflict_release["id"],
+                    "capabilities": ["installation:read"],
+                    "mode": "fresh",
+                },
+                "app_status": {
+                    "method": "GET",
+                    "path": f"/api/v1/app/installations/{active_path}",
+                    "credential_env": CREDENTIAL_VARIABLES[6],
+                },
+                "foreign_app_status": {
+                    "method": "GET",
+                    "path": f"/api/v1/app/installations/{installations['foreign_active']['vault_id']}",
+                    "credential_env": CREDENTIAL_VARIABLES[7],
+                },
+                "credential_exchange": {
+                    "method": "POST",
+                    "path": "/api/v1/auth/app-token",
+                },
+            },
+        }
+        credentials = {
+            CREDENTIAL_VARIABLES[0]: system_token,
+            CREDENTIAL_VARIABLES[1]: vault_token,
+            CREDENTIAL_VARIABLES[2]: reader_token,
+            CREDENTIAL_VARIABLES[3]: writer_token,
+            CREDENTIAL_VARIABLES[4]: foreign_token,
+            CREDENTIAL_VARIABLES[5]: primary_credential,
+            CREDENTIAL_VARIABLES[7]: foreign_credential,
+        }
+        return manifest, credentials
+    finally:
+        await connection.close()
+
+
+def _exchange_fixture_app_token(origin: str, credential: str) -> str:
+    request = Request(
+        f"{origin}/api/v1/auth/app-token",
+        data=json.dumps({"credential": credential}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:  # nosec B310
+            payload = json.loads(response.read(65536))
+    except (HTTPError, OSError, URLError, ValueError) as exc:
+        raise RuntimeError("fixture app token exchange failed") from exc
+    access_token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(access_token, str) or not access_token:
+        raise RuntimeError("fixture app token exchange returned no token")
+    return access_token
+
+
+def seed_scenario(settings: RuntimeSettings) -> tuple[dict[str, object] | None, dict[str, str] | None]:
+    remove_fixture_artifacts(settings)
+    if settings.scenario == DEFAULT_SCENARIO:
+        return None, None
+    if settings.scenario != APP_LIFECYCLE_SCENARIO:
+        raise ValueError("unsupported E2E scenario")
+    manifest, credentials = asyncio.run(
+        _seed_app_lifecycle(
+            settings.database_url,
+            origin=settings.origin,
+            fixture_origin=settings.fixture_origin,
+        )
+    )
+    credentials[CREDENTIAL_VARIABLES[6]] = _exchange_fixture_app_token(
+        settings.origin,
+        credentials[CREDENTIAL_VARIABLES[5]],
+    )
+    return manifest, credentials
+
+
+def write_fixture_artifacts(
+    settings: RuntimeSettings,
+    manifest: dict[str, object] | None,
+    credentials: dict[str, str] | None,
+) -> None:
+    if manifest is None or credentials is None:
+        return
+    manifest_path, profile_path = fixture_artifact_paths(settings)
+    manifest_content = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ) + "\n"
+    profile_content = "".join(
+        f"{name}={shlex.quote(credentials[name])}\n" for name in CREDENTIAL_VARIABLES
+    )
+    _atomic_write(manifest_path, manifest_content, 0o600)
+    try:
+        _atomic_write(profile_path, profile_content, 0o600)
+    except BaseException:
+        remove_fixture_artifacts(settings)
+        raise
+
+
 def ready_payload(settings: RuntimeSettings) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema_version": 1,
         "status": "ready",
         "origin": settings.origin,
@@ -262,10 +967,30 @@ def ready_payload(settings: RuntimeSettings) -> dict[str, object]:
         "reset_url": f"{settings.fixture_origin}/__e2e/reset",
         "scenario": settings.scenario,
     }
+    if settings.scenario == APP_LIFECYCLE_SCENARIO:
+        manifest_path, profile_path = fixture_artifact_paths(settings)
+        payload.update(
+            {
+                "fixture_manifest": str(manifest_path),
+                "credential_profile": str(profile_path),
+                "credential_variables": list(CREDENTIAL_VARIABLES),
+            }
+        )
+    return payload
 
 
 def reset_payload(settings: RuntimeSettings) -> dict[str, object]:
-    return {"ok": True, "scenario": settings.scenario}
+    payload: dict[str, object] = {"ok": True, "scenario": settings.scenario}
+    if settings.scenario == APP_LIFECYCLE_SCENARIO:
+        manifest_path, profile_path = fixture_artifact_paths(settings)
+        payload.update(
+            {
+                "fixture_manifest": str(manifest_path),
+                "credential_profile": str(profile_path),
+                "credential_variables": list(CREDENTIAL_VARIABLES),
+            }
+        )
+    return payload
 
 
 def write_ready_file(path: Path, payload: Mapping[str, object]) -> None:
@@ -559,6 +1284,7 @@ class E2ERuntime:
             "AKB_E2E_DATABASE_URL",
             "AKB_E2E_S3_ACCESS_KEY",
             "AKB_E2E_S3_SECRET_KEY",
+            *CREDENTIAL_VARIABLES,
         ):
             environment.pop(key, None)
         return environment
@@ -622,7 +1348,6 @@ class E2ERuntime:
     def _start_backend(self) -> None:
         self.backend_process = self._start_process(self.backend_command, self.repo_root, BACKEND_LOG)
         self._wait_for_backend()
-        self._write_ready()
 
     def _stop_backend(self) -> None:
         self.ready = False
@@ -633,6 +1358,7 @@ class E2ERuntime:
     def start(self) -> None:
         try:
             remove_ready_file(self.settings.ready_file)
+            remove_fixture_artifacts(self.settings)
             if self.settings.manage_postgres:
                 self._compose_up()
             clear_git_fixture_root()
@@ -642,6 +1368,9 @@ class E2ERuntime:
             self.embed_process = self._start_process(self.embed_command, self.repo_root / "backend", EMBED_LOG)
             self._wait_for_embed()
             self._start_backend()
+            manifest, credentials = seed_scenario(self.settings)
+            write_fixture_artifacts(self.settings, manifest, credentials)
+            self._write_ready()
         except BaseException:
             self.shutdown()
             raise
@@ -649,10 +1378,14 @@ class E2ERuntime:
     def reset(self) -> None:
         with self.reset_lock:
             self._stop_backend()
+            remove_fixture_artifacts(self.settings)
             try:
                 reset_database(self.settings.database_url)
                 clear_git_fixture_root()
                 self._start_backend()
+                manifest, credentials = seed_scenario(self.settings)
+                write_fixture_artifacts(self.settings, manifest, credentials)
+                self._write_ready()
             except BaseException:
                 self._stop_backend()
                 raise
@@ -709,6 +1442,7 @@ class E2ERuntime:
         self.ready = False
         try:
             remove_ready_file(self.settings.ready_file)
+            remove_fixture_artifacts(self.settings)
             if self.control_server is not None:
                 self.control_server.shutdown()
                 self.control_server.server_close()
