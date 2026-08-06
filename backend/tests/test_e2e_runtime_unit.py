@@ -91,6 +91,14 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
         "method": "GET",
         "url": "http://127.0.0.1:8889/openapi.json",
     }
+    assert fixture["fixture_discovery"] == {
+        "method": "GET",
+        "url": "http://127.0.0.1:8889/discover",
+    }
+    assert fixture["log_observation"] == {
+        "method": "GET",
+        "url": "http://127.0.0.1:8889/log-observation",
+    }
     assert fixture["reset"] == {
         "method": "POST",
         "url": "http://127.0.0.1:8889/reset",
@@ -118,9 +126,11 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     assert "external-password-value" not in serialized
 
 
-def test_scenario_argument_is_explicitly_empty_only():
+def test_scenario_argument_supports_the_lifecycle_fixture():
     config = _parse_args(["serve", "--scenario", "empty"])
     assert config.scenario == "empty"
+    lifecycle = _parse_args(["serve", "--scenario", "app-installation-lifecycle"])
+    assert lifecycle.scenario == "app-installation-lifecycle"
     with pytest.raises(SystemExit):
         _parse_args(["serve", "--scenario", "project"])
 
@@ -252,23 +262,40 @@ async def test_process_termination_cleans_a_process_group():
 
 
 class FakeFixtureRuntime:
-    def __init__(self):
+    def __init__(self, scenario="empty"):
         self.reset_count = 0
-        self.scenario = "empty"
+        self.scenario = scenario
 
     def fixture_health(self):
-        return {"status": "ready", "scenario": "empty", "app_ready": True}
+        return {"status": "ready", "scenario": self.scenario, "app_ready": True}
 
-    async def reset_empty(self):
+    def fixture_discovery(self):
+        return {"status": "ready", "scenario": self.scenario, "fixtures": {}}
+
+    def fixture_log_observation(self):
+        return {
+            "status": "ready",
+            "scenario": self.scenario,
+            "redacted": True,
+            "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
+        }
+
+    async def reset_scenario(self):
         self.reset_count += 1
 
 
 @pytest.mark.asyncio
-async def test_fixture_control_exposes_only_empty_reset_and_discovery():
+async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
     runtime = FakeFixtureRuntime()
     app = create_app(runtime)
     paths = {route.path for route in app.routes}
-    assert {"/health", "/reset", "/openapi.json"} <= paths
+    assert {
+        "/health",
+        "/reset",
+        "/discover",
+        "/log-observation",
+        "/openapi.json",
+    } <= paths
     assert "/stop" not in paths
 
     async with httpx.AsyncClient(
@@ -276,14 +303,29 @@ async def test_fixture_control_exposes_only_empty_reset_and_discovery():
     ) as client:
         health = await client.get("/health")
         assert health.status_code == 200
+        discovery = await client.get("/discover")
+        assert discovery.json()["fixtures"] == {}
+        log_observation = await client.get("/log-observation")
+        assert log_observation.json()["redaction_scan"]["private_value_hits"] == 0
         reset = await client.post("/reset", json={"scenario": "empty"})
         assert reset.status_code == 200
         assert runtime.reset_count == 1
+        lifecycle_runtime = FakeFixtureRuntime("app-installation-lifecycle")
+        lifecycle_app = create_app(lifecycle_runtime)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=lifecycle_app),
+            base_url="http://lifecycle-fixture.test",
+        ) as lifecycle_client:
+            lifecycle_reset = await lifecycle_client.post(
+                "/reset", json={"scenario": "app-installation-lifecycle"}
+            )
+        assert lifecycle_reset.status_code == 200
+        assert lifecycle_runtime.reset_count == 1
         unsupported = await client.post("/reset", json={"scenario": "project"})
         assert unsupported.status_code == 422
-        discovery = await client.get("/openapi.json")
-        assert discovery.status_code == 200
-        assert "/reset" in discovery.json()["paths"]
+        openapi = await client.get("/openapi.json")
+        assert openapi.status_code == 200
+        assert "/reset" in openapi.json()["paths"]
 
 
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
@@ -299,6 +341,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     workflow = WORKFLOW.read_text()
     assert "backend/scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
+    assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
     assert "uv sync --locked --extra dev --project backend" in workflow
     assert "services:" not in workflow
     for suite in CURATED_SUITES:
@@ -312,6 +355,7 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     text = BOOTSTRAP.read_text()
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
+    assert "app-installation-lifecycle" in text
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text
     assert stat.S_IMODE(BOOTSTRAP.stat().st_mode) & stat.S_IXUSR
