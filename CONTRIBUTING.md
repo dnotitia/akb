@@ -54,6 +54,10 @@ Backend code lives in `backend/app/`; the MCP server in `backend/mcp_server/`;
 the frontend in `frontend/`. The stdio MCP proxy that ships on npm lives
 under `packages/akb-mcp-client/`.
 
+The local Compose path and the repository-owned E2E runtime are separate
+development paths. See [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md)
+for the suite, runtime, and clean-host bootstrap contracts.
+
 ## Configuration
 
 The backend reads exactly two YAML files — `app.yaml` (non-secret) and
@@ -68,11 +72,24 @@ variables are read by the backend.** When you need a new setting:
 ## Running Tests
 
 ```bash
-# Backend E2E (requires the docker compose stack up)
+# Individual endpoint-driven suites against the normal local Compose stack
 AKB_URL=http://localhost:8000 bash backend/tests/test_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_edit_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
 # … see backend/tests/ for the full list
+
+# CI-equivalent isolated full gate (uses the repository-owned runtime and
+# its private PostgreSQL/MinIO dependency stack, not the root Compose app)
+uv sync --locked --extra dev --project backend
+RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
+export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
+  'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"
+export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
+  'import secrets; print(secrets.token_urlsafe(24))')"
+uv run --locked --project backend python \
+  backend/scripts/ci/e2e_runtime.py gate \
+  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
+unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 
 # Frontend
 cd frontend && pnpm test
@@ -80,7 +97,13 @@ cd frontend && pnpm test
 
 The E2E suites create ephemeral users and vaults and clean up after
 themselves. They poll `/health` for indexing completion before running search
-assertions, so a slow remote embedding endpoint won't cause flakes.
+assertions, so a slow remote embedding endpoint won't cause flakes. An
+individual suite targets whatever `AKB_URL` points at; the isolated full gate
+starts its own host-process backend/embed/fixture topology. Read the detailed
+runtime contract before changing CI or host bootstrap behavior. The supervisor
+cleans child processes and dependency resources on exit, but leaves the
+private `RUNTIME_ROOT` and its logs for inspection; the caller owns removing
+that explicit temporary directory after collecting what it needs.
 
 ## Code Style
 
@@ -92,6 +115,8 @@ assertions, so a slow remote embedding endpoint won't cause flakes.
 ## Pull Request Checklist
 
 - [ ] All E2E suites pass against your local stack.
+- [ ] Changes to the E2E runtime/bootstrap also pass the isolated full gate;
+      see [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md).
 - [ ] No secrets, internal hostnames/IPs, or personal info in commits or
       diffs (check `git diff` carefully).
 - [ ] New configuration is reflected in `config/*.yaml.example`.
