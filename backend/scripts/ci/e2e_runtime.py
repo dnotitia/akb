@@ -360,6 +360,7 @@ class E2ERuntime:
         secret_config = {
             "db_password": "akb",
             "jwt_secret": secrets.token_urlsafe(48),
+            "app_token_secret": secrets.token_urlsafe(48),
             "embed_api_key": "ci-stub-no-auth",
             "s3_access_key": "akb-ci",
             "s3_secret_key": "akb-ci-secret",
