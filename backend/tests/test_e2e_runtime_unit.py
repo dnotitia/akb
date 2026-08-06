@@ -261,6 +261,31 @@ async def test_process_termination_cleans_a_process_group():
     assert process.returncode is not None
 
 
+@pytest.mark.asyncio
+async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp_path, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path))
+    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    async def fake_compose(*arguments: str, **kwargs: object) -> int:
+        compose_calls.append((arguments, kwargs))
+        return 0
+
+    async def fake_wait_tcp(*_args: object) -> None:
+        return None
+
+    async def fake_wait_http(*_args: object) -> bytes:
+        return b""
+
+    monkeypatch.setattr(runtime, "_compose", fake_compose)
+    monkeypatch.setattr(runtime, "_wait_tcp", fake_wait_tcp)
+    monkeypatch.setattr(runtime, "_wait_http", fake_wait_http)
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+
+    await runtime._start_dependencies()
+
+    assert compose_calls == [(("up", "--detach", "--wait"), {})]
+
+
 class FakeFixtureRuntime:
     def __init__(self, scenario="empty"):
         self.reset_count = 0

@@ -504,7 +504,7 @@ class E2ERuntime:
         await terminate_process(managed.process, process_group=managed.process_group)
 
     async def _start_dependencies(self) -> None:
-        await self._compose("up", "--detach")
+        await self._compose("up", "--detach", "--wait")
         await self._wait_tcp("PostgreSQL", "127.0.0.1", 15432)
         await self._wait_http(
             "MinIO",
