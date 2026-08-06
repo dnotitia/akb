@@ -1,4 +1,4 @@
-"""Focused contract tests for the repository-owned Apple VM E2E runtime."""
+"""Focused contract tests for the repository-owned E2E runtime."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from fixture_control import create_app  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
-BOOTSTRAP = CI_DIR / "apple_vm_bootstrap.sh"
+BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 
 
@@ -306,7 +306,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     assert "akb-e2e-runtime-logs" in workflow
 
 
-def test_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
+def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)
     assert result.returncode == 0
     text = BOOTSTRAP.read_text()

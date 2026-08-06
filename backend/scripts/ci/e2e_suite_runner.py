@@ -1,6 +1,6 @@
 """Run the exact curated HTTP E2E suite used by hosted CI.
 
-The list and count handling live here so an Apple VM gate and GitHub Actions
+The list and count handling live here so an isolated host gate and GitHub Actions
 cannot silently drift.  A suite must report both counts in its final matching
 ``Results: N passed, M failed`` line; otherwise the gate fails closed.
 """

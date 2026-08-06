@@ -1,4 +1,4 @@
-"""Repository-owned live E2E runtime for an Ubuntu Apple VM.
+"""Repository-owned live E2E runtime for a clean Ubuntu 24.04 host.
 
 The runtime owns only the test infrastructure around AKB:
 

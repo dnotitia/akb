@@ -2,7 +2,7 @@
 
 ## Architecture
 
-- **Backend**: Python 3.11, FastAPI + Uvicorn, PostgreSQL 16 + pgvector, GitPython (bare repo)
+- **Backend**: Python 3.14, FastAPI + Uvicorn, PostgreSQL 16 + pgvector, GitPython (bare repo)
 - **MCP**: Anthropic MCP SDK (Streamable HTTP) — backend serves as HTTP MCP server
 - **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, zero dependencies, stdio ↔ HTTP bridge
 - **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Plate (`platejs` markdown editor; lazy-loaded in Edit / New-document flows)
@@ -77,6 +77,10 @@ Two supported paths:
 - Central function: `document_repo.find_by_ref()`
 
 ## Testing
+
+The endpoint-driven suites, isolated repository-owned runtime, and optional
+Ubuntu host bootstrap are documented in
+[`backend/scripts/ci/README.md`](backend/scripts/ci/README.md).
 
 - `backend/tests/test_mcp_e2e.sh` — main E2E (75 tests), covers core CRUD, search, tables, access control
 - `backend/tests/test_edit_e2e.sh` — akb_edit E2E (33 tests)

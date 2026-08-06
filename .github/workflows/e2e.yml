@@ -1,6 +1,6 @@
 name: e2e
 
-# The repository-owned runtime is shared with the Apple VM launcher.  Compose
+# The repository-owned runtime is shared with the clean Ubuntu host bootstrap.  Compose
 # owns only pgvector/PostgreSQL and pinned MinIO; the embedding stub, backend,
 # fixture control, and curated shell suites stay host processes.
 on:
