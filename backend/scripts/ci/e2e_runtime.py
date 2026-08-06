@@ -245,9 +245,31 @@ class E2ERuntime:
         }
 
     def fixture_discovery(self) -> dict[str, object]:
-        """Return randomized, non-secret fixture coordinates for validation."""
+        """Return fixture coordinates and source-neutral validator entry points."""
 
-        return json.loads(json.dumps(self._fixture_catalog))
+        catalog = json.loads(json.dumps(self._fixture_catalog))
+        catalog["access"] = {
+            "login": {
+                "service": "app",
+                "method": "POST",
+                "path": "/api/v1/auth/login",
+                "fields": ["username", "password"],
+                "credential_source": "external_env_only",
+                "credential_env": {
+                    "username": self.config.credentials.username_env,
+                    "password": self.config.credentials.password_env,
+                },
+            }
+        }
+        catalog["tasks"] = {
+            "log_observation": {
+                "service": "fixture",
+                "method": "GET",
+                "path": "/log-observation",
+                "result": "sanitized",
+            }
+        }
+        return catalog
 
     def fixture_log_observation(self) -> dict[str, object]:
         """Return redaction counts without returning runtime log contents."""
@@ -302,15 +324,7 @@ class E2ERuntime:
                     },
                     "discovery": {
                         "method": "GET",
-                        "url": f"{self.config.fixture_origin}/openapi.json",
-                    },
-                    "fixture_discovery": {
-                        "method": "GET",
                         "url": f"{self.config.fixture_origin}/discover",
-                    },
-                    "log_observation": {
-                        "method": "GET",
-                        "url": f"{self.config.fixture_origin}/log-observation",
                     },
                 },
             },

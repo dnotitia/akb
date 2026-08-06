@@ -89,16 +89,9 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     }
     assert fixture["discovery"] == {
         "method": "GET",
-        "url": "http://127.0.0.1:8889/openapi.json",
-    }
-    assert fixture["fixture_discovery"] == {
-        "method": "GET",
         "url": "http://127.0.0.1:8889/discover",
     }
-    assert fixture["log_observation"] == {
-        "method": "GET",
-        "url": "http://127.0.0.1:8889/log-observation",
-    }
+    assert set(fixture) == {"origin", "health", "reset", "discovery"}
     assert fixture["reset"] == {
         "method": "POST",
         "url": "http://127.0.0.1:8889/reset",
@@ -122,6 +115,54 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     assert descriptor["credentials"]["username_env"] == "TEST_USERNAME_ENV"
     assert descriptor["credentials"]["password_env"] == "TEST_PASSWORD_ENV"
     serialized = str(descriptor)
+    assert "external-user-value" not in serialized
+    assert "external-password-value" not in serialized
+
+
+def test_fixture_discovery_declares_access_tasks_and_preserves_catalog_without_secrets(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_USERNAME_ENV", "external-user-value")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "external-password-value")
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "namespace": "fixture-randomized",
+        "fixtures": {
+            "active": {"installation_id": "installation-randomized"},
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+
+    assert discovery["scenario"] == "app-installation-lifecycle"
+    assert discovery["namespace"] == "fixture-randomized"
+    assert discovery["fixtures"] == {
+        "active": {"installation_id": "installation-randomized"},
+    }
+    assert discovery["access"] == {
+        "login": {
+            "service": "app",
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "fields": ["username", "password"],
+            "credential_source": "external_env_only",
+            "credential_env": {
+                "username": "TEST_USERNAME_ENV",
+                "password": "TEST_PASSWORD_ENV",
+            },
+        }
+    }
+    assert discovery["tasks"] == {
+        "log_observation": {
+            "service": "fixture",
+            "method": "GET",
+            "path": "/log-observation",
+            "result": "sanitized",
+        }
+    }
+    serialized = json.dumps(discovery)
     assert "external-user-value" not in serialized
     assert "external-password-value" not in serialized
 
@@ -308,7 +349,28 @@ class FakeFixtureRuntime:
         return {"status": "ready", "scenario": self.scenario, "app_ready": True}
 
     def fixture_discovery(self):
-        return {"status": "ready", "scenario": self.scenario, "fixtures": {}}
+        return {
+            "status": "ready",
+            "scenario": self.scenario,
+            "fixtures": {},
+            "access": {
+                "login": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": "/api/v1/auth/login",
+                    "fields": ["username", "password"],
+                    "credential_source": "external_env_only",
+                }
+            },
+            "tasks": {
+                "log_observation": {
+                    "service": "fixture",
+                    "method": "GET",
+                    "path": "/log-observation",
+                    "result": "sanitized",
+                }
+            },
+        }
 
     def fixture_log_observation(self):
         return {
@@ -343,6 +405,19 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         assert health.status_code == 200
         discovery = await client.get("/discover")
         assert discovery.json()["fixtures"] == {}
+        assert discovery.json()["access"]["login"] == {
+            "service": "app",
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "fields": ["username", "password"],
+            "credential_source": "external_env_only",
+        }
+        assert discovery.json()["tasks"]["log_observation"] == {
+            "service": "fixture",
+            "method": "GET",
+            "path": "/log-observation",
+            "result": "sanitized",
+        }
         log_observation = await client.get("/log-observation")
         assert log_observation.json()["redaction_scan"]["private_value_hits"] == 0
         reset = await client.post("/reset", json={"scenario": "empty"})
