@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import stat
 import subprocess
 import sys
@@ -23,6 +24,13 @@ from e2e_runtime import (  # noqa: E402
     terminate_process,
     prepare_private_runtime_root,
 )
+from e2e_gate_observability import (  # noqa: E402
+    EVENT_PREFIX,
+    emit_gate_event,
+    shell_exit_code,
+    signal_from_returncode,
+)
+import e2e_suite_runner  # noqa: E402
 from e2e_suite_runner import (  # noqa: E402
     CURATED_SUITES,
     SuiteResult,
@@ -119,6 +127,7 @@ def test_scenario_argument_is_explicitly_empty_only():
 
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):
     runtime = E2ERuntime(make_config(tmp_path))
+    assert runtime._child_environment()["PYTHONFAULTHANDLER"] == "1"
     monkeypatch.delenv("AKB_PG_EXEC", raising=False)
     child_env = runtime._child_environment()
     assert child_env["AKB_PG_EXEC"].endswith("exec -T postgres")
@@ -143,7 +152,91 @@ def test_suite_summary_uses_last_complete_line_and_fails_closed():
     assert parse_assertion_summary("Results: 5 passed") is None
     assert SuiteResult("suite.sh", 0, 0, 0, None, "").gate_failed
     assert SuiteResult("suite.sh", 0, 2, 0, "Results: 2 passed, 0 failed", "").gate_failed is False
+    assert SuiteResult("suite.sh", -4, 0, 0, None, "").signal == 4
     assert len(CURATED_SUITES) == 15
+
+
+def test_gate_events_are_safe_and_shell_signal_aware(capsys):
+    emit_gate_event(
+        {
+            "event": "suite_complete",
+            "process": "suite_runner",
+            "suite": "test_publications_e2e.sh",
+            "returncode": -4,
+            "passed": 0,
+            "failed": 0,
+            "summary": None,
+            "signal": 4,
+        }
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith(EVENT_PREFIX)
+    stderr_event = json.loads(captured.err[len(EVENT_PREFIX) :])
+    assert stderr_event["suite"] == "test_publications_e2e.sh"
+    assert stderr_event["signal"] == 4
+    assert signal_from_returncode(-4) == 4
+    assert shell_exit_code(-4) == 132
+    assert "external-password-value" not in captured.err
+
+
+def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
+    monkeypatch.setattr(e2e_suite_runner, "CURATED_SUITES", ("test_fake.sh",))
+    monkeypatch.setattr(
+        e2e_suite_runner,
+        "run_suite",
+        lambda *_args, **_kwargs: SuiteResult(
+            "test_fake.sh", 0, 2, 0, "Results: 2 passed, 0 failed", ""
+        ),
+    )
+    assert e2e_suite_runner.run_curated(REPO_ROOT) == 0
+
+    events = [
+        json.loads(line[len(EVENT_PREFIX) :])
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith(EVENT_PREFIX)
+    ]
+    assert [event["event"] for event in events] == [
+        "suite_start",
+        "suite_complete",
+        "gate_complete",
+    ]
+    assert events[1]["suite"] == "test_fake.sh"
+    assert events[1]["summary"] == "Results: 2 passed, 0 failed"
+    assert events[2]["passed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd):
+    checkout = tmp_path / "checkout"
+    suite_path = checkout / "backend" / "scripts" / "ci" / "e2e_suite_runner.py"
+    suite_path.parent.mkdir(parents=True)
+    suite_path.write_text(
+        "import sys\n"
+        "print('credential-looking suite output')\n"
+        "print('AKB_E2E_GATE {\"event\":\"suite_complete\","
+        "\"suite\":\"test_fake.sh\",\"returncode\":132}', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    config = RuntimeConfig(
+        checkout=checkout,
+        runtime_root=tmp_path / "runtime",
+        mode="gate",
+        compose_file=COMPOSE_FILE,
+        compose_project="akb-e2e-io-unit",
+    )
+    prepare_private_runtime_root(config.runtime_root)
+    runtime = E2ERuntime(config)
+
+    assert await runtime._run_gate() == 0
+
+    captured = capfd.readouterr()
+    gate_log = (config.logs_dir / "gate.log").read_text(encoding="utf-8")
+    assert "credential-looking suite output" in gate_log
+    assert "credential-looking suite output" not in captured.err
+    assert '"event":"suite_complete"' in captured.err
+    assert '"returncode":132' in captured.err
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import faulthandler
 import json
 import logging
 import os
@@ -35,6 +36,10 @@ from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from e2e_gate_observability import (
+    emit_gate_event,
+    shell_exit_code,
+)
 from fixture_control import create_app
 
 
@@ -329,6 +334,7 @@ class E2ERuntime:
     def _child_environment(self) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONFAULTHANDLER"] = "1"
         env["AKB_URL"] = self.config.app_origin
         if not env.get("AKB_PG_EXEC"):
             env["AKB_PG_EXEC"] = shlex.join(
@@ -686,6 +692,16 @@ class E2ERuntime:
     async def _run_gate(self) -> int:
         suite_path = self.config.backend_dir / "scripts" / "ci" / "e2e_suite_runner.py"
         log_path = self.config.logs_dir / "gate.log"
+        emit_gate_event(
+            {
+                "event": "gate_start",
+                "process": "supervisor",
+                "suite_runner": str(suite_path),
+                "gate_log": str(log_path),
+            },
+        )
+
+        child_env = self._child_environment()
         with log_path.open("ab", buffering=0) as handle:
             os.chmod(log_path, 0o600)
             process = await asyncio.create_subprocess_exec(
@@ -694,28 +710,36 @@ class E2ERuntime:
                 "--repo-root",
                 str(self.config.checkout),
                 cwd=str(self.config.runtime_root),
-                env=self._child_environment(),
+                env=child_env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=handle,
-                stderr=handle,
                 start_new_session=True,
             )
             self._suite_process = ManagedProcess(process)
+            wait_task = asyncio.create_task(process.wait(), name="e2e-suite")
+            stop_task = asyncio.create_task(self._stop_event.wait(), name="e2e-stop")
+            try:
+                done, _pending = await asyncio.wait(
+                    (wait_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if stop_task in done and not wait_task.done():
+                    emit_gate_event(
+                        {
+                            "event": "runner_stop_requested",
+                            "process": "supervisor",
+                            "child": "suite_runner",
+                        },
+                    )
+                    await terminate_process(process)
+                raw_returncode = process.returncode
+                if raw_returncode is None:
+                    raw_returncode = await wait_task
 
-        wait_task = asyncio.create_task(process.wait(), name="e2e-suite")
-        stop_task = asyncio.create_task(self._stop_event.wait(), name="e2e-stop")
-        try:
-            done, _pending = await asyncio.wait(
-                (wait_task, stop_task), return_when=asyncio.FIRST_COMPLETED
-            )
-            if stop_task in done and not wait_task.done():
-                await terminate_process(process)
-                return 128 + (signal.SIGTERM if os.name != "nt" else 15)
-            return process.returncode or 0
-        finally:
-            stop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stop_task
+                return shell_exit_code(raw_returncode)
+            finally:
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
 
     async def _stop_fixture_control(self) -> None:
         if self._fixture_server is not None:
@@ -836,6 +860,7 @@ async def _async_main(config: RuntimeConfig) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    faulthandler.enable()
     _configure_logging()
     config = _parse_args(argv)
     return asyncio.run(_async_main(config))

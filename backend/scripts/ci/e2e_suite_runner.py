@@ -15,6 +15,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from e2e_gate_observability import (
+    emit_gate_event,
+    signal_from_returncode,
+    signal_name,
+)
+
 
 CURATED_SUITES: tuple[str, ...] = (
     "test_probes_e2e.sh",
@@ -58,6 +64,10 @@ class SuiteResult:
         if self.returncode != 0 or self.failed != 0:
             return True
         return self.passed == 0 and self.name not in EMPTY_COUNT_ALLOWED
+
+    @property
+    def signal(self) -> int | None:
+        return signal_from_returncode(self.returncode)
 
 
 def parse_assertion_summary(output: str) -> tuple[int, int, str] | None:
@@ -104,6 +114,13 @@ def run_curated(repo_root: Path, env: dict[str, str] | None = None) -> int:
     failed_suites: list[str] = []
 
     for suite in CURATED_SUITES:
+        emit_gate_event(
+            {
+                "event": "suite_start",
+                "process": "suite_runner",
+                "suite": suite,
+            }
+        )
         print(f"::group::{suite}", flush=True)
         result = run_suite(suite, repo_root, env)
         tail = _tail(result.output)
@@ -117,6 +134,19 @@ def run_curated(repo_root: Path, env: dict[str, str] | None = None) -> int:
             f"(rc={result.returncode})",
             flush=True,
         )
+        completion_event: dict[str, object] = {
+            "event": "suite_complete",
+            "process": "suite_runner",
+            "suite": suite,
+            "returncode": result.returncode,
+            "passed": result.passed,
+            "failed": result.failed,
+            "summary": result.summary,
+        }
+        if result.signal is not None:
+            completion_event["signal"] = result.signal
+            completion_event["signal_name"] = signal_name(result.signal)
+        emit_gate_event(completion_event)
 
         if result.gate_failed:
             failed_suites.append(suite)
@@ -139,6 +169,17 @@ def run_curated(repo_root: Path, env: dict[str, str] | None = None) -> int:
     print("═════════════════════════════════════════", flush=True)
     print(f"TOTAL: {total_pass} passed, {total_fail} failed", flush=True)
     print("═════════════════════════════════════════", flush=True)
+    gate_returncode = 1 if failed_suites else 0
+    emit_gate_event(
+        {
+            "event": "gate_complete",
+            "process": "suite_runner",
+            "returncode": gate_returncode,
+            "passed": total_pass,
+            "failed": total_fail,
+            "failed_suites": failed_suites,
+        }
+    )
     if failed_suites:
         print("FAILED SUITES:", flush=True)
         for suite in failed_suites:
