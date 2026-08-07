@@ -81,6 +81,10 @@ class NativeRevisionBackend:
         repository = NativeRevisionRepository(await self._pool())
         rows = await repository.list_activity(
             namespace_id=vault_id,
+            # This facade is the Document-only feed selected by A1; text-File
+            # mutations still land activity rows (C3 provenance) but must
+            # never surface in the Document envelope C6 froze.
+            surface="document",
             limit=max_count,
             since=self._parse_since(since),
             path=path,

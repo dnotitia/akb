@@ -138,12 +138,62 @@ class NativeRevisionRepository:
         reference: str,
         conn: asyncpg.Connection | None = None,
     ) -> dict | None:
-        """Resolve a current path first, then a live old-path alias.
+        """Resolve a live Resource identifier first, else a current path, else an alias.
 
-        Exact current ownership always wins.  The alias points directly to a
-        Resource (never another path), so a chain cannot form after repeated
-        moves and a deleted Resource cannot be resurrected by an old alias.
+        Mirrors ``document_repo.DocumentRepository._MATCH_WHERE``, which
+        accepts either the public id or the path in a single ``OR``
+        predicate for the legacy backend — for both reads and every
+        mutation lookup. A ``reference`` that parses as a UUID is tried
+        FIRST as an exact, live ``resource_id`` scoped to this ``surface``
+        (so a File's resource_id cannot resolve as a Document reference, or
+        vice versa, just because the caller asked with the wrong
+        ``surface``); on a miss, resolution falls through to the same
+        current-path / live-alias lookup used for every other reference.
+
+        The fall-through is required, not cosmetic: File surface logical
+        paths are not required to carry an extension
+        (``app.util.text.validate_file_name`` has no such rule, and a
+        root-collection upload's logical path is exactly its filename), so
+        a File can genuinely be named a bare UUID-shaped string. Returning
+        early on an id miss would 404 a live File at a UUID-shaped path
+        (e.g. its own delete, which resolves by that same path) even though
+        it was never addressed by id. Falling through instead reproduces
+        legacy's single ``id OR path`` predicate exactly: try id, and if
+        that does not name a live Resource, try path/alias.
+
+        Exact current ownership always wins over the alias fallback. The
+        alias points directly to a Resource (never another path), so a
+        chain cannot form after repeated moves and a deleted Resource
+        cannot be resurrected by an old alias.
         """
+        resource_id: uuid.UUID | None
+        try:
+            resource_id = uuid.UUID(reference)
+        except (AttributeError, TypeError, ValueError):
+            resource_id = None
+
+        if resource_id is not None:
+            id_sql = """
+                SELECT rs.resource_id, rs.namespace_id, rs.surface,
+                       rs.content_profile, rs.current_path, rs.lifecycle,
+                       rs.head_revision_id, rs.created_at, rs.updated_at
+                  FROM native_resources rs
+                 WHERE rs.namespace_id = $1
+                   AND rs.surface = $2
+                   AND rs.resource_id = $3
+                   AND rs.lifecycle = 'live'
+            """
+            if conn is not None:
+                row = await conn.fetchrow(id_sql, namespace_id, surface, resource_id)
+            else:
+                async with self.pool.acquire() as acquired:
+                    row = await acquired.fetchrow(id_sql, namespace_id, surface, resource_id)
+            if row is not None:
+                return dict(row)
+            # Fall through to path/alias resolution — do NOT return None
+            # here. A UUID-shaped reference that does not name a live
+            # Resource by id may still name one by path (see docstring).
+
         sql = """
             SELECT rs.resource_id, rs.namespace_id, rs.surface,
                    rs.content_profile, rs.current_path, rs.lifecycle,
@@ -642,10 +692,26 @@ class NativeRevisionRepository:
         self,
         *,
         namespace_id: uuid.UUID,
+        surface: str,
         limit: int,
         since: datetime | None = None,
         path: str | None = None,
     ) -> list[dict]:
+        """List activity events, scoped to one Resource ``surface``.
+
+        ``native_revision_activity`` carries every mutation across both
+        surfaces (Document mutations and the bridged text-File publications
+        C3 needs for provenance). This is the only *Document-facing feed*
+        over that table (``NativeRevisionBackend.vault_activity``); other
+        callers — e.g. ``scripts/native_revision_m1_adapter.py`` — read the
+        table directly for measurement, unscoped by surface, which is fine
+        for a measurement script but means this method is not the table's
+        sole reader. The ``surface`` join here is what keeps a File's
+        activity row out of the Document feed specifically. Joining
+        ``native_resources`` (rather than denormalizing ``surface`` onto
+        the activity row) reads the one immutable fact recorded at Resource
+        creation, which never drifts even across a move/replace lineage.
+        """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -656,21 +722,26 @@ class NativeRevisionRepository:
                   FROM native_revision_activity a
                   JOIN native_revisions r
                     ON r.revision_id = a.revision_id
+                  JOIN native_resources rs
+                    ON rs.namespace_id = a.namespace_id
+                   AND rs.resource_id = a.resource_id
                  WHERE a.namespace_id = $1
-                   AND ($2::timestamptz IS NULL OR a.occurred_at >= $2)
+                   AND rs.surface = $2
+                   AND ($3::timestamptz IS NULL OR a.occurred_at >= $3)
                    AND (
-                        $3::text IS NULL
-                        OR r.path_at_revision = $3
-                        OR r.path_at_revision LIKE $3 || '/%'
-                        OR a.changed_path_from = $3
-                        OR a.changed_path_from LIKE $3 || '/%'
-                        OR a.changed_path_to = $3
-                        OR a.changed_path_to LIKE $3 || '/%'
+                        $4::text IS NULL
+                        OR r.path_at_revision = $4
+                        OR r.path_at_revision LIKE $4 || '/%'
+                        OR a.changed_path_from = $4
+                        OR a.changed_path_from LIKE $4 || '/%'
+                        OR a.changed_path_to = $4
+                        OR a.changed_path_to LIKE $4 || '/%'
                    )
                  ORDER BY a.occurred_at DESC, a.revision_id DESC
-                 LIMIT $4
+                 LIMIT $5
                 """,
                 namespace_id,
+                surface,
                 since,
                 path,
                 limit,
