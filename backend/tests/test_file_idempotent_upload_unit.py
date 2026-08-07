@@ -172,6 +172,72 @@ async def test_default_s3_facade_keeps_accepting_slash_names(monkeypatch):
         )
 
 
+async def test_default_s3_facade_exposes_no_placement_observation(monkeypatch):
+    """Placement observability is measurement-only: absent, not empty, here.
+
+    `native_revision_m1_file_driver = s3_current` means no measurement facade
+    was ever constructed, so the census surface must answer 404 exactly like
+    the guarded transfer capability does — never a synthesized census.
+    """
+    from app.exceptions import NotFoundError
+    from app.services import file_service as fs
+
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    service = fs.FileService()
+
+    with pytest.raises(NotFoundError) as err:
+        await service.namespace_placement_observation(uuid.uuid4(), "team")
+    assert err.value.status_code == 404
+
+
+async def test_default_s3_facade_file_envelope_is_unchanged(monkeypatch):
+    """The non-measurement File envelope gains nothing — not even a null key."""
+    from app.services import file_service as fs
+
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    service = fs.FileService()
+    vault_id = uuid.uuid4()
+    file_id = uuid.uuid4()
+
+    class _Conn:
+        async def fetchrow(self, *_args, **_kwargs):
+            return None
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def _pool():
+        return _Pool()
+
+    async def _rows(_conn, _vault_id, **_kwargs):
+        return [{
+            "id": file_id, "collection": None, "name": "page.html",
+            "mime_type": "text/html", "size_bytes": 12,
+            "content_hash": _HASH_A, "hash_algorithm": "sha256",
+            "etag": None, "storage_version": None, "description": "",
+            "created_by": "tester", "created_at": None,
+        }]
+
+    monkeypatch.setattr(fs, "get_pool", _pool)
+    monkeypatch.setattr(fs.vault_files_repo, "list_for_vault", _rows)
+
+    items = await service.list_files(vault_id, "team")
+
+    assert set(items[0]) == {
+        "kind", "uri", "collection", "name", "mime_type", "size_bytes",
+        "content_hash", "hash_algorithm", "etag", "storage_version",
+        "description", "created_by", "created_at",
+    }
+
+
 # ── the constraint itself, against a real Postgres ───────────────
 
 

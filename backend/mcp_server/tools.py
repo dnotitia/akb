@@ -446,7 +446,9 @@ TOOLS = [
                     "description": (
                         "Guarded native M1 W3b measurement mode: include admitted searchable "
                         "text Files as well as Documents. File results include resource_type=file, "
-                        "their canonical akb:// URI, revision, and content_hash. Binary Files are "
+                        "their canonical akb:// URI, revision, and content_hash; native results "
+                        "also report payload_placement, the body placement their bytes were read "
+                        "from. Binary Files are "
                         "never searchable. Rejected unless the exact native measurement backend "
                         "and dedicated database guard are active."
                     ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import uuid
 
@@ -450,6 +451,201 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
 
     assert results[0].title == "Hydrated"
     assert verify_threads
+
+
+class _StubAcquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _StubPool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _StubAcquire(self.conn)
+
+
+class _LegacyChunkConn:
+    """Serves the one chunk query the legacy Document-only grep branch runs."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = ""
+
+    async def fetch(self, sql, *_params):
+        self.sql = sql
+        return self.rows
+
+
+class _NativeHeadConn:
+    """Serves the native arm's aggregate guard + Head body fetch."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def transaction(self, **_kwargs):
+        return _StubAcquire(self)
+
+    async def fetchrow(self, _sql, *_params):
+        return {"resource_count": 1, "total_bytes": self.row["byte_size"]}
+
+    async def fetch(self, _sql, *_params):
+        return [self.row]
+
+
+def _legacy_arm(monkeypatch) -> None:
+    from app.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "document_revision_backend", "bare_git_current")
+    monkeypatch.setattr(app_settings, "native_revision_m1_measurement_only", False)
+    monkeypatch.setattr(app_settings, "db_name", "akb")
+
+
+def _native_arm(monkeypatch) -> None:
+    from app.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "document_revision_backend", "native_ledger_m1")
+    monkeypatch.setattr(app_settings, "native_revision_m1_measurement_only", True)
+    monkeypatch.setattr(app_settings, "db_name", "akb_revision_m1_measurement")
+
+
+def _install_pool(monkeypatch, conn) -> None:
+    from app.services import search_service
+
+    async def get_test_pool():
+        return _StubPool(conn)
+
+    monkeypatch.setattr(search_service, "get_pool", get_test_pool)
+
+
+@pytest.mark.asyncio
+async def test_legacy_document_grep_response_has_no_placement_key(monkeypatch):
+    """Byte-invariance proof: the native-arm-OFF grep response is unchanged.
+
+    Placement observability is additive on the native arm only. The legacy
+    Document-only branch builds its own result dicts and must keep the exact
+    frozen key set, both as the service dict and after REST serialization
+    (`response_model_exclude_none=True`, which is how the earlier additive
+    fields stay invisible here too).
+    """
+    _legacy_arm(monkeypatch)
+    conn = _LegacyChunkConn([
+        {
+            "doc_id": str(uuid.uuid4()),
+            "vault": "legacy",
+            "path": "notes/guide.md",
+            "title": "Guide",
+            "metadata": {},
+            "section_path": "Intro",
+            "content": "needle body\n",
+            "chunk_index": 0,
+        },
+    ])
+    _install_pool(monkeypatch, conn)
+
+    response = await SearchService().grep(
+        pattern="needle", vault="legacy", user_id=str(uuid.uuid4()),
+    )
+
+    assert response == {
+        "pattern": "needle",
+        "regex": False,
+        "returned_docs": 1,
+        "returned_matches": 1,
+        "total_docs": 1,
+        "total_matches": 1,
+        "truncated": False,
+        "results": [{
+            "uri": "akb://legacy/coll/notes/doc/guide.md",
+            "vault": "legacy",
+            "path": "notes/guide.md",
+            "title": "Guide",
+            "matches": [{"section": "Intro", "text": "needle body"}],
+        }],
+    }
+    serialized = GrepResponse.model_validate(
+        {"kind": "grep", **response},
+    ).model_dump(exclude_none=True)
+    assert set(serialized["results"][0]) == {"uri", "vault", "path", "title", "matches"}
+    assert "payload_placement" not in json.dumps(serialized)
+
+
+@pytest.mark.asyncio
+async def test_native_arm_grep_response_reports_the_head_placement(monkeypatch):
+    """The same call on the native arm makes the Document's placement visible."""
+    _native_arm(monkeypatch)
+    assert active_document_source_type(
+        backend="native_ledger_m1",
+        measurement_only=True,
+        database="akb_revision_m1_measurement",
+    ) == "native_document"
+    body = b"needle body\n"
+    conn = _NativeHeadConn({
+        "namespace_id": uuid.uuid4(),
+        "vault": "measure",
+        "resource_id": uuid.uuid4(),
+        "surface": "document",
+        "current_path": "notes/guide.md",
+        "head_revision_id": "a" * 40,
+        "digest": hashlib.sha256(body).hexdigest(),
+        "byte_size": len(body),
+        "encoding": "utf-8",
+        "selected_placement": M1PgBodyStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        "canonical_bytes": body,
+    })
+    _install_pool(monkeypatch, conn)
+
+    response = await SearchService().grep(
+        pattern="needle", vault="measure", user_id=str(uuid.uuid4()),
+    )
+
+    result = response["results"][0]
+    assert result["payload_placement"] == M1PgBodyStore.selected_placement
+    assert {"payload_id", "private_locator", "payload_manifest_id"}.isdisjoint(result)
+    serialized = GrepResponse.model_validate(
+        {"kind": "grep", **response},
+    ).model_dump(exclude_none=True)
+    assert serialized["results"][0]["payload_placement"] == (
+        M1PgBodyStore.selected_placement
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_arm_grep_reports_a_historical_reference_placement(monkeypatch):
+    """A row that never moved still reports its own placement, not the default."""
+    _native_arm(monkeypatch)
+    body = b"needle body\n"
+    conn = _NativeHeadConn({
+        "namespace_id": uuid.uuid4(),
+        "vault": "measure",
+        "resource_id": uuid.uuid4(),
+        "surface": "document",
+        "current_path": "notes/historical.md",
+        "head_revision_id": "b" * 40,
+        "digest": hashlib.sha256(body).hexdigest(),
+        "byte_size": len(body),
+        "encoding": "utf-8",
+        "selected_placement": M1ReferencePayloadStore.selected_placement,
+        "verification_profile": "sha256-size-utf8-v1",
+        "canonical_bytes": body,
+    })
+    _install_pool(monkeypatch, conn)
+
+    response = await SearchService().grep(
+        pattern="needle", vault="measure", user_id=str(uuid.uuid4()),
+    )
+
+    assert response["results"][0]["payload_placement"] == (
+        M1ReferencePayloadStore.selected_placement
+    )
 
 
 def test_native_search_metadata_verification_rejects_unknown_placement():

@@ -701,6 +701,20 @@ class FileService:
             raise NotFoundError("File transfer", token)
         return await self._measurement.transfer(token, body=body, method=method)
 
+    async def namespace_placement_observation(
+        self, vault_id: uuid.UUID, vault_name: str,
+    ) -> dict:
+        """Report which body placements a vault's native bodies still use.
+
+        Measurement-only, and gated exactly like
+        `transfer_measurement_capability`: outside M1 measurement mode the
+        facade does not exist, so the surface is simply absent (404) rather
+        than answering with an empty or synthesized census.
+        """
+        if self._measurement is None:
+            raise NotFoundError("File placement observation", vault_name)
+        return await self._measurement.namespace_placement_observation(vault_id, vault_name)
+
 
 async def index_file_metadata(
     file_id: str,

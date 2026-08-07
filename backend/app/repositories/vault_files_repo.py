@@ -14,6 +14,21 @@ from __future__ import annotations
 import uuid
 
 
+# The measurement File reads resolve the placement of the body a confirmed
+# native-text row is pinned to. The join is on the row's own Head identity
+# (`native_resource_id` + `native_revision_id`), so it names the manifest that
+# revision published and nothing later. It yields the placement STRING only —
+# `private_locator` / `payload_manifest_id` are internal addresses and are
+# never selected here. Binary rows have no native identity and get NULL.
+_MEASUREMENT_PLACEMENT_JOIN = """
+          LEFT JOIN native_revisions nr
+                 ON nr.resource_id = vf.native_resource_id
+                AND nr.revision_id = vf.native_revision_id
+          LEFT JOIN native_payload_manifests pm
+                 ON pm.payload_manifest_id = nr.payload_manifest_id
+"""
+
+
 async def insert_or_adopt(
     conn,
     *,
@@ -93,9 +108,11 @@ async def insert_or_adopt_measurement_confirmed(
         SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.collection_id, c.path AS collection,
                vf.name, vf.mime_type, vf.size_bytes, vf.description,
                vf.content_hash, vf.storage_driver, vf.storage_locator,
-               vf.native_resource_id, vf.native_revision_id
+               vf.native_resource_id, vf.native_revision_id,
+               pm.selected_placement AS payload_placement
           FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
           LEFT JOIN collections c ON c.id = vf.collection_id
+        """ + _MEASUREMENT_PLACEMENT_JOIN + """
          WHERE vf.vault_id = $1
            AND vf.collection_id IS NOT DISTINCT FROM $2
            AND vf.name = $3 AND vf.content_hash = $4
@@ -124,9 +141,11 @@ async def list_measurement_confirmed(
         """
         SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection, vf.name, vf.mime_type,
                vf.size_bytes, vf.content_hash, vf.hash_algorithm, vf.storage_driver,
-               vf.storage_locator
+               vf.storage_locator, vf.native_resource_id, vf.native_revision_id,
+               pm.selected_placement AS payload_placement
           FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
           LEFT JOIN collections c ON c.id = vf.collection_id
+        """ + _MEASUREMENT_PLACEMENT_JOIN + """
          WHERE vf.vault_id = $1 AND vf.storage_driver IS NOT NULL
         """ + collection_clause + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}",
         *params,
@@ -165,9 +184,10 @@ async def find_measurement_by_id(conn, vault_id: uuid.UUID, file_id: uuid.UUID) 
         SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection, vf.name, vf.mime_type,
                vf.size_bytes, vf.description, vf.content_hash,
                vf.storage_driver, vf.storage_locator, vf.native_resource_id,
-               vf.native_revision_id
+               vf.native_revision_id, pm.selected_placement AS payload_placement
           FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
           LEFT JOIN collections c ON c.id = vf.collection_id
+        """ + _MEASUREMENT_PLACEMENT_JOIN + """
          WHERE vf.id = $1 AND vf.vault_id = $2 AND vf.storage_driver IS NOT NULL
         """, file_id, vault_id,
     )
@@ -183,9 +203,11 @@ async def find_measurement_exact(
         SELECT vf.id, vf.vault_id, v.name AS vault_name, c.path AS collection,
                vf.name, vf.mime_type, vf.size_bytes, vf.description,
                vf.content_hash, vf.storage_driver, vf.storage_locator,
-               vf.native_resource_id, vf.native_revision_id
+               vf.native_resource_id, vf.native_revision_id,
+               pm.selected_placement AS payload_placement
           FROM vault_files vf JOIN vaults v ON v.id = vf.vault_id
           LEFT JOIN collections c ON c.id = vf.collection_id
+        """ + _MEASUREMENT_PLACEMENT_JOIN + """
          WHERE vf.vault_id = $1
            AND vf.collection_id IS NOT DISTINCT FROM $2
            AND vf.name = $3 AND vf.content_hash = $4
