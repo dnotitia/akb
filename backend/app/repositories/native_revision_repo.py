@@ -689,7 +689,10 @@ class NativeRevisionRepository:
                 """
                 SELECT rs.resource_id, rs.current_path AS path,
                        rs.head_revision_id AS revision_id, rs.updated_at,
-                       v.name AS vault_name, p.canonical_bytes
+                       v.name AS vault_name,
+                       pm.digest, pm.byte_size, pm.encoding,
+                       pm.selected_placement, pm.verification_profile,
+                       p.canonical_bytes
                   FROM native_resources rs
                   JOIN vaults v ON v.id = rs.namespace_id
                   JOIN native_revisions rv

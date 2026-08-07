@@ -42,14 +42,20 @@ async def _fresh_database():
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
     admin = await asyncpg.connect(_DSN)
-    name = f"akb_native_derived_{uuid.uuid4().hex[:10]}"
+    # Measurement-prefixed on purpose: migration 057 is name-gated, and only a
+    # database named for the measurement arm can ever receive a native write
+    # (see `app/config.py`). Under any other name 057 self-disables and the
+    # fixture silently keeps migration 053's one-placement-per-namespace
+    # trigger — a schema no real native write ever meets, and one P1's mixed
+    # placements would trip the moment this pipeline covers a facade write.
+    name = f"akb_revision_m1_measurement_derived_{uuid.uuid4().hex[:10]}"
     await admin.execute(f'CREATE DATABASE "{name}"')
     dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
     conn = await asyncpg.connect(dsn)
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 53, 54):
+        for number in (5, 6, 48, 53, 54, 57):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None

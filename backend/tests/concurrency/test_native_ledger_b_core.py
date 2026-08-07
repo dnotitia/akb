@@ -20,7 +20,8 @@ import pytest
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.native_revision_repo import NativeRevisionRepository
-from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_native_grep_service import M1NativeGrepService
+from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_document_service import (
     NativeDocumentService,
@@ -82,7 +83,16 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
     admin = await asyncpg.connect(_DSN)
-    name = f"akb_native_{uuid.uuid4().hex[:12]}"
+    # The disposable database must carry the measurement prefix. Migration 057
+    # self-disables on any other name, so a fixture called `akb_native_*`
+    # silently kept migration 053's one-placement-per-namespace trigger — a
+    # schema no native write can ever actually meet, because `app/config.py`
+    # and `revision_backend._assert_native_measurement_safety()` refuse the
+    # native arm unless `db_name` is exactly `akb_revision_m1_measurement`.
+    # Naming the fixture this way makes it the same 048+053+057 schema the
+    # only legal native-write deployment has, which is what P1's deliberately
+    # mixed-placement namespaces need.
+    name = f"akb_revision_m1_measurement_bcore_{uuid.uuid4().hex[:12]}"
     await admin.execute(f'CREATE DATABASE "{name}"')
     dsn = _database_dsn(name)
     conn = await asyncpg.connect(dsn)
@@ -2223,6 +2233,292 @@ async def test_default_reference_payload_document_is_applied_to_searchable_deriv
                 created.resource_id,
                 created.revision_id,
             ) > 0
+
+
+async def _owned_vault(pool: asyncpg.Pool, vault_id: uuid.UUID) -> tuple[uuid.UUID, str]:
+    """Give the fixture vault a real owner so grep/recent-changes can read it."""
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES ($1, $2, 'disabled') RETURNING id
+            """,
+            f"placement-{uuid.uuid4().hex}",
+            f"placement-{uuid.uuid4().hex}@invalid.example",
+        )
+        await conn.execute("UPDATE vaults SET owner_id = $1 WHERE id = $2", owner_id, vault_id)
+        vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    return owner_id, vault
+
+
+async def _head_placement(pool: asyncpg.Pool, resource_id: uuid.UUID) -> str:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            SELECT pm.selected_placement
+              FROM native_resources rs
+              JOIN native_revisions rv
+                ON rv.resource_id = rs.resource_id
+               AND rv.revision_id = rs.head_revision_id
+              JOIN native_payload_manifests pm
+                ON pm.payload_manifest_id = rv.payload_manifest_id
+             WHERE rs.resource_id = $1
+            """,
+            resource_id,
+        )
+
+
+async def test_facade_document_body_lands_on_the_pg_body_store_and_still_deduplicates():
+    """P1 unification: a Document written through the facade is a PG BodyStore body."""
+    async with _fresh_database() as (pool, vault_id):
+        _owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="unified",
+                title="Unified note",
+                content="unified placement body",
+            ),
+            agent_id="m1-writer",
+        )
+
+        async with pool.acquire() as conn:
+            manifest = await conn.fetchrow(
+                """
+                SELECT pm.selected_placement, pm.verification_profile,
+                       pm.private_locator, pm.digest, pm.byte_size,
+                       p.selected_placement AS payload_placement,
+                       p.canonical_bytes
+                  FROM native_revisions rv
+                  JOIN native_payload_manifests pm
+                    ON pm.payload_manifest_id = rv.payload_manifest_id
+                  JOIN m1_reference_payloads p
+                    ON p.payload_id = pm.private_locator
+                 WHERE rv.revision_id = $1
+                """,
+                created.commit_hash,
+            )
+        assert manifest["selected_placement"] == M1PgBodyStore.selected_placement
+        assert manifest["payload_placement"] == M1PgBodyStore.selected_placement
+        assert manifest["verification_profile"] == M1PgBodyStore.verification_profile
+
+        canonical = bytes(manifest["canonical_bytes"])
+        assert manifest["digest"] == hashlib.sha256(canonical).hexdigest()
+        assert manifest["byte_size"] == len(canonical)
+
+        # Content-addressed dedup still holds: re-preparing the exact bytes the
+        # facade published reuses the same body row rather than writing a copy.
+        pg_store = M1PgBodyStore(pool)
+        replayed = await pg_store.prepare_text(namespace_id=vault_id, payload=canonical)
+        assert replayed.payload_id == manifest["private_locator"]
+
+        # ...and dedup stays placement-scoped, so the pre-P1 adapter can still
+        # hold the identical bytes as its own separately verified body.
+        reference = await M1ReferencePayloadStore(pool).prepare_text(
+            namespace_id=vault_id, payload=canonical,
+        )
+        assert reference.payload_id != manifest["private_locator"]
+        assert reference.selected_placement == M1ReferencePayloadStore.selected_placement
+
+        async with pool.acquire() as conn:
+            placements = await conn.fetch(
+                """
+                SELECT selected_placement, count(*)::int AS bodies
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1
+                 GROUP BY selected_placement
+                 ORDER BY selected_placement
+                """,
+                vault_id,
+            )
+        assert [(row["selected_placement"], row["bodies"]) for row in placements] == [
+            (M1ReferencePayloadStore.selected_placement, 1),
+            (M1PgBodyStore.selected_placement, 1),
+        ]
+
+
+async def test_mixed_placement_namespace_stays_readable_across_every_native_reader():
+    """A pre-P1 body and a post-P1 body must coexist in one namespace.
+
+    Migrating historical rows is explicitly not part of P1, so the reference
+    placement survives forever on Revisions published before the switch. Every
+    reader therefore has to dispatch on the manifest's ``selected_placement``:
+    a pinned read of the old Revision, a diff that spans the placement change,
+    the recent-changes list, and grep all have to keep verifying.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=documents)
+
+        # A pre-P1 Document: the scaffolding path, on the reference adapter.
+        legacy_body = "---\ntitle: Legacy note\ntype: note\n---\nshared-token before\n"
+        legacy = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/legacy.md",
+            payload=legacy_body,
+            actor="pre-p1-writer",
+            mutation_id=uuid.uuid4(),
+            message="[put] notes/legacy.md",
+            subject="[put] notes/legacy.md",
+            summary="pre-P1 revision",
+        )
+        # A second Document that never gets touched again, so the namespace
+        # still has a live reference-placement Head after the switch.
+        untouched = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/untouched.md",
+            payload="---\ntitle: Untouched\n---\nshared-token untouched\n",
+            actor="pre-p1-writer",
+            mutation_id=uuid.uuid4(),
+            message="[put] notes/untouched.md",
+            subject="[put] notes/untouched.md",
+            summary="pre-P1 revision",
+        )
+
+        # The post-P1 facade replaces the first Document in place.
+        updated = await documents.update(
+            vault,
+            "notes/legacy.md",
+            DocumentUpdateRequest(
+                content="shared-token after",
+                message="unify placement",
+                expected_commit=legacy.revision_id,
+            ),
+            agent_id="p1-writer",
+        )
+        assert updated.previous_commit == legacy.revision_id
+
+        async with pool.acquire() as conn:
+            lineage = await conn.fetch(
+                """
+                SELECT rv.revision_id, pm.selected_placement
+                  FROM native_revisions rv
+                  JOIN native_payload_manifests pm
+                    ON pm.payload_manifest_id = rv.payload_manifest_id
+                 WHERE rv.resource_id = $1
+                 ORDER BY rv.occurred_at, rv.revision_id
+                """,
+                legacy.resource_id,
+            )
+        assert [row["revision_id"] for row in lineage] == [
+            legacy.revision_id,
+            updated.commit_hash,
+        ]
+        assert [row["selected_placement"] for row in lineage] == [
+            M1ReferencePayloadStore.selected_placement,
+            M1PgBodyStore.selected_placement,
+        ]
+        assert await _head_placement(pool, untouched.resource_id) == (
+            M1ReferencePayloadStore.selected_placement
+        )
+
+        # 1. A pinned read of the pre-P1 Revision, through the facade that now
+        #    writes the other placement.
+        pinned = await documents.get_at_commit(vault, "notes/legacy.md", legacy.revision_id)
+        assert pinned.content == "shared-token before"
+        assert pinned.current_commit == legacy.revision_id
+        assert pinned.metadata_is_current is True
+        current = await documents.get(vault, "notes/legacy.md")
+        assert current.content == "shared-token after"
+
+        # 2. A native diff whose parent and child sit on different placements.
+        diff = await backend.document_diff(vault, "notes/legacy.md", updated.commit_hash)
+        assert diff is not None
+        assert diff["type"] == "modified"
+        assert "-shared-token before" in diff["diff"]
+        assert "+shared-token after" in diff["diff"]
+        creation_diff = await backend.document_diff(
+            vault, "notes/legacy.md", legacy.revision_id,
+        )
+        assert creation_diff is not None
+        assert creation_diff["type"] == "added"
+        assert "+shared-token before" in creation_diff["diff"]
+
+        # 3. recent_changes spans both placements and verifies both bodies.
+        recent = await backend.recent_changes(str(owner_id), vault=vault, limit=20)
+        assert {(row["path"], row["title"]) for row in recent} == {
+            ("notes/legacy.md", "Legacy note"),
+            ("notes/untouched.md", "Untouched"),
+        }
+        assert {row["commit"] for row in recent} == {
+            updated.commit_hash,
+            untouched.revision_id,
+        }
+
+        # 4. grep scans both placements in one bounded pass.
+        grep = await M1NativeGrepService(pool).grep(
+            "shared-token",
+            user_id=owner_id,
+            vaults=[vault],
+        )
+        assert grep["total_resources"] == 2
+        assert {row["path"] for row in grep["results"]} == {
+            "notes/legacy.md",
+            "notes/untouched.md",
+        }
+        assert {row["revision"] for row in grep["results"]} == {
+            updated.commit_hash,
+            untouched.revision_id,
+        }
+
+
+async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest():
+    """recent_changes must verify, not decode-and-trust.
+
+    The schema already blocks this corruption (a CHECK on the stored digest
+    plus a row-immutability trigger), so the test removes those guards inside
+    its disposable database to prove the read path does not depend on them —
+    the same fail-closed contract grep, search, and the derived worker hold.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=documents)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="verified",
+                title="Verified note",
+                content="honest body",
+            ),
+            agent_id="m1-writer",
+        )
+        assert (await backend.recent_changes(str(owner_id), vault=vault, limit=5))[0][
+            "commit"
+        ] == created.commit_hash
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                ALTER TABLE m1_reference_payloads
+                    DISABLE TRIGGER trg_m1_reference_payloads_immutable;
+                ALTER TABLE m1_reference_payloads
+                    DROP CONSTRAINT m1_reference_payloads_digest_matches;
+                """
+            )
+            # Same length, same encoding, no NUL: only the digest can catch it.
+            tampered = await conn.fetchval(
+                """
+                UPDATE m1_reference_payloads
+                   SET canonical_bytes = overlay(
+                           canonical_bytes PLACING $2 FROM 1 FOR 1
+                       )
+                 WHERE namespace_id = $1
+                 RETURNING octet_length(canonical_bytes)
+                """,
+                vault_id,
+                b"X",
+            )
+            assert tampered is not None
+
+        with pytest.raises(PgBodyIntegrityError, match="digest mismatch"):
+            await backend.recent_changes(str(owner_id), vault=vault, limit=5)
 
 
 async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts():

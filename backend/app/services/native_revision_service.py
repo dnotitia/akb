@@ -25,6 +25,7 @@ from app.services.m1_reference_payload_store import (
     PreparedReferencePayload,
     ReferencePayloadIntegrityError,
 )
+from app.services.native_payload_verification import payload_store_for_placement
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
@@ -1225,10 +1226,30 @@ class NativeRevisionService:
         )
         return resource, rows
 
+    def _read_store(self, selected_placement: str) -> TextPayloadStore:
+        """Select the verified adapter this Revision's manifest actually names.
+
+        Writes keep using the configured ``payload_store``; reads must follow
+        the immutable placement recorded at publication time. Since P1 put
+        facade Documents on the PostgreSQL BodyStore, one namespace can hold
+        both historical ``m1-reference-payload-v1`` bodies and new
+        ``pg-bodystore-v1`` bodies, and each adapter's ``_verify_row`` refuses
+        the other's placement — so a single hardcoded reader would fail closed
+        on half of a mixed corpus.
+
+        A store that declares no placement is an injected test double; it is
+        used as-is instead of being replaced by a real adapter.
+        """
+        configured = getattr(self.payload_store, "selected_placement", None)
+        if configured is None or configured == selected_placement:
+            return self.payload_store
+        return payload_store_for_placement(self.pool, selected_placement)
+
     async def _snapshot_from_row(self, row: dict) -> NativeRevisionSnapshot:
         if row["payload_manifest_id"] is None or row["private_locator"] is None:
             raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
-        payload_bytes = await self.payload_store.open_verified(row["private_locator"])
+        store = self._read_store(row["selected_placement"])
+        payload_bytes = await store.open_verified(row["private_locator"])
         text = await asyncio.to_thread(_verify_snapshot_payload, payload_bytes, row)
         return NativeRevisionSnapshot(
             resource_id=row["resource_id"],

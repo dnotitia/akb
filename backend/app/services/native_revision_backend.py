@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import uuid
 from datetime import UTC, datetime
@@ -13,8 +14,11 @@ from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.document_service import _parse_markdown
-from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_document_service import NativeDocumentService
+from app.services.native_payload_verification import (
+    payload_store_for_placement,
+    verify_native_head_body,
+)
 from app.services.native_revision_service import NativeRevisionService
 
 
@@ -112,10 +116,24 @@ class NativeRevisionBackend:
             vault=vault,
             limit=limit,
         )
+        return await asyncio.to_thread(self._verified_changes, rows)
+
+    @staticmethod
+    def _verified_changes(rows: list[dict]) -> list[dict[str, Any]]:
+        """Bind every listed body to its manifest before reading a title from it.
+
+        This list used to decode ``canonical_bytes`` with no verification at
+        all, which trusted the payload table more than every other native read
+        path (grep, search, and the derived worker all verify). It also could
+        not survive P1's mixed corpus, because a title has to be parsed out of
+        bodies stored under either placement. Verification is fail-closed and
+        runs off the event loop: SHA-256 over the whole listed corpus is not
+        request-thread work.
+        """
         changes: list[dict[str, Any]] = []
         for row in rows:
-            raw = bytes(row["canonical_bytes"]).decode("utf-8")
-            metadata, _ = _parse_markdown(raw)
+            canonical = verify_native_head_body(row)
+            metadata, _ = _parse_markdown(canonical.decode("utf-8", errors="strict"))
             changes.append(
                 {
                     "doc_id": str(row["resource_id"]),
@@ -148,10 +166,19 @@ class NativeRevisionBackend:
         return vault_id, resource
 
     async def _revision_bytes(self, row: dict) -> bytes | None:
+        """Open one historical Revision body through its own placement.
+
+        ``selected_placement`` is an immutable per-Revision manifest fact. A
+        document created before P1 and replaced after it has a
+        ``m1-reference-payload-v1`` parent and a ``pg-bodystore-v1`` child, so
+        hardcoding either adapter makes native diff fail closed on one side of
+        the pair.
+        """
         locator = row.get("private_locator")
         if locator is None:
             return None
-        return await M1ReferencePayloadStore(await self._pool()).open_verified(locator)
+        store = payload_store_for_placement(await self._pool(), row["selected_placement"])
+        return await store.open_verified(locator)
 
     async def document_diff(
         self,
