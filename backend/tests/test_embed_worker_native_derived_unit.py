@@ -65,7 +65,8 @@ async def test_file_measurement_drains_native_intents_with_legacy_document_backe
     monkeypatch.setattr(settings, "db_name", "akb_revision_m1_measurement")
 
     # Positive native-only work must keep BackfillRunner hot even when no
-    # chunks were materialized (for example direct-grep and delete intents).
+    # chunks were materialized in this pass (delete, superseded, and abandoned
+    # intents all report work done without adding a row to the embed queue).
     assert await embed_worker._process_once() == 1
     assert await embed_worker._process_once() == 1
     assert await embed_worker._process_once() == 0

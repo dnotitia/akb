@@ -53,6 +53,9 @@ _INDEXABLE_MIGRATIONS = (
 _BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_pg_body.py"
 _PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "057_native_revision_m1_payload_placement.py"
 _DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "054_native_revision_searchable_derived.py"
+_FILE_DERIVED_MIGRATION = (
+    _BACKEND / "app" / "db" / "migrations" / "059_native_file_searchable_derived.py"
+)
 _WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -115,6 +118,7 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
                 await _load_migration(path).migrate(conn=conn)
             await _load_migration(_WRITE_POLICY_MIGRATION).migrate(conn=conn)
             await _load_migration(_DERIVED_MIGRATION).migrate(conn=conn)
+            await _load_migration(_FILE_DERIVED_MIGRATION).migrate(conn=conn)
         await conn.close()
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size)
         async with pool.acquire() as seeded:
@@ -847,6 +851,132 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
             ):
                 assert await conn.fetchval(f"SELECT COUNT(*) FROM {table} WHERE {where} = $1", vault_id) == 0
         assert created.path == "notes/native.md"
+
+
+async def test_public_delete_tombstones_native_text_file_derived_chunks(
+    monkeypatch,
+    tmp_path,
+):
+    """A vault delete must reach native File body chunks too.
+
+    ``access_service.delete_vault``'s per-file hook enqueues the legacy
+    ``file`` discriminator, which native File body chunks do not carry, and the
+    ``chunks.vault_id`` CASCADE takes rows out of PostgreSQL without writing to
+    ``vector_delete_outbox``.  ``index_service.delete_vault_chunks`` is the only
+    thing standing between that and orphaned vector points.
+    """
+    async with _fresh_database(with_derived=True) as (pool, _):
+        from app.config import settings
+        from app.db import postgres as postgres
+        from app.services import access_service, native_document_service as native_documents
+
+        class _RoleSync:
+            def __init__(self) -> None:
+                self.deleted: list[uuid.UUID] = []
+
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+            async def on_vault_delete(self, vault_id) -> None:
+                self.deleted.append(vault_id)
+
+        role_sync = _RoleSync()
+        monkeypatch.setattr(postgres, "_pool", pool)
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: role_sync)
+        monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
+        monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+        monkeypatch.setattr(settings, "s3_endpoint_url", "")
+        owner_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
+                owner_id,
+                f"owner-{owner_id.hex}",
+                f"{owner_id.hex}@example.test",
+                "test",
+            )
+
+        documents = NativeDocumentService(pool=pool)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+
+        async def _native() -> NativeRevisionService:
+            return native
+
+        documents._native = _native  # type: ignore[method-assign]
+        vault_name = f"native-file-delete-{uuid.uuid4().hex}"
+        vault_id = uuid.UUID(await documents.create_vault(vault_name, owner_id=str(owner_id)))
+        created = await native.create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="src/main.py",
+            payload="vault delete regression file body\n",
+            actor=str(owner_id),
+            mutation_id=uuid.uuid4(),
+        )
+        # The public File row the native bridge adopts shares the Resource id,
+        # so the legacy per-file hook really does run for this file — and still
+        # never sees the native body chunks.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vault_files (id, vault_id, name, s3_key) VALUES ($1, $2, $3, $4)",
+                created.resource_id,
+                vault_id,
+                "main.py",
+                f"{vault_name}/src/main.py",
+            )
+        assert await NativeDerivedWorker(pool).process_once() == 1
+
+        async with pool.acquire() as conn:
+            native_file_chunk_ids = {
+                row["id"]
+                for row in await conn.fetch(
+                    "SELECT id FROM chunks WHERE vault_id = $1 AND source_type = 'native_file'",
+                    vault_id,
+                )
+            }
+            assert native_file_chunk_ids
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_derived_heads WHERE namespace_id = $1", vault_id
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM vector_delete_outbox"
+            ) == 0
+
+        assert await access_service.delete_vault(str(owner_id), vault_name) == {
+            "deleted": True,
+            "vault": vault_name,
+        }
+        assert role_sync.deleted == [vault_id]
+
+        async with pool.acquire() as conn:
+            queued = {
+                row["chunk_id"]
+                for row in await conn.fetch(
+                    "SELECT chunk_id FROM vector_delete_outbox WHERE source_type = 'native_file'"
+                )
+            }
+            assert queued == native_file_chunk_ids
+            # Nothing leaks out through the CASCADE unaccounted for: every
+            # chunk that existed is now both gone from PG and queued.
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE vault_id = $1", vault_id
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM vector_delete_outbox"
+            ) == len(native_file_chunk_ids)
+            for table, where in (
+                ("vaults", "id"),
+                ("vault_files", "vault_id"),
+                ("native_resources", "namespace_id"),
+                ("native_derived_heads", "namespace_id"),
+                ("native_derived_chunks", "namespace_id"),
+            ):
+                assert await conn.fetchval(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where} = $1", vault_id
+                ) == 0
 
 
 async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(monkeypatch):
