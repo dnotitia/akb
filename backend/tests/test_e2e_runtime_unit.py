@@ -89,8 +89,9 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     }
     assert fixture["discovery"] == {
         "method": "GET",
-        "url": "http://127.0.0.1:8889/openapi.json",
+        "url": "http://127.0.0.1:8889/discover",
     }
+    assert set(fixture) == {"origin", "health", "reset", "discovery"}
     assert fixture["reset"] == {
         "method": "POST",
         "url": "http://127.0.0.1:8889/reset",
@@ -118,9 +119,59 @@ def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, 
     assert "external-password-value" not in serialized
 
 
-def test_scenario_argument_is_explicitly_empty_only():
+def test_fixture_discovery_declares_access_tasks_and_preserves_catalog_without_secrets(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_USERNAME_ENV", "external-user-value")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "external-password-value")
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "namespace": "fixture-randomized",
+        "fixtures": {
+            "active": {"installation_id": "installation-randomized"},
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+
+    assert discovery["scenario"] == "app-installation-lifecycle"
+    assert discovery["namespace"] == "fixture-randomized"
+    assert discovery["fixtures"] == {
+        "active": {"installation_id": "installation-randomized"},
+    }
+    assert discovery["access"] == {
+        "login": {
+            "service": "app",
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "fields": ["username", "password"],
+            "credential_source": "external_env_only",
+            "credential_env": {
+                "username": "TEST_USERNAME_ENV",
+                "password": "TEST_PASSWORD_ENV",
+            },
+        }
+    }
+    assert discovery["tasks"] == {
+        "log_observation": {
+            "service": "fixture",
+            "method": "GET",
+            "path": "/log-observation",
+            "result": "sanitized",
+        }
+    }
+    serialized = json.dumps(discovery)
+    assert "external-user-value" not in serialized
+    assert "external-password-value" not in serialized
+
+
+def test_scenario_argument_supports_the_lifecycle_fixture():
     config = _parse_args(["serve", "--scenario", "empty"])
     assert config.scenario == "empty"
+    lifecycle = _parse_args(["serve", "--scenario", "app-installation-lifecycle"])
+    assert lifecycle.scenario == "app-installation-lifecycle"
     with pytest.raises(SystemExit):
         _parse_args(["serve", "--scenario", "project"])
 
@@ -144,6 +195,19 @@ def test_runtime_root_is_private_and_separate(tmp_path):
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     for directory in (config_dir, logs_dir, state_dir, vault_dir):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_runtime_configures_distinct_app_token_signing_secret(tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    prepare_private_runtime_root(runtime.config.runtime_root)
+
+    runtime._write_config()
+
+    secret_config = yaml.safe_load(
+        (runtime.config.config_dir / "secret.yaml").read_text(encoding="utf-8")
+    )
+    assert secret_config["app_token_secret"]
+    assert secret_config["app_token_secret"] != secret_config["jwt_secret"]
 
 
 def test_suite_summary_uses_last_complete_line_and_fails_closed():
@@ -251,24 +315,87 @@ async def test_process_termination_cleans_a_process_group():
     assert process.returncode is not None
 
 
+@pytest.mark.asyncio
+async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp_path, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path))
+    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    async def fake_compose(*arguments: str, **kwargs: object) -> int:
+        compose_calls.append((arguments, kwargs))
+        return 0
+
+    async def fake_wait_tcp(*_args: object) -> None:
+        return None
+
+    async def fake_wait_http(*_args: object) -> bytes:
+        return b""
+
+    monkeypatch.setattr(runtime, "_compose", fake_compose)
+    monkeypatch.setattr(runtime, "_wait_tcp", fake_wait_tcp)
+    monkeypatch.setattr(runtime, "_wait_http", fake_wait_http)
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+
+    await runtime._start_dependencies()
+
+    assert compose_calls == [(("up", "--detach", "--wait"), {})]
+
+
 class FakeFixtureRuntime:
-    def __init__(self):
+    def __init__(self, scenario="empty"):
         self.reset_count = 0
-        self.scenario = "empty"
+        self.scenario = scenario
 
     def fixture_health(self):
-        return {"status": "ready", "scenario": "empty", "app_ready": True}
+        return {"status": "ready", "scenario": self.scenario, "app_ready": True}
 
-    async def reset_empty(self):
+    def fixture_discovery(self):
+        return {
+            "status": "ready",
+            "scenario": self.scenario,
+            "fixtures": {},
+            "access": {
+                "login": {
+                    "service": "app",
+                    "method": "POST",
+                    "path": "/api/v1/auth/login",
+                    "fields": ["username", "password"],
+                    "credential_source": "external_env_only",
+                }
+            },
+            "tasks": {
+                "log_observation": {
+                    "service": "fixture",
+                    "method": "GET",
+                    "path": "/log-observation",
+                    "result": "sanitized",
+                }
+            },
+        }
+
+    def fixture_log_observation(self):
+        return {
+            "status": "ready",
+            "scenario": self.scenario,
+            "redacted": True,
+            "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
+        }
+
+    async def reset_scenario(self):
         self.reset_count += 1
 
 
 @pytest.mark.asyncio
-async def test_fixture_control_exposes_only_empty_reset_and_discovery():
+async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
     runtime = FakeFixtureRuntime()
     app = create_app(runtime)
     paths = {route.path for route in app.routes}
-    assert {"/health", "/reset", "/openapi.json"} <= paths
+    assert {
+        "/health",
+        "/reset",
+        "/discover",
+        "/log-observation",
+        "/openapi.json",
+    } <= paths
     assert "/stop" not in paths
 
     async with httpx.AsyncClient(
@@ -276,14 +403,42 @@ async def test_fixture_control_exposes_only_empty_reset_and_discovery():
     ) as client:
         health = await client.get("/health")
         assert health.status_code == 200
+        discovery = await client.get("/discover")
+        assert discovery.json()["fixtures"] == {}
+        assert discovery.json()["access"]["login"] == {
+            "service": "app",
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "fields": ["username", "password"],
+            "credential_source": "external_env_only",
+        }
+        assert discovery.json()["tasks"]["log_observation"] == {
+            "service": "fixture",
+            "method": "GET",
+            "path": "/log-observation",
+            "result": "sanitized",
+        }
+        log_observation = await client.get("/log-observation")
+        assert log_observation.json()["redaction_scan"]["private_value_hits"] == 0
         reset = await client.post("/reset", json={"scenario": "empty"})
         assert reset.status_code == 200
         assert runtime.reset_count == 1
+        lifecycle_runtime = FakeFixtureRuntime("app-installation-lifecycle")
+        lifecycle_app = create_app(lifecycle_runtime)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=lifecycle_app),
+            base_url="http://lifecycle-fixture.test",
+        ) as lifecycle_client:
+            lifecycle_reset = await lifecycle_client.post(
+                "/reset", json={"scenario": "app-installation-lifecycle"}
+            )
+        assert lifecycle_reset.status_code == 200
+        assert lifecycle_runtime.reset_count == 1
         unsupported = await client.post("/reset", json={"scenario": "project"})
         assert unsupported.status_code == 422
-        discovery = await client.get("/openapi.json")
-        assert discovery.status_code == 200
-        assert "/reset" in discovery.json()["paths"]
+        openapi = await client.get("/openapi.json")
+        assert openapi.status_code == 200
+        assert "/reset" in openapi.json()["paths"]
 
 
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
@@ -299,6 +454,7 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     workflow = WORKFLOW.read_text()
     assert "backend/scripts/ci/e2e_runtime.py gate" in workflow
     assert "--scenario empty" in workflow
+    assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
     assert "uv sync --locked --extra dev --project backend" in workflow
     assert "services:" not in workflow
     for suite in CURATED_SUITES:
@@ -312,6 +468,7 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     text = BOOTSTRAP.read_text()
     assert "exec 3>&1 1>&2" in text
     assert "--scenario empty" in text
+    assert "app-installation-lifecycle" in text
     assert "uv sync --locked" in text
     assert "exec 1>&3 3>&-" in text
     assert stat.S_IMODE(BOOTSTRAP.stat().st_mode) & stat.S_IXUSR

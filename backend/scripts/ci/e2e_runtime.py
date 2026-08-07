@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import dataclasses
 import faulthandler
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from fixture_control import create_app
 
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
-Scenario = Literal["empty"]
+Scenario = Literal["empty", "app-installation-lifecycle"]
 SCENARIO: Scenario = "empty"
 DEFAULT_USERNAME_ENV = "AKB_E2E_USERNAME"
 DEFAULT_PASSWORD_ENV = "AKB_E2E_PASSWORD"
@@ -218,6 +219,12 @@ class E2ERuntime:
         self._resetting = False
         self._cleaned = False
         self._prepared = False
+        self._fixture_catalog: dict[str, object] = {
+            "status": "starting",
+            "scenario": self.config.scenario,
+        }
+        self._fixture_private_values: tuple[str, ...] = ()
+        self._fixture_private_marker = ""
 
         self._compose_log = self.config.logs_dir / "compose.log"
 
@@ -235,6 +242,55 @@ class E2ERuntime:
             "status": "ready" if self.app_ready else "starting",
             "scenario": self.config.scenario,
             "app_ready": self.app_ready,
+        }
+
+    def fixture_discovery(self) -> dict[str, object]:
+        """Return fixture coordinates and source-neutral validator entry points."""
+
+        catalog = json.loads(json.dumps(self._fixture_catalog))
+        catalog["access"] = {
+            "login": {
+                "service": "app",
+                "method": "POST",
+                "path": "/api/v1/auth/login",
+                "fields": ["username", "password"],
+                "credential_source": "external_env_only",
+                "credential_env": {
+                    "username": self.config.credentials.username_env,
+                    "password": self.config.credentials.password_env,
+                },
+            }
+        }
+        catalog["tasks"] = {
+            "log_observation": {
+                "service": "fixture",
+                "method": "GET",
+                "path": "/log-observation",
+                "result": "sanitized",
+            }
+        }
+        return catalog
+
+    def fixture_log_observation(self) -> dict[str, object]:
+        """Return redaction counts without returning runtime log contents."""
+
+        log_text = ""
+        if self.config.logs_dir.is_dir():
+            for path in self.config.logs_dir.glob("*.log"):
+                with contextlib.suppress(OSError):
+                    log_text += path.read_text(encoding="utf-8", errors="replace")
+        private_hits = sum(value in log_text for value in self._fixture_private_values)
+        return {
+            "status": "ready" if self._prepared else "starting",
+            "scenario": self.config.scenario,
+            "redacted": True,
+            "redaction_scan": {
+                "private_value_hits": private_hits,
+                "app_credential_prefix_hits": log_text.count("akb_app_"),
+                "app_token_prefix_hits": log_text.count("Bearer eyJ"),
+                "raw_log_exposed": False,
+            },
+            "log_line_count": log_text.count("\n"),
         }
 
     def descriptor(self) -> dict[str, object]:
@@ -268,7 +324,7 @@ class E2ERuntime:
                     },
                     "discovery": {
                         "method": "GET",
-                        "url": f"{self.config.fixture_origin}/openapi.json",
+                        "url": f"{self.config.fixture_origin}/discover",
                     },
                 },
             },
@@ -318,6 +374,7 @@ class E2ERuntime:
         secret_config = {
             "db_password": "akb",
             "jwt_secret": secrets.token_urlsafe(48),
+            "app_token_secret": secrets.token_urlsafe(48),
             "embed_api_key": "ci-stub-no-auth",
             "s3_access_key": "akb-ci",
             "s3_secret_key": "akb-ci-secret",
@@ -462,7 +519,7 @@ class E2ERuntime:
         await terminate_process(managed.process, process_group=managed.process_group)
 
     async def _start_dependencies(self) -> None:
-        await self._compose("up", "--detach")
+        await self._compose("up", "--detach", "--wait")
         await self._wait_tcp("PostgreSQL", "127.0.0.1", 15432)
         await self._wait_http(
             "MinIO",
@@ -546,6 +603,574 @@ class E2ERuntime:
         except (ValueError, AttributeError):
             return False
 
+    async def _insert_fixture_user(
+        self,
+        connection: Any,
+        *,
+        username: str,
+        password_hash: str,
+        label: str,
+    ) -> uuid.UUID:
+        user_id = uuid.uuid4()
+        await connection.execute(
+            """
+            INSERT INTO users (id, username, email, password_hash)
+            VALUES ($1, $2, $3, $4)
+            """,
+            user_id,
+            username,
+            f"{label}@invalid.akb",
+            password_hash,
+        )
+        return user_id
+
+    async def _insert_fixture_vault(
+        self,
+        connection: Any,
+        *,
+        namespace: str,
+        label: str,
+        owner_id: uuid.UUID,
+        grants: list[tuple[uuid.UUID, str]],
+        granted_by: uuid.UUID,
+    ) -> tuple[uuid.UUID, str]:
+        vault_id = uuid.uuid4()
+        name = f"{namespace}-vault-{label}"
+        await connection.execute(
+            """
+            INSERT INTO vaults (id, name, git_path, owner_id)
+            VALUES ($1, $2, $3, $4)
+            """,
+            vault_id,
+            name,
+            str(self.config.vault_dir / f"{name}.git"),
+            owner_id,
+        )
+        for user_id, role in grants:
+            await connection.execute(
+                """
+                INSERT INTO vault_access (vault_id, user_id, role, granted_by)
+                VALUES ($1, $2, $3, $4)
+                """,
+                vault_id,
+                user_id,
+                role,
+                granted_by,
+            )
+        return vault_id, name
+
+    async def _insert_fixture_release(
+        self,
+        connection: Any,
+        *,
+        app_id: uuid.UUID,
+        version: str,
+        expected_fingerprint: str | None,
+    ) -> uuid.UUID:
+        manifest: dict[str, object] = {"steps": [{"id": "prepare"}]}
+        if expected_fingerprint is not None:
+            manifest["expected_schema_fingerprint"] = expected_fingerprint
+        encoded = json.dumps(manifest, separators=(",", ":"))
+        release_id = uuid.uuid4()
+        await connection.execute(
+            """
+            INSERT INTO app_releases (id, app_id, version, manifest, manifest_checksum)
+            VALUES ($1, $2, $3, $4::jsonb, $5)
+            """,
+            release_id,
+            app_id,
+            version,
+            encoded,
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        )
+        return release_id
+
+    async def _insert_fixture_installation(
+        self,
+        connection: Any,
+        *,
+        app_id: uuid.UUID,
+        vault_id: uuid.UUID,
+        desired_release_id: uuid.UUID,
+        current_release_id: uuid.UUID | None,
+        lifecycle: str,
+        capabilities: list[str],
+        resources: list[tuple[str, str, str]],
+        observed_release_id: uuid.UUID | None = None,
+        observed_release_version: str | None = None,
+        schema_fingerprint: str | None = None,
+        blocked_reason: str | None = None,
+    ) -> uuid.UUID:
+        installation_id = uuid.uuid4()
+        initial_current = (
+            current_release_id
+            if current_release_id is not None
+            else desired_release_id
+            if lifecycle == "uninstalled"
+            else None
+        )
+        initial_lifecycle = lifecycle if lifecycle != "uninstalled" else "active"
+        await connection.execute(
+            """
+            INSERT INTO vault_app_installations (
+                id, app_id, vault_id, desired_release_id, current_release_id,
+                lifecycle, blocked_reason
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            installation_id,
+            app_id,
+            vault_id,
+            desired_release_id,
+            initial_current,
+            initial_lifecycle,
+            blocked_reason if initial_lifecycle == "blocked" else None,
+        )
+        await connection.execute(
+            """
+            INSERT INTO installation_grants (
+                installation_id, generation, capabilities, issuer, provenance
+            ) VALUES ($1, 1, $2, 'runtime-fixture', $3::jsonb)
+            """,
+            installation_id,
+            sorted(capabilities),
+            json.dumps({"source": "runtime_fixture", "mode": "fixture"}),
+        )
+        if lifecycle == "uninstalled":
+            await connection.execute(
+                """
+                UPDATE installation_grants
+                   SET status = 'revoked', revoked_at = NOW()
+                 WHERE installation_id = $1
+                """,
+                installation_id,
+            )
+            await connection.execute(
+                """
+                UPDATE vault_app_installations
+                   SET desired_release_id = NULL,
+                       lifecycle = 'uninstalled',
+                       blocked_reason = NULL
+                 WHERE id = $1
+                """,
+                installation_id,
+            )
+        for resource_kind, resource_key, status in resources:
+            await connection.execute(
+                """
+                INSERT INTO app_owned_resources (
+                    installation_id, vault_id, resource_kind, resource_key, status
+                ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                installation_id,
+                vault_id,
+                resource_kind,
+                resource_key,
+                status,
+            )
+        if observed_release_id is not None:
+            await connection.execute(
+                """
+                INSERT INTO app_installation_observed_states (
+                    installation_id, app_id, vault_id, observed_generation,
+                    observed_at, observed_release_id, observed_release_version,
+                    schema_fingerprint, observed_grant_generation,
+                    checkpoint, recent_error
+                ) VALUES (
+                    $1, $2, $3, 1, NOW(), $4, $5, $6, 1, $7::jsonb, $8::jsonb
+                )
+                """,
+                installation_id,
+                app_id,
+                vault_id,
+                observed_release_id,
+                observed_release_version,
+                schema_fingerprint,
+                json.dumps(
+                    {
+                        "phase": "ready",
+                        "private_marker": self._fixture_private_marker,
+                        "worker_payload": {"token": "private"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "code": "fixture_recent_error",
+                        "message": self._fixture_private_marker,
+                        "payload": {"private_field": "private"},
+                    }
+                ),
+            )
+        return installation_id
+
+    async def _seed_app_installation_lifecycle(
+        self,
+        connection: Any,
+        *,
+        password_hash: str,
+        system_admin_id: uuid.UUID,
+    ) -> None:
+        namespace = f"fixture-{uuid.uuid4().hex[:12]}"
+        actor_specs = (
+            ("target_owner", "target-owner"),
+            ("target_admin", "target-admin"),
+            ("reader", "reader"),
+            ("writer", "writer"),
+            ("foreign_admin", "foreign-admin"),
+        )
+        actors: dict[str, dict[str, object]] = {
+            "system_admin": {"id": str(system_admin_id), "role": "system_admin"}
+        }
+        actor_ids: dict[str, uuid.UUID] = {}
+        for role, label in actor_specs:
+            username = f"{namespace}-{label}"
+            user_id = await self._insert_fixture_user(
+                connection,
+                username=username,
+                password_hash=password_hash,
+                label=f"{namespace}-{label}",
+            )
+            actor_ids[role] = user_id
+            vault_role = {
+                "target_owner": "owner",
+                "target_admin": "admin",
+                "reader": "reader",
+                "writer": "writer",
+                "foreign_admin": "owner",
+            }[role]
+            vault_scope = "foreign" if role == "foreign_admin" else "target"
+            actors[role] = {
+                "id": str(user_id),
+                "username": username,
+                "role": role,
+                "vault_role": vault_role,
+                "vault_scope": vault_scope,
+            }
+
+        target_grants = [
+            (actor_ids["target_owner"], "owner"),
+            (actor_ids["target_admin"], "admin"),
+            (actor_ids["reader"], "reader"),
+            (actor_ids["writer"], "writer"),
+        ]
+        vaults: dict[str, dict[str, str]] = {}
+        target_vault_ids: dict[str, uuid.UUID] = {}
+        for label in (
+            "install",
+            "installing",
+            "active",
+            "blocked",
+            "uninstalled",
+            "restore-compatible",
+            "restore-mismatch",
+            "restore-unknown",
+            "fresh-retained",
+            "fresh-empty",
+        ):
+            vault_id, vault_name = await self._insert_fixture_vault(
+                connection,
+                namespace=namespace,
+                label=label,
+                owner_id=actor_ids["target_owner"],
+                grants=target_grants,
+                granted_by=system_admin_id,
+            )
+            target_vault_ids[label] = vault_id
+            vaults[label] = {"id": str(vault_id), "name": vault_name}
+
+        foreign_vault_id, foreign_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="foreign",
+            owner_id=actor_ids["foreign_admin"],
+            grants=[(actor_ids["foreign_admin"], "owner")],
+            granted_by=system_admin_id,
+        )
+        vaults["foreign"] = {"id": str(foreign_vault_id), "name": foreign_vault_name}
+
+        target_app_id = uuid.uuid4()
+        foreign_app_id = uuid.uuid4()
+        await connection.execute(
+            """
+            INSERT INTO app_definitions (id, app_key, display_name)
+            VALUES ($1, $2, $3), ($4, $5, $6)
+            """,
+            target_app_id,
+            f"{namespace}-target-app",
+            "Runtime Target App",
+            foreign_app_id,
+            f"{namespace}-foreign-app",
+            "Runtime Foreign App",
+        )
+        release_a = await self._insert_fixture_release(
+            connection,
+            app_id=target_app_id,
+            version="1.0.0",
+            expected_fingerprint="a" * 64,
+        )
+        release_b = await self._insert_fixture_release(
+            connection,
+            app_id=target_app_id,
+            version="2.0.0",
+            expected_fingerprint="c" * 64,
+        )
+        release_unknown = await self._insert_fixture_release(
+            connection,
+            app_id=target_app_id,
+            version="3.0.0",
+            expected_fingerprint=None,
+        )
+        foreign_release = await self._insert_fixture_release(
+            connection,
+            app_id=foreign_app_id,
+            version="1.0.0",
+            expected_fingerprint="a" * 64,
+        )
+
+        fixtures: dict[str, dict[str, object]] = {}
+
+        async def add_fixture(
+            name: str,
+            *,
+            vault_label: str,
+            release_id: uuid.UUID,
+            installation_id: uuid.UUID | None = None,
+            requested_release_id: uuid.UUID | None = None,
+        ) -> None:
+            item: dict[str, object] = {
+                "app_id": str(target_app_id),
+                "vault_id": str(target_vault_ids[vault_label]),
+                "release_id": str(release_id),
+            }
+            if requested_release_id is not None:
+                item["requested_release_id"] = str(requested_release_id)
+            if installation_id is not None:
+                item["installation_id"] = str(installation_id)
+            fixtures[name] = item
+
+        install_vault = target_vault_ids["install"]
+        await add_fixture("install", vault_label="install", release_id=release_a)
+        await add_fixture("install_conflict", vault_label="install", release_id=release_b)
+
+        installing_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["installing"],
+            desired_release_id=release_a,
+            current_release_id=None,
+            lifecycle="installing",
+            capabilities=["installation:read"],
+            resources=[],
+        )
+        await add_fixture(
+            "status_installing",
+            vault_label="installing",
+            release_id=release_a,
+            installation_id=installing_id,
+        )
+
+        active_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["active"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="active",
+            capabilities=["installation:read", "inventory:read"],
+            resources=[("table", f"{namespace}-active-table", "owned")],
+            observed_release_id=release_a,
+            observed_release_version="1.0.0",
+            schema_fingerprint="a" * 64,
+        )
+        await add_fixture(
+            "status_active",
+            vault_label="active",
+            release_id=release_a,
+            installation_id=active_id,
+        )
+
+        blocked_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["blocked"],
+            desired_release_id=release_b,
+            current_release_id=release_a,
+            lifecycle="blocked",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-blocked-table", "owned")],
+            observed_release_id=release_a,
+            observed_release_version="1.0.0",
+            schema_fingerprint="a" * 64,
+            blocked_reason="fixture_blocked",
+        )
+        await add_fixture(
+            "status_blocked",
+            vault_label="blocked",
+            release_id=release_b,
+            installation_id=blocked_id,
+            requested_release_id=release_b,
+        )
+
+        uninstalled_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["uninstalled"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-uninstalled-table", "retained")],
+        )
+        await add_fixture(
+            "status_uninstalled",
+            vault_label="uninstalled",
+            release_id=release_a,
+            installation_id=uninstalled_id,
+        )
+
+        restore_compatible_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["restore-compatible"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-restore-table", "retained")],
+            observed_release_id=release_a,
+            observed_release_version="1.0.0",
+            schema_fingerprint="a" * 64,
+        )
+        await add_fixture(
+            "restore_compatible",
+            vault_label="restore-compatible",
+            release_id=release_a,
+            installation_id=restore_compatible_id,
+        )
+
+        restore_mismatch_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["restore-mismatch"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-mismatch-table", "retained")],
+            observed_release_id=release_a,
+            observed_release_version="1.0.0",
+            schema_fingerprint="b" * 64,
+        )
+        await add_fixture(
+            "restore_mismatch",
+            vault_label="restore-mismatch",
+            release_id=release_a,
+            installation_id=restore_mismatch_id,
+        )
+
+        restore_unknown_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["restore-unknown"],
+            desired_release_id=release_unknown,
+            current_release_id=release_unknown,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-unknown-table", "retained")],
+            observed_release_id=release_unknown,
+            observed_release_version="3.0.0",
+            schema_fingerprint="a" * 64,
+        )
+        await add_fixture(
+            "restore_unknown",
+            vault_label="restore-unknown",
+            release_id=release_unknown,
+            installation_id=restore_unknown_id,
+        )
+
+        fresh_retained_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["fresh-retained"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[("table", f"{namespace}-fresh-retained-table", "retained")],
+        )
+        await add_fixture(
+            "fresh_retained",
+            vault_label="fresh-retained",
+            release_id=release_b,
+            installation_id=fresh_retained_id,
+            requested_release_id=release_b,
+        )
+
+        fresh_empty_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["fresh-empty"],
+            desired_release_id=release_a,
+            current_release_id=release_a,
+            lifecycle="uninstalled",
+            capabilities=["installation:read"],
+            resources=[],
+        )
+        await add_fixture(
+            "fresh_empty",
+            vault_label="fresh-empty",
+            release_id=release_b,
+            installation_id=fresh_empty_id,
+            requested_release_id=release_b,
+        )
+
+        foreign_installation_id = await self._insert_fixture_installation(
+            connection,
+            app_id=foreign_app_id,
+            vault_id=foreign_vault_id,
+            desired_release_id=foreign_release,
+            current_release_id=foreign_release,
+            lifecycle="active",
+            capabilities=["installation:read"],
+            resources=[],
+        )
+
+        self._fixture_catalog = {
+            "status": "ready",
+            "scenario": self.config.scenario,
+            "namespace": namespace,
+            "actors": actors,
+            "apps": {
+                "target": {"id": str(target_app_id)},
+                "foreign": {"id": str(foreign_app_id)},
+            },
+            "releases": {
+                "target_primary": {"id": str(release_a), "version": "1.0.0"},
+                "target_next": {"id": str(release_b), "version": "2.0.0"},
+                "target_unknown": {"id": str(release_unknown), "version": "3.0.0"},
+                "foreign": {"id": str(foreign_release), "version": "1.0.0"},
+            },
+            "vaults": vaults,
+            "fixtures": fixtures,
+            "commands": {
+                "install": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(install_vault),
+                    "release_id": str(release_a),
+                },
+                "conflict_release": {
+                    "app_id": str(target_app_id),
+                    "vault_id": str(install_vault),
+                    "release_id": str(release_b),
+                },
+            },
+            "foreign_installation": {
+                "app_id": str(foreign_app_id),
+                "vault_id": str(foreign_vault_id),
+                "release_id": str(foreign_release),
+                "installation_id": str(foreign_installation_id),
+            },
+        }
+
     async def _seed_external_credential(self) -> None:
         username, password = self.config.credentials.values()
         if len(username) > 200 or len(password) > 1000:
@@ -560,6 +1185,9 @@ class E2ERuntime:
                     "ascii"
                 )
             )
+            self._fixture_private_marker = f"runtime-private-{uuid.uuid4().hex}"
+            self._fixture_private_values = (username, password, self._fixture_private_marker)
+            system_admin_id = uuid.uuid4()
             connection = await asyncpg.connect(
                 host="127.0.0.1",
                 port=15432,
@@ -574,11 +1202,30 @@ class E2ERuntime:
                         (id, username, email, password_hash, is_admin)
                     VALUES ($1, $2, $3, $4, TRUE)
                     """,
-                    uuid.uuid4(),
+                    system_admin_id,
                     username,
                     f"runtime-{uuid.uuid4().hex}@invalid.akb",
                     password_hash,
                 )
+                if self.config.scenario == "app-installation-lifecycle":
+                    await self._seed_app_installation_lifecycle(
+                        connection,
+                        password_hash=password_hash,
+                        system_admin_id=system_admin_id,
+                    )
+                else:
+                    self._fixture_catalog = {
+                        "status": "ready",
+                        "scenario": self.config.scenario,
+                        "namespace": f"fixture-{uuid.uuid4().hex[:12]}",
+                        "actors": {
+                            "system_admin": {
+                                "id": str(system_admin_id),
+                                "role": "system_admin",
+                            }
+                        },
+                        "fixtures": {},
+                    }
             finally:
                 await connection.close()
         except ProvisioningFailure:
@@ -633,7 +1280,7 @@ class E2ERuntime:
         await self._bootstrap_backend_and_seed()
         self._prepared = True
 
-    async def reset_empty(self) -> None:
+    async def reset_scenario(self) -> None:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
@@ -824,7 +1471,11 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--username-env", default=DEFAULT_USERNAME_ENV)
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
-    parser.add_argument("--scenario", choices=(SCENARIO,), default=SCENARIO)
+    parser.add_argument(
+        "--scenario",
+        choices=("empty", "app-installation-lifecycle"),
+        default=SCENARIO,
+    )
     args = parser.parse_args(argv)
 
     checkout = args.checkout.expanduser().resolve()
