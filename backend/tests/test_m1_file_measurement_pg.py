@@ -23,7 +23,10 @@ from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_derived_worker import NativeDerivedWorker
-from app.services.native_revision_service import NativeRevisionService
+from app.services.native_revision_service import (
+    FAILPOINT_BOUNDARIES,
+    NativeRevisionService,
+)
 
 
 _DSN = os.environ.get("AKB_M1_FILE_TEST_DSN")
@@ -1223,3 +1226,246 @@ async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_
         "lifecycle": "live",
         "head_revision_id": create_revision_id,
     }
+
+
+_NATIVE_AUTHORITY_TABLES = (
+    "native_resources",
+    "native_payload_manifests",
+    "native_revisions",
+    "native_revision_activity",
+    "native_invalidation_intents",
+)
+
+
+async def _native_authority_counts(pool, resource_id: uuid.UUID) -> dict[str, int]:
+    async with pool.acquire() as conn:
+        return {
+            table: await conn.fetchval(
+                f"SELECT count(*) FROM {table} WHERE resource_id = $1", resource_id,
+            )
+            for table in _NATIVE_AUTHORITY_TABLES
+        }
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        # Prepared *inside* the caller's File transaction, unlike the
+        # standalone-pool arm where the verified body survives a rollback.
+        "payload.after_prepare_before_tx",
+        "authority.after_resource",
+        "authority.after_manifest",
+        "authority.after_revision",
+        "authority.after_head",
+        "authority.after_path",
+        "authority.after_alias",
+        "authority.after_activity",
+        "authority.after_invalidation",
+        "authority.before_commit",
+    ],
+)
+@pytest.mark.asyncio
+async def test_composite_file_confirm_failpoint_leaves_no_partial_authority_and_retries_once(
+    context, monkeypatch, boundary,
+):
+    """C5 at the riskiest boundary AKB has: a composite File confirm.
+
+    ``MeasurementFileService.confirm_upload`` owns the outer ``vault_files``
+    transaction and the bridged ledger publish runs inside it as a savepoint.
+    A failure injected into the nested publish must therefore unwind *both*:
+    no public File row, no rows in any of the five native authority tables,
+    no path alias and no verified body.  The transfer intent is the one thing
+    that must survive, because it is what makes the retry possible — and the
+    clean retry must land exactly one activity event and one durable
+    invalidation intent, not two.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+    assert boundary in FAILPOINT_BOUNDARIES
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+
+    fired: list[str] = []
+
+    async def failpoint(name: str) -> None:
+        fired.append(name)
+        if name == boundary:
+            raise RuntimeError(f"injected:{name}")
+
+    bridge.install_m1_native_text_file_bridge(failpoint=failpoint)
+
+    service = m1.MeasurementFileService()
+    data = b"composite confirm body\nsecond line\n"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="composite.py",
+        actor_id="c5-test",
+        mime_type="text/x-python",
+        description="composite failpoint",
+        content_hash=digest,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    with pytest.raises(RuntimeError, match=f"injected:{boundary}"):
+        await service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest)
+
+    assert fired[-1] == boundary
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 0,
+    )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_resource_path_aliases WHERE namespace_id = $1",
+            vault_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_reference_payloads WHERE digest = $1", digest,
+        ) == 0
+        # The only durable residue is the transfer intent the retry needs.
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", file_id,
+        ) == 1
+    assert await service.list_files(vault_id, vault_name, None, 50) == []
+    with pytest.raises(NotFoundError):
+        await service.get_download_url(vault_id, initiated["file_id"])
+
+    # Reinstall production-shaped (no failpoint) and retry the same confirm.
+    bridge.install_m1_native_text_file_bridge()
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    assert confirmed["file_id"] == initiated["file_id"]
+    assert confirmed["uri"] == initiated["uri"]
+    assert confirmed["storage_driver"] == "native_text"
+    assert confirmed["native_resource_id"] == initiated["file_id"]
+    assert confirmed["content_hash"] == digest
+
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 1,
+    )
+    async with pool.acquire() as conn:
+        activity = await conn.fetchrow(
+            "SELECT action, revision_id, actor FROM native_revision_activity WHERE resource_id = $1",
+            file_id,
+        )
+        intent = await conn.fetchrow(
+            """
+            SELECT reason, revision_id, claimed_at, completed_at, last_error
+              FROM native_invalidation_intents
+             WHERE resource_id = $1
+            """,
+            file_id,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", file_id,
+        ) == 0
+    assert dict(activity) == {
+        "action": "create",
+        "revision_id": confirmed["native_revision_id"],
+        "actor": "c5-test",
+    }
+    # Durable means still owed: the retry left a pending intent for the
+    # invalidation worker, not a completed or already-claimed one.
+    assert dict(intent) == {
+        "reason": "create",
+        "revision_id": confirmed["native_revision_id"],
+        "claimed_at": None,
+        "completed_at": None,
+        "last_error": None,
+    }
+
+    download = await service.get_download_url(vault_id, initiated["file_id"])
+    assert await service.transfer(_token(download["download_url"]), method="GET") == data
+    assert [item["file_id"] for item in await service.list_files(vault_id, vault_name, None, 50)] == [
+        initiated["file_id"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_composite_confirm_discards_a_ledger_publish_that_already_reported_commit(
+    context, monkeypatch,
+):
+    """In a composite transaction the ledger's own "commit" is not one.
+
+    ``authority.after_commit_before_response`` fires once the nested publish
+    has released its savepoint.  On the standalone pool that boundary models
+    a lost response over a *durable* Revision, and the retry replays it
+    idempotently.  Bridged into a File confirm there is no such Revision: the
+    outer ``vault_files`` transaction is still the only commit boundary, so
+    the whole publication is discarded.  What this test asserts is exactly
+    that non-durability — zero rows after the failure, one row after the
+    retry.  It does *not* assert that the retry took the fresh-lineage path
+    rather than the replay path: the aborted revision id never reached the
+    database, so the exactly-one counts cannot tell the two apart, and
+    fresh-lineage is an inference from the rollback rather than an observed
+    fact.  Pinning the non-durability keeps the boundary's name from being
+    read as a durability claim on this path.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+
+    fired = False
+
+    async def failpoint(name: str) -> None:
+        nonlocal fired
+        if name == "authority.after_commit_before_response" and not fired:
+            fired = True
+            raise RuntimeError("injected:response-lost")
+
+    bridge.install_m1_native_text_file_bridge(failpoint=failpoint)
+
+    service = m1.MeasurementFileService()
+    data = b"savepoint release is not a commit\n"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="after_commit.py",
+        actor_id="c5-test",
+        mime_type="text/x-python",
+        description="composite after-commit",
+        content_hash=digest,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    with pytest.raises(RuntimeError, match="injected:response-lost"):
+        await service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest)
+
+    assert fired is True
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 0,
+    )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    assert confirmed["storage_driver"] == "native_text"
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 1,
+    )

@@ -28,7 +28,10 @@ from app.services.native_document_service import (
 )
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_revision_backend import NativeRevisionBackend
-from app.services.native_revision_service import NativeRevisionService
+from app.services.native_revision_service import (
+    FAILPOINT_BOUNDARIES,
+    NativeRevisionService,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -1998,6 +2001,130 @@ async def test_committed_response_lost_retry_returns_same_revision_once():
             changed = _create_args(vault_id, mutation_id=mutation_id)
             changed["payload"] = "different retry"
             await service.create_text(**changed)
+
+
+async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries():
+    """C5 must be injectable through the Document facade, not only under it.
+
+    The facade builds its own ``NativeRevisionService`` per call, so before
+    the constructor seam existed a C5 case had to overwrite the private
+    ``_native`` coroutine to reach a boundary.  Assert the exact dispatch
+    order for both mutations so a boundary that stops firing is a failure
+    rather than a silently shorter list.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        seen: list[str] = []
+
+        async def record(name: str) -> None:
+            seen.append(name)
+
+        documents = NativeDocumentService(pool=pool, failpoint=record)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="seam",
+                title="Seam",
+                content="created",
+            ),
+            agent_id="seam",
+        )
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+            "authority.after_resource",
+            "authority.after_manifest",
+            "authority.after_revision",
+            "authority.after_head",
+            "authority.after_path",
+            "authority.after_alias",
+            "authority.after_activity",
+            "authority.after_invalidation",
+            "authority.before_commit",
+            "authority.after_commit_before_response",
+        ]
+
+        seen.clear()
+        updated = await documents.update(
+            vault,
+            created.path,
+            DocumentUpdateRequest(content="second"),
+            agent_id="seam",
+        )
+        assert updated.previous_commit == created.commit_hash
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+            "authority.after_manifest",
+            "authority.after_revision",
+            "authority.after_head",
+            "authority.after_path",
+            "authority.after_activity",
+            "authority.after_invalidation",
+            "authority.before_commit",
+            "authority.after_commit_before_response",
+        ]
+        assert set(seen) <= set(FAILPOINT_BOUNDARIES)
+        assert await _authority_counts(pool) == {
+            "native_resources": 1,
+            "native_revisions": 2,
+            "native_payload_manifests": 2,
+            "native_revision_activity": 2,
+            "native_invalidation_intents": 2,
+        }
+
+
+@pytest.mark.parametrize(
+    ("boundary", "error"),
+    [
+        ("authority.after_revision", RuntimeError("injected put failure")),
+        # The facade retries a slug-less put only on the path-collision
+        # ConflictError it raises itself.  A ConflictError from anywhere else
+        # must surface, not spin the loop forever against a failpoint that
+        # fires again on every attempt.
+        ("authority.before_commit", ConflictError("Native Revision conflict: injected")),
+    ],
+)
+async def test_document_facade_injected_failure_surfaces_without_a_retry_loop_hang(
+    boundary: str, error: Exception,
+):
+    assert boundary in FAILPOINT_BOUNDARIES
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        async def failpoint(name: str) -> None:
+            if name == boundary:
+                raise error
+
+        documents = NativeDocumentService(pool=pool, failpoint=failpoint)
+        with pytest.raises(type(error), match="injected"):
+            await asyncio.wait_for(
+                documents.put(
+                    # No slug: this is the arm with the resolve-and-retry loop.
+                    DocumentPutRequest(
+                        vault=vault,
+                        collection="notes",
+                        title="Injected",
+                        content="must not be published",
+                    ),
+                    agent_id="seam",
+                ),
+                timeout=10,
+            )
+
+        assert await _authority_counts(pool) == {
+            "native_resources": 0,
+            "native_revisions": 0,
+            "native_payload_manifests": 0,
+            "native_revision_activity": 0,
+            "native_invalidation_intents": 0,
+        }
 
 
 async def test_create_idempotency_fingerprint_includes_requested_resource_identity():

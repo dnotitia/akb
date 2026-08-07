@@ -37,7 +37,11 @@ from app.services.document_service import (
     newest_public_slug,
     validate_vault_name,
 )
-from app.services.native_revision_service import NativeRevisionService, NativeRevisionSnapshot
+from app.services.native_revision_service import (
+    Failpoint,
+    NativeRevisionService,
+    NativeRevisionSnapshot,
+)
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import doc_uri
@@ -65,10 +69,20 @@ class NativeRevisionUnsupportedSurfaceError(AKBError):
 class NativeDocumentService(DocumentService):
     """Document lifecycle adapter preserving existing request/response models."""
 
-    def __init__(self, *, pool: asyncpg.Pool | None = None):
+    def __init__(
+        self,
+        *,
+        pool: asyncpg.Pool | None = None,
+        failpoint: Failpoint | None = None,
+    ):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
         self._injected_pool = pool
+        # ``failpoint`` carries the native service's deterministic test-only
+        # hook down to the substrate this facade composes; production
+        # composition must leave it unset.  Left unset, ``_native`` builds
+        # exactly the service it built before this seam existed.
+        self._failpoint = failpoint
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -82,7 +96,7 @@ class NativeDocumentService(DocumentService):
         return vault_id
 
     async def _native(self) -> NativeRevisionService:
-        return NativeRevisionService(await self._pool())
+        return NativeRevisionService(await self._pool(), failpoint=self._failpoint)
 
     @staticmethod
     async def _yield_after_head_race(race_count: int) -> None:

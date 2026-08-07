@@ -7,11 +7,20 @@ authorities after a failure.  ``_BoundPool`` adapts the existing native service
 and PostgreSQL BodyStore to a caller-owned connection; their nested
 transactions become asyncpg savepoints and the outer File transaction remains
 the only commit boundary.
+
+Because the confirm is a *composite* transaction, this bridge is also the only
+place a C5 failpoint can be injected where the risk actually lives.  A failure
+raised inside the nested ledger publish must unwind the savepoint *and* the
+outer ``vault_files`` transaction, leaving no public File row, no ledger rows
+and no orphan visible state.  ``install_m1_native_text_file_bridge`` therefore
+accepts the same deterministic test-only hook the native service documents;
+production installation leaves it unset.
 """
 
 from __future__ import annotations
 
 import uuid
+from functools import partial
 from typing import Any, cast
 
 import asyncpg
@@ -27,7 +36,7 @@ from app.services.m1_file_measurement import (
     register_native_text_file_services,
 )
 from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.native_revision_service import NativeRevisionService
+from app.services.native_revision_service import Failpoint, NativeRevisionService
 
 
 _MUTATION_NAMESPACE = uuid.UUID("8d881f1f-72a0-4bd6-9c06-f02a5cc19c33")
@@ -54,7 +63,10 @@ class _BoundPool:
         return _BoundAcquire(self.conn)
 
 
-def _service_on(conn: asyncpg.Connection) -> NativeRevisionService:
+def _service_on(
+    conn: asyncpg.Connection,
+    failpoint: Failpoint | None = None,
+) -> NativeRevisionService:
     # The composed services only call Pool.acquire(); every call must resolve
     # to the transaction-owning connection above.  The casts are limited to
     # this measurement-only adapter instead of weakening production types.
@@ -63,6 +75,7 @@ def _service_on(conn: asyncpg.Connection) -> NativeRevisionService:
         pool,
         repository=NativeRevisionRepository(pool),
         payload_store=M1PgBodyStore(pool),
+        failpoint=failpoint,
     )
 
 
@@ -73,10 +86,12 @@ def _mutation_id(kind: str, *parts: object) -> uuid.UUID:
 async def _publish(
     conn: object,
     request: NativeTextPublishRequest,
+    *,
+    failpoint: Failpoint | None = None,
 ) -> NativeTextPublication:
     if not isinstance(conn, asyncpg.Connection):
         raise AKBError("native text File publisher requires a PostgreSQL transaction", status_code=503)
-    result = await _service_on(conn).create_text(
+    result = await _service_on(conn, failpoint).create_text(
         namespace_id=request.vault_id,
         surface="file",
         path=request.logical_path,
@@ -125,10 +140,15 @@ async def _open(
     )
 
 
-async def _delete(conn: object, request: NativeTextDeleteRequest) -> None:
+async def _delete(
+    conn: object,
+    request: NativeTextDeleteRequest,
+    *,
+    failpoint: Failpoint | None = None,
+) -> None:
     if not isinstance(conn, asyncpg.Connection):
         raise AKBError("native text File deleter requires a PostgreSQL transaction", status_code=503)
-    result = await _service_on(conn).delete_resource(
+    result = await _service_on(conn, failpoint).delete_resource(
         namespace_id=request.vault_id,
         surface="file",
         path=request.logical_path,
@@ -148,10 +168,18 @@ async def _delete(conn: object, request: NativeTextDeleteRequest) -> None:
         raise AKBError("native text File delete returned the wrong lineage", status_code=502)
 
 
-def install_m1_native_text_file_bridge() -> None:
-    """Install the guarded process callbacks after migrations have completed."""
+def install_m1_native_text_file_bridge(*, failpoint: Failpoint | None = None) -> None:
+    """Install the guarded process callbacks after migrations have completed.
+
+    ``failpoint`` is the native service's deterministic test-only hook; it is
+    bound onto the two callbacks that publish authority inside the caller's
+    File transaction.  Production installation must leave it unset, and unset
+    it composes the same ``NativeRevisionService`` as before.  ``_open`` is
+    deliberately excluded: it reads on its own pool connection outside any
+    File transaction and crosses no authority boundary.
+    """
     register_native_text_file_services(
-        publisher=_publish,
+        publisher=partial(_publish, failpoint=failpoint),
         opener=_open,
-        deleter=_delete,
+        deleter=partial(_delete, failpoint=failpoint),
     )
