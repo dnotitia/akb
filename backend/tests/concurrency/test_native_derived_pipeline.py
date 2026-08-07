@@ -49,14 +49,14 @@ async def _fresh_database():
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 49, 50):
+        for number in (5, 6, 48, 53, 54):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None
             migration = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(migration)
             await migration.migrate(conn=conn)
-            if number == 50:
+            if number == 54:
                 await migration.migrate(conn=conn)  # startup retry is idempotent
         await conn.close()
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
