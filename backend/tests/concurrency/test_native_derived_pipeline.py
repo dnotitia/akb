@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import os
 import uuid
@@ -10,10 +11,16 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.config import settings
+from app.services import embed_worker, sparse_encoder
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services._backfill import MAX_RETRIES
-from app.services.native_derived_worker import NativeDerivedWorker
+from app.services.native_derived_worker import (
+    NATIVE_FILE_SOURCE,
+    SELECTED_DELIVERY,
+    NativeDerivedWorker,
+)
 from app.services.native_revision_service import NativeRevisionService
 
 
@@ -55,14 +62,14 @@ async def _fresh_database():
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 53, 54, 57):
+        for number in (5, 6, 48, 53, 54, 57, 59):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None
             migration = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(migration)
             await migration.migrate(conn=conn)
-            if number == 54:
+            if number in (54, 59):
                 await migration.migrate(conn=conn)  # startup retry is idempotent
         await conn.close()
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
@@ -163,40 +170,273 @@ async def test_worker_coalesces_to_current_head_and_closes_chunk_mapping_residue
             assert {row["chunk_id"] for row in queued} == set(prior_chunk_ids)
 
 
-async def test_text_file_intent_closes_on_explicit_direct_grep_delivery_without_chunks():
+async def _owned_vault(pool, prefix: str) -> tuple[uuid.UUID, uuid.UUID]:
+    async with pool.acquire() as conn:
+        owner = await conn.fetchval(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES ($1, $2, 'disabled') RETURNING id
+            """,
+            f"{prefix}-{uuid.uuid4().hex}",
+            f"{prefix}-{uuid.uuid4().hex}@invalid.example",
+        )
+        vault_id = await conn.fetchval(
+            "INSERT INTO vaults (name, git_path, owner_id) VALUES ($1, '/tmp/unused.git', $2) RETURNING id",
+            f"{prefix}-{uuid.uuid4().hex}",
+            owner,
+        )
+    return owner, vault_id
+
+
+async def test_text_file_intent_applies_the_document_parity_derived_path():
+    """Successor to the pre-parity `direct_grep` closure test.
+
+    A text File intent used to close on an explicit no-op delivery, which left
+    text Files greppable but permanently unembeddable. It must now materialize
+    the same derived state a Document does — chunks, a derived Head, and
+    Revision/intent provenance — on the same Resource/Revision basis.
+    """
     async with _fresh_database() as pool:
-        async with pool.acquire() as conn:
-            vault_id = await conn.fetchval(
-                "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
-                f"file-{uuid.uuid4().hex}",
-            )
+        _owner, vault_id = await _owned_vault(pool, "file-parity")
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        worker = NativeDerivedWorker(pool)
         created = await service.create_text(
             namespace_id=vault_id,
             surface="file",
             path="src/main.py",
-            payload="direct_grep_token\n",
+            payload="embeddable_file_token\n",
             actor="derived-test",
             mutation_id=uuid.uuid4(),
         )
 
-        assert await NativeDerivedWorker(pool).process_once() == 1
+        assert await worker.process_once() == 1
         async with pool.acquire() as conn:
             intent = await conn.fetchrow(
                 """
-                SELECT completed_at, delivery_outcome, selected_delivery
+                SELECT intent_id, completed_at, delivery_outcome, selected_delivery,
+                       last_error, next_attempt_at
                   FROM native_invalidation_intents WHERE revision_id = $1
                 """,
                 created.revision_id,
             )
             assert intent["completed_at"] is not None
-            assert intent["delivery_outcome"] == "direct_grep"
-            assert intent["selected_delivery"] == "native-direct-pg-grep-v1"
-            assert await conn.fetchval(
-                "SELECT COUNT(*) FROM chunks WHERE source_id = $1", created.resource_id
-            ) == 0
+            assert intent["delivery_outcome"] == "applied"
+            # One delivery mechanism after parity: Files no longer carry a
+            # separate `native-direct-pg-grep-v1` selection.
+            assert intent["selected_delivery"] == SELECTED_DELIVERY
+            assert intent["last_error"] is None
+            assert intent["next_attempt_at"] is None
+
+            chunk_rows = await conn.fetch(
+                """
+                SELECT c.id, c.content, c.vault_id, c.vector_indexed_at,
+                       dc.resource_id, dc.revision_id, dc.intent_id, dc.namespace_id
+                  FROM chunks c JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                 WHERE c.source_type = $1 AND c.source_id = $2
+                 ORDER BY c.chunk_index
+                """,
+                NATIVE_FILE_SOURCE,
+                created.resource_id,
+            )
+            assert chunk_rows
+            assert all("embeddable_file_token" in row["content"] for row in chunk_rows)
+            # File addressing, not Document addressing.
+            vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+            assert all(
+                f"URI: akb://{vault_name}/coll/src/file/{created.resource_id}" in row["content"]
+                for row in chunk_rows
+            )
+            assert all("PATH: src/main.py" in row["content"] for row in chunk_rows)
+            # C3 identification chain: every derived row names the exact
+            # Resource, Revision, and intent it was produced from.
+            assert {row["revision_id"] for row in chunk_rows} == {created.revision_id}
+            assert {row["intent_id"] for row in chunk_rows} == {intent["intent_id"]}
+            assert {row["namespace_id"] for row in chunk_rows} == {vault_id}
+            assert {row["vault_id"] for row in chunk_rows} == {vault_id}
+            # Crash-safe ordering: chunks land unindexed for the embed worker.
+            assert all(row["vector_indexed_at"] is None for row in chunk_rows)
+
+            head = await conn.fetchrow(
+                """
+                SELECT namespace_id, revision_id, intent_id, path, chunk_count, content_digest
+                  FROM native_derived_heads WHERE resource_id = $1
+                """,
+                created.resource_id,
+            )
+            assert head["namespace_id"] == vault_id
+            assert head["revision_id"] == created.revision_id
+            assert head["intent_id"] == intent["intent_id"]
+            assert head["path"] == "src/main.py"
+            assert head["chunk_count"] == len(chunk_rows)
+            assert head["content_digest"] == hashlib.sha256(b"embeddable_file_token\n").hexdigest()
+
             assert await conn.fetchval(
                 "SELECT COUNT(*) FROM native_invalidation_intents WHERE completed_at IS NULL"
+            ) == 0
+
+        stats = await worker.pending_stats(vault_id)
+        assert stats["pending"] == 0
+        assert stats["applied"] == 1
+        assert stats["direct_grep"] == 0
+
+        prior_chunk_ids = {row["id"] for row in chunk_rows}
+        deleted = await service.delete_resource(
+            namespace_id=vault_id,
+            surface="file",
+            path="src/main.py",
+            actor="derived-test",
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=created.revision_id,
+            expected_resource_id=created.resource_id,
+        )
+        assert deleted.revision_id != created.revision_id
+        assert await worker.process_once() == 1
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT delivery_outcome FROM native_invalidation_intents WHERE revision_id = $1",
+                deleted.revision_id,
+            ) == "deleted"
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE source_type = $1 AND source_id = $2",
+                NATIVE_FILE_SOURCE,
+                created.resource_id,
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_derived_chunks WHERE resource_id = $1",
+                created.resource_id,
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_derived_heads WHERE resource_id = $1",
+                created.resource_id,
+            ) == 0
+            # Vector tombstones ride the same outbox the Document path uses.
+            queued = await conn.fetch(
+                "SELECT chunk_id FROM vector_delete_outbox WHERE source_type = $1",
+                NATIVE_FILE_SOURCE,
+            )
+            assert {row["chunk_id"] for row in queued} == prior_chunk_ids
+
+
+async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
+    """Derived output is never an exact-grep oracle.
+
+    Text Files have no update path today, so the disagreement is manufactured
+    directly in the disposable database: the derived chunk row is rewritten to
+    claim a token the Head never contained and to drop the token it does.  Grep
+    must still answer from the verified Head bytes.
+    """
+    async with _fresh_database() as pool:
+        owner, vault_id = await _owned_vault(pool, "grep-head")
+        service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        created = await service.create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="src/main.py",
+            payload="head_truth_token\n",
+            actor="derived-test",
+            mutation_id=uuid.uuid4(),
+        )
+        assert await NativeDerivedWorker(pool).process_once() == 1
+
+        async with pool.acquire() as conn:
+            corrupted = await conn.fetchval(
+                """
+                UPDATE chunks SET content = 'chunk_lie_token'
+                 WHERE source_type = $1 AND source_id = $2
+                RETURNING id
+                """,
+                NATIVE_FILE_SOURCE,
+                created.resource_id,
+            )
+            assert corrupted is not None
+
+        grep = M1NativeGrepService(pool)
+        found = await grep.grep("head_truth_token", user_id=owner, include_text_files=True)
+        assert found["total_resources"] == 1
+        assert found["results"][0]["revision"] == created.revision_id
+        assert found["results"][0]["resource_type"] == "file"
+        lied = await grep.grep("chunk_lie_token", user_id=owner, include_text_files=True)
+        assert lied["total_resources"] == 0
+        assert lied["results"] == []
+
+
+async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(monkeypatch):
+    """The embeddability the frozen spec requires, proven end to end.
+
+    Admitted text File create → intent → derived worker → chunks with the
+    File's Revision/intent provenance → the embed worker's own selection query
+    claims them and drives them through to a vector-store upsert.
+    """
+    async with _fresh_database() as pool:
+        _owner, vault_id = await _owned_vault(pool, "embed-file")
+        service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        created = await service.create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="src/service.py",
+            payload="def handler():\n    return 'indexable file body'\n",
+            actor="derived-test",
+            mutation_id=uuid.uuid4(),
+        )
+        assert await NativeDerivedWorker(pool).process_once() == 1
+
+        async with pool.acquire() as conn:
+            derived_chunk_ids = {
+                row["id"]
+                for row in await conn.fetch(
+                    "SELECT id FROM chunks WHERE source_type = $1 AND source_id = $2",
+                    NATIVE_FILE_SOURCE,
+                    created.resource_id,
+                )
+            }
+        assert derived_chunk_ids
+
+        # 1. The embed worker's real selection query must see them.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                claimed = await embed_worker._claim_batch(conn)
+        assert {row["id"] for row in claimed} == derived_chunk_ids
+        assert {row["source_type"] for row in claimed} == {NATIVE_FILE_SOURCE}
+        assert {row["source_id"] for row in claimed} == {created.resource_id}
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE chunks SET vector_next_attempt_at = NULL")
+
+        # 2. Drive the whole pass with a faked model + vector store. The
+        #    measurement hook stays off (this database is not named exactly
+        #    `akb_revision_m1_measurement`), so the pass measures embedding
+        #    pickup only.
+        upserts: list[dict] = []
+
+        class _FakeStore:
+            async def upsert_one(self, **kwargs):
+                upserts.append(kwargs)
+
+        async def fake_embeddings(texts):
+            return [[0.5] * 4 for _ in texts]
+
+        async def fake_sparse(_content):
+            return [1], [1.0]
+
+        async def fake_get_pool():
+            return pool
+
+        monkeypatch.setattr(embed_worker, "get_pool", fake_get_pool)
+        monkeypatch.setattr(embed_worker, "generate_embeddings", fake_embeddings)
+        monkeypatch.setattr(embed_worker, "get_vector_store", lambda: _FakeStore())
+        monkeypatch.setattr(sparse_encoder, "encode_document", fake_sparse)
+        monkeypatch.setattr(settings, "embed_base_url", "http://embed.invalid/v1")
+
+        assert await embed_worker._process_once() == len(derived_chunk_ids)
+        assert {uuid.UUID(call["chunk_id"]) for call in upserts} == derived_chunk_ids
+        assert {call["source_type"] for call in upserts} == {NATIVE_FILE_SOURCE}
+        assert {call["source_id"] for call in upserts} == {str(created.resource_id)}
+        assert {call["vault_id"] for call in upserts} == {str(vault_id)}
+        assert all(call["dense"] == [0.5] * 4 for call in upserts)
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE id = ANY($1::uuid[]) AND vector_indexed_at IS NULL",
+                list(derived_chunk_ids),
             ) == 0
 
 

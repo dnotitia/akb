@@ -63,6 +63,7 @@ async def pool():
             "055_native_revision_m1_file_storage.py",
             "056_native_revision_m1_file_constraints.py",
             "057_native_revision_m1_payload_placement.py",
+            "059_native_file_searchable_derived.py",
         ):
             await _migration(filename).migrate(conn)
     try:
