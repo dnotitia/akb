@@ -37,6 +37,7 @@ from app.services.document_service import (
     newest_public_slug,
     validate_vault_name,
 )
+from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_service import (
     Failpoint,
     NativeRevisionService,
@@ -96,7 +97,30 @@ class NativeDocumentService(DocumentService):
         return vault_id
 
     async def _native(self) -> NativeRevisionService:
-        return NativeRevisionService(await self._pool(), failpoint=self._failpoint)
+        """Compose the substrate on the frozen P1 searchable-body placement.
+
+        This method is the composition root for every Document written through
+        the public facade, so it is where P1 selects ``pg-bodystore-v1`` — the
+        same placement ``m1_native_text_file_bridge`` already injects for
+        native text Files. Documents and Files therefore land on one body
+        store instead of two.
+
+        The injection deliberately does **not** move into
+        ``NativeRevisionService``'s own default. The M1 measurement adapters
+        (``backend/scripts/native_revision_m1_adapter.py`` and its siblings)
+        construct ``NativeRevisionService(pool)`` directly and must keep
+        reproducing the historical ``m1-reference-payload-v1`` behaviour their
+        recorded runs were measured against; changing the default would
+        silently re-label every replay of an already-published measurement.
+
+        Historical Revisions keep the placement recorded in their immutable
+        manifest, so a namespace is mixed by design during the transition.
+        Readers dispatch on ``selected_placement`` rather than assuming one.
+        """
+        pool = await self._pool()
+        return NativeRevisionService(
+            pool, payload_store=M1PgBodyStore(pool), failpoint=self._failpoint
+        )
 
     @staticmethod
     async def _yield_after_head_race(race_count: int) -> None:
