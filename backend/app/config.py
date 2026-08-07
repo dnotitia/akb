@@ -484,6 +484,18 @@ class Settings(BaseModel):
     # caller (MCP, REST, internal) is bounded uniformly.
     search_limit_max: int = Field(default=50, ge=1)
 
+    # Hard ceiling on how many documents a single `grep(replace=...)` may
+    # rewrite. Deliberately NOT `search_limit_max`: that one bounds the
+    # snippet payload, and reusing it as the write bound is what made a
+    # find-and-replace silently rewrite only the first 50 matches and report
+    # success (issue #315). `limit` is now preview-only; this is the write
+    # bound, and it fails CLOSED — a replace whose scope exceeds it is
+    # rejected with zero writes rather than truncated, so the caller narrows
+    # the scope deliberately instead of discovering a partial rewrite later.
+    # Each replaced document costs one git commit plus one re-index, which is
+    # what keeps this a bounded number rather than "all of them".
+    grep_replace_max_docs: int = Field(default=500, ge=1)
+
     # Push the ACL filter down to VAULT granularity in the vector store (issue
     # #189 Phase 2). When True AND the driver is pgvector AND a search has no
     # doc-level filter (collection/doc_type/tags/source_uris), search filters by

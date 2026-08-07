@@ -27,6 +27,7 @@ from app.services.vector_store import VectorHit, get_vector_store
 from app.services.vector_store.base import VectorStoreUnavailable, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
+from app.util.text import like_escape
 
 logger = logging.getLogger("akb.search")
 
@@ -62,6 +63,42 @@ def _configured_document_source_type() -> str:
         measurement_only=settings.native_revision_m1_measurement_only,
         database=settings.db_name,
     )
+
+
+def collection_containment_sql(column: str, collection: str, params: list) -> str:
+    """Build an anchored, escaped "inside this collection" predicate.
+
+    Appends the two bound values to `params` and returns the SQL fragment
+    referencing them by 1-based position:
+
+        (<column> = $exact OR <column> LIKE $prefix ESCAPE '\\')
+
+    Two things the old `<column> LIKE $n || '%'` got wrong (issue #338):
+
+    * **No escaping.** The raw collection name was spliced in as a LIKE
+      pattern, so a `_` or `%` inside a perfectly ordinary name acted as
+      a wildcard — `my_docs` also matched `myXdocs`, and `%` matched the
+      caller's whole accessible corpus. `like_escape` + `ESCAPE '\\'`
+      makes those characters literal.
+    * **No anchor.** A bare `prefix%` match also admitted every
+      prefix-adjacent sibling, so `core` swept in `core-extra/...`.
+      Anchoring on `{prefix}/` confines it to real descendants.
+
+    This is the containment rule the native arm already implements
+    (`m1_native_grep_service._head_bodies`) and the one conformance case
+    C7b pins as the target: `path == prefix or path.startswith(prefix + "/")`.
+    The exact-match arm is what makes a *collection* path column
+    (`collections.path`, `resources.current_path`) include the collection
+    row itself; on `documents.path` it is inert, because a document path
+    is always composed by `util.text.doc_path` and so always carries a
+    `.md` filename segment. It is kept there anyway so all three call
+    sites read as the same rule rather than as three dialects of it.
+    """
+    prefix = collection.strip("/")
+    params.append(prefix)
+    exact = len(params)
+    params.append(like_escape(prefix) + "/%")
+    return f"({column} = ${exact} OR {column} LIKE ${len(params)} ESCAPE '\\')"
 
 # Strips the indexing-time enrichment block emitted by
 # `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
@@ -219,14 +256,8 @@ class SearchService:
             params.append(vaults)
             conditions.append(f"v.name = ANY(${len(params)})")
         if collection:
-            prefix = collection.strip("/")
-            escaped_prefix = (
-                prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            params.extend([prefix, f"{escaped_prefix}/%"])
             conditions.append(
-                f"(r.current_path = ${len(params) - 1} OR "
-                f"r.current_path LIKE ${len(params)} ESCAPE '\\')"
+                collection_containment_sql("r.current_path", collection, params)
             )
         if user_uuid is not None and not is_admin:
             params.append(user_uuid)
@@ -458,8 +489,9 @@ class SearchService:
                     conditions.append(f"v.name = ANY(${idx})")
                     params.append(vaults); idx += 1
                 if collection:
-                    conditions.append(f"d.path LIKE ${idx} || '%'")
-                    params.append(collection); idx += 1
+                    conditions.append(
+                        collection_containment_sql("d.path", collection, params)
+                    ); idx += 2
                 if doc_type:
                     conditions.append(f"d.doc_type = ${idx}")
                     params.append(doc_type); idx += 1
@@ -536,10 +568,13 @@ class SearchService:
                     if collection:
                         # vault_files.collection (TEXT) was dropped in
                         # migration 020 → collection_id FK. Filter via the
-                        # joined collections.path with a prefix match, same
-                        # semantics as the documents branch above.
-                        f_conds.append(f"c.path LIKE ${len(f_params) + 1} || '%'")
-                        f_params.append(collection)
+                        # joined collections.path, same containment rule as
+                        # the documents branch above. The join is a LEFT
+                        # JOIN, so a file with no collection has a NULL
+                        # `c.path` and drops out of both arms — unchanged.
+                        f_conds.append(
+                            collection_containment_sql("c.path", collection, f_params)
+                        )
                     acl_sql, acl_params = _vault_acl(len(f_params) + 1)
                     if acl_sql:
                         f_conds.append(acl_sql)
@@ -1167,9 +1202,13 @@ class SearchService:
                 idx += 1
 
             if collection:
-                conditions.append(f"d.path LIKE ${idx} || '%'")
-                params.append(collection)
-                idx += 1
+                # Anchored + escaped (#338). This filter selects the exact
+                # document set that `replace=` below rewrites, so an
+                # over-match here is a write outside the caller's scope.
+                conditions.append(
+                    collection_containment_sql("d.path", collection, params)
+                )
+                idx += 2
 
             where_sql = " AND ".join(conditions)
             # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited
@@ -1284,15 +1323,43 @@ class SearchService:
         result_docs = matched_docs[:limit]
         returned_matches = sum(len(d["matches"]) for d in result_docs)
 
-        # Replace mode: apply find-and-replace on each matching document.
-        # Service-layer `doc_service.update` still wants the doc path
-        # (which find_by_ref accepts) — we pass `path` rather than re-
-        # parsing the URI we just built.
+        # ── Replace mode ─────────────────────────────────────────────
+        # Scope is the FULL matched set, not the `limit` preview slice.
+        # `limit` is documented as an output knob and is clamped to 50, so
+        # driving the rewrite from `result_docs` silently dropped every match
+        # past the 50th while reporting success — and two ordinary cases
+        # (a case-only replacement, or a replacement containing the pattern)
+        # never drained on retry because the same first-50 docs were selected
+        # each time. Issue #315.
+        #
+        # The write bound is now its own budget, checked BEFORE any write and
+        # failing closed: too wide a scope is rejected whole rather than
+        # truncated, so the caller narrows it deliberately.
         replaced: list[dict] = []
-        if replace is not None and result_docs and doc_service:
-            re_flags = 0 if case_sensitive else _re.IGNORECASE
+        replace_docs = matched_docs if replace is not None and doc_service else []
+        if replace_docs and total_docs > settings.grep_replace_max_docs:
+            return {
+                "error": (
+                    f"replace scope is {total_docs} documents, over the "
+                    f"{settings.grep_replace_max_docs}-document limit; nothing was "
+                    f"written. Narrow the scope (vault/collection/pattern), or "
+                    f"preview it with count_only=true / files_with_matches=true."
+                ),
+                "code": "replace_scope_too_large",
+                "pattern": pattern,
+                "regex": regex,
+                "total_docs": total_docs,
+                "total_matches": total_matches,
+                "max_replacements": settings.grep_replace_max_docs,
+            }
 
-            for doc_info in result_docs:
+        if replace is not None and doc_service and replace_docs:
+            re_flags = 0 if case_sensitive else _re.IGNORECASE
+            literal_replacement = replace  # narrowed, for the closure below
+            # Service-layer `doc_service.update` still wants the doc path
+            # (which find_by_ref accepts) — we pass `path` rather than
+            # re-parsing the URI we just built.
+            for doc_info in replace_docs:
                 doc_vault = doc_info["vault"]
                 doc_path = doc_info["path"]
                 doc_uri_str = doc_info["uri"]
@@ -1305,14 +1372,41 @@ class SearchService:
 
                 body = doc.content or ""
 
-                if regex:
-                    new_body = _re.sub(pattern, replace, body, flags=re_flags)
-                else:
-                    if case_sensitive:
+                # `replace` is a regex replacement TEMPLATE only when the
+                # caller asked for regex — that is the documented contract
+                # ("supports backreferences when regex=true"). In non-regex
+                # mode it must be literal on BOTH case branches: the
+                # case-sensitive branch used `str.replace` (literal) while the
+                # case-insensitive one passed the string to `_re.sub`, so on
+                # the default path `TODO\1` raised, `[\g<0>]` expanded, and
+                # `C:\new` wrote a newline. A function replacement is inserted
+                # verbatim, which makes the two branches agree.
+                try:
+                    if regex:
+                        new_body = _re.sub(pattern, replace, body, flags=re_flags)
+                    elif case_sensitive:
                         new_body = body.replace(pattern, replace)
                     else:
-                        # Case-insensitive non-regex replace
-                        new_body = _re.sub(_re.escape(pattern), replace, body, flags=_re.IGNORECASE)
+                        new_body = _re.sub(
+                            _re.escape(pattern), lambda _m: literal_replacement,
+                            body, flags=_re.IGNORECASE,
+                        )
+                except _re.error as e:
+                    # A bad regex template is a property of (pattern, replace),
+                    # not of this document, so it fails on the first document
+                    # that would have changed — i.e. with zero writes behind
+                    # it. Reject the whole call rather than emit one identical
+                    # error per document.
+                    return {
+                        "error": f"Invalid regex replacement: {e}",
+                        "code": "invalid_replacement",
+                        "pattern": pattern,
+                        "regex": regex,
+                        "total_docs": total_docs,
+                        "total_matches": total_matches,
+                        "replaced_docs": len(replaced),
+                        "replacements": replaced,
+                    }
 
                 if new_body == body:
                     continue  # no actual change
@@ -1322,12 +1416,41 @@ class SearchService:
                     content=new_body,
                     message=f"grep replace: '{pattern}' → '{replace}'",
                 )
-                result = await doc_service.update(doc_vault, doc_path, req, agent_id=agent_id)
+                try:
+                    result = await doc_service.update(
+                        doc_vault, doc_path, req, agent_id=agent_id
+                    )
+                except Exception as e:
+                    # Each document is its own commit — there is no transaction
+                    # spanning the loop — so a mid-loop failure (write-lane
+                    # contention, a concurrent edit losing the OCC check) leaves
+                    # the earlier documents committed. Returning the ledger of
+                    # what already landed is the only way the caller can tell
+                    # what to undo or resume from; letting the exception escape
+                    # discards it. Issue #315.
+                    logger.warning(
+                        "grep replace aborted at %s after %d document(s): %s",
+                        doc_uri_str, len(replaced), e,
+                    )
+                    return {
+                        "error": f"replace aborted at {doc_uri_str}: {e}",
+                        "code": "replace_incomplete",
+                        "pattern": pattern,
+                        "regex": regex,
+                        "total_docs": total_docs,
+                        "total_matches": total_matches,
+                        "replaced_docs": len(replaced),
+                        "replacements": replaced,
+                        "remaining_docs": total_docs - len(replaced),
+                    }
                 replaced.append({
                     "uri": doc_uri_str,
                     "path": doc_path,
                     "title": doc_info["title"],
                     "commit": result.commit_hash,
+                    # The commit this document moved OFF, so a caller
+                    # unwinding a partial run has both ends of each edit.
+                    "previous_commit": result.previous_commit,
                 })
 
         # Build response — strip internal handles (`_doc_pk`, `metadata`)
@@ -1348,12 +1471,22 @@ class SearchService:
             "results": clean_results,
         }
         if resp["truncated"]:
-            resp["hint"] = (
+            hint = (
                 f"Showing {len(clean_results)} of {total_docs} matching docs "
                 f"(limit={limit}, {returned_matches} of {total_matches} line matches). "
                 f"For full counts use count_only=true; for the full URI list use "
                 f"files_with_matches=true."
             )
+            if replace is not None:
+                # `truncated` has only ever described the snippet payload, but
+                # while replace was driven by the same slice it also, silently,
+                # described the rewrite. It no longer does — say so, so the
+                # flag is not read as "the replace was cut short too".
+                hint += (
+                    f" `truncated` refers to this preview only: replace covered "
+                    f"all {total_docs} matching docs."
+                )
+            resp["hint"] = hint
 
         if total_matches == 0 and not regex:
             metachars = set("|.*+?()[]{}^$\\")

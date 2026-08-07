@@ -323,6 +323,10 @@ class GrepReplacement(BaseModel):
     path: str | None = None
     title: str | None = None
     commit: str | None = None
+    # The commit the document moved OFF. A replace is one commit per
+    # document with no transaction spanning them, so a run that aborts
+    # part-way is only unwindable if each entry carries both ends.
+    previous_commit: str | None = None
     error: str | None = None
 
 

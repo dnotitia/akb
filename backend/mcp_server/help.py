@@ -167,7 +167,8 @@ akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="n
 
 ## akb_grep — Exact Text Search & Replace
 Find exact strings or regex patterns across documents. Use when you need precision, not meaning.
-Add `replace` to find-and-replace across all matching documents in one call.
+Add `replace` to find-and-replace across all matching documents in one call
+(every match in scope — `limit` only trims the preview that comes back).
 
 ```
 akb_grep(pattern="PostgreSQL 14")                                      # Find exact string
@@ -856,6 +857,9 @@ Unlike akb_search (semantic), this finds **exact matches** — use it for
 specific terms, URLs, code snippets, version numbers, error codes, etc.
 
 Optionally pass `replace` to find-and-replace across all matching documents.
+The rewrite covers the whole matched scope, not just the `limit` documents
+shown; if that scope is wider than the server's replace budget the call is
+rejected outright and nothing is written.
 
 ## Parameters
 | Param | Required | Description |
@@ -865,8 +869,8 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
-| replace | | Replacement string — triggers find-and-replace mode |
-| limit | | Max documents to return (default 20) |
+| replace | | Replacement string — triggers find-and-replace mode. Literal unless regex=true |
+| limit | | Max documents to return (default 20). Output only — does not bound `replace` |
 | count_only | | Return exact per-resource counts without snippets |
 | measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
 
@@ -898,6 +902,8 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 
 **Tip:** Run grep WITHOUT replace first to preview matches, then add replace.
 Each replaced document gets its own git commit and is re-indexed for search.
+Backreferences only apply when regex=true — with regex=false the replacement
+goes in exactly as typed, so `C:\\new` stays `C:\\new`.
 
 ## Result Structure
 Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
@@ -908,7 +914,12 @@ also carries `payload_placement` — which body placement the matched bytes were
 read from; it names a storage strategy, never an address. If snippets hit
 response safety bounds,
 `truncated` is true and `truncation` reports the applied match/byte limits.
-When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
+When replace is used, response also includes `replaced_docs` count and
+`replacements` list (each with `commit` and `previous_commit`). `truncated`
+describes the preview only — it never means the rewrite was cut short. A
+replace that would exceed the server budget returns `code:
+"replace_scope_too_large"` with nothing written; one that fails part-way
+returns `code: "replace_incomplete"` plus the documents already committed.""",
 
     "akb_drill_down": """# akb_drill_down — Section-Level Reader
 

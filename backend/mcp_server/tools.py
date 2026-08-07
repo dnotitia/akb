@@ -419,7 +419,8 @@ TOOLS = [
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
             "Returns matching documents (each with its `uri`) and matched lines. "
-            "Optionally pass `replace` to find-and-replace across all matching documents. "
+            "Optionally pass `replace` to find-and-replace across all matching documents "
+            "(every match in scope, not just the `limit` shown). "
             "Three response shapes (mutually exclusive): default lines, `count_only=true` "
             "(grep -c — per-doc counts + total, no snippets), `files_with_matches=true` "
             "(grep -l — just the URIs that contain the pattern). "
@@ -436,8 +437,8 @@ TOOLS = [
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
                 "regex": {"type": "boolean", "default": False, "description": "Treat pattern as PostgreSQL regex. REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
-                "replace": {"type": "string", "description": "Replacement string. If provided, replaces all matches in EVERY matching document across the search scope (git commit + re-index per doc). Supports regex backreferences (\\1, \\2) when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return"},
+                "replace": {"type": "string", "description": "Replacement string. If provided, replaces all matches in EVERY matching document across the search scope (git commit + re-index per doc) — independently of `limit`, which only bounds the returned preview. Supports regex backreferences (\\1, \\2) when regex=true; with regex=false the replacement is inserted literally, backslashes and all. A scope wider than the server's replace budget is REJECTED with nothing written, so preview it first with count_only=true. For precise edits to a single known document, prefer akb_edit instead."},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return. Output only — it does NOT bound what `replace` rewrites."},
                 "count_only": {"type": "boolean", "default": False, "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."},
                 "files_with_matches": {"type": "boolean", "default": False, "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."},
                 "measurement_include_text_files": {
