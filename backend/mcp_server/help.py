@@ -903,7 +903,10 @@ Each replaced document gets its own git commit and is re-indexed for search.
 Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
 `{section, text}` showing the section path and matched line.
 File results additionally include `resource_type: "file"`, their canonical URI,
-`revision`, and `content_hash`. If snippets hit response safety bounds,
+`revision`, and `content_hash`. On the native measurement backend every result
+also carries `payload_placement` — which body placement the matched bytes were
+read from; it names a storage strategy, never an address. If snippets hit
+response safety bounds,
 `truncated` is true and `truncation` reports the applied match/byte limits.
 When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
 

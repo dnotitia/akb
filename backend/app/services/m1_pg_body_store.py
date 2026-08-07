@@ -26,6 +26,22 @@ M1_PG_TEXT_MAX_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
+class NamespacePlacementTotals:
+    """One placement's bounded footprint inside a measurement namespace.
+
+    Deliberately id-free and digest-value-free: `selected_placement` is a
+    member of the closed, non-dereferenceable placement set, and the digest
+    column is only ever reduced to a cardinality.  Nothing here can be turned
+    back into an address for a user body.
+    """
+
+    selected_placement: str
+    bodies: int
+    body_bytes: int
+    distinct_digests: int
+
+
+@dataclass(frozen=True, slots=True)
 class VerifiedPgTextBody:
     """Receipt-quality facts returned only after byte-level verification."""
 
@@ -233,3 +249,42 @@ class M1PgBodyStore:
                 self.selected_placement,
             )
         return dict(row)
+
+    async def namespace_placement_totals(
+        self, namespace_id: uuid.UUID,
+    ) -> list[NamespacePlacementTotals]:
+        """Group every verified body in one namespace by its selected placement.
+
+        `namespace_residue` answers "what is left on MY placement"; this answers
+        "which placements does this namespace still use at all", which is the
+        unification-purity question the M1 ADR carried into P1.  A namespace
+        that reports a single `pg-bodystore-v1` row has zero reference residue.
+
+        The projection is intentionally an aggregate: counts and a byte sum per
+        placement, plus the *cardinality* of distinct digests.  Digest strings
+        are content hashes of user bodies and are never enumerated, and neither
+        `payload_id` nor any manifest identifier is selected.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT selected_placement,
+                       COUNT(*)::int AS bodies,
+                       COALESCE(SUM(byte_size), 0)::bigint AS body_bytes,
+                       COUNT(DISTINCT digest)::int AS distinct_digests
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1
+                 GROUP BY selected_placement
+                 ORDER BY selected_placement
+                """,
+                namespace_id,
+            )
+        return [
+            NamespacePlacementTotals(
+                selected_placement=row["selected_placement"],
+                bodies=row["bodies"],
+                body_bytes=row["body_bytes"],
+                distinct_digests=row["distinct_digests"],
+            )
+            for row in rows
+        ]

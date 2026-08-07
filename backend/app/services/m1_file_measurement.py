@@ -18,7 +18,7 @@ from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.services.adapters import s3_adapter
 from app.services.m1_binary_store import BinaryStore, FilesystemCAS, PreparedBinary, S3CAS
-from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES
+from app.services.m1_pg_body_store import M1_PG_TEXT_MAX_BYTES, M1PgBodyStore
 from app.services.resource_hash import HASH_ALGORITHM, is_sha256_hex
 from app.services.uri_service import file_uri
 from app.util.text import normalize_collection_path, validate_file_name
@@ -566,6 +566,46 @@ class MeasurementFileService:
             "storage_version": None,
             "native_resource_id": str(row["native_resource_id"]) if row.get("native_resource_id") else None,
             "native_revision_id": row.get("native_revision_id"),
+            # Which body placement this File's Head is pinned to, read straight
+            # off the manifest the revision published. The placement strings are
+            # a closed, non-dereferenceable set, so this is an observation, not
+            # an address — no payload_id / private_locator / storage path.
+            #
+            # Binary Files report `null` rather than dropping the key: placement
+            # is a text-body concept, their CAS is already named by
+            # `storage_driver`, and this envelope's convention for "not
+            # applicable to this row" is an explicit null (`etag`,
+            # `storage_version`, `native_resource_id` all behave that way), which
+            # keeps every item of a mixed listing the same shape.
+            "payload_placement": (
+                row.get("payload_placement") if row["storage_driver"] == "native_text" else None
+            ),
+        }
+
+    async def namespace_placement_observation(
+        self, vault_id: uuid.UUID, vault_name: str,
+    ) -> dict:
+        """Report the namespace's body placements as a bounded aggregate.
+
+        This is the unification-purity instrument: it answers "is this vault
+        100% pg-bodystore-v1, or is there reference residue left" without
+        naming a single resource, digest value, or internal address.
+        """
+        pool = await get_pool()
+        totals = await M1PgBodyStore(pool).namespace_placement_totals(vault_id)
+        return {
+            "vault": vault_name,
+            "placements": [
+                {
+                    "selected_placement": total.selected_placement,
+                    "bodies": total.bodies,
+                    "body_bytes": total.body_bytes,
+                    "distinct_digests": total.distinct_digests,
+                }
+                for total in totals
+            ],
+            "total_bodies": sum(total.bodies for total in totals),
+            "total_body_bytes": sum(total.body_bytes for total in totals),
         }
 
 

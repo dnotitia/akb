@@ -15,9 +15,12 @@ import pytest
 import pytest_asyncio
 
 from app.config import settings
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, ForbiddenError, NotFoundError
+from app.models.file import BodyPlacementObservation
 from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
+from app.services.auth_service import AuthenticatedUser
+from app.services.file_service import FileService
 from app.services.m1_binary_store import PreparedBinary
 from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore
@@ -1469,3 +1472,204 @@ async def test_composite_confirm_discards_a_ledger_publish_that_already_reported
     assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
         _NATIVE_AUTHORITY_TABLES, 1,
     )
+
+
+def _measurement_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=str(uuid.uuid4()), username="placement-observer",
+        email="placement@invalid.example", display_name=None, is_admin=False,
+        auth_method="pat", token_id=None, key_class=None, token_scopes=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_envelope_observes_body_placement_without_any_locator(
+    context, monkeypatch,
+):
+    """Per-resource observability: which placement holds THIS File's body.
+
+    The whole point of the P1 item is that a fixture can bind an object to its
+    placement from the outside. The envelope therefore has to agree across
+    confirm, download, and list, and it must never carry an address.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    service = m1.MeasurementFileService()
+
+    text = await _confirmed_native_text_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="observable.txt", body=b"observable native text\n",
+    )
+    binary = await _confirmed_binary_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="observable.bin", body=b"binary\x00bytes",
+    )
+
+    assert text["storage_driver"] == "native_text"
+    assert text["payload_placement"] == M1PgBodyStore.selected_placement
+    # Binary Files report null: placement is a text-body concept and their CAS
+    # is already named by storage_driver.
+    assert binary["storage_driver"] == "fscas"
+    assert binary["payload_placement"] is None
+
+    download = await service.get_download_url(vault_id, text["file_id"])
+    listed = {
+        item["file_id"]: item
+        for item in await service.list_files(vault_id, vault_name, None, 50)
+    }
+
+    assert download["payload_placement"] == M1PgBodyStore.selected_placement
+    assert listed[text["file_id"]]["payload_placement"] == (
+        M1PgBodyStore.selected_placement
+    )
+    assert listed[text["file_id"]]["native_revision_id"] == text["native_revision_id"]
+    assert listed[binary["file_id"]]["payload_placement"] is None
+
+    forbidden = {
+        "payload_id", "private_locator", "payload_manifest_id",
+        "storage_locator", "s3_key",
+    }
+    for envelope in (text, binary, download, *listed.values()):
+        assert forbidden.isdisjoint(envelope)
+
+
+@pytest.mark.asyncio
+async def test_namespace_placement_observation_counts_both_placements(
+    context, monkeypatch,
+):
+    """Namespace aggregate: is this vault unified, or is there residue left?
+
+    After the Document unification a namespace that also holds a pre-existing
+    reference-placement Head is mixed, and the census has to say so — with
+    counts only, never an id or a digest value.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, denied_vault_id, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    service = m1.MeasurementFileService()
+
+    empty = await service.namespace_placement_observation(vault_id, vault_name)
+    assert empty == {
+        "vault": vault_name, "placements": [],
+        "total_bodies": 0, "total_body_bytes": 0,
+    }
+
+    unified_body = b"unified document body\n"
+    await NativeRevisionService(pool, payload_store=M1PgBodyStore(pool)).create_text(
+        namespace_id=vault_id, surface="document", path="notes/unified.md",
+        payload=unified_body, actor="placement-observer", mutation_id=uuid.uuid4(),
+        expected_digest=hashlib.sha256(unified_body).hexdigest(),
+        expected_size=len(unified_body),
+    )
+    historical_body = b"historical document body\n"
+    await NativeRevisionService(
+        pool, payload_store=M1ReferencePayloadStore(pool),
+    ).create_text(
+        namespace_id=vault_id, surface="document", path="notes/historical.md",
+        payload=historical_body, actor="placement-observer", mutation_id=uuid.uuid4(),
+        expected_digest=hashlib.sha256(historical_body).hexdigest(),
+        expected_size=len(historical_body),
+    )
+    file_body = b"observable native file\n"
+    await _confirmed_native_text_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="census.txt", body=file_body,
+    )
+
+    observation = await service.namespace_placement_observation(vault_id, vault_name)
+
+    assert observation == {
+        "vault": vault_name,
+        "placements": [
+            {
+                "selected_placement": M1ReferencePayloadStore.selected_placement,
+                "bodies": 1,
+                "body_bytes": len(historical_body),
+                "distinct_digests": 1,
+            },
+            {
+                "selected_placement": M1PgBodyStore.selected_placement,
+                "bodies": 2,
+                "body_bytes": len(unified_body) + len(file_body),
+                "distinct_digests": 2,
+            },
+        ],
+        "total_bodies": 3,
+        "total_body_bytes": len(historical_body) + len(unified_body) + len(file_body),
+    }
+    # Namespace-scoped: a second vault in the same database is not counted.
+    assert await service.namespace_placement_observation(
+        denied_vault_id, "denied",
+    ) == {
+        "vault": "denied", "placements": [],
+        "total_bodies": 0, "total_body_bytes": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_body_placement_route_is_reader_guarded_and_absent_without_measurement(
+    context, monkeypatch,
+):
+    """Authorization matches the neighbouring measurement read; off means 404."""
+    from app.api.routes import files as files_routes
+    from app.services import file_service as file_service_module
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(file_service_module, "get_pool", test_pool)
+    checks: list[tuple[str, str, str]] = []
+
+    async def allow(user_id, vault, *, required_role="reader", **_kwargs):
+        checks.append((user_id, vault, required_role))
+        return {"vault_id": vault_id, "role": required_role}
+
+    monkeypatch.setattr(files_routes, "check_vault_access", allow)
+    monkeypatch.setattr(files_routes, "file_service", FileService())
+    user = _measurement_user()
+
+    payload = await files_routes.get_body_placements(vault=vault_name, user=user)
+
+    assert checks == [(user.user_id, vault_name, "reader")]
+    assert BodyPlacementObservation.model_validate(payload).vault == vault_name
+
+    # A denied vault never reaches the service.
+    reached = False
+
+    async def deny(*_args, **_kwargs):
+        raise ForbiddenError("no reader grant")
+
+    async def unreachable(*_args, **_kwargs):
+        nonlocal reached
+        reached = True
+
+    monkeypatch.setattr(files_routes, "check_vault_access", deny)
+    monkeypatch.setattr(
+        files_routes.file_service, "namespace_placement_observation", unreachable,
+    )
+    with pytest.raises(ForbiddenError):
+        await files_routes.get_body_placements(vault=vault_name, user=user)
+    assert reached is False
+
+    # Measurement off: the facade does not exist, so neither does the surface.
+    monkeypatch.setattr(files_routes, "check_vault_access", allow)
+    monkeypatch.setattr(file_service_module, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(files_routes, "file_service", FileService())
+    with pytest.raises(NotFoundError) as missing:
+        await files_routes.get_body_placements(vault=vault_name, user=user)
+    assert missing.value.status_code == 404

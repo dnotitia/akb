@@ -89,6 +89,7 @@ async def test_mcp_grep_passes_explicit_text_file_measurement_argument(monkeypat
 @pytest.mark.asyncio
 async def test_public_native_grep_file_identity_and_default_exclusion(monkeypatch):
     from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
+    from app.services.m1_pg_body_store import M1PgBodyStore
 
     document = HeadBody(
         namespace_id=uuid.uuid4(),
@@ -127,6 +128,10 @@ async def test_public_native_grep_file_identity_and_default_exclusion(monkeypatc
 
     assert [row["uri"] for row in legacy["results"]] == [document.uri]
     assert "resource_type" not in legacy["results"][0]
+    # Placement is not part of the File-only additive head identity: it rides
+    # on every native row, so a Document-only native grep still reports which
+    # placement its bytes came from.
+    assert legacy["results"][0]["payload_placement"] == M1PgBodyStore.selected_placement
     assert with_files["results"][1] == {
         "uri": file.uri,
         "vault": "measurement",
@@ -136,6 +141,7 @@ async def test_public_native_grep_file_identity_and_default_exclusion(monkeypatc
         "resource_type": "file",
         "revision": file.revision_id,
         "content_hash": file.digest,
+        "payload_placement": M1PgBodyStore.selected_placement,
     }
 
 

@@ -239,6 +239,10 @@ def _scan_bodies_sync(
                 "title": body.title,
                 "revision": body.revision_id,
                 "content_hash": body.digest,
+                # The placement the matched Head bytes were read from. It is a
+                # member of a closed, non-dereferenceable set — never the
+                # manifest's private_locator or any payload id.
+                "payload_placement": body.selected_placement,
                 "matches": lines,
                 "_body_index": body_index,
             })
@@ -868,6 +872,15 @@ class M1NativeGrepService:
                         "content_hash": row["content_hash"],
                     }
                 )
+            # Placement rides on every native row, Document included: the P1
+            # observability item exists precisely because Documents moved onto
+            # the PG BodyStore, so hiding it from Document rows would leave the
+            # unification unobservable on the surface that reads their bytes.
+            # The key is only emitted when the native row actually carries one,
+            # so the legacy Document-only grep branch — which never sets it —
+            # keeps its byte-identical response.
+            if row.get("payload_placement"):
+                public["payload_placement"] = row["payload_placement"]
             clean.append(public)
         result: dict[str, Any] = {
             "pattern": pattern,
