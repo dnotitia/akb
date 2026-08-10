@@ -24,6 +24,13 @@ The proxy-local MCP `initialize` response advertises the inline-image workflow.
 Backend guidance is capability-conditional, so direct MCP connections and
 older proxies are not instructed to call tools absent from their tool list.
 
+`akb_put_image` requires the corresponding backend image endpoint. During a
+split backend/proxy rollout, deploy and verify the backend first, then publish
+or install `akb-mcp` 2.2.0. Publishing the proxy first would expose the local
+tool while an older backend can only reject its upload request. Existing MCP
+processes must be restarted (or otherwise re-resolved) to load the new npm
+version and tool list.
+
 ## 2.1.0 — survive backend/VPN outages without a session restart
 
 Resilience fix for the failure mode where a long VPN/backend outage

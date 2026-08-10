@@ -190,7 +190,7 @@ const FILE_TOOLS = [
   {
     name: "akb_put_image",
     description:
-      "Upload a local PNG, JPEG, GIF, or WebP for inline use in an AKB Markdown document. Returns a stable `/api/assets/{uuid}` URL and a ready-to-paste `markdown` image expression. Call this first, then place the returned `markdown` at the intended position with `akb_put`, `akb_update`, or a targeted `akb_edit`. This creates a hidden document attachment, not a standalone File; use akb_put_file when the binary should appear in browse/search. If the document write fails, call akb_discard_image with the returned URL.",
+      "Upload a local PNG, JPEG, GIF, or WebP (maximum 10 MiB) for inline use in an AKB Markdown document. Returns a stable `/api/assets/{uuid}` URL and a ready-to-paste `markdown` image expression. For a new document, place it with akb_put. For an existing document, prefer a targeted akb_edit; akb_update(content=...) replaces the entire body and must never receive only an image fragment. Images are immutable: upload a replacement and edit the Markdown reference. This creates a hidden document attachment, not a standalone File; use akb_put_file when the binary should appear in browse/search. If the document write fails, call akb_discard_image with the returned URL.",
     inputSchema: {
       type: "object",
       properties: {
@@ -206,7 +206,7 @@ const FILE_TOOLS = [
         },
         file_path: {
           type: "string",
-          description: "Absolute path to the local image file.",
+          description: "Absolute path to the local image file (maximum 10 MiB).",
         },
         alt_text: {
           type: "string",
@@ -314,8 +314,10 @@ const PROXY_VERSION = "2.2.0";
 const PROXY_INSTRUCTIONS =
   "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
   "For an inline document image, call akb_put_image and place its returned `markdown` " +
-  "with akb_put, akb_update, or a targeted akb_edit. If the document write fails, " +
-  "clean up the uncommitted upload with akb_discard_image.";
+  "with akb_put for a new document or a targeted akb_edit for an existing one. " +
+  "Never pass only an image fragment to akb_update(content=...), because it replaces " +
+  "the entire document body. If the document write fails, clean up the uncommitted " +
+  "upload with akb_discard_image.";
 
 // Fallback MCP protocol version echoed to the client when its `initialize`
 // request omits one. We otherwise echo the client's requested version.

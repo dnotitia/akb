@@ -155,6 +155,7 @@ letting the indexing worker re-populate.
 | `akb_list_vaults` / `akb_create_vault` | Vault management |
 | `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (Git commit + indexing) |
 | `akb_put_file` / `akb_get_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
+| `akb_put_image` / `akb_discard_image` | Validated inline Markdown images — proxy-side in `akb-mcp` 2.2+ |
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
 | `akb_browse` | Tree traversal (collection → docs) |
 | `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
@@ -173,6 +174,36 @@ through the standard `akb_search` / `akb_browse` / `akb_get` tools
 exactly like any other vault.
 
 The full tool catalogue is exposed via `akb_help()` from any MCP client.
+
+### Inline document images from MCP
+
+Inline images are hidden document attachments, not browsable Files. Upload a
+local PNG, JPEG, GIF, or WebP (maximum 10 MiB), then insert the returned
+Markdown without reconstructing its asset URL:
+
+```text
+image = akb_put_image(
+  parent="akb://eng/coll/specs",
+  file_path="/workspace/architecture.png",
+  alt_text="Request processing architecture")
+
+akb_put(
+  parent="akb://eng/coll/specs",
+  title="Request Processing",
+  content="# Architecture\n\n" + image.markdown)
+```
+
+For an existing document, use `akb_get` followed by a targeted
+`akb_edit(base_commit=...)`. Do not pass only the image fragment to
+`akb_update(content=...)`, which replaces the complete body. Image bytes are
+immutable: replacing an image means uploading a new one and editing the
+Markdown reference. Remove an image by deleting its Markdown expression; use
+`akb_discard_image` only for an upload that never reached a successful document
+commit. Run `akb_help(topic="images")` for retention and publication behavior.
+
+The image tools require both the matching backend release and `akb-mcp` 2.2 or
+newer. For upgrades, deploy the backend first, then publish/install the proxy
+and restart existing MCP processes so they load the updated tool list.
 
 ## Document Format
 

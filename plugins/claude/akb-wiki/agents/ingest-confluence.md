@@ -17,7 +17,7 @@ Scope boundaries:
 - **No fan-out at ingest.** Concept clustering, membership backlinks, cross-source aggregation, and structural checks are all handled by an external maintenance layer that runs over the same AKB vault.
 - **Atlassian MCP required.** Page body is fetched live via `mcp__atlassian__confluence_get_page` — no payload escape hatch.
 - **Fixed collection.** Pages land in `atlassian-pages`; sub-organize with tags.
-- **No attachment download.** Embedded image/attachment URLs are preserved as references; bytes stay in Confluence.
+- **No attachment download in this workflow.** Embedded image/attachment URLs remain external references because this agent has no authenticated attachment-download tool. Those bytes do not receive AKB retention or publication guarantees. If durable inline rendering is required, obtain a local copy in a separate authorized workflow and use `akb_put_image`; `akb_put_file` is for a browsable standalone File, not an inline image.
 
 ## Inputs (provided by the /akb-ingest router)
 
@@ -115,7 +115,7 @@ The conversion is **structural fidelity over visual fidelity** — preserve info
 
 ## Images and attachments
 
-- `<ac:image>` and ADF `media` nodes → `![{alt or filename}]({attachment_url})`. The attachment file itself is **not** downloaded into AKB at this version; the URL is left as a reference. A future raw-layer integration may download attachment bytes via `akb_put_file`.
+- `<ac:image>` and ADF `media` nodes → `![{alt or filename}]({attachment_url})`. This workflow cannot download authenticated attachment bytes, so the URL remains an explicit external dependency. A later authorized workflow may download the image, call `akb_put_image`, and replace this expression with the returned stable Markdown. Do not use `akb_put_file` when the image must render inline.
 - If the attachment URL is relative (Confluence-internal), prefix it with the tenant base URL captured at fetch time so the link is followable from outside the wiki.
 
 ## Mentions and metadata noise
@@ -134,7 +134,7 @@ The conversion is **structural fidelity over visual fidelity** — preserve info
 
 - No agent rewriting. The conversion is structural (HTML/ADF → markdown). Do not summarize, paraphrase, or "clean up" prose. Compiled-truth synthesis (TL;DR / Key Points) happens in the calling skill's separate compose step on top of this converted body.
 - No external link verification. Do not fetch any URL referenced inside the body.
-- No attachment download. URLs are preserved as-is.
+- No attachment download. URLs are preserved as explicit external dependencies; they are not AKB-owned image assets.
 
 If a fragment cannot be converted faithfully, prefer leaving the source HTML/ADF inline (verbatim, in a code block) over guessing a markdown equivalent. The vault would rather hold an awkward but lossless record than a polished but misleading one.
 

@@ -59,6 +59,9 @@ itAsync("initialize responds locally even when the backend is down", async () =>
   assert.equal(res.result.capabilities.tools.listChanged, true, "advertises listChanged");
   assert.equal(res.result.serverInfo.name, "akb-mcp");
   assert.match(res.result.instructions, /akb_put_image/);
+  assert.match(res.result.instructions, /targeted akb_edit/);
+  assert.match(res.result.instructions, /replaces the entire document body/);
+  assert.match(res.result.instructions, /akb_discard_image/);
   assert.equal(proxy._initialized, true);
 });
 
@@ -101,6 +104,10 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   }
   const put = res.result.tools.find((t) => t.name === "akb_put");
   assert.ok(put.inputSchema.properties.file, "file param injected into akb_put");
+  const image = res.result.tools.find((t) => t.name === "akb_put_image");
+  assert.match(image.description, /maximum 10 MiB/);
+  assert.match(image.description, /targeted akb_edit/);
+  assert.match(image.description, /replaces the entire body/);
   assert.equal(proxy._servedDegraded, false, "cached full list is not degraded");
   // The cache must not be mutated by decoration.
   assert.ok(

@@ -712,6 +712,9 @@ akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md")
     "akb_update": """# akb_update — Update a Document
 
 Only send fields you want to change. Unspecified fields remain unchanged.
+`content` is the exception: when present, it replaces the **entire Markdown
+body**. Never pass only a newly uploaded image or another partial fragment as
+`content`; use a targeted `akb_edit` for that.
 
 ## Parameters
 | Param | Required | Description |
@@ -725,6 +728,8 @@ Only send fields you want to change. Unspecified fields remain unchanged.
 | depends_on | | Update dependency list (akb:// URIs) |
 | related_to | | Update related list (akb:// URIs) |
 | message | | Git commit message |
+| expected_commit | | Reject if the document moved since it was read |
+| expected_content_hash | | Reject if the current body changed since it was read |
 
 ## Examples
 ```
@@ -752,6 +757,7 @@ Use akb_update for metadata changes (title, tags, status, etc.).
 | new_string | ✓ | Replacement text (can be empty to delete) |
 | replace_all | | If true, replaces every occurrence (default: false) |
 | message | | Git commit message |
+| base_commit | | Reject if the document moved since it was read |
 
 ## Uniqueness Rule
 By default, `old_string` must match **exactly one** place in the document body.
@@ -762,6 +768,10 @@ or set `replace_all=true` to replace every occurrence.
 1. `akb_get(uri)` → read current content
 2. Pick a distinctive piece of text you want to change
 3. `akb_edit(uri, old_string="...", new_string="...")` → apply
+
+For an inline image, upload it first with `akb_put_image`, then use the exact
+returned `markdown` as part of `new_string`. Pass the `current_commit` returned
+by `akb_get` as `base_commit` when concurrent writers are possible.
 
 ## Error Handling
 Errors return `error: "edit_failed"` with a message explaining:
@@ -1506,6 +1516,24 @@ akb_put(
   content="# Architecture\n\n" + image.markdown)
 ```
 
+For an existing document, first read the current body and commit, then make a
+targeted edit. Do not send an image fragment to `akb_update(content=...)`; that
+field replaces the complete document body.
+
+```
+doc = akb_get(uri="akb://eng/coll/specs/doc/request-processing.md")
+image = akb_put_image(
+  parent="akb://eng/coll/specs",
+  file_path="/workspace/architecture.png",
+  alt_text="Request processing architecture")
+
+akb_edit(
+  uri=doc.uri,
+  old_string="## Architecture",
+  new_string="## Architecture\n\n" + image.markdown,
+  base_commit=doc.current_commit)
+```
+
 The upload result contains:
 
 - `url`: stable `/api/assets/{uuid}` reference stored in Markdown
@@ -1513,9 +1541,11 @@ The upload result contains:
 - decoded MIME type, dimensions, and size
 
 The backend accepts PNG, JPEG, GIF, and WebP up to 10 MiB and verifies the
-decoded content before storing it. The document write validates that every
-generated image belongs to the same vault and atomically claims it for Git
-revision history.
+decoded content before storing it. A document write atomically claims every
+available same-vault image for Git revision history. An unavailable, expired,
+or cross-vault asset URL does not abort an otherwise valid document write; it
+renders as an unavailable placeholder. Always use the exact `markdown`
+returned by `akb_put_image` rather than constructing an asset URL.
 
 If the document write fails or is abandoned, clean up the uncommitted upload:
 
@@ -1523,9 +1553,33 @@ If the document write fails or is abandoned, clean up the uncommitted upload:
 akb_discard_image(parent="akb://eng", url=image.url)
 ```
 
-Once any document commit claims the image, it cannot be discarded separately;
-removing its Markdown link stops current rendering while the bytes remain for
-older Git revisions.
+## Insert, replace, remove, and reuse
+
+- **Insert:** upload once, then insert `image.markdown` with `akb_put` or a
+  targeted `akb_edit`.
+- **Replace:** image bytes are immutable. Upload the replacement, replace the
+  old Markdown expression with the new one, and discard the new upload if the
+  edit fails.
+- **Remove:** delete the complete `![alt](/api/assets/{uuid})` expression with
+  `akb_edit`; do not call `akb_discard_image` for a committed image.
+- **Reuse:** the same returned Markdown may be referenced by multiple
+  documents in the same vault. A cross-vault document must upload its own
+  image.
+- **Publish:** no separate image publication is required. The image inherits
+  the exact document publication and section filter.
+
+## Lifecycle defaults
+
+| Event | Result |
+|-------|--------|
+| Upload abandoned before a document commit | Uploader-only preview; `akb_discard_image` can remove it, otherwise GC after 24 hours by default |
+| Markdown link removed or replaced | Current access ends unless another document references it; matching Git revisions retain it for 30 days by default |
+| Document or recursive collection deleted | Live references are revoked; unshared images follow the same bounded revision retention |
+| Vault deleted | Access is revoked immediately and object deletion is queued |
+
+Once any document commit claims an image, it cannot be discarded separately.
+Retention values are deployment settings, so old Git revisions are not a
+permanent image archive.
 
 💡 Details: `akb_help(topic="akb_put_image")`,
 `akb_help(topic="akb_discard_image")`""",
@@ -1549,26 +1603,31 @@ in the document.
 | alt_text | | Accessible alt text; defaults to the filename |
 | mime_type | | Optional allowlisted override for an extensionless file |
 
-## Example
+## Create a document
 ```
 image = akb_put_image(vault="eng", file_path="/workspace/flow.webp",
   alt_text="Authentication flow")
 # image.markdown == "![Authentication flow](/api/assets/<uuid>)"
 
-akb_update(uri="akb://eng/coll/specs/doc/auth.md",
+akb_put(parent="akb://eng/coll/specs", title="Authentication",
   content="# Authentication\n\n" + image.markdown)
 ```
 
-For an existing document, prefer a targeted insertion that preserves the rest
-of the body:
+## Insert into an existing document
+
+Read the document first so the edit can be pinned to the observed commit:
 
 ```
-akb_edit(uri="akb://eng/coll/specs/doc/auth.md",
+doc = akb_get(uri="akb://eng/coll/specs/doc/auth.md")
+akb_edit(uri=doc.uri,
   old_string="## Architecture",
-  new_string="## Architecture\n\n" + image.markdown)
+  new_string="## Architecture\n\n" + image.markdown,
+  base_commit=doc.current_commit)
 ```
 
-If the document write fails, pass `image.url` to `akb_discard_image`.""",
+`akb_update(content=...)` replaces the complete body. Use it only when sending
+the complete fetched-and-merged content with an OCC pin. If the document write
+fails, pass `image.url` to `akb_discard_image`.""",
 
     "akb_discard_image": """# akb_discard_image — Clean Up an Uncommitted Image
 
@@ -1584,8 +1643,10 @@ akb_discard_image(vault="eng", url="/api/assets/<uuid>")
 ```
 
 To remove a rendered image from a document, update the Markdown body and remove
-the `![alt](/api/assets/<uuid>)` expression. AKB retains claimed bytes so older
-Git revisions continue to render correctly.""",
+the `![alt](/api/assets/<uuid>)` expression. Claimed bytes are retained only
+for the configured revision window (30 days by default), then collected when
+no live document still references them. Uncommitted uploads are collected
+after 24 hours by default even if this cleanup call is missed.""",
 
     "files": """# File Storage (S3-backed)
 

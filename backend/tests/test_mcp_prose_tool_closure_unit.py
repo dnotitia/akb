@@ -187,6 +187,31 @@ def test_prose_never_names_a_nonexistent_akb_tool() -> None:
     )
 
 
+def test_inline_image_guidance_is_safe_and_matches_bounded_lifecycle() -> None:
+    """Agent prose must not turn image insertion into a body-truncating update."""
+    topics = _help_topics()
+    images = topics["images"]
+    put_image = topics["akb_put_image"]
+    discard_image = topics["akb_discard_image"]
+    update = topics["akb_update"]
+    instructions = _instructions_text()
+
+    for body in (images, put_image, update, instructions):
+        normalized = re.sub(r"\s+", " ", body.replace("**", ""))
+        assert "replaces the entire" in normalized or "replaces the complete" in normalized
+        assert "akb_edit" in body
+
+    assert "30 days by default" in images
+    assert "24 hours by default" in images
+    assert "30 days by default" in discard_image
+    assert "same vault" in images
+    assert "cross-vault" in images
+    assert "unavailable placeholder" in images
+
+    unsafe_example = 'akb_update(uri="akb://eng/coll/specs/doc/auth.md",\n  content="# Authentication'
+    assert unsafe_example not in put_image
+
+
 def test_help_root_table_topics_are_real_help_topics() -> None:
     """Every drill-down topic the root help table points at exists as a key.
 
