@@ -324,14 +324,16 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch):
-    """When S3 is configured, delete_vault deletes vault_files early (to
-    issue S3 object deletes), so the file-chunk outbox enqueue must read
-    the file ids BEFORE that delete — otherwise file chunks CASCADE out
-    of PG with no vector_delete_outbox row and orphan in the vector store.
+    """When S3 is configured, delete_vault records both durable outboxes.
+
+    The file ids must reach the vector outbox before the metadata cascade, and
+    each immutable object key must reach the S3 outbox in the same transaction
+    so a transient store failure cannot orphan bytes after the vault row is
+    gone.
 
     The default-env inv7 test does not catch this because the audit stack
     has no S3 (the early `DELETE FROM vault_files` branch is skipped). Here
-    we force S3 on and stub the adapter so the early delete runs.
+    We force S3 on so the explicit metadata delete and object outbox path run.
     """
     from app.config import settings
     from app.services.role_sync import RoleSync, set_role_sync, get_role_sync
@@ -339,10 +341,6 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
 
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     monkeypatch.setattr(settings, "s3_endpoint_url", "http://stub-s3:9000")
-    # Stub the S3 adapter so the early per-file delete loop is a no-op.
-    from app.services.adapters import s3_adapter
-    monkeypatch.setattr(s3_adapter, "delete", lambda *_a, **_k: None)
-
     try:
         get_role_sync()
     except RuntimeError:
@@ -383,11 +381,19 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
         outbox = await conn.fetchval(
             "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = $1", file_id,
         )
+        s3_outbox = await conn.fetchval(
+            "SELECT COUNT(*) FROM s3_delete_outbox WHERE s3_key = $1",
+            f"_inv7b_{file_id}",
+        )
 
     assert post == 0, f"file chunk should be gone from PG, got {post}"
     assert outbox == 1, (
         "file chunk must be enqueued in vector_delete_outbox even when S3 is "
         f"configured (vault_files deleted early); got {outbox}"
+    )
+    assert s3_outbox == 1, (
+        "file bytes must be enqueued transactionally for retry after vault deletion; "
+        f"got {s3_outbox}"
     )
 
 

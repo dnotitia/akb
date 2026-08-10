@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import threading
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -37,11 +40,18 @@ def test_inspect_image_rejects_truncated_or_unknown_content() -> None:
 
 def test_extract_asset_ids_is_conservative_around_code() -> None:
     visible = uuid.uuid4()
+    titled = uuid.uuid4()
+    referenced = uuid.uuid4()
     fenced = uuid.uuid4()
     inline = uuid.uuid4()
+    ordinary_link = uuid.uuid4()
     external = uuid.uuid4()
     markdown = f"""
 ![diagram](/api/assets/{visible})
+![diagram with title](/api/assets/{titled} "Architecture")
+![reference image][asset]
+
+[asset]: /api/assets/{referenced}
 
 `![not rendered](/api/assets/{inline})`
 
@@ -49,10 +59,385 @@ def test_extract_asset_ids_is_conservative_around_code() -> None:
 ![example only](/api/assets/{fenced})
 ```
 
+[ordinary link](/api/assets/{ordinary_link})
 ![remote](https://example.com/{external})
 """
 
-    assert extract_asset_ids(markdown) == {visible}
+    assert extract_asset_ids(markdown) == {visible, titled, referenced}
+
+
+@pytest.mark.asyncio
+async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    events: list[tuple] = []
+    main_thread = threading.get_ident()
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, *_args):
+            events.append(("lock_vault",))
+            return uuid.uuid4()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_get_pool():
+        return _Pool()
+
+    def fake_inspect(_body):
+        events.append(("inspect", threading.get_ident()))
+        return "image/png", 1, 1
+
+    def fake_ensure(_bucket):
+        events.append(("ensure",))
+
+    def fake_put(_key, _body, _mime):
+        events.append(("put",))
+
+    async def fake_insert(_conn, **_kwargs):
+        events.append(("insert_pending",))
+
+    async def fake_finalize(_conn, **_kwargs):
+        events.append(("finalize",))
+        return True
+
+    monkeypatch.setattr(asset_service, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(asset_service, "get_pool", fake_get_pool)
+    monkeypatch.setattr(asset_service, "inspect_image", fake_inspect)
+    monkeypatch.setattr(asset_service.s3_adapter, "ensure_bucket", fake_ensure)
+    monkeypatch.setattr(asset_service.s3_adapter, "put_bytes", fake_put)
+    monkeypatch.setattr(
+        asset_service.vault_files_repo, "insert_pending_attachment", fake_insert,
+    )
+    monkeypatch.setattr(
+        asset_service.vault_files_repo, "finalize_attachment", fake_finalize,
+    )
+
+    result = await asset_service.create_image_asset(
+        vault_id=uuid.uuid4(),
+        vault_name="team",
+        filename="diagram.png",
+        declared_mime="image/png",
+        body=ONE_PIXEL_PNG,
+        actor_id="alice",
+    )
+
+    names = [event[0] for event in events]
+    assert events[names.index("inspect")][1] != main_thread
+    assert (
+        names.index("insert_pending")
+        < names.index("lock_vault")
+        < names.index("put")
+        < names.index("finalize")
+    )
+    assert result["url"] == f"/api/assets/{result['id']}"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_settles_put_before_enqueuing_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    events: list[str] = []
+    put_started = threading.Event()
+    allow_put_to_finish = threading.Event()
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, *_args):
+            events.append("lock_vault")
+            return uuid.uuid4()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_get_pool():
+        return _Pool()
+
+    def fake_put(_key, _body, _mime):
+        events.append("put_started")
+        put_started.set()
+        assert allow_put_to_finish.wait(timeout=2)
+        events.append("put_finished")
+
+    async def fake_insert(_conn, **_kwargs):
+        events.append("insert_pending")
+
+    async def fake_delete(_conn, **_kwargs):
+        events.append("delete_metadata")
+        return {"s3_key": "team/.akb-assets/id/image.png"}
+
+    async def fake_enqueue(_conn, _key):
+        events.append("enqueue_delete")
+
+    monkeypatch.setattr(asset_service, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(asset_service, "get_pool", fake_get_pool)
+    monkeypatch.setattr(
+        asset_service, "inspect_image", lambda _body: ("image/png", 1, 1),
+    )
+    monkeypatch.setattr(asset_service.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(asset_service.s3_adapter, "put_bytes", fake_put)
+    monkeypatch.setattr(
+        asset_service.vault_files_repo, "insert_pending_attachment", fake_insert,
+    )
+    monkeypatch.setattr(
+        asset_service.vault_files_repo, "delete_unclaimed_attachment", fake_delete,
+    )
+    monkeypatch.setattr(asset_service, "enqueue_delete", fake_enqueue)
+
+    upload = asyncio.create_task(
+        asset_service.create_image_asset(
+            vault_id=uuid.uuid4(),
+            vault_name="team",
+            filename="diagram.png",
+            declared_mime="image/png",
+            body=ONE_PIXEL_PNG,
+            actor_id="alice",
+        )
+    )
+    assert await asyncio.to_thread(put_started.wait, 1)
+    upload.cancel()
+    await asyncio.sleep(0)
+    assert "delete_metadata" not in events
+
+    allow_put_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    assert events.index("put_finished") < events.index("delete_metadata")
+    assert events.index("delete_metadata") < events.index("enqueue_delete")
+
+
+@pytest.mark.asyncio
+async def test_public_asset_requires_counted_page_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+    from app.api.routes import public
+
+    resolved = False
+
+    async def unexpected_resolve(*_args, **_kwargs):
+        nonlocal resolved
+        resolved = True
+        raise AssertionError("an ungranted image must not resolve or spend a view")
+
+    monkeypatch.setattr(public, "_extract_view_grant", lambda _request: None)
+    monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: False)
+    monkeypatch.setattr(public, "_resolve_with_access", unexpected_resolve)
+
+    with pytest.raises(HTTPException) as exc:
+        await public.publication_document_asset("share", str(uuid.uuid4()), object())
+    assert exc.value.status_code == 404
+    assert resolved is False
+
+
+@pytest.mark.asyncio
+async def test_public_asset_grant_never_increments_publication_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.responses import Response
+    from app.api.routes import public
+
+    file_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    captured: dict = {}
+
+    async def fake_resolve(slug, **kwargs):
+        captured.update(slug=slug, **kwargs)
+        return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
+
+    async def fake_document(_publication):
+        return {"content": f"![diagram](/api/assets/{file_id})"}
+
+    async def fake_load(requested, requested_vault):
+        captured.update(file_id=requested, vault_id=requested_vault)
+        return {"id": file_id}
+
+    async def fake_response(_row, *, public: bool):
+        captured["public"] = public
+        return Response(content=b"image", media_type="image/png")
+
+    monkeypatch.setattr(public, "_extract_view_grant", lambda _request: "grant")
+    monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
+    monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
+    monkeypatch.setattr(
+        public.publication_service, "resolve_document_publication", fake_document,
+    )
+    monkeypatch.setattr(public.assets, "load_asset_row", fake_load)
+    monkeypatch.setattr(public.assets, "image_asset_response", fake_response)
+
+    response = await public.publication_document_asset("share", str(file_id), object())
+
+    assert response.body == b"image"
+    assert captured == {
+        "slug": "share",
+        "password": None,
+        "increment_view": False,
+        "bypass_password": True,
+        "enforce_view_cap": False,
+        "file_id": str(file_id),
+        "vault_id": vault_id,
+        "public": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_public_asset_grant_is_asset_scoped_password_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A counted page grant must outlive the broader password token.
+
+    The asset route may bypass the publication password only after validating
+    the page grant, and it still authorizes one UUID from the exact rendered
+    document slice below. Full-content routes continue to use
+    ``_resolve_with_access`` and therefore keep the shorter password-token TTL.
+    """
+    from fastapi.responses import Response
+    from app.api.routes import public
+
+    file_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    calls: list[dict] = []
+
+    async def fake_resolve(slug, **kwargs):
+        calls.append({"slug": slug, **kwargs})
+        return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
+
+    async def fake_document(_publication):
+        return {"content": f"![diagram](/api/assets/{file_id})"}
+
+    monkeypatch.setattr(public, "_extract_view_grant", lambda _request: "grant")
+    monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
+    monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
+    monkeypatch.setattr(
+        public.publication_service, "resolve_document_publication", fake_document,
+    )
+    monkeypatch.setattr(
+        public.assets,
+        "load_asset_row",
+        lambda *_args: asyncio.sleep(0, result={"id": file_id}),
+    )
+    monkeypatch.setattr(
+        public.assets,
+        "image_asset_response",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0, result=Response(content=b"image", media_type="image/png"),
+        ),
+    )
+
+    response = await public.publication_document_asset("share", str(file_id), object())
+
+    assert response.body == b"image"
+    assert calls == [{
+        "slug": "share",
+        "password": None,
+        "increment_view": False,
+        "bypass_password": True,
+        "enforce_view_cap": False,
+    }]
+
+
+def test_publication_view_grant_outlives_browser_lazy_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.routes import public
+
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 86_400)
+    grant = public._make_view_grant("share")
+
+    now += 3_600
+    assert public._verify_view_grant("share", grant) is True
+    now += 86_401
+    assert public._verify_view_grant("share", grant) is False
+
+
+@pytest.mark.asyncio
+async def test_asset_response_heads_then_streams_without_buffering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.responses import StreamingResponse
+    from app.api.routes import assets
+
+    calls: list[tuple] = []
+
+    def fake_head(key):
+        calls.append(("head", key))
+        return {"ContentLength": 5}
+
+    def fake_stream(key, *, max_bytes):
+        calls.append(("stream", key, max_bytes))
+        yield b"im"
+        yield b"age"
+
+    def unexpected_buffer(*_args, **_kwargs):
+        raise AssertionError("image responses must not buffer the full object")
+
+    monkeypatch.setattr(assets.file_service, "head_object", fake_head)
+    monkeypatch.setattr(assets.file_service, "iter_object_chunks", fake_stream)
+    monkeypatch.setattr(assets.file_service, "get_object_bytes", unexpected_buffer)
+
+    response = await assets.image_asset_response(
+        {
+            "id": uuid.uuid4(),
+            "s3_key": "team/.akb-assets/id/image.png",
+            "mime_type": "image/png",
+            "size_bytes": 5,
+        }
+    )
+
+    assert isinstance(response, StreamingResponse)
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"image"
+    assert calls == [
+        ("head", "team/.akb-assets/id/image.png"),
+        (
+            "stream",
+            "team/.akb-assets/id/image.png",
+            assets.asset_service.IMAGE_ASSET_MAX_BYTES,
+        ),
+    ]
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["vary"] == "Authorization"
 
 
 @pytest.mark.asyncio
@@ -202,3 +587,128 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
         )
 
     assert storage_touched is False
+
+
+@pytest.mark.asyncio
+async def test_sync_references_retains_previous_and_publishes_current() -> None:
+    from app.repositories import vault_files_repo
+
+    document_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    retain_until = datetime.now(timezone.utc)
+    calls: list[tuple[str, tuple]] = []
+
+    class _Connection:
+        async def execute(self, sql, *args):
+            calls.append((" ".join(sql.split()), args))
+
+    await vault_files_repo.sync_document_asset_references(
+        _Connection(),
+        document_id=document_id,
+        vault_id=vault_id,
+        document_path="new/doc.md",
+        commit_hash="b" * 40,
+        asset_ids={asset_id},
+        retain_until=retain_until,
+        previous_commit="a" * 40,
+        previous_path="old/doc.md",
+    )
+
+    assert len(calls) == 4
+    assert "SELECT live.vault_id" in calls[0][0]
+    assert calls[0][1][2:4] == ("old/doc.md", "a" * 40)
+    assert "DELETE FROM document_asset_refs" in calls[1][0]
+    assert "INSERT INTO document_asset_refs" in calls[2][0]
+    assert "INSERT INTO document_asset_revision_refs" in calls[3][0]
+    assert calls[3][1][1:4] == ("new/doc.md", "b" * 40, [asset_id])
+
+
+@pytest.mark.asyncio
+async def test_private_asset_lookup_carries_live_owner_and_revision_scope() -> None:
+    from app.repositories import vault_files_repo
+
+    file_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    captured: dict = {}
+
+    class _Connection:
+        async def fetchrow(self, sql, *args):
+            captured.update(sql=" ".join(sql.split()), args=args)
+            return None
+
+    result = await vault_files_repo.find_authorized_attachment(
+        _Connection(),
+        vault_id=vault_id,
+        file_id=file_id,
+        created_by="alice",
+        document_path="notes/weekly.md",
+        commit_prefix="abcdef1",
+    )
+
+    assert result is None
+    assert "document_asset_refs live" in captured["sql"]
+    assert "document_asset_revision_refs rev" in captured["sql"]
+    assert "rev.retain_until > NOW()" in captured["sql"]
+    assert captured["args"] == (
+        file_id, vault_id, "alice", "notes/weekly.md", "abcdef1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_asset_gc_deletes_metadata_and_enqueues_object_in_one_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_gc_worker
+
+    calls: list[tuple] = []
+
+    class _Transaction:
+        async def __aenter__(self):
+            calls.append(("tx_enter",))
+
+        async def __aexit__(self, *_args):
+            calls.append(("tx_exit",))
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def execute(self, sql, *args):
+            calls.append(("execute", " ".join(sql.split()), args))
+
+        async def fetch(self, sql, *_args):
+            calls.append(("fetch", " ".join(sql.split())))
+            return [
+                {"id": uuid.uuid4(), "s3_key": "vault/.akb-assets/old/image.png"},
+            ]
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_get_pool():
+        return _Pool()
+
+    async def fake_enqueue(_conn, key):
+        calls.append(("enqueue", key))
+
+    monkeypatch.setattr(asset_gc_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(asset_gc_worker, "enqueue_delete", fake_enqueue)
+
+    assert await asset_gc_worker.collect_once() == 1
+    assert calls[0] == ("tx_enter",)
+    assert ("enqueue", "vault/.akb-assets/old/image.png") in calls
+    expiry_call = next(call for call in calls if call[0] == "execute")
+    assert "ORDER BY retain_until LIMIT $1 FOR UPDATE SKIP LOCKED" in expiry_call[1]
+    assert expiry_call[2] == (asset_gc_worker.REVISION_EXPIRE_BATCH_SIZE,)
+    candidate_sql = next(call[1] for call in calls if call[0] == "fetch")
+    assert "hash_verified_at IS NOT NULL" not in candidate_sql
+    assert calls[-1] == ("tx_exit",)

@@ -58,6 +58,7 @@ itAsync("initialize responds locally even when the backend is down", async () =>
   assert.equal(res.result.protocolVersion, "2025-06-18", "echoes client protocol version");
   assert.equal(res.result.capabilities.tools.listChanged, true, "advertises listChanged");
   assert.equal(res.result.serverInfo.name, "akb-mcp");
+  assert.match(res.result.instructions, /akb_put_image/);
   assert.equal(proxy._initialized, true);
 });
 

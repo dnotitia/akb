@@ -46,6 +46,25 @@ describe("MarkdownEditor image insertion", () => {
     expect(validateEditorImage(new File(["png"], "ok.png", { type: "image/png" }))).toBeNull();
   });
 
+  it("rejects the whole invalid batch without offering an impossible partial retry", async () => {
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const valid = new File(["png"], "first.png", { type: "image/png" });
+    const invalid = new File(["svg"], "vector.svg", { type: "image/svg+xml" });
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [valid, invalid] },
+    });
+
+    expect(await screen.findByText(/Choose a PNG/)).toBeVisible();
+    expect(screen.getByText(/No images were uploaded/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/Choose a PNG/)).toBeNull();
+    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
+  });
+
   it("uploads a picked image and serializes its private asset URL", async () => {
     apiMocks.uploadAsset.mockResolvedValue({
       id: ASSET_ID,
@@ -126,5 +145,147 @@ describe("MarkdownEditor image insertion", () => {
     await waitFor(() =>
       expect(apiMocks.discardAsset).toHaveBeenCalledWith("team", ASSET_ID),
     );
+  });
+
+  it("does not discard uploads when a document save owns the unmount", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "diagram.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    const { container, rerender, unmount } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const file = new File(["image"], "diagram.png", { type: "image/png" });
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [file] },
+    });
+    await screen.findByRole("img", { name: "diagram" });
+
+    rerender(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        onChange={vi.fn()}
+        preserveUploadsOnUnmount
+      />,
+    );
+    unmount();
+
+    await Promise.resolve();
+    expect(apiMocks.discardAsset).not.toHaveBeenCalled();
+  });
+
+  it("retries the failed image and every remaining file in a batch", async () => {
+    const ids = [
+      "4f18f05e-d1cf-44ce-a39e-74737fb88e7c",
+      "e06049c1-6bb7-4c08-b649-3d8faf79c69f",
+      "b17fc0f8-e100-4f5c-b688-996324896bc3",
+    ];
+    const result = (id: string, name: string) => ({
+      id,
+      url: `/api/assets/${id}`,
+      name,
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    apiMocks.uploadAsset
+      .mockResolvedValueOnce(result(ids[0], "one.png"))
+      .mockRejectedValueOnce(new Error("temporary upload failure"))
+      .mockResolvedValueOnce(result(ids[1], "two.png"))
+      .mockResolvedValueOnce(result(ids[2], "three.png"));
+    const files = ["one.png", "two.png", "three.png"].map(
+      (name) => new File([name], name, { type: "image/png" }),
+    );
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files },
+    });
+    expect(await screen.findByText(/2 images remain/)).toBeVisible();
+    expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(4));
+    expect(apiMocks.uploadAsset.mock.calls.map((call) => call[1])).toEqual([
+      files[0],
+      files[1],
+      files[1],
+      files[2],
+    ]);
+  });
+
+  it("prevents default file-drop navigation and retains a batch dropped during upload", async () => {
+    const firstId = "4f18f05e-d1cf-44ce-a39e-74737fb88e7c";
+    const secondId = "e06049c1-6bb7-4c08-b649-3d8faf79c69f";
+    let finishFirst!: (value: {
+      id: string;
+      url: string;
+      name: string;
+      mime_type: string;
+      size_bytes: number;
+    }) => void;
+    apiMocks.uploadAsset
+      .mockImplementationOnce(
+        () => new Promise((resolve) => {
+          finishFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({
+        id: secondId,
+        url: `/api/assets/${secondId}`,
+        name: "second.png",
+        mime_type: "image/png",
+        size_bytes: 5,
+      });
+    const first = new File(["first"], "first.png", { type: "image/png" });
+    const second = new File(["second"], "second.png", { type: "image/png" });
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [first] },
+    });
+    await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(1));
+    const dropResult = fireEvent.drop(container.querySelector('[contenteditable="true"]')!, {
+      dataTransfer: { files: [second] },
+    });
+    expect(dropResult).toBe(false);
+
+    finishFirst({
+      id: firstId,
+      url: `/api/assets/${firstId}`,
+      name: "first.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    expect(await screen.findByText(/previous image batch finished/i)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2));
+    expect(apiMocks.uploadAsset.mock.calls[1][1]).toBe(second);
+  });
+
+  it("leaves mixed rich-text clipboard content to the normal paste path", () => {
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const file = new File(["image"], "sheet.png", { type: "image/png" });
+    const editor = container.querySelector('[contenteditable="true"]');
+
+    fireEvent.paste(editor!, {
+      clipboardData: {
+        files: [file],
+        getData: (type: string) =>
+          type === "text/html" ? "<table><tr><td>Copied cell</td></tr></table>" : "Copied cell",
+      },
+    });
+
+    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
   });
 });

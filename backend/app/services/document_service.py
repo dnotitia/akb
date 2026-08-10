@@ -571,12 +571,12 @@ class DocumentService:
         md_content = _compose_markdown(fm_dict, req.content)
         content_hash = _certified_content_hash(md_content)
 
-        # Validate generated asset URLs before the Git write.  The row locks
-        # also serialize a concurrent editor discard with this transaction;
-        # a successful document commit makes its assets permanently retained
-        # for Git history, while a failed write rolls the claims back.
-        await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=req.content,
+        # Claim every valid same-vault attachment before the Git write. Broken,
+        # expired, or copied cross-vault URLs remain inert placeholders instead
+        # of rejecting an otherwise valid import/document save. The row locks
+        # still serialize a concurrent editor discard with this transaction.
+        asset_ids = await asset_service.claim_document_assets(
+            conn, vault_id=vault_id, markdown=req.content, strict=False,
         )
 
         # Git commit
@@ -613,6 +613,14 @@ class DocumentService:
             now=now, commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={}, conn=conn,
             doc_id=doc_id, vault_name=req.vault,
+        )
+        await asset_service.sync_document_assets(
+            conn,
+            document_id=pg_doc_id,
+            vault_id=vault_id,
+            document_path=file_path,
+            commit_hash=commit_hash,
+            asset_ids=asset_ids,
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -880,7 +888,9 @@ class DocumentService:
             # Re-read under the lock so we observe any commit that landed
             # between the initial resolution and lock acquisition. Uses the
             # lock connection so the whole update holds one pool connection.
-            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+            row = await doc_repo.find_by_ref_with_conn(
+                conn, vault_id, doc_ref, for_update=True,
+            )
             if not row:
                 raise NotFoundError("Document", doc_ref)
 
@@ -939,10 +949,9 @@ class DocumentService:
         previous_hash = current_hash
         content_hash = _certified_content_hash(new_md)
 
-        if req.content is not None:
-            await asset_service.claim_document_assets(
-                conn, vault_id=vault_id, markdown=new_body,
-            )
+        asset_ids = await asset_service.claim_document_assets(
+            conn, vault_id=vault_id, markdown=new_body, strict=False,
+        )
 
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
@@ -960,6 +969,15 @@ class DocumentService:
             commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
             tags=req.tags, conn=conn,
+        )
+        await asset_service.sync_document_assets(
+            conn,
+            document_id=pg_doc_id,
+            vault_id=vault_id,
+            document_path=file_path,
+            commit_hash=commit_hash,
+            asset_ids=asset_ids,
+            previous_commit=row.get("current_commit"),
         )
 
         chunks_indexed = 0
@@ -1071,7 +1089,9 @@ class DocumentService:
 
         async with self._move_lock(vault_id, old_path, est_new_path, vault_name=vault) as conn:
             # Re-read under the lock and recompute the target from fresh state.
-            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+            row = await doc_repo.find_by_ref_with_conn(
+                conn, vault_id, doc_ref, for_update=True,
+            )
             if not row:
                 raise NotFoundError("Document", doc_ref)
             old_path = row["path"]
@@ -1123,6 +1143,9 @@ class DocumentService:
                 if new_coll else None
             )
             now = datetime.now(timezone.utc)
+            live_asset_ids = await asset_service.list_live_document_asset_ids(
+                conn, document_id=pg_doc_id, vault_id=vault_id,
+            )
             summary = message or f"{old_path} -> {new_path}"
             commit_msg = (
                 f"[move] {old_path} -> {new_path}\n\n"
@@ -1152,6 +1175,16 @@ class DocumentService:
             await doc_repo.update_path(
                 pg_doc_id, new_path, collection_id=new_collection_id,
                 now=now, commit_hash=commit_hash, conn=conn,
+            )
+            await asset_service.sync_document_assets(
+                conn,
+                document_id=pg_doc_id,
+                vault_id=vault_id,
+                document_path=new_path,
+                commit_hash=commit_hash,
+                asset_ids=live_asset_ids,
+                previous_commit=row.get("current_commit"),
+                previous_path=old_path,
             )
 
             # Keep collection doc counts honest when the folder changed.
@@ -1280,7 +1313,9 @@ class DocumentService:
         file_path = row["path"]
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
-            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+            row = await doc_repo.find_by_ref_with_conn(
+                conn, vault_id, doc_ref, for_update=True,
+            )
             if not row:
                 raise NotFoundError("Document", doc_ref)
             if base_commit and row["current_commit"] != base_commit:
@@ -1348,8 +1383,8 @@ class DocumentService:
         previous_hash = row.get("content_hash") or _body_content_hash(current_body)
         content_hash = _certified_content_hash(new_md)
 
-        await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=new_body,
+        asset_ids = await asset_service.claim_document_assets(
+            conn, vault_id=vault_id, markdown=new_body, strict=False,
         )
 
         msg = message or f"Edit {file_path}"
@@ -1368,6 +1403,15 @@ class DocumentService:
             commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, content_hash_commit=commit_hash,
             tags=None, conn=conn,
+        )
+        await asset_service.sync_document_assets(
+            conn,
+            document_id=pg_doc_id,
+            vault_id=vault_id,
+            document_path=file_path,
+            commit_hash=commit_hash,
+            asset_ids=asset_ids,
+            previous_commit=row.get("current_commit"),
         )
 
         # Re-chunk and re-embed (full pipeline — mirrors update())
@@ -1438,7 +1482,9 @@ class DocumentService:
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
-            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+            row = await doc_repo.find_by_ref_with_conn(
+                conn, vault_id, doc_ref, for_update=True,
+            )
             if not row:
                 raise NotFoundError("Document", doc_ref)
             return await self._delete_locked(

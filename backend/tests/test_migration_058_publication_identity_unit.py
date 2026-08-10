@@ -63,10 +63,12 @@ _DSN = os.environ.get(
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 
-# The additions 058 makes. Dropping these from an init.sql database
-# reconstructs the pre-058 shape, which is what the migration has to turn
-# back into the post-058 shape.
+# The additions 058 makes. Later image-reference tables depend on its composite
+# document key, so drop those dependants first; the remaining statements then
+# reconstruct the pre-058 shape that this migration has to upgrade.
 _UNDO_058 = """
+DROP TABLE document_asset_refs;
+DROP TABLE document_asset_revision_refs;
 ALTER TABLE publications DROP CONSTRAINT publications_document_fk;
 DROP INDEX idx_publications_document_id;
 ALTER TABLE publications DROP COLUMN document_id;

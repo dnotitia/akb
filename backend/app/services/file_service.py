@@ -100,12 +100,10 @@ def get_object_bytes(s3_key: str, max_bytes: int | None = None) -> bytes:
     if max_bytes is None:
         return s3_adapter.get_bytes(s3_key)
     buf = bytearray()
-    gen = s3_adapter.iter_chunks(s3_key)
+    gen = iter_object_chunks(s3_key, max_bytes=max_bytes)
     try:
         for chunk in gen:
             buf.extend(chunk)
-            if len(buf) > max_bytes:
-                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
     finally:
         # release the boto stream promptly on cap-abort or exhaustion; the
         # concrete iterator is a generator, but the annotation is Iterator[bytes]
@@ -124,9 +122,24 @@ def head_object(s3_key: str) -> dict:
 
 
 def iter_object_chunks(
-    s3_key: str, chunk_size: int = _S3_STREAM_CHUNK_SIZE
+    s3_key: str,
+    chunk_size: int = _S3_STREAM_CHUNK_SIZE,
+    *,
+    max_bytes: int | None = None,
 ) -> Iterator[bytes]:
-    return s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    """Stream an object with an optional hard bound on transferred bytes."""
+    transferred = 0
+    gen = s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    try:
+        for chunk in gen:
+            transferred += len(chunk)
+            if max_bytes is not None and transferred > max_bytes:
+                raise StorageError(f"object {s3_key} exceeds {max_bytes} bytes")
+            yield chunk
+    finally:
+        close = getattr(gen, "close", None)
+        if callable(close):
+            close()
 
 
 def put_object_bytes(
@@ -499,7 +512,11 @@ class FileService:
             row = await vault_files_repo.find_by_id(
                 conn, vault_id, uuid.UUID(file_id),
             )
-            if not row or row.get("kind") != "file":
+            if (
+                not row
+                or row.get("kind") != "file"
+                or row.get("upload_state") != "confirmed"
+            ):
                 raise NotFoundError("File", file_id)
 
         # Override stored Content-Type with DB value so browsers inline

@@ -364,11 +364,16 @@ export async function getAssetBlob(
   fileId: string,
   vault: string,
   signal?: AbortSignal,
+  source?: { document: string; commit: string },
 ): Promise<Blob> {
   const token = getToken();
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   const params = new URLSearchParams({ vault });
+  if (source) {
+    params.set("document", source.document);
+    params.set("commit", source.commit);
+  }
   const res = await fetch(`/api/assets/${encodeURIComponent(fileId)}?${params}`, { headers, signal });
   if (res.status === 401) {
     setToken(null);
@@ -842,12 +847,15 @@ export function publicationRawUrl(slug: string): string {
   return `${API_BASE}/public/${slug}/raw${qs ? `?${qs}` : ""}`;
 }
 
-/** Same-view URL for an image embedded by a document publication. */
+/**
+ * Asset-scoped URL for an image embedded by a counted document view.
+ *
+ * The view grant is sufficient for this narrow endpoint. Do not repeat the
+ * broader password token in every `<img>` URL/access-log entry.
+ */
 export function publicationAssetUrl(slug: string, fileId: string): string {
-  const token = getPublicationToken(slug);
   const grant = getViewGrant(slug);
   const search = new URLSearchParams();
-  if (token) search.set("token", token);
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${encodeURIComponent(slug)}/assets/${encodeURIComponent(fileId)}${qs ? `?${qs}` : ""}`;

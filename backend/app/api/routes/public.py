@@ -100,15 +100,15 @@ def _verify_token(slug: str, token: str) -> bool:
 # View-grant: proves a COUNTED page open, so the paired /raw and /download
 # re-serves of that same view don't re-count and stay usable at the last allowed
 # view. Distinct from the password token (different HMAC purpose prefix) so one
-# can't substitute for the other: a password token must NOT skip view-counting,
-# and a grant must NOT bypass the password gate. WITHOUT a grant, /raw and
-# /download each count as their own view and are capped — so max_views is a HARD
-# cap on every content-delivery path, not just the page GET. TTL is short: it
-# only has to outlive a single page session's preview→download, and a short
-# window bounds how long a leaked/shared grant URL can fetch without counting.
+# can't substitute for the other on full-content routes: a password token must
+# NOT skip view-counting, and a grant must NOT unlock the page, /raw, or
+# /download. The document-image route is deliberately narrower: after a
+# successful counted page open, the grant alone may fetch only image UUIDs that
+# remain embedded by the exact current publication slice. This lets a
+# password-protected page lazy-load images for the grant lifetime without
+# extending the broader password token. Every subordinate request still checks
+# publication existence, expiry, and the exact published representation.
 # ============================================================
-
-_VIEW_GRANT_TTL = 600  # 10 minutes
 
 
 def _make_view_grant(slug: str) -> str:
@@ -126,7 +126,7 @@ def _verify_view_grant(slug: str, grant: str | None) -> bool:
         ts = int(ts_str)
     except (ValueError, AttributeError):
         return False
-    if abs(time.time() - ts) > _VIEW_GRANT_TTL:
+    if abs(time.time() - ts) > settings.publication_view_grant_ttl_secs:
         return False
     msg = f"grant:{slug}:{ts_str}".encode("utf-8")
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
@@ -589,7 +589,7 @@ async def publication_meta(slug: str, request: Request):
                 file_row = await conn.fetchrow(
                     "SELECT name, mime_type, size_bytes FROM vault_files "
                     "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
-                    "AND hash_verified_at IS NOT NULL",
+                    "AND upload_state = 'confirmed'",
                     to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
@@ -666,13 +666,26 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
     document-wide manifest accidentally exposing an image from a private
     section, and removal/unpublish revokes access immediately.
     """
+    # An image is a subordinate fetch of an already-counted page view, never a
+    # new publication view of its own. Require the counted-page grant so a
+    # document with N images cannot consume N additional view-cap entries (and
+    # so the last allowed page view can still render all of its images).
+    if not _verify_view_grant(slug, _extract_view_grant(request)):
+        raise HTTPException(status_code=404, detail="Asset not found")
     try:
-        has_grant = _verify_view_grant(slug, _extract_view_grant(request))
-        publication = await _resolve_with_access(
+        # The grant proves this client already passed any password gate on the
+        # counted page open. Treat it as asset-scoped authority only: unlike a
+        # password token it cannot fetch the document, raw File bytes, tables,
+        # or arbitrary attachments, and the exact rendered slice is checked
+        # below before object storage is touched. This also prevents the
+        # one-hour password token from breaking images that lazy-load later in
+        # the grant's (configurable) page-session lifetime.
+        publication = await publication_service.resolve_publication(
             slug,
-            request,
-            increment_view=not has_grant,
-            enforce_view_cap=not has_grant,
+            password=None,
+            increment_view=False,
+            bypass_password=True,
+            enforce_view_cap=False,
         )
         if publication["resource_type"] != ResourceType.DOCUMENT:
             raise PublicationNotFound(slug)
@@ -746,7 +759,7 @@ async def publication_raw(slug: str, request: Request):
         file_row = await conn.fetchrow(
             "SELECT s3_key, mime_type, size_bytes, name FROM vault_files "
             "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
-            "AND hash_verified_at IS NOT NULL",
+            "AND upload_state = 'confirmed'",
             to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
@@ -1001,10 +1014,10 @@ async def get_public_publication(
 
     rt = publication["resource_type"]
 
-    # Hand back a short-lived grant so the paired /raw and /download re-serves of
+    # Hand back a bounded grant so the paired /raw and /download re-serves of
     # THIS view don't re-count (and a page at its last allowed view can still
     # fetch its bytes). Mint a FRESH grant only on a counted (grantless) open; on
-    # a grant-carried re-serve, ECHO the same grant so its ORIGINAL 600s TTL
+    # a grant-carried re-serve, ECHO the same grant so its ORIGINAL TTL
     # stands. Re-minting on every GET would let a viewer refresh before expiry to
     # roll the timestamp forward indefinitely — an unlimited renewable capability
     # from a single counted view, defeating the cap (Codex High). Only the JSON
@@ -1200,7 +1213,7 @@ async def oembed(url: str, format: str = "json"):
                 async with pool.acquire() as conn:
                     f_row = await conn.fetchrow(
                         "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2 "
-                        "AND kind = 'file' AND hash_verified_at IS NOT NULL",
+                        "AND kind = 'file' AND upload_state = 'confirmed'",
                         to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                     )
                     if f_row:

@@ -10,14 +10,19 @@ Adds two proxy-local tools for agent-authored document images:
   expression. Agents place that expression at the intended position with
   `akb_put`, `akb_update`, or a targeted `akb_edit`.
 - **`akb_discard_image`** removes an upload that never reached a document
-  commit. Once a document claims the image, AKB retains the bytes for Git
-  revision history and this cleanup tool fails closed.
+  commit. Once a document claims the image, this cleanup tool fails closed;
+  AKB derives access from current document references and retains removed or
+  deleted references for a bounded Git-revision window before GC.
 
 Document images are deliberately separate from `akb_put_file`: they stay out
 of File browse/search/publication surfaces, inherit the document/vault access
 model, and are decoded and validated by the backend before becoming usable.
 The proxy still has zero runtime dependencies and never receives object-store
 credentials or a presigned URL for this path.
+
+The proxy-local MCP `initialize` response advertises the inline-image workflow.
+Backend guidance is capability-conditional, so direct MCP connections and
+older proxies are not instructed to call tools absent from their tool list.
 
 ## 2.1.0 — survive backend/VPN outages without a session restart
 

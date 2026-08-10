@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from app.api import file_write_context
 from app.services.auth_service import AuthenticatedUser
 
 
@@ -175,9 +176,9 @@ async def test_action_limited_upload_uses_human_actor_and_service_audit_metadata
         observed["initiate"] = kwargs
         return {"uri": "akb://team/file/f-1"}
 
-    monkeypatch.setattr(files, "check_vault_access", _check_service)
-    monkeypatch.setattr(files, "require_delegated_actor", _delegated_actor)
-    monkeypatch.setattr(files, "check_delegated_vault_writer", _check_human)
+    monkeypatch.setattr(file_write_context, "check_vault_access", _check_service)
+    monkeypatch.setattr(file_write_context, "require_delegated_actor", _delegated_actor)
+    monkeypatch.setattr(file_write_context, "check_delegated_vault_writer", _check_human)
     monkeypatch.setattr(files.file_service, "initiate_upload", _initiate)
 
     result = await files.upload_file(
@@ -231,9 +232,9 @@ async def test_action_limited_confirm_emits_both_actor_ids(monkeypatch):
         observed["kwargs"] = kwargs
         return {"uri": "akb://team/file/f-1"}
 
-    monkeypatch.setattr(files, "check_vault_access", _check_service)
-    monkeypatch.setattr(files, "require_delegated_actor", _delegated_actor)
-    monkeypatch.setattr(files, "check_delegated_vault_writer", _check_human)
+    monkeypatch.setattr(file_write_context, "check_vault_access", _check_service)
+    monkeypatch.setattr(file_write_context, "require_delegated_actor", _delegated_actor)
+    monkeypatch.setattr(file_write_context, "check_delegated_vault_writer", _check_human)
     monkeypatch.setattr(files.file_service, "confirm_upload", _confirm)
 
     await files.confirm_upload(
@@ -295,8 +296,8 @@ async def test_wildcard_grant_keeps_existing_non_delegated_file_behavior(monkeyp
         observed.update(kwargs)
         return {"uri": "akb://team/file/f-2"}
 
-    monkeypatch.setattr(files, "check_vault_access", _check_service)
-    monkeypatch.setattr(files, "require_delegated_actor", _must_not_delegate)
+    monkeypatch.setattr(file_write_context, "check_vault_access", _check_service)
+    monkeypatch.setattr(file_write_context, "require_delegated_actor", _must_not_delegate)
     monkeypatch.setattr(files.file_service, "initiate_upload", _initiate)
 
     await files.upload_file(

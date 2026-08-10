@@ -1,4 +1,5 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ArrowLeft, ArrowRight, Check, ChevronRight, FolderPlus } from "lucide-react";
 import { ApiError, putDocument } from "@/lib/api";
@@ -169,6 +170,10 @@ export default function DocumentNewPage() {
       // manual reload (the explorer/home stay mounted across this navigation).
       refetchTree();
       refetchVaults();
+      // The response means document refs now own every valid image. Commit the
+      // state before navigation so editor cleanup may discard only uploads the
+      // saved body did not claim.
+      flushSync(() => setCreating(false));
       const path = result?.path;
       if (path) {
         navigate(`/vault/${name}/doc/${encodeURIComponent(path)}`);
@@ -385,6 +390,7 @@ export default function DocumentNewPage() {
               required
               vault={name!}
               onUploadingChange={setUploadingImage}
+              preserveUploadsOnUnmount={creating}
             />
           </Suspense>
         </div>

@@ -3,8 +3,8 @@
 An uploaded image begins unclaimed.  A document writer atomically marks every
 referenced image as claimed in the same PostgreSQL transaction that advances
 the document's authoritative ``current_commit``.  Only unclaimed images may be
-discarded by the editor; claimed bytes remain available to historical Git
-revisions until the vault is deleted.
+discarded explicitly by the editor. Migration 062 adds the live and bounded
+revision reference tables that govern authorization and garbage collection.
 """
 
 from __future__ import annotations

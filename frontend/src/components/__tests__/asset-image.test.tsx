@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { AssetImage } from "@/components/asset-image";
+import { MarkdownRender } from "@/components/markdown-render";
 import { assetIdFromUrl } from "@/lib/image-assets";
 
 const apiMocks = vi.hoisted(() => ({
@@ -53,10 +54,38 @@ describe("AssetImage", () => {
       ASSET_ID,
       "team",
       expect.any(AbortSignal),
+      undefined,
     );
 
     unmount();
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:private-image"));
+  });
+
+  it("passes the exact historical document context to the byte request", async () => {
+    apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
+    render(
+      <AssetImage
+        src={ASSET_URL}
+        alt="Old diagram"
+        assetContext={{
+          mode: "authenticated",
+          vault: "team",
+          document: "notes/weekly.md",
+          commit: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
+        }}
+      />,
+    );
+
+    await screen.findByRole("img", { name: "Old diagram" });
+    expect(apiMocks.getAssetBlob).toHaveBeenCalledWith(
+      ASSET_ID,
+      "team",
+      expect.any(AbortSignal),
+      {
+        document: "notes/weekly.md",
+        commit: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
+      },
+    );
   });
 
   it("never reuses a resolved blob while a different asset is loading", async () => {
@@ -117,5 +146,26 @@ describe("AssetImage", () => {
     );
     expect(apiMocks.publicationAssetUrl).toHaveBeenCalledWith("slug", ASSET_ID);
     expect(apiMocks.getAssetBlob).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch when a parent recreates an equivalent asset context", async () => {
+    apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
+    const markdown = `![Architecture](${ASSET_URL})`;
+    const { rerender } = render(
+      <MarkdownRender
+        markdown={markdown}
+        assetContext={{ mode: "authenticated", vault: "team" }}
+      />,
+    );
+    await screen.findByRole("img", { name: "Architecture" });
+
+    rerender(
+      <MarkdownRender
+        markdown={markdown}
+        assetContext={{ mode: "authenticated", vault: "team" }}
+      />,
+    );
+
+    await waitFor(() => expect(apiMocks.getAssetBlob).toHaveBeenCalledTimes(1));
   });
 });

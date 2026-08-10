@@ -139,7 +139,12 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
         >
           <MarkdownRender
             markdown={doc.content || ""}
-            assetContext={{ mode: "authenticated", vault }}
+            assetContext={{
+              mode: "authenticated",
+              vault,
+              document: doc.path,
+              commit: doc.current_commit,
+            }}
           />
         </div>
       ) : (

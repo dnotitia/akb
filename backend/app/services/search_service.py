@@ -533,7 +533,7 @@ class SearchService:
                     # never standalone searchable File resources.
                     f_conds: list[str] = [
                         "f.kind = 'file'",
-                        "f.hash_verified_at IS NOT NULL",
+                        "f.upload_state = 'confirmed'",
                     ]
                     if vaults:
                         f_conds.append("v.name = ANY($1)")
@@ -901,7 +901,7 @@ class SearchService:
                       LEFT JOIN collections c ON c.id = f.collection_id
                      WHERE f.id = ANY($1)
                        AND f.kind = 'file'
-                       AND f.hash_verified_at IS NOT NULL
+                       AND f.upload_state = 'confirmed'
                     """,
                     [uuid.UUID(x) for x in by_type["file"]],
                 )

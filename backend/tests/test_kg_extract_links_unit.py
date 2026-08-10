@@ -49,6 +49,12 @@ def test_generated_image_asset_is_not_a_document_relation():
     assert extract_markdown_links(content) == ["design.md"]
 
 
+def test_relative_image_target_remains_a_document_relation():
+    assert extract_markdown_links("![diagram](./design/architecture.md)") == [
+        "design/architecture.md"
+    ]
+
+
 def test_strip_code_spans_removes_code_keeps_prose():
     stripped = strip_code_spans("`akb://x/coll/y/doc/z.md` keep-this")
     assert "akb://" not in stripped

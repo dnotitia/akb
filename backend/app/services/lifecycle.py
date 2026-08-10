@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import asset_gc_worker, audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -162,7 +162,9 @@ def start_workers() -> None:
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
     if settings.s3_endpoint_url:
+        asset_gc_worker.start()
         s3_delete_worker.start()
+        started.append("asset_gc_worker")
         started.append("s3_delete_worker")
     else:
         logger.info("s3_delete_worker disabled (S3 not configured)")
@@ -233,6 +235,9 @@ async def stop_workers() -> None:
     await events_publisher.stop()
     await metadata_worker.stop()
     await external_git_poller.stop()
+    # Stop producers before the S3 outbox consumer so shutdown cannot leave a
+    # freshly-enqueued object waiting solely because the consumer exited first.
+    await asset_gc_worker.stop()
     await s3_delete_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()

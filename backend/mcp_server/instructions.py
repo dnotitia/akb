@@ -19,7 +19,7 @@ When writing into a vault:
 4. Never inline secrets in document bodies — use ${{secrets.X}} placeholders.
 5. Destructive tools (akb_delete_vault, akb_delete_collection) require explicit user confirmation.
 6. Reference resources by the akb:// URIs returned by tool calls — do not reassemble paths yourself.
-7. For an inline document image, call akb_put_image and place its returned `markdown` exactly where the image belongs with akb_put, akb_update, or a targeted akb_edit. Use akb_discard_image if the document write fails.
+7. If your tool list includes the proxy-local akb_put_image tool, use it for inline document images and place its returned `markdown` exactly where the image belongs. If that tool is absent, do not call it; upgrade or connect through akb-mcp 2.2 or newer first.
 8. For other surfaces (akb_publish, akb_activity, akb_history), call akb_help() for an overview.
 
 Agent memory is handled outside the MCP tool-use loop — the AKB lifecycle plugin (akb-claude-code, akb-cursor, ...) drives /api/v1/agent-sessions REST endpoints automatically. As an agent, your own memory vault (named agent-memory-{your-user-id}, with your display name in its description) is accessible via the normal akb_search / akb_browse / akb_get tools just like any other vault — find it with akb_list_vaults rather than reconstructing the name.

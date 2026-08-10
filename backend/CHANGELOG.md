@@ -7,6 +7,58 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added secure inline document images with bounded revision retention
+
+The Markdown editor and MCP proxy can upload validated PNG, JPEG, GIF, and WebP
+images as hidden object-storage attachments and insert stable
+`/api/assets/{uuid}` references. Attachments do not appear in File browse,
+search, or standalone publication surfaces. Private reads require either the
+uploader's uncommitted upload, a current document reference, or an exact
+document-path/Git-commit manifest that has not expired. Public reads continue
+to inherit the exact published document commit and section slice.
+
+Document writes now replace their live image-reference set transactionally and
+record bounded revision manifests. Link, document, external-mirror, and
+recursive collection deletion therefore revoke live access immediately while
+preserving recent historical revisions. A background collector expires
+uncommitted uploads (24 hours by default) and objects with no live or retained
+revision reference (30 days by default), deleting metadata and enqueueing the
+S3 object removal in one transaction. Vault deletion remains an immediate
+whole-container purge. The retention windows and GC cadence are configurable.
+
+Image validation fully decodes bounded frames on a worker thread rather than
+the API event loop. Uploads persist an unreadable pending metadata row before
+the S3 PUT and finalize it only after the PUT succeeds; a process exit in that
+window therefore leaves a GC-visible key instead of an untracked object.
+Cancellation settles the underlying PUT before enqueueing cleanup, closing the
+late-thread orphan race. Valid CommonMark image nodes, including titled and
+reference-style forms, share one parser-backed reachability path. Expired
+revision manifests are removed in indexed batches, and verified image bodies
+stream through the API after a bounded HEAD check instead of being fully
+buffered per request.
+
+Upload/finalization holds a vault key-share lock while vault deletion takes the
+conflicting lock before enumerating S3 keys, preventing a late PUT from escaping
+a whole-vault purge. Vault deletion records those immutable keys in the existing
+retrying S3 outbox in the same transaction as the metadata cascade, avoiding
+remote network I/O under the vault lock and preserving cleanup across crashes or
+store failures. Slow request bodies use a separately bounded admission pool and
+deadline instead of occupying image decode/S3 slots indefinitely. Regular
+File upload readiness now uses an explicit `upload_state`: pre-hash legacy Files
+remain confirmed and visible, while only newly initiated transfers are pending.
+
+Document writers claim all available same-vault assets without rejecting the
+entire Markdown save for an expired, imported, or cross-vault broken URL; those
+URLs remain unreadable placeholders. Public image requests require the page's
+already-counted, configurable view grant (24 hours by default) and never
+increment publication views themselves, so a page containing multiple or
+lazy-loaded images consumes exactly one view-cap entry. The grant is also the
+narrow authority for those exact embedded image UUIDs, so password-protected
+pages keep loading images after the broader one-hour password token expires;
+it cannot retrieve the document or any other publication content. Image URLs
+therefore carry only this asset-scoped grant instead of repeating the broader
+password token in every request.
+
 ### Added app identity credential exchange and capability enforcement
 
 System administrators can now issue, list, rotate, and revoke exchange-only app

@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import logging
 import re
 import uuid
 import warnings
+from datetime import datetime, timedelta, timezone
 
+from markdown_it import MarkdownIt
 from PIL import Image, ImageSequence, UnidentifiedImageError
 
 from app.config import settings
@@ -17,6 +20,7 @@ from app.exceptions import AKBError, ValidationError
 from app.repositories import vault_files_repo
 from app.services.adapters import s3_adapter
 from app.services.m1_file_measurement import measurement_enabled
+from app.services.s3_delete_worker import enqueue_delete
 
 
 ASSET_URL_PREFIX = "/api/assets/"
@@ -27,10 +31,10 @@ IMAGE_ASSET_MAX_FRAMES = 300
 IMAGE_ASSET_MAX_TOTAL_FRAME_PIXELS = 80_000_000
 
 _ASSET_ID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
-_MARKDOWN_ASSET_RE = re.compile(
-    rf"!\[[^\n]*?\]\(\s*<?{re.escape(ASSET_URL_PREFIX)}(?P<id>{_ASSET_ID})>?\s*\)"
+_ASSET_URL_RE = re.compile(
+    rf"^{re.escape(ASSET_URL_PREFIX)}(?P<id>{_ASSET_ID})/?$"
 )
-_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+_MARKDOWN_PARSER = MarkdownIt("commonmark")
 
 _FORMAT_MIMES = {
     "PNG": "image/png",
@@ -39,6 +43,7 @@ _FORMAT_MIMES = {
     "WEBP": "image/webp",
 }
 _ALLOWED_MIMES = frozenset(_FORMAT_MIMES.values())
+logger = logging.getLogger("akb.assets")
 
 
 def inspect_image(data: bytes) -> tuple[str, int, int]:
@@ -93,53 +98,52 @@ def inspect_image(data: bytes) -> tuple[str, int, int]:
     return mime, width, height
 
 
-def _strip_inline_code(line: str) -> str:
-    """Remove CommonMark-style code spans before looking for image syntax."""
-    out: list[str] = []
-    i = 0
-    while i < len(line):
-        if line[i] != "`":
-            out.append(line[i])
-            i += 1
-            continue
-        run = 1
-        while i + run < len(line) and line[i + run] == "`":
-            run += 1
-        closing = line.find("`" * run, i + run)
-        if closing < 0:
-            out.append(line[i:i + run])
-            i += run
-        else:
-            out.append(" " * (closing + run - i))
-            i = closing + run
-    return "".join(out)
-
-
 def extract_asset_ids(markdown: str) -> set[uuid.UUID]:
-    """Extract generated asset references, excluding fenced/inline code.
+    """Extract stable asset URLs from images rendered by CommonMark.
 
-    This parser is deliberately conservative: only the exact inline image form
-    emitted by the editor authorizes public bytes.  Unsupported Markdown forms
-    fail closed instead of accidentally widening a publication's asset set.
+    Authorization follows parsed image nodes rather than source-text regexes so
+    inline destinations with titles and reference-style images behave exactly
+    like their rendered equivalents. Code spans, fenced examples, ordinary
+    links, and raw HTML never produce an image token and therefore cannot retain
+    or publicly authorize bytes.
     """
     result: set[uuid.UUID] = set()
-    fence_char: str | None = None
-    fence_len = 0
-    for line in markdown.splitlines():
-        fence = _FENCE_RE.match(line)
-        if fence:
-            token = fence.group("fence")
-            if fence_char is None:
-                fence_char, fence_len = token[0], len(token)
-                continue
-            if token[0] == fence_char and len(token) >= fence_len:
-                fence_char, fence_len = None, 0
-                continue
-        if fence_char is not None:
+    pending = list(_MARKDOWN_PARSER.parse(markdown))
+    while pending:
+        token = pending.pop()
+        if token.children:
+            pending.extend(token.children)
+        if token.type != "image":
             continue
-        for match in _MARKDOWN_ASSET_RE.finditer(_strip_inline_code(line)):
+        source = token.attrGet("src")
+        if not isinstance(source, str):
+            continue
+        match = _ASSET_URL_RE.fullmatch(source)
+        if match:
             result.add(uuid.UUID(match.group("id")))
     return result
+
+
+async def _settle_must_complete_task(task: asyncio.Task[None]) -> None:
+    """Wait for a shielded storage call even after its caller is cancelled.
+
+    Cancelling ``asyncio.to_thread`` only abandons the await; it cannot stop an
+    already-running boto3 call. Cleanup must not race ahead of that call or a
+    late PUT can recreate an object after its delete outbox entry was consumed.
+    """
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    # Retrieve a late storage exception even when cancellation won the race
+    # with task completion; otherwise asyncio reports an unobserved exception.
+    try:
+        task.result()
+    except BaseException:
+        pass
 
 
 async def claim_document_assets(
@@ -152,9 +156,11 @@ async def claim_document_assets(
     """Validate and retain the generated image references in ``markdown``.
 
     The vault predicate is part of the database lookup, so copying an asset URL
-    from another vault cannot turn it into a readable reference.  Claiming is
-    performed by the caller's document transaction: if the Git/PG write fails,
-    the claim rolls back with the document's authoritative commit pointer.
+    from another vault cannot turn it into a readable reference. In non-strict
+    mode unavailable URLs remain broken placeholders while valid local assets
+    are retained. Claiming is performed by the caller's document transaction:
+    if the Git/PG write fails, the claim rolls back with the document's
+    authoritative commit pointer.
     """
     referenced = extract_asset_ids(markdown)
     found = await vault_files_repo.claim_attachment_references(
@@ -165,6 +171,75 @@ async def claim_document_assets(
             "Document contains an unavailable image reference; upload the image to this vault first"
         )
     return found
+
+
+def _revision_retain_until() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(
+        days=settings.document_asset_revision_retention_days,
+    )
+
+
+async def sync_document_assets(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    document_path: str,
+    commit_hash: str,
+    asset_ids: set[uuid.UUID],
+    previous_commit: str | None = None,
+    previous_path: str | None = None,
+) -> None:
+    """Publish the current image set and its bounded Git manifest."""
+    # Production document writers always hold a caller-owned transaction.
+    # A few focused service tests exercise the private locked helpers without
+    # a connection; keep that established seam side-effect free.
+    if conn is None:
+        return
+    await vault_files_repo.sync_document_asset_references(
+        conn,
+        document_id=document_id,
+        vault_id=vault_id,
+        document_path=document_path,
+        commit_hash=commit_hash,
+        asset_ids=asset_ids,
+        retain_until=_revision_retain_until(),
+        previous_commit=previous_commit,
+        previous_path=previous_path,
+    )
+
+
+async def list_live_document_asset_ids(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+) -> set[uuid.UUID]:
+    """Return the current attachment set through the asset-service boundary."""
+    return await vault_files_repo.list_live_document_asset_ids(
+        conn,
+        document_id=document_id,
+        vault_id=vault_id,
+    )
+
+
+async def retain_document_assets_for_delete(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    document_path: str,
+    commit_hash: str | None,
+) -> None:
+    """Keep the deleted document's last image-bearing revision temporarily."""
+    await vault_files_repo.retain_current_document_assets(
+        conn,
+        document_id=document_id,
+        vault_id=vault_id,
+        document_path=document_path,
+        commit_hash=commit_hash,
+        retain_until=_revision_retain_until(),
+    )
 
 
 def _safe_filename(filename: str, mime: str) -> str:
@@ -192,7 +267,11 @@ async def create_image_asset(
     if len(body) > IMAGE_ASSET_MAX_BYTES:
         raise AKBError("Image exceeds the 10 MB limit", status_code=413)
 
-    actual_mime, width, height = inspect_image(body)
+    # Pillow verifies and fully decodes every bounded frame. Keep that CPU work
+    # off the asyncio event loop so a large animated upload cannot stall probes
+    # and unrelated API requests. The route-level semaphore bounds concurrent
+    # calls into this thread path.
+    actual_mime, width, height = await asyncio.to_thread(inspect_image, body)
     claimed = declared_mime.split(";", 1)[0].strip().lower()
     if claimed not in _ALLOWED_MIMES or claimed != actual_mime:
         raise AKBError("Image content does not match its declared MIME type", status_code=415)
@@ -203,30 +282,79 @@ async def create_image_asset(
     digest = hashlib.sha256(body).hexdigest()
 
     await asyncio.to_thread(s3_adapter.ensure_bucket, settings.s3_bucket)
-    await asyncio.to_thread(s3_adapter.put_bytes, s3_key, body, actual_mime)
-
     pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await vault_files_repo.insert_pending_attachment(
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                name=safe_name,
+                s3_key=s3_key,
+                mime_type=actual_mime,
+                size_bytes=len(body),
+                content_hash=digest,
+                created_by=actor_id,
+            )
+
+    put_task: asyncio.Task[None] | None = None
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await vault_files_repo.insert_attachment(
+                # Keep a key-share lock from immediately before the remote PUT
+                # through metadata finalization. Vault deletion takes the
+                # conflicting row lock before enumerating object keys, so it
+                # either sees this finalized attachment or wins before the PUT
+                # starts. This closes the delete/enumerate/late-PUT orphan race.
+                vault_exists = await conn.fetchval(
+                    "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
+                    vault_id,
+                )
+                if vault_exists is None:
+                    raise AKBError(
+                        "Vault was deleted while the image upload was starting",
+                        status_code=409,
+                    )
+                put_task = asyncio.create_task(
+                    asyncio.to_thread(s3_adapter.put_bytes, s3_key, body, actual_mime),
+                    name=f"document-image-put:{file_id}",
+                )
+                await asyncio.shield(put_task)
+                finalized = await vault_files_repo.finalize_attachment(
                     conn,
                     file_id=file_id,
                     vault_id=vault_id,
-                    name=safe_name,
                     s3_key=s3_key,
-                    mime_type=actual_mime,
-                    size_bytes=len(body),
-                    content_hash=digest,
-                    created_by=actor_id,
                 )
-    except Exception:
-        # The per-file key is unique, so immediate cleanup cannot delete a
-        # different row's bytes (unlike content-addressed shared keys).
+                if not finalized:
+                    raise RuntimeError("pending document image disappeared before finalization")
+    except BaseException:
+        # ``to_thread`` continues after request/task cancellation. Settle the
+        # actual PUT before enqueueing its key so deletion is ordered after the
+        # last possible object creation.
+        if put_task is not None:
+            await _settle_must_complete_task(put_task)
+        # A normal failure uses the same transactional outbox as every other
+        # object deletion. A hard process exit cannot run this block, but the
+        # already-committed pending row lets asset_gc_worker discover and delete
+        # that object after the bounded unclaimed TTL.
         try:
-            await asyncio.to_thread(s3_adapter.delete, s3_key)
-        except Exception:  # noqa: BLE001 — preserve the database failure
-            pass
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    row = await vault_files_repo.delete_unclaimed_attachment(
+                        conn,
+                        vault_id=vault_id,
+                        file_id=file_id,
+                        created_by=actor_id,
+                    )
+                    if row is not None:
+                        await enqueue_delete(conn, row["s3_key"])
+        except Exception as cleanup_error:  # noqa: BLE001 — preserve the upload failure
+            logger.warning(
+                "document image cleanup deferred to GC for %s: %s",
+                file_id,
+                cleanup_error,
+            )
         raise
 
     return {

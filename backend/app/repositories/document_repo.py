@@ -214,7 +214,14 @@ class DocumentRepository:
         async with self.pool.acquire() as conn:
             return await self.find_by_ref_with_conn(conn, vault_id, ref)
 
-    async def find_by_ref_with_conn(self, conn, vault_id: uuid.UUID, ref: str) -> dict | None:
+    async def find_by_ref_with_conn(
+        self,
+        conn,
+        vault_id: uuid.UUID,
+        ref: str,
+        *,
+        for_update: bool = False,
+    ) -> dict | None:
         """Find document using an existing connection (no pool acquire).
 
         Resolution order: an exact id/path match wins; only on a miss do we
@@ -222,6 +229,7 @@ class DocumentRepository:
         still resolves to the current document. Exact-first means a real
         document that now occupies a reused path always beats a stale redirect.
         """
+        lock_clause = "FOR UPDATE OF d" if for_update else ""
         row = await conn.fetchrow(
             f"""
             SELECT d.*, v.name as vault_name
@@ -229,6 +237,7 @@ class DocumentRepository:
             JOIN vaults v ON d.vault_id = v.id
             WHERE d.vault_id = $1
               AND {self._MATCH_WHERE}
+            {lock_clause}
             """,
             vault_id, ref,
         )
@@ -236,7 +245,7 @@ class DocumentRepository:
             return dict(row)
         # Alias fallback — old_ref → current resource_id (never path→path).
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT d.*, v.name as vault_name
             FROM resource_aliases a
             JOIN documents d ON d.id = a.resource_id
@@ -244,17 +253,27 @@ class DocumentRepository:
             WHERE a.vault_id = $1 AND a.resource_type = 'document' AND a.old_ref = $2
               AND d.vault_id = $1
             LIMIT 1
+            {lock_clause}
             """,
             vault_id, ref,
         )
         return dict(row) if row else None
 
-    async def find_by_path(self, vault_id: uuid.UUID, path: str, *, conn=None) -> dict | None:
-        sql = """
+    async def find_by_path(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        *,
+        conn=None,
+        for_update: bool = False,
+    ) -> dict | None:
+        lock_clause = "FOR UPDATE OF d" if for_update else ""
+        sql = f"""
             SELECT d.*, v.name as vault_name
             FROM documents d
             JOIN vaults v ON d.vault_id = v.id
             WHERE d.vault_id = $1 AND d.path = $2
+            {lock_clause}
         """
         if conn is not None:
             row = await conn.fetchrow(sql, vault_id, path)
@@ -426,6 +445,7 @@ class DocumentRepository:
             )
         # Imported here, not at module scope: publication_service imports the
         # document services at import time, so a top-level import cycles.
+        from app.services import asset_service
         from app.services.publication_service import delete_publications_by_doc_uri
         from app.services.uri_service import doc_uri
 
@@ -434,7 +454,8 @@ class DocumentRepository:
         # writers.
         locked = await conn.fetchrow(
             """
-            SELECT d.path AS path, v.name AS vault_name
+            SELECT d.path AS path, d.current_commit AS current_commit,
+                   v.name AS vault_name
               FROM documents d JOIN vaults v ON v.id = d.vault_id
              WHERE d.id = $1 AND d.vault_id = $2
              FOR UPDATE OF d
@@ -445,6 +466,18 @@ class DocumentRepository:
             # Already gone (or not this vault's): nothing to delete, and no
             # publication to clean up that a live document isn't backing.
             return False
+        # Current image refs use the same document-row lock as publication
+        # cleanup. Centralizing this here prevents a stale collection snapshot
+        # from retaining the wrong path/commit, and makes every ordinary
+        # document deletion preserve its last revision before the live-ref FK
+        # cascade runs.
+        await asset_service.retain_document_assets_for_delete(
+            conn,
+            document_id=doc_id,
+            vault_id=vault_id,
+            document_path=locked["path"],
+            commit_hash=locked.get("current_commit"),
+        )
         # The by-URI form, not the validating one: this URI was just built
         # from the row we hold locked, so there is no caller-supplied string
         # to guard against — and validating would reject a legitimate path

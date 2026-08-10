@@ -607,6 +607,9 @@ export interface MarkdownEditorProps {
   vault: string;
   /** Lets the owning form block save/navigation while an upload is in flight. */
   onUploadingChange?: (uploading: boolean) => void;
+  /** Keep uploaded assets for an in-flight document save to claim. The server
+   * GC remains the fallback when the save ultimately fails after navigation. */
+  preserveUploadsOnUnmount?: boolean;
 }
 
 export function MarkdownEditor({
@@ -621,18 +624,22 @@ export function MarkdownEditor({
   required,
   vault,
   onUploadingChange,
+  preserveUploadsOnUnmount = false,
 }: MarkdownEditorProps) {
   const [uploadingImage, setUploadingImage] = React.useState(false);
   const [uploadingName, setUploadingName] = React.useState("");
   const [uploadFailure, setUploadFailure] = React.useState<{
-    file: File;
+    files: File[];
     message: string;
+    retryable: boolean;
   } | null>(null);
   const uploadControllerRef = React.useRef<AbortController | null>(null);
   const uploadInFlightRef = React.useRef(false);
+  const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
+  const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
 
   const discardIfUnclaimed = React.useCallback(
     (url: string | undefined) => {
@@ -653,6 +660,10 @@ export function MarkdownEditor({
   }, [onUploadingChange]);
 
   React.useEffect(() => {
+    preserveUploadsOnUnmountRef.current = preserveUploadsOnUnmount;
+  }, [preserveUploadsOnUnmount]);
+
+  React.useEffect(() => {
     // React StrictMode replays effects in development; reset the guard on the
     // second setup so completed uploads can still update their local status.
     const unclaimedAssetIds = unclaimedAssetIdsRef.current;
@@ -660,10 +671,12 @@ export function MarkdownEditor({
     return () => {
       mountedRef.current = false;
       uploadControllerRef.current?.abort();
-      for (const assetId of unclaimedAssetIds) {
-        void discardAsset(vault, assetId)
-          .then(() => unclaimedAssetIds.delete(assetId))
-          .catch(() => undefined);
+      if (!preserveUploadsOnUnmountRef.current) {
+        for (const assetId of unclaimedAssetIds) {
+          void discardAsset(vault, assetId)
+            .then(() => unclaimedAssetIds.delete(assetId))
+            .catch(() => undefined);
+        }
       }
       onUploadingChangeRef.current?.(false);
     };
@@ -693,15 +706,23 @@ export function MarkdownEditor({
       for (const file of files) {
         const validationMessage = validateEditorImage(file);
         if (validationMessage) {
-          setUploadFailure({ file, message: validationMessage });
+          setUploadFailure({
+            // Validation is a preflight over the entire batch, so no earlier
+            // file has uploaded yet. Reject the batch explicitly instead of
+            // presenting a partial retry that silently omits valid files.
+            files: [],
+            message: `${file.name}: ${validationMessage} No images were uploaded.`,
+            retryable: false,
+          });
           return;
         }
       }
 
       const controller = new AbortController();
       const insertionRef = insertionRange ? editor.api.rangeRef(insertionRange) : null;
-      let currentFile = files[0];
+      let currentFileIndex = 0;
       let restoredInsertion = false;
+      let failed = false;
       uploadControllerRef.current = controller;
       uploadInFlightRef.current = true;
       setUploadFailure(null);
@@ -709,8 +730,8 @@ export function MarkdownEditor({
       onUploadingChangeRef.current?.(true);
 
       try {
-        for (const file of files) {
-          currentFile = file;
+        for (const [index, file] of files.entries()) {
+          currentFileIndex = index;
           setUploadingName(file.name);
           const asset = await uploadAsset(vault, file, controller.signal);
           const assetId = assetIdFromUrl(asset.url);
@@ -743,12 +764,24 @@ export function MarkdownEditor({
         const aborted =
           controller.signal.aborted ||
           (error instanceof DOMException && error.name === "AbortError");
+        failed = true;
         if (!aborted && mountedRef.current) {
           const message =
             error instanceof ApiError || error instanceof Error
               ? error.message
               : "The image could not be uploaded.";
-          setUploadFailure({ file: currentFile, message });
+          const deferred = deferredImageFilesRef.current.splice(0);
+          setUploadFailure({
+            files: [...files.slice(currentFileIndex), ...deferred],
+            message,
+            retryable: true,
+          });
+        } else if (mountedRef.current && deferredImageFilesRef.current.length > 0) {
+          setUploadFailure({
+            files: deferredImageFilesRef.current.splice(0),
+            message: "The current upload was cancelled before the next batch started.",
+            retryable: true,
+          });
         }
       } finally {
         insertionRef?.unref();
@@ -760,6 +793,13 @@ export function MarkdownEditor({
           setUploadingImage(false);
           setUploadingName("");
           onUploadingChangeRef.current?.(false);
+          if (!failed && deferredImageFilesRef.current.length > 0) {
+            setUploadFailure({
+              files: deferredImageFilesRef.current.splice(0),
+              message: "The previous image batch finished. Upload the next batch when ready.",
+              retryable: true,
+            });
+          }
         }
       }
     },
@@ -809,16 +849,32 @@ export function MarkdownEditor({
       {!uploadingImage && uploadFailure && (
         <Alert variant="destructive" title="Image upload failed" className="border-x border-t-0">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span>{uploadFailure.message}</span>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void uploadImages([uploadFailure.file])}
-            >
-              <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-              Retry
-            </Button>
+            <span>
+              {uploadFailure.message}
+              {uploadFailure.files.length > 1
+                ? ` ${uploadFailure.files.length} images remain in this batch.`
+                : ""}
+            </span>
+            {uploadFailure.retryable ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void uploadImages(uploadFailure.files)}
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                Retry
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setUploadFailure(null)}
+              >
+                Dismiss
+              </Button>
+            )}
           </div>
         </Alert>
       )}
@@ -833,7 +889,15 @@ export function MarkdownEditor({
           if (readOnly) return;
           const files = transferredImages(event.clipboardData);
           if (files.length === 0) return;
+          const carriesDocumentContent = ["text/plain", "text/html"].some(
+            (type) => event.clipboardData.getData(type).trim().length > 0,
+          );
+          if (carriesDocumentContent) return;
           event.preventDefault();
+          if (uploadInFlightRef.current) {
+            deferredImageFilesRef.current.push(...files);
+            return;
+          }
           void uploadImages(files);
         }}
         onDragOver={(event) => {
@@ -851,7 +915,16 @@ export function MarkdownEditor({
           if (readOnly) return;
           const files = transferredImages(event.dataTransfer);
           if (files.length === 0) return;
+          // Always consume an image-file drop once drag-over advertised copy.
+          // Letting the browser's default run here can navigate to/open the
+          // local file, which would discard the editor session. A concurrent
+          // batch is retained in the visible retry affordance instead.
           event.preventDefault();
+          event.stopPropagation();
+          if (uploadInFlightRef.current) {
+            deferredImageFilesRef.current.push(...files);
+            return;
+          }
           const dropRange = editor.api.findEventRange(event.nativeEvent) || editor.selection;
           void uploadImages(files, dropRange);
         }}

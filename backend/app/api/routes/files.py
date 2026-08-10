@@ -4,15 +4,14 @@ import asyncio
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
-from app.api.deps import get_current_user, require_delegated_actor
+from app.api.deps import get_current_user
+from app.api.file_write_context import (
+    resolve_file_write_context as _resolve_file_write_context,
+)
 from app.config import settings
 from app.exceptions import AKBError
 from app.models.file import BodyPlacementObservation
-from app.services.access_service import (
-    FILE_UPLOAD_WRITE_ACTION,
-    check_delegated_vault_writer,
-    check_vault_access,
-)
+from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.file_service import FileService
 from app.util.text import to_nfc
@@ -53,30 +52,6 @@ async def measurement_file_transfer(token: str, request: Request):
             return Response(status_code=200)
         data = await file_service.transfer_measurement_capability(token, method="GET")
         return Response(content=data or b"", media_type="application/octet-stream")
-
-
-async def _resolve_file_write_context(
-    request: Request,
-    vault: str,
-    user: AuthenticatedUser,
-) -> tuple[dict, str, dict[str, str] | None]:
-    access = await check_vault_access(
-        user.user_id,
-        vault,
-        required_role="writer",
-        write_action=FILE_UPLOAD_WRITE_ACTION,
-    )
-    actions = frozenset(access.get("write_grant_actions") or [])
-    if access.get("role_source") != "write_policy_grant" or "*" in actions:
-        return access, user.username, None
-
-    delegated_actor = await require_delegated_actor(request, user)
-    await check_delegated_vault_writer(delegated_actor.user.user_id, vault)
-    return access, delegated_actor.user.username, {
-        "delegated_user_id": delegated_actor.user.user_id,
-        "service_user_id": delegated_actor.service_user_id,
-        "service_token_id": delegated_actor.service_token_id,
-    }
 
 
 @router.post("/files/{vault}/upload", summary="Upload a file (presigned URL flow)")

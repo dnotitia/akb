@@ -47,6 +47,7 @@ const getRelationsMock = getRelations as unknown as ReturnType<typeof vi.fn>;
 const updateDocumentMock = updateDocument as unknown as ReturnType<typeof vi.fn>;
 
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
+const UPDATED_COMMIT = "fedcba987654321"; // pragma: allowlist secret — synthetic Git commit
 
 function makeDoc(overrides: Record<string, unknown> = {}) {
   // NB: the real GET /documents response exposes NO internal `id` — `uri`/
@@ -100,8 +101,8 @@ beforeEach(() => {
   getVaultInfoMock.mockResolvedValue({ role: "reader" });
   getRelationsMock.mockResolvedValue({ relations: [] });
   updateDocumentMock.mockResolvedValue({
-    current_commit: "fedcba987654321",
-    commit_hash: "fedcba987654321",
+    current_commit: UPDATED_COMMIT,
+    commit_hash: UPDATED_COMMIT,
   });
 
   // /activity is fetched directly via fetch() — stub it to a no-op.
@@ -218,8 +219,8 @@ describe("DocumentPage view toggle", () => {
     updateDocumentMock.mockImplementation(async () => {
       saved = true;
       return {
-        current_commit: "fedcba987654321",
-        commit_hash: "fedcba987654321",
+        current_commit: UPDATED_COMMIT,
+        commit_hash: UPDATED_COMMIT,
       };
     });
     getDocumentMock.mockImplementation(async () =>
@@ -227,7 +228,7 @@ describe("DocumentPage view toggle", () => {
         saved
           ? {
               content: "Updated from pinned HEAD",
-              current_commit: "fedcba987654321",
+              current_commit: UPDATED_COMMIT,
             }
           : {},
       ),
@@ -253,6 +254,13 @@ describe("DocumentPage view toggle", () => {
     await waitFor(() =>
       expect(screen.getByTestId("location-search")).toHaveTextContent(""),
     );
-    expect(await screen.findByText("Updated from pinned HEAD")).toBeInTheDocument();
+    // The optimistic document and the live-query document replace each other
+    // during the URL transition. Re-query the current DOM on each attempt so
+    // the assertion cannot retain a node detached by that handoff.
+    await waitFor(
+      () =>
+        expect(screen.getByText("Updated from pinned HEAD")).toBeInTheDocument(),
+      { timeout: 5_000 },
+    );
   });
 });

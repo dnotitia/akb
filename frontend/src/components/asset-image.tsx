@@ -5,7 +5,12 @@ import { assetIdFromUrl } from "@/lib/image-assets";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
 
 export type AssetContext =
-  | { mode: "authenticated"; vault: string }
+  | {
+      mode: "authenticated";
+      vault: string;
+      document?: string;
+      commit?: string;
+    }
   | { mode: "publication"; slug: string };
 
 function safeExternalImageUrl(src: string): string | null {
@@ -42,7 +47,15 @@ export function AssetImage({
   const assetId = assetIdFromUrl(src);
   const privateVault =
     assetContext?.mode === "authenticated" ? assetContext.vault : null;
-  const assetKey = assetId && privateVault ? `${privateVault}:${assetId}` : null;
+  const privateDocument =
+    assetContext?.mode === "authenticated" ? assetContext.document : undefined;
+  const privateCommit =
+    assetContext?.mode === "authenticated" ? assetContext.commit : undefined;
+  const publicationSlug =
+    assetContext?.mode === "publication" ? assetContext.slug : null;
+  const assetKey = assetId && privateVault
+    ? `${privateVault}:${privateDocument ?? "live"}:${privateCommit ?? "live"}:${assetId}`
+    : null;
   const [loadState, setLoadState] = useState<{
     key: string;
     blobUrl: string | null;
@@ -50,8 +63,8 @@ export function AssetImage({
   } | null>(null);
   const currentLoadState = loadState?.key === assetKey ? loadState : null;
   const renderKey = assetId
-    ? assetContext?.mode === "publication"
-      ? `publication:${assetContext.slug}:${assetId}`
+    ? publicationSlug
+      ? `publication:${publicationSlug}:${assetId}`
       : assetKey
     : src ?? null;
   const [imageErrorKey, setImageErrorKey] = useState<string | null>(null);
@@ -64,7 +77,14 @@ export function AssetImage({
     const controller = new AbortController();
     let objectUrl: string | null = null;
     setLoadState({ key: assetKey, blobUrl: null, failed: false });
-    getAssetBlob(assetId, privateVault, controller.signal)
+    getAssetBlob(
+      assetId,
+      privateVault,
+      controller.signal,
+      privateDocument && privateCommit
+        ? { document: privateDocument, commit: privateCommit }
+        : undefined,
+    )
       .then((blob) => {
         if (controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(blob);
@@ -80,20 +100,20 @@ export function AssetImage({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [assetId, assetKey, privateVault]);
+  }, [assetId, assetKey, privateCommit, privateDocument, privateVault]);
 
   const resolvedSrc = useMemo(() => {
     if (assetId) {
-      if (assetContext?.mode === "authenticated") {
+      if (privateVault) {
         return currentLoadState?.blobUrl ?? null;
       }
-      if (assetContext?.mode === "publication") {
-        return publicationAssetUrl(assetContext.slug, assetId);
+      if (publicationSlug) {
+        return publicationAssetUrl(publicationSlug, assetId);
       }
       return null;
     }
     return src ? safeExternalImageUrl(src) : null;
-  }, [assetContext, assetId, currentLoadState?.blobUrl, src]);
+  }, [assetId, currentLoadState?.blobUrl, privateVault, publicationSlug, src]);
 
   const frameClass = cn(
     "block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto",

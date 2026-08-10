@@ -248,6 +248,10 @@ export default function DocumentPage() {
       // tab-strip remount and the user never sees it.
       flushSync(() => {
         flashSaved();
+        // Let the editor's unmount cleanup run only after the server has
+        // atomically claimed referenced uploads. During the request this stays
+        // true so an unrelated SPA navigation cannot win the discard race.
+        setSavingBody(false);
       });
       const p = new URLSearchParams(searchParams);
       p.delete("view");
@@ -580,6 +584,7 @@ export default function DocumentPage() {
                   autoFocus
                   vault={name!}
                   onUploadingChange={setUploadingImage}
+                  preserveUploadsOnUnmount={savingBody}
                 />
               </Suspense>
               {bodyError && <Alert variant="destructive">{bodyError}</Alert>}

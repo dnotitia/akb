@@ -237,7 +237,10 @@ async def _apply_migrations() -> None:
         "058_publication_document_identity.py",  # publications.document_id + composite FK (document_id, vault_id) → documents(id, vault_id) ON DELETE CASCADE; conservative backfill
         "059_native_file_searchable_derived.py",  # chunks.source_type admits 'native_file' so text Files reach the chunk/index/embedding pipeline on the Document's Resource/Revision basis
         "060_document_image_assets.py",  # vault_files.kind separates hidden editor attachments from standalone Files
-        "061_document_image_asset_lifecycle.py",  # claimed attachments survive for historical Git revisions; only unclaimed uploads may be discarded
+        "061_document_image_asset_lifecycle.py",  # first-claim marker; 062 adds bounded live/revision reference lifecycle
+        "062_document_image_asset_references.py",  # live document refs + bounded Git-revision manifests for attachment ACL/GC
+        "063_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
+        "064_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
     ):
         if filename in applied:
             continue

@@ -29,6 +29,7 @@ import pytest
 import pytest_asyncio
 from starlette.requests import Request
 
+from app.api import file_write_context
 from app.exceptions import AKBError
 from app.repositories import vault_files_repo
 from app.repositories.vault_repo import VaultRepository
@@ -262,7 +263,11 @@ async def pool():
     # `events` (migration 015) and `s3_delete_outbox` (019) are not in
     # init.sql but are part of the confirm/cleanup contract. Idempotent.
     import importlib.util
-    for mig_name in ("015_events_outbox.py", "019_s3_delete_outbox.py"):
+    for mig_name in (
+        "015_events_outbox.py",
+        "019_s3_delete_outbox.py",
+        "064_vault_file_upload_state.py",
+    ):
         mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
         spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
         module = importlib.util.module_from_spec(spec)
@@ -317,6 +322,34 @@ async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
 
         assert second == first, "the second upload must adopt the first row"
         assert await _row_count(conn, vault_id) == 1
+
+
+async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):
+    """An older pod only sets hash_verified_at; the migration trigger keeps a
+    rolling deployment from leaving that successfully uploaded File hidden."""
+    file_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO vault_files (id, vault_id, name, s3_key)
+            VALUES ($1, $2, 'legacy.txt', $3)
+            """,
+            file_id,
+            vault_id,
+            f"legacy/{file_id}",
+        )
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
+
+        # This is the confirmation statement issued by pre-064 code.
+        await conn.execute(
+            "UPDATE vault_files SET hash_verified_at = NOW() WHERE id = $1",
+            file_id,
+        )
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "confirmed"
 
 
 async def test_different_bytes_same_name_is_two_rows(pool, vault_id):
@@ -446,12 +479,18 @@ async def test_confirm_certifies_bytes_that_match_the_key_they_are_under(
     key = _s3_key("v", "IS", "page.html", content_hash=_HASH_A)
     async with pool.acquire() as conn:
         file_id = await _put(conn, vault_id, key)
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
 
     result = await confirmable(vault_id, file_id, key, _BYTES_A)
 
     assert result["content_hash"] == _HASH_A
     async with pool.acquire() as conn:
         assert await _row_count(conn, vault_id) == 1
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "confirmed"
 
 
 async def test_confirm_rejects_bytes_stored_under_another_content_key(
@@ -519,7 +558,7 @@ async def test_upload_route_forwards_content_hash_and_defaults_it_off(monkeypatc
         seen.append(kwargs)
         return {"uri": "akb://team/file/f-1"}
 
-    monkeypatch.setattr(files, "check_vault_access", _access)
+    monkeypatch.setattr(file_write_context, "check_vault_access", _access)
     monkeypatch.setattr(files.file_service, "initiate_upload", _initiate)
 
     async def _call(**overrides):

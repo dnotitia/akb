@@ -1483,6 +1483,10 @@ Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
 
     "images": """# Inline Document Images
 
+Availability: `akb_put_image` and `akb_discard_image` are local-filesystem
+tools supplied by the `akb-mcp` stdio proxy version 2.2 or newer. Use this
+workflow only when those names are present in the client's tool list.
+
 Use `akb_put_image` when a local raster image should render inside an AKB
 Markdown document. This is different from `akb_put_file`: an inline image is a
 hidden, vault-owned document attachment and does not appear as a standalone
@@ -1528,6 +1532,9 @@ older Git revisions.
 
     "akb_put_image": """# akb_put_image — Upload an Inline Document Image
 
+Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+direct connection to the backend MCP endpoint.
+
 Reads a local PNG, JPEG, GIF, or WebP through the akb-mcp stdio proxy and
 uploads it to AKB's authenticated document-image endpoint. The backend verifies
 the actual bytes and returns a stable Markdown reference; no S3 URL is stored
@@ -1564,6 +1571,9 @@ akb_edit(uri="akb://eng/coll/specs/doc/auth.md",
 If the document write fails, pass `image.url` to `akb_discard_image`.""",
 
     "akb_discard_image": """# akb_discard_image — Clean Up an Uncommitted Image
+
+Availability: proxy-local in `akb-mcp` 2.2 or newer; it is not exposed by a
+direct connection to the backend MCP endpoint.
 
 Deletes a caller-owned image upload only when no document commit has claimed
 it. This is a failure-recovery tool, not a way to remove historical document

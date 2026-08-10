@@ -12,6 +12,7 @@ referencing `collections.id`. NULL == vault root. The legacy free-form
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 
 # The measurement File reads resolve the placement of the body a confirmed
@@ -68,9 +69,9 @@ async def insert_or_adopt(
     row = await conn.fetchrow(
         """
         INSERT INTO vault_files
-            (id, vault_id, collection_id, name, s3_key, mime_type,
-             size_bytes, description, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (id, vault_id, collection_id, kind, upload_state, name, s3_key,
+             mime_type, size_bytes, description, created_by)
+        VALUES ($1, $2, $3, 'file', 'pending', $4, $5, $6, $7, $8, $9)
         ON CONFLICT (vault_id, s3_key) DO UPDATE
             SET collection_id = EXCLUDED.collection_id
         RETURNING id
@@ -81,7 +82,7 @@ async def insert_or_adopt(
     return row["id"]
 
 
-async def insert_attachment(
+async def insert_pending_attachment(
     conn,
     *,
     file_id: uuid.UUID,
@@ -93,27 +94,51 @@ async def insert_attachment(
     content_hash: str,
     created_by: str,
 ) -> None:
-    """Publish a fully validated editor image as a hidden attachment.
+    """Record a validated editor image before its object-store PUT.
 
-    Attachment uploads are proxied through AKB, so the caller has already
-    supplied the complete immutable byte string by the time this row is
-    inserted.  There is intentionally no pending row and no collection:
-    document images survive document moves/collection deletion and remain
-    available to historical Git revisions until the owning vault is deleted.
+    The row remains unreadable while ``hash_verified_at`` is NULL. Persisting
+    it before the remote PUT gives the lifecycle worker an authoritative key to
+    collect if the process exits between S3 and finalization. There is no
+    collection: document images are authorized through explicit live/revision
+    reference tables.
     """
     await conn.execute(
         """
         INSERT INTO vault_files (
-            id, vault_id, collection_id, kind, name, s3_key, mime_type,
-            size_bytes, content_hash, hash_algorithm, hash_verified_at,
+            id, vault_id, collection_id, kind, upload_state, name, s3_key, mime_type,
+            size_bytes, content_hash, hash_algorithm,
             description, created_by
         )
-        VALUES ($1, $2, NULL, 'attachment', $3, $4, $5, $6, $7,
-                'sha256', NOW(), 'Document image', $8)
+        VALUES ($1, $2, NULL, 'attachment', 'pending', $3, $4, $5, $6, $7,
+                'sha256', 'Document image', $8)
         """,
         file_id, vault_id, name, s3_key, mime_type, size_bytes,
         content_hash, created_by,
     )
+
+
+async def finalize_attachment(
+    conn,
+    *,
+    file_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    s3_key: str,
+) -> bool:
+    """Make one pending attachment readable after its immutable PUT succeeds."""
+    row = await conn.fetchrow(
+        """
+        UPDATE vault_files
+           SET upload_state = 'confirmed', hash_verified_at = NOW(), updated_at = NOW()
+         WHERE id = $1
+           AND vault_id = $2
+           AND kind = 'attachment'
+           AND s3_key = $3
+           AND hash_verified_at IS NULL
+        RETURNING id
+        """,
+        file_id, vault_id, s3_key,
+    )
+    return row is not None
 
 
 async def insert_or_adopt_measurement_confirmed(
@@ -126,11 +151,12 @@ async def insert_or_adopt_measurement_confirmed(
     await conn.execute(
         """
         INSERT INTO vault_files (
-            id, vault_id, collection_id, name, s3_key, mime_type, size_bytes,
+            id, vault_id, collection_id, kind, upload_state,
+            name, s3_key, mime_type, size_bytes,
             content_hash, hash_algorithm, hash_verified_at, description, created_by,
             storage_driver, storage_locator, native_resource_id, native_revision_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'sha256', NOW(), $9, $10,
+        VALUES ($1, $2, $3, 'file', 'confirmed', $4, $5, $6, $7, $8, 'sha256', NOW(), $9, $10,
                 $11, $12, $13, $14)
         ON CONFLICT DO NOTHING
         """,
@@ -203,7 +229,7 @@ async def find_by_id(
                vf.name, vf.s3_key, vf.mime_type, vf.size_bytes,
                vf.description, vf.created_by, vf.created_at, vf.updated_at,
                vf.content_hash, vf.hash_algorithm, vf.etag,
-               vf.storage_version, vf.hash_verified_at
+               vf.storage_version, vf.hash_verified_at, vf.upload_state
           FROM vault_files vf
           LEFT JOIN collections c ON c.id = vf.collection_id
          WHERE vf.id = $1 AND vf.vault_id = $2
@@ -241,6 +267,63 @@ async def find_attachment_by_id(
     return dict(row) if row else None
 
 
+async def find_authorized_attachment(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    created_by: str,
+    document_path: str | None = None,
+    commit_prefix: str | None = None,
+) -> dict | None:
+    """Resolve one attachment only through an authorized reachability edge.
+
+    A reader may load an image that is referenced by a current document.  The
+    uploader may also preview an unclaimed upload before the first save.  A
+    historical read must provide the exact document path and a Git commit
+    prefix that is still present in the bounded revision manifest.  Keeping
+    every branch in this single vault-scoped query avoids an asset-existence
+    probe before authorization.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
+               vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
+               vf.hash_verified_at
+          FROM vault_files vf
+          JOIN vaults v ON v.id = vf.vault_id
+         WHERE vf.id = $1
+           AND vf.vault_id = $2
+           AND vf.kind = 'attachment'
+           AND vf.hash_verified_at IS NOT NULL
+           AND (
+                (vf.attachment_claimed_at IS NULL AND vf.created_by = $3)
+                OR EXISTS (
+                    SELECT 1
+                      FROM document_asset_refs live
+                     WHERE live.asset_id = vf.id
+                       AND live.vault_id = vf.vault_id
+                )
+                OR (
+                    $4::text IS NOT NULL
+                    AND $5::text IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM document_asset_revision_refs rev
+                         WHERE rev.asset_id = vf.id
+                           AND rev.vault_id = vf.vault_id
+                           AND rev.document_path = $4
+                           AND rev.commit_hash LIKE $5 || '%'
+                           AND rev.retain_until > NOW()
+                    )
+                )
+           )
+        """,
+        file_id, vault_id, created_by, document_path, commit_prefix,
+    )
+    return dict(row) if row else None
+
+
 async def claim_attachment_references(
     conn,
     vault_id: uuid.UUID,
@@ -250,11 +333,10 @@ async def claim_attachment_references(
 ) -> set[uuid.UUID]:
     """Lock and claim valid attachment ids from a document body.
 
-    In strict mode every id must be a confirmed attachment in ``vault_id``;
-    user document writes fail closed on missing or cross-vault references.
-    External mirrors use non-strict mode so an upstream broken link remains a
-    broken link instead of aborting the whole mirror, while valid local assets
-    still gain historical-revision retention.
+    In strict mode every id must be a confirmed attachment in ``vault_id``.
+    Document writers use non-strict mode so imports, expired drafts, and copied
+    Markdown preserve broken links without making them readable; valid local
+    assets still gain historical-revision retention.
     """
     if not file_ids:
         return set()
@@ -266,6 +348,7 @@ async def claim_attachment_references(
            AND id = ANY($2::uuid[])
            AND kind = 'attachment'
            AND hash_verified_at IS NOT NULL
+         ORDER BY id
          FOR UPDATE
         """,
         vault_id, list(file_ids),
@@ -286,6 +369,128 @@ async def claim_attachment_references(
     return found
 
 
+async def sync_document_asset_references(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    document_path: str,
+    commit_hash: str,
+    asset_ids: set[uuid.UUID],
+    retain_until: datetime,
+    previous_commit: str | None = None,
+    previous_path: str | None = None,
+) -> None:
+    """Replace live refs and record bounded manifests for adjacent commits.
+
+    The caller has already locked/validated ``asset_ids`` with
+    :func:`claim_attachment_references`.  Before replacing the live set, the
+    prior HEAD's refs are extended from *this* superseding write.  Thus an
+    image removed from a long-lived document still gets a complete retention
+    window instead of expiring immediately because its original commit is old.
+    """
+    if previous_commit:
+        await conn.execute(
+            """
+            INSERT INTO document_asset_revision_refs (
+                vault_id, document_path, commit_hash, asset_id, retain_until
+            )
+            SELECT live.vault_id, $3, $4, live.asset_id, $5
+              FROM document_asset_refs live
+             WHERE live.document_id = $1 AND live.vault_id = $2
+            ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
+            DO UPDATE SET retain_until = GREATEST(
+                document_asset_revision_refs.retain_until,
+                EXCLUDED.retain_until
+            )
+            """,
+            document_id, vault_id, previous_path or document_path,
+            previous_commit, retain_until,
+        )
+
+    await conn.execute(
+        """
+        DELETE FROM document_asset_refs
+         WHERE document_id = $1
+           AND vault_id = $2
+           AND NOT (asset_id = ANY($3::uuid[]))
+        """,
+        document_id, vault_id, list(asset_ids),
+    )
+    if asset_ids:
+        await conn.execute(
+            """
+            INSERT INTO document_asset_refs (document_id, vault_id, asset_id)
+            SELECT $1, $2, asset_id
+              FROM unnest($3::uuid[]) AS asset_id
+            ON CONFLICT (document_id, asset_id) DO NOTHING
+            """,
+            document_id, vault_id, list(asset_ids),
+        )
+        await conn.execute(
+            """
+            INSERT INTO document_asset_revision_refs (
+                vault_id, document_path, commit_hash, asset_id, retain_until
+            )
+            SELECT $1, $2, $3, asset_id, $5
+              FROM unnest($4::uuid[]) AS asset_id
+            ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
+            DO UPDATE SET retain_until = GREATEST(
+                document_asset_revision_refs.retain_until,
+                EXCLUDED.retain_until
+            )
+            """,
+            vault_id, document_path, commit_hash, list(asset_ids), retain_until,
+        )
+
+
+async def list_live_document_asset_ids(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+) -> set[uuid.UUID]:
+    rows = await conn.fetch(
+        """
+        SELECT asset_id
+          FROM document_asset_refs
+         WHERE document_id = $1 AND vault_id = $2
+        """,
+        document_id, vault_id,
+    )
+    return {row["asset_id"] for row in rows}
+
+
+async def retain_current_document_assets(
+    conn,
+    *,
+    document_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    document_path: str,
+    commit_hash: str | None,
+    retain_until: datetime,
+) -> None:
+    """Extend the current HEAD manifest before a document row is deleted."""
+    if not commit_hash:
+        return
+    await conn.execute(
+        """
+        INSERT INTO document_asset_revision_refs (
+            vault_id, document_path, commit_hash, asset_id, retain_until
+        )
+        SELECT live.vault_id, $3, $4, live.asset_id, $5
+          FROM document_asset_refs live
+         WHERE live.document_id = $1 AND live.vault_id = $2
+        ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
+        DO UPDATE SET retain_until = GREATEST(
+            document_asset_revision_refs.retain_until,
+            EXCLUDED.retain_until
+        )
+        """,
+        document_id, vault_id, document_path, commit_hash, retain_until,
+    )
+
+
 async def delete_unclaimed_attachment(
     conn,
     *,
@@ -300,7 +505,6 @@ async def delete_unclaimed_attachment(
          WHERE id = $1
            AND vault_id = $2
            AND kind = 'attachment'
-           AND hash_verified_at IS NOT NULL
            AND attachment_claimed_at IS NULL
            AND created_by = $3
         RETURNING id, s3_key
@@ -375,6 +579,7 @@ async def update_confirmed_metadata(
             hash_algorithm = $3,
             etag = $4,
             storage_version = $5,
+            upload_state = 'confirmed',
             hash_verified_at = NOW(),
             updated_at = NOW()
         WHERE id = $6
@@ -428,7 +633,8 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.kind = 'file' AND vf.collection_id IS NULL
+                 WHERE vf.vault_id = $1 AND vf.kind = 'file'
+                   AND vf.upload_state = 'confirmed' AND vf.collection_id IS NULL
                  ORDER BY vf.created_at DESC
                  LIMIT $2
                 """,
@@ -444,7 +650,8 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.kind = 'file' AND vf.collection_id = $2
+                 WHERE vf.vault_id = $1 AND vf.kind = 'file'
+                   AND vf.upload_state = 'confirmed' AND vf.collection_id = $2
                  ORDER BY vf.created_at DESC
                  LIMIT $3
                 """,
@@ -485,6 +692,7 @@ async def list_for_vault(
             "  FROM vault_files vf "
             "  LEFT JOIN collections c ON c.id = vf.collection_id "
             " WHERE vf.vault_id = $1 AND vf.kind = 'file'"
+            "   AND vf.upload_state = 'confirmed'"
             + prefix_clause
             + depth_clause
             + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}"
@@ -501,6 +709,7 @@ async def list_for_vault(
               FROM vault_files vf
               LEFT JOIN collections c ON c.id = vf.collection_id
              WHERE vf.vault_id = $1 AND vf.kind = 'file'
+               AND vf.upload_state = 'confirmed'
              ORDER BY vf.created_at DESC
              LIMIT $2
             """,

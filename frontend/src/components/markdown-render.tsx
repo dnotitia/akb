@@ -719,9 +719,32 @@ export function MarkdownRender({ markdown, className, assetContext }: MarkdownRe
     () => normalizeLatexDelimiters(body),
     [body],
   );
+  const authenticatedContext =
+    assetContext?.mode === "authenticated" ? assetContext : undefined;
+  const publicationContext =
+    assetContext?.mode === "publication" ? assetContext : undefined;
+  const assetMode = assetContext?.mode;
+  const assetVault = authenticatedContext?.vault;
+  const assetDocument = authenticatedContext?.document;
+  const assetCommit = authenticatedContext?.commit;
+  const publicationSlug = publicationContext?.slug;
+  const stableAssetContext = useMemo<AssetContext | undefined>(() => {
+    if (assetMode === "authenticated" && assetVault) {
+      return {
+        mode: "authenticated",
+        vault: assetVault,
+        document: assetDocument,
+        commit: assetCommit,
+      };
+    }
+    if (assetMode === "publication" && publicationSlug) {
+      return { mode: "publication", slug: publicationSlug };
+    }
+    return undefined;
+  }, [assetCommit, assetDocument, assetMode, assetVault, publicationSlug]);
   const components = useMemo(
-    () => buildComponents(body, assetContext),
-    [assetContext, body],
+    () => buildComponents(body, stableAssetContext),
+    [body, stableAssetContext],
   );
 
   return (

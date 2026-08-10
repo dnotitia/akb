@@ -70,7 +70,7 @@ const DOCUMENT_IMAGE_MIMES = new Set([
   "image/gif",
   "image/webp",
 ]);
-const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
+const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
 
 function parseAssetUrl(url) {
   if (typeof url !== "string") throw new Error("image url must be a string");
@@ -311,6 +311,11 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
 const PROXY_VERSION = "2.2.0";
+const PROXY_INSTRUCTIONS =
+  "This akb-mcp proxy provides local-file tools in addition to the AKB backend. " +
+  "For an inline document image, call akb_put_image and place its returned `markdown` " +
+  "with akb_put, akb_update, or a targeted akb_edit. If the document write fails, " +
+  "clean up the uncommitted upload with akb_discard_image.";
 
 // Fallback MCP protocol version echoed to the client when its `initialize`
 // request omits one. We otherwise echo the client's requested version.
@@ -458,6 +463,7 @@ export class AKBProxy {
         // degraded (backend-unreachable) tools/list is recovered.
         capabilities: { tools: { listChanged: true } },
         serverInfo: { name: "akb-mcp", version: PROXY_VERSION },
+        instructions: PROXY_INSTRUCTIONS,
       },
     };
   }

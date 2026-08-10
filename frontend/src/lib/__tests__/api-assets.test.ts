@@ -74,6 +74,27 @@ describe("editor image asset API", () => {
     });
   });
 
+  it("scopes a historical image read to its document revision", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      blob: vi.fn().mockResolvedValue(new Blob(["history"])),
+    } as unknown as Response);
+
+    await getAssetBlob(ASSET_ID, "team", undefined, {
+      document: "notes/weekly.md",
+      commit: "abcdef123456", // pragma: allowlist secret — synthetic Git commit
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/assets/${ASSET_ID}?vault=team&document=notes%2Fweekly.md&commit=abcdef123456`, // pragma: allowlist secret — synthetic Git commit
+      {
+        headers: { Authorization: "Bearer test-token" },
+        signal: undefined,
+      },
+    );
+  });
+
   it("discards an uncommitted upload through the vault-scoped endpoint", async () => {
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
 
@@ -93,7 +114,7 @@ describe("editor image asset API", () => {
     setViewGrant("public slug", "view grant");
 
     expect(publicationAssetUrl("public slug", ASSET_ID)).toBe(
-      `/api/v1/public/public%20slug/assets/${ASSET_ID}?token=password+token&grant=view+grant`,
+      `/api/v1/public/public%20slug/assets/${ASSET_ID}?grant=view+grant`,
     );
   });
 });
