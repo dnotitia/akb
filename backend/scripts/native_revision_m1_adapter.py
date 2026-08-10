@@ -442,7 +442,7 @@ async def workload_lifecycle(
     # recreate: C6 is the original resource's complete lifecycle, not the
     # distinct same-path resource that follows it.
     history_rows = await service.repository.list_history(resource_id=created.resource_id, limit=16)
-    activities = await service.repository.list_activity(namespace_id=namespace_id, limit=16)
+    activities = await service.repository.list_activity(namespace_id=namespace_id, surface="document", limit=16)
     recreate_key = mutation_id()
     requests.append(request_record("recreate", path=path, mutation_id=str(recreate_key)))
     recreated = await service.create_text(

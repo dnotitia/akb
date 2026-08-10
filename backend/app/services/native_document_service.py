@@ -37,7 +37,12 @@ from app.services.document_service import (
     newest_public_slug,
     validate_vault_name,
 )
-from app.services.native_revision_service import NativeRevisionService, NativeRevisionSnapshot
+from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.native_revision_service import (
+    Failpoint,
+    NativeRevisionService,
+    NativeRevisionSnapshot,
+)
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import doc_uri
@@ -65,10 +70,20 @@ class NativeRevisionUnsupportedSurfaceError(AKBError):
 class NativeDocumentService(DocumentService):
     """Document lifecycle adapter preserving existing request/response models."""
 
-    def __init__(self, *, pool: asyncpg.Pool | None = None):
+    def __init__(
+        self,
+        *,
+        pool: asyncpg.Pool | None = None,
+        failpoint: Failpoint | None = None,
+    ):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
         self._injected_pool = pool
+        # ``failpoint`` carries the native service's deterministic test-only
+        # hook down to the substrate this facade composes; production
+        # composition must leave it unset.  Left unset, ``_native`` builds
+        # exactly the service it built before this seam existed.
+        self._failpoint = failpoint
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -82,7 +97,30 @@ class NativeDocumentService(DocumentService):
         return vault_id
 
     async def _native(self) -> NativeRevisionService:
-        return NativeRevisionService(await self._pool())
+        """Compose the substrate on the frozen P1 searchable-body placement.
+
+        This method is the composition root for every Document written through
+        the public facade, so it is where P1 selects ``pg-bodystore-v1`` — the
+        same placement ``m1_native_text_file_bridge`` already injects for
+        native text Files. Documents and Files therefore land on one body
+        store instead of two.
+
+        The injection deliberately does **not** move into
+        ``NativeRevisionService``'s own default. The M1 measurement adapters
+        (``backend/scripts/native_revision_m1_adapter.py`` and its siblings)
+        construct ``NativeRevisionService(pool)`` directly and must keep
+        reproducing the historical ``m1-reference-payload-v1`` behaviour their
+        recorded runs were measured against; changing the default would
+        silently re-label every replay of an already-published measurement.
+
+        Historical Revisions keep the placement recorded in their immutable
+        manifest, so a namespace is mixed by design during the transition.
+        Readers dispatch on ``selected_placement`` rather than assuming one.
+        """
+        pool = await self._pool()
+        return NativeRevisionService(
+            pool, payload_store=M1PgBodyStore(pool), failpoint=self._failpoint
+        )
 
     @staticmethod
     async def _yield_after_head_race(race_count: int) -> None:

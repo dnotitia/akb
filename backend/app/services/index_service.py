@@ -27,15 +27,22 @@ logger = logging.getLogger("akb.index")
 # tuple (for runtime set-membership) and the Literal (for type checking).
 SOURCE_DOCUMENT: Literal["document"] = "document"
 SOURCE_NATIVE_DOCUMENT: Literal["native_document"] = "native_document"
+# Native text File body chunks. Distinct from SOURCE_FILE because a native
+# text File's Resource id IS the public `vault_files.id`: one discriminator
+# for both would make the legacy metadata chunk and the native body chunks
+# collide on a single (source_type, source_id) key, and each side's chunk
+# replacement would delete the other's rows.
+SOURCE_NATIVE_FILE: Literal["native_file"] = "native_file"
 SOURCE_TABLE: Literal["table"] = "table"
 SOURCE_FILE: Literal["file"] = "file"
 SOURCE_TYPES: tuple[str, ...] = (
     SOURCE_DOCUMENT,
     SOURCE_NATIVE_DOCUMENT,
+    SOURCE_NATIVE_FILE,
     SOURCE_TABLE,
     SOURCE_FILE,
 )
-SourceType = Literal["document", "native_document", "table", "file"]
+SourceType = Literal["document", "native_document", "native_file", "table", "file"]
 
 
 @dataclass
@@ -66,6 +73,7 @@ CHUNK_HEADER_KEYS: tuple[str, ...] = (
     "SUMMARY",
     "TAGS",
     "PATH",
+    "URI",
     "TYPE",
     "VAULT",
     "MIME",
@@ -195,6 +203,71 @@ def build_file_chunk(
     )
 
 
+def build_file_metadata_header(
+    *,
+    vault_name: str,
+    path: str,
+    uri: str,
+    size_bytes: int | None = None,
+) -> str:
+    """Top block prepended to every chunk of a *searchable text File*.
+
+    ``build_file_chunk`` above describes a file the pipeline cannot read into
+    (binary; filename + description + mime is all the signal there is). This
+    header instead rides along with the File's real body chunks, and so it
+    follows the File addressing convention rather than the Document one:
+    ``VAULT`` and ``PATH`` stay separate (``PATH`` is the vault-relative
+    ``collection/name``, never ``vault/path``), and the resource locator is the
+    canonical ``akb://…/file/<uuid>`` URI — a File is not addressable as
+    ``akb://…/doc/<path>``.
+    """
+    lines = [
+        f"TITLE: {path.rsplit('/', 1)[-1]}",
+        "TYPE: file",
+        f"VAULT: {vault_name}",
+        f"PATH: {path}",
+        f"URI: {uri}",
+    ]
+    if size_bytes is not None:
+        lines.append(f"SIZE: {size_bytes}")
+    return "\n".join(lines) + "\n\n"
+
+
+def chunk_text_body(content: str, metadata_header: str = "") -> list[Chunk]:
+    """Chunk unstructured text: size-bounded splits, no markdown structure.
+
+    ``chunk_markdown`` is wrong for an arbitrary text File. Its heading regex
+    matches any line starting with ``# ``, so a Python comment would be read as
+    a section boundary — and everything preceding the first "heading" is
+    dropped, because the markdown splitter only emits the spans it recognizes.
+    A text File's body is therefore treated as one unstructured region and
+    split *only* on size: no line is ever discarded for looking like a heading,
+    and `section_path` stays empty because there is no structure to claim.
+
+    Exactly what survives: every line of the body appears in some chunk, in
+    order. A body over the size budget is split at paragraph boundaries (with
+    `OVERLAP` characters carried into the next chunk) and each piece is
+    `strip()`ed, so inter-chunk whitespace at a split point is not preserved
+    verbatim — the same trade `_split_large_chunk` already makes for documents.
+
+    `metadata_header` rides on **every** chunk, not just the first, so a chunk
+    from deep inside a large file still carries its resource-level identifiers.
+    The body budget is reduced by the header length so the emitted chunk stays
+    within the same `MAX_CHUNK_SIZE` bound `chunk_markdown` respects.
+    """
+    if not metadata_header:
+        return _split_large_chunk("", content, 0)
+    # Floor the budget so a pathologically long header (a very deep path)
+    # cannot starve the body down to a per-character split. Past that floor the
+    # combined chunk may exceed MAX_CHUNK_SIZE; a degenerate header is the
+    # lesser problem to have.
+    budget = max(MAX_CHUNK_SIZE // 2, MAX_CHUNK_SIZE - len(metadata_header))
+    chunks = _split_large_chunk("", content, 0, limit=budget)
+    for chunk in chunks:
+        chunk.content = metadata_header + chunk.content
+    return chunks
+
+
 def chunk_markdown(content: str, metadata_header: str = "") -> list[Chunk]:
     """Split markdown into chunks based on headings.
 
@@ -275,11 +348,20 @@ def _hard_split_by_chars(text: str, limit: int, overlap: int) -> list[str]:
     return pieces
 
 
-def _split_large_chunk(section_path: str, content: str, char_offset: int) -> list[Chunk]:
-    """Split content exceeding MAX_CHUNK_SIZE at paragraph boundaries,
+def _split_large_chunk(
+    section_path: str,
+    content: str,
+    char_offset: int,
+    limit: int = MAX_CHUNK_SIZE,
+) -> list[Chunk]:
+    """Split content exceeding `limit` at paragraph boundaries,
     falling back to char-level splits for any single paragraph that is
-    itself larger than the limit."""
-    if len(content) <= MAX_CHUNK_SIZE:
+    itself larger than the limit.
+
+    `limit` defaults to MAX_CHUNK_SIZE. Callers that prepend a per-chunk
+    header AFTER splitting (see `chunk_text_body`) pass the reduced budget so
+    the assembled chunk still fits the same bound."""
+    if len(content) <= limit:
         return [
             Chunk(
                 section_path=section_path,
@@ -292,19 +374,19 @@ def _split_large_chunk(section_path: str, content: str, char_offset: int) -> lis
 
     # Pre-split any paragraph larger than the limit into char-bounded
     # pieces so the assembly loop below never has to swallow a single
-    # piece bigger than MAX_CHUNK_SIZE. Without this, a paragraph with
+    # piece bigger than `limit`. Without this, a paragraph with
     # no `\n\n` boundary inside it would be appended whole, producing
     # chunks that exceed the embedding model's context.
     paragraphs: list[str] = []
     for raw in content.split("\n\n"):
-        paragraphs.extend(_hard_split_by_chars(raw, MAX_CHUNK_SIZE, OVERLAP))
+        paragraphs.extend(_hard_split_by_chars(raw, limit, OVERLAP))
 
     chunks: list[Chunk] = []
     current = ""
     current_start = char_offset
 
     for para in paragraphs:
-        if len(current) + len(para) + 2 > MAX_CHUNK_SIZE and current:
+        if len(current) + len(para) + 2 > limit and current:
             chunks.append(
                 Chunk(
                     section_path=section_path,
@@ -516,11 +598,14 @@ async def delete_file_chunks(conn, file_id: str) -> None:
 
 
 async def delete_vault_chunks(conn, vault_id) -> None:
-    """Remove legacy and native document chunks, queuing vector deletes.
+    """Remove legacy and native chunks, queuing vector deletes.
 
-    Tables/files have their own vault-delete cleanup hooks.  Native document
-    chunks otherwise disappear through ``chunks.vault_id`` CASCADE without
-    an outbox row, leaking their derived vector points.
+    Legacy tables/files have their own vault-delete cleanup hooks, keyed by the
+    registry rows read before the cascade.  Native document *and* native text
+    File chunks otherwise disappear through ``chunks.vault_id`` CASCADE without
+    an outbox row, leaking their derived vector points — the legacy file hook
+    does not cover them, because it enqueues the ``file`` discriminator and
+    native File body chunks carry ``native_file``.
     """
     # The outbox INSERT must commit atomically with the chunk DELETE
     # below; failing the enqueue silently leaks vector-store rows.
@@ -550,18 +635,20 @@ async def delete_vault_chunks(conn, vault_id) -> None:
             (chunk_id, source_type, source_id, next_attempt_at)
         SELECT c.id, c.source_type, c.source_id, NOW()
           FROM chunks c
-         WHERE c.source_type = 'native_document'
+         WHERE c.source_type = ANY($2)
            AND c.vault_id = $1
         """,
         vault_id,
+        [SOURCE_NATIVE_DOCUMENT, SOURCE_NATIVE_FILE],
     )
     await conn.execute(
         """
         DELETE FROM chunks
-         WHERE source_type = 'native_document'
+         WHERE source_type = ANY($2)
            AND vault_id = $1
         """,
         vault_id,
+        [SOURCE_NATIVE_DOCUMENT, SOURCE_NATIVE_FILE],
     )
 
 

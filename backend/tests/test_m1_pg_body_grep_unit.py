@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import threading
 import time
 import uuid
@@ -166,6 +167,7 @@ async def test_bounded_regex_worker_preserves_exact_match_receipt(monkeypatch):
         "title": "main.py",
         "revision": body.revision_id,
         "content_hash": body.digest,
+        "payload_placement": M1PgBodyStore.selected_placement,
         "matches": [
             {"line": 1, "text": "Needful"},
             {"line": 2, "text": "needle"},
@@ -750,6 +752,117 @@ async def test_regex_worker_rejects_serialized_output_over_hard_cap(monkeypatch)
         await service.grep(
             "needle", user_id=uuid.uuid4(), regex=True, include_text_files=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_grep_items_report_each_head_placement_without_any_locator(monkeypatch):
+    """Placement is observable per resource; addresses never are."""
+    unified = HeadBody(
+        namespace_id=uuid.uuid4(),
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="document",
+        path="notes/unified.md",
+        revision_id="a" * 40,
+        digest="b" * 64,
+        byte_size=len(b"needle unified\n"),
+        canonical_bytes=b"needle unified\n",
+        selected_placement=M1PgBodyStore.selected_placement,
+    )
+    historical = HeadBody(
+        namespace_id=unified.namespace_id,
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="document",
+        path="notes/historical.md",
+        revision_id="c" * 40,
+        digest="d" * 64,
+        byte_size=len(b"needle historical\n"),
+        canonical_bytes=b"needle historical\n",
+        selected_placement=M1ReferencePayloadStore.selected_placement,
+    )
+    text_file = HeadBody(
+        namespace_id=unified.namespace_id,
+        vault="measure",
+        resource_id=uuid.uuid4(),
+        surface="file",
+        path="src/main.py",
+        revision_id="e" * 40,
+        digest="f" * 64,
+        byte_size=len(b"needle file\n"),
+        canonical_bytes=b"needle file\n",
+        selected_placement=M1PgBodyStore.selected_placement,
+    )
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+
+    async def head_bodies(**_kwargs):
+        return [unified, historical, text_file]
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    internal = await service.grep(
+        "needle", user_id=uuid.uuid4(), include_text_files=True,
+    )
+    public = M1NativeGrepService._public_response(
+        pattern="needle", regex=False, native=internal,
+    )
+
+    assert [row["payload_placement"] for row in internal["results"]] == [
+        M1PgBodyStore.selected_placement,
+        M1ReferencePayloadStore.selected_placement,
+        M1PgBodyStore.selected_placement,
+    ]
+    assert [row["payload_placement"] for row in public["results"]] == [
+        M1PgBodyStore.selected_placement,
+        M1ReferencePayloadStore.selected_placement,
+        M1PgBodyStore.selected_placement,
+    ]
+    forbidden = {"payload_id", "private_locator", "payload_manifest_id", "namespace_id"}
+    for row in internal["results"] + public["results"]:
+        assert forbidden.isdisjoint(row)
+
+
+@pytest.mark.asyncio
+async def test_namespace_placement_totals_group_without_ids_or_digest_values():
+    class _AggregateConn:
+        def __init__(self):
+            self.sql = ""
+            self.params = ()
+
+        async def fetch(self, sql, *params):
+            self.sql = sql
+            self.params = params
+            return [
+                {
+                    "selected_placement": M1ReferencePayloadStore.selected_placement,
+                    "bodies": 2,
+                    "body_bytes": 30,
+                    "distinct_digests": 1,
+                },
+                {
+                    "selected_placement": M1PgBodyStore.selected_placement,
+                    "bodies": 3,
+                    "body_bytes": 44,
+                    "distinct_digests": 3,
+                },
+            ]
+
+    conn = _AggregateConn()
+    namespace_id = uuid.uuid4()
+
+    totals = await M1PgBodyStore(_Pool(conn)).namespace_placement_totals(namespace_id)
+
+    assert [(row.selected_placement, row.bodies, row.body_bytes, row.distinct_digests) for row in totals] == [
+        (M1ReferencePayloadStore.selected_placement, 2, 30, 1),
+        (M1PgBodyStore.selected_placement, 3, 44, 3),
+    ]
+    assert conn.params == (namespace_id,)
+    assert "GROUP BY selected_placement" in conn.sql
+    # The projection must stay an aggregate: no addresses, no bodies, and the
+    # digest column only ever reduced to a cardinality.
+    for forbidden in ("payload_id", "private_locator", "canonical_bytes", "prepared_at"):
+        assert forbidden not in conn.sql
+    assert re.findall(r"\bdigest\b", conn.sql) == ["digest"]
+    assert "COUNT(DISTINCT digest)" in conn.sql
 
 
 def test_regex_worker_rejects_when_process_slots_are_exhausted(monkeypatch):

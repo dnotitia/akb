@@ -1,10 +1,23 @@
-"""Measurement-only consumer for native searchable-document derived state.
+"""Measurement-only consumer for native searchable derived state.
 
 The worker consumes durable native invalidation intents, but it never trusts an
 intent as read authority: immediately before replacing chunks it locks and
 rechecks the native Resource Head.  Chunks and their Revision mapping commit in
 one PostgreSQL transaction; vector upsert/delete continues through AKB's
 existing embed and delete workers.
+
+Both admitted surfaces take this path.  Text Files used to be closed on an
+explicit ``direct_grep`` delivery that produced nothing — a measurement
+bookkeeping device that kept W3b from sitting permanently pending, and which
+had the consequence that a text File could be grepped but never embedded (the
+embed pipeline consumes ``chunks``, and File Revisions produced no chunks).
+The frozen P0 specification requires searchable *and embeddable* text Files,
+entering the chunk/index/embedding boundary "on the same Resource/Revision
+basis as Documents", so the surfaces differ only in how a body is chunked and
+which discriminator the derived rows carry.
+
+Derived output is still never a Head and never an exact-grep oracle:
+``M1NativeGrepService`` reads verified Head bytes and never touches ``chunks``.
 """
 
 from __future__ import annotations
@@ -20,14 +33,44 @@ import asyncpg
 from app.services import delete_worker
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.document_service import _parse_markdown
-from app.services.index_service import Chunk, build_doc_metadata_header, chunk_markdown
+from app.services.index_service import (
+    Chunk,
+    build_doc_metadata_header,
+    build_file_metadata_header,
+    chunk_markdown,
+    chunk_text_body,
+)
 from app.services.native_payload_verification import verify_native_head_body
+from app.services.uri_service import file_uri
 
 logger = logging.getLogger("akb.native_derived_worker")
 
 NATIVE_DOCUMENT_SOURCE = "native_document"
+NATIVE_FILE_SOURCE = "native_file"
+# One delivery name for both surfaces: `selected_delivery` records the delivery
+# *mechanism*, and after parity there is literally one — the same code path,
+# the same `chunks` + `native_derived_chunks` + `native_derived_heads` rows,
+# the same invalidation contract. The surface is not delivery identity; it
+# stays recoverable by joining `native_resources`.
 SELECTED_DELIVERY = "native-searchable-derived-v1"
+# Historical only. Text File intents closed under this delivery before the
+# document-parity path existed. Nothing produces it now; it stays defined (and
+# `pending_stats` keeps counting it) so pre-parity rows can still be read and
+# reported instead of being rewritten out of the ledger.
 DIRECT_GREP_DELIVERY = "native-direct-pg-grep-v1"
+
+_SOURCE_TYPE_BY_SURFACE = {
+    "document": NATIVE_DOCUMENT_SOURCE,
+    "file": NATIVE_FILE_SOURCE,
+}
+
+
+def source_type_for_surface(surface: str) -> str:
+    """Map an admitted native surface to its derived chunk discriminator."""
+    try:
+        return _SOURCE_TYPE_BY_SURFACE[surface]
+    except KeyError:
+        raise ValueError(f"unsupported native derived surface: {surface}") from None
 
 
 def build_native_document_chunks(
@@ -51,6 +94,31 @@ def build_native_document_chunks(
         doc_type=metadata.get("type") or "note",
     )
     return chunk_markdown(body, metadata_header=header)
+
+
+def build_native_file_chunks(
+    *,
+    vault_name: str,
+    path: str,
+    resource_id: uuid.UUID,
+    canonical_text: str,
+) -> list[Chunk]:
+    """Build the real AKB chunk representation from one verified File body.
+
+    A text File has no frontmatter to strip and no markdown structure to trust,
+    so the whole verified body is chunked on size alone. The header carries
+    File addressing (``akb://…/file/<uuid>``), not a Document path.
+    """
+    if not canonical_text.strip():
+        return []
+    collection = path.rsplit("/", 1)[0] if "/" in path else None
+    header = build_file_metadata_header(
+        vault_name=vault_name,
+        path=path,
+        uri=file_uri(vault_name, str(resource_id), collection=collection),
+        size_bytes=len(canonical_text.encode("utf-8")),
+    )
+    return chunk_text_body(canonical_text, metadata_header=header)
 
 
 class NativeDerivedWorker:
@@ -80,15 +148,12 @@ class NativeDerivedWorker:
                     UPDATE native_invalidation_intents i
                        SET completed_at = NOW(),
                            delivery_outcome = 'superseded',
-                           selected_delivery = CASE
-                               WHEN r.surface = 'file' THEN $2 ELSE $1
-                           END,
+                           selected_delivery = $1,
                            last_error = NULL
                       FROM ranked r
                      WHERE i.intent_id = r.intent_id AND r.position > 1
                     """,
                     SELECTED_DELIVERY,
-                    DIRECT_GREP_DELIVERY,
                 )
                 row = await conn.fetchrow(
                     """
@@ -113,15 +178,11 @@ class NativeDerivedWorker:
                     UPDATE native_invalidation_intents
                        SET claimed_at = NOW(),
                            next_attempt_at = NOW() + INTERVAL '10 minutes',
-                           selected_delivery = CASE
-                               WHEN $3 = 'file' THEN $4 ELSE $2
-                           END
+                           selected_delivery = $2
                      WHERE intent_id = $1
                     """,
                     row["intent_id"],
                     SELECTED_DELIVERY,
-                    row["surface"],
-                    DIRECT_GREP_DELIVERY,
                 )
                 return dict(row)
 
@@ -202,15 +263,19 @@ class NativeDerivedWorker:
             )
         return dict(row) if row is not None else None
 
-    async def _drop_chunks(self, conn, resource_id: uuid.UUID) -> None:
+    async def _drop_chunks(self, conn, resource_id: uuid.UUID, source_type: str) -> None:
+        # Outbox first, in the caller's transaction: the chunk ids must reach
+        # `vector_delete_outbox` before `chunks` forgets them, or the derived
+        # vector points outlive the Revision that produced them. Identical for
+        # both surfaces — only the discriminator differs.
         await delete_worker.enqueue_source_deletes(
-            NATIVE_DOCUMENT_SOURCE,
+            source_type,
             str(resource_id),
             conn=conn,
         )
         await conn.execute(
             "DELETE FROM chunks WHERE source_type = $1 AND source_id = $2",
-            NATIVE_DOCUMENT_SOURCE,
+            source_type,
             resource_id,
         )
 
@@ -243,7 +308,11 @@ class NativeDerivedWorker:
                         intent["intent_id"],
                     )
                     return
-                await self._drop_chunks(conn, intent["resource_id"])
+                await self._drop_chunks(
+                    conn,
+                    intent["resource_id"],
+                    source_type_for_surface(intent["surface"]),
+                )
                 await conn.execute(
                     "DELETE FROM native_derived_heads WHERE resource_id = $1",
                     intent["resource_id"],
@@ -259,16 +328,25 @@ class NativeDerivedWorker:
                 )
 
     async def _apply_live(self, intent: dict, head: dict) -> int:
+        source_type = source_type_for_surface(intent["surface"])
+
         def prepare() -> tuple[str, list[Chunk]]:
             canonical = verify_native_head_body(head)
-            return (
-                hashlib.sha256(canonical).hexdigest(),
-                build_native_document_chunks(
+            canonical_text = canonical.decode("utf-8", errors="strict")
+            if intent["surface"] == "file":
+                chunks = build_native_file_chunks(
                     vault_name=head["vault_name"],
                     path=head["current_path"],
-                    canonical_text=canonical.decode("utf-8", errors="strict"),
-                ),
-            )
+                    resource_id=head["resource_id"],
+                    canonical_text=canonical_text,
+                )
+            else:
+                chunks = build_native_document_chunks(
+                    vault_name=head["vault_name"],
+                    path=head["current_path"],
+                    canonical_text=canonical_text,
+                )
+            return hashlib.sha256(canonical).hexdigest(), chunks
 
         digest, chunks = await asyncio.to_thread(
             prepare,
@@ -298,7 +376,7 @@ class NativeDerivedWorker:
                         intent["intent_id"],
                     )
                     return 0
-                await self._drop_chunks(conn, intent["resource_id"])
+                await self._drop_chunks(conn, intent["resource_id"], source_type)
                 await conn.execute(
                     """
                     INSERT INTO native_derived_heads (
@@ -332,7 +410,7 @@ class NativeDerivedWorker:
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         """,
                         chunk_id,
-                        NATIVE_DOCUMENT_SOURCE,
+                        source_type,
                         intent["resource_id"],
                         intent["namespace_id"],
                         chunk.section_path,
@@ -373,17 +451,6 @@ class NativeDerivedWorker:
             if head is None or head["head_revision_id"] != intent["revision_id"]:
                 await self._complete(intent["intent_id"], "superseded")
                 return 1
-            if intent["surface"] == "file":
-                # Searchable text Files are read directly from the verified
-                # current Head by M1NativeGrepService; no chunk/vector copy is
-                # created. Closing the intent records that explicit delivery
-                # choice instead of leaving W3b permanently pending.
-                await self._complete(
-                    intent["intent_id"],
-                    "direct_grep",
-                    selected_delivery=DIRECT_GREP_DELIVERY,
-                )
-                return 1
             if head["lifecycle"] == "deleted":
                 await self._apply_delete(intent)
             else:
@@ -407,6 +474,9 @@ class NativeDerivedWorker:
                        COUNT(*) FILTER (WHERE delivery_outcome = 'applied')::int AS applied,
                        COUNT(*) FILTER (WHERE delivery_outcome = 'superseded')::int AS superseded,
                        COUNT(*) FILTER (WHERE delivery_outcome = 'deleted')::int AS deleted,
+                       -- Pre-parity rows only; nothing produces 'direct_grep'
+                       -- since text Files took the document-parity path. The
+                       -- counter stays so history is reported, not rewritten.
                        COUNT(*) FILTER (WHERE delivery_outcome = 'direct_grep')::int AS direct_grep,
                        COUNT(*) FILTER (WHERE delivery_outcome = 'abandoned')::int AS abandoned,
                        COUNT(*) FILTER (

@@ -20,7 +20,14 @@ import pytest
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.native_revision_repo import NativeRevisionRepository
-from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_file_measurement import (
+    NativeTextDeleteRequest,
+    NativeTextPublishRequest,
+)
+from app.services.m1_native_grep_service import M1NativeGrepService
+from app.services.m1_native_text_file_bridge import _delete as _bridge_delete
+from app.services.m1_native_text_file_bridge import _publish as _bridge_publish
+from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_document_service import (
     NativeDocumentService,
@@ -28,7 +35,10 @@ from app.services.native_document_service import (
 )
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_revision_backend import NativeRevisionBackend
-from app.services.native_revision_service import NativeRevisionService
+from app.services.native_revision_service import (
+    FAILPOINT_BOUNDARIES,
+    NativeRevisionService,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -43,6 +53,9 @@ _INDEXABLE_MIGRATIONS = (
 _BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_pg_body.py"
 _PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "057_native_revision_m1_payload_placement.py"
 _DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "054_native_revision_searchable_derived.py"
+_FILE_DERIVED_MIGRATION = (
+    _BACKEND / "app" / "db" / "migrations" / "059_native_file_searchable_derived.py"
+)
 _WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -79,7 +92,16 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
     admin = await asyncpg.connect(_DSN)
-    name = f"akb_native_{uuid.uuid4().hex[:12]}"
+    # The disposable database must carry the measurement prefix. Migration 057
+    # self-disables on any other name, so a fixture called `akb_native_*`
+    # silently kept migration 053's one-placement-per-namespace trigger — a
+    # schema no native write can ever actually meet, because `app/config.py`
+    # and `revision_backend._assert_native_measurement_safety()` refuse the
+    # native arm unless `db_name` is exactly `akb_revision_m1_measurement`.
+    # Naming the fixture this way makes it the same 048+053+057 schema the
+    # only legal native-write deployment has, which is what P1's deliberately
+    # mixed-placement namespaces need.
+    name = f"akb_revision_m1_measurement_bcore_{uuid.uuid4().hex[:12]}"
     await admin.execute(f'CREATE DATABASE "{name}"')
     dsn = _database_dsn(name)
     conn = await asyncpg.connect(dsn)
@@ -96,6 +118,7 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
                 await _load_migration(path).migrate(conn=conn)
             await _load_migration(_WRITE_POLICY_MIGRATION).migrate(conn=conn)
             await _load_migration(_DERIVED_MIGRATION).migrate(conn=conn)
+            await _load_migration(_FILE_DERIVED_MIGRATION).migrate(conn=conn)
         await conn.close()
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size)
         async with pool.acquire() as seeded:
@@ -828,6 +851,132 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
             ):
                 assert await conn.fetchval(f"SELECT COUNT(*) FROM {table} WHERE {where} = $1", vault_id) == 0
         assert created.path == "notes/native.md"
+
+
+async def test_public_delete_tombstones_native_text_file_derived_chunks(
+    monkeypatch,
+    tmp_path,
+):
+    """A vault delete must reach native File body chunks too.
+
+    ``access_service.delete_vault``'s per-file hook enqueues the legacy
+    ``file`` discriminator, which native File body chunks do not carry, and the
+    ``chunks.vault_id`` CASCADE takes rows out of PostgreSQL without writing to
+    ``vector_delete_outbox``.  ``index_service.delete_vault_chunks`` is the only
+    thing standing between that and orphaned vector points.
+    """
+    async with _fresh_database(with_derived=True) as (pool, _):
+        from app.config import settings
+        from app.db import postgres as postgres
+        from app.services import access_service, native_document_service as native_documents
+
+        class _RoleSync:
+            def __init__(self) -> None:
+                self.deleted: list[uuid.UUID] = []
+
+            async def on_vault_create_in_conn(self, conn, vault_id, owner_id) -> None:
+                pass
+
+            async def on_public_access_change_in_conn(self, conn, vault_id, access) -> None:
+                pass
+
+            async def on_vault_delete(self, vault_id) -> None:
+                self.deleted.append(vault_id)
+
+        role_sync = _RoleSync()
+        monkeypatch.setattr(postgres, "_pool", pool)
+        monkeypatch.setattr(native_documents, "get_role_sync", lambda: role_sync)
+        monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
+        monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+        monkeypatch.setattr(settings, "s3_endpoint_url", "")
+        owner_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
+                owner_id,
+                f"owner-{owner_id.hex}",
+                f"{owner_id.hex}@example.test",
+                "test",
+            )
+
+        documents = NativeDocumentService(pool=pool)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+
+        async def _native() -> NativeRevisionService:
+            return native
+
+        documents._native = _native  # type: ignore[method-assign]
+        vault_name = f"native-file-delete-{uuid.uuid4().hex}"
+        vault_id = uuid.UUID(await documents.create_vault(vault_name, owner_id=str(owner_id)))
+        created = await native.create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="src/main.py",
+            payload="vault delete regression file body\n",
+            actor=str(owner_id),
+            mutation_id=uuid.uuid4(),
+        )
+        # The public File row the native bridge adopts shares the Resource id,
+        # so the legacy per-file hook really does run for this file — and still
+        # never sees the native body chunks.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vault_files (id, vault_id, name, s3_key) VALUES ($1, $2, $3, $4)",
+                created.resource_id,
+                vault_id,
+                "main.py",
+                f"{vault_name}/src/main.py",
+            )
+        assert await NativeDerivedWorker(pool).process_once() == 1
+
+        async with pool.acquire() as conn:
+            native_file_chunk_ids = {
+                row["id"]
+                for row in await conn.fetch(
+                    "SELECT id FROM chunks WHERE vault_id = $1 AND source_type = 'native_file'",
+                    vault_id,
+                )
+            }
+            assert native_file_chunk_ids
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM native_derived_heads WHERE namespace_id = $1", vault_id
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM vector_delete_outbox"
+            ) == 0
+
+        assert await access_service.delete_vault(str(owner_id), vault_name) == {
+            "deleted": True,
+            "vault": vault_name,
+        }
+        assert role_sync.deleted == [vault_id]
+
+        async with pool.acquire() as conn:
+            queued = {
+                row["chunk_id"]
+                for row in await conn.fetch(
+                    "SELECT chunk_id FROM vector_delete_outbox WHERE source_type = 'native_file'"
+                )
+            }
+            assert queued == native_file_chunk_ids
+            # Nothing leaks out through the CASCADE unaccounted for: every
+            # chunk that existed is now both gone from PG and queued.
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE vault_id = $1", vault_id
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM vector_delete_outbox"
+            ) == len(native_file_chunk_ids)
+            for table, where in (
+                ("vaults", "id"),
+                ("vault_files", "vault_id"),
+                ("native_resources", "namespace_id"),
+                ("native_derived_heads", "namespace_id"),
+                ("native_derived_chunks", "namespace_id"),
+            ):
+                assert await conn.fetchval(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where} = $1", vault_id
+                ) == 0
 
 
 async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(monkeypatch):
@@ -2000,6 +2149,130 @@ async def test_committed_response_lost_retry_returns_same_revision_once():
             await service.create_text(**changed)
 
 
+async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries():
+    """C5 must be injectable through the Document facade, not only under it.
+
+    The facade builds its own ``NativeRevisionService`` per call, so before
+    the constructor seam existed a C5 case had to overwrite the private
+    ``_native`` coroutine to reach a boundary.  Assert the exact dispatch
+    order for both mutations so a boundary that stops firing is a failure
+    rather than a silently shorter list.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        seen: list[str] = []
+
+        async def record(name: str) -> None:
+            seen.append(name)
+
+        documents = NativeDocumentService(pool=pool, failpoint=record)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="seam",
+                title="Seam",
+                content="created",
+            ),
+            agent_id="seam",
+        )
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+            "authority.after_resource",
+            "authority.after_manifest",
+            "authority.after_revision",
+            "authority.after_head",
+            "authority.after_path",
+            "authority.after_alias",
+            "authority.after_activity",
+            "authority.after_invalidation",
+            "authority.before_commit",
+            "authority.after_commit_before_response",
+        ]
+
+        seen.clear()
+        updated = await documents.update(
+            vault,
+            created.path,
+            DocumentUpdateRequest(content="second"),
+            agent_id="seam",
+        )
+        assert updated.previous_commit == created.commit_hash
+        assert seen == [
+            "payload.before_prepare",
+            "payload.after_verified",
+            "payload.after_prepare_before_tx",
+            "authority.after_manifest",
+            "authority.after_revision",
+            "authority.after_head",
+            "authority.after_path",
+            "authority.after_activity",
+            "authority.after_invalidation",
+            "authority.before_commit",
+            "authority.after_commit_before_response",
+        ]
+        assert set(seen) <= set(FAILPOINT_BOUNDARIES)
+        assert await _authority_counts(pool) == {
+            "native_resources": 1,
+            "native_revisions": 2,
+            "native_payload_manifests": 2,
+            "native_revision_activity": 2,
+            "native_invalidation_intents": 2,
+        }
+
+
+@pytest.mark.parametrize(
+    ("boundary", "error"),
+    [
+        ("authority.after_revision", RuntimeError("injected put failure")),
+        # The facade retries a slug-less put only on the path-collision
+        # ConflictError it raises itself.  A ConflictError from anywhere else
+        # must surface, not spin the loop forever against a failpoint that
+        # fires again on every attempt.
+        ("authority.before_commit", ConflictError("Native Revision conflict: injected")),
+    ],
+)
+async def test_document_facade_injected_failure_surfaces_without_a_retry_loop_hang(
+    boundary: str, error: Exception,
+):
+    assert boundary in FAILPOINT_BOUNDARIES
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        async def failpoint(name: str) -> None:
+            if name == boundary:
+                raise error
+
+        documents = NativeDocumentService(pool=pool, failpoint=failpoint)
+        with pytest.raises(type(error), match="injected"):
+            await asyncio.wait_for(
+                documents.put(
+                    # No slug: this is the arm with the resolve-and-retry loop.
+                    DocumentPutRequest(
+                        vault=vault,
+                        collection="notes",
+                        title="Injected",
+                        content="must not be published",
+                    ),
+                    agent_id="seam",
+                ),
+                timeout=10,
+            )
+
+        assert await _authority_counts(pool) == {
+            "native_resources": 0,
+            "native_revisions": 0,
+            "native_payload_manifests": 0,
+            "native_revision_activity": 0,
+            "native_invalidation_intents": 0,
+        }
+
+
 async def test_create_idempotency_fingerprint_includes_requested_resource_identity():
     async with _fresh_database() as (pool, vault_id):
         mutation_id = uuid.uuid4()
@@ -2096,6 +2369,292 @@ async def test_default_reference_payload_document_is_applied_to_searchable_deriv
                 created.resource_id,
                 created.revision_id,
             ) > 0
+
+
+async def _owned_vault(pool: asyncpg.Pool, vault_id: uuid.UUID) -> tuple[uuid.UUID, str]:
+    """Give the fixture vault a real owner so grep/recent-changes can read it."""
+    async with pool.acquire() as conn:
+        owner_id = await conn.fetchval(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES ($1, $2, 'disabled') RETURNING id
+            """,
+            f"placement-{uuid.uuid4().hex}",
+            f"placement-{uuid.uuid4().hex}@invalid.example",
+        )
+        await conn.execute("UPDATE vaults SET owner_id = $1 WHERE id = $2", owner_id, vault_id)
+        vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    return owner_id, vault
+
+
+async def _head_placement(pool: asyncpg.Pool, resource_id: uuid.UUID) -> str:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            SELECT pm.selected_placement
+              FROM native_resources rs
+              JOIN native_revisions rv
+                ON rv.resource_id = rs.resource_id
+               AND rv.revision_id = rs.head_revision_id
+              JOIN native_payload_manifests pm
+                ON pm.payload_manifest_id = rv.payload_manifest_id
+             WHERE rs.resource_id = $1
+            """,
+            resource_id,
+        )
+
+
+async def test_facade_document_body_lands_on_the_pg_body_store_and_still_deduplicates():
+    """P1 unification: a Document written through the facade is a PG BodyStore body."""
+    async with _fresh_database() as (pool, vault_id):
+        _owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="unified",
+                title="Unified note",
+                content="unified placement body",
+            ),
+            agent_id="m1-writer",
+        )
+
+        async with pool.acquire() as conn:
+            manifest = await conn.fetchrow(
+                """
+                SELECT pm.selected_placement, pm.verification_profile,
+                       pm.private_locator, pm.digest, pm.byte_size,
+                       p.selected_placement AS payload_placement,
+                       p.canonical_bytes
+                  FROM native_revisions rv
+                  JOIN native_payload_manifests pm
+                    ON pm.payload_manifest_id = rv.payload_manifest_id
+                  JOIN m1_reference_payloads p
+                    ON p.payload_id = pm.private_locator
+                 WHERE rv.revision_id = $1
+                """,
+                created.commit_hash,
+            )
+        assert manifest["selected_placement"] == M1PgBodyStore.selected_placement
+        assert manifest["payload_placement"] == M1PgBodyStore.selected_placement
+        assert manifest["verification_profile"] == M1PgBodyStore.verification_profile
+
+        canonical = bytes(manifest["canonical_bytes"])
+        assert manifest["digest"] == hashlib.sha256(canonical).hexdigest()
+        assert manifest["byte_size"] == len(canonical)
+
+        # Content-addressed dedup still holds: re-preparing the exact bytes the
+        # facade published reuses the same body row rather than writing a copy.
+        pg_store = M1PgBodyStore(pool)
+        replayed = await pg_store.prepare_text(namespace_id=vault_id, payload=canonical)
+        assert replayed.payload_id == manifest["private_locator"]
+
+        # ...and dedup stays placement-scoped, so the pre-P1 adapter can still
+        # hold the identical bytes as its own separately verified body.
+        reference = await M1ReferencePayloadStore(pool).prepare_text(
+            namespace_id=vault_id, payload=canonical,
+        )
+        assert reference.payload_id != manifest["private_locator"]
+        assert reference.selected_placement == M1ReferencePayloadStore.selected_placement
+
+        async with pool.acquire() as conn:
+            placements = await conn.fetch(
+                """
+                SELECT selected_placement, count(*)::int AS bodies
+                  FROM m1_reference_payloads
+                 WHERE namespace_id = $1
+                 GROUP BY selected_placement
+                 ORDER BY selected_placement
+                """,
+                vault_id,
+            )
+        assert [(row["selected_placement"], row["bodies"]) for row in placements] == [
+            (M1ReferencePayloadStore.selected_placement, 1),
+            (M1PgBodyStore.selected_placement, 1),
+        ]
+
+
+async def test_mixed_placement_namespace_stays_readable_across_every_native_reader():
+    """A pre-P1 body and a post-P1 body must coexist in one namespace.
+
+    Migrating historical rows is explicitly not part of P1, so the reference
+    placement survives forever on Revisions published before the switch. Every
+    reader therefore has to dispatch on the manifest's ``selected_placement``:
+    a pinned read of the old Revision, a diff that spans the placement change,
+    the recent-changes list, and grep all have to keep verifying.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=documents)
+
+        # A pre-P1 Document: the scaffolding path, on the reference adapter.
+        legacy_body = "---\ntitle: Legacy note\ntype: note\n---\nshared-token before\n"
+        legacy = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/legacy.md",
+            payload=legacy_body,
+            actor="pre-p1-writer",
+            mutation_id=uuid.uuid4(),
+            message="[put] notes/legacy.md",
+            subject="[put] notes/legacy.md",
+            summary="pre-P1 revision",
+        )
+        # A second Document that never gets touched again, so the namespace
+        # still has a live reference-placement Head after the switch.
+        untouched = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/untouched.md",
+            payload="---\ntitle: Untouched\n---\nshared-token untouched\n",
+            actor="pre-p1-writer",
+            mutation_id=uuid.uuid4(),
+            message="[put] notes/untouched.md",
+            subject="[put] notes/untouched.md",
+            summary="pre-P1 revision",
+        )
+
+        # The post-P1 facade replaces the first Document in place.
+        updated = await documents.update(
+            vault,
+            "notes/legacy.md",
+            DocumentUpdateRequest(
+                content="shared-token after",
+                message="unify placement",
+                expected_commit=legacy.revision_id,
+            ),
+            agent_id="p1-writer",
+        )
+        assert updated.previous_commit == legacy.revision_id
+
+        async with pool.acquire() as conn:
+            lineage = await conn.fetch(
+                """
+                SELECT rv.revision_id, pm.selected_placement
+                  FROM native_revisions rv
+                  JOIN native_payload_manifests pm
+                    ON pm.payload_manifest_id = rv.payload_manifest_id
+                 WHERE rv.resource_id = $1
+                 ORDER BY rv.occurred_at, rv.revision_id
+                """,
+                legacy.resource_id,
+            )
+        assert [row["revision_id"] for row in lineage] == [
+            legacy.revision_id,
+            updated.commit_hash,
+        ]
+        assert [row["selected_placement"] for row in lineage] == [
+            M1ReferencePayloadStore.selected_placement,
+            M1PgBodyStore.selected_placement,
+        ]
+        assert await _head_placement(pool, untouched.resource_id) == (
+            M1ReferencePayloadStore.selected_placement
+        )
+
+        # 1. A pinned read of the pre-P1 Revision, through the facade that now
+        #    writes the other placement.
+        pinned = await documents.get_at_commit(vault, "notes/legacy.md", legacy.revision_id)
+        assert pinned.content == "shared-token before"
+        assert pinned.current_commit == legacy.revision_id
+        assert pinned.metadata_is_current is True
+        current = await documents.get(vault, "notes/legacy.md")
+        assert current.content == "shared-token after"
+
+        # 2. A native diff whose parent and child sit on different placements.
+        diff = await backend.document_diff(vault, "notes/legacy.md", updated.commit_hash)
+        assert diff is not None
+        assert diff["type"] == "modified"
+        assert "-shared-token before" in diff["diff"]
+        assert "+shared-token after" in diff["diff"]
+        creation_diff = await backend.document_diff(
+            vault, "notes/legacy.md", legacy.revision_id,
+        )
+        assert creation_diff is not None
+        assert creation_diff["type"] == "added"
+        assert "+shared-token before" in creation_diff["diff"]
+
+        # 3. recent_changes spans both placements and verifies both bodies.
+        recent = await backend.recent_changes(str(owner_id), vault=vault, limit=20)
+        assert {(row["path"], row["title"]) for row in recent} == {
+            ("notes/legacy.md", "Legacy note"),
+            ("notes/untouched.md", "Untouched"),
+        }
+        assert {row["commit"] for row in recent} == {
+            updated.commit_hash,
+            untouched.revision_id,
+        }
+
+        # 4. grep scans both placements in one bounded pass.
+        grep = await M1NativeGrepService(pool).grep(
+            "shared-token",
+            user_id=owner_id,
+            vaults=[vault],
+        )
+        assert grep["total_resources"] == 2
+        assert {row["path"] for row in grep["results"]} == {
+            "notes/legacy.md",
+            "notes/untouched.md",
+        }
+        assert {row["revision"] for row in grep["results"]} == {
+            updated.commit_hash,
+            untouched.revision_id,
+        }
+
+
+async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest():
+    """recent_changes must verify, not decode-and-trust.
+
+    The schema already blocks this corruption (a CHECK on the stored digest
+    plus a row-immutability trigger), so the test removes those guards inside
+    its disposable database to prove the read path does not depend on them —
+    the same fail-closed contract grep, search, and the derived worker hold.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        owner_id, vault = await _owned_vault(pool, vault_id)
+        documents = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=documents)
+        created = await documents.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="verified",
+                title="Verified note",
+                content="honest body",
+            ),
+            agent_id="m1-writer",
+        )
+        assert (await backend.recent_changes(str(owner_id), vault=vault, limit=5))[0][
+            "commit"
+        ] == created.commit_hash
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                ALTER TABLE m1_reference_payloads
+                    DISABLE TRIGGER trg_m1_reference_payloads_immutable;
+                ALTER TABLE m1_reference_payloads
+                    DROP CONSTRAINT m1_reference_payloads_digest_matches;
+                """
+            )
+            # Same length, same encoding, no NUL: only the digest can catch it.
+            tampered = await conn.fetchval(
+                """
+                UPDATE m1_reference_payloads
+                   SET canonical_bytes = overlay(
+                           canonical_bytes PLACING $2 FROM 1 FOR 1
+                       )
+                 WHERE namespace_id = $1
+                 RETURNING octet_length(canonical_bytes)
+                """,
+                vault_id,
+                b"X",
+            )
+            assert tampered is not None
+
+        with pytest.raises(PgBodyIntegrityError, match="digest mismatch"):
+            await backend.recent_changes(str(owner_id), vault=vault, limit=5)
 
 
 async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts():
@@ -2356,3 +2915,330 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
 
         with pytest.raises(NativeRevisionUnsupportedSurfaceError):
             await document_service.browse(vault)
+
+
+async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface():
+    """R5: a bridged text-File publication must not leak into a Document feed.
+
+    Legacy's ``vault_log`` never emits a text-File revision as a Document
+    ``{"path": ..., "change": ...}`` entry — that envelope shape is frozen by
+    conformance C6. The native ledger records BOTH surfaces' mutations in one
+    ``native_revision_activity`` table (the File row is real C3 provenance,
+    not a bug), so the Document-facing reads must filter it back out.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=document_service)
+
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="native",
+                title="Native note",
+                content="Alpha body",
+            ),
+            agent_id="doc-writer",
+        )
+
+        file_result = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="attachments/native.bin",
+            payload="file bytes",
+            actor="file-writer",
+            mutation_id=uuid.uuid4(),
+            message="publish native file",
+        )
+
+        # The File's activity row is real C3 provenance — it must exist in
+        # the ledger table even though no Document feed may surface it.
+        async with pool.acquire() as conn:
+            file_activity_count = await conn.fetchval(
+                """
+                SELECT count(*)
+                  FROM native_revision_activity a
+                  JOIN native_resources rs ON rs.resource_id = a.resource_id
+                 WHERE rs.surface = 'file' AND a.resource_id = $1
+                """,
+                file_result.resource_id,
+            )
+            total_activity_count = await conn.fetchval(
+                "SELECT count(*) FROM native_revision_activity WHERE namespace_id = $1",
+                vault_id,
+            )
+        assert file_activity_count == 1
+        assert total_activity_count == 2  # one Document row, one File row
+
+        activity = await backend.vault_activity(vault, max_count=20, since=None, path=None)
+        assert [entry["hash"] for entry in activity] == [created.commit_hash]
+        assert activity[0]["files"] == [{"path": created.path, "change": "added"}]
+
+        recent = await backend.recent_changes("unused-user", vault=vault, limit=20)
+        assert [entry["commit"] for entry in recent] == [created.commit_hash]
+
+        # Path-filter variant: filtering on the File's own path prefix must
+        # not resurrect it in the Document feed either.
+        file_scoped = await backend.vault_activity(vault, max_count=20, since=None, path="attachments")
+        assert file_scoped == []
+
+        doc_scoped = await backend.vault_activity(vault, max_count=20, since=None, path="notes")
+        assert [entry["hash"] for entry in doc_scoped] == [created.commit_hash]
+
+
+async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_scoped_to_surface():
+    """R6: mirror legacy's dual (id OR path) reference semantics natively.
+
+    ``document_repo.DocumentRepository._MATCH_WHERE`` accepts either the
+    public id or the exact path for every legacy lookup, including the
+    mutation lookups (`update`/`move`/`edit`/`delete` all route through
+    `find_by_ref`). The native resolver must do the same, without letting a
+    File's resource_id resolve as a Document reference (or vice versa).
+    """
+    async with _fresh_database() as (pool, vault_id):
+        repository = NativeRevisionRepository(pool)
+        service = NativeRevisionService(pool)
+
+        document = await service.create_text(**_create_args(vault_id))
+        file_args = _create_args(vault_id)
+        file_args["surface"] = "file"
+        file_args["path"] = "attachments/native.bin"
+        file_resource = await service.create_text(**file_args)
+
+        by_id = await repository.resolve_live_reference(
+            namespace_id=vault_id,
+            surface="document",
+            reference=str(document.resource_id),
+        )
+        assert by_id is not None
+        assert by_id["resource_id"] == document.resource_id
+        assert by_id["current_path"] == "notes/native.md"
+
+        # A File's resource_id must not resolve as a Document reference.
+        assert (
+            await repository.resolve_live_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference=str(file_resource.resource_id),
+            )
+            is None
+        )
+        # ...but it still resolves symmetrically on its own surface.
+        by_file_id = await repository.resolve_live_reference(
+            namespace_id=vault_id,
+            surface="file",
+            reference=str(file_resource.resource_id),
+        )
+        assert by_file_id is not None
+        assert by_file_id["resource_id"] == file_resource.resource_id
+
+        # A nonexistent UUID does not resolve.
+        assert (
+            await repository.resolve_live_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference=str(uuid.uuid4()),
+            )
+            is None
+        )
+
+        # Path resolution is unchanged for an ordinary, non-UUID-shaped path.
+        by_path = await repository.resolve_live_reference(
+            namespace_id=vault_id,
+            surface="document",
+            reference="notes/native.md",
+        )
+        assert by_path is not None
+        assert by_path["resource_id"] == document.resource_id
+
+
+async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit():
+    """R6: the ``doc_id`` recent_changes hands out must feed back into akb_get.
+
+    ``NativeRevisionBackend.recent_changes`` returns
+    ``"doc_id": str(row["resource_id"])`` — a bare UUID. Feeding that back as
+    ``doc_ref`` used to 404 on the native arm even though the identical
+    round-trip works on legacy (`_MATCH_WHERE` accepts the id form too).
+    """
+    async with _fresh_database() as (pool, vault_id):
+        async with pool.acquire() as conn:
+            vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+
+        document_service = NativeDocumentService(pool=pool)
+        backend = NativeRevisionBackend(pool=pool, document_service=document_service)
+
+        created = await document_service.put(
+            DocumentPutRequest(
+                vault=vault,
+                collection="notes",
+                slug="native",
+                title="Native note",
+                content="Alpha body",
+            ),
+            agent_id="doc-writer",
+        )
+
+        recent = await backend.recent_changes("unused-user", vault=vault, limit=20)
+        assert len(recent) == 1
+        doc_id = recent[0]["doc_id"]
+        uuid.UUID(doc_id)  # sanity: recent_changes really does hand out a bare UUID
+
+        by_uuid = await document_service.get(vault, doc_id)
+        assert by_uuid.path == created.path
+        assert by_uuid.content == "Alpha body"
+
+        pinned = await document_service.get_at_commit(vault, doc_id, created.commit_hash)
+        assert pinned.path == created.path
+        assert pinned.content == "Alpha body"
+
+        # Path resolution is unchanged.
+        by_path = await document_service.get(vault, created.path)
+        assert by_path.content == by_uuid.content
+
+        # A File's resource_id must not resolve as a Document ref either.
+        file_result = await NativeRevisionService(pool).create_text(
+            namespace_id=vault_id,
+            surface="file",
+            path="attachments/native.bin",
+            payload="file bytes",
+            actor="file-writer",
+            mutation_id=uuid.uuid4(),
+        )
+        with pytest.raises(NotFoundError):
+            await document_service.get(vault, str(file_result.resource_id))
+
+        # A nonexistent UUID 404s.
+        with pytest.raises(NotFoundError):
+            await document_service.get(vault, str(uuid.uuid4()))
+
+
+async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge():
+    """R6 fall-through regression guard: a File's logical path may itself be
+    a bare UUID string, and its delete must still resolve it — by path.
+
+    ``app.util.text.validate_file_name`` has no extension requirement, and
+    a root-collection upload's logical path is exactly its filename, so a
+    File can genuinely be named e.g. "550e8400-e29b-41d4-a716-446655440000".
+    Deleting it goes through ``m1_native_text_file_bridge._delete`` ->
+    ``NativeRevisionService.delete_resource`` -> ``_lock_live_reference`` ->
+    ``resolve_live_reference`` with that UUID-shaped string as the *path*
+    argument. An id-branch that returns early on a miss 404s this delete
+    (the File's real resource_id is a different, randomly-generated UUID —
+    it was never addressed by id). The fall-through fix must resolve it by
+    path once the id lookup misses, exactly like legacy's single
+    ``id OR path`` predicate. This test goes through the actual bridge
+    functions, not just NativeRevisionService, to reproduce the exact call
+    shape production hits.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        uuid_name = "550e8400-e29b-41d4-a716-446655440000"
+        data = b"uuid-named file body\n"
+        digest = hashlib.sha256(data).hexdigest()
+        file_id = uuid.uuid4()
+        assert str(file_id) != uuid_name  # the File's identity, not its path
+
+        async with pool.acquire() as conn, conn.transaction():
+            publication = await _bridge_publish(
+                conn,
+                NativeTextPublishRequest(
+                    vault_id=vault_id,
+                    file_id=file_id,
+                    logical_path=uuid_name,
+                    mime_type="text/plain",
+                    data=data,
+                    digest=digest,
+                    actor_id="file-writer",
+                    description="upload",
+                ),
+            )
+        assert publication.resource_id == file_id
+
+        live = await NativeRevisionService(pool).get_current_reference(
+            namespace_id=vault_id,
+            surface="file",
+            reference=uuid_name,
+        )
+        assert live.resource_id == file_id
+
+        async with pool.acquire() as conn, conn.transaction():
+            await _bridge_delete(
+                conn,
+                NativeTextDeleteRequest(
+                    vault_id=vault_id,
+                    resource_id=file_id,
+                    revision_id=publication.revision_id,
+                    logical_path=uuid_name,
+                    actor_id="file-writer",
+                ),
+            )
+
+        with pytest.raises(NotFoundError):
+            await NativeRevisionService(pool).get_current_reference(
+                namespace_id=vault_id,
+                surface="file",
+                reference=uuid_name,
+            )
+
+
+async def test_resolve_live_reference_id_branch_respects_lifecycle_and_namespace():
+    """The id branch must not resurrect a deleted Resource or leak across vaults.
+
+    A live, correctly-surfaced resource_id resolves (already covered
+    elsewhere); this test locks down the two edges: a resource_id whose
+    Resource has since been deleted, and a resource_id that is live but
+    belongs to a different namespace.
+    """
+    async with _fresh_database() as (pool, vault_id):
+        repository = NativeRevisionRepository(pool)
+        service = NativeRevisionService(pool)
+
+        document = await service.create_text(**_create_args(vault_id))
+        await service.delete_resource(
+            namespace_id=vault_id,
+            surface="document",
+            path="notes/native.md",
+            actor="m1-test",
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=document.revision_id,
+        )
+
+        # A deleted Resource's id must not resolve via the id branch, and
+        # the fall-through must not accidentally resurrect it by path
+        # either — `lifecycle = 'live'` gates both branches identically.
+        assert (
+            await repository.resolve_live_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference=str(document.resource_id),
+            )
+            is None
+        )
+
+        # A resource_id that is real, live, and correctly-surfaced — but in
+        # a DIFFERENT namespace — must not resolve either.
+        async with pool.acquire() as conn:
+            other_vault_id = await conn.fetchval(
+                "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
+                f"native-other-{uuid.uuid4().hex}",
+                "/tmp/legacy-unused-2.git",
+            )
+        other_document = await service.create_text(**_create_args(other_vault_id))
+        assert (
+            await repository.resolve_live_reference(
+                namespace_id=vault_id,
+                surface="document",
+                reference=str(other_document.resource_id),
+            )
+            is None
+        )
+        # ...but it resolves correctly when scoped to its own namespace.
+        same_namespace = await repository.resolve_live_reference(
+            namespace_id=other_vault_id,
+            surface="document",
+            reference=str(other_document.resource_id),
+        )
+        assert same_namespace is not None
+        assert same_namespace["resource_id"] == other_document.resource_id

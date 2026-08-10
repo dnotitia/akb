@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from app.api.deps import get_current_user, require_delegated_actor
 from app.config import settings
 from app.exceptions import AKBError
+from app.models.file import BodyPlacementObservation
 from app.services.access_service import (
     FILE_UPLOAD_WRITE_ACTION,
     check_delegated_vault_writer,
@@ -154,6 +155,36 @@ async def list_files(
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     files = await file_service.list_files(access["vault_id"], vault, collection, limit)
     return {"kind": "file", "vault": vault, "items": files, "total": len(files)}
+
+
+@router.get(
+    "/files/{vault}/body-placements",
+    response_model=BodyPlacementObservation,
+    operation_id="filesGetVaultBodyPlacements",
+    summary="Body placement census for a vault (measurement builds only)",
+)
+async def get_body_placements(
+    vault: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Report which native body placements a vault's bodies still use.
+
+    Makes the M1 placement decision observable from outside without exposing
+    any internal address: the response is an aggregate of counts and byte sums
+    keyed by the closed placement identifiers, and carries no resource id, no
+    payload id, no locator, and no digest values.
+
+    Authorization matches the neighbouring measurement read `GET /files/{vault}`
+    (vault reader): the census is strictly less specific than the file listing
+    a reader can already fetch, so it introduces no new permission model.
+
+    Deployments that keep the direct-S3 File driver have no measurement facade
+    at all, so this route answers 404 there — same discipline as the guarded
+    transfer capability. It stays in the published schema because, unlike that
+    route, its path holds no secret and clients need a typed shape for it.
+    """
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    return await file_service.namespace_placement_observation(access["vault_id"], vault)
 
 
 @router.delete("/files/{vault}/{file_id}", summary="Delete a file")

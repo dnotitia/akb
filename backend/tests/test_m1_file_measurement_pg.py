@@ -15,15 +15,21 @@ import pytest
 import pytest_asyncio
 
 from app.config import settings
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, ForbiddenError, NotFoundError
+from app.models.file import BodyPlacementObservation
 from app.repositories import vault_files_repo
 from app.services import m1_file_measurement as m1
+from app.services.auth_service import AuthenticatedUser
+from app.services.file_service import FileService
 from app.services.m1_binary_store import PreparedBinary
 from app.services.m1_native_grep_service import M1NativeGrepService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_derived_worker import NativeDerivedWorker
-from app.services.native_revision_service import NativeRevisionService
+from app.services.native_revision_service import (
+    FAILPOINT_BOUNDARIES,
+    NativeRevisionService,
+)
 
 
 _DSN = os.environ.get("AKB_M1_FILE_TEST_DSN")
@@ -57,6 +63,7 @@ async def pool():
             "055_native_revision_m1_file_storage.py",
             "056_native_revision_m1_file_constraints.py",
             "057_native_revision_m1_payload_placement.py",
+            "059_native_file_searchable_derived.py",
         ):
             await _migration(filename).migrate(conn)
     try:
@@ -1223,3 +1230,447 @@ async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_
         "lifecycle": "live",
         "head_revision_id": create_revision_id,
     }
+
+
+_NATIVE_AUTHORITY_TABLES = (
+    "native_resources",
+    "native_payload_manifests",
+    "native_revisions",
+    "native_revision_activity",
+    "native_invalidation_intents",
+)
+
+
+async def _native_authority_counts(pool, resource_id: uuid.UUID) -> dict[str, int]:
+    async with pool.acquire() as conn:
+        return {
+            table: await conn.fetchval(
+                f"SELECT count(*) FROM {table} WHERE resource_id = $1", resource_id,
+            )
+            for table in _NATIVE_AUTHORITY_TABLES
+        }
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        # Prepared *inside* the caller's File transaction, unlike the
+        # standalone-pool arm where the verified body survives a rollback.
+        "payload.after_prepare_before_tx",
+        "authority.after_resource",
+        "authority.after_manifest",
+        "authority.after_revision",
+        "authority.after_head",
+        "authority.after_path",
+        "authority.after_alias",
+        "authority.after_activity",
+        "authority.after_invalidation",
+        "authority.before_commit",
+    ],
+)
+@pytest.mark.asyncio
+async def test_composite_file_confirm_failpoint_leaves_no_partial_authority_and_retries_once(
+    context, monkeypatch, boundary,
+):
+    """C5 at the riskiest boundary AKB has: a composite File confirm.
+
+    ``MeasurementFileService.confirm_upload`` owns the outer ``vault_files``
+    transaction and the bridged ledger publish runs inside it as a savepoint.
+    A failure injected into the nested publish must therefore unwind *both*:
+    no public File row, no rows in any of the five native authority tables,
+    no path alias and no verified body.  The transfer intent is the one thing
+    that must survive, because it is what makes the retry possible — and the
+    clean retry must land exactly one activity event and one durable
+    invalidation intent, not two.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+    assert boundary in FAILPOINT_BOUNDARIES
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+
+    fired: list[str] = []
+
+    async def failpoint(name: str) -> None:
+        fired.append(name)
+        if name == boundary:
+            raise RuntimeError(f"injected:{name}")
+
+    bridge.install_m1_native_text_file_bridge(failpoint=failpoint)
+
+    service = m1.MeasurementFileService()
+    data = b"composite confirm body\nsecond line\n"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="composite.py",
+        actor_id="c5-test",
+        mime_type="text/x-python",
+        description="composite failpoint",
+        content_hash=digest,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    with pytest.raises(RuntimeError, match=f"injected:{boundary}"):
+        await service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest)
+
+    assert fired[-1] == boundary
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 0,
+    )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM native_resource_path_aliases WHERE namespace_id = $1",
+            vault_id,
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_reference_payloads WHERE digest = $1", digest,
+        ) == 0
+        # The only durable residue is the transfer intent the retry needs.
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", file_id,
+        ) == 1
+    assert await service.list_files(vault_id, vault_name, None, 50) == []
+    with pytest.raises(NotFoundError):
+        await service.get_download_url(vault_id, initiated["file_id"])
+
+    # Reinstall production-shaped (no failpoint) and retry the same confirm.
+    bridge.install_m1_native_text_file_bridge()
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    assert confirmed["file_id"] == initiated["file_id"]
+    assert confirmed["uri"] == initiated["uri"]
+    assert confirmed["storage_driver"] == "native_text"
+    assert confirmed["native_resource_id"] == initiated["file_id"]
+    assert confirmed["content_hash"] == digest
+
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 1,
+    )
+    async with pool.acquire() as conn:
+        activity = await conn.fetchrow(
+            "SELECT action, revision_id, actor FROM native_revision_activity WHERE resource_id = $1",
+            file_id,
+        )
+        intent = await conn.fetchrow(
+            """
+            SELECT reason, revision_id, claimed_at, completed_at, last_error
+              FROM native_invalidation_intents
+             WHERE resource_id = $1
+            """,
+            file_id,
+        )
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", file_id,
+        ) == 0
+    assert dict(activity) == {
+        "action": "create",
+        "revision_id": confirmed["native_revision_id"],
+        "actor": "c5-test",
+    }
+    # Durable means still owed: the retry left a pending intent for the
+    # invalidation worker, not a completed or already-claimed one.
+    assert dict(intent) == {
+        "reason": "create",
+        "revision_id": confirmed["native_revision_id"],
+        "claimed_at": None,
+        "completed_at": None,
+        "last_error": None,
+    }
+
+    download = await service.get_download_url(vault_id, initiated["file_id"])
+    assert await service.transfer(_token(download["download_url"]), method="GET") == data
+    assert [item["file_id"] for item in await service.list_files(vault_id, vault_name, None, 50)] == [
+        initiated["file_id"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_composite_confirm_discards_a_ledger_publish_that_already_reported_commit(
+    context, monkeypatch,
+):
+    """In a composite transaction the ledger's own "commit" is not one.
+
+    ``authority.after_commit_before_response`` fires once the nested publish
+    has released its savepoint.  On the standalone pool that boundary models
+    a lost response over a *durable* Revision, and the retry replays it
+    idempotently.  Bridged into a File confirm there is no such Revision: the
+    outer ``vault_files`` transaction is still the only commit boundary, so
+    the whole publication is discarded.  What this test asserts is exactly
+    that non-durability — zero rows after the failure, one row after the
+    retry.  It does *not* assert that the retry took the fresh-lineage path
+    rather than the replay path: the aborted revision id never reached the
+    database, so the exactly-one counts cannot tell the two apart, and
+    fresh-lineage is an inference from the rollback rather than an observed
+    fact.  Pinning the non-durability keeps the boundary's name from being
+    read as a durability claim on this path.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+
+    fired = False
+
+    async def failpoint(name: str) -> None:
+        nonlocal fired
+        if name == "authority.after_commit_before_response" and not fired:
+            fired = True
+            raise RuntimeError("injected:response-lost")
+
+    bridge.install_m1_native_text_file_bridge(failpoint=failpoint)
+
+    service = m1.MeasurementFileService()
+    data = b"savepoint release is not a commit\n"
+    digest = hashlib.sha256(data).hexdigest()
+    initiated = await service.initiate_upload(
+        vault_name=vault_name,
+        vault_id=vault_id,
+        collection="src",
+        filename="after_commit.py",
+        actor_id="c5-test",
+        mime_type="text/x-python",
+        description="composite after-commit",
+        content_hash=digest,
+    )
+    file_id = uuid.UUID(initiated["file_id"])
+    await service.transfer(_token(initiated["upload_url"]), method="PUT", body=data)
+
+    with pytest.raises(RuntimeError, match="injected:response-lost"):
+        await service.confirm_upload(vault_id, initiated["file_id"], content_hash=digest)
+
+    assert fired is True
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 0,
+    )
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vault_files WHERE id = $1", file_id,
+        ) == 0
+
+    confirmed = await service.confirm_upload(
+        vault_id, initiated["file_id"], content_hash=digest,
+    )
+    assert confirmed["storage_driver"] == "native_text"
+    assert await _native_authority_counts(pool, file_id) == dict.fromkeys(
+        _NATIVE_AUTHORITY_TABLES, 1,
+    )
+
+
+def _measurement_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=str(uuid.uuid4()), username="placement-observer",
+        email="placement@invalid.example", display_name=None, is_admin=False,
+        auth_method="pat", token_id=None, key_class=None, token_scopes=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_envelope_observes_body_placement_without_any_locator(
+    context, monkeypatch,
+):
+    """Per-resource observability: which placement holds THIS File's body.
+
+    The whole point of the P1 item is that a fixture can bind an object to its
+    placement from the outside. The envelope therefore has to agree across
+    confirm, download, and list, and it must never carry an address.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    service = m1.MeasurementFileService()
+
+    text = await _confirmed_native_text_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="observable.txt", body=b"observable native text\n",
+    )
+    binary = await _confirmed_binary_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="observable.bin", body=b"binary\x00bytes",
+    )
+
+    assert text["storage_driver"] == "native_text"
+    assert text["payload_placement"] == M1PgBodyStore.selected_placement
+    # Binary Files report null: placement is a text-body concept and their CAS
+    # is already named by storage_driver.
+    assert binary["storage_driver"] == "fscas"
+    assert binary["payload_placement"] is None
+
+    download = await service.get_download_url(vault_id, text["file_id"])
+    listed = {
+        item["file_id"]: item
+        for item in await service.list_files(vault_id, vault_name, None, 50)
+    }
+
+    assert download["payload_placement"] == M1PgBodyStore.selected_placement
+    assert listed[text["file_id"]]["payload_placement"] == (
+        M1PgBodyStore.selected_placement
+    )
+    assert listed[text["file_id"]]["native_revision_id"] == text["native_revision_id"]
+    assert listed[binary["file_id"]]["payload_placement"] is None
+
+    forbidden = {
+        "payload_id", "private_locator", "payload_manifest_id",
+        "storage_locator", "s3_key",
+    }
+    for envelope in (text, binary, download, *listed.values()):
+        assert forbidden.isdisjoint(envelope)
+
+
+@pytest.mark.asyncio
+async def test_namespace_placement_observation_counts_both_placements(
+    context, monkeypatch,
+):
+    """Namespace aggregate: is this vault unified, or is there residue left?
+
+    After the Document unification a namespace that also holds a pre-existing
+    reference-placement Head is mixed, and the census has to say so — with
+    counts only, never an id or a digest value.
+    """
+    from app.services import m1_native_text_file_bridge as bridge
+
+    pool, vault_id, denied_vault_id, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(bridge, "get_pool", test_pool)
+    bridge.install_m1_native_text_file_bridge()
+    service = m1.MeasurementFileService()
+
+    empty = await service.namespace_placement_observation(vault_id, vault_name)
+    assert empty == {
+        "vault": vault_name, "placements": [],
+        "total_bodies": 0, "total_body_bytes": 0,
+    }
+
+    unified_body = b"unified document body\n"
+    await NativeRevisionService(pool, payload_store=M1PgBodyStore(pool)).create_text(
+        namespace_id=vault_id, surface="document", path="notes/unified.md",
+        payload=unified_body, actor="placement-observer", mutation_id=uuid.uuid4(),
+        expected_digest=hashlib.sha256(unified_body).hexdigest(),
+        expected_size=len(unified_body),
+    )
+    historical_body = b"historical document body\n"
+    await NativeRevisionService(
+        pool, payload_store=M1ReferencePayloadStore(pool),
+    ).create_text(
+        namespace_id=vault_id, surface="document", path="notes/historical.md",
+        payload=historical_body, actor="placement-observer", mutation_id=uuid.uuid4(),
+        expected_digest=hashlib.sha256(historical_body).hexdigest(),
+        expected_size=len(historical_body),
+    )
+    file_body = b"observable native file\n"
+    await _confirmed_native_text_file(
+        vault_id=vault_id, vault_name=vault_name, collection="notes",
+        filename="census.txt", body=file_body,
+    )
+
+    observation = await service.namespace_placement_observation(vault_id, vault_name)
+
+    assert observation == {
+        "vault": vault_name,
+        "placements": [
+            {
+                "selected_placement": M1ReferencePayloadStore.selected_placement,
+                "bodies": 1,
+                "body_bytes": len(historical_body),
+                "distinct_digests": 1,
+            },
+            {
+                "selected_placement": M1PgBodyStore.selected_placement,
+                "bodies": 2,
+                "body_bytes": len(unified_body) + len(file_body),
+                "distinct_digests": 2,
+            },
+        ],
+        "total_bodies": 3,
+        "total_body_bytes": len(historical_body) + len(unified_body) + len(file_body),
+    }
+    # Namespace-scoped: a second vault in the same database is not counted.
+    assert await service.namespace_placement_observation(
+        denied_vault_id, "denied",
+    ) == {
+        "vault": "denied", "placements": [],
+        "total_bodies": 0, "total_body_bytes": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_body_placement_route_is_reader_guarded_and_absent_without_measurement(
+    context, monkeypatch,
+):
+    """Authorization matches the neighbouring measurement read; off means 404."""
+    from app.api.routes import files as files_routes
+    from app.services import file_service as file_service_module
+
+    pool, vault_id, _denied, vault_name = context
+
+    async def test_pool():
+        return pool
+
+    monkeypatch.setattr(file_service_module, "get_pool", test_pool)
+    checks: list[tuple[str, str, str]] = []
+
+    async def allow(user_id, vault, *, required_role="reader", **_kwargs):
+        checks.append((user_id, vault, required_role))
+        return {"vault_id": vault_id, "role": required_role}
+
+    monkeypatch.setattr(files_routes, "check_vault_access", allow)
+    monkeypatch.setattr(files_routes, "file_service", FileService())
+    user = _measurement_user()
+
+    payload = await files_routes.get_body_placements(vault=vault_name, user=user)
+
+    assert checks == [(user.user_id, vault_name, "reader")]
+    assert BodyPlacementObservation.model_validate(payload).vault == vault_name
+
+    # A denied vault never reaches the service.
+    reached = False
+
+    async def deny(*_args, **_kwargs):
+        raise ForbiddenError("no reader grant")
+
+    async def unreachable(*_args, **_kwargs):
+        nonlocal reached
+        reached = True
+
+    monkeypatch.setattr(files_routes, "check_vault_access", deny)
+    monkeypatch.setattr(
+        files_routes.file_service, "namespace_placement_observation", unreachable,
+    )
+    with pytest.raises(ForbiddenError):
+        await files_routes.get_body_placements(vault=vault_name, user=user)
+    assert reached is False
+
+    # Measurement off: the facade does not exist, so neither does the surface.
+    monkeypatch.setattr(files_routes, "check_vault_access", allow)
+    monkeypatch.setattr(file_service_module, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(files_routes, "file_service", FileService())
+    with pytest.raises(NotFoundError) as missing:
+        await files_routes.get_body_placements(vault=vault_name, user=user)
+    assert missing.value.status_code == 404

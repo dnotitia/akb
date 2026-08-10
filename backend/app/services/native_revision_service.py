@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Final, Protocol
 
 import asyncpg
 
@@ -25,9 +25,34 @@ from app.services.m1_reference_payload_store import (
     PreparedReferencePayload,
     ReferencePayloadIntegrityError,
 )
+from app.services.native_payload_verification import payload_store_for_placement
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
+
+FAILPOINT_BOUNDARIES: Final[tuple[str, ...]] = (
+    "payload.before_prepare",
+    "payload.after_verified",
+    "payload.after_prepare_before_tx",
+    "authority.after_resource",
+    "authority.after_manifest",
+    "authority.after_revision",
+    "authority.after_head",
+    "authority.after_path",
+    "authority.after_alias",
+    "authority.after_activity",
+    "authority.after_invalidation",
+    "authority.before_commit",
+    "authority.after_commit_before_response",
+)
+"""Every boundary name ``_hit`` dispatches, in publication order.
+
+A failpoint is a callable that receives *every* boundary and decides for
+itself which one to act on, so a misspelled name simply never fires and the
+injection silently measures nothing.  Injection sites assert membership in
+this tuple instead; ``_hit`` rejects a name that is missing from it so the
+registry cannot drift behind the service.
+"""
 
 
 class TextPayloadStore(Protocol):
@@ -110,6 +135,8 @@ class NativeRevisionService:
     async def _hit(self, name: str) -> None:
         if self.failpoint is None:
             return
+        if name not in FAILPOINT_BOUNDARIES:
+            raise ValueError(f"Native failpoint boundary is not registered: {name}")
         value = self.failpoint(name)
         if inspect.isawaitable(value):
             await value
@@ -1199,10 +1226,30 @@ class NativeRevisionService:
         )
         return resource, rows
 
+    def _read_store(self, selected_placement: str) -> TextPayloadStore:
+        """Select the verified adapter this Revision's manifest actually names.
+
+        Writes keep using the configured ``payload_store``; reads must follow
+        the immutable placement recorded at publication time. Since P1 put
+        facade Documents on the PostgreSQL BodyStore, one namespace can hold
+        both historical ``m1-reference-payload-v1`` bodies and new
+        ``pg-bodystore-v1`` bodies, and each adapter's ``_verify_row`` refuses
+        the other's placement — so a single hardcoded reader would fail closed
+        on half of a mixed corpus.
+
+        A store that declares no placement is an injected test double; it is
+        used as-is instead of being replaced by a real adapter.
+        """
+        configured = getattr(self.payload_store, "selected_placement", None)
+        if configured is None or configured == selected_placement:
+            return self.payload_store
+        return payload_store_for_placement(self.pool, selected_placement)
+
     async def _snapshot_from_row(self, row: dict) -> NativeRevisionSnapshot:
         if row["payload_manifest_id"] is None or row["private_locator"] is None:
             raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
-        payload_bytes = await self.payload_store.open_verified(row["private_locator"])
+        store = self._read_store(row["selected_placement"])
+        payload_bytes = await store.open_verified(row["private_locator"])
         text = await asyncio.to_thread(_verify_snapshot_payload, payload_bytes, row)
         return NativeRevisionSnapshot(
             resource_id=row["resource_id"],

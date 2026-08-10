@@ -307,6 +307,12 @@ class GrepResult(BaseModel):
     resource_type: str | None = None
     revision: str | None = None
     content_hash: str | None = None
+    # Which body placement the matched Head bytes were read from, from the
+    # closed native set. Native rows (Document and File alike) carry it; the
+    # legacy Document grep branch leaves it None and `response_model_exclude_none`
+    # keeps that response byte-identical. Never an address — no payload id,
+    # no locator.
+    payload_placement: str | None = None
     matches: list[GrepMatch] = Field(default_factory=list)
 
 
