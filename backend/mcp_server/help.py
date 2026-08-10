@@ -29,6 +29,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `search` | search, browse, drill_down | Find and read documents |
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
+| `images` | put_image, discard_image | Inline images for Markdown documents |
 | `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
 | `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
@@ -122,6 +123,7 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_delete` | Removing a document |
 | `akb_browse` | Exploring what exists (tree view) |
 | `akb_drill_down` | Reading specific sections of a long document |
+| `akb_put_image` | Uploading a local image to embed in Markdown |
 | `akb_create_collection` | Creating an empty collection (folder) in a vault |
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
 
@@ -1479,10 +1481,109 @@ akb_sql(vaults=["sales","external-projects"],
 
 Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
 
+    "images": """# Inline Document Images
+
+Use `akb_put_image` when a local raster image should render inside an AKB
+Markdown document. This is different from `akb_put_file`: an inline image is a
+hidden, vault-owned document attachment and does not appear as a standalone
+resource in browse, search, or File publication surfaces.
+
+## Recommended workflow
+
+```
+image = akb_put_image(
+  parent="akb://eng/coll/specs",
+  file_path="/workspace/architecture.png",
+  alt_text="Request processing architecture")
+
+akb_put(
+  parent="akb://eng/coll/specs",
+  title="Request Processing",
+  content="# Architecture\n\n" + image.markdown)
+```
+
+The upload result contains:
+
+- `url`: stable `/api/assets/{uuid}` reference stored in Markdown
+- `markdown`: ready-to-paste `![alt](/api/assets/{uuid})` expression
+- decoded MIME type, dimensions, and size
+
+The backend accepts PNG, JPEG, GIF, and WebP up to 10 MiB and verifies the
+decoded content before storing it. The document write validates that every
+generated image belongs to the same vault and atomically claims it for Git
+revision history.
+
+If the document write fails or is abandoned, clean up the uncommitted upload:
+
+```
+akb_discard_image(parent="akb://eng", url=image.url)
+```
+
+Once any document commit claims the image, it cannot be discarded separately;
+removing its Markdown link stops current rendering while the bytes remain for
+older Git revisions.
+
+💡 Details: `akb_help(topic="akb_put_image")`,
+`akb_help(topic="akb_discard_image")`""",
+
+    "akb_put_image": """# akb_put_image — Upload an Inline Document Image
+
+Reads a local PNG, JPEG, GIF, or WebP through the akb-mcp stdio proxy and
+uploads it to AKB's authenticated document-image endpoint. The backend verifies
+the actual bytes and returns a stable Markdown reference; no S3 URL is stored
+in the document.
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| parent | one of parent/vault | `akb://{vault}` or `akb://{vault}/coll/{path}` |
+| vault | one of parent/vault | Vault name |
+| file_path | ✓ | Absolute path to a local PNG/JPEG/GIF/WebP, maximum 10 MiB |
+| alt_text | | Accessible alt text; defaults to the filename |
+| mime_type | | Optional allowlisted override for an extensionless file |
+
+## Example
+```
+image = akb_put_image(vault="eng", file_path="/workspace/flow.webp",
+  alt_text="Authentication flow")
+# image.markdown == "![Authentication flow](/api/assets/<uuid>)"
+
+akb_update(uri="akb://eng/coll/specs/doc/auth.md",
+  content="# Authentication\n\n" + image.markdown)
+```
+
+For an existing document, prefer a targeted insertion that preserves the rest
+of the body:
+
+```
+akb_edit(uri="akb://eng/coll/specs/doc/auth.md",
+  old_string="## Architecture",
+  new_string="## Architecture\n\n" + image.markdown)
+```
+
+If the document write fails, pass `image.url` to `akb_discard_image`.""",
+
+    "akb_discard_image": """# akb_discard_image — Clean Up an Uncommitted Image
+
+Deletes a caller-owned image upload only when no document commit has claimed
+it. This is a failure-recovery tool, not a way to remove historical document
+content.
+
+```
+akb_discard_image(vault="eng", url="/api/assets/<uuid>")
+```
+
+To remove a rendered image from a document, update the Markdown body and remove
+the `![alt](/api/assets/<uuid>)` expression. AKB retains claimed bytes so older
+Git revisions continue to render correctly.""",
+
     "files": """# File Storage (S3-backed)
 
 Binary files (images, PDFs, exports) stored in S3 with metadata in PostgreSQL.
 Files appear in `akb_browse` alongside documents and tables.
+
+For an image that should render *inside* Markdown, use `akb_put_image` instead.
+That path creates a hidden document attachment and returns the Markdown to embed.
 
 File tools (`akb_put_file`, `akb_get_file`, `akb_delete_file`) work with local file paths —
 they are handled by the akb-mcp stdio proxy which streams files directly to/from S3.

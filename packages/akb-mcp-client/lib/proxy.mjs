@@ -5,6 +5,7 @@
  * - Handles file tools locally:
  *   - Gets presigned URLs from AKB server
  *   - Uploads/downloads directly to/from S3 (AKB never touches file bytes)
+ *   - Uploads bounded document images through AKB for validation and ACLs
  * - Auto-reconnects on server restart
  * - Zero dependencies (Node.js built-in only)
  */
@@ -14,7 +15,7 @@ import { request as httpRequest, Agent as httpAgent } from "node:http";
 import { createInterface } from "node:readline";
 import { createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { createHash } from "node:crypto";
 
 // ── Connection reuse ───────────────────────────────────────
@@ -60,6 +61,35 @@ function guessMime(filename) {
   const dot = filename.lastIndexOf(".");
   if (dot < 0) return "application/octet-stream";
   return MIME_TABLE[filename.slice(dot).toLowerCase()] || "application/octet-stream";
+}
+
+const DOCUMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const DOCUMENT_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
+
+function parseAssetUrl(url) {
+  if (typeof url !== "string") throw new Error("image url must be a string");
+  const match = ASSET_URL_RE.exec(url);
+  if (!match) {
+    throw new Error(
+      `Invalid document image URL: '${url}'. Expected /api/assets/<uuid>.`,
+    );
+  }
+  return match[1];
+}
+
+function markdownAltText(value) {
+  return String(value || "Image")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\\/g, "\\\\")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]") || "Image";
 }
 
 // ── Unicode NFC normalization ──────────────────────────────
@@ -158,6 +188,66 @@ const FILE_TOOLS = [
     },
   },
   {
+    name: "akb_put_image",
+    description:
+      "Upload a local PNG, JPEG, GIF, or WebP for inline use in an AKB Markdown document. Returns a stable `/api/assets/{uuid}` URL and a ready-to-paste `markdown` image expression. Call this first, then place the returned `markdown` at the intended position with `akb_put`, `akb_update`, or a targeted `akb_edit`. This creates a hidden document attachment, not a standalone File; use akb_put_file when the binary should appear in browse/search. If the document write fails, call akb_discard_image with the returned URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent: {
+          type: "string",
+          description:
+            "Vault or collection URI (`akb://{vault}` or `akb://{vault}/coll/{path}`). " +
+            "The image is owned by that vault; the collection portion only identifies the vault.",
+        },
+        vault: {
+          type: "string",
+          description: "Vault name. Required unless `parent` is given.",
+        },
+        file_path: {
+          type: "string",
+          description: "Absolute path to the local image file.",
+        },
+        alt_text: {
+          type: "string",
+          description:
+            "Accessible Markdown alt text. Defaults to the filename without its extension.",
+        },
+        mime_type: {
+          type: "string",
+          enum: ["image/png", "image/jpeg", "image/gif", "image/webp"],
+          description:
+            "Optional MIME override for extensionless or unusually named files. The server verifies it against decoded bytes.",
+        },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
+    name: "akb_discard_image",
+    description:
+      "Discard a document image upload that was never committed in an AKB document. Use this only to clean up after a failed or abandoned akb_put/akb_update. Images already claimed by a document or retained Git revision cannot be discarded through this tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent: {
+          type: "string",
+          description:
+            "Vault or collection URI used for the upload. The vault is derived from it.",
+        },
+        vault: {
+          type: "string",
+          description: "Vault name. Required unless `parent` is given.",
+        },
+        url: {
+          type: "string",
+          description: "Stable `/api/assets/{uuid}` URL returned by akb_put_image.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
     name: "akb_get_file",
     description: "Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from akb_browse or akb_put_file.",
     inputSchema: {
@@ -220,7 +310,7 @@ const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.1.0";
+const PROXY_VERSION = "2.2.0";
 
 // Fallback MCP protocol version echoed to the client when its `initialize`
 // request omits one. We otherwise echo the client's requested version.
@@ -468,6 +558,12 @@ export class AKBProxy {
         case "akb_put_file":
           result = await this._putFile(args);
           break;
+        case "akb_put_image":
+          result = await this._putImage(args);
+          break;
+        case "akb_discard_image":
+          result = await this._discardImage(args);
+          break;
         case "akb_get_file":
           result = await this._getFile(args);
           break;
@@ -555,6 +651,89 @@ export class AKBProxy {
         }),
     );
     return JSON.parse(confirmResp.text);
+  }
+
+  async _putImage(args) {
+    const { vault } = _resolveParent(args);
+    const { file_path: filePath } = args;
+    if (!filePath) throw new Error("file_path required");
+    if (!vault) {
+      throw new Error(
+        "Either `parent` (akb:// URI) or `vault` is required to upload an image.",
+      );
+    }
+
+    const filename = basename(filePath);
+    let fileStat;
+    try {
+      fileStat = statSync(filePath);
+    } catch {
+      throw new Error(`Image file not found: ${filePath}`);
+    }
+    if (!fileStat.isFile()) throw new Error(`Image path is not a regular file: ${filePath}`);
+    if (fileStat.size < 1) throw new Error("Image is empty.");
+    if (fileStat.size > DOCUMENT_IMAGE_MAX_BYTES) {
+      throw new Error(
+        `Image too large: ${(fileStat.size / 1024 / 1024).toFixed(1)}MB (max 10MB).`,
+      );
+    }
+
+    const mimeType = args.mime_type || guessMime(filename);
+    if (!DOCUMENT_IMAGE_MIMES.has(mimeType)) {
+      throw new Error("Document images must be PNG, JPEG, GIF, or WebP.");
+    }
+
+    // The backend intentionally receives the complete bounded byte string: it
+    // decodes the image, verifies MIME/dimensions/frame limits, and writes a
+    // hidden vault attachment. Unlike akb_put_file, no presigned S3 URL is
+    // exposed and no unverified object can become a Markdown image.
+    const response = await this._http(
+      "POST",
+      `/api/v1/assets/${encodeURIComponent(vault)}?` +
+        new URLSearchParams({ filename }),
+      readFileSync(filePath),
+      { "Content-Type": mimeType },
+    );
+    const asset = JSON.parse(response.text);
+    const assetId = parseAssetUrl(asset.url);
+    if (asset.id !== assetId) {
+      throw new Error("AKB returned inconsistent document image identifiers.");
+    }
+
+    const defaultAlt = filename.slice(0, filename.length - extname(filename).length);
+    const altText = markdownAltText(args.alt_text ?? defaultAlt);
+    return {
+      kind: "document_image",
+      vault,
+      url: asset.url,
+      markdown: `![${altText}](${asset.url})`,
+      name: asset.name,
+      mime_type: asset.mime_type,
+      size_bytes: asset.size_bytes,
+      width: asset.width,
+      height: asset.height,
+    };
+  }
+
+  async _discardImage(args) {
+    const { vault } = _resolveParent(args);
+    if (!vault) {
+      throw new Error(
+        "Either `parent` (akb:// URI) or `vault` is required to discard an image.",
+      );
+    }
+    if (!args.url) throw new Error("url required");
+    const assetId = parseAssetUrl(args.url);
+    await this._http(
+      "DELETE",
+      `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
+    );
+    return {
+      kind: "document_image",
+      vault,
+      url: args.url,
+      discarded: true,
+    };
   }
 
   async _getFile(args) {

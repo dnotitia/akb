@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.2.0 — upload images for inline Markdown documents
+
+Adds two proxy-local tools for agent-authored document images:
+
+- **`akb_put_image`** reads a local PNG, JPEG, GIF, or WebP (maximum
+  10 MiB), uploads it through AKB's authenticated image endpoint, and returns
+  both the stable `/api/assets/{uuid}` URL and a ready-to-paste Markdown image
+  expression. Agents place that expression at the intended position with
+  `akb_put`, `akb_update`, or a targeted `akb_edit`.
+- **`akb_discard_image`** removes an upload that never reached a document
+  commit. Once a document claims the image, AKB retains the bytes for Git
+  revision history and this cleanup tool fails closed.
+
+Document images are deliberately separate from `akb_put_file`: they stay out
+of File browse/search/publication surfaces, inherit the document/vault access
+model, and are decoded and validated by the backend before becoming usable.
+The proxy still has zero runtime dependencies and never receives object-store
+credentials or a presigned URL for this path.
+
 ## 2.1.0 — survive backend/VPN outages without a session restart
 
 Resilience fix for the failure mode where a long VPN/backend outage

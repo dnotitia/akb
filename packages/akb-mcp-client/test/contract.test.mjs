@@ -168,6 +168,107 @@ itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical 
   }
 });
 
+itAsync("_putImage proxies bounded bytes and returns ready-to-paste Markdown", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-mcp-image-"));
+  const imagePath = join(directory, "architecture one.png");
+  const data = Buffer.from("server-validates-these-image-bytes");
+  const assetId = "11111111-2222-4333-8444-555555555555";
+  await writeFile(imagePath, data);
+  try {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const calls = [];
+    proxy._http = async (method, path, body, headers) => {
+      calls.push({ method, path, body, headers });
+      return {
+        text: JSON.stringify({
+          id: assetId,
+          url: `/api/assets/${assetId}`,
+          name: "architecture one.png",
+          mime_type: "image/png",
+          size_bytes: data.length,
+          width: 640,
+          height: 480,
+        }),
+      };
+    };
+
+    const result = await proxy._putImage({
+      parent: "akb://myvault/coll/specs",
+      file_path: imagePath,
+      alt_text: "Architecture [request path]",
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(
+      calls[0].path,
+      "/api/v1/assets/myvault?filename=architecture+one.png",
+    );
+    assert.deepEqual(calls[0].body, data);
+    assert.deepEqual(calls[0].headers, { "Content-Type": "image/png" });
+    assert.deepEqual(result, {
+      kind: "document_image",
+      vault: "myvault",
+      url: `/api/assets/${assetId}`,
+      markdown: `![Architecture \\[request path\\]](/api/assets/${assetId})`,
+      name: "architecture one.png",
+      mime_type: "image/png",
+      size_bytes: data.length,
+      width: 640,
+      height: 480,
+    });
+    assert.ok(!("id" in result), "asset UUID stays encapsulated in the stable URL");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+itAsync("_putImage rejects unsupported image types before network access", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-mcp-image-type-"));
+  const imagePath = join(directory, "vector.svg");
+  await writeFile(imagePath, "<svg/>");
+  try {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    let networkTouched = false;
+    proxy._http = async () => {
+      networkTouched = true;
+      throw new Error("unexpected network call");
+    };
+    await assert.rejects(
+      () => proxy._putImage({ vault: "myvault", file_path: imagePath }),
+      /PNG, JPEG, GIF, or WebP/,
+    );
+    assert.equal(networkTouched, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+itAsync("_discardImage accepts only canonical asset URLs", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const assetId = "11111111-2222-4333-8444-555555555555";
+  const calls = [];
+  proxy._http = async (method, path) => {
+    calls.push({ method, path });
+    return { text: "" };
+  };
+
+  const result = await proxy._discardImage({
+    vault: "myvault",
+    url: `/api/assets/${assetId}`,
+  });
+  assert.deepEqual(calls, [{
+    method: "DELETE",
+    path: `/api/v1/assets/myvault/${assetId}`,
+  }]);
+  assert.equal(result.discarded, true);
+
+  await assert.rejects(
+    () => proxy._discardImage({ vault: "myvault", url: `https://evil.test/${assetId}` }),
+    /Invalid document image URL/,
+  );
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 
 await Promise.all(pending);
