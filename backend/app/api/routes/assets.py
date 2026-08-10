@@ -9,6 +9,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
+from app.api.bounded_body import read_bounded_body
 from app.api.deps import get_current_user
 from app.api.file_write_context import resolve_file_write_context
 from app.db.postgres import get_pool
@@ -29,39 +30,6 @@ _asset_body_slots = asyncio.Semaphore(8)
 _asset_transfer_slots = asyncio.Semaphore(4)
 
 
-async def _read_bounded_image(request: Request) -> bytes:
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            declared_size = int(declared)
-        except ValueError as exc:
-            raise AKBError("Invalid Content-Length", status_code=400) from exc
-        if declared_size < 0:
-            raise AKBError("Invalid Content-Length", status_code=400)
-        if declared_size > asset_service.IMAGE_ASSET_MAX_BYTES:
-            raise AKBError("Image exceeds the 10 MB limit", status_code=413)
-
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > asset_service.IMAGE_ASSET_MAX_BYTES:
-            raise AKBError("Image exceeds the 10 MB limit", status_code=413)
-    return bytes(body)
-
-
-async def _asset_write_actor(
-    request: Request,
-    vault: str,
-    user: AuthenticatedUser,
-) -> tuple[dict, str]:
-    access, actor_id, _delegated_actor = await resolve_file_write_context(
-        request,
-        vault,
-        user,
-    )
-    return access, actor_id
-
-
 @router.post("/assets/{vault}", status_code=201, summary="Upload a document image")
 async def upload_document_image(
     request: Request,
@@ -76,7 +44,9 @@ async def upload_document_image(
     sniff bytes before publication, and works on deployments that have no
     browser-facing object-store/CORS configuration.
     """
-    access, actor_id = await _asset_write_actor(request, vault, user)
+    access, actor_id, _delegated_actor = await resolve_file_write_context(
+        request, vault, user,
+    )
     # Slow request bodies have a separate, bounded admission pool. They cannot
     # occupy the scarcer Pillow/S3 slots, and the deadline prevents a writer
     # from keeping a body slot forever with a trickle upload. Holding the body
@@ -87,7 +57,11 @@ async def upload_document_image(
             async with asyncio.timeout(settings.document_asset_upload_body_timeout_secs):
                 await _asset_body_slots.acquire()
                 body_slot_acquired = True
-                body = await _read_bounded_image(request)
+                body = await read_bounded_body(
+                    request,
+                    max_bytes=asset_service.IMAGE_ASSET_MAX_BYTES,
+                    too_large_message="Image exceeds the 10 MB limit",
+                )
         except TimeoutError as exc:
             raise AKBError("Image upload body timed out", status_code=408) from exc
 
@@ -201,7 +175,9 @@ async def discard_document_image(
     still address older revisions after the current Markdown link is removed.
     Missing, foreign, claimed, and other users' uploads share the same 404.
     """
-    access, actor_id = await _asset_write_actor(request, vault, user)
+    access, actor_id, _delegated_actor = await resolve_file_write_context(
+        request, vault, user,
+    )
     try:
         fid = uuid.UUID(file_id)
     except (ValueError, AttributeError) as exc:

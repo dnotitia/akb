@@ -21,6 +21,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
 from app.models.document import SearchResponse, SearchResult
+from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.vector_store import VectorHit, get_vector_store
@@ -531,10 +532,7 @@ class SearchService:
                     f_params: list = []
                     # Editor attachments are storage implementation details,
                     # never standalone searchable File resources.
-                    f_conds: list[str] = [
-                        "f.kind = 'file'",
-                        "f.upload_state = 'confirmed'",
-                    ]
+                    f_conds: list[str] = [confirmed_file_predicate("f")]
                     if vaults:
                         f_conds.append("v.name = ANY($1)")
                         f_params.append(vaults)
@@ -893,15 +891,14 @@ class SearchService:
                     }
             if by_type["file"]:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT f.id, v.name AS vault_name, c.path AS collection,
                            f.name, f.description, f.mime_type
                       FROM vault_files f
                       JOIN vaults v ON f.vault_id = v.id
                       LEFT JOIN collections c ON c.id = f.collection_id
                      WHERE f.id = ANY($1)
-                       AND f.kind = 'file'
-                       AND f.upload_state = 'confirmed'
+                       AND {confirmed_file_predicate("f")}
                     """,
                     [uuid.UUID(x) for x in by_type["file"]],
                 )

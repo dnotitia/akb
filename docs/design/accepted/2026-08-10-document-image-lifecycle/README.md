@@ -1,6 +1,11 @@
-# Document image lifecycle
+---
+status: accepted
+stage: applied
+created: 2026-08-10
+updated: 2026-08-10
+---
 
-Status: accepted and implemented
+# Document image lifecycle
 
 ## Decision
 

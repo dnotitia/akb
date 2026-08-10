@@ -178,6 +178,36 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
   });
 
+  it("forgets uploaded cleanup candidates after a successful save", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "diagram.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    const { container, rerender, unmount } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] },
+    });
+    await screen.findByRole("img", { name: "diagram" });
+
+    rerender(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        onChange={vi.fn()}
+        uploadsClaimed
+      />,
+    );
+    unmount();
+
+    await Promise.resolve();
+    expect(apiMocks.discardAsset).not.toHaveBeenCalled();
+  });
+
   it("retries the failed image and every remaining file in a batch", async () => {
     const ids = [
       "4f18f05e-d1cf-44ce-a39e-74737fb88e7c",

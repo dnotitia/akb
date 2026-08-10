@@ -610,6 +610,8 @@ export interface MarkdownEditorProps {
   /** Keep uploaded assets for an in-flight document save to claim. The server
    * GC remains the fallback when the save ultimately fails after navigation. */
   preserveUploadsOnUnmount?: boolean;
+  /** The owning document write completed and now owns every referenced upload. */
+  uploadsClaimed?: boolean;
 }
 
 export function MarkdownEditor({
@@ -625,6 +627,7 @@ export function MarkdownEditor({
   vault,
   onUploadingChange,
   preserveUploadsOnUnmount = false,
+  uploadsClaimed = false,
 }: MarkdownEditorProps) {
   const [uploadingImage, setUploadingImage] = React.useState(false);
   const [uploadingName, setUploadingName] = React.useState("");
@@ -640,6 +643,8 @@ export function MarkdownEditor({
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
   const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
+  const uploadsClaimedRef = React.useRef(uploadsClaimed);
+  uploadsClaimedRef.current = uploadsClaimed;
 
   const discardIfUnclaimed = React.useCallback(
     (url: string | undefined) => {
@@ -663,6 +668,10 @@ export function MarkdownEditor({
     preserveUploadsOnUnmountRef.current = preserveUploadsOnUnmount;
   }, [preserveUploadsOnUnmount]);
 
+  React.useLayoutEffect(() => {
+    if (uploadsClaimed) unclaimedAssetIdsRef.current.clear();
+  }, [uploadsClaimed]);
+
   React.useEffect(() => {
     // React StrictMode replays effects in development; reset the guard on the
     // second setup so completed uploads can still update their local status.
@@ -671,7 +680,7 @@ export function MarkdownEditor({
     return () => {
       mountedRef.current = false;
       uploadControllerRef.current?.abort();
-      if (!preserveUploadsOnUnmountRef.current) {
+      if (!preserveUploadsOnUnmountRef.current && !uploadsClaimedRef.current) {
         for (const assetId of unclaimedAssetIds) {
           void discardAsset(vault, assetId)
             .then(() => unclaimedAssetIds.delete(assetId))

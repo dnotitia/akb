@@ -498,6 +498,7 @@ class ExternalGitService:
             summary=summary, tags=tags, doc_type=doc_type,
         )
         chunks = chunk_markdown(body, metadata_header=meta_header)
+        referenced_asset_ids = asset_service.extract_asset_ids(body)
 
         # One connection, one tx: collection get-or-create → doc upsert →
         # chunks replace. Halves the pool acquires per file (5658 ×).
@@ -506,8 +507,8 @@ class ExternalGitService:
         coll_repo = CollectionRepository(pool)
         async with pool.acquire() as conn:
             async with conn.transaction():
-                previous = await doc_repo.find_by_path(
-                    vault_id, path, conn=conn, for_update=True,
+                previous_asset_state = await doc_repo.find_asset_sync_state_for_update(
+                    vault_id, path, conn=conn,
                 )
                 collection_id = (
                     await coll_repo.get_or_create(vault_id, coll_path, conn=conn)
@@ -548,18 +549,25 @@ class ExternalGitService:
                 # mirror fidelity wins over rejecting the entire sync.  Valid
                 # same-vault references are still claimed for Git-history
                 # retention, while invalid ones remain fail-closed at render.
-                asset_ids = await asset_service.claim_document_assets(
-                    conn, vault_id=vault_id, markdown=body, strict=False,
-                )
-                await asset_service.sync_document_assets(
-                    conn,
-                    document_id=pg_doc_id,
-                    vault_id=vault_id,
-                    document_path=path,
-                    commit_hash=last_commit,
-                    asset_ids=asset_ids,
-                    previous_commit=(previous or {}).get("current_commit"),
-                )
+                if referenced_asset_ids or (
+                    previous_asset_state
+                    and previous_asset_state["has_asset_refs"]
+                ):
+                    asset_ids = await asset_service.claim_document_asset_ids(
+                        conn,
+                        vault_id=vault_id,
+                        asset_ids=referenced_asset_ids,
+                        strict=False,
+                    )
+                    await asset_service.sync_document_assets(
+                        conn,
+                        document_id=pg_doc_id,
+                        vault_id=vault_id,
+                        document_path=path,
+                        commit_hash=last_commit,
+                        asset_ids=asset_ids,
+                        previous_commit=(previous_asset_state or {}).get("current_commit"),
+                    )
                 # Subscribers (search reindex, audit) need to see external
                 # mirror writes the same as user PUTs. Emitted inside the
                 # same TX so rollback drops the event too.

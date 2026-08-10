@@ -62,6 +62,7 @@ export default function DocumentNewPage() {
   const [invalidField, setInvalidField] = useState<"title" | "collection" | "body" | null>(null);
   const [creating, setCreating] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [uploadsClaimed, setUploadsClaimed] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
@@ -173,7 +174,10 @@ export default function DocumentNewPage() {
       // The response means document refs now own every valid image. Commit the
       // state before navigation so editor cleanup may discard only uploads the
       // saved body did not claim.
-      flushSync(() => setCreating(false));
+      flushSync(() => {
+        setCreating(false);
+        setUploadsClaimed(true);
+      });
       const path = result?.path;
       if (path) {
         navigate(`/vault/${name}/doc/${encodeURIComponent(path)}`);
@@ -389,8 +393,12 @@ export default function DocumentNewPage() {
               ariaLabelledby="doc-body-label"
               required
               vault={name!}
-              onUploadingChange={setUploadingImage}
+              onUploadingChange={(uploading) => {
+                setUploadingImage(uploading);
+                if (uploading) setUploadsClaimed(false);
+              }}
               preserveUploadsOnUnmount={creating}
+              uploadsClaimed={uploadsClaimed}
             />
           </Suspense>
         </div>

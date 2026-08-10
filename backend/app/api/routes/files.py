@@ -4,12 +4,12 @@ import asyncio
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
+from app.api.bounded_body import read_bounded_body
 from app.api.deps import get_current_user
 from app.api.file_write_context import (
     resolve_file_write_context as _resolve_file_write_context,
 )
 from app.config import settings
-from app.exceptions import AKBError
 from app.models.file import BodyPlacementObservation
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -31,23 +31,14 @@ async def measurement_file_transfer(token: str, request: Request):
     """
     async with _measurement_transfer_slots:
         if request.method == "PUT":
-            declared = request.headers.get("content-length")
-            if declared:
-                try:
-                    declared_size = int(declared)
-                except ValueError as exc:
-                    raise AKBError("invalid measurement transfer content-length", status_code=400) from exc
-                if declared_size < 0:
-                    raise AKBError("invalid measurement transfer content-length", status_code=400)
-                if declared_size > settings.native_revision_m1_file_transfer_max_bytes:
-                    raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
-            body = bytearray()
-            async for chunk in request.stream():
-                body.extend(chunk)
-                if len(body) > settings.native_revision_m1_file_transfer_max_bytes:
-                    raise AKBError("measurement transfer exceeds configured size limit", status_code=413)
+            body = await read_bounded_body(
+                request,
+                max_bytes=settings.native_revision_m1_file_transfer_max_bytes,
+                too_large_message="measurement transfer exceeds configured size limit",
+                invalid_length_message="invalid measurement transfer content-length",
+            )
             await file_service.transfer_measurement_capability(
-                token, method="PUT", body=bytes(body),
+                token, method="PUT", body=body,
             )
             return Response(status_code=200)
         data = await file_service.transfer_measurement_capability(token, method="GET")

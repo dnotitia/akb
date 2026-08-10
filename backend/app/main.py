@@ -38,6 +38,7 @@ from app.exceptions import AKBError
 from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
 from app.services import (
+    asset_gc_worker,
     audit_log,
     embed_worker,
     events_publisher,
@@ -430,6 +431,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "status": "ok",
         "service": "akb",
         "external_git": await _safe(external_git_poller.pending_stats),
+        "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
         "vector_store": vs_info,

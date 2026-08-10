@@ -36,13 +36,14 @@ _ASSET_URL_RE = re.compile(
 )
 _MARKDOWN_PARSER = MarkdownIt("commonmark")
 
-_FORMAT_MIMES = {
-    "PNG": "image/png",
-    "JPEG": "image/jpeg",
-    "GIF": "image/gif",
-    "WEBP": "image/webp",
+_IMAGE_FORMATS = {
+    "PNG": ("image/png", ".png"),
+    "JPEG": ("image/jpeg", ".jpg"),
+    "GIF": ("image/gif", ".gif"),
+    "WEBP": ("image/webp", ".webp"),
 }
-_ALLOWED_MIMES = frozenset(_FORMAT_MIMES.values())
+_MIME_EXTENSIONS = {mime: extension for mime, extension in _IMAGE_FORMATS.values()}
+_ALLOWED_MIMES = frozenset(_MIME_EXTENSIONS)
 logger = logging.getLogger("akb.assets")
 
 
@@ -52,12 +53,13 @@ def inspect_image(data: bytes) -> tuple[str, int, int]:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(data)) as image:
-                mime = _FORMAT_MIMES.get(image.format or "")
-                if mime is None:
+                format_spec = _IMAGE_FORMATS.get(image.format or "")
+                if format_spec is None:
                     raise AKBError(
                         "Only PNG, JPEG, GIF, and WebP images are supported",
                         status_code=415,
                     )
+                mime, _extension = format_spec
                 width, height = image.size
                 frame_count = int(getattr(image, "n_frames", 1) or 1)
                 if width < 1 or height < 1:
@@ -107,6 +109,9 @@ def extract_asset_ids(markdown: str) -> set[uuid.UUID]:
     links, and raw HTML never produce an image token and therefore cannot retain
     or publicly authorize bytes.
     """
+    if ASSET_URL_PREFIX not in markdown:
+        return set()
+
     result: set[uuid.UUID] = set()
     pending = list(_MARKDOWN_PARSER.parse(markdown))
     while pending:
@@ -162,11 +167,26 @@ async def claim_document_assets(
     if the Git/PG write fails, the claim rolls back with the document's
     authoritative commit pointer.
     """
-    referenced = extract_asset_ids(markdown)
-    found = await vault_files_repo.claim_attachment_references(
-        conn, vault_id, referenced, strict=strict,
+    return await claim_document_asset_ids(
+        conn,
+        vault_id=vault_id,
+        asset_ids=extract_asset_ids(markdown),
+        strict=strict,
     )
-    if strict and found != referenced:
+
+
+async def claim_document_asset_ids(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    asset_ids: set[uuid.UUID],
+    strict: bool = True,
+) -> set[uuid.UUID]:
+    """Claim an already-parsed image manifest inside a document transaction."""
+    found = await vault_files_repo.claim_attachment_references(
+        conn, vault_id, asset_ids, strict=strict,
+    )
+    if strict and found != asset_ids:
         raise ValidationError(
             "Document contains an unavailable image reference; upload the image to this vault first"
         )
@@ -191,11 +211,6 @@ async def sync_document_assets(
     previous_path: str | None = None,
 ) -> None:
     """Publish the current image set and its bounded Git manifest."""
-    # Production document writers always hold a caller-owned transaction.
-    # A few focused service tests exercise the private locked helpers without
-    # a connection; keep that established seam side-effect free.
-    if conn is None:
-        return
     await vault_files_repo.sync_document_asset_references(
         conn,
         document_id=document_id,
@@ -246,8 +261,7 @@ def _safe_filename(filename: str, mime: str) -> str:
     name = filename.replace("\\", "/").rsplit("/", 1)[-1]
     name = "".join(ch for ch in name if ch >= " " and ch not in "\x7f/").strip()
     if not name:
-        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}[mime]
-        return f"image{ext}"
+        return f"image{_MIME_EXTENSIONS[mime]}"
     return name[:160]
 
 

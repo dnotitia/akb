@@ -615,6 +615,38 @@ class DocumentRepository:
             )
             return dict(row) if row else None
 
+    async def find_asset_sync_state_for_update(
+        self,
+        vault_id: uuid.UUID,
+        path: str,
+        *,
+        conn,
+    ) -> dict | None:
+        """Lock one mirrored document and report only asset-sync state.
+
+        The reconciler needs the prior commit only when the document has live
+        image refs. Returning that boolean in the same lock query lets the
+        common image-free path skip claim/sync writes without weakening the
+        update-vs-reference-removal serialization.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT d.current_commit,
+                   EXISTS (
+                       SELECT 1
+                         FROM document_asset_refs refs
+                        WHERE refs.document_id = d.id
+                          AND refs.vault_id = d.vault_id
+                   ) AS has_asset_refs
+              FROM documents d
+             WHERE d.vault_id = $1 AND d.path = $2
+             FOR UPDATE OF d
+            """,
+            vault_id,
+            path,
+        )
+        return dict(row) if row else None
+
     async def upsert_external(
         self,
         *,

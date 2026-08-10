@@ -86,6 +86,7 @@ export default function DocumentPage() {
   const [editorKey, setEditorKey] = useState(0);
   const [savingBody, setSavingBody] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [uploadsClaimed, setUploadsClaimed] = useState(false);
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // Plate's markdown roundtrip is not byte-identity: adopt the first
@@ -172,6 +173,7 @@ export default function DocumentPage() {
     setRelationsError(false);
     setHistoryError(false);
     setBodyError("");
+    setUploadsClaimed(false);
     if (!d) return;
     const body = d.content || "";
     setOriginalContent(body);
@@ -252,6 +254,7 @@ export default function DocumentPage() {
         // atomically claimed referenced uploads. During the request this stays
         // true so an unrelated SPA navigation cannot win the discard race.
         setSavingBody(false);
+        setUploadsClaimed(true);
       });
       const p = new URLSearchParams(searchParams);
       p.delete("view");
@@ -583,8 +586,12 @@ export default function DocumentPage() {
                   ariaLabel="Document body (markdown)"
                   autoFocus
                   vault={name!}
-                  onUploadingChange={setUploadingImage}
+                  onUploadingChange={(uploading) => {
+                    setUploadingImage(uploading);
+                    if (uploading) setUploadsClaimed(false);
+                  }}
                   preserveUploadsOnUnmount={savingBody}
+                  uploadsClaimed={uploadsClaimed}
                 />
               </Suspense>
               {bodyError && <Alert variant="destructive">{bodyError}</Alert>}

@@ -38,6 +38,12 @@ def test_inspect_image_rejects_truncated_or_unknown_content() -> None:
     assert bad_crc.value.status_code == 415
 
 
+def test_safe_filename_uses_supported_format_metadata() -> None:
+    from app.services import asset_service
+
+    assert asset_service._safe_filename("\x7f", "image/webp") == "image.webp"
+
+
 def test_extract_asset_ids_is_conservative_around_code() -> None:
     visible = uuid.uuid4()
     titled = uuid.uuid4()
@@ -285,8 +291,8 @@ async def test_public_asset_grant_never_increments_publication_view(
         captured.update(slug=slug, **kwargs)
         return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
 
-    async def fake_document(_publication):
-        return {"content": f"![diagram](/api/assets/{file_id})"}
+    async def fake_asset_ids(_publication):
+        return frozenset({file_id})
 
     async def fake_load(requested, requested_vault):
         captured.update(file_id=requested, vault_id=requested_vault)
@@ -300,7 +306,9 @@ async def test_public_asset_grant_never_increments_publication_view(
     monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
     monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
     monkeypatch.setattr(
-        public.publication_service, "resolve_document_publication", fake_document,
+        public.publication_service,
+        "resolve_document_publication_asset_ids",
+        fake_asset_ids,
     )
     monkeypatch.setattr(public.assets, "load_asset_row", fake_load)
     monkeypatch.setattr(public.assets, "image_asset_response", fake_response)
@@ -342,14 +350,16 @@ async def test_public_asset_grant_is_asset_scoped_password_authority(
         calls.append({"slug": slug, **kwargs})
         return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
 
-    async def fake_document(_publication):
-        return {"content": f"![diagram](/api/assets/{file_id})"}
+    async def fake_asset_ids(_publication):
+        return frozenset({file_id})
 
     monkeypatch.setattr(public, "_extract_view_grant", lambda _request: "grant")
     monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
     monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
     monkeypatch.setattr(
-        public.publication_service, "resolve_document_publication", fake_document,
+        public.publication_service,
+        "resolve_document_publication_asset_ids",
+        fake_asset_ids,
     )
     monkeypatch.setattr(
         public.assets,
@@ -374,6 +384,69 @@ async def test_public_asset_grant_is_asset_scoped_password_authority(
         "bypass_password": True,
         "enforce_view_cap": False,
     }]
+
+
+@pytest.mark.asyncio
+async def test_public_document_body_and_asset_manifest_share_pinned_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import publication_service
+
+    visible = uuid.uuid4()
+    hidden = uuid.uuid4()
+    reads = 0
+
+    class _Git:
+        def read_file(self, vault, path, commit):
+            nonlocal reads
+            reads += 1
+            assert (vault, path, commit) == ("team", "weekly.md", "a" * 40)
+            return (
+                "---\ntitle: Weekly\n---\n"
+                f"# Public\n\n![shown](/api/assets/{visible})\n\n"
+                f"# Private\n\n![hidden](/api/assets/{hidden})\n"
+            )
+
+    row = {
+        "path": "weekly.md",
+        "title": "Weekly",
+        "doc_type": "note",
+        "summary": None,
+        "domain": None,
+        "updated_at": None,
+        "tags": [],
+        "current_commit": "a" * 40,
+        "vault_name": "team",
+        "created_by_name": "Alice",
+    }
+    publication = {
+        "resource_type": publication_service.ResourceType.DOCUMENT,
+        "section_filter": "Public",
+        "vault_id": str(uuid.uuid4()),
+    }
+
+    async def fake_find(_publication):
+        return row
+
+    publication_service._read_pinned_document_body.cache_clear()
+    monkeypatch.setattr(
+        publication_service,
+        "_get_doc_service",
+        lambda: SimpleNamespace(git=_Git()),
+    )
+    monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
+    try:
+        rendered = await publication_service.resolve_document_publication(publication)
+        asset_ids = await publication_service.resolve_document_publication_asset_ids(
+            publication,
+        )
+    finally:
+        publication_service._read_pinned_document_body.cache_clear()
+
+    assert reads == 1
+    assert str(visible) in rendered["content"]
+    assert str(hidden) not in rendered["content"]
+    assert asset_ids == frozenset({visible})
 
 
 def test_publication_view_grant_outlives_browser_lazy_loading(
@@ -511,7 +584,7 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
             return _Acquire()
 
     async def fake_actor(_request, _vault, _user):
-        return {"vault_id": vault_id}, "alice"
+        return {"vault_id": vault_id}, "alice", None
 
     async def fake_delete(_conn, *, vault_id, file_id, created_by):
         calls.append(("delete", vault_id, file_id, created_by))
@@ -523,7 +596,7 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
     async def fake_get_pool():
         return _Pool()
 
-    monkeypatch.setattr(assets, "_asset_write_actor", fake_actor)
+    monkeypatch.setattr(assets, "resolve_file_write_context", fake_actor)
     monkeypatch.setattr(assets, "get_pool", fake_get_pool)
     monkeypatch.setattr(
         assets.vault_files_repo,

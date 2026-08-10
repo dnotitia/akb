@@ -60,48 +60,70 @@ export class ApiError<T = unknown> extends Error {
   }
 }
 
-async function api<T>(path: string, opts?: RequestInit): Promise<T> {
+function withBearerToken(headers?: HeadersInit): HeadersInit {
   const token = getToken();
+  if (headers instanceof Headers || Array.isArray(headers)) {
+    const merged = new Headers(headers);
+    if (token) merged.set("Authorization", `Bearer ${token}`);
+    return merged;
+  }
+  return {
+    ...(headers || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+function expireUnauthorizedSession(redirect: boolean) {
+  setToken(null);
+  if (redirect && !location.pathname.startsWith("/auth")) {
+    location.href =
+      "/auth?next=" + encodeURIComponent(location.pathname + location.search);
+  }
+}
+
+async function authenticatedFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  { redirectOnUnauthorized = true } = {},
+): Promise<Response> {
+  const res = await fetch(input, {
+    ...init,
+    headers: withBearerToken(init?.headers),
+  });
+  if (res.status === 401) {
+    expireUnauthorizedSession(redirectOnUnauthorized);
+    throw new Error("Unauthorized");
+  }
+  return res;
+}
+
+async function throwJsonApiError(res: Response): Promise<never> {
+  const body = await res.json().catch(() => ({}));
+  if (body && typeof body.detail === "object" && body.detail !== null) {
+    const detail = body.detail as { message?: string };
+    throw new ApiError(
+      detail.message || `${res.status} ${res.statusText}`,
+      res.status,
+      body.detail,
+    );
+  }
+  throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+}
+
+async function api<T>(path: string, opts?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((opts?.headers as Record<string, string>) || {}),
   };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    throw new Error("Unauthorized");
-  }
+  const res = await authenticatedFetch(`${API_BASE}${path}`, { ...opts, headers });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    if (body && typeof body.detail === "object" && body.detail !== null) {
-      // FastAPI returns {detail: {...}} for HTTPException(detail=dict).
-      // Preserve the structured payload so callers can render its fields.
-      const detail = body.detail as { message?: string };
-      throw new ApiError(
-        detail.message || `${res.status} ${res.statusText}`,
-        res.status,
-        body.detail,
-      );
-    }
-    throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+    await throwJsonApiError(res);
   }
   return res.json();
 }
 
 async function apiText(path: string, opts?: RequestInit): Promise<string> {
-  const token = getToken();
-  const headers: Record<string, string> = {
-    ...((opts?.headers as Record<string, string>) || {}),
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    throw new Error("Unauthorized");
-  }
+  const res = await authenticatedFetch(`${API_BASE}${path}`, opts);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(body || `${res.status} ${res.statusText}`);
@@ -328,33 +350,15 @@ export async function uploadAsset(
   file: File,
   signal?: AbortSignal,
 ): Promise<AssetUploadResponse> {
-  const token = getToken();
   const params = new URLSearchParams({ filename: file.name });
   const headers: Record<string, string> = { "Content-Type": file.type };
-  if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(
+  const res = await authenticatedFetch(
     `${API_BASE}/assets/${encodeURIComponent(vault)}?${params}`,
     { method: "POST", headers, body: file, signal },
   );
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) {
-      location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    }
-    throw new Error("Unauthorized");
-  }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    if (body && typeof body.detail === "object" && body.detail !== null) {
-      const detail = body.detail as { message?: string };
-      throw new ApiError(
-        detail.message || `${res.status} ${res.statusText}`,
-        res.status,
-        body.detail,
-      );
-    }
-    throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+    await throwJsonApiError(res);
   }
   return res.json();
 }
@@ -366,42 +370,29 @@ export async function getAssetBlob(
   signal?: AbortSignal,
   source?: { document: string; commit: string },
 ): Promise<Blob> {
-  const token = getToken();
-  const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
   const params = new URLSearchParams({ vault });
   if (source) {
     params.set("document", source.document);
     params.set("commit", source.commit);
   }
-  const res = await fetch(`/api/assets/${encodeURIComponent(fileId)}?${params}`, { headers, signal });
-  if (res.status === 401) {
-    setToken(null);
-    if (!location.pathname.startsWith("/auth")) {
-      location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
-    }
-    throw new Error("Unauthorized");
-  }
+  const res = await authenticatedFetch(
+    `/api/assets/${encodeURIComponent(fileId)}?${params}`,
+    { signal },
+  );
   if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
   return res.blob();
 }
 
 /** Best-effort cleanup for an upload that never reached a document commit. */
 export async function discardAsset(vault: string, fileId: string): Promise<void> {
-  const token = getToken();
-  const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(
+  const res = await authenticatedFetch(
     `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
-    { method: "DELETE", headers, keepalive: true },
+    { method: "DELETE", keepalive: true },
+    { redirectOnUnauthorized: false },
   );
   // Cleanup is idempotent from the editor's perspective. A 404 also covers an
   // asset that a successful save already claimed and therefore retained.
   if (res.ok || res.status === 404) return;
-  if (res.status === 401) {
-    setToken(null);
-    throw new Error("Unauthorized");
-  }
   throw new Error(`Image cleanup failed (${res.status})`);
 }
 

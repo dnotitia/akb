@@ -11,6 +11,7 @@ referencing `collections.id`. NULL == vault root. The legacy free-form
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 
@@ -27,6 +28,35 @@ _MEASUREMENT_PLACEMENT_JOIN = """
                 AND nr.revision_id = vf.native_revision_id
           LEFT JOIN native_payload_manifests pm
                  ON pm.payload_manifest_id = nr.payload_manifest_id
+"""
+
+_SQL_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def confirmed_file_predicate(alias: str = "vf") -> str:
+    """Trusted SQL fragment for a user-visible standalone File row."""
+    if not _SQL_ALIAS_RE.fullmatch(alias):
+        raise ValueError(f"Invalid SQL alias: {alias!r}")
+    return f"{alias}.kind = 'file' AND {alias}.upload_state = 'confirmed'"
+
+
+def confirmed_attachment_predicate(alias: str = "vf") -> str:
+    """Trusted SQL fragment for a readable hidden document attachment."""
+    if not _SQL_ALIAS_RE.fullmatch(alias):
+        raise ValueError(f"Invalid SQL alias: {alias!r}")
+    return (
+        f"{alias}.kind = 'attachment' "
+        f"AND {alias}.upload_state = 'confirmed' "
+        f"AND {alias}.hash_verified_at IS NOT NULL"
+    )
+
+
+_ATTACHMENT_SELECT = """
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
+               vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
+               vf.hash_verified_at
+          FROM vault_files vf
+          JOIN vaults v ON v.id = vf.vault_id
 """
 
 
@@ -251,16 +281,10 @@ async def find_attachment_by_id(
     global asset-id existence probe before authorization.
     """
     row = await conn.fetchrow(
-        """
-        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
-               vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
-               vf.hash_verified_at
-          FROM vault_files vf
-          JOIN vaults v ON v.id = vf.vault_id
+        _ATTACHMENT_SELECT + f"""
          WHERE vf.id = $1
            AND vf.vault_id = $2
-           AND vf.kind = 'attachment'
-           AND vf.hash_verified_at IS NOT NULL
+           AND {confirmed_attachment_predicate("vf")}
         """,
         file_id, vault_id,
     )
@@ -286,16 +310,10 @@ async def find_authorized_attachment(
     probe before authorization.
     """
     row = await conn.fetchrow(
-        """
-        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
-               vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
-               vf.hash_verified_at
-          FROM vault_files vf
-          JOIN vaults v ON v.id = vf.vault_id
+        _ATTACHMENT_SELECT + f"""
          WHERE vf.id = $1
            AND vf.vault_id = $2
-           AND vf.kind = 'attachment'
-           AND vf.hash_verified_at IS NOT NULL
+           AND {confirmed_attachment_predicate("vf")}
            AND (
                 (vf.attachment_claimed_at IS NULL AND vf.created_by = $3)
                 OR EXISTS (
@@ -341,13 +359,12 @@ async def claim_attachment_references(
     if not file_ids:
         return set()
     rows = await conn.fetch(
-        """
+        f"""
         SELECT id
           FROM vault_files
          WHERE vault_id = $1
            AND id = ANY($2::uuid[])
-           AND kind = 'attachment'
-           AND hash_verified_at IS NOT NULL
+           AND {confirmed_attachment_predicate("vault_files")}
          ORDER BY id
          FOR UPDATE
         """,
@@ -625,7 +642,7 @@ async def list_for_vault(
     if scoped:
         if collection_id is None:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                        vf.mime_type, vf.size_bytes, vf.description,
                        vf.created_by, vf.created_at, vf.content_hash,
@@ -633,8 +650,8 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.kind = 'file'
-                   AND vf.upload_state = 'confirmed' AND vf.collection_id IS NULL
+                 WHERE vf.vault_id = $1 AND {confirmed_file_predicate("vf")}
+                   AND vf.collection_id IS NULL
                  ORDER BY vf.created_at DESC
                  LIMIT $2
                 """,
@@ -642,7 +659,7 @@ async def list_for_vault(
             )
         else:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                        vf.mime_type, vf.size_bytes, vf.description,
                        vf.created_by, vf.created_at, vf.content_hash,
@@ -650,8 +667,8 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.kind = 'file'
-                   AND vf.upload_state = 'confirmed' AND vf.collection_id = $2
+                 WHERE vf.vault_id = $1 AND {confirmed_file_predicate("vf")}
+                   AND vf.collection_id = $2
                  ORDER BY vf.created_at DESC
                  LIMIT $3
                 """,
@@ -691,8 +708,7 @@ async def list_for_vault(
             "       vf.hash_verified_at "
             "  FROM vault_files vf "
             "  LEFT JOIN collections c ON c.id = vf.collection_id "
-            " WHERE vf.vault_id = $1 AND vf.kind = 'file'"
-            "   AND vf.upload_state = 'confirmed'"
+            f" WHERE vf.vault_id = $1 AND {confirmed_file_predicate('vf')}"
             + prefix_clause
             + depth_clause
             + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}"
@@ -700,7 +716,7 @@ async def list_for_vault(
         rows = await conn.fetch(sql, *params)
     else:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT vf.id, vf.collection_id, c.path AS collection, vf.name,
                    vf.mime_type, vf.size_bytes, vf.description,
                    vf.created_by, vf.created_at, vf.content_hash,
@@ -708,8 +724,7 @@ async def list_for_vault(
                    vf.hash_verified_at
               FROM vault_files vf
               LEFT JOIN collections c ON c.id = vf.collection_id
-             WHERE vf.vault_id = $1 AND vf.kind = 'file'
-               AND vf.upload_state = 'confirmed'
+             WHERE vf.vault_id = $1 AND {confirmed_file_predicate("vf")}
              ORDER BY vf.created_at DESC
              LIMIT $2
             """,

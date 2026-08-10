@@ -42,8 +42,9 @@ from app.api.routes import assets
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
+from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.util.text import NFCModel
-from app.services import asset_service, audit_log, file_service, publication_service
+from app.services import audit_log, file_service, publication_service
 from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -587,9 +588,9 @@ async def publication_meta(slug: str, request: Request):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 file_row = await conn.fetchrow(
-                    "SELECT name, mime_type, size_bytes FROM vault_files "
-                    "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
-                    "AND upload_state = 'confirmed'",
+                    "SELECT name, mime_type, size_bytes FROM vault_files f "
+                    "WHERE id = $1 AND vault_id = $2 AND "
+                    + confirmed_file_predicate("f"),
                     to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
@@ -689,7 +690,9 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
         )
         if publication["resource_type"] != ResourceType.DOCUMENT:
             raise PublicationNotFound(slug)
-        rendered = await publication_service.resolve_document_publication(publication)
+        asset_ids = await publication_service.resolve_document_publication_asset_ids(
+            publication,
+        )
     except PublicationError as exc:
         raise _publication_error_to_http(exc)
 
@@ -697,7 +700,7 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
         requested_id = uuid.UUID(file_id)
     except (ValueError, AttributeError) as exc:
         raise HTTPException(status_code=404, detail="Asset not found") from exc
-    if requested_id not in asset_service.extract_asset_ids(rendered.get("content") or ""):
+    if requested_id not in asset_ids:
         raise HTTPException(status_code=404, detail="Asset not found")
 
     try:
@@ -757,9 +760,9 @@ async def publication_raw(slug: str, request: Request):
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files "
-            "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
-            "AND upload_state = 'confirmed'",
+            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files f "
+            "WHERE id = $1 AND vault_id = $2 AND "
+            + confirmed_file_predicate("f"),
             to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
@@ -1212,8 +1215,8 @@ async def oembed(url: str, format: str = "json"):
                 pool = await get_pool()
                 async with pool.acquire() as conn:
                     f_row = await conn.fetchrow(
-                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2 "
-                        "AND kind = 'file' AND upload_state = 'confirmed'",
+                        "SELECT name FROM vault_files f WHERE id = $1 AND vault_id = $2 AND "
+                        + confirmed_file_predicate("f"),
                         to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                     )
                     if f_row:

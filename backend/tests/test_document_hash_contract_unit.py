@@ -361,7 +361,7 @@ class _CommittingGit:
 
 
 def _patch_index_side_effects(monkeypatch) -> None:
-    """Neutralize the chunk/relations/event writes that need a live DB."""
+    """Neutralize derived writes that need a live database connection."""
     import app.repositories.document_repo as document_repo
     import app.services.document_service as ds
 
@@ -377,10 +377,18 @@ def _patch_index_side_effects(monkeypatch) -> None:
     async def fake_emit_event(*args, **kwargs):
         return None
 
+    async def fake_claim_document_assets(*args, **kwargs):
+        return set()
+
+    async def fake_sync_document_assets(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(document_repo, "drop_resource_alias", fake_drop_resource_alias)
     monkeypatch.setattr(ds, "write_source_chunks", fake_write_source_chunks)
     monkeypatch.setattr(ds, "store_document_relations", fake_store_document_relations)
     monkeypatch.setattr(ds, "emit_event", fake_emit_event)
+    monkeypatch.setattr(ds.asset_service, "claim_document_assets", fake_claim_document_assets)
+    monkeypatch.setattr(ds.asset_service, "sync_document_assets", fake_sync_document_assets)
 
 
 @pytest.mark.asyncio
