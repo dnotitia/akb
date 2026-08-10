@@ -241,6 +241,7 @@ async def _apply_migrations() -> None:
         "062_document_image_asset_references.py",  # live document refs + bounded Git-revision manifests for attachment ACL/GC
         "063_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
         "064_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
+        "065_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
     ):
         if filename in applied:
             continue

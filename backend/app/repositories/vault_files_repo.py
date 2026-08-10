@@ -269,6 +269,41 @@ async def find_by_id(
     return dict(row) if row else None
 
 
+async def lease_file_upload_confirmation(
+    conn,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+) -> dict | None:
+    """Refresh a File's confirmation lease and return its scoped metadata.
+
+    The short UPDATE lock serializes with stale-pending GC without retaining a
+    database connection while S3 bytes are hashed.
+    """
+    row = await conn.fetchrow(
+        """
+        WITH leased AS (
+            UPDATE vault_files
+               SET updated_at = NOW()
+             WHERE id = $1
+               AND vault_id = $2
+               AND kind = 'file'
+            RETURNING *
+        )
+        SELECT leased.id, leased.vault_id, leased.collection_id, leased.kind,
+               c.path AS collection, leased.name, leased.s3_key,
+               leased.mime_type, leased.size_bytes, leased.description,
+               leased.created_by, leased.created_at, leased.updated_at,
+               leased.content_hash, leased.hash_algorithm, leased.etag,
+               leased.storage_version, leased.hash_verified_at,
+               leased.upload_state
+          FROM leased
+          LEFT JOIN collections c ON c.id = leased.collection_id
+        """,
+        file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
 async def find_attachment_by_id(
     conn,
     vault_id: uuid.UUID,

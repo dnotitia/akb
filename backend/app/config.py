@@ -525,6 +525,9 @@ class Settings(BaseModel):
     # separately so abandoned uploads remain eligible for bounded cleanup.
     document_asset_revision_retention_days: int = Field(default=30, ge=1, le=3650)
     document_asset_unclaimed_ttl_hours: int = Field(default=24, ge=1, le=8760)
+    # Direct File uploads use a one-hour presigned PUT. Give clients a much
+    # larger completion window before stale, still-private metadata is reaped.
+    file_pending_upload_ttl_hours: int = Field(default=24, ge=2, le=8760)
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
     document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
 
@@ -700,10 +703,10 @@ class Settings(BaseModel):
     # ``lifecycle._validate_required_settings`` fails the app launch if
     # this is empty.
     public_base_url: str = ""
-    # A counted publication page may lazy-load subordinate images long after
-    # first paint. This signed grant suppresses N+1 view counting only; every
-    # asset request still revalidates publication access and the exact slice.
-    publication_view_grant_ttl_secs: int = Field(default=86_400, ge=60, le=604_800)
+    # A counted publication page may lazy-load subordinate images after first
+    # paint. Keep this capability short-lived: it is carried by subordinate
+    # URLs and suppresses repeat view counting for the same page open.
+    publication_view_grant_ttl_secs: int = Field(default=600, ge=60, le=3600)
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
     #

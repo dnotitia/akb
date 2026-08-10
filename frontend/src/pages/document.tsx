@@ -586,6 +586,8 @@ export default function DocumentPage() {
                   ariaLabel="Document body (markdown)"
                   autoFocus
                   vault={name!}
+                  document={doc?.path}
+                  commit={doc?.current_commit ?? undefined}
                   onUploadingChange={(uploading) => {
                     setUploadingImage(uploading);
                     if (uploading) setUploadsClaimed(false);

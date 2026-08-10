@@ -29,6 +29,10 @@ from app.services.adapters import s3_adapter
 logger = logging.getLogger("akb.s3_delete_worker")
 
 BATCH_SIZE = 16
+# A presigned PUT may already be in flight when its metadata is deleted. Issue
+# one immediate idempotent delete and one delayed reconciliation delete after
+# the normal pending-upload lifecycle has elapsed.
+PENDING_UPLOAD_DELETE_RECHECK_SECONDS = 24 * 60 * 60
 
 SWEEP_GRACE_INTERVAL = "1 day"
 SWEEP_INTERVAL_SECONDS = 3600.0
@@ -38,13 +42,26 @@ _last_sweep_at: float = 0.0
 # ── Outbox helpers (called by services in their TX) ──────────────
 
 
-async def enqueue_delete(conn, s3_key: str) -> None:
+async def enqueue_delete(conn, s3_key: str, *, delay_seconds: int = 0) -> None:
     """Enqueue an S3 object for asynchronous deletion. MUST be called
     inside the same TX as the DB write that removes the row pointing
     at this object — that's the only way to guarantee no orphan."""
     await conn.execute(
-        "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
+        """
+        INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
+        VALUES ($1, NOW() + ($2 * INTERVAL '1 second'))
+        """,
+        s3_key, delay_seconds,
+    )
+
+
+async def enqueue_pending_upload_delete(conn, s3_key: str) -> None:
+    """Delete now and reconcile once after any accepted PUT has settled."""
+    await enqueue_delete(conn, s3_key)
+    await enqueue_delete(
+        conn,
         s3_key,
+        delay_seconds=PENDING_UPLOAD_DELETE_RECHECK_SECONDS,
     )
 
 

@@ -120,6 +120,26 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
   });
 
+  it("uses the exact document revision when resolving an existing image", async () => {
+    render(
+      <MarkdownEditor
+        value={`![diagram](/api/assets/${ASSET_ID})`}
+        vault="team"
+        document="notes/weekly.md"
+        commit="aaaaaaaaaaaa"
+        onChange={vi.fn()}
+      />,
+    );
+
+    await screen.findByRole("img", { name: "diagram" });
+    expect(apiMocks.getAssetBlob).toHaveBeenCalledWith(
+      ASSET_ID,
+      "team",
+      expect.any(AbortSignal),
+      { document: "notes/weekly.md", commit: "aaaaaaaaaaaa" },
+    );
+  });
+
   it("discards a newly uploaded image when its node is removed before save", async () => {
     apiMocks.uploadAsset.mockResolvedValue({
       id: ASSET_ID,
@@ -239,6 +259,7 @@ describe("MarkdownEditor image insertion", () => {
     expect(await screen.findByText(/2 images remain/)).toBeVisible();
     expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2);
 
+    expect(screen.getByText("Image upload failed")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(4));
     expect(apiMocks.uploadAsset.mock.calls.map((call) => call[1])).toEqual([
@@ -295,8 +316,9 @@ describe("MarkdownEditor image insertion", () => {
       size_bytes: 5,
     });
     expect(await screen.findByText(/previous image batch finished/i)).toBeVisible();
+    expect(screen.getByText("Images waiting to upload")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
     await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(2));
     expect(apiMocks.uploadAsset.mock.calls[1][1]).toBe(second);
   });

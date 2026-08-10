@@ -375,9 +375,12 @@ class FileService:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-            if not row or row.get("kind") != "file":
-                raise NotFoundError("File", file_id)
+            async with conn.transaction():
+                row = await vault_files_repo.lease_file_upload_confirmation(
+                    conn, vault_id, fid,
+                )
+                if not row:
+                    raise NotFoundError("File", file_id)
 
         # Read object size. Treat NoSuchKey specially: that means the
         # client never finished its presigned upload; clean up the

@@ -1525,9 +1525,9 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Lock before enumerating object keys. Image uploads hold the
-            # conflicting key-share lock across PUT + finalization, so a vault
-            # delete cannot miss an object that is created after this sweep.
+            # Lock before enumerating object keys. Image uploads register a
+            # pending row before PUT and revalidate this lock at finalization,
+            # so the sweep includes every key that can become readable.
             vault = await conn.fetchrow(
                 "SELECT id, git_path FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
@@ -1545,13 +1545,19 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             # transaction instead; the existing worker retries idempotent
             # object deletion after the vault's access has been revoked.
             file_rows = await conn.fetch(
-                "SELECT id, s3_key FROM vault_files WHERE vault_id = $1",
+                "SELECT id, s3_key, upload_state FROM vault_files WHERE vault_id = $1",
                 vault_id,
             )
             if file_rows and settings.s3_endpoint_url:
-                from app.services.s3_delete_worker import enqueue_delete
+                from app.services.s3_delete_worker import (
+                    enqueue_delete,
+                    enqueue_pending_upload_delete,
+                )
                 for fr in file_rows:
-                    await enqueue_delete(conn, fr["s3_key"])
+                    if fr["upload_state"] == "pending":
+                        await enqueue_pending_upload_delete(conn, fr["s3_key"])
+                    else:
+                        await enqueue_delete(conn, fr["s3_key"])
 
             # Publication snapshots live outside the vault file prefix.
             snap_rows = await conn.fetch(

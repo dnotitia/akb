@@ -732,10 +732,17 @@ export class AKBProxy {
     }
     if (!args.url) throw new Error("url required");
     const assetId = parseAssetUrl(args.url);
-    await this._http(
-      "DELETE",
-      `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
-    );
+    try {
+      await this._http(
+        "DELETE",
+        `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
+      );
+    } catch (error) {
+      // A successful document save claims the image, while another cleanup may
+      // already have removed an abandoned upload. Both make discard complete
+      // from the caller's perspective.
+      if (error?.statusCode !== 404) throw error;
+    }
     return {
       kind: "document_image",
       vault,
@@ -952,7 +959,9 @@ export class AKBProxy {
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
           if (res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+            const error = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
+            error.statusCode = res.statusCode;
+            reject(error);
           } else {
             resolve({ text: data, headers: res.headers });
           }

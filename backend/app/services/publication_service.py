@@ -1217,15 +1217,22 @@ async def _resolve_document_body(
 ) -> _ResolvedDocumentBody:
     commit_hash = doc_row["current_commit"]
     if commit_hash is None:
-        # Legacy NULL commits fall back to floating HEAD in GitService. They are
-        # deliberately not cached because their bytes can change under one key.
-        return await asyncio.to_thread(
-            _read_document_body_uncached,
+        # Legacy rows used floating HEAD. Resolve HEAD first, then use the same
+        # immutable cache as current rows: a later commit produces a new cache
+        # key, while N image requests for one page do not re-read and re-parse
+        # the complete Git file.
+        commit_hash = await asyncio.to_thread(
+            _get_doc_service().git.current_commit,
             doc_row["vault_name"],
-            doc_row["path"],
-            None,
-            section_filter,
         )
+        if commit_hash is None:
+            return await asyncio.to_thread(
+                _read_document_body_uncached,
+                doc_row["vault_name"],
+                doc_row["path"],
+                None,
+                section_filter,
+            )
     try:
         return await asyncio.to_thread(
             _read_pinned_document_body,

@@ -267,6 +267,7 @@ async def pool():
         "015_events_outbox.py",
         "019_s3_delete_outbox.py",
         "064_vault_file_upload_state.py",
+        "065_vault_file_lifecycle_indexes.py",
     ):
         mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
         spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
@@ -525,6 +526,77 @@ async def test_confirm_on_a_legacy_key_is_unchanged(pool, vault_id, confirmable)
     result = await confirmable(vault_id, file_id, key, _BYTES_B)
 
     assert result["content_hash"] == _HASH_B
+
+
+async def test_confirmation_lease_refreshes_pending_file_gc_deadline(pool, vault_id):
+    key = _s3_key("v", "IS", "leased.bin")
+    async with pool.acquire() as conn:
+        file_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            file_id,
+        )
+        before = await conn.fetchval(
+            "SELECT updated_at FROM vault_files WHERE id = $1", file_id,
+        )
+        row = await vault_files_repo.lease_file_upload_confirmation(
+            conn, vault_id, file_id,
+        )
+
+    assert row is not None
+    assert row["upload_state"] == "pending"
+    assert row["updated_at"] > before
+
+
+async def test_confirmation_lease_wins_stale_gc_race(pool, vault_id):
+    key = _s3_key("v", "IS", "racing.bin")
+    async with pool.acquire() as conn:
+        file_id = await _put(conn, vault_id, key)
+        await conn.execute(
+            "UPDATE vault_files SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1",
+            file_id,
+        )
+
+    leased = asyncio.Event()
+    release = asyncio.Event()
+
+    async def confirmer():
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await vault_files_repo.lease_file_upload_confirmation(
+                    conn, vault_id, file_id,
+                )
+                assert row is not None
+                leased.set()
+                await release.wait()
+
+    async def collector():
+        await leased.wait()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                DELETE FROM vault_files
+                 WHERE id = $1
+                   AND upload_state = 'pending'
+                   AND updated_at < NOW() - INTERVAL '24 hours'
+                RETURNING id
+                """,
+                file_id,
+            )
+
+    confirm_task = asyncio.create_task(confirmer())
+    collect_task = asyncio.create_task(collector())
+    await leased.wait()
+    await asyncio.sleep(0.05)
+    assert not collect_task.done()
+    release.set()
+
+    await confirm_task
+    assert await collect_task is None
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", file_id,
+        ) == "pending"
 
 
 async def test_confirm_still_rejects_a_mismatched_client_hash(

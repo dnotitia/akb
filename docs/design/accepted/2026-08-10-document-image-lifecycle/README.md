@@ -71,16 +71,14 @@ Markdown slice, so publishing one section cannot expose an image used only by a
 different section.
 
 The page-open response spends one publication view and mints a bounded view
-grant (24 hours by default so browser lazy-loading remains usable). Every
+grant (10 minutes by default). Every
 embedded-image request requires that grant and is resolved with view counting
 disabled while still rechecking the current publication and exact section
 slice. Images are subordinate bytes of the counted page, so a document with N
-images still consumes exactly one view-cap entry. For this asset route only,
-the counted grant is sufficient proof that the page password gate was passed;
-that narrow capability outlives the one-hour full-publication password token
-but cannot fetch the document, raw File bytes, tables, or arbitrary attachment
-UUIDs. The renderer consequently omits the broader password token from image
-URLs and sends only the asset-scoped grant.
+images still consumes exactly one view-cap entry. The grant controls counting,
+not content access: a password-protected publication also requires its existing
+one-hour password token on every image request. The exact section manifest is
+checked before any attachment UUID reaches object storage.
 
 ## Deletion and retention
 
@@ -91,6 +89,7 @@ URLs and sends only the asset-scoped grant.
 | Delete a collection recursively | Same as deleting each contained document | Same bounded behavior; standalone Files retain their existing cascade |
 | Delete a vault | Revoked with the vault | Rows are removed immediately; every object key is transactionally queued for retrying deletion |
 | Abandon an upload before save | Uploader-only preview until expiry | Collected after the unclaimed-upload TTL |
+| Never confirm a standalone File upload | Never visible | Pending metadata and any uploaded object are collected after the pending-upload TTL |
 
 The collector first removes an indexed, bounded batch of expired revision
 manifests, then locks eligible attachment rows with `FOR UPDATE SKIP LOCKED`. A
@@ -103,21 +102,23 @@ yet publish reference rows.
 Uploads use an explicit pending/confirmed state. This preserves pre-hash legacy
 Files as confirmed while making newly initiated transfers unambiguous. After
 server-side decoding succeeds, AKB commits an unreadable pending attachment row
-before the S3 PUT, then marks it confirmed and hash-verified only after the PUT
-completes. Normal failures enqueue the key for deletion immediately; a hard
-process exit leaves the pending row for the same bounded collector. Image
+before the S3 PUT, performs the remote PUT without holding a database connection,
+then marks it confirmed and hash-verified in a short transaction. Normal failures
+enqueue the key for deletion immediately; a hard process exit leaves the pending
+row for the same bounded collector. Image
 decoding runs in a bounded worker-thread path so multi-frame validation cannot
 block the API event loop.
 Request cancellation shields and settles an in-flight boto3 PUT before cleanup
 is enqueued, preventing a late thread completion from recreating an already
 deleted, untracked object.
 
-Upload/finalization also holds a key-share lock on the vault row. Whole-vault
-deletion takes the conflicting lock before enumerating object keys, so it either
-waits for the attachment to finalize and deletes it, or wins before the PUT is
-allowed to start. The delete transaction writes those keys to the existing S3
-outbox rather than waiting on irreversible object-store calls while holding the
-lock; the worker retries physical deletion after access and metadata are gone.
+Upload registration and finalization each take a short key-share lock on the
+vault row. Whole-vault deletion takes the conflicting lock before enumerating
+object keys. A pending transfer may finish after deletion begins, so deletion
+records both an immediate object delete and a delayed reconciliation delete
+after the presigned PUT window. No transaction waits on irreversible
+object-store I/O; the worker retries physical deletion after access and metadata
+are gone.
 Slow body reads use a separate bounded pool with a deadline; they cannot consume
 the smaller decoder/object-store transfer pool forever.
 
@@ -125,9 +126,10 @@ Defaults:
 
 - `document_asset_revision_retention_days: 30`
 - `document_asset_unclaimed_ttl_hours: 24`
+- `file_pending_upload_ttl_hours: 24`
 - `document_asset_gc_interval_secs: 300`
 - `document_asset_upload_body_timeout_secs: 60`
-- `publication_view_grant_ttl_secs: 86400`
+- `publication_view_grant_ttl_secs: 600`
 
 These are operational retention controls, not public-link credentials. Lowering
 them can intentionally make older Git revisions lose image rendering sooner.

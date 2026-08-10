@@ -571,12 +571,11 @@ class DocumentService:
         md_content = _compose_markdown(fm_dict, req.content)
         content_hash = _certified_content_hash(md_content)
 
-        # Claim every valid same-vault attachment before the Git write. Broken,
-        # expired, or copied cross-vault URLs remain inert placeholders instead
-        # of rejecting an otherwise valid import/document save. The row locks
-        # still serialize a concurrent editor discard with this transaction.
+        # A new document cannot inherit a pre-existing broken placeholder:
+        # every AKB asset URL it introduces must still be a confirmed attachment
+        # in this vault. The row locks serialize a concurrent editor discard.
         asset_ids = await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=req.content, strict=False,
+            conn, vault_id=vault_id, markdown=req.content,
         )
 
         # Git commit
@@ -950,7 +949,11 @@ class DocumentService:
         content_hash = _certified_content_hash(new_md)
 
         asset_ids = await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=new_body, strict=False,
+            conn,
+            vault_id=vault_id,
+            markdown=new_body,
+            strict=False,
+            previous_markdown=current_body,
         )
 
         message = req.message or f"Update {file_path}"
@@ -1384,7 +1387,11 @@ class DocumentService:
         content_hash = _certified_content_hash(new_md)
 
         asset_ids = await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=new_body, strict=False,
+            conn,
+            vault_id=vault_id,
+            markdown=new_body,
+            strict=False,
+            previous_markdown=current_body,
         )
 
         msg = message or f"Edit {file_path}"

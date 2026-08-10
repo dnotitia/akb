@@ -469,13 +469,12 @@ class ExternalGitService:
             self.git.last_commit_for_path, vault_name, path, tip_sha
         )
         if last_commit is None:
-            # ``path`` came from ls-tree at ``tip_sha``, so it must have a
-            # reachable introducing commit. Fail closed if the hermetic log
-            # cannot establish that identity instead of publishing a document
-            # and revision manifest with an unaddressable commit.
-            raise ValueError(
-                f"external_git path {path!r} has no reachable commit at {tip_sha}"
-            )
+            # The path was read from tip_sha, which is itself an exact commit
+            # containing the bytes. Some shallow or replacement-ref histories
+            # cannot identify the last path-touch commit; pinning the mirror tip
+            # preserves a non-null, addressable document revision without
+            # stalling the entire reconcile cursor.
+            last_commit = tip_sha
         created_by = _created_by_for(remote_url)
         now = datetime.now(timezone.utc)
 
@@ -498,7 +497,7 @@ class ExternalGitService:
             summary=summary, tags=tags, doc_type=doc_type,
         )
         chunks = chunk_markdown(body, metadata_header=meta_header)
-        referenced_asset_ids = asset_service.extract_asset_ids(body)
+        referenced_asset_ids = await asset_service.extract_asset_ids_async(body)
 
         # One connection, one tx: collection get-or-create → doc upsert →
         # chunks replace. Halves the pool acquires per file (5658 ×).

@@ -192,6 +192,8 @@ function TableHeaderCellElement(props: PlateElementProps) {
 
 interface EditorAssetLifecycle {
   vault: string;
+  document?: string;
+  commit?: string;
 }
 
 const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
@@ -212,7 +214,12 @@ function ImageElement(props: PlateElementProps) {
           alt={alt}
           assetContext={
             assetLifecycle
-              ? { mode: "authenticated", vault: assetLifecycle.vault }
+              ? {
+                  mode: "authenticated",
+                  vault: assetLifecycle.vault,
+                  document: assetLifecycle.document,
+                  commit: assetLifecycle.commit,
+                }
               : undefined
           }
           className="my-0 max-h-[70vh] object-contain"
@@ -605,6 +612,9 @@ export interface MarkdownEditorProps {
   required?: boolean;
   /** Vault receiving pasted, dropped, or picked image assets. */
   vault: string;
+  /** Exact source identity used when rendering a retained Git revision. */
+  document?: string;
+  commit?: string;
   /** Lets the owning form block save/navigation while an upload is in flight. */
   onUploadingChange?: (uploading: boolean) => void;
   /** Keep uploaded assets for an in-flight document save to claim. The server
@@ -625,6 +635,8 @@ export function MarkdownEditor({
   ariaLabelledby,
   required,
   vault,
+  document,
+  commit,
   onUploadingChange,
   preserveUploadsOnUnmount = false,
   uploadsClaimed = false,
@@ -635,6 +647,7 @@ export function MarkdownEditor({
     files: File[];
     message: string;
     retryable: boolean;
+    kind: "error" | "queued";
   } | null>(null);
   const uploadControllerRef = React.useRef<AbortController | null>(null);
   const uploadInFlightRef = React.useRef(false);
@@ -722,6 +735,7 @@ export function MarkdownEditor({
             files: [],
             message: `${file.name}: ${validationMessage} No images were uploaded.`,
             retryable: false,
+            kind: "error",
           });
           return;
         }
@@ -784,12 +798,14 @@ export function MarkdownEditor({
             files: [...files.slice(currentFileIndex), ...deferred],
             message,
             retryable: true,
+            kind: "error",
           });
         } else if (mountedRef.current && deferredImageFilesRef.current.length > 0) {
           setUploadFailure({
             files: deferredImageFilesRef.current.splice(0),
             message: "The current upload was cancelled before the next batch started.",
             retryable: true,
+            kind: "error",
           });
         }
       } finally {
@@ -807,6 +823,7 @@ export function MarkdownEditor({
               files: deferredImageFilesRef.current.splice(0),
               message: "The previous image batch finished. Upload the next batch when ready.",
               retryable: true,
+              kind: "queued",
             });
           }
         }
@@ -816,8 +833,8 @@ export function MarkdownEditor({
   );
 
   const assetLifecycle = React.useMemo(
-    () => ({ vault }),
-    [vault],
+    () => ({ vault, document, commit }),
+    [commit, document, vault],
   );
 
   return (
@@ -856,7 +873,11 @@ export function MarkdownEditor({
         </Alert>
       )}
       {!uploadingImage && uploadFailure && (
-        <Alert variant="destructive" title="Image upload failed" className="border-x border-t-0">
+        <Alert
+          variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
+          title={uploadFailure.kind === "queued" ? "Images waiting to upload" : "Image upload failed"}
+          className="border-x border-t-0"
+        >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span>
               {uploadFailure.message}
@@ -872,7 +893,7 @@ export function MarkdownEditor({
                 onClick={() => void uploadImages(uploadFailure.files)}
               >
                 <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                Retry
+                {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
               </Button>
             ) : (
               <Button

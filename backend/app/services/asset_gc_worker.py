@@ -15,7 +15,10 @@ from datetime import timedelta
 from app.config import settings
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner
-from app.services.s3_delete_worker import enqueue_delete
+from app.services.s3_delete_worker import (
+    enqueue_delete,
+    enqueue_pending_upload_delete,
+)
 
 logger = logging.getLogger("akb.asset_gc_worker")
 
@@ -28,6 +31,7 @@ async def collect_once() -> int:
     pool = await get_pool()
     unclaimed_ttl = timedelta(hours=settings.document_asset_unclaimed_ttl_hours)
     claimed_grace = timedelta(days=settings.document_asset_revision_retention_days)
+    pending_file_ttl = timedelta(hours=settings.file_pending_upload_ttl_hours)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -55,41 +59,47 @@ async def collect_once() -> int:
                 WITH candidates AS (
                     SELECT vf.id
                       FROM vault_files vf
-                     WHERE vf.kind = 'attachment'
-                       AND NOT EXISTS (
-                            SELECT 1 FROM document_asset_refs live
-                             WHERE live.asset_id = vf.id
-                               AND live.vault_id = vf.vault_id
-                       )
-                       AND NOT EXISTS (
-                            SELECT 1 FROM document_asset_revision_refs rev
-                             WHERE rev.asset_id = vf.id
-                               AND rev.vault_id = vf.vault_id
-                               AND rev.retain_until > NOW()
-                       )
-                       AND (
-                            (
-                                vf.attachment_claimed_at IS NULL
-                                AND vf.created_at < NOW() - $1::interval
+                     WHERE (
+                            vf.kind = 'attachment'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM document_asset_refs live
+                                 WHERE live.asset_id = vf.id
+                                   AND live.vault_id = vf.vault_id
                             )
-                            OR (
-                                vf.attachment_claimed_at IS NOT NULL
-                                AND vf.updated_at < NOW() - $2::interval
+                            AND NOT EXISTS (
+                                SELECT 1 FROM document_asset_revision_refs rev
+                                 WHERE rev.asset_id = vf.id
+                                   AND rev.vault_id = vf.vault_id
+                                   AND rev.retain_until > NOW()
                             )
+                            AND (
+                                (vf.attachment_claimed_at IS NULL
+                                 AND vf.created_at < NOW() - $1::interval)
+                                OR
+                                (vf.attachment_claimed_at IS NOT NULL
+                                 AND vf.updated_at < NOW() - $2::interval)
+                            )
+                       ) OR (
+                            vf.kind = 'file'
+                            AND vf.upload_state = 'pending'
+                            AND vf.updated_at < NOW() - $3::interval
                        )
                      ORDER BY vf.created_at, vf.id
-                     LIMIT $3
+                     LIMIT $4
                      FOR UPDATE SKIP LOCKED
                 )
                 DELETE FROM vault_files vf
                  USING candidates c
                  WHERE vf.id = c.id
-                RETURNING vf.id, vf.s3_key
+                RETURNING vf.id, vf.s3_key, vf.kind, vf.upload_state
                 """,
-                unclaimed_ttl, claimed_grace, BATCH_SIZE,
+                unclaimed_ttl, claimed_grace, pending_file_ttl, BATCH_SIZE,
             )
             for row in rows:
-                await enqueue_delete(conn, row["s3_key"])
+                if row["upload_state"] == "pending":
+                    await enqueue_pending_upload_delete(conn, row["s3_key"])
+                else:
+                    await enqueue_delete(conn, row["s3_key"])
 
     count = len(rows)
     if count:
@@ -112,13 +122,19 @@ async def pending_stats() -> dict[str, int]:
         row = await conn.fetchrow(
             """
             SELECT
-                COUNT(*) FILTER (
-                    WHERE kind = 'attachment' AND attachment_claimed_at IS NULL
-                ) AS unclaimed,
-                COUNT(*) FILTER (
-                    WHERE kind = 'attachment' AND attachment_claimed_at IS NOT NULL
-                ) AS claimed
-              FROM vault_files
+                (SELECT COUNT(*) FROM vault_files
+                  WHERE kind = 'attachment'
+                    AND attachment_claimed_at IS NULL) AS unclaimed,
+                (SELECT COUNT(*) FROM vault_files
+                  WHERE kind = 'attachment'
+                    AND attachment_claimed_at IS NOT NULL) AS claimed,
+                (SELECT COUNT(*) FROM vault_files
+                  WHERE kind = 'file'
+                    AND upload_state = 'pending') AS pending_files
             """
         )
-    return {"unclaimed": int(row["unclaimed"]), "claimed": int(row["claimed"])}
+    return {
+        "unclaimed": int(row["unclaimed"]),
+        "claimed": int(row["claimed"]),
+        "pending_files": int(row["pending_files"]),
+    }

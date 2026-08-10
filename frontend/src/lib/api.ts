@@ -841,12 +841,14 @@ export function publicationRawUrl(slug: string): string {
 /**
  * Asset-scoped URL for an image embedded by a counted document view.
  *
- * The view grant is sufficient for this narrow endpoint. Do not repeat the
- * broader password token in every `<img>` URL/access-log entry.
+ * The grant suppresses N+1 view counting. Password-protected publications also
+ * require their short-lived password token; a grant never unlocks content.
  */
 export function publicationAssetUrl(slug: string, fileId: string): string {
+  const token = getPublicationToken(slug);
   const grant = getViewGrant(slug);
   const search = new URLSearchParams();
+  if (token) search.set("token", token);
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${encodeURIComponent(slug)}/assets/${encodeURIComponent(fileId)}${qs ? `?${qs}` : ""}`;

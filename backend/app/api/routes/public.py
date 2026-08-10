@@ -98,17 +98,10 @@ def _verify_token(slug: str, token: str) -> bool:
 
 
 # ============================================================
-# View-grant: proves a COUNTED page open, so the paired /raw and /download
-# re-serves of that same view don't re-count and stay usable at the last allowed
-# view. Distinct from the password token (different HMAC purpose prefix) so one
-# can't substitute for the other on full-content routes: a password token must
-# NOT skip view-counting, and a grant must NOT unlock the page, /raw, or
-# /download. The document-image route is deliberately narrower: after a
-# successful counted page open, the grant alone may fetch only image UUIDs that
-# remain embedded by the exact current publication slice. This lets a
-# password-protected page lazy-load images for the grant lifetime without
-# extending the broader password token. Every subordinate request still checks
-# publication existence, expiry, and the exact published representation.
+# View-grant: proves a COUNTED page open, so subordinate requests for that view
+# do not re-count. It is deliberately distinct from the password token: a grant
+# never unlocks content, including document images. Password-protected image
+# requests must carry both capabilities while public images need only the grant.
 # ============================================================
 
 
@@ -667,25 +660,16 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
     document-wide manifest accidentally exposing an image from a private
     section, and removal/unpublish revokes access immediately.
     """
-    # An image is a subordinate fetch of an already-counted page view, never a
-    # new publication view of its own. Require the counted-page grant so a
-    # document with N images cannot consume N additional view-cap entries (and
-    # so the last allowed page view can still render all of its images).
+    # An image is a subordinate fetch of an already-counted page view. Require
+    # its short-lived grant so N images do not consume N view-cap entries.
     if not _verify_view_grant(slug, _extract_view_grant(request)):
         raise HTTPException(status_code=404, detail="Asset not found")
     try:
-        # The grant proves this client already passed any password gate on the
-        # counted page open. Treat it as asset-scoped authority only: unlike a
-        # password token it cannot fetch the document, raw File bytes, tables,
-        # or arbitrary attachments, and the exact rendered slice is checked
-        # below before object storage is touched. This also prevents the
-        # one-hour password token from breaking images that lazy-load later in
-        # the grant's (configurable) page-session lifetime.
-        publication = await publication_service.resolve_publication(
-            slug,
-            password=None,
+        # Re-run normal publication access without incrementing the view. A
+        # grant suppresses counting but never substitutes for a password token.
+        publication = await _resolve_with_access(
+            slug, request,
             increment_view=False,
-            bypass_password=True,
             enforce_view_cap=False,
         )
         if publication["resource_type"] != ResourceType.DOCUMENT:

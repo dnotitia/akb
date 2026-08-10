@@ -114,7 +114,7 @@ describe("editor image asset API", () => {
     setViewGrant("public slug", "view grant");
 
     expect(publicationAssetUrl("public slug", ASSET_ID)).toBe(
-      `/api/v1/public/public%20slug/assets/${ASSET_ID}?grant=view+grant`,
+      `/api/v1/public/public%20slug/assets/${ASSET_ID}?token=password+token&grant=view+grant`,
     );
   });
 });

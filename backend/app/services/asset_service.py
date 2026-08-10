@@ -129,6 +129,13 @@ def extract_asset_ids(markdown: str) -> set[uuid.UUID]:
     return result
 
 
+async def extract_asset_ids_async(markdown: str) -> set[uuid.UUID]:
+    """Parse a document manifest without occupying the asyncio event loop."""
+    if ASSET_URL_PREFIX not in markdown:
+        return set()
+    return await asyncio.to_thread(extract_asset_ids, markdown)
+
+
 async def _settle_must_complete_task(task: asyncio.Task[None]) -> None:
     """Wait for a shielded storage call even after its caller is cancelled.
 
@@ -157,22 +164,40 @@ async def claim_document_assets(
     vault_id: uuid.UUID,
     markdown: str,
     strict: bool = True,
+    previous_markdown: str | None = None,
 ) -> set[uuid.UUID]:
     """Validate and retain the generated image references in ``markdown``.
 
     The vault predicate is part of the database lookup, so copying an asset URL
-    from another vault cannot turn it into a readable reference. In non-strict
-    mode unavailable URLs remain broken placeholders while valid local assets
-    are retained. Claiming is performed by the caller's document transaction:
-    if the Git/PG write fails, the claim rolls back with the document's
-    authoritative commit pointer.
+    from another vault cannot turn it into a readable reference. Updates may
+    retain unavailable URLs already present in ``previous_markdown`` but reject
+    newly introduced ones; valid local assets are retained. Claiming is
+    performed by the caller's document transaction, so a failed Git/PG write
+    rolls back with the document's authoritative commit pointer.
     """
-    return await claim_document_asset_ids(
+    asset_ids = await extract_asset_ids_async(markdown)
+    previous_asset_ids = (
+        await extract_asset_ids_async(previous_markdown)
+        if previous_markdown is not None
+        else None
+    )
+    found = await claim_document_asset_ids(
         conn,
         vault_id=vault_id,
-        asset_ids=extract_asset_ids(markdown),
-        strict=strict,
+        asset_ids=asset_ids,
+        # Existing broken references may remain editable, but newly introduced
+        # references are validated below. The transaction rolls this claim back
+        # if that validation fails.
+        strict=strict and previous_asset_ids is None,
     )
+    required = asset_ids if strict else set()
+    if previous_asset_ids is not None:
+        required = asset_ids - previous_asset_ids
+    if not required.issubset(found):
+        raise ValidationError(
+            "Document contains an unavailable image reference; upload the image to this vault first"
+        )
+    return found
 
 
 async def claim_document_asset_ids(
@@ -260,7 +285,7 @@ async def retain_document_assets_for_delete(
 def _safe_filename(filename: str, mime: str) -> str:
     name = filename.replace("\\", "/").rsplit("/", 1)[-1]
     name = "".join(ch for ch in name if ch >= " " and ch not in "\x7f/").strip()
-    if not name:
+    if not name or name in {".", ".."}:
         return f"image{_MIME_EXTENSIONS[mime]}"
     return name[:160]
 
@@ -326,11 +351,22 @@ async def create_image_asset(
 
     put_task: asyncio.Task[None] | None = None
     try:
+        # The pending row is the durable owner of this key. Perform remote I/O
+        # without holding a PostgreSQL connection or vault row lock; finalizing
+        # below revalidates both after the PUT finishes. Vault deletion records
+        # an additional delayed delete for pending keys, so a transfer that was
+        # already accepted by object storage cannot outlive its deleted vault.
+        put_task = asyncio.create_task(
+            asyncio.to_thread(s3_adapter.put_bytes, s3_key, body, actual_mime),
+            name=f"document-image-put:{file_id}",
+        )
+        await asyncio.shield(put_task)
+
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # Hold the vault lock through finalization so deletion either
-                # observes the finalized attachment or prevents the transfer
-                # from starting.
+                # Serialize final publication with vault deletion. The S3 call
+                # has completed, so this transaction contains only bounded DB
+                # work and does not pin a pool connection on remote latency.
                 vault_exists = await conn.fetchval(
                     "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
                     vault_id,
@@ -340,11 +376,6 @@ async def create_image_asset(
                         "Vault was deleted while the image upload was starting",
                         status_code=409,
                     )
-                put_task = asyncio.create_task(
-                    asyncio.to_thread(s3_adapter.put_bytes, s3_key, body, actual_mime),
-                    name=f"document-image-put:{file_id}",
-                )
-                await asyncio.shield(put_task)
                 finalized = await vault_files_repo.finalize_attachment(
                     conn,
                     file_id=file_id,

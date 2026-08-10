@@ -35,26 +35,25 @@ forms, share one parser-backed reachability path. Expired revision manifests
 are removed in indexed batches, and verified image bodies stream through the
 API after a bounded metadata check instead of being fully buffered per request.
 
-Upload finalization and vault deletion use coordinated row locks so every
-committed attachment is included in the deletion sweep. Vault deletion records
-immutable object keys in the existing retrying S3 outbox in the same transaction
-as the metadata cascade. Slow request bodies use a separately bounded admission
-pool and deadline instead of occupying image decode and object-storage slots.
-Regular File upload readiness now uses an explicit `upload_state`: pre-hash
-legacy Files remain confirmed and visible, while only newly initiated transfers
-are pending.
+Upload registration and finalization use short coordinated row-lock phases; the
+remote S3 PUT runs between them without pinning a PostgreSQL connection. Vault
+deletion records immutable object keys in the existing retrying S3 outbox in the
+same transaction as the metadata cascade. Pending keys receive both an immediate
+delete and a delayed reconciliation delete after the presigned-upload window.
+Slow request bodies use a separately bounded admission pool and deadline instead
+of occupying image decode and object-storage slots. Regular File upload readiness
+now uses an explicit `upload_state`: pre-hash legacy Files remain confirmed and
+visible, while newly initiated transfers are pending and stale pending rows are
+collected after 24 hours by default.
 
-Document writers claim all available same-vault assets without rejecting the
-entire Markdown save for an expired, imported, or cross-vault broken URL; those
-URLs remain unreadable placeholders. Public image requests require the page's
-already-counted, configurable view grant (24 hours by default) and never
-increment publication views themselves, so a page containing multiple or
-lazy-loaded images consumes exactly one view-cap entry. The grant is also the
-narrow authority for those exact embedded image UUIDs, so password-protected
-pages keep loading images after the broader one-hour password token expires;
-it cannot retrieve the document or any other publication content. Image URLs
-therefore carry only this asset-scoped grant instead of repeating the broader
-password token in every request.
+Document updates preserve pre-existing broken placeholders but reject newly
+introduced unavailable, expired, or cross-vault asset URLs. Public image
+requests require the page's already-counted, configurable view grant (10 minutes
+by default) and never increment publication views themselves, so a page
+containing multiple images consumes exactly one view-cap entry. The grant never
+replaces publication access: password-protected image requests must also carry
+the one-hour password token and continue to revalidate the exact published
+section before storage is touched.
 
 ### Added app identity credential exchange and capability enforcement
 

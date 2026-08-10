@@ -42,6 +42,8 @@ def test_safe_filename_uses_supported_format_metadata() -> None:
     from app.services import asset_service
 
     assert asset_service._safe_filename("\x7f", "image/webp") == "image.webp"
+    assert asset_service._safe_filename(".", "image/png") == "image.png"
+    assert asset_service._safe_filename("..", "image/jpeg") == "image.jpg"
 
 
 def test_extract_asset_ids_is_conservative_around_code() -> None:
@@ -83,9 +85,11 @@ async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
 
     class _Transaction:
         async def __aenter__(self):
+            events.append(("tx_enter",))
             return None
 
         async def __aexit__(self, *_args):
+            events.append(("tx_exit",))
             return None
 
     class _Connection:
@@ -151,14 +155,17 @@ async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
     names = [event[0] for event in events]
     assert events[names.index("inspect")][1] != main_thread
     lock_indexes = [i for i, name in enumerate(names) if name == "lock_vault"]
+    tx_enter_indexes = [i for i, name in enumerate(names) if name == "tx_enter"]
+    tx_exit_indexes = [i for i, name in enumerate(names) if name == "tx_exit"]
     assert len(lock_indexes) == 2
     assert (
         lock_indexes[0]
         < names.index("insert_pending")
-        < lock_indexes[1]
         < names.index("put")
+        < lock_indexes[1]
         < names.index("finalize")
     )
+    assert tx_exit_indexes[0] < names.index("put") < tx_enter_indexes[1]
     assert result["url"] == f"/api/assets/{result['id']}"
 
 
@@ -354,8 +361,10 @@ async def test_public_asset_grant_never_increments_publication_view(
     vault_id = uuid.uuid4()
     captured: dict = {}
 
-    async def fake_resolve(slug, **kwargs):
-        captured.update(slug=slug, **kwargs)
+    request = object()
+
+    async def fake_resolve(slug, resolved_request, **kwargs):
+        captured.update(slug=slug, request=resolved_request, **kwargs)
         return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
 
     async def fake_asset_ids(_publication):
@@ -371,7 +380,7 @@ async def test_public_asset_grant_never_increments_publication_view(
 
     monkeypatch.setattr(public, "_extract_view_grant", lambda _request: "grant")
     monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
-    monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
+    monkeypatch.setattr(public, "_resolve_with_access", fake_resolve)
     monkeypatch.setattr(
         public.publication_service,
         "resolve_document_publication_asset_ids",
@@ -380,14 +389,13 @@ async def test_public_asset_grant_never_increments_publication_view(
     monkeypatch.setattr(public.assets, "load_asset_row", fake_load)
     monkeypatch.setattr(public.assets, "image_asset_response", fake_response)
 
-    response = await public.publication_document_asset("share", str(file_id), object())
+    response = await public.publication_document_asset("share", str(file_id), request)
 
     assert response.body == b"image"
     assert captured == {
         "slug": "share",
-        "password": None,
+        "request": request,
         "increment_view": False,
-        "bypass_password": True,
         "enforce_view_cap": False,
         "file_id": str(file_id),
         "vault_id": vault_id,
@@ -396,61 +404,24 @@ async def test_public_asset_grant_never_increments_publication_view(
 
 
 @pytest.mark.asyncio
-async def test_public_asset_grant_is_asset_scoped_password_authority(
+async def test_public_asset_grant_does_not_bypass_password_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A counted page grant remains valid beyond the broader password token.
-
-    The asset route authorizes image access only after validating the page
-    grant, and it still authorizes one UUID from the exact rendered document
-    slice below. Full-content routes continue to use
-    ``_resolve_with_access`` and therefore keep the shorter password-token TTL.
-    """
-    from fastapi.responses import Response
+    from fastapi import HTTPException
     from app.api.routes import public
 
     file_id = uuid.uuid4()
-    vault_id = uuid.uuid4()
-    calls: list[dict] = []
 
-    async def fake_resolve(slug, **kwargs):
-        calls.append({"slug": slug, **kwargs})
-        return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": vault_id}
-
-    async def fake_asset_ids(_publication):
-        return frozenset({file_id})
+    async def require_password(*_args, **_kwargs):
+        raise public.PublicationPasswordRequired()
 
     monkeypatch.setattr(public, "_extract_view_grant", lambda _request: "grant")
     monkeypatch.setattr(public, "_verify_view_grant", lambda _slug, _grant: True)
-    monkeypatch.setattr(public.publication_service, "resolve_publication", fake_resolve)
-    monkeypatch.setattr(
-        public.publication_service,
-        "resolve_document_publication_asset_ids",
-        fake_asset_ids,
-    )
-    monkeypatch.setattr(
-        public.assets,
-        "load_asset_row",
-        lambda *_args: asyncio.sleep(0, result={"id": file_id}),
-    )
-    monkeypatch.setattr(
-        public.assets,
-        "image_asset_response",
-        lambda *_args, **_kwargs: asyncio.sleep(
-            0, result=Response(content=b"image", media_type="image/png"),
-        ),
-    )
+    monkeypatch.setattr(public, "_resolve_with_access", require_password)
 
-    response = await public.publication_document_asset("share", str(file_id), object())
-
-    assert response.body == b"image"
-    assert calls == [{
-        "slug": "share",
-        "password": None,
-        "increment_view": False,
-        "bypass_password": True,
-        "enforce_view_cap": False,
-    }]
+    with pytest.raises(HTTPException) as exc:
+        await public.publication_document_asset("share", str(file_id), object())
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -516,19 +487,83 @@ async def test_public_document_body_and_asset_manifest_share_pinned_cache(
     assert asset_ids == frozenset({visible})
 
 
-def test_publication_view_grant_outlives_browser_lazy_loading(
+@pytest.mark.asyncio
+async def test_legacy_public_document_resolves_head_into_pinned_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import publication_service
+
+    visible = uuid.uuid4()
+    reads = 0
+    heads = 0
+
+    class _Git:
+        def current_commit(self, vault):
+            nonlocal heads
+            heads += 1
+            assert vault == "team"
+            return "c" * 40
+
+        def read_file(self, vault, path, commit):
+            nonlocal reads
+            reads += 1
+            assert (vault, path, commit) == ("team", "legacy.md", "c" * 40)
+            return f"---\ntitle: Legacy\n---\n![shown](/api/assets/{visible})"
+
+    row = {
+        "path": "legacy.md",
+        "title": "Legacy",
+        "doc_type": "note",
+        "summary": None,
+        "domain": None,
+        "updated_at": None,
+        "tags": [],
+        "current_commit": None,
+        "vault_name": "team",
+        "created_by_name": "Alice",
+    }
+    publication = {
+        "resource_type": publication_service.ResourceType.DOCUMENT,
+        "section_filter": None,
+        "vault_id": str(uuid.uuid4()),
+    }
+
+    async def fake_find(_publication):
+        return row
+
+    publication_service._read_pinned_document_body.cache_clear()
+    monkeypatch.setattr(
+        publication_service,
+        "_get_doc_service",
+        lambda: SimpleNamespace(git=_Git()),
+    )
+    monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
+    try:
+        await publication_service.resolve_document_publication(publication)
+        asset_ids = await publication_service.resolve_document_publication_asset_ids(
+            publication,
+        )
+    finally:
+        publication_service._read_pinned_document_body.cache_clear()
+
+    assert heads == 2
+    assert reads == 1
+    assert asset_ids == frozenset({visible})
+
+
+def test_publication_view_grant_is_short_lived(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.routes import public
 
     now = 1_000_000.0
     monkeypatch.setattr(public.time, "time", lambda: now)
-    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 86_400)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     grant = public._make_view_grant("share")
 
-    now += 3_600
+    now += 599
     assert public._verify_view_grant("share", grant) is True
-    now += 86_401
+    now += 2
     assert public._verify_view_grant("share", grant) is False
 
 
@@ -619,6 +654,44 @@ async def test_document_asset_claim_rejects_missing_or_cross_vault_ids(
 
 
 @pytest.mark.asyncio
+async def test_document_asset_claim_rejects_only_new_unavailable_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    existing_broken = uuid.uuid4()
+    newly_missing = uuid.uuid4()
+
+    async def find_none(_conn, _vault_id, _file_ids, *, strict):
+        assert strict is False
+        return set()
+
+    monkeypatch.setattr(
+        asset_service.vault_files_repo,
+        "claim_attachment_references",
+        find_none,
+    )
+    previous = f"![old](/api/assets/{existing_broken})"
+    assert await claim_document_assets(
+        object(),
+        vault_id=uuid.uuid4(),
+        markdown=previous,
+        strict=False,
+        previous_markdown=previous,
+    ) == set()
+
+    with pytest.raises(AKBError) as exc:
+        await claim_document_assets(
+            object(),
+            vault_id=uuid.uuid4(),
+            markdown=previous + f"\n![new](/api/assets/{newly_missing})",
+            strict=False,
+            previous_markdown=previous,
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_discard_route_deletes_only_through_transactional_outbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -692,9 +765,20 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
     """The generic File confirm endpoint must not mutate editor assets."""
     from app.services import file_service
 
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
     class _Acquire:
         async def __aenter__(self):
-            return object()
+            return _Connection()
 
         async def __aexit__(self, *_args):
             return None
@@ -706,8 +790,9 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
     async def fake_get_pool():
         return _Pool()
 
-    async def fake_find_by_id(_conn, _vault_id, _file_id):
-        return {"kind": "attachment", "s3_key": "must-not-be-read"}
+    async def fake_lease(_conn, _vault_id, _file_id):
+        # The repository predicate excludes kind='attachment'.
+        return None
 
     storage_touched = False
 
@@ -718,7 +803,11 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
 
     monkeypatch.setattr(file_service, "get_pool", fake_get_pool)
     monkeypatch.setattr(file_service, "measurement_enabled", lambda: False)
-    monkeypatch.setattr(file_service.vault_files_repo, "find_by_id", fake_find_by_id)
+    monkeypatch.setattr(
+        file_service.vault_files_repo,
+        "lease_file_upload_confirmation",
+        fake_lease,
+    )
     monkeypatch.setattr(file_service.s3_adapter, "head", unexpected_head)
 
     with pytest.raises(NotFoundError):
@@ -820,7 +909,12 @@ async def test_asset_gc_deletes_metadata_and_enqueues_object_in_one_transaction(
         async def fetch(self, sql, *_args):
             calls.append(("fetch", " ".join(sql.split())))
             return [
-                {"id": uuid.uuid4(), "s3_key": "vault/.akb-assets/old/image.png"},
+                {
+                    "id": uuid.uuid4(),
+                    "s3_key": "vault/.akb-assets/old/image.png",
+                    "kind": "attachment",
+                    "upload_state": "confirmed",
+                },
             ]
 
     class _Acquire:
@@ -851,4 +945,29 @@ async def test_asset_gc_deletes_metadata_and_enqueues_object_in_one_transaction(
     assert expiry_call[2] == (asset_gc_worker.REVISION_EXPIRE_BATCH_SIZE,)
     candidate_sql = next(call[1] for call in calls if call[0] == "fetch")
     assert "hash_verified_at IS NOT NULL" not in candidate_sql
+    assert "vf.kind = 'file'" in candidate_sql
+    assert "vf.upload_state = 'pending'" in candidate_sql
     assert calls[-1] == ("tx_exit",)
+
+
+@pytest.mark.asyncio
+async def test_pending_upload_delete_is_rechecked_after_presigned_put_window() -> None:
+    from app.services import s3_delete_worker
+
+    calls: list[tuple[str, int]] = []
+
+    class _Connection:
+        async def execute(self, _sql, key, delay_seconds):
+            calls.append((key, delay_seconds))
+
+    await s3_delete_worker.enqueue_pending_upload_delete(
+        _Connection(), "vault/file.bin",
+    )
+
+    assert calls == [
+        ("vault/file.bin", 0),
+        (
+            "vault/file.bin",
+            s3_delete_worker.PENDING_UPLOAD_DELETE_RECHECK_SECONDS,
+        ),
+    ]

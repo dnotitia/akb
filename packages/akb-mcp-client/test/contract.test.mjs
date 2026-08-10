@@ -269,6 +269,22 @@ itAsync("_discardImage accepts only canonical asset URLs", async () => {
   );
 });
 
+itAsync("_discardImage treats an already absent upload as discarded", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const assetId = "11111111-2222-4333-8444-555555555555";
+  proxy._http = async () => {
+    const error = new Error("HTTP 404: Asset not found");
+    error.statusCode = 404;
+    throw error;
+  };
+
+  const result = await proxy._discardImage({
+    vault: "myvault",
+    url: `/api/assets/${assetId}`,
+  });
+  assert.equal(result.discarded, true);
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 
 await Promise.all(pending);
