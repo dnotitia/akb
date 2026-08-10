@@ -362,8 +362,9 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
     file_id = uuid.uuid4()
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO vault_files (id, vault_id, name, s3_key, mime_type, size_bytes, created_at) VALUES "
-            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, NOW())",
+            "INSERT INTO vault_files "
+            "(id, vault_id, name, s3_key, mime_type, size_bytes, upload_state, created_at) VALUES "
+            "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, 'pending', NOW())",
             file_id, vid, f"_inv7b_{file_id}",
         )
         await conn.execute(
@@ -381,8 +382,16 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
         outbox = await conn.fetchval(
             "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = $1", file_id,
         )
-        s3_outbox = await conn.fetchval(
-            "SELECT COUNT(*) FROM s3_delete_outbox WHERE s3_key = $1",
+        s3_outbox = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE next_attempt_at <= NOW()) AS immediate,
+                   COUNT(*) FILTER (
+                       WHERE next_attempt_at > NOW() + INTERVAL '23 hours'
+                   ) AS reconciliation
+              FROM s3_delete_outbox
+             WHERE s3_key = $1
+            """,
             f"_inv7b_{file_id}",
         )
 
@@ -391,9 +400,9 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
         "file chunk must be enqueued in vector_delete_outbox even when S3 is "
         f"configured (vault_files deleted early); got {outbox}"
     )
-    assert s3_outbox == 1, (
-        "file bytes must be enqueued transactionally for retry after vault deletion; "
-        f"got {s3_outbox}"
+    assert dict(s3_outbox) == {"total": 2, "immediate": 1, "reconciliation": 1}, (
+        "a pending upload must enqueue one immediate delete and one delayed "
+        f"reconciliation after vault deletion; got {dict(s3_outbox)}"
     )
 
 
