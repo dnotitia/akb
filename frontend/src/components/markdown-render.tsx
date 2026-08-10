@@ -45,6 +45,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import "katex/dist/katex.min.css";
+import { AssetImage, type AssetContext } from "@/components/asset-image";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
 import { parseHeadings, slugify, stripFrontmatter } from "@/lib/markdown";
 
@@ -437,7 +438,7 @@ function flattenText(children: React.ReactNode): string {
 /* ── Build the full components map ───────────────────────────────── */
 type HeadingProps = ComponentProps<"h1"> & ExtraProps;
 
-function buildComponents(markdown: string): Components {
+function buildComponents(markdown: string, assetContext?: AssetContext): Components {
   // Heading slugs in document order — matches parseHeadings() so the
   // outline's `#slug` anchors line up with the rendered `id`s. The
   // cursor advances once per heading element react-markdown renders,
@@ -588,10 +589,10 @@ function buildComponents(markdown: string): Components {
       );
     },
     img: ({ node: _node, src, alt, ...props }) => (
-      <img
-        src={src}
+      <AssetImage
+        src={typeof src === "string" ? src : null}
         alt={alt}
-        loading="lazy"
+        assetContext={assetContext}
         className="block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto"
         {...props}
       />
@@ -699,6 +700,7 @@ const REHYPE_PLUGINS = [rehypeKatex];
 export interface MarkdownRenderProps {
   markdown: string;
   className?: string;
+  assetContext?: AssetContext;
 }
 
 /**
@@ -707,7 +709,7 @@ export interface MarkdownRenderProps {
  * font color + a `.akb-md` scope used to style KaTeX display blocks
  * (see src/index.css).
  */
-export function MarkdownRender({ markdown, className }: MarkdownRenderProps) {
+export function MarkdownRender({ markdown, className, assetContext }: MarkdownRenderProps) {
   // Drop any leading embedded frontmatter block before rendering so its
   // closing `---` isn't parsed as a setext heading (see stripFrontmatter).
   // Sharing the stripped body keeps the rendered headings and the slug
@@ -718,8 +720,8 @@ export function MarkdownRender({ markdown, className }: MarkdownRenderProps) {
     [body],
   );
   const components = useMemo(
-    () => buildComponents(body),
-    [body],
+    () => buildComponents(body, assetContext),
+    [assetContext, body],
   );
 
   return (

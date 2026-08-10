@@ -460,7 +460,8 @@ async def create_publication(
                     # Bind to vault_id (not id alone) so this can't be satisfied
                     # by a same-UUID file in another vault (cross-vault IDOR).
                     found = await conn.fetchval(
-                        "SELECT 1 FROM vault_files WHERE id = $1 AND vault_id = $2 FOR SHARE",
+                        "SELECT 1 FROM vault_files WHERE id = $1 AND vault_id = $2 "
+                        "AND kind = 'file' AND hash_verified_at IS NOT NULL FOR SHARE",
                         file_uuid_obj, vault_id,
                     )
                     if not found:
@@ -573,6 +574,7 @@ async def create_publication_for_vault(
                   FROM vault_files f
                   LEFT JOIN collections c ON c.id = f.collection_id
                  WHERE f.id = $1 AND f.vault_id = $2
+                   AND f.kind = 'file' AND f.hash_verified_at IS NOT NULL
                 """,
                 uuid.UUID(file_id), vault_id,
             )
@@ -1364,6 +1366,7 @@ async def resolve_file_publication(publication: dict) -> dict:
               FROM vault_files f
               LEFT JOIN collections c ON c.id = f.collection_id
              WHERE f.id = $1 AND f.vault_id = $2
+               AND f.kind = 'file' AND f.hash_verified_at IS NOT NULL
             """,
             to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
@@ -1403,7 +1406,9 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+            "SELECT name, s3_key, mime_type, size_bytes FROM vault_files "
+            "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
+            "AND hash_verified_at IS NOT NULL",
             to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
         )
     if file_row is None:

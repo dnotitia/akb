@@ -236,6 +236,8 @@ async def _apply_migrations() -> None:
         "057_native_revision_m1_payload_placement.py", # M1 placement-scoped payload deduplication
         "058_publication_document_identity.py",  # publications.document_id + composite FK (document_id, vault_id) → documents(id, vault_id) ON DELETE CASCADE; conservative backfill
         "059_native_file_searchable_derived.py",  # chunks.source_type admits 'native_file' so text Files reach the chunk/index/embedding pipeline on the Document's Resource/Revision basis
+        "060_document_image_assets.py",  # vault_files.kind separates hidden editor attachments from standalone Files
+        "061_document_image_asset_lifecycle.py",  # claimed attachments survive for historical Git revisions; only unclaimed uploads may be discarded
     ):
         if filename in applied:
             continue

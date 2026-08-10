@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -52,6 +52,7 @@ type DocView = "rendered" | "raw" | "agent" | "edit";
 export default function DocumentPage() {
   const { name, id } = useParams<{ name: string; id: string }>();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { refetchTree } = useVaultRefresh();
   const [searchParams, setSearchParams] = useSearchParams();
   const commitHash = searchParams.get("commit") || undefined;
@@ -84,6 +85,7 @@ export default function DocumentPage() {
   const [originalContent, setOriginalContent] = useState("");
   const [editorKey, setEditorKey] = useState(0);
   const [savingBody, setSavingBody] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // Plate's markdown roundtrip is not byte-identity: adopt the first
@@ -91,6 +93,7 @@ export default function DocumentPage() {
   // editor doesn't flash "UNSAVED" the moment it mounts.
   const hydratedKey = useRef<number | null>(null);
   const isDirty = editingContent !== originalContent;
+  const hasUnsavedWork = isDirty || uploadingImage;
   const docId = id ? decodeURIComponent(id) : "";
 
   const applyView = (next: DocView) => {
@@ -102,7 +105,7 @@ export default function DocumentPage() {
   const setView = (next: DocView) => {
     // Leaving Edit with unsaved changes routes through a ConfirmDialog
     // (design system bans window.confirm); the actual switch happens on confirm.
-    if (view === "edit" && next !== "edit" && isDirty) {
+    if (view === "edit" && next !== "edit" && hasUnsavedWork) {
       setPendingView(next);
       return;
     }
@@ -197,29 +200,40 @@ export default function DocumentPage() {
 
   // Warn before page navigation (close tab, browser back) when dirty.
   useEffect(() => {
-    if (!isDirty) return;
+    if (!hasUnsavedWork) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [isDirty]);
+  }, [hasUnsavedWork]);
 
   async function handleSaveBody() {
-    if (!name || !docId) return;
+    if (!name || !docId || uploadingImage) return;
     setSavingBody(true);
     setBodyError("");
     try {
-      await updateDocument(name, docId, { content: editingContent });
+      const saved = await updateDocument(name, docId, { content: editingContent });
       const now = new Date().toISOString();
       // Optimistically advance content + updated_at so the byline reads
-      // "last changed just now" without waiting for a refetch.
-      setDocOverride({
+      // "last changed just now" without waiting for a refetch. DocumentView
+      // consumes the same query key independently, so update that cache too;
+      // a local page override alone leaves its Rendered tab stale.
+      const nextDoc = {
         ...(doc || {}),
         content: editingContent,
         updated_at: now,
-      });
+        current_commit: saved.current_commit ?? saved.commit_hash ?? doc?.current_commit,
+      };
+      setDocOverride(nextDoc);
+      queryClient.setQueryData(
+        ["document", name, docId, undefined],
+        (cached: Record<string, unknown> | undefined) => ({
+          ...(cached || {}),
+          ...nextDoc,
+        }),
+      );
       setOriginalContent(editingContent);
       // Sidebar refresh is best-effort — its failure must not leave the
       // user looking at a "still dirty" editor after a successful save.
@@ -237,6 +251,10 @@ export default function DocumentPage() {
       });
       const p = new URLSearchParams(searchParams);
       p.delete("view");
+      // A commit pin equal to HEAD is editable, but this save just created a
+      // newer HEAD. Return to the live document instead of leaving the URL on
+      // the now-historical revision while showing the new body.
+      p.delete("commit");
       setSearchParams(p, { replace: true });
     } catch (e: unknown) {
       const status = e instanceof ApiError ? e.status : 0;
@@ -560,19 +578,25 @@ export default function DocumentPage() {
                   }}
                   ariaLabel="Document body (markdown)"
                   autoFocus
+                  vault={name!}
+                  onUploadingChange={setUploadingImage}
                 />
               </Suspense>
               {bodyError && <Alert variant="destructive">{bodyError}</Alert>}
               <div className="flex items-center justify-between">
                 <div className="coord">
-                  {isDirty && <span className="text-warning">Unsaved changes</span>}
+                  {uploadingImage ? (
+                    <span className="text-info">Waiting for image upload</span>
+                  ) : (
+                    isDirty && <span className="text-warning">Unsaved changes</span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
                     type="button"
                     variant="outline"
                     onClick={handleCancelBody}
-                    disabled={savingBody || !isDirty}
+                    disabled={savingBody || uploadingImage || !isDirty}
                     size="sm"
                   >
                     Cancel
@@ -581,7 +605,7 @@ export default function DocumentPage() {
                     type="button"
                     variant="accent"
                     onClick={handleSaveBody}
-                    disabled={savingBody || !isDirty}
+                    disabled={savingBody || uploadingImage || !isDirty}
                     size="sm"
                   >
                     {savingBody ? (
@@ -797,7 +821,11 @@ export default function DocumentPage() {
         open={pendingView !== null}
         onOpenChange={(o) => !o && setPendingView(null)}
         title="Discard unsaved changes?"
-        description="Your edits to the document body will be lost."
+        description={
+          uploadingImage
+            ? "The image upload will be cancelled and your edits to the document body will be lost."
+            : "Your edits to the document body will be lost."
+        }
         confirmLabel="Discard changes"
         variant="destructive"
         onConfirm={() => {
@@ -864,4 +892,3 @@ function FrontmatterCard({ doc }: { doc: any }) {
     </Panel>
   );
 }
-

@@ -129,6 +129,7 @@ from app.repositories.events_repo import emit_event
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository
 from app.services.git_service import GitService
+from app.services import asset_service
 from app.services.index_service import (
     build_doc_metadata_header,
     chunk_markdown,
@@ -570,6 +571,14 @@ class DocumentService:
         md_content = _compose_markdown(fm_dict, req.content)
         content_hash = _certified_content_hash(md_content)
 
+        # Validate generated asset URLs before the Git write.  The row locks
+        # also serialize a concurrent editor discard with this transaction;
+        # a successful document commit makes its assets permanently retained
+        # for Git history, while a failed write rolls the claims back.
+        await asset_service.claim_document_assets(
+            conn, vault_id=vault_id, markdown=req.content,
+        )
+
         # Git commit
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
         commit_hash = await run_git_write(
@@ -929,6 +938,11 @@ class DocumentService:
         new_md = _compose_markdown(current_fm, new_body)
         previous_hash = current_hash
         content_hash = _certified_content_hash(new_md)
+
+        if req.content is not None:
+            await asset_service.claim_document_assets(
+                conn, vault_id=vault_id, markdown=new_body,
+            )
 
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
@@ -1333,6 +1347,10 @@ class DocumentService:
         new_md = _compose_markdown(current_fm, new_body)
         previous_hash = row.get("content_hash") or _body_content_hash(current_body)
         content_hash = _certified_content_hash(new_md)
+
+        await asset_service.claim_document_assets(
+            conn, vault_id=vault_id, markdown=new_body,
+        )
 
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
@@ -2117,6 +2135,9 @@ class DocumentService:
                         SELECT
                           (SELECT COUNT(*) FROM documents
                             WHERE vault_id = $1 AND path <> 'overview/vault-skill.md') AS docs,
+                          -- This is a rollback safety guard, not a UI resource
+                          -- count: every concurrent byte write, including a
+                          -- hidden editor attachment, must prevent vault purge.
                           (SELECT COUNT(*) FROM vault_files WHERE vault_id = $1) AS files,
                           (SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1) AS tables,
                           (SELECT COUNT(*) FROM publications WHERE vault_id = $1) AS pubs,

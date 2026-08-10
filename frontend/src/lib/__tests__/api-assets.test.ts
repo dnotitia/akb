@@ -1,0 +1,99 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  discardAsset,
+  getAssetBlob,
+  publicationAssetUrl,
+  setPublicationToken,
+  setToken,
+  setViewGrant,
+  uploadAsset,
+} from "@/lib/api";
+
+const ASSET_ID = "6d04dc8a-0302-4a85-a314-e7485ff5a610";
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("editor image asset API", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    localStorage.clear();
+    sessionStorage.clear();
+    setToken("test-token");
+  });
+
+  afterEach(() => {
+    setToken(null);
+    vi.restoreAllMocks();
+  });
+
+  it("uploads the image as a raw MIME body", async () => {
+    const file = new File(["image bytes"], "diagram one.png", { type: "image/png" });
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: ASSET_ID,
+        url: `/api/assets/${ASSET_ID}`,
+        name: file.name,
+        mime_type: file.type,
+        size_bytes: file.size,
+      }),
+    );
+
+    const result = await uploadAsset("team vault", file);
+
+    expect(result.id).toBe(ASSET_ID);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/assets/team%20vault?filename=diagram+one.png");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(file);
+    expect(init.headers).toEqual({
+      "Content-Type": "image/png",
+      Authorization: "Bearer test-token",
+    });
+  });
+
+  it("fetches private image bytes with Bearer auth", async () => {
+    const blob = new Blob(["image bytes"], { type: "image/png" });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      blob: vi.fn().mockResolvedValue(blob),
+    } as unknown as Response);
+
+    await expect(getAssetBlob(ASSET_ID, "team vault")).resolves.toEqual(blob);
+    expect(fetchMock).toHaveBeenCalledWith(`/api/assets/${ASSET_ID}?vault=team+vault`, {
+      headers: { Authorization: "Bearer test-token" },
+      signal: undefined,
+    });
+  });
+
+  it("discards an uncommitted upload through the vault-scoped endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await expect(discardAsset("team vault", ASSET_ID)).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/assets/team%20vault/${ASSET_ID}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: "Bearer test-token" },
+        keepalive: true,
+      },
+    );
+  });
+
+  it("carries the publication token and view grant in asset URLs", () => {
+    setPublicationToken("public slug", "password token");
+    setViewGrant("public slug", "view grant");
+
+    expect(publicationAssetUrl("public slug", ASSET_ID)).toBe(
+      `/api/v1/public/public%20slug/assets/${ASSET_ID}?token=password+token&grant=view+grant`,
+    );
+  });
+});

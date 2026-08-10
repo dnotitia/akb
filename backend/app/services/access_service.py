@@ -688,7 +688,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
         _q("SELECT COUNT(*) FROM vault_access WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vid),
         _q("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid),
-        _q("SELECT COUNT(*) FROM vault_files WHERE vault_id = $1", vid),
+        _q("SELECT COUNT(*) FROM vault_files WHERE vault_id = $1 AND kind = 'file'", vid),
         # Authoritative collection total — depth-safe, unlike a client-side
         # browse(depth=2) count which silently undercounts deeper nesting.
         _q("SELECT COUNT(*) FROM collections WHERE vault_id = $1", vid),

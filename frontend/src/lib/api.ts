@@ -309,6 +309,97 @@ export const updateDocument = (vault: string, id: string, data: any) =>
 export const deleteDocument = (vault: string, id: string) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "DELETE" });
 
+// ── Editor image assets ──
+export interface AssetUploadResponse {
+  id: string;
+  url: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+}
+
+/**
+ * Upload an editor image as a raw request body. This deliberately does not use
+ * `api()`: that helper always injects `Content-Type: application/json`, while
+ * the asset endpoint validates the image MIME from this header.
+ */
+export async function uploadAsset(
+  vault: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<AssetUploadResponse> {
+  const token = getToken();
+  const params = new URLSearchParams({ filename: file.name });
+  const headers: Record<string, string> = { "Content-Type": file.type };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}?${params}`,
+    { method: "POST", headers, body: file, signal },
+  );
+  if (res.status === 401) {
+    setToken(null);
+    if (!location.pathname.startsWith("/auth")) {
+      location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
+    }
+    throw new Error("Unauthorized");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    if (body && typeof body.detail === "object" && body.detail !== null) {
+      const detail = body.detail as { message?: string };
+      throw new ApiError(
+        detail.message || `${res.status} ${res.statusText}`,
+        res.status,
+        body.detail,
+      );
+    }
+    throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Fetch a private asset with the app's Bearer credential for blob rendering. */
+export async function getAssetBlob(
+  fileId: string,
+  vault: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const params = new URLSearchParams({ vault });
+  const res = await fetch(`/api/assets/${encodeURIComponent(fileId)}?${params}`, { headers, signal });
+  if (res.status === 401) {
+    setToken(null);
+    if (!location.pathname.startsWith("/auth")) {
+      location.href = "/auth?next=" + encodeURIComponent(location.pathname + location.search);
+    }
+    throw new Error("Unauthorized");
+  }
+  if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
+  return res.blob();
+}
+
+/** Best-effort cleanup for an upload that never reached a document commit. */
+export async function discardAsset(vault: string, fileId: string): Promise<void> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+    { method: "DELETE", headers, keepalive: true },
+  );
+  // Cleanup is idempotent from the editor's perspective. A 404 also covers an
+  // asset that a successful save already claimed and therefore retained.
+  if (res.ok || res.status === 404) return;
+  if (res.status === 401) {
+    setToken(null);
+    throw new Error("Unauthorized");
+  }
+  throw new Error(`Image cleanup failed (${res.status})`);
+}
+
 // ── Browse ──
 export const browseVault = (vault: string, collection?: string, depth = 1) => {
   const p = new URLSearchParams({ depth: String(depth) });
@@ -749,6 +840,17 @@ export function publicationRawUrl(slug: string): string {
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   return `${API_BASE}/public/${slug}/raw${qs ? `?${qs}` : ""}`;
+}
+
+/** Same-view URL for an image embedded by a document publication. */
+export function publicationAssetUrl(slug: string, fileId: string): string {
+  const token = getPublicationToken(slug);
+  const grant = getViewGrant(slug);
+  const search = new URLSearchParams();
+  if (token) search.set("token", token);
+  if (grant) search.set("grant", grant);
+  const qs = search.toString();
+  return `${API_BASE}/public/${encodeURIComponent(slug)}/assets/${encodeURIComponent(fileId)}${qs ? `?${qs}` : ""}`;
 }
 
 export function publicationCsvUrl(slug: string, params?: Record<string, string>): string {

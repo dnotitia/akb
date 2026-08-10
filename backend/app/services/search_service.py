@@ -529,7 +529,12 @@ class SearchService:
 
                 if not doc_type or doc_type == "file":
                     f_params: list = []
-                    f_conds: list[str] = []
+                    # Editor attachments are storage implementation details,
+                    # never standalone searchable File resources.
+                    f_conds: list[str] = [
+                        "f.kind = 'file'",
+                        "f.hash_verified_at IS NOT NULL",
+                    ]
                     if vaults:
                         f_conds.append("v.name = ANY($1)")
                         f_params.append(vaults)
@@ -895,6 +900,8 @@ class SearchService:
                       JOIN vaults v ON f.vault_id = v.id
                       LEFT JOIN collections c ON c.id = f.collection_id
                      WHERE f.id = ANY($1)
+                       AND f.kind = 'file'
+                       AND f.hash_verified_at IS NOT NULL
                     """,
                     [uuid.UUID(x) for x in by_type["file"]],
                 )

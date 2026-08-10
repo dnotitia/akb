@@ -903,6 +903,7 @@ class CollectionRepository:
             "  FROM vault_files vf "
             "  JOIN collections c ON c.id = vf.collection_id "
             " WHERE vf.vault_id = $1 "
+            "   AND vf.kind = 'file' "
             "   AND (c.path = $2 OR c.path LIKE $3 ESCAPE '\\')"
         )
         async def _do(c):

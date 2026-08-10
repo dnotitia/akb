@@ -56,8 +56,10 @@ LinkRelationType = Literal[
 ]
 LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
 
-# Matches markdown links: [text](target)
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Matches markdown links: [text](target), excluding image syntax.  Editor
+# assets are byte references governed by the document/publication ACL, not
+# knowledge-graph document edges.
+_MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
 # Matches Obsidian-style wikilinks: [[target]] or [[target|alias]]. Only the
 # target (before the first '|') is the link; the rest is display text. The
 # inner run cannot contain '[' or ']'.
@@ -103,7 +105,7 @@ def extract_markdown_links(content: str) -> list[str]:
         external URLs / anchors; keeps akb:// URIs verbatim; strips a
         leading './' and any '#fragment' from relative paths."""
         target = raw.strip()
-        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+        if not target or target.startswith(("http://", "https://", "mailto:", "#", "/api/assets/")):
             return
         if target.startswith("akb://"):
             if target not in seen:
@@ -608,7 +610,7 @@ async def _fetch_orphan_nodes(
     file_rows = await conn.fetch(
         "SELECT f.id::text AS id, f.name, c.path AS coll "
         "FROM vault_files f LEFT JOIN collections c ON f.collection_id = c.id "
-        "WHERE f.vault_id = $1 AND f.id::text != ALL($2::text[]) "
+        "WHERE f.vault_id = $1 AND f.kind = 'file' AND f.id::text != ALL($2::text[]) "
         "ORDER BY f.created_at DESC LIMIT $3",
         vault_id, list(file_ids), per,
     )
@@ -1044,7 +1046,7 @@ async def _batch_resolve_names(
     if file_ids:
         rows = await conn.fetch(
             "SELECT id::text, name FROM vault_files "
-            "WHERE id::text = ANY($1::text[]) AND vault_id = $2",
+            "WHERE id::text = ANY($1::text[]) AND vault_id = $2 AND kind = 'file'",
             file_ids, vault_id,
         )
         for r in rows:
@@ -1072,7 +1074,7 @@ async def _resource_exists(conn, vault_id: uuid.UUID, rtype: str, identifier: st
         ))
     elif rtype == "file":
         return bool(await conn.fetchval(
-            "SELECT 1 FROM vault_files WHERE vault_id = $1 AND id::text = $2", vault_id, identifier,
+            "SELECT 1 FROM vault_files WHERE vault_id = $1 AND kind = 'file' AND id::text = $2", vault_id, identifier,
         ))
     return False
 
@@ -1320,4 +1322,3 @@ async def _bfs_collect(
 
 
 # ── URI builder helpers for callers ──────────────────────────
-

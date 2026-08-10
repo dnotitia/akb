@@ -210,16 +210,12 @@ async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> 
     """Drop this file's publications on the CALLER's connection, before its
     `vault_files` row goes.
 
-    A file becomes publishable the moment `initiate_upload` writes its row —
-    `create_publication` only checks `SELECT 1 FROM vault_files WHERE id=$1
-    AND vault_id=$2`, with no confirmed/hash predicate. So a file can be
-    published while the upload is still outstanding, and the two
-    `confirm_upload` failure paths that clean up the row (S3 object missing,
-    declared-bytes mismatch) would otherwise leave the publication behind:
-    a live slug in the owner's list pointing at a resource that no longer
-    exists. A file URI carries a UUID, so this cannot be reoccupied the way
-    a document path can — the row is simply stale, not reachable as
-    something else.
+    Publication creation now requires a confirmed ``kind='file'`` row, but
+    this remains the shared deletion chokepoint for both confirm-time cleanup
+    and ordinary File deletion. Keeping the cascade here protects legacy rows
+    and avoids coupling correctness to the order in which callers discovered
+    the invalid or deleted object. A file URI carries a UUID, so any surviving
+    publication would be stale rather than re-bound to another resource.
 
     Takes `vault_id` because `confirm_upload` never resolves the vault NAME,
     which the shared helper needs to build the canonical URI.
@@ -367,7 +363,7 @@ class FileService:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-            if not row:
+            if not row or row.get("kind") != "file":
                 raise NotFoundError("File", file_id)
 
         # Read object size. Treat NoSuchKey specially: that means the
@@ -503,7 +499,7 @@ class FileService:
             row = await vault_files_repo.find_by_id(
                 conn, vault_id, uuid.UUID(file_id),
             )
-            if not row:
+            if not row or row.get("kind") != "file":
                 raise NotFoundError("File", file_id)
 
         # Override stored Content-Type with DB value so browsers inline
@@ -607,7 +603,7 @@ class FileService:
         # 1. Look up the file + vault name (read-only, no TX needed).
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-            if not row:
+            if not row or row.get("kind") != "file":
                 raise NotFoundError("File", file_id)
             vault_row = await conn.fetchrow(
                 "SELECT name FROM vaults WHERE id = $1", vault_id,

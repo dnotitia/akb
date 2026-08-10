@@ -7,6 +7,7 @@ import {
   PlateLeaf,
   type PlateElementProps,
   type PlateLeafProps,
+  createPlatePlugin,
   useEditorRef,
   useEditorState,
   usePlateEditor,
@@ -32,7 +33,12 @@ import {
   Heading1,
   Heading2,
   Heading3,
+  ImagePlus,
+  Loader2,
   Pilcrow,
+  RotateCcw,
+  Trash2,
+  X,
 } from "lucide-react";
 import {
   BlockquotePlugin,
@@ -62,6 +68,15 @@ import {
   TableRowPlugin,
 } from "@platejs/table/react";
 import remarkGfm from "remark-gfm";
+import { AssetImage } from "@/components/asset-image";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { ApiError, discardAsset, uploadAsset } from "@/lib/api";
+import {
+  assetIdFromUrl,
+  EDITOR_IMAGE_MIME_TYPES,
+  validateEditorImage,
+} from "@/lib/image-assets";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
 
 // ── Element & leaf components ─────────────────────────────────────────────
@@ -175,6 +190,61 @@ function TableHeaderCellElement(props: PlateElementProps) {
   );
 }
 
+interface EditorAssetLifecycle {
+  vault: string;
+}
+
+const EditorAssetLifecycleContext = React.createContext<EditorAssetLifecycle | null>(null);
+
+function ImageElement(props: PlateElementProps) {
+  const editor = useEditorRef();
+  const assetLifecycle = React.useContext(EditorAssetLifecycleContext);
+  const element = props.element as {
+    url?: string;
+    caption?: Array<{ text?: string }>;
+  };
+  const alt = element.caption?.map((part) => part.text || "").join("") || "";
+  return (
+    <PlateElement {...props} className="my-4">
+      <figure contentEditable={false} className="group relative m-0">
+        <AssetImage
+          src={element.url}
+          alt={alt}
+          assetContext={
+            assetLifecycle
+              ? { mode: "authenticated", vault: assetLifecycle.vault }
+              : undefined
+          }
+          className="my-0 max-h-[70vh] object-contain"
+        />
+        {alt && (
+          <figcaption className="mt-1.5 text-center text-xs text-foreground-muted">
+            {alt}
+          </figcaption>
+        )}
+        <Button
+          type="button"
+          variant="destructive"
+          size="icon"
+          aria-label={alt ? `Remove image: ${alt}` : "Remove image"}
+          title="Remove image"
+          className="absolute right-2 top-2 h-8 w-8 opacity-0 shadow-sm group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            const path = editor.api.findPath(props.element);
+            if (path) {
+              editor.tf.removeNodes({ at: path });
+            }
+          }}
+        >
+          <Trash2 className="h-4 w-4" aria-hidden />
+        </Button>
+      </figure>
+      {props.children}
+    </PlateElement>
+  );
+}
+
 // Marks (inline formatting) — render as semantic inline tags with utility
 // classes; prose plugin will pick them up too but Plate replaces default
 // rendering when a leaf component is registered.
@@ -203,6 +273,11 @@ function StrikethroughLeaf(props: PlateLeafProps) {
 
 // ── Plugin set + component map ────────────────────────────────────────────
 
+const ImagePlugin = createPlatePlugin({
+  key: "img",
+  node: { isElement: true, isVoid: true },
+});
+
 const plugins = [
   // Blocks
   ParagraphPlugin,
@@ -223,6 +298,7 @@ const plugins = [
   TableRowPlugin,
   TableCellPlugin,
   TableCellHeaderPlugin,
+  ImagePlugin,
   // Marks
   BoldPlugin,
   ItalicPlugin,
@@ -263,6 +339,7 @@ const components: Record<string, React.FC<any>> = {
   [TableRowPlugin.key]: TableRowElement,
   [TableCellPlugin.key]: TableCellElement,
   [TableCellHeaderPlugin.key]: TableHeaderCellElement,
+  [ImagePlugin.key]: ImageElement,
   // Marks
   [BoldPlugin.key]: BoldLeaf,
   [ItalicPlugin.key]: ItalicLeaf,
@@ -293,19 +370,25 @@ const TOOLBAR_BTN_ACTIVE =
 const TOOLBAR_GROUP =
   "inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-1";
 
+function transferredImages(transfer: DataTransfer): File[] {
+  return Array.from(transfer.files).filter((file) => file.type.startsWith("image/"));
+}
+
 interface RibbonButtonProps {
   label: string;
   active?: boolean;
+  disabled?: boolean;
   onClick: () => void;
   children: React.ReactNode;
 }
 
-function RibbonButton({ label, active, onClick, children }: RibbonButtonProps) {
+function RibbonButton({ label, active, disabled, onClick, children }: RibbonButtonProps) {
   return (
     <button
       type="button"
       aria-label={label}
       aria-pressed={active}
+      disabled={disabled}
       title={label}
       // Prevent the editor from losing its selection when the button is pressed.
       onMouseDown={(e) => e.preventDefault()}
@@ -317,11 +400,17 @@ function RibbonButton({ label, active, onClick, children }: RibbonButtonProps) {
   );
 }
 
-function EditorToolbar() {
+interface EditorToolbarProps {
+  uploadingImage: boolean;
+  onChooseImages: (files: File[]) => void;
+}
+
+function EditorToolbar({ uploadingImage, onChooseImages }: EditorToolbarProps) {
   // useEditorState re-renders on editor changes so active states stay in sync;
   // useEditorRef gives a stable handle for the mutating callbacks.
   const editor = useEditorRef();
   const state = useEditorState();
+  const imageInputRef = React.useRef<HTMLInputElement>(null);
 
   // Active mark lookup — editor.api.marks() returns the marks that would apply
   // at the current selection (null when none).
@@ -458,6 +547,30 @@ function EditorToolbar() {
         <RibbonButton label="Insert table" onClick={onTable}>
           <TableIcon className="h-4 w-4" />
         </RibbonButton>
+        <RibbonButton
+          label={uploadingImage ? "Uploading image" : "Insert image"}
+          disabled={uploadingImage}
+          onClick={() => imageInputRef.current?.click()}
+        >
+          {uploadingImage ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <ImagePlus className="h-4 w-4" />
+          )}
+        </RibbonButton>
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept={EDITOR_IMAGE_MIME_TYPES.join(",")}
+          className="sr-only"
+          tabIndex={-1}
+          aria-hidden="true"
+          onChange={(event) => {
+            const files = Array.from(event.currentTarget.files || []);
+            event.currentTarget.value = "";
+            if (files.length > 0) onChooseImages(files);
+          }}
+        />
       </div>
 
       {/* History */}
@@ -490,6 +603,10 @@ export interface MarkdownEditorProps {
   ariaLabel?: string;
   ariaLabelledby?: string;
   required?: boolean;
+  /** Vault receiving pasted, dropped, or picked image assets. */
+  vault: string;
+  /** Lets the owning form block save/navigation while an upload is in flight. */
+  onUploadingChange?: (uploading: boolean) => void;
 }
 
 export function MarkdownEditor({
@@ -502,7 +619,56 @@ export function MarkdownEditor({
   ariaLabel,
   ariaLabelledby,
   required,
+  vault,
+  onUploadingChange,
 }: MarkdownEditorProps) {
+  const [uploadingImage, setUploadingImage] = React.useState(false);
+  const [uploadingName, setUploadingName] = React.useState("");
+  const [uploadFailure, setUploadFailure] = React.useState<{
+    file: File;
+    message: string;
+  } | null>(null);
+  const uploadControllerRef = React.useRef<AbortController | null>(null);
+  const uploadInFlightRef = React.useRef(false);
+  const unclaimedAssetIdsRef = React.useRef(new Set<string>());
+  const mountedRef = React.useRef(true);
+  const onUploadingChangeRef = React.useRef(onUploadingChange);
+
+  const discardIfUnclaimed = React.useCallback(
+    (url: string | undefined) => {
+      const assetId = assetIdFromUrl(url);
+      if (!assetId || !unclaimedAssetIdsRef.current.has(assetId)) return;
+      void discardAsset(vault, assetId)
+        .then(() => unclaimedAssetIdsRef.current.delete(assetId))
+        .catch(() => {
+          // Retain the id for the unmount retry. A future server-side TTL
+          // sweep remains the final backstop for abrupt browser termination.
+        });
+    },
+    [vault],
+  );
+
+  React.useEffect(() => {
+    onUploadingChangeRef.current = onUploadingChange;
+  }, [onUploadingChange]);
+
+  React.useEffect(() => {
+    // React StrictMode replays effects in development; reset the guard on the
+    // second setup so completed uploads can still update their local status.
+    const unclaimedAssetIds = unclaimedAssetIdsRef.current;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      uploadControllerRef.current?.abort();
+      for (const assetId of unclaimedAssetIds) {
+        void discardAsset(vault, assetId)
+          .then(() => unclaimedAssetIds.delete(assetId))
+          .catch(() => undefined);
+      }
+      onUploadingChangeRef.current?.(false);
+    };
+  }, [vault]);
+
   const editor = usePlateEditor({
     plugins,
     components,
@@ -520,19 +686,142 @@ export function MarkdownEditor({
     },
   });
 
+  const uploadImages = React.useCallback(
+    async (files: File[], insertionRange = editor.selection) => {
+      if (readOnly || uploadInFlightRef.current || files.length === 0) return;
+
+      for (const file of files) {
+        const validationMessage = validateEditorImage(file);
+        if (validationMessage) {
+          setUploadFailure({ file, message: validationMessage });
+          return;
+        }
+      }
+
+      const controller = new AbortController();
+      const insertionRef = insertionRange ? editor.api.rangeRef(insertionRange) : null;
+      let currentFile = files[0];
+      let restoredInsertion = false;
+      uploadControllerRef.current = controller;
+      uploadInFlightRef.current = true;
+      setUploadFailure(null);
+      setUploadingImage(true);
+      onUploadingChangeRef.current?.(true);
+
+      try {
+        for (const file of files) {
+          currentFile = file;
+          setUploadingName(file.name);
+          const asset = await uploadAsset(vault, file, controller.signal);
+          const assetId = assetIdFromUrl(asset.url);
+          if (!assetId || assetId !== asset.id) {
+            throw new Error("The image upload returned an invalid asset URL.");
+          }
+          unclaimedAssetIdsRef.current.add(assetId);
+
+          if (controller.signal.aborted || !mountedRef.current) {
+            discardIfUnclaimed(asset.url);
+            throw new DOMException("Upload cancelled", "AbortError");
+          }
+
+          if (!restoredInsertion && insertionRef?.current) {
+            editor.tf.select(insertionRef.current);
+          }
+          restoredInsertion = true;
+          const alt = file.name.replace(/\.[^.]+$/, "") || "Image";
+          editor.tf.insertNodes(
+            {
+              type: ImagePlugin.key,
+              url: asset.url,
+              caption: [{ text: alt }],
+              children: [{ text: "" }],
+            },
+            { select: true },
+          );
+        }
+      } catch (error) {
+        const aborted =
+          controller.signal.aborted ||
+          (error instanceof DOMException && error.name === "AbortError");
+        if (!aborted && mountedRef.current) {
+          const message =
+            error instanceof ApiError || error instanceof Error
+              ? error.message
+              : "The image could not be uploaded.";
+          setUploadFailure({ file: currentFile, message });
+        }
+      } finally {
+        insertionRef?.unref();
+        if (uploadControllerRef.current === controller) {
+          uploadControllerRef.current = null;
+        }
+        uploadInFlightRef.current = false;
+        if (mountedRef.current) {
+          setUploadingImage(false);
+          setUploadingName("");
+          onUploadingChangeRef.current?.(false);
+        }
+      }
+    },
+    [discardIfUnclaimed, editor, readOnly, vault],
+  );
+
+  const assetLifecycle = React.useMemo(
+    () => ({ vault }),
+    [vault],
+  );
+
   return (
-    <Plate
-      editor={editor}
-      onChange={({ editor: ed }) => {
-        if (!onChange) return;
-        // Serialize on every change — for documents in the typical AKB size
-        // (single-digit KB markdown), this is well under a millisecond. Move
-        // to a debounce only if profiling shows the cost.
-        const md = ed.getApi(MarkdownPlugin).markdown.serialize();
-        onChange(md);
-      }}
-    >
-      {!readOnly && <EditorToolbar />}
+    <EditorAssetLifecycleContext.Provider value={assetLifecycle}>
+      <Plate
+        editor={editor}
+        onChange={({ editor: ed }) => {
+          if (!onChange) return;
+          // Serialize on every change — for documents in the typical AKB size
+          // (single-digit KB markdown), this is well under a millisecond. Move
+          // to a debounce only if profiling shows the cost.
+          const md = ed.getApi(MarkdownPlugin).markdown.serialize();
+          onChange(md);
+        }}
+      >
+      {!readOnly && (
+        <EditorToolbar
+          uploadingImage={uploadingImage}
+          onChooseImages={(files) => void uploadImages(files)}
+        />
+      )}
+      {uploadingImage && (
+        <Alert variant="info" title="Uploading image" className="border-x border-t-0">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="truncate">{uploadingName}</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => uploadControllerRef.current?.abort()}
+            >
+              <X className="h-3.5 w-3.5" aria-hidden />
+              Cancel upload
+            </Button>
+          </div>
+        </Alert>
+      )}
+      {!uploadingImage && uploadFailure && (
+        <Alert variant="destructive" title="Image upload failed" className="border-x border-t-0">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span>{uploadFailure.message}</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void uploadImages([uploadFailure.file])}
+            >
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+              Retry
+            </Button>
+          </div>
+        </Alert>
+      )}
       <PlateContent
         autoFocus={autoFocus}
         readOnly={readOnly}
@@ -540,6 +829,32 @@ export function MarkdownEditor({
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledby}
         aria-required={required || undefined}
+        onPaste={(event) => {
+          if (readOnly) return;
+          const files = transferredImages(event.clipboardData);
+          if (files.length === 0) return;
+          event.preventDefault();
+          void uploadImages(files);
+        }}
+        onDragOver={(event) => {
+          if (
+            !readOnly &&
+            Array.from(event.dataTransfer.items).some(
+              (item) => item.kind === "file" && item.type.startsWith("image/"),
+            )
+          ) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }
+        }}
+        onDrop={(event) => {
+          if (readOnly) return;
+          const files = transferredImages(event.dataTransfer);
+          if (files.length === 0) return;
+          event.preventDefault();
+          const dropRange = editor.api.findEventRange(event.nativeEvent) || editor.selection;
+          void uploadImages(files, dropRange);
+        }}
         className={cn(
           "min-h-[360px] w-full outline-none cursor-text",
           // `prose` defaults to max-width: 65ch — explicitly override so
@@ -558,7 +873,8 @@ export function MarkdownEditor({
           className,
         )}
       />
-    </Plate>
+      </Plate>
+    </EditorAssetLifecycleContext.Provider>
   );
 }
 

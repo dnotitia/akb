@@ -60,6 +60,7 @@ export default function DocumentNewPage() {
   const [error, setError] = useState("");
   const [invalidField, setInvalidField] = useState<"title" | "collection" | "body" | null>(null);
   const [creating, setCreating] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
@@ -84,6 +85,7 @@ export default function DocumentNewPage() {
     summary.trim() !== "" ||
     tags.length > 0 ||
     body.trim() !== "";
+  const hasUnsavedWork = isDirty || uploadingImage;
 
   function doCancel() {
     if (typeof window !== "undefined" && window.history.length > 1) {
@@ -94,7 +96,7 @@ export default function DocumentNewPage() {
   }
   function handleCancel() {
     // Guard a dirty draft behind a ConfirmDialog (design system bans window.confirm).
-    if (isDirty && !creating) setDiscardOpen(true);
+    if (hasUnsavedWork && !creating) setDiscardOpen(true);
     else doCancel();
   }
 
@@ -107,17 +109,17 @@ export default function DocumentNewPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [creating, discardOpen, isDirty]);
+  }, [creating, discardOpen, hasUnsavedWork]);
 
   useEffect(() => {
-    if (!isDirty || creating) return;
+    if (!hasUnsavedWork || creating) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
       e.returnValue = "";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [isDirty, creating]);
+  }, [hasUnsavedWork, creating]);
 
   // Fail a field: surface the message, mark the field invalid (aria + red
   // border), and move focus to it so a keyboard/AT user lands on the problem.
@@ -130,7 +132,7 @@ export default function DocumentNewPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name) return;
+    if (!name || uploadingImage) return;
     setError("");
     setInvalidField(null);
     const t = title.trim();
@@ -189,7 +191,11 @@ export default function DocumentNewPage() {
     }
   }
 
-  const canSubmit = title.trim() !== "" && collection.trim() !== "" && body.trim() !== "";
+  const canSubmit =
+    title.trim() !== "" &&
+    collection.trim() !== "" &&
+    body.trim() !== "" &&
+    !uploadingImage;
 
   return (
     <div className="max-w-3xl mx-auto fade-up">
@@ -377,6 +383,8 @@ export default function DocumentNewPage() {
               placeholder="Write the document body in markdown."
               ariaLabelledby="doc-body-label"
               required
+              vault={name!}
+              onUploadingChange={setUploadingImage}
             />
           </Suspense>
         </div>
@@ -405,7 +413,11 @@ export default function DocumentNewPage() {
         open={discardOpen}
         onOpenChange={setDiscardOpen}
         title="Discard this draft?"
-        description="Your unsaved document will be lost."
+        description={
+          uploadingImage
+            ? "The image upload will be cancelled and your unsaved document will be lost."
+            : "Your unsaved document will be lost."
+        }
         confirmLabel="Discard"
         variant="destructive"
         onConfirm={doCancel}

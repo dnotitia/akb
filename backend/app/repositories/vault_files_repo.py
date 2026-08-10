@@ -81,6 +81,41 @@ async def insert_or_adopt(
     return row["id"]
 
 
+async def insert_attachment(
+    conn,
+    *,
+    file_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    name: str,
+    s3_key: str,
+    mime_type: str,
+    size_bytes: int,
+    content_hash: str,
+    created_by: str,
+) -> None:
+    """Publish a fully validated editor image as a hidden attachment.
+
+    Attachment uploads are proxied through AKB, so the caller has already
+    supplied the complete immutable byte string by the time this row is
+    inserted.  There is intentionally no pending row and no collection:
+    document images survive document moves/collection deletion and remain
+    available to historical Git revisions until the owning vault is deleted.
+    """
+    await conn.execute(
+        """
+        INSERT INTO vault_files (
+            id, vault_id, collection_id, kind, name, s3_key, mime_type,
+            size_bytes, content_hash, hash_algorithm, hash_verified_at,
+            description, created_by
+        )
+        VALUES ($1, $2, NULL, 'attachment', $3, $4, $5, $6, $7,
+                'sha256', NOW(), 'Document image', $8)
+        """,
+        file_id, vault_id, name, s3_key, mime_type, size_bytes,
+        content_hash, created_by,
+    )
+
+
 async def insert_or_adopt_measurement_confirmed(
     conn, *, file_id: uuid.UUID, vault_id: uuid.UUID, collection_id: uuid.UUID | None,
     name: str, mime_type: str, description: str, created_by: str, driver: str,
@@ -164,7 +199,7 @@ async def find_by_id(
     that need the path string."""
     row = await conn.fetchrow(
         """
-        SELECT vf.id, vf.vault_id, vf.collection_id, c.path AS collection,
+        SELECT vf.id, vf.vault_id, vf.collection_id, vf.kind, c.path AS collection,
                vf.name, vf.s3_key, vf.mime_type, vf.size_bytes,
                vf.description, vf.created_by, vf.created_at, vf.updated_at,
                vf.content_hash, vf.hash_algorithm, vf.etag,
@@ -174,6 +209,103 @@ async def find_by_id(
          WHERE vf.id = $1 AND vf.vault_id = $2
         """,
         file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
+async def find_attachment_by_id(
+    conn,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+) -> dict | None:
+    """Find a confirmed document image inside one authorization scope.
+
+    Callers must resolve the vault from their authenticated document or public
+    publication context first.  Keeping that predicate in the lookup avoids a
+    global asset-id existence probe before authorization.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
+               vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
+               vf.hash_verified_at
+          FROM vault_files vf
+          JOIN vaults v ON v.id = vf.vault_id
+         WHERE vf.id = $1
+           AND vf.vault_id = $2
+           AND vf.kind = 'attachment'
+           AND vf.hash_verified_at IS NOT NULL
+        """,
+        file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
+async def claim_attachment_references(
+    conn,
+    vault_id: uuid.UUID,
+    file_ids: set[uuid.UUID],
+    *,
+    strict: bool = True,
+) -> set[uuid.UUID]:
+    """Lock and claim valid attachment ids from a document body.
+
+    In strict mode every id must be a confirmed attachment in ``vault_id``;
+    user document writes fail closed on missing or cross-vault references.
+    External mirrors use non-strict mode so an upstream broken link remains a
+    broken link instead of aborting the whole mirror, while valid local assets
+    still gain historical-revision retention.
+    """
+    if not file_ids:
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT id
+          FROM vault_files
+         WHERE vault_id = $1
+           AND id = ANY($2::uuid[])
+           AND kind = 'attachment'
+           AND hash_verified_at IS NOT NULL
+         FOR UPDATE
+        """,
+        vault_id, list(file_ids),
+    )
+    found = {row["id"] for row in rows}
+    if strict and found != file_ids:
+        return found
+    if found:
+        await conn.execute(
+            """
+            UPDATE vault_files
+               SET attachment_claimed_at = COALESCE(attachment_claimed_at, NOW()),
+                   updated_at = NOW()
+             WHERE vault_id = $1 AND id = ANY($2::uuid[])
+            """,
+            vault_id, list(found),
+        )
+    return found
+
+
+async def delete_unclaimed_attachment(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    created_by: str,
+) -> dict | None:
+    """Delete one caller-owned upload only if no document ever claimed it."""
+    row = await conn.fetchrow(
+        """
+        DELETE FROM vault_files
+         WHERE id = $1
+           AND vault_id = $2
+           AND kind = 'attachment'
+           AND hash_verified_at IS NOT NULL
+           AND attachment_claimed_at IS NULL
+           AND created_by = $3
+        RETURNING id, s3_key
+        """,
+        file_id, vault_id, created_by,
     )
     return dict(row) if row else None
 
@@ -296,7 +428,7 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.collection_id IS NULL
+                 WHERE vf.vault_id = $1 AND vf.kind = 'file' AND vf.collection_id IS NULL
                  ORDER BY vf.created_at DESC
                  LIMIT $2
                 """,
@@ -312,7 +444,7 @@ async def list_for_vault(
                        vf.hash_verified_at
                   FROM vault_files vf
                   LEFT JOIN collections c ON c.id = vf.collection_id
-                 WHERE vf.vault_id = $1 AND vf.collection_id = $2
+                 WHERE vf.vault_id = $1 AND vf.kind = 'file' AND vf.collection_id = $2
                  ORDER BY vf.created_at DESC
                  LIMIT $3
                 """,
@@ -352,7 +484,7 @@ async def list_for_vault(
             "       vf.hash_verified_at "
             "  FROM vault_files vf "
             "  LEFT JOIN collections c ON c.id = vf.collection_id "
-            " WHERE vf.vault_id = $1"
+            " WHERE vf.vault_id = $1 AND vf.kind = 'file'"
             + prefix_clause
             + depth_clause
             + f" ORDER BY vf.created_at DESC LIMIT ${len(params)}"
@@ -368,7 +500,7 @@ async def list_for_vault(
                    vf.hash_verified_at
               FROM vault_files vf
               LEFT JOIN collections c ON c.id = vf.collection_id
-             WHERE vf.vault_id = $1
+             WHERE vf.vault_id = $1 AND vf.kind = 'file'
              ORDER BY vf.created_at DESC
              LIMIT $2
             """,

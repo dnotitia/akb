@@ -153,7 +153,7 @@ export default function PublicationPage() {
 
       {/* Body */}
       <main className="mx-auto max-w-[1200px] px-6 py-12 fade-up">
-        {data.resource_type === "document" && <DocumentBody data={data} />}
+        {data.resource_type === "document" && <DocumentBody slug={slug} data={data} />}
         {data.resource_type === "table_query" && (
           <TableViewer slug={slug} initialData={data} />
         )}
@@ -177,7 +177,7 @@ export default function PublicationPage() {
   );
 }
 
-function DocumentBody({ data }: { data: PublicationResponse }) {
+function DocumentBody({ slug, data }: { slug: string; data: PublicationResponse }) {
   return (
     <article className="grid grid-cols-1 lg:grid-cols-[180px_1fr] gap-8">
       {/* Left rail — metadata */}
@@ -237,7 +237,11 @@ function DocumentBody({ data }: { data: PublicationResponse }) {
           </Alert>
         )}
 
-        <MarkdownRender markdown={data.content || ""} className="text-[15px]" />
+        <MarkdownRender
+          markdown={data.content || ""}
+          className="text-[15px]"
+          assetContext={{ mode: "publication", slug }}
+        />
 
       </div>
     </article>

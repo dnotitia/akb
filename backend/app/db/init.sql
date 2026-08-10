@@ -409,6 +409,7 @@ CREATE TABLE IF NOT EXISTS vault_files (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
     collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL DEFAULT 'file',
     name TEXT NOT NULL,
     s3_key TEXT NOT NULL,
     mime_type TEXT,
@@ -418,6 +419,7 @@ CREATE TABLE IF NOT EXISTS vault_files (
     etag TEXT,                         -- object-store ETag/checksum hint
     storage_version TEXT,              -- object-store version id when available
     hash_verified_at TIMESTAMPTZ,      -- when AKB last verified content_hash from storage bytes
+    attachment_claimed_at TIMESTAMPTZ, -- first document commit that referenced an editor attachment
     description TEXT,
     created_by TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

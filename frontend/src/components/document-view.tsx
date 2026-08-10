@@ -137,7 +137,10 @@ export function DocumentView({ vault, docId, view: viewProp, onViewChange, extra
           className="min-w-0"
           style={{ maxWidth: "100%" }}
         >
-          <MarkdownRender markdown={doc.content || ""} />
+          <MarkdownRender
+            markdown={doc.content || ""}
+            assetContext={{ mode: "authenticated", vault }}
+          />
         </div>
       ) : (
         <div

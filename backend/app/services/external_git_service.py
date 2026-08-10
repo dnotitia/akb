@@ -44,6 +44,7 @@ from app.services.index_service import (
     delete_document_chunks,
     write_source_chunks,
 )
+from app.services import asset_service
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.uri_service import doc_uri
 from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
@@ -531,6 +532,13 @@ class ExternalGitService:
                     conn, "document", str(pg_doc_id),
                     vault_id=vault_id,
                     chunks=chunks,
+                )
+                # External Markdown may contain stale or foreign asset URLs;
+                # mirror fidelity wins over rejecting the entire sync.  Valid
+                # same-vault references are still claimed for Git-history
+                # retention, while invalid ones remain fail-closed at render.
+                await asset_service.claim_document_assets(
+                    conn, vault_id=vault_id, markdown=body, strict=False,
                 )
                 # Subscribers (search reindex, audit) need to see external
                 # mirror writes the same as user PUTs. Emitted inside the

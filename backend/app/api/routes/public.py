@@ -38,11 +38,12 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import ConfigDict
 
 from app.api.deps import get_current_user, get_optional_user
+from app.api.routes import assets
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
 from app.util.text import NFCModel
-from app.services import audit_log, file_service, publication_service
+from app.services import asset_service, audit_log, file_service, publication_service
 from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
@@ -586,7 +587,9 @@ async def publication_meta(slug: str, request: Request):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 file_row = await conn.fetchrow(
-                    "SELECT name, mime_type, size_bytes FROM vault_files WHERE id = $1 AND vault_id = $2",
+                    "SELECT name, mime_type, size_bytes FROM vault_files "
+                    "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
+                    "AND hash_verified_at IS NOT NULL",
                     to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                 )
             if file_row:
@@ -651,6 +654,47 @@ def _is_inert_raw_mime(mime: str) -> bool:
 
 
 @router.get(
+    "/public/{slug}/assets/{file_id}",
+    response_class=Response,
+    summary="Render an image inherited from a document publication",
+)
+async def publication_document_asset(slug: str, file_id: str, request: Request):
+    """Serve an attachment only when the exact public document slice embeds it.
+
+    Authorization is derived on every request from the publication's pinned
+    document identity/current commit and its section filter.  This avoids a
+    document-wide manifest accidentally exposing an image from a private
+    section, and removal/unpublish revokes access immediately.
+    """
+    try:
+        has_grant = _verify_view_grant(slug, _extract_view_grant(request))
+        publication = await _resolve_with_access(
+            slug,
+            request,
+            increment_view=not has_grant,
+            enforce_view_cap=not has_grant,
+        )
+        if publication["resource_type"] != ResourceType.DOCUMENT:
+            raise PublicationNotFound(slug)
+        rendered = await publication_service.resolve_document_publication(publication)
+    except PublicationError as exc:
+        raise _publication_error_to_http(exc)
+
+    try:
+        requested_id = uuid.UUID(file_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    if requested_id not in asset_service.extract_asset_ids(rendered.get("content") or ""):
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    try:
+        row = await assets.load_asset_row(file_id, to_uuid(publication["vault_id"]))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    return await assets.image_asset_response(row, public=True)
+
+
+@router.get(
     "/public/{slug}/raw",
     response_class=Response,
     responses={
@@ -700,7 +744,9 @@ async def publication_raw(slug: str, request: Request):
     pool = await get_pool()
     async with pool.acquire() as conn:
         file_row = await conn.fetchrow(
-            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files WHERE id = $1 AND vault_id = $2",
+            "SELECT s3_key, mime_type, size_bytes, name FROM vault_files "
+            "WHERE id = $1 AND vault_id = $2 AND kind = 'file' "
+            "AND hash_verified_at IS NOT NULL",
             to_uuid(parsed.identifier), to_uuid(publication["vault_id"]),
         )
     if not file_row:
@@ -1153,7 +1199,8 @@ async def oembed(url: str, format: str = "json"):
                 pool = await get_pool()
                 async with pool.acquire() as conn:
                     f_row = await conn.fetchrow(
-                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2",
+                        "SELECT name FROM vault_files WHERE id = $1 AND vault_id = $2 "
+                        "AND kind = 'file' AND hash_verified_at IS NOT NULL",
                         to_uuid(file_uuid_str), to_uuid(publication["vault_id"]),
                     )
                     if f_row:

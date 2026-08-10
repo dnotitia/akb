@@ -16,6 +16,7 @@ from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
     access,
     activity,
+    assets,
     app_inventory,
     agent_sessions,
     app_identity,
@@ -279,6 +280,8 @@ app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-session
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
+app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
+app.include_router(assets.stable_router, prefix="/api", tags=["assets"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
 app.include_router(help_routes.router, prefix="/api/v1/help", tags=["help"])
 install_openapi_contract(app)

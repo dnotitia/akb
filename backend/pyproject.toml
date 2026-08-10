@@ -32,6 +32,7 @@ dependencies = [
     "grpcio==1.81.0",
     "protobuf==6.33.6",
     "pyarrow==22.0.0",
+    "pillow==12.3.0",
 ]
 
 [project.optional-dependencies]

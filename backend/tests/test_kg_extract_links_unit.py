@@ -41,6 +41,14 @@ def test_real_prose_links_are_still_extracted():
     assert "akb://v/coll/notes/doc/intro.md" in out
 
 
+def test_generated_image_asset_is_not_a_document_relation():
+    content = (
+        "![diagram](/api/assets/6d04dc8a-0302-4a85-a314-e7485ff5a610)\n\n"
+        "[design notes](./design.md)"
+    )
+    assert extract_markdown_links(content) == ["design.md"]
+
+
 def test_strip_code_spans_removes_code_keeps_prose():
     stripped = strip_code_spans("`akb://x/coll/y/doc/z.md` keep-this")
     assert "akb://" not in stripped
