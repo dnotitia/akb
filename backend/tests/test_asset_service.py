@@ -150,13 +150,80 @@ async def test_create_asset_decodes_off_loop_and_records_pending_before_s3(
 
     names = [event[0] for event in events]
     assert events[names.index("inspect")][1] != main_thread
+    lock_indexes = [i for i, name in enumerate(names) if name == "lock_vault"]
+    assert len(lock_indexes) == 2
     assert (
-        names.index("insert_pending")
-        < names.index("lock_vault")
+        lock_indexes[0]
+        < names.index("insert_pending")
+        < lock_indexes[1]
         < names.index("put")
         < names.index("finalize")
     )
     assert result["url"] == f"/api/assets/{result['id']}"
+
+
+@pytest.mark.asyncio
+async def test_create_asset_rejects_vault_deleted_while_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, *_args):
+            return None
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_get_pool():
+        return _Pool()
+
+    async def unexpected_insert(*_args, **_kwargs):
+        raise AssertionError("a deleted vault must not receive a pending asset row")
+
+    def unexpected_put(*_args, **_kwargs):
+        raise AssertionError("a deleted vault must not receive object bytes")
+
+    monkeypatch.setattr(asset_service, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(asset_service, "get_pool", fake_get_pool)
+    monkeypatch.setattr(
+        asset_service, "inspect_image", lambda _body: ("image/png", 1, 1),
+    )
+    monkeypatch.setattr(asset_service.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(asset_service.s3_adapter, "put_bytes", unexpected_put)
+    monkeypatch.setattr(
+        asset_service.vault_files_repo, "insert_pending_attachment", unexpected_insert,
+    )
+
+    with pytest.raises(AKBError) as exc_info:
+        await asset_service.create_image_asset(
+            vault_id=uuid.uuid4(),
+            vault_name="deleted",
+            filename="diagram.png",
+            declared_mime="image/png",
+            body=ONE_PIXEL_PNG,
+            actor_id="alice",
+        )
+
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -332,11 +399,11 @@ async def test_public_asset_grant_never_increments_publication_view(
 async def test_public_asset_grant_is_asset_scoped_password_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A counted page grant must outlive the broader password token.
+    """A counted page grant remains valid beyond the broader password token.
 
-    The asset route may bypass the publication password only after validating
-    the page grant, and it still authorizes one UUID from the exact rendered
-    document slice below. Full-content routes continue to use
+    The asset route authorizes image access only after validating the page
+    grant, and it still authorizes one UUID from the exact rendered document
+    slice below. Full-content routes continue to use
     ``_resolve_with_access`` and therefore keep the shorter password-token TTL.
     """
     from fastapi.responses import Response

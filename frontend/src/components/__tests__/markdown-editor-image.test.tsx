@@ -138,8 +138,8 @@ describe("MarkdownEditor image insertion", () => {
     await screen.findByRole("img", { name: "diagram" });
     fireEvent.click(screen.getByRole("button", { name: "Remove image: diagram" }));
 
-    // Physical cleanup is deferred until the edit session ends. Deleting here
-    // would race Save and make Plate's Undo restore a broken URL.
+    // Physical cleanup is deferred until the edit session ends so Save and
+    // Plate's Undo continue to reference the same asset.
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
     unmount();
     await waitFor(() =>

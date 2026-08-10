@@ -59,9 +59,9 @@ Authenticated byte reads execute one vault-scoped query and require one of:
 3. the request supplies a document path and Git commit prefix matching a
    non-expired revision manifest.
 
-Failures return 404 before object storage is touched. This avoids exposing an
-asset-ID existence oracle across vaults. Historical UI reads include their
-document path and selected commit; ordinary current reads use the live set.
+Failures return 404 before object storage is touched, keeping cross-vault
+existence checks indistinguishable. Historical UI reads include their document
+path and selected commit; ordinary current reads use the live set.
 After a bounded HEAD validation, image bodies stream through the API rather
 than being accumulated into one in-process buffer per image request.
 
@@ -94,11 +94,11 @@ URLs and sends only the asset-scoped grant.
 
 The collector first removes an indexed, bounded batch of expired revision
 manifests, then locks eligible attachment rows with `FOR UPDATE SKIP LOCKED`. A
-document claim takes the same row lock, eliminating claim-versus-GC races.
+document claim takes the same row lock, serializing it with collection.
 Metadata deletion and insertion into `s3_delete_outbox` share one transaction;
 the existing retrying S3 worker performs the remote delete. A conservative
-claimed-object grace also protects rolling upgrades from an older writer that
-did not yet publish reference rows.
+claimed-object grace keeps rolling upgrades compatible with writers that do not
+yet publish reference rows.
 
 Uploads use an explicit pending/confirmed state. This preserves pre-hash legacy
 Files as confirmed while making newly initiated transfers unambiguous. After

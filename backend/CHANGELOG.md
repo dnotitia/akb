@@ -7,7 +7,7 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
-### Added secure inline document images with bounded revision retention
+### Added inline document images with bounded revision retention
 
 The Markdown editor and MCP proxy can upload validated PNG, JPEG, GIF, and WebP
 images as hidden object-storage attachments and insert stable
@@ -23,29 +23,26 @@ recursive collection deletion therefore revoke live access immediately while
 preserving recent historical revisions. A background collector expires
 uncommitted uploads (24 hours by default) and objects with no live or retained
 revision reference (30 days by default), deleting metadata and enqueueing the
-S3 object removal in one transaction. Vault deletion remains an immediate
-whole-container purge. The retention windows and GC cadence are configurable.
+S3 object removal in one transaction. Vault deletion immediately revokes access
+and transactionally queues associated object deletion. The retention windows
+and GC cadence are configurable.
 
 Image validation fully decodes bounded frames on a worker thread rather than
-the API event loop. Uploads persist an unreadable pending metadata row before
-the S3 PUT and finalize it only after the PUT succeeds; a process exit in that
-window therefore leaves a GC-visible key instead of an untracked object.
-Cancellation settles the underlying PUT before enqueueing cleanup, closing the
-late-thread orphan race. Valid CommonMark image nodes, including titled and
-reference-style forms, share one parser-backed reachability path. Expired
-revision manifests are removed in indexed batches, and verified image bodies
-stream through the API after a bounded HEAD check instead of being fully
-buffered per request.
+the API event loop. Upload metadata and cleanup state are recorded before object
+transfer, and cancellation completes the transfer outcome before scheduling
+cleanup. Valid CommonMark image nodes, including titled and reference-style
+forms, share one parser-backed reachability path. Expired revision manifests
+are removed in indexed batches, and verified image bodies stream through the
+API after a bounded metadata check instead of being fully buffered per request.
 
-Upload/finalization holds a vault key-share lock while vault deletion takes the
-conflicting lock before enumerating S3 keys, preventing a late PUT from escaping
-a whole-vault purge. Vault deletion records those immutable keys in the existing
-retrying S3 outbox in the same transaction as the metadata cascade, avoiding
-remote network I/O under the vault lock and preserving cleanup across crashes or
-store failures. Slow request bodies use a separately bounded admission pool and
-deadline instead of occupying image decode/S3 slots indefinitely. Regular
-File upload readiness now uses an explicit `upload_state`: pre-hash legacy Files
-remain confirmed and visible, while only newly initiated transfers are pending.
+Upload finalization and vault deletion use coordinated row locks so every
+committed attachment is included in the deletion sweep. Vault deletion records
+immutable object keys in the existing retrying S3 outbox in the same transaction
+as the metadata cascade. Slow request bodies use a separately bounded admission
+pool and deadline instead of occupying image decode and object-storage slots.
+Regular File upload readiness now uses an explicit `upload_state`: pre-hash
+legacy Files remain confirmed and visible, while only newly initiated transfers
+are pending.
 
 Document writers claim all available same-vault assets without rejecting the
 entire Markdown save for an expired, imported, or cross-vault broken URL; those

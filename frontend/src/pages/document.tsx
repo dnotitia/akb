@@ -252,7 +252,7 @@ export default function DocumentPage() {
         flashSaved();
         // Let the editor's unmount cleanup run only after the server has
         // atomically claimed referenced uploads. During the request this stays
-        // true so an unrelated SPA navigation cannot win the discard race.
+        // true so navigation cleanup cannot discard assets being saved.
         setSavingBody(false);
         setUploadsClaimed(true);
       });

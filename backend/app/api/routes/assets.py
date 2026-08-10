@@ -136,8 +136,7 @@ async def read_document_image(
     try:
         access = await check_vault_access(user.user_id, vault, required_role="reader")
     except (ForbiddenError, NotFoundError) as exc:
-        # Normalize access failures so the stable UUID is not an existence
-        # oracle across vaults.
+        # Normalize cross-vault failures before resolving the asset.
         raise NotFoundError("Asset", file_id) from exc
     try:
         fid = uuid.UUID(file_id)

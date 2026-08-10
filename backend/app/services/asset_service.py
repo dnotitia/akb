@@ -133,8 +133,8 @@ async def _settle_must_complete_task(task: asyncio.Task[None]) -> None:
     """Wait for a shielded storage call even after its caller is cancelled.
 
     Cancelling ``asyncio.to_thread`` only abandons the await; it cannot stop an
-    already-running boto3 call. Cleanup must not race ahead of that call or a
-    late PUT can recreate an object after its delete outbox entry was consumed.
+    already-running boto3 call. Cleanup waits for the call to finish so the
+    final object state is known before deletion is scheduled.
     """
     while not task.done():
         try:
@@ -143,8 +143,8 @@ async def _settle_must_complete_task(task: asyncio.Task[None]) -> None:
             continue
         except BaseException:
             break
-    # Retrieve a late storage exception even when cancellation won the race
-    # with task completion; otherwise asyncio reports an unobserved exception.
+    # Retrieve a storage exception when cancellation and task completion occur
+    # together; otherwise asyncio reports an unobserved exception.
     try:
         task.result()
     except BaseException:
@@ -299,6 +299,19 @@ async def create_image_asset(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Revalidate the vault under the same lock used by the transfer
+            # phase. This serializes queued uploads with permanent deletion and
+            # ensures that every committed pending row is included in the
+            # deletion sweep.
+            vault_exists = await conn.fetchval(
+                "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
+                vault_id,
+            )
+            if vault_exists is None:
+                raise AKBError(
+                    "Vault was deleted while the image upload was queued",
+                    status_code=409,
+                )
             await vault_files_repo.insert_pending_attachment(
                 conn,
                 file_id=file_id,
@@ -315,11 +328,9 @@ async def create_image_asset(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # Keep a key-share lock from immediately before the remote PUT
-                # through metadata finalization. Vault deletion takes the
-                # conflicting row lock before enumerating object keys, so it
-                # either sees this finalized attachment or wins before the PUT
-                # starts. This closes the delete/enumerate/late-PUT orphan race.
+                # Hold the vault lock through finalization so deletion either
+                # observes the finalized attachment or prevents the transfer
+                # from starting.
                 vault_exists = await conn.fetchval(
                     "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
                     vault_id,

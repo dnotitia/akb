@@ -522,8 +522,7 @@ class Settings(BaseModel):
 
     # Document images use live document refs for authorization and a bounded
     # manifest for recent Git revisions. Uncommitted uploads are collected
-    # separately so a crashed editor, MCP client, or backend process cannot
-    # leak objects forever.
+    # separately so abandoned uploads remain eligible for bounded cleanup.
     document_asset_revision_retention_days: int = Field(default=30, ge=1, le=3650)
     document_asset_unclaimed_ttl_hours: int = Field(default=24, ge=1, le=8760)
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)

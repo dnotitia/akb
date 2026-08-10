@@ -264,7 +264,7 @@ itAsync("_discardImage accepts only canonical asset URLs", async () => {
   assert.equal(result.discarded, true);
 
   await assert.rejects(
-    () => proxy._discardImage({ vault: "myvault", url: `https://evil.test/${assetId}` }),
+    () => proxy._discardImage({ vault: "myvault", url: `https://example.com/${assetId}` }),
     /Invalid document image URL/,
   );
 });
