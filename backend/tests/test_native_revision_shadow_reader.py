@@ -1141,6 +1141,33 @@ async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary(
     ]
 
 
+async def test_legacy_reader_rejects_precreation_row_before_current_head():
+    document = _document()
+    fixed_ref = _oid("f")
+    git = _NoWriteGit(document)
+    raw = git.manual_fixed_ref_history(
+        "p2-manual",
+        fixed_ref,
+        document.current_path,
+        current_commit=document.current_commit,
+    )
+    raw["history"].insert(
+        0,
+        {
+            "legacy_git_oid": _oid("0"),
+            "path_at_revision": document.current_path,
+            "committed_at": document.created_at - timedelta(microseconds=1),
+        },
+    )
+    git.snapshot_override = raw
+
+    with pytest.raises(ShadowReaderScopeError, match="history"):
+        await LegacyFixedRefShadowReader(
+            git=git,
+            vault_name="p2-manual",
+        ).history(document, selector=document.current_commit, fixed_ref=fixed_ref)
+
+
 async def test_legacy_reader_fails_closed_on_missing_or_corrupt_product_facts():
     document = _document()
     fixed_ref = _oid("f")

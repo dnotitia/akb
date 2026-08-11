@@ -471,6 +471,8 @@ class LegacyFixedRefShadowReader:
                 raise ShadowReaderScopeError("legacy fixed-ref materialization returned no body")
             if not isinstance(history, list) or not all(isinstance(entry, Mapping) for entry in history):
                 raise ShadowReaderScopeError("legacy fixed-ref history is invalid")
+            if not history or history[0].get("legacy_git_oid") != document.current_commit:
+                raise ShadowReaderScopeError("legacy fixed-ref history does not start at current head")
             if not isinstance(activity, Mapping):
                 raise ShadowReaderScopeError("legacy fixed-ref activity is invalid")
             if not isinstance(materialized_fixed_ref, str) or not isinstance(
