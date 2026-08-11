@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Added immutable app release reconciliation and staged rollout
+
+Added a database-backed rollout request ledger with UUID idempotency, sealed
+snapshot membership, manifest v1 checksum validation, whole-snapshot preflight,
+canary-first then sequential ten-target batches, bounded backfill checkpoints,
+lease fencing, replay/resume, redacted status, and monotonic installation/
+observed-state convergence. Added admin and self-app request/status routes,
+worker lifecycle registration, migration 060, and the source-neutral
+`app-release-rollout` repository E2E fixture scenario.
+
 ### Added app installation lifecycle commands
 
 Added administrator install, restore, fresh, status, and uninstall commands

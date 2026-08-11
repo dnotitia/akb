@@ -172,6 +172,8 @@ def test_scenario_argument_supports_the_lifecycle_fixture():
     assert config.scenario == "empty"
     lifecycle = _parse_args(["serve", "--scenario", "app-installation-lifecycle"])
     assert lifecycle.scenario == "app-installation-lifecycle"
+    rollout = _parse_args(["serve", "--scenario", "app-release-rollout"])
+    assert rollout.scenario == "app-release-rollout"
     with pytest.raises(SystemExit):
         _parse_args(["serve", "--scenario", "project"])
 
@@ -380,6 +382,14 @@ class FakeFixtureRuntime:
             "redaction_scan": {"private_value_hits": 0, "raw_log_exposed": False},
         }
 
+    def fixture_control(self, action, target, enabled):
+        return {
+            "status": "accepted",
+            "scenario": self.scenario,
+            "action": action,
+            "enabled": enabled,
+        }
+
     async def reset_scenario(self):
         self.reset_count += 1
 
@@ -394,6 +404,7 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         "/reset",
         "/discover",
         "/log-observation",
+        "/control",
         "/openapi.json",
     } <= paths
     assert "/stop" not in paths
@@ -423,6 +434,12 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         reset = await client.post("/reset", json={"scenario": "empty"})
         assert reset.status_code == 200
         assert runtime.reset_count == 1
+        control = await client.post(
+            "/control",
+            json={"action": "worker_observation", "enabled": True},
+        )
+        assert control.status_code == 200
+        assert control.json()["scenario"] == "empty"
         lifecycle_runtime = FakeFixtureRuntime("app-installation-lifecycle")
         lifecycle_app = create_app(lifecycle_runtime)
         async with httpx.AsyncClient(
@@ -439,6 +456,47 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
         openapi = await client.get("/openapi.json")
         assert openapi.status_code == 200
         assert "/reset" in openapi.json()["paths"]
+
+
+def test_rollout_fixture_discovery_is_source_neutral_and_redacted(tmp_path):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-rollout-unit",
+            scenario="app-release-rollout",
+        )
+    )
+    descriptor = runtime.descriptor()
+    assert descriptor["schema_version"] == 2
+    assert descriptor["status"] == "ready"
+    assert descriptor["scenario"] == "app-release-rollout"
+    runtime._fixture_private_values = ("private-credential", "private-marker")
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-release-rollout",
+        "namespace": "fixture-randomized",
+        "apps": {"target": {"id": "target-app"}, "foreign": {"id": "foreign-app"}},
+        "installations": [{"ordinal": 0, "id": "target-installation"}],
+        "coordinates": {
+            "admin": {"request": {"method": "POST", "path": "/api/v1/apps/{app_id}/rollouts"}},
+            "self_app": {"request": {"method": "POST", "path": "/api/v1/app/rollouts"}},
+        },
+        "polling": {"rollout_status": {"terminal_statuses": ["applied", "blocked"]}},
+        "controls": {"failure_injection": {"method": "POST", "path": "/control"}},
+        "secret": "private-marker-suffix",  # pragma: allowlist secret
+    }
+    discovery = runtime.fixture_discovery()
+    assert discovery["scenario"] == "app-release-rollout"
+    assert len(discovery["installations"]) >= 1
+    assert "private-marker" not in json.dumps(discovery)
+    # Fixture discovery must never include runtime values, even if a caller
+    # accidentally placed one in its private catalog while testing.
+    assert "private-credential" not in json.dumps(discovery)
+    assert discovery["coordinates"]["admin"]["request"]["method"] == "POST"
+    assert discovery["polling"]["rollout_status"]["terminal_statuses"] == ["applied", "blocked"]
 
 
 def test_compose_and_hosted_workflow_preserve_the_live_topology():

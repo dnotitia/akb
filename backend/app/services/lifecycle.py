@@ -6,11 +6,12 @@ import these so the start/stop order stays consistent across entrypoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.config import settings
 from app.db.postgres import close_pool, get_pool, init_db
-from app.services import audit_log, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
+from app.services import audit_log, app_rollout_worker, delete_worker, embed_worker, events_publisher, external_git_poller, http_pool, m1_file_transfer_reaper, metadata_worker, s3_delete_worker, sparse_encoder, tool_usage, vault_backfill, write_lane
 from app.services.git_service import GitService
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
@@ -124,6 +125,16 @@ async def init_storage() -> None:
 def start_workers() -> None:
     embed_worker.start()
     delete_worker.start()
+    # ``start_workers`` is normally called from the FastAPI lifespan loop.
+    # Keep direct, loop-free lifecycle probes (and import-time diagnostics)
+    # side-effect free; the rollout runner owns asyncio tasks and cannot be
+    # started without a running loop.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("app_rollout_worker deferred: no running event loop")
+    else:
+        app_rollout_worker.start()
     # external-git kill-switch: the mirror poller must not run when the feature is
     # off (no claim, no outbound). Gated so a disabled deployment
     # starts zero mirror I/O; the read paths refuse mirror reads and the marker
@@ -152,7 +163,7 @@ def start_workers() -> None:
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
     write_lane.start_commit_pool()
-    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "bm25_stats_refresher", "vault_backfill"]
+    started = ["tokenizer_pool", "git_commit_pool", "embed_worker", "delete_worker", "app_rollout_worker", "bm25_stats_refresher", "vault_backfill"]
     if settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():
@@ -234,6 +245,7 @@ async def stop_workers() -> None:
     await metadata_worker.stop()
     await external_git_poller.stop()
     await s3_delete_worker.stop()
+    await app_rollout_worker.stop()
     await delete_worker.stop()
     await embed_worker.stop()
     await vault_backfill.stop()
