@@ -170,6 +170,8 @@ akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="n
 ## akb_grep — Exact Text Search & Replace
 Find exact strings or regex patterns across documents. Use when you need precision, not meaning.
 Add `replace` to find-and-replace across all matching documents in one call.
+`limit` controls only the returned preview; `max_replacements` is the separate
+write budget and rejects the call before any write when the scope is larger.
 
 ```
 akb_grep(pattern="PostgreSQL 14")                                      # Find exact string
@@ -877,8 +879,9 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
-| replace | | Replacement string — triggers find-and-replace mode |
-| limit | | Max documents to return (default 20) |
+| replace | | Replacement string — literal unless `regex=true`, which enables backreferences |
+| limit | | Max documents to return (default 20; does not limit writes) |
+| max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
 | count_only | | Return exact per-resource counts without snippets |
 | measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
 
@@ -908,7 +911,8 @@ akb_grep(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16")
 akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 ```
 
-**Tip:** Run grep WITHOUT replace first to preview matches, then add replace.
+**Tip:** Run grep WITHOUT replace first to preview matches, then add replace with
+`max_replacements` set high enough for the intended scope.
 Each replaced document gets its own git commit and is re-indexed for search.
 
 ## Result Structure

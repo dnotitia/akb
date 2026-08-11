@@ -72,6 +72,18 @@ sets rather than retaining complete Markdown bodies. Existing imported
 protocol-relative image sources remain renderable with a no-referrer policy;
 clickable protocol-relative links remain blocked.
 
+### Fixed scoped grep replacement completeness and recovery
+
+`akb_grep(replace=...)` now treats `limit` only as a response-preview bound and
+uses a separate `max_replacements` write budget. A scope larger than that budget
+is rejected before any document changes, while an accepted scope is applied to
+every matching document. Replacement receipts include both the new and previous
+commit, and a failure after earlier commits returns those completed receipts plus
+the failed document instead of discarding the partial result. The audit stream
+records a bounded summary and one metadata-only receipt per committed document.
+Literal-mode replacements now also preserve backslashes as ordinary text;
+replacement-template backreferences remain exclusive to regex mode.
+
 ### Added app installation lifecycle commands
 
 Added administrator install, restore, fresh, status, and uninstall commands

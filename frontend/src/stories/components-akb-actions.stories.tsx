@@ -115,7 +115,8 @@ export const RoleChangeSuccess: Story = {
     const canvas = within(canvasElement);
     await userEvent.click(canvas.getByRole("button", { name: /Change role for writer-user/i }));
     await userEvent.click(await within(document.body).findByRole("menuitemradio", { name: "writer" }));
-    await expect(canvas.getByRole("button", { name: /Change role for writer-user/i })).toHaveTextContent("writer");
+    const trigger = canvas.getByRole("button", { name: /Change role for writer-user/i });
+    await expect(await within(trigger).findByText("writer")).toBeVisible();
   },
 };
 

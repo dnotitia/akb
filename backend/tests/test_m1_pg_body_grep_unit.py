@@ -284,6 +284,114 @@ async def test_native_grep_document_replace_uses_its_head_placement(
 
 
 @pytest.mark.asyncio
+async def test_native_grep_replace_uses_full_scope_beyond_response_limit(monkeypatch):
+    body_bytes = b"---\ntitle: Document\n---\nTODO item\n"
+    bodies = [
+        HeadBody(
+            namespace_id=uuid.uuid4(),
+            vault="measure",
+            resource_id=uuid.uuid4(),
+            surface="document",
+            path=f"notes/{index}.md",
+            revision_id=str(index) * 40,
+            digest=hashlib.sha256(body_bytes).hexdigest(),
+            byte_size=len(body_bytes),
+            canonical_bytes=body_bytes,
+        )
+        for index in range(1, 4)
+    ]
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    calls = []
+
+    async def head_bodies(**_kwargs):
+        return bodies
+
+    async def require_write_access(**_kwargs):
+        return None
+
+    class _Native:
+        async def replace_text(self, **kwargs):
+            calls.append(kwargs)
+            return type(
+                "Result",
+                (),
+                {
+                    "revision_id": f"new-{len(calls)}",
+                    "parent_revision_id": kwargs["expected_revision_id"],
+                },
+            )()
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(service, "_require_write_access", require_write_access)
+    monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
+
+    replacement = r"C:\temp\1"
+    result = await service.grep_public(
+        "TODO",
+        user_id=uuid.uuid4(),
+        replace=replacement,
+        actor="tester",
+        limit=1,
+        max_replacements=3,
+    )
+
+    assert result["returned_docs"] == 1
+    assert result["total_docs"] == 3
+    assert result["replaced_docs"] == 3
+    assert len(result["replacements"]) == 3
+    assert [row["previous_commit"] for row in result["replacements"]] == [
+        body.revision_id for body in bodies
+    ]
+    assert len(calls) == 3
+    assert all(f"{replacement} item" in call["payload"] for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_native_grep_replace_budget_fails_before_mutation(monkeypatch):
+    body_bytes = b"---\ntitle: Document\n---\nTODO item\n"
+    bodies = [
+        HeadBody(
+            namespace_id=uuid.uuid4(),
+            vault="measure",
+            resource_id=uuid.uuid4(),
+            surface="document",
+            path=f"notes/{index}.md",
+            revision_id=str(index) * 40,
+            digest=hashlib.sha256(body_bytes).hexdigest(),
+            byte_size=len(body_bytes),
+            canonical_bytes=body_bytes,
+        )
+        for index in range(1, 4)
+    ]
+    service = M1NativeGrepService(object())  # type: ignore[arg-type]
+    calls = []
+
+    async def head_bodies(**_kwargs):
+        return bodies
+
+    class _Native:
+        async def replace_text(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(service, "_head_bodies", head_bodies)
+    monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
+
+    result = await service.grep_public(
+        "TODO",
+        user_id=uuid.uuid4(),
+        replace="done",
+        actor="tester",
+        limit=1,
+        max_replacements=2,
+    )
+
+    assert result["code"] == "bulk_too_large"
+    assert result["replacement_complete"] is False
+    assert result["replacements"] == []
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_native_grep_prevalidates_all_head_placements_before_replacing(monkeypatch):
     body_bytes = b"---\ntitle: Document\n---\nneedle body\n"
     bodies = [

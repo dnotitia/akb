@@ -375,8 +375,7 @@ B_MV=$(curl -sk -X POST "$BASE_URL/api/v1/agent-sessions/collide-b-${TS}" \
 # ── Summary ────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════"
-echo "  Passed: $PASS"
-echo "  Failed: $FAIL"
+echo "  Results: $PASS passed, $FAIL failed"
 echo "════════════════════════════════════════════════"
 if [ "$FAIL" -ne 0 ]; then
   for e in "${ERRORS[@]}"; do echo "  — $e"; done
