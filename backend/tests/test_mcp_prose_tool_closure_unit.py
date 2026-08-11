@@ -47,6 +47,7 @@ _PLUGINS = Path(__file__).resolve().parents[2] / "plugins"
 _PROXY_ONLY_TOOLS = frozenset({
     "akb_put_file",
     "akb_get_file",
+    "akb_update_file",
     "akb_delete_file",
     "akb_put_image",
     "akb_discard_image",

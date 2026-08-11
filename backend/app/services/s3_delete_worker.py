@@ -44,14 +44,18 @@ _last_sweep_at: float = 0.0
 # ── Outbox helpers (called by services in their TX) ──────────────
 
 
-async def enqueue_delete(conn, s3_key: str, *, delay_seconds: int = 0) -> None:
-    """Enqueue an S3 object for asynchronous deletion. MUST be called
-    inside the same TX as the DB write that removes the row pointing
-    at this object — that's the only way to guarantee no orphan."""
-    await conn.execute(
+async def enqueue_delete(conn, s3_key: str, *, delay_seconds: int = 0) -> int:
+    """Enqueue an S3 object for asynchronous deletion.
+
+    Row-owned objects must be enqueued inside the same transaction as the DB
+    mutation that disowns them. ``delay_seconds`` also supports staging
+    objects that must remain available until a presigned capability expires.
+    """
+    return await conn.fetchval(
         """
         INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
         VALUES ($1, NOW() + ($2 * INTERVAL '1 second'))
+        RETURNING id
         """,
         s3_key, delay_seconds,
     )
@@ -64,6 +68,23 @@ async def enqueue_pending_upload_delete(conn, s3_key: str) -> None:
         conn,
         s3_key,
         delay_seconds=PENDING_UPLOAD_DELETE_RECHECK_SECONDS,
+    )
+
+
+async def cancel_delete(conn, outbox_id: int) -> None:
+    """Cancel a delayed cleanup after its object becomes database-owned.
+
+    Callers must do this in the same transaction that publishes the object.
+    The outbox row then resolves commit ambiguity atomically: either both the
+    publication and cancellation commit, or the pending cleanup remains.
+    """
+    await conn.execute(
+        """
+        UPDATE s3_delete_outbox
+           SET processed_at = NOW(), last_error = NULL
+         WHERE id = $1 AND processed_at IS NULL
+        """,
+        outbox_id,
     )
 
 

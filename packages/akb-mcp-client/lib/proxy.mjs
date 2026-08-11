@@ -151,7 +151,7 @@ const FILE_TOOLS = [
   {
     name: "akb_put_file",
     description:
-      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
+      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_update_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
     inputSchema: {
       type: "object",
       properties: {
@@ -263,6 +263,37 @@ const FILE_TOOLS = [
         },
       },
       required: ["uri", "save_to"],
+    },
+  },
+  {
+    name: "akb_update_file",
+    description:
+      "Replace the bytes of an existing vault file while preserving its URI. The local file is hashed before transfer; identical content is skipped. Pass expected_content_hash and/or expected_version from akb_get_file to reject stale writes with HTTP 409 instead of overwriting a concurrent change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uri: {
+          type: "string",
+          description: "Existing file URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)",
+        },
+        file_path: {
+          type: "string",
+          description: "Absolute path to the local replacement file",
+        },
+        expected_content_hash: {
+          type: "string",
+          description: "Optional sha256 returned by akb_get_file; stale values are rejected with 409",
+        },
+        expected_version: {
+          type: "string",
+          description: "Optional opaque `version` returned by akb_get_file; stale values are rejected with 409",
+        },
+        mime_type: {
+          type: "string",
+          description: "Optional replacement MIME type. The existing file type is preserved when omitted.",
+        },
+      },
+      required: ["uri", "file_path"],
     },
   },
   {
@@ -575,6 +606,9 @@ export class AKBProxy {
         case "akb_get_file":
           result = await this._getFile(args);
           break;
+        case "akb_update_file":
+          result = await this._updateFile(args);
+          break;
         case "akb_delete_file":
           result = await this._deleteFile(args);
           break;
@@ -770,6 +804,7 @@ export class AKBProxy {
       hash_algorithm,
       etag,
       storage_version,
+      version,
     } = JSON.parse(resp.text);
 
     // 2. Determine save path
@@ -794,7 +829,58 @@ export class AKBProxy {
       hash_algorithm,
       etag,
       storage_version,
+      version,
     };
+  }
+
+  async _updateFile(args) {
+    const { uri, file_path } = args;
+    if (!uri || !file_path) throw new Error("uri and file_path required");
+    const { vault, id: fileId } = parseFileUri(uri);
+
+    let fileSize;
+    try {
+      fileSize = statSync(file_path).size;
+    } catch {
+      throw new Error(`File not found: ${file_path}`);
+    }
+    const contentHash = await this._sha256File(file_path);
+    const initiateParams = new URLSearchParams({ content_hash: contentHash });
+    if (args.mime_type) initiateParams.set("mime_type", args.mime_type);
+    if (args.expected_content_hash) {
+      initiateParams.set("expected_content_hash", args.expected_content_hash);
+    }
+    if (args.expected_version) {
+      initiateParams.set("expected_version", args.expected_version);
+    }
+
+    const initiateResp = await this._http(
+      "POST",
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/replace?${initiateParams}`,
+    );
+    const initiated = JSON.parse(initiateResp.text);
+    if (initiated.unchanged) return initiated;
+
+    const { replacement_id, upload_url } = initiated;
+    if (!replacement_id || !upload_url) {
+      throw new Error("Invalid file replacement response: missing replacement_id or upload_url");
+    }
+    const uploadMimeType = initiated.mime_type || args.mime_type || "application/octet-stream";
+    await this._uploadToS3(upload_url, file_path, fileSize, uploadMimeType);
+
+    const confirmParams = new URLSearchParams({ content_hash: contentHash });
+    if (args.expected_content_hash) {
+      confirmParams.set("expected_content_hash", args.expected_content_hash);
+    }
+    if (args.expected_version) {
+      confirmParams.set("expected_version", args.expected_version);
+    }
+    const confirmResp = await this._http(
+      "POST",
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}` +
+        `/replace/${encodeURIComponent(replacement_id)}/confirm?${confirmParams}`,
+    );
+    return JSON.parse(confirmResp.text);
   }
 
   async _deleteFile(args) {

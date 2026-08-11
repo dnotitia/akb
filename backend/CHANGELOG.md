@@ -84,6 +84,14 @@ records a bounded summary and one metadata-only receipt per committed document.
 Literal-mode replacements now also preserve backslashes as ordinary text;
 replacement-template backreferences remain exclusive to regex mode.
 
+### Added conflict-safe file replacement
+
+The File REST surface and stdio proxy now support replacing an existing file's
+bytes without changing its canonical URI. Callers may pin the current sha256,
+an opaque file version, or both; stale confirmation attempts return 409.
+Replacement uploads are isolated from the live object until a row-locked final
+precondition check succeeds, and identical content skips the byte transfer.
+
 ### Added app installation lifecycle commands
 
 Added administrator install, restore, fresh, status, and uninstall commands

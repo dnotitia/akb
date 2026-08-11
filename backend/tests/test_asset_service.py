@@ -1403,8 +1403,9 @@ async def test_pending_upload_delete_schedules_post_put_reconciliation() -> None
     calls: list[tuple[str, int]] = []
 
     class _Connection:
-        async def execute(self, _sql, key, delay_seconds):
+        async def fetchval(self, _sql, key, delay_seconds):
             calls.append((key, delay_seconds))
+            return len(calls)
 
     await s3_delete_worker.enqueue_pending_upload_delete(
         _Connection(), "vault/file.bin",

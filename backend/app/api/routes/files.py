@@ -101,6 +101,78 @@ async def confirm_upload(
     )
 
 
+@router.post("/files/{vault}/{file_id}/replace", summary="Prepare an in-place file replacement")
+async def replace_file(
+    request: Request,
+    vault: str,
+    file_id: str,
+    content_hash: str = Query(..., description="sha256 of the replacement bytes"),
+    mime_type: str | None = Query(
+        None,
+        description="Replacement MIME type; preserves the existing type when omitted",
+    ),
+    expected_content_hash: str | None = Query(
+        None,
+        description="Reject with 409 unless the current file hash matches",
+    ),
+    expected_version: str | None = Query(
+        None,
+        description="Reject with 409 unless the current opaque file version matches",
+    ),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Return an isolated presigned PUT URL, or ``unchanged=true``."""
+    access, _actor_id, _delegated_actor = await _resolve_file_write_context(
+        request, vault, user,
+    )
+    return await file_service.initiate_replace(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        file_id=file_id,
+        content_hash=content_hash,
+        mime_type=mime_type,
+        expected_content_hash=expected_content_hash,
+        expected_version=expected_version,
+    )
+
+
+@router.post(
+    "/files/{vault}/{file_id}/replace/{replacement_id}/confirm",
+    summary="Confirm an in-place file replacement",
+)
+async def confirm_file_replace(
+    request: Request,
+    vault: str,
+    file_id: str,
+    replacement_id: str,
+    content_hash: str = Query(..., description="sha256 of the replacement bytes"),
+    expected_content_hash: str | None = Query(
+        None,
+        description="Reject with 409 unless the current file hash matches",
+    ),
+    expected_version: str | None = Query(
+        None,
+        description="Reject with 409 unless the current opaque file version matches",
+    ),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Certify staged bytes and atomically publish them under the same URI."""
+    access, actor_id, delegated_actor = await _resolve_file_write_context(
+        request, vault, user,
+    )
+    return await file_service.confirm_replace(
+        vault_name=vault,
+        vault_id=access["vault_id"],
+        file_id=file_id,
+        replacement_id=replacement_id,
+        actor_id=actor_id,
+        delegated_actor=delegated_actor,
+        content_hash=content_hash,
+        expected_content_hash=expected_content_hash,
+        expected_version=expected_version,
+    )
+
+
 @router.get("/files/{vault}/{file_id}/download", summary="Get download URL")
 async def get_download_url(
     vault: str,

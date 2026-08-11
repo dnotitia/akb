@@ -1815,6 +1815,7 @@ class DocumentService:
                 hash_algorithm=r.get("hash_algorithm") if include_hashes else None,
                 etag=r.get("etag") if include_hashes else None,
                 storage_version=r.get("storage_version") if include_hashes else None,
+                version=(r.get("storage_version") or r.get("etag")) if include_hashes else None,
             )
             for r in rows
         ]

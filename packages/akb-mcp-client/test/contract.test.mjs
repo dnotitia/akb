@@ -54,6 +54,7 @@ const downloadResp = JSON.stringify({
   hash_algorithm: "sha256",
   etag: "etag-1",
   storage_version: "version-1",
+  version: "version-1",
   expires_in: 3600,
 });
 
@@ -82,13 +83,14 @@ it("_putFile destructures uri + upload_url", () => {
   assert.match(upload_url, /^https:/);
 });
 
-it("_getFile destructures name + download_url + size_bytes + hash fields", () => {
-  const { name: filename, download_url, size_bytes, content_hash, hash_algorithm } = JSON.parse(downloadResp);
+it("_getFile destructures name + download_url + size_bytes + hash/version fields", () => {
+  const { name: filename, download_url, size_bytes, content_hash, hash_algorithm, version } = JSON.parse(downloadResp);
   assert.equal(filename, "file.bin");
   assert.match(download_url, /^https:/);
   assert.equal(size_bytes, 4096);
   assert.match(content_hash, /^[0-9a-f]{64}$/);
   assert.equal(hash_algorithm, "sha256");
+  assert.equal(version, "version-1");
 });
 
 it("_deleteFile passthrough produces a dict (not bool)", () => {
@@ -224,6 +226,61 @@ itAsync("_putImage proxies bounded bytes and returns ready-to-paste Markdown", a
   }
 });
 
+itAsync("_updateFile stages bytes and forwards both optimistic-concurrency pins", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-mcp-replace-"));
+  const filePath = join(directory, "replacement.bin");
+  const data = Buffer.from("replacement payload");
+  const fileId = "11111111-2222-3333-4444-555555555555";
+  const replacementId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const uri = `akb://myvault/coll/proof/file/${fileId}`;
+  const canonical = {
+    kind: "file", uri, vault: "myvault", collection: "proof",
+    name: "original.bin", content_hash: "f".repeat(64), version: "etag-new",
+    previous_content_hash: "a".repeat(64), previous_version: "etag-old",
+    unchanged: false,
+  };
+  await writeFile(filePath, data);
+  try {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const calls = [];
+    proxy._http = async (method, path) => {
+      calls.push({ method, path });
+      if (calls.length === 1) {
+        return { text: JSON.stringify({
+          kind: "file", uri, replacement_id: replacementId,
+          upload_url: "http://transfer.test/replace", mime_type: "application/octet-stream",
+          unchanged: false,
+        }) };
+      }
+      return { text: JSON.stringify(canonical) };
+    };
+    const uploads = [];
+    proxy._uploadToS3 = async (...uploadArgs) => { uploads.push(uploadArgs); };
+
+    const result = await proxy._updateFile({
+      uri, file_path: filePath,
+      expected_content_hash: "a".repeat(64), expected_version: "etag-old",
+    });
+
+    assert.deepEqual(result, canonical);
+    assert.deepEqual(uploads, [[
+      "http://transfer.test/replace", filePath, data.length, "application/octet-stream",
+    ]]);
+    assert.equal(calls.length, 2);
+    const initiate = new URL(`http://test${calls[0].path}`);
+    const confirm = new URL(`http://test${calls[1].path}`);
+    assert.match(initiate.pathname, new RegExp(`/files/myvault/${fileId}/replace$`));
+    assert.match(confirm.pathname, new RegExp(`/replace/${replacementId}/confirm$`));
+    for (const requestUrl of [initiate, confirm]) {
+      assert.equal(requestUrl.searchParams.get("content_hash"), await proxy._sha256File(filePath));
+      assert.equal(requestUrl.searchParams.get("expected_content_hash"), "a".repeat(64));
+      assert.equal(requestUrl.searchParams.get("expected_version"), "etag-old");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 itAsync("_putImage rejects unsupported image types before network access", async () => {
   const directory = await mkdtemp(join(tmpdir(), "akb-mcp-image-type-"));
   const imagePath = join(directory, "vector.svg");
@@ -240,6 +297,28 @@ itAsync("_putImage rejects unsupported image types before network access", async
       /PNG, JPEG, GIF, or WebP/,
     );
     assert.equal(networkTouched, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+itAsync("_updateFile skips transfer when the backend reports identical content", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-mcp-replace-skip-"));
+  const filePath = join(directory, "same.bin");
+  const uri = "akb://myvault/file/11111111-2222-3333-4444-555555555555";
+  await writeFile(filePath, Buffer.from("already current"));
+  try {
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    let calls = 0;
+    const unchanged = { kind: "file", uri, content_hash: "a".repeat(64), unchanged: true };
+    proxy._http = async () => {
+      calls++;
+      return { text: JSON.stringify(unchanged) };
+    };
+    proxy._uploadToS3 = async () => { throw new Error("upload should have been skipped"); };
+
+    assert.deepEqual(await proxy._updateFile({ uri, file_path: filePath }), unchanged);
+    assert.equal(calls, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

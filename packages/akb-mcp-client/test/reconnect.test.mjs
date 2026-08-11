@@ -39,6 +39,7 @@ const fileToolNames = [
   "akb_put_image",
   "akb_discard_image",
   "akb_get_file",
+  "akb_update_file",
   "akb_delete_file",
 ];
 

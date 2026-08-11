@@ -254,6 +254,90 @@ async def test_action_limited_confirm_emits_both_actor_ids(monkeypatch):
     }
 
 
+async def test_action_limited_replace_forwards_pins_and_delegated_actor(monkeypatch):
+    from app.api.routes import files
+
+    service = _user(key_class="service", token_id=str(uuid.uuid4()))
+    human = _user(key_class=None, auth_method="jwt", username="alice")
+    vault_id = uuid.uuid4()
+    observed: dict = {}
+
+    async def _check_service(*_args, **_kwargs):
+        return {
+            "vault_id": vault_id,
+            "role": "writer",
+            "role_source": "write_policy_grant",
+            "write_grant_actions": ["file_upload"],
+        }
+
+    async def _delegated_actor(*_args):
+        return SimpleNamespace(
+            user=human,
+            service_user_id=service.user_id,
+            service_token_id=service.token_id,
+        )
+
+    async def _check_human(*_args):
+        return {"role": "writer"}
+
+    async def _initiate(**kwargs):
+        observed["initiate"] = kwargs
+        return {"uri": "akb://team/file/f-1", "unchanged": False}
+
+    async def _confirm(**kwargs):
+        observed["confirm"] = kwargs
+        return {"uri": "akb://team/file/f-1", "unchanged": False}
+
+    monkeypatch.setattr(file_write_context, "check_vault_access", _check_service)
+    monkeypatch.setattr(file_write_context, "require_delegated_actor", _delegated_actor)
+    monkeypatch.setattr(
+        file_write_context, "check_delegated_vault_writer", _check_human,
+    )
+    monkeypatch.setattr(files.file_service, "initiate_replace", _initiate)
+    monkeypatch.setattr(files.file_service, "confirm_replace", _confirm)
+
+    digest = "a" * 64
+    expected = "b" * 64
+    await files.replace_file(
+        request=_request("Bearer user.jwt"),
+        vault="team",
+        file_id="f-1",
+        content_hash=digest,
+        mime_type=None,
+        expected_content_hash=expected,
+        expected_version="etag-old",
+        user=service,
+    )
+    await files.confirm_file_replace(
+        request=_request("Bearer user.jwt"),
+        vault="team",
+        file_id="f-1",
+        replacement_id="r-1",
+        content_hash=digest,
+        expected_content_hash=expected,
+        expected_version="etag-old",
+        user=service,
+    )
+
+    assert observed["initiate"] == {
+        "vault_name": "team",
+        "vault_id": vault_id,
+        "file_id": "f-1",
+        "content_hash": digest,
+        "mime_type": None,
+        "expected_content_hash": expected,
+        "expected_version": "etag-old",
+    }
+    assert observed["confirm"]["actor_id"] == human.username
+    assert observed["confirm"]["delegated_actor"] == {
+        "delegated_user_id": human.user_id,
+        "service_user_id": service.user_id,
+        "service_token_id": service.token_id,
+    }
+    assert observed["confirm"]["expected_content_hash"] == expected
+    assert observed["confirm"]["expected_version"] == "etag-old"
+
+
 async def test_file_event_flattens_only_bounded_delegation_ids():
     from app.services.file_service import _delegated_actor_event_fields
 

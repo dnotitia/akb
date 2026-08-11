@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -35,6 +35,7 @@ from app.services.resource_hash import (
     compute_stream_content_hash,
     is_sha256_hex,
 )
+from app.services.s3_delete_worker import cancel_delete as _cancel_s3_delete
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
@@ -48,6 +49,8 @@ logger = logging.getLogger("akb.files")
 _PRESIGN_UPLOAD_TTL = 3600
 _PRESIGN_DOWNLOAD_TTL = 3600
 _S3_STREAM_CHUNK_SIZE = 64 * 1024
+_REPLACEMENT_STAGING_DELETE_DELAY = _PRESIGN_UPLOAD_TTL + 300
+_REPLACEMENT_CANDIDATE_DELETE_DELAY = 24 * 60 * 60
 
 _DELEGATED_ACTOR_EVENT_KEYS = (
     "delegated_user_id",
@@ -216,6 +219,75 @@ def _content_key_honors_hash(s3_key: str, content_hash: str) -> bool:
     return last_segment.startswith(f"{_content_key_prefix(content_hash)}_")
 
 
+def _replacement_staging_key(
+    vault_name: str,
+    file_id: uuid.UUID,
+    replacement_id: uuid.UUID,
+) -> str:
+    """Private upload target for one replacement attempt.
+
+    The caller receives a presigned URL for this key, never for the live file
+    key.  Confirmation copies these bytes to a fresh, non-presigned key before
+    publishing the metadata switch.
+    """
+    return f"__akb_file_replacements__/{vault_name}/{file_id}/{replacement_id}"
+
+
+def _replacement_final_key(
+    vault_name: str,
+    collection: str,
+    filename: str,
+    replacement_id: uuid.UUID,
+) -> str:
+    """Non-presigned destination for one certified replacement.
+
+    Unlike the legacy create key, this uses the full replacement UUID.  A
+    collision must never overwrite another file before PostgreSQL can reject
+    the duplicate key.
+    """
+    safe_name = filename.replace("/", "_")
+    prefix = replacement_id.hex
+    if collection:
+        return f"{vault_name}/{collection}/{prefix}_{safe_name}"
+    return f"{vault_name}/{prefix}_{safe_name}"
+
+
+def _file_version(row: dict) -> str | None:
+    """Return the opaque optimistic-concurrency token exposed to callers."""
+    return row.get("storage_version") or row.get("etag")
+
+
+def _check_file_preconditions(
+    row: dict,
+    *,
+    expected_content_hash: str | None,
+    expected_version: str | None,
+) -> None:
+    if expected_content_hash is not None and row.get("content_hash") != expected_content_hash:
+        raise ConflictError(f"content_hash moved: expected {expected_content_hash}, actual {row.get('content_hash')}")
+    current_version = _file_version(row)
+    if expected_version is not None and current_version != expected_version:
+        raise ConflictError(f"file version moved: expected {expected_version}, actual {current_version}")
+
+
+async def _discard_replacement_objects(*s3_keys: str) -> None:
+    """Best-effort cleanup for unpublished replacement objects.
+
+    A precondition failure must remain a 409 even if storage cleanup has a
+    transient failure.  Successful publishes use the durable delete outbox;
+    this helper is only for objects that never became database-owned.
+    """
+    for s3_key in s3_keys:
+        if not s3_key:
+            continue
+        try:
+            await asyncio.to_thread(s3_adapter.delete, s3_key)
+        except NotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not discard unpublished replacement object %s: %s", s3_key, exc)
+
+
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
 
 
@@ -365,6 +437,312 @@ class FileService:
             "expires_in": _PRESIGN_UPLOAD_TTL,
             "deduplicated": deduplicated,
         }
+
+    async def initiate_replace(
+        self,
+        vault_name: str,
+        vault_id: uuid.UUID,
+        file_id: str,
+        *,
+        content_hash: str,
+        mime_type: str | None = None,
+        expected_content_hash: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict:
+        """Prepare an isolated upload that can replace one logical file.
+
+        No live object key is exposed for PUT.  The caller uploads to a
+        replacement-specific staging key and ``confirm_replace`` publishes a
+        fresh object only after re-checking the optimistic-concurrency pins.
+        """
+        if not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        if expected_content_hash is not None and not is_sha256_hex(expected_content_hash):
+            raise AKBError(
+                "expected_content_hash must be a lowercase sha256 hex digest",
+                status_code=400,
+            )
+        if self._measurement is not None:
+            raise ConflictError("File replacement is unavailable for the active measurement storage driver")
+
+        fid = uuid.UUID(file_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        if not row or row.get("kind") != "file":
+            raise NotFoundError("File", file_id)
+        _check_file_preconditions(
+            row,
+            expected_content_hash=expected_content_hash,
+            expected_version=expected_version,
+        )
+
+        current_version = _file_version(row)
+        canonical_uri = file_uri(vault_name, file_id, collection=row["collection"])
+        if row.get("content_hash") == content_hash:
+            return {
+                "kind": "file",
+                "uri": canonical_uri,
+                "vault": vault_name,
+                "collection": row["collection"],
+                "name": row["name"],
+                "mime_type": row["mime_type"],
+                "size_bytes": row["size_bytes"],
+                "content_hash": row["content_hash"],
+                "hash_algorithm": row["hash_algorithm"],
+                "etag": row["etag"],
+                "storage_version": row["storage_version"],
+                "version": current_version,
+                "unchanged": True,
+            }
+
+        s3_adapter.ensure_bucket(self._bucket)
+        replacement_id = uuid.uuid4()
+        staging_key = _replacement_staging_key(vault_name, fid, replacement_id)
+        upload_mime_type = mime_type or row.get("mime_type") or "application/octet-stream"
+        upload_url = s3_adapter.presign_put(
+            staging_key,
+            content_type=upload_mime_type,
+            ttl=_PRESIGN_UPLOAD_TTL,
+        )
+        # An abandoned replacement has no vault_files row from which a normal
+        # delete can discover its staging key.  Schedule cleanup just after the
+        # presigned URL expires; successful confirmation also enqueues an
+        # immediate delete, and duplicate S3 deletes are intentionally safe.
+        async with pool.acquire() as conn:
+            await _enqueue_s3_delete(
+                conn,
+                staging_key,
+                delay_seconds=_REPLACEMENT_STAGING_DELETE_DELAY,
+            )
+        return {
+            "kind": "file",
+            "uri": canonical_uri,
+            "vault": vault_name,
+            "collection": row["collection"],
+            "name": row["name"],
+            "mime_type": upload_mime_type,
+            "replacement_id": str(replacement_id),
+            "upload_url": upload_url,
+            "expires_in": _PRESIGN_UPLOAD_TTL,
+            "current_content_hash": row.get("content_hash"),
+            "current_version": current_version,
+            "unchanged": False,
+        }
+
+    async def confirm_replace(
+        self,
+        vault_name: str,
+        vault_id: uuid.UUID,
+        file_id: str,
+        replacement_id: str,
+        *,
+        actor_id: str,
+        delegated_actor: dict[str, str] | None = None,
+        content_hash: str,
+        expected_content_hash: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict:
+        """Publish staged replacement bytes under the existing file URI."""
+        if not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        if expected_content_hash is not None and not is_sha256_hex(expected_content_hash):
+            raise AKBError(
+                "expected_content_hash must be a lowercase sha256 hex digest",
+                status_code=400,
+            )
+        if self._measurement is not None:
+            raise ConflictError("File replacement is unavailable for the active measurement storage driver")
+
+        fid = uuid.UUID(file_id)
+        rid = uuid.UUID(replacement_id)
+        staging_key = _replacement_staging_key(vault_name, fid, rid)
+        pool = await get_pool()
+
+        # Cheap stale-request rejection before any server-side copy.  The same
+        # checks run again under a row lock below; this first pass is only an
+        # optimization and is not the concurrency boundary.
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        if not row or row.get("kind") != "file":
+            await _discard_replacement_objects(staging_key)
+            raise NotFoundError("File", file_id)
+        try:
+            _check_file_preconditions(
+                row,
+                expected_content_hash=expected_content_hash,
+                expected_version=expected_version,
+            )
+        except ConflictError:
+            await _discard_replacement_objects(staging_key)
+            raise
+
+        # The presigned staging URL remains valid until its TTL elapses.  Copy
+        # to a fresh, non-presigned key and certify THAT immutable candidate;
+        # a later reuse of the staging URL therefore cannot mutate live bytes.
+        final_key = _replacement_final_key(
+            vault_name,
+            row.get("collection") or "",
+            row["name"],
+            rid,
+        )
+        # The candidate has no owning vault_files row until the metadata swap
+        # commits.  Schedule a durable fallback cleanup before creating it,
+        # then cancel that cleanup in the SAME transaction that adopts it.
+        # This is safe even if the client cannot tell whether COMMIT succeeded.
+        async with pool.acquire() as conn:
+            candidate_cleanup_id = await _enqueue_s3_delete(
+                conn,
+                final_key,
+                delay_seconds=_REPLACEMENT_CANDIDATE_DELETE_DELAY,
+            )
+        try:
+            final_meta = await asyncio.to_thread(s3_adapter.copy, staging_key, final_key)
+            server_content_hash = await asyncio.to_thread(
+                compute_stream_content_hash,
+                s3_adapter.iter_chunks(final_key),
+            )
+        except Exception:
+            await _discard_replacement_objects(staging_key, final_key)
+            raise
+
+        if server_content_hash != content_hash:
+            await _discard_replacement_objects(staging_key, final_key)
+            raise ConflictError("Uploaded replacement file hash mismatch")
+
+        size_bytes = final_meta["ContentLength"]
+        mime_type = final_meta.get("ContentType") or row.get("mime_type") or "application/octet-stream"
+        etag = (final_meta.get("ETag") or "").strip('"') or None
+        storage_version = final_meta.get("VersionId")
+        previous_content_hash: str | None = None
+        previous_version: str | None = None
+        unchanged = False
+        ready_to_commit = False
+
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
+                    if not locked:
+                        raise NotFoundError("File", file_id)
+                    _check_file_preconditions(
+                        locked,
+                        expected_content_hash=expected_content_hash,
+                        expected_version=expected_version,
+                    )
+                    previous_content_hash = locked.get("content_hash")
+                    previous_version = _file_version(locked)
+
+                    # A concurrent unconditional writer may have published the
+                    # same bytes since initiation.  Keep its object/version and
+                    # retire both candidates without manufacturing a write.
+                    if previous_content_hash == server_content_hash:
+                        unchanged = True
+                        await _enqueue_s3_delete(conn, staging_key)
+                        await _enqueue_s3_delete(conn, final_key)
+                        result_row = locked
+                    else:
+                        await vault_files_repo.replace_confirmed_metadata(
+                            conn,
+                            fid,
+                            s3_key=final_key,
+                            mime_type=mime_type,
+                            size_bytes=size_bytes,
+                            content_hash=server_content_hash,
+                            hash_algorithm=HASH_ALGORITHM,
+                            etag=etag,
+                            storage_version=storage_version,
+                        )
+                        # Publishing the candidate and cancelling its fallback
+                        # cleanup are one atomic PostgreSQL decision.
+                        await _cancel_s3_delete(conn, candidate_cleanup_id)
+                        await _enqueue_s3_delete(conn, locked["s3_key"])
+                        await _enqueue_s3_delete(conn, staging_key)
+                        await emit_event(
+                            conn,
+                            "file.update",
+                            vault_id=vault_id,
+                            resource_uri=file_uri(
+                                vault_name,
+                                file_id,
+                                collection=locked["collection"],
+                            ),
+                            actor_id=actor_id,
+                            payload={
+                                "vault": vault_name,
+                                "collection": locked["collection"],
+                                "name": locked["name"],
+                                "mime_type": mime_type,
+                                "size_bytes": size_bytes,
+                                "content_hash": server_content_hash,
+                                "hash_algorithm": HASH_ALGORITHM,
+                                "etag": etag,
+                                "storage_version": storage_version,
+                                "previous_content_hash": previous_content_hash,
+                                "previous_version": previous_version,
+                                **_delegated_actor_event_fields(delegated_actor),
+                            },
+                        )
+                        result_row = {
+                            **locked,
+                            "s3_key": final_key,
+                            "mime_type": mime_type,
+                            "size_bytes": size_bytes,
+                            "content_hash": server_content_hash,
+                            "hash_algorithm": HASH_ALGORITHM,
+                            "etag": etag,
+                            "storage_version": storage_version,
+                        }
+                    # From this point onward, an exception can be an ambiguous
+                    # COMMIT result rather than a known rollback.
+                    ready_to_commit = True
+        except Exception:
+            # Staging is never database-owned and can be removed immediately.
+            # Do not blindly delete final_key: after the transaction body
+            # finishes, COMMIT may have succeeded even when the connection
+            # reports an error. Its delayed outbox row is cancelled atomically
+            # iff publication committed.
+            await _discard_replacement_objects(staging_key)
+            if not ready_to_commit:
+                # The transaction body did not finish, so asyncpg enters its
+                # rollback path and the candidate cannot have been adopted.
+                await _discard_replacement_objects(final_key)
+            raise
+
+        if not unchanged:
+            try:
+                await index_file_metadata(
+                    file_id,
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    collection=result_row["collection"] or "",
+                    name=result_row["name"],
+                    mime_type=result_row["mime_type"],
+                    size_bytes=result_row["size_bytes"],
+                    description=result_row["description"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("file metadata indexing failed for %s: %s", file_id, exc)
+
+        result_version = _file_version(result_row)
+        return {
+            "kind": "file",
+            "uri": file_uri(vault_name, file_id, collection=result_row["collection"]),
+            "vault": vault_name,
+            "collection": result_row["collection"],
+            "name": result_row["name"],
+            "mime_type": result_row["mime_type"],
+            "size_bytes": result_row["size_bytes"],
+            "content_hash": result_row["content_hash"],
+            "hash_algorithm": result_row["hash_algorithm"],
+            "etag": result_row["etag"],
+            "storage_version": result_row["storage_version"],
+            "version": result_version,
+            "previous_content_hash": previous_content_hash,
+            "previous_version": previous_version,
+            "unchanged": unchanged,
+        }
+
 
     async def confirm_upload(
         self,
@@ -526,6 +904,7 @@ class FileService:
             "hash_algorithm": HASH_ALGORITHM,
             "etag": etag,
             "storage_version": storage_version,
+            "version": storage_version or etag,
         }
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
@@ -569,6 +948,7 @@ class FileService:
             "hash_algorithm": row["hash_algorithm"],
             "etag": row["etag"],
             "storage_version": row["storage_version"],
+            "version": _file_version(row),
             "expires_in": _PRESIGN_DOWNLOAD_TTL,
         }
 
@@ -623,6 +1003,7 @@ class FileService:
                 "hash_algorithm": r["hash_algorithm"],
                 "etag": r["etag"],
                 "storage_version": r["storage_version"],
+                "version": _file_version(r),
                 "description": r["description"],
                 "created_by": r["created_by"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
@@ -642,17 +1023,7 @@ class FileService:
         fid = uuid.UUID(file_id)
         pool = await get_pool()
 
-        # 1. Look up the file + vault name (read-only, no TX needed).
-        async with pool.acquire() as conn:
-            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
-            if not row or row.get("kind") != "file":
-                raise NotFoundError("File", file_id)
-            vault_row = await conn.fetchrow(
-                "SELECT name FROM vaults WHERE id = $1", vault_id,
-            )
-            vault_name = vault_row["name"] if vault_row else ""
-
-        # 2. Atomic PG mutations: vault_files DELETE + edges cleanup +
+        # Atomic PG mutations: row lock + vault_files DELETE + edges cleanup +
         # chunk-delete outbox + s3-delete outbox under one TX. The
         # actual S3 delete is performed asynchronously by
         # s3_delete_worker after the TX commits, so a crash between
@@ -660,6 +1031,16 @@ class FileService:
         # missing-blob row). The outbox row carries the s3_key.
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # Serialize with confirm_replace.  Reading the key before this
+                # transaction can enqueue a stale object if a replacement wins
+                # the race, leaving the newly published object orphaned.
+                row = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
+                if not row:
+                    raise NotFoundError("File", file_id)
+                vault_row = await conn.fetchrow(
+                    "SELECT name FROM vaults WHERE id = $1", vault_id,
+                )
+                vault_name = vault_row["name"] if vault_row else ""
                 if vault_name:
                     f_uri = file_uri(vault_name, file_id, collection=row["collection"])
                     # App-level publication cascade — `publications.

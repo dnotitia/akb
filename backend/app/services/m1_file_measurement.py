@@ -564,6 +564,7 @@ class MeasurementFileService:
             "storage_driver": row["storage_driver"],
             "etag": None,
             "storage_version": None,
+            "version": row.get("native_revision_id") or row["content_hash"],
             "native_resource_id": str(row["native_resource_id"]) if row.get("native_resource_id") else None,
             "native_revision_id": row.get("native_revision_id"),
             # Which body placement this File's Head is pinned to, read straight
