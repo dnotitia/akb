@@ -27,6 +27,7 @@ from app.services.legacy_revision_bridge import (
 )
 from app.services.native_revision_shadow_reader import (
     LegacyFixedRefShadowReader,
+    NativeActivityEvidence,
     NativeRevisionShadowReader,
     ShadowReaderScopeError,
 )
@@ -153,13 +154,13 @@ class ShadowReader(Protocol):
         fixed_ref: str,
     ) -> Mapping[str, Any]: ...
 
-    async def audit_activity(
+    async def activity_evidence(
         self,
         document: LegacyInventoryDocument,
         *,
         selector: str,
         fixed_ref: str,
-    ) -> None: ...
+    ) -> NativeActivityEvidence: ...
 
 
 class NativeRevisionShadowComparator:
@@ -291,26 +292,28 @@ class NativeRevisionShadowComparator:
                 fixed_ref=binding.fixed_ref,
             )
             candidate_selector = native_revision_id
-            raw_candidate = await self._read(
-                self.candidate_reader,
-                operation,
-                document,
-                selector=candidate_selector,
-                fixed_ref=binding.fixed_ref,
-            )
-            candidate = raw_candidate
             if operation == "activity":
-                await self._audit_candidate_activity(
+                raw_candidate, activity_binding_fact = await self._read_candidate_activity(
                     document,
                     selector=native_revision_id,
                     fixed_ref=binding.fixed_ref,
                 )
+                binding.evidence_fact["activity_audit"] = activity_binding_fact
                 candidate = self._project_candidate_activity(
                     legacy,
                     raw_candidate,
                     document,
                     native_revision_id,
                 )
+            else:
+                raw_candidate = await self._read(
+                    self.candidate_reader,
+                    operation,
+                    document,
+                    selector=candidate_selector,
+                    fixed_ref=binding.fixed_ref,
+                )
+                candidate = raw_candidate
             _, _, mismatches = self._compare_operation(
                 operation,
                 legacy,
@@ -332,21 +335,36 @@ class NativeRevisionShadowComparator:
             operations[operation] = operation_result
         return {"operations": operations}
 
-    async def _audit_candidate_activity(
+    async def _read_candidate_activity(
         self,
         document: LegacyInventoryDocument,
         *,
         selector: str,
         fixed_ref: str,
-    ) -> None:
-        auditor = getattr(self.candidate_reader, "audit_activity", None)
-        if auditor is None:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        reader = getattr(self.candidate_reader, "activity_evidence", None)
+        if reader is None:
             raise ShadowComparisonError(
                 "candidate reader cannot prove the raw native activity audit"
             )
-        value = auditor(document, selector=selector, fixed_ref=fixed_ref)
+        value = reader(document, selector=selector, fixed_ref=fixed_ref)
         if inspect.isawaitable(value):
-            await value
+            value = await value
+        if not isinstance(value, NativeActivityEvidence):
+            raise ShadowComparisonError(
+                "candidate reader returned an invalid raw native activity audit"
+            )
+        envelope = self._jsonable(value.envelope)
+        binding_fact = self._jsonable(value.binding_fact)
+        if not isinstance(envelope, dict) or not isinstance(binding_fact, dict):
+            raise ShadowComparisonError(
+                "candidate raw native activity audit is not an object"
+            )
+        if binding_fact.get("profile") != _ACTIVITY_AUDIT_PROFILE:
+            raise ShadowComparisonError(
+                "candidate raw native activity audit profile is invalid"
+            )
+        return envelope, binding_fact
 
     async def _read(
         self,
@@ -671,6 +689,10 @@ class NativeRevisionShadowComparator:
                 fact["native_revision_id"],
             ),
         )
+        if any("activity_audit" not in fact for fact in mappings):
+            raise ShadowComparisonError(
+                "evidence binding is missing an audited native activity fact"
+            )
         preimage = {
             "comparison_run": run_facts,
             "mapping_owner_scope": mappings,

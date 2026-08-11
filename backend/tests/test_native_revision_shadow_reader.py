@@ -41,6 +41,7 @@ from app.services.native_revision_shadow import (
 from app.services.native_revision_shadow_reader import (
     _apply_unified_patch,
     LegacyFixedRefShadowReader,
+    NativeActivityEvidence,
     NativeRevisionShadowReader,
     ShadowReaderScopeError,
 )
@@ -395,14 +396,27 @@ class _WireReader:
             ]
         }
 
-    async def audit_activity(
+    async def activity_evidence(
         self,
         document: LegacyInventoryDocument,
         *,
         selector: str,
         fixed_ref: str,
-    ) -> None:
-        del document, selector, fixed_ref
+    ) -> NativeActivityEvidence:
+        envelope = await self.activity(
+            document,
+            selector=selector,
+            fixed_ref=fixed_ref,
+        )
+        return NativeActivityEvidence(
+            envelope=envelope,
+            binding_fact={
+                "profile": "akb-native-revision-p2-activity-audit/v1",
+                "resource_id": str(document.resource_id),
+                "selector": selector,
+                "fixed_ref": fixed_ref,
+            },
+        )
 
 
 class _NoWriteGit:
@@ -695,6 +709,8 @@ def _native_activity_reader(
     fixed_ref: str,
     service: _NoWriteNative,
     repository: _NoWriteNativeRepository,
+    *,
+    native_mappings: dict[str, str] | None = None,
 ) -> NativeRevisionShadowReader:
     return NativeRevisionShadowReader(
         pool=None,
@@ -702,7 +718,12 @@ def _native_activity_reader(
         vault_name="p2-manual",
         native_service=service,
         native_repository=repository,
-        selector_bridge=_CompletedSelectorBridge(document, native_id, fixed_ref),
+        selector_bridge=_CompletedSelectorBridge(
+            document,
+            native_id,
+            fixed_ref,
+            native_mappings=native_mappings,
+        ),
     )
 
 
@@ -767,9 +788,13 @@ async def test_reconcile_activity_audit_derives_action_from_parent_and_current_p
     native_id = _oid("c")
     parent_id = _oid("e")
     fixed_ref = _oid("f")
+    old_path = "notes/old-migration-candidate.md"
+    document = replace(
+        document,
+        lineage=(replace(document.lineage[0], path_at_revision=old_path), document.lineage[1]),
+    )
     service = _NoWriteNative((document, native_id))
     repository = _NoWriteNativeRepository((document, native_id))
-    old_path = "notes/old-migration-candidate.md"
     selected = {
         **repository._revision(document.resource_id),
         "action": "move",
@@ -820,6 +845,62 @@ async def test_reconcile_activity_audit_derives_action_from_parent_and_current_p
             fixed_ref,
             service,
             repository,
+            native_mappings={document.lineage[0].legacy_git_oid: parent_id},
+        ).activity(document, selector=native_id, fixed_ref=fixed_ref)
+
+
+async def test_reconcile_activity_audit_rejects_correlated_parent_path_tampering():
+    document = _document()
+    native_id = _oid("c")
+    parent_id = _oid("e")
+    fixed_ref = _oid("f")
+    service = _NoWriteNative((document, native_id))
+    repository = _NoWriteNativeRepository((document, native_id))
+    forged_parent_path = "notes/forged-parent.md"
+    selected = {
+        **repository._revision(document.resource_id),
+        "action": "move",
+        "parent_revision_id": parent_id,
+        "path_from": forged_parent_path,
+        "path_to": document.current_path,
+        "actor": document.activity.actor,
+        "subject": document.activity.subject,
+        "summary": document.activity.summary,
+    }
+    parent = {
+        **repository._revision(document.resource_id),
+        "revision_id": parent_id,
+        "path_at_revision": forged_parent_path,
+        "path_from": None,
+        "path_to": forged_parent_path,
+    }
+    repository.revision_selector_overrides[(document.resource_id, native_id)] = selected
+    repository.revision_selector_overrides[(document.resource_id, parent_id)] = parent
+    repository.activity_override = _activity_for_revision(selected)
+    service.snapshot_overrides[(document.resource_id, native_id)] = _Snapshot(
+        resource_id=document.resource_id,
+        revision_id=native_id,
+        surface="document",
+        path=document.current_path,
+        text=document.body.decode(),
+        digest=document.body_digest,
+        byte_size=document.byte_size,
+        action="move",
+        parent_revision_id=parent_id,
+        occurred_at=selected["occurred_at"],
+    )
+
+    with pytest.raises(
+        ShadowReaderScopeError,
+        match="parent path differs from its completed legacy mapping",
+    ):
+        await _native_activity_reader(
+            document,
+            native_id,
+            fixed_ref,
+            service,
+            repository,
+            native_mappings={document.lineage[0].legacy_git_oid: parent_id},
         ).activity(document, selector=native_id, fixed_ref=fixed_ref)
 
 
@@ -839,8 +920,7 @@ async def test_activity_audit_failure_prevents_shadow_projection(monkeypatch):
         repository,
     )
     candidate = _WireReader(native_id, candidate=True)
-    candidate.activity = native_candidate.activity
-    candidate.audit_activity = native_candidate.audit_activity
+    candidate.activity_evidence = native_candidate.activity_evidence
     comparator = NativeRevisionShadowComparator(
         repository=_ReadRepository(run, item),
         bridge=_InventoryBridge(inventory),
@@ -1410,11 +1490,44 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert run.inventory_digest not in encoded
 
 
+async def test_evidence_binding_commits_to_private_audited_activity_facts():
+    document = _document()
+    run, item, inventory, native_id = _run_and_item(document)
+    baseline_candidate = _WireReader(native_id, candidate=True)
+    changed_candidate = _WireReader(native_id, candidate=True)
+    original_evidence = changed_candidate.activity_evidence
+
+    async def changed_evidence(*args, **kwargs):
+        evidence = await original_evidence(*args, **kwargs)
+        return NativeActivityEvidence(
+            envelope=evidence.envelope,
+            binding_fact={**evidence.binding_fact, "audit_variant": "changed"},
+        )
+
+    changed_candidate.activity_evidence = changed_evidence
+
+    async def compare(candidate):
+        return await NativeRevisionShadowComparator(
+            repository=_ReadRepository(run, item),
+            bridge=_InventoryBridge(inventory),
+            legacy_reader=_WireReader(native_id, candidate=False),
+            candidate_reader=candidate,
+        ).compare_run(run.run_id)
+
+    baseline = await compare(baseline_candidate)
+    changed = await compare(changed_candidate)
+
+    assert baseline["resources"] == changed["resources"]
+    assert baseline["summary"] == changed["summary"]
+    assert baseline["evidence_binding"]["commitment"] != changed["evidence_binding"]["commitment"]
+    assert baseline["receipt_digest"] != changed["receipt_digest"]
+
+
 async def test_comparator_requires_a_candidate_raw_activity_auditor():
     document = _document()
     run, item, inventory, native_id = _run_and_item(document)
     candidate = _WireReader(native_id, candidate=True)
-    candidate.audit_activity = None
+    candidate.activity_evidence = None
     comparator = NativeRevisionShadowComparator(
         repository=_ReadRepository(run, item),
         bridge=_InventoryBridge(inventory),

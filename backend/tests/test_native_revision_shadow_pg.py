@@ -30,6 +30,7 @@ from app.services.native_revision_shadow import (
     ShadowRunIncompleteError,
     NativeRevisionShadowComparator,
 )
+from app.services.native_revision_shadow_reader import NativeActivityEvidence
 
 
 pytestmark = pytest.mark.asyncio
@@ -356,14 +357,27 @@ class _Reader:
             ]
         }
 
-    async def audit_activity(
+    async def activity_evidence(
         self,
         document: LegacyInventoryDocument,
         *,
         selector: str,
         fixed_ref: str,
-    ) -> None:
-        del document, selector, fixed_ref
+    ) -> NativeActivityEvidence:
+        envelope = await self.activity(
+            document,
+            selector=selector,
+            fixed_ref=fixed_ref,
+        )
+        return NativeActivityEvidence(
+            envelope=envelope,
+            binding_fact={
+                "profile": "akb-native-revision-p2-activity-audit/v1",
+                "resource_id": str(document.resource_id),
+                "selector": selector,
+                "fixed_ref": fixed_ref,
+            },
+        )
 
 
 class _CrossRunReadRepository:
