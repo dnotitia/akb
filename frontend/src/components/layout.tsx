@@ -1,4 +1,4 @@
-import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams, matchPath } from "react-router-dom";
+import { Link, Outlet, useNavigate, Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { Search as SearchIcon } from "lucide-react";
 import { getToken } from "@/lib/api";
@@ -8,25 +8,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
 import { IndexingBadge } from "@/components/status-badge";
 import { ErrorBoundary } from "@/components/error-boundary";
-
-const VAULT_SHELL_PATTERNS = [
-  "/vault",
-  "/vault/:name",
-  "/vault/:name/doc/:id",
-  "/vault/:name/table/:table",
-  "/vault/:name/file/:id",
-  "/vault/:name/graph",
-  "/vault/:name/publications",
-  "/vault/:name/search",
-  "/vault/:name/members",
-  "/vault/:name/settings",
-  "/vault/:name/activity",
-];
-
-function isVaultShellRoute(pathname: string): boolean {
-  if (pathname === "/vault/new") return false;
-  return VAULT_SHELL_PATTERNS.some((p) => !!matchPath({ path: p, end: true }, pathname));
-}
+import { appRouteBoundaryForPath } from "@/app-route-contract";
 
 type SearchMode = "dense" | "literal";
 
@@ -58,7 +40,7 @@ export function Layout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname, searchParams]);
 
-  const wide = isVaultShellRoute(location.pathname);
+  const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
   const { data: health } = useHealth(!!getToken());
 
   if (!getToken()) {
