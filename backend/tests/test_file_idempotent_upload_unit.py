@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -374,6 +375,106 @@ async def test_re_adopting_stale_pending_file_wins_gc_race(pool, vault_id):
             "SELECT COUNT(*) FROM vault_files WHERE id = $1",
             original_id,
         ) == 1
+
+
+async def test_stale_delete_intent_skips_a_reused_live_key(
+    pool, vault_id, monkeypatch,
+):
+    """A delayed intent cannot remove bytes after a vault-name/key reuse."""
+    from app.services import s3_delete_worker
+
+    replacement_name = f"_test_recreated_vault_{uuid.uuid4().hex[:8]}"
+    key = _s3_key(
+        replacement_name, "IS", "reused.bin", content_hash=_HASH_A,
+    )
+    replacement_vault_id = await VaultRepository(pool).create(
+        name=replacement_name,
+        description="replacement vault",
+        git_path=f"/tmp/{replacement_name}.git",
+        owner_id=None,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        # A recreated vault has a different UUID but can derive the same key
+        # from its reused name and identical File metadata.
+        await _put(conn, replacement_vault_id, key)
+        await conn.execute(
+            "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
+            key,
+        )
+
+    async def fake_get_pool():
+        return pool
+
+    def unexpected_delete(_key):
+        raise AssertionError("a live metadata reference must cancel stale deletion")
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", unexpected_delete)
+
+    assert await s3_delete_worker._process_deletes_once() == 1
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM vault_files WHERE vault_id = $1 AND s3_key = $2",
+            replacement_vault_id, key,
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT processed_at IS NOT NULL FROM s3_delete_outbox WHERE s3_key = $1",
+            key,
+        ) is True
+        await conn.execute(
+            "DELETE FROM vaults WHERE id = $1", replacement_vault_id,
+        )
+
+
+async def test_delete_and_key_registration_are_serialized(
+    pool, vault_id, monkeypatch,
+):
+    """A registration that loses the key lock runs only after deletion."""
+    from app.services import s3_delete_worker
+
+    key = _s3_key("v", "IS", "serialized.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        await conn.execute(
+            "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
+            key,
+        )
+
+    delete_started = threading.Event()
+    release_delete = threading.Event()
+
+    async def fake_get_pool():
+        return pool
+
+    def controlled_delete(observed_key):
+        assert observed_key == key
+        delete_started.set()
+        assert release_delete.wait(timeout=2)
+
+    async def register_again():
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return await _put(conn, vault_id, key)
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", controlled_delete)
+
+    worker_task = asyncio.create_task(s3_delete_worker._process_deletes_once())
+    assert await asyncio.to_thread(delete_started.wait, 2)
+    registration_task = asyncio.create_task(register_again())
+    await asyncio.sleep(0.05)
+    assert not registration_task.done()
+
+    release_delete.set()
+    assert await worker_task == 1
+    registered_id = await registration_task
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT id FROM vault_files WHERE vault_id = $1 AND s3_key = $2",
+            vault_id, key,
+        ) == registered_id
 
 
 async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):

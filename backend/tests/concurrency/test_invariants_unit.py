@@ -434,30 +434,44 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
         name=name, description="inv7b", git_path=f"/tmp/{name}.git", owner_id=admin_id,
     )
 
-    file_id = uuid.uuid4()
+    pending_file_id = uuid.uuid4()
+    confirmed_file_id = uuid.uuid4()
+    pending_key = f"_inv7b_{pending_file_id}"
+    confirmed_key = f"_inv7b_{confirmed_file_id}"
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO vault_files "
             "(id, vault_id, name, s3_key, mime_type, size_bytes, upload_state, created_at) VALUES "
             "($1, $2, 'f.bin', $3, 'application/octet-stream', 0, 'pending', NOW())",
-            file_id, vid, f"_inv7b_{file_id}",
+            pending_file_id, vid, pending_key,
+        )
+        await conn.execute(
+            "INSERT INTO vault_files "
+            "(id, vault_id, name, s3_key, mime_type, size_bytes, upload_state, "
+            "hash_verified_at, created_at) VALUES "
+            "($1, $2, 'confirmed.bin', $3, 'application/octet-stream', 0, "
+            "'confirmed', NOW(), NOW())",
+            confirmed_file_id, vid, confirmed_key,
         )
         await conn.execute(
             "INSERT INTO chunks (id, source_type, source_id, vault_id, chunk_index, content) "
-            "VALUES (gen_random_uuid(), 'file', $1, $2, 0, 'f')",
-            file_id, vid,
+            "VALUES (gen_random_uuid(), 'file', $1, $3, 0, 'pending'), "
+            "       (gen_random_uuid(), 'file', $2, $3, 0, 'confirmed')",
+            pending_file_id, confirmed_file_id, vid,
         )
 
     await access_service.delete_vault(user_id=str(admin_id), vault_name=name)
 
     async with pool.acquire() as conn:
         post = await conn.fetchval(
-            "SELECT COUNT(*) FROM chunks WHERE source_id = $1", file_id,
+            "SELECT COUNT(*) FROM chunks WHERE source_id = ANY($1::uuid[])",
+            [pending_file_id, confirmed_file_id],
         )
         outbox = await conn.fetchval(
-            "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = $1", file_id,
+            "SELECT COUNT(*) FROM vector_delete_outbox WHERE source_id = ANY($1::uuid[])",
+            [pending_file_id, confirmed_file_id],
         )
-        s3_outbox = await conn.fetchrow(
+        pending_s3_outbox = await conn.fetchrow(
             """
             SELECT COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE next_attempt_at <= NOW()) AS immediate,
@@ -467,17 +481,35 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
               FROM s3_delete_outbox
              WHERE s3_key = $1
             """,
-            f"_inv7b_{file_id}",
+            pending_key,
+        )
+        confirmed_s3_outbox = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE next_attempt_at <= NOW()) AS immediate,
+                   COUNT(*) FILTER (WHERE next_attempt_at > NOW()) AS delayed
+              FROM s3_delete_outbox
+             WHERE s3_key = $1
+            """,
+            confirmed_key,
         )
 
     assert post == 0, f"file chunk should be gone from PG, got {post}"
-    assert outbox == 1, (
-        "file chunk must be enqueued in vector_delete_outbox even when S3 is "
+    assert outbox == 2, (
+        "both file chunks must be enqueued in vector_delete_outbox when S3 is "
         f"configured (vault_files deleted early); got {outbox}"
     )
-    assert dict(s3_outbox) == {"total": 2, "immediate": 1, "reconciliation": 1}, (
+    assert dict(pending_s3_outbox) == {
+        "total": 2, "immediate": 1, "reconciliation": 1,
+    }, (
         "a pending upload must enqueue one immediate delete and one delayed "
-        f"reconciliation after vault deletion; got {dict(s3_outbox)}"
+        f"reconciliation after vault deletion; got {dict(pending_s3_outbox)}"
+    )
+    assert dict(confirmed_s3_outbox) == {
+        "total": 1, "immediate": 1, "delayed": 0,
+    }, (
+        "a confirmed file must enqueue exactly one immediate object delete; "
+        f"got {dict(confirmed_s3_outbox)}"
     )
 
 
@@ -1105,6 +1137,70 @@ async def _await_blocked(watch, *, count: int, contains: str | None = None,
                 + f", saw {len(qs)}. All waiters: {all_waiting}"
             )
         await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_publication_waits_for_vault_before_locking_document(
+    pool, vault, monkeypatch,
+):
+    """Publication creation follows the vault -> document lifecycle order."""
+    from app.services import publication_service
+    from app.services.publication_service import create_publication
+
+    monkeypatch.setattr(
+        publication_service.settings, "public_base_url",
+        "https://race.test.local", raising=False,
+    )
+    vid, vname = vault["id"], vault["name"]
+    did = uuid.uuid4()
+    path = "reports/parent-lock.md"
+    uri = f"akb://{vname}/coll/reports/doc/parent-lock.md"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, $3, 'Parent lock', 'report', 'draft', NOW(), NOW(), "
+            "'cafef00d', '{}'::text[], '{}'::jsonb)",
+            did, vid, path,
+        )
+
+    doc_repo = DocumentRepository(pool)
+    watch = await asyncpg.connect(_DSN)
+    try:
+        async with pool.acquire() as lifecycle:
+            tx = lifecycle.transaction()
+            await tx.start()
+            await lifecycle.fetchval(
+                "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vid,
+            )
+
+            publisher = asyncio.create_task(create_publication(
+                vault_id=vid,
+                resource_type="document",
+                resource_uri=uri,
+                document_id=did,
+                title="Parent lock",
+            ))
+            await _await_blocked(
+                watch,
+                count=1,
+                contains="FROM vaults",
+                what="publication to wait on the parent vault",
+            )
+
+            # If the publisher had locked the document first, this call and
+            # the publisher's later vault FK lock would form the inverse-order
+            # cycle. It must complete while the publisher remains parked on
+            # the parent.
+            assert await doc_repo.delete_with_publications(
+                lifecycle, doc_id=did, vault_id=vid,
+            ) is True
+            await tx.commit()
+
+        with pytest.raises(ValueError, match="deleted concurrently"):
+            await asyncio.wait_for(publisher, timeout=2)
+    finally:
+        await watch.close()
 
 
 @pytest.mark.asyncio

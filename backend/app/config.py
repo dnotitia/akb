@@ -712,6 +712,11 @@ class Settings(BaseModel):
     # paint. Keep this capability short-lived: it is carried by subordinate
     # URLs and suppresses repeat view counting for the same page open.
     publication_view_grant_ttl_secs: int = Field(default=600, ge=60, le=3600)
+    # Expand/contract rollout gate. Keep legacy emission enabled while any
+    # running server accepts only the original two-field grant. New servers
+    # read both forms; after the fleet is fully upgraded this can be disabled
+    # to emit bounded, rotatable three-field grants.
+    publication_view_grant_emit_legacy: bool = True
     # An expired per-request grant may be rotated without spending another
     # view, but only inside this fixed page-session window. Rotation preserves
     # the original issue time, so it cannot extend the capability indefinitely.

@@ -107,7 +107,9 @@ def extract_markdown_links(content: str) -> list[str]:
         external URLs / anchors; keeps akb:// URIs verbatim; strips a
         leading './' and any '#fragment' from relative paths."""
         target = raw.strip()
-        if not target or target.startswith(("http://", "https://", "mailto:", "#", ASSET_URL_PREFIX)):
+        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+            return
+        if target.lower().startswith(ASSET_URL_PREFIX):
             return
         if target.startswith("akb://"):
             if target not in seen:

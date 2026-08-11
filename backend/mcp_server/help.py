@@ -1638,7 +1638,8 @@ direct connection to the backend MCP endpoint.
 
 Deletes a caller-owned image upload only when no document commit has claimed
 it. This is a failure-recovery tool, not a way to remove historical document
-content.
+content. The result reports `discarded=true` only when an owned upload was
+removed; `false` is a non-disclosing no-op for a missing or non-owned URL.
 
 ```
 akb_discard_image(vault="eng", url="/api/assets/<uuid>")

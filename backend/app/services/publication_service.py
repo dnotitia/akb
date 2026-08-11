@@ -33,6 +33,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories.vault_files_repo import confirmed_file_predicate
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services import asset_service, file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
@@ -367,6 +368,12 @@ async def create_publication(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Vault deletion locks the parent before cascading into documents,
+            # files, and publications. Creation takes the same parent-first
+            # order before locking its document/file resource, so neither side
+            # can hold one row while waiting for the other.
+            if not await lock_vault_for_child_write(conn, vault_id):
+                raise ValueError("Vault not found (deleted concurrently)")
             # Re-check resource existence INSIDE the publish TX. Closes the
             # publish/delete race: without this, `document_service.delete`
             # could cascade-clean publications (zero rows) before we

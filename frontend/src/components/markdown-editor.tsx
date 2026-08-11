@@ -383,8 +383,18 @@ function transferredImages(transfer: DataTransfer): File[] {
 
 function isStandaloneImageClipboard(transfer: DataTransfer): boolean {
   const html = transfer.getData("text/html").trim();
-  const plain = transfer.getData("text/plain").trim();
-  if (!html) return plain.length === 0;
+  if (!html) {
+    // File-manager copy commonly supplies the image File plus only a plain
+    // filename. With no rich HTML payload to preserve, the binary file is the
+    // authoritative clipboard flavor and should enter the upload path. If the
+    // plain flavor contains unrelated prose, keep that prose on the normal
+    // editor path instead of guessing that it is disposable metadata.
+    const plain = transfer.getData("text/plain").trim();
+    if (!plain) return true;
+    const imageNames = new Set(transferredImages(transfer).map((file) => file.name));
+    const lines = plain.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every((line) => imageNames.has(line));
+  }
 
   // Browser "Copy image" commonly provides both an image File and an HTML
   // <img> flavor, sometimes with a plain-text label or URL. Rich document

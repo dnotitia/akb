@@ -660,6 +660,18 @@ def test_publication_view_grant_is_short_lived(
     assert public._verify_view_grant("share", grant) is False
 
 
+def test_publication_grant_emission_stays_legacy_during_rolling_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.routes import public
+
+    monkeypatch.setattr(public.settings, "publication_view_grant_emit_legacy", True)
+    grant = public._make_view_grant("share", issued_at=1_000_000)
+
+    assert len(grant.split(".")) == 2
+    assert public._parse_view_grant("share", grant) == (1_000_000, 1_000_600)
+
+
 def test_legacy_publication_view_grant_remains_valid_during_rollout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -679,6 +691,14 @@ def test_legacy_publication_view_grant_remains_valid_during_rollout(
     assert public._parse_view_grant("other", legacy_grant) is None
 
 
+def test_non_ascii_hmac_inputs_fail_closed() -> None:
+    from app.api.routes import public
+
+    assert public._verify_view_grant("share", "1000000.é") is False
+    assert public._verify_view_grant("share", "1000000.1000600.é") is False
+    assert public._verify_token("share", "1000000.é") is False
+
+
 def test_publication_view_grant_cannot_rotate_past_fixed_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -688,6 +708,7 @@ def test_publication_view_grant_cannot_rotate_past_fixed_session(
     monkeypatch.setattr(public.time, "time", lambda: now)
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_emit_legacy", False)
     grant = public._make_view_grant("share")
 
     now += 3599
@@ -700,10 +721,31 @@ def test_publication_view_grant_cannot_rotate_past_fixed_session(
     assert public._renew_view_grant("share", rotated) is None
 
 
-@pytest.mark.asyncio
-async def test_expired_legacy_view_grant_rotates_without_counting_another_view(
+def test_bounded_grant_rotation_does_not_downgrade_during_legacy_emission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.api.routes import public
+
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_emit_legacy", True)
+    grant = public._make_bounded_view_grant("share")
+
+    now += 601
+    rotated = public._renew_view_grant("share", grant)
+
+    assert rotated is not None
+    assert len(rotated.split(".")) == 3
+    assert public._verify_view_grant("share", rotated) is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_view_grant_cannot_be_promoted_to_a_longer_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
     from starlette.requests import Request
     from app.api.routes import public
 
@@ -718,14 +760,11 @@ async def test_expired_legacy_view_grant_rotates_without_counting_another_view(
     ).hexdigest()
     old_grant = f"{now}.{signature}"
     now += 601
-    observed: dict = {}
+    resolve_called = False
 
     async def fake_resolve(slug, request, increment_view=True, enforce_view_cap=True):
-        observed.update(
-            slug=slug,
-            increment_view=increment_view,
-            enforce_view_cap=enforce_view_cap,
-        )
+        nonlocal resolve_called
+        resolve_called = True
         return {"slug": slug}
 
     monkeypatch.setattr(public, "_resolve_with_access", fake_resolve)
@@ -737,15 +776,11 @@ async def test_expired_legacy_view_grant_rotates_without_counting_another_view(
         "query_string": f"grant={old_grant}".encode(),
     })
 
-    result = await public.renew_publication_view_grant("share", request)
+    with pytest.raises(HTTPException) as exc:
+        await public.renew_publication_view_grant("share", request)
 
-    assert result["view_grant"] != old_grant
-    assert public._verify_view_grant("share", result["view_grant"]) is True
-    assert observed == {
-        "slug": "share",
-        "increment_view": False,
-        "enforce_view_cap": False,
-    }
+    assert exc.value.status_code == 404
+    assert resolve_called is False
 
 
 @pytest.mark.asyncio
@@ -944,7 +979,7 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
         object(), "vault", str(file_id), SimpleNamespace(),
     )
 
-    assert response.status_code == 204
+    assert response == {"discarded": True}
     assert calls == [
         ("tx_enter",),
         ("state", vault_id, file_id, "alice"),
@@ -952,6 +987,60 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
         ("enqueue", "vault/.akb-assets/object"),
         ("tx_exit",),
     ]
+
+
+@pytest.mark.asyncio
+async def test_discard_route_reports_non_disclosing_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.routes import assets
+
+    vault_id = uuid.uuid4()
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_actor(_request, _vault, _user):
+        return {"vault_id": vault_id}, "alice", None
+
+    async def fake_state(*_args, **_kwargs):
+        return None
+
+    async def fake_get_pool():
+        return _Pool()
+
+    monkeypatch.setattr(assets, "resolve_file_write_context", fake_actor)
+    monkeypatch.setattr(assets, "get_pool", fake_get_pool)
+    monkeypatch.setattr(
+        assets.vault_files_repo,
+        "find_owned_attachment_for_discard",
+        fake_state,
+    )
+
+    response = await assets.discard_document_image(
+        object(), "vault", str(uuid.uuid4()), SimpleNamespace(),
+    )
+
+    assert response == {"discarded": False}
 
 
 @pytest.mark.asyncio
@@ -1262,7 +1351,7 @@ async def test_asset_gc_deletes_metadata_and_enqueues_object_in_one_transaction(
 
 
 @pytest.mark.asyncio
-async def test_pending_upload_delete_is_rechecked_after_presigned_put_window() -> None:
+async def test_pending_upload_delete_schedules_post_put_reconciliation() -> None:
     from app.services import s3_delete_worker
 
     calls: list[tuple[str, int]] = []
@@ -1282,3 +1371,79 @@ async def test_pending_upload_delete_is_rechecked_after_presigned_put_window() -
             s3_delete_worker.PENDING_UPLOAD_DELETE_RECHECK_SECONDS,
         ),
     ]
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+@pytest.mark.asyncio
+async def test_s3_delete_worker_rechecks_live_key_under_shared_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    referenced: bool,
+) -> None:
+    from app.services import s3_delete_worker
+
+    calls: list[tuple] = []
+
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, sql, key):
+            assert "SELECT EXISTS" in sql
+            calls.append(("referenced", key))
+            return referenced
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_get_pool():
+        return _Pool()
+
+    async def fake_claim(_conn):
+        calls.append(("claim",))
+        return [{"id": 7, "s3_key": "vault/shared.bin", "retry_count": 0}]
+
+    async def fake_lock(_conn, key):
+        calls.append(("lock", key))
+
+    async def fake_success(_conn, outbox_id):
+        calls.append(("success", outbox_id))
+
+    def fake_delete(key):
+        calls.append(("delete", key))
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_get_pool)
+    monkeypatch.setattr(s3_delete_worker, "_claim_batch", fake_claim)
+    monkeypatch.setattr(s3_delete_worker, "_mark_success", fake_success)
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "lock_s3_key_for_mutation",
+        fake_lock,
+    )
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", fake_delete)
+
+    assert await s3_delete_worker._process_deletes_once() == 1
+    assert calls[:3] == [
+        ("claim",),
+        ("lock", "vault/shared.bin"),
+        ("referenced", "vault/shared.bin"),
+    ]
+    if referenced:
+        assert ("delete", "vault/shared.bin") not in calls
+    else:
+        assert calls[3] == ("delete", "vault/shared.bin")
+    assert calls[-1] == ("success", 7)

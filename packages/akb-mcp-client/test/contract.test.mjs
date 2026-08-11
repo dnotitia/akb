@@ -250,7 +250,7 @@ itAsync("_discardImage normalizes case variants of canonical asset URLs", async 
   const calls = [];
   proxy._http = async (method, path) => {
     calls.push({ method, path });
-    return { text: "" };
+    return { text: '{"discarded":true}' };
   };
 
   const result = await proxy._discardImage({
@@ -276,6 +276,19 @@ itAsync("_discardImage normalizes case variants of canonical asset URLs", async 
     method: "DELETE",
     path: `/api/v1/assets/myvault/${assetId}`,
   }]);
+});
+
+itAsync("_discardImage does not claim a backend no-op deleted anything", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const assetId = "11111111-2222-4333-8444-555555555555";
+  proxy._http = async () => ({ text: '{"discarded":false}' });
+
+  const result = await proxy._discardImage({
+    vault: "myvault",
+    url: `/api/assets/${assetId}`,
+  });
+
+  assert.equal(result.discarded, false);
 });
 
 itAsync("_discardImage surfaces backend lookup failures", async () => {

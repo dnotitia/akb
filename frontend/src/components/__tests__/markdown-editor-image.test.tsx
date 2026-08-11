@@ -362,6 +362,53 @@ describe("MarkdownEditor image insertion", () => {
     ));
   });
 
+  it("uploads an image copied from a file manager with a plain filename flavor", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "finder.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const file = new File(["image"], "finder.png", { type: "image/png" });
+    const editor = container.querySelector('[contenteditable="true"]');
+
+    const allowed = fireEvent.paste(editor!, {
+      clipboardData: {
+        files: [file],
+        getData: (type: string) => type === "text/plain" ? "finder.png" : "",
+      },
+    });
+
+    expect(allowed).toBe(false);
+    await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledWith(
+      "team",
+      file,
+      expect.any(AbortSignal),
+    ));
+  });
+
+  it("preserves unrelated plain text when a clipboard also exposes an image file", () => {
+    const { container } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    const file = new File(["image"], "finder.png", { type: "image/png" });
+    const editor = container.querySelector('[contenteditable="true"]');
+
+    const allowed = fireEvent.paste(editor!, {
+      clipboardData: {
+        files: [file],
+        getData: (type: string) => type === "text/plain" ? "Keep this caption" : "",
+      },
+    });
+
+    expect(allowed).toBe(true);
+    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
+  });
+
   it("leaves mixed rich-text clipboard content to the normal paste path", () => {
     const { container } = render(
       <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,

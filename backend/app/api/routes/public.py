@@ -70,6 +70,17 @@ logger = logging.getLogger("akb.publications.public")
 _TOKEN_TTL = 3600  # 1 hour
 
 
+def _matches_hmac_hexdigest(expected: str, supplied: str) -> bool:
+    """Compare an untrusted digest without ``compare_digest`` type errors."""
+    try:
+        supplied_bytes = supplied.encode("ascii")
+    except (AttributeError, UnicodeEncodeError):
+        return False
+    if len(supplied_bytes) != 64 or any(c not in b"0123456789abcdef" for c in supplied_bytes):
+        return False
+    return hmac.compare_digest(expected.encode("ascii"), supplied_bytes)
+
+
 def _make_token(slug: str) -> str:
     # Bound to the slug (not the password): publications are create-only, so a
     # password "change" is an unpublish + republish, which mints a NEW slug —
@@ -94,7 +105,7 @@ def _verify_token(slug: str, token: str) -> bool:
         return False
     msg = f"{slug}:{ts_str}".encode("utf-8")
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+    return _matches_hmac_hexdigest(expected, sig)
 
 
 # ============================================================
@@ -105,7 +116,7 @@ def _verify_token(slug: str, token: str) -> bool:
 # ============================================================
 
 
-def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
+def _make_bounded_view_grant(slug: str, *, issued_at: int | None = None) -> str:
     now = int(time.time())
     issued = now if issued_at is None else issued_at
     expires = min(
@@ -117,13 +128,22 @@ def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
     return f"{issued}.{expires}.{sig}"
 
 
+def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
+    if not settings.publication_view_grant_emit_legacy:
+        return _make_bounded_view_grant(slug, issued_at=issued_at)
+    issued = int(time.time()) if issued_at is None else issued_at
+    msg = f"grant:{slug}:{issued}".encode("utf-8")
+    sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{issued}.{sig}"
+
+
 def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
     """Validate current and pre-session view-grant wire formats.
 
     The two-field form was issued before bounded grant rotation existed. It is
-    accepted for its original TTL and can rotate only inside the same fixed
-    session bound, so an already-open page survives a rolling deployment
-    without spending another publication view or gaining a longer lifetime.
+    accepted only for its original TTL and is never promoted into a rotatable
+    session. Reading both forms lets an already-open page survive a rolling
+    deployment without gaining a longer lifetime.
     """
     if not grant:
         return None
@@ -151,7 +171,7 @@ def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
     if expires > issued + settings.publication_view_grant_session_secs:
         return None
     expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
+    if not _matches_hmac_hexdigest(expected, sig):
         return None
     return issued, expires
 
@@ -166,6 +186,12 @@ def _verify_view_grant(slug: str, grant: str | None) -> bool:
 
 
 def _renew_view_grant(slug: str, grant: str | None) -> str | None:
+    # A legacy grant carried only its original short TTL. Converting it into a
+    # rotatable session would silently extend that capability and bypass view
+    # limits beyond the contract under which it was issued. During the rollout
+    # compatibility phase it remains readable, but never renewable.
+    if not grant or len(grant.split(".")) != 3:
+        return None
     parsed = _parse_view_grant(slug, grant)
     if parsed is None:
         return None
@@ -173,7 +199,10 @@ def _renew_view_grant(slug: str, grant: str | None) -> str | None:
     now = int(time.time())
     if issued > now + 30 or now >= issued + settings.publication_view_grant_session_secs:
         return None
-    return _make_view_grant(slug, issued_at=issued)
+    # The incoming grant is already the bounded format. Keep its wire form
+    # even while new page opens emit legacy grants for old-server rollout
+    # compatibility; downgrading here would return an already-expired TTL.
+    return _make_bounded_view_grant(slug, issued_at=issued)
 
 
 def _extract_view_grant(request: Request) -> str | None:

@@ -49,6 +49,16 @@ def test_generated_image_asset_is_not_a_document_relation():
     assert extract_markdown_links(content) == ["design.md"]
 
 
+def test_generated_image_asset_case_variants_are_not_document_relations():
+    asset_id = "6D04DC8A-0302-4A85-A314-E7485FF5A610"
+    content = (
+        f"![diagram](/API/ASSETS/{asset_id})\n\n"
+        "[design notes](./design.md)"
+    )
+
+    assert extract_markdown_links(content) == ["design.md"]
+
+
 def test_relative_image_target_remains_a_document_relation():
     assert extract_markdown_links("![diagram](./design/architecture.md)") == [
         "design/architecture.md"

@@ -195,7 +195,6 @@ async def read_document_image(
 
 @router.delete(
     "/assets/{vault}/{file_id}",
-    status_code=204,
     summary="Discard an uncommitted document image",
 )
 async def discard_document_image(
@@ -229,7 +228,9 @@ async def discard_document_image(
                 created_by=actor_id,
             )
             if state is None:
-                return Response(status_code=204)
+                # Missing and non-owned ids share one result, so this reports
+                # a truthful no-op without exposing which case occurred.
+                return {"discarded": False}
             if state["upload_state"] != "confirmed":
                 raise AKBError("Image upload is still being finalized", status_code=409)
             if state["attachment_claimed_at"] is not None:
@@ -243,4 +244,4 @@ async def discard_document_image(
             if row is None:
                 raise RuntimeError("locked unclaimed image changed during discard")
             await enqueue_delete(conn, row["s3_key"])
-    return Response(status_code=204)
+    return {"discarded": True}

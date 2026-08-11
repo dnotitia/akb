@@ -31,6 +31,24 @@ _MEASUREMENT_PLACEMENT_JOIN = """
 """
 
 _SQL_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_S3_KEY_LOCK_NAMESPACE = 1_735_359_043
+
+
+async def lock_s3_key_for_mutation(conn, s3_key: str) -> None:
+    """Serialize object deletion with metadata registration for one S3 key.
+
+    A deterministic File key can be reused after an abandoned upload, and a
+    vault name can be reused after vault deletion.  The delete worker holds
+    this transaction-scoped lock while it rechecks ``vault_files`` and removes
+    bytes.  File registration takes the same lock before inserting metadata,
+    making the two safe orderings explicit: either deletion finishes before a
+    new upload is registered, or the worker observes the new live reference.
+    """
+    await conn.fetchval(
+        "SELECT pg_advisory_xact_lock($1::int, hashtext($2))",
+        _S3_KEY_LOCK_NAMESPACE,
+        s3_key,
+    )
 
 
 def confirmed_file_predicate(alias: str = "vf") -> str:
@@ -98,10 +116,14 @@ async def insert_or_adopt(
     """
     row = await conn.fetchrow(
         """
+        WITH key_lock AS (
+            SELECT pg_advisory_xact_lock($10::int, hashtext($5)) AS held
+        )
         INSERT INTO vault_files
             (id, vault_id, collection_id, kind, upload_state, name, s3_key,
              mime_type, size_bytes, description, created_by)
-        VALUES ($1, $2, $3, 'file', 'pending', $4, $5, $6, $7, $8, $9)
+        SELECT $1, $2, $3, 'file', 'pending', $4, $5, $6, $7, $8, $9
+          FROM key_lock
         ON CONFLICT (vault_id, s3_key) DO UPDATE
             SET collection_id = EXCLUDED.collection_id,
                 updated_at = CASE
@@ -112,6 +134,7 @@ async def insert_or_adopt(
         """,
         file_id, vault_id, collection_id, name, s3_key,
         mime_type, size_bytes, description, created_by,
+        _S3_KEY_LOCK_NAMESPACE,
     )
     return row["id"]
 

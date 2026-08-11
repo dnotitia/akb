@@ -142,6 +142,9 @@ document_asset_upload_body_timeout_secs: 60
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 publication_view_grant_ttl_secs: 600
+# Rolling upgrades must keep this true until every backend instance can read
+# both the two-field and bounded three-field grant formats.
+publication_view_grant_emit_legacy: true
 publication_view_grant_session_secs: 3600
 
 # === App identity exchange ===

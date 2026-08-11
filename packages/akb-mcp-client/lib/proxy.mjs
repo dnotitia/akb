@@ -732,15 +732,22 @@ export class AKBProxy {
     }
     if (!args.url) throw new Error("url required");
     const assetId = parseAssetUrl(args.url);
-    await this._http(
+    const response = await this._http(
       "DELETE",
       `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
     );
+    let discarded = null;
+    if (response.text) {
+      const body = JSON.parse(response.text);
+      if (typeof body.discarded === "boolean") discarded = body.discarded;
+    }
     return {
       kind: "document_image",
       vault,
       url: args.url,
-      discarded: true,
+      // null is possible only with an older backend that returned an empty
+      // 204. Never claim deletion unless the backend confirmed the row change.
+      discarded,
     };
   }
 

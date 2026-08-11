@@ -17,12 +17,14 @@ backoff, claim, sweep.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
 
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
+from app.repositories import vault_files_repo
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
 from app.services.adapters import s3_adapter
 
@@ -128,21 +130,37 @@ async def _process_deletes_once() -> int:
 
     succeeded = 0
     for row in batch:
-        try:
-            s3_adapter.delete(row["s3_key"])
-        except NotFoundError:
-            # S3 object already absent — treat as success (delete is
-            # idempotent; this also covers re-runs after a partial
-            # failure).
-            pass
-        except Exception as e:  # noqa: BLE001
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await _mark_failure(conn, row["id"], row["retry_count"], str(e))
-            continue
-
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # A delayed intent may outlive the metadata row that created
+                # it. Deterministic File keys and recreated vault names can
+                # legitimately register the same key again before this worker
+                # runs. Share one key lock with File registration, then check
+                # reachability while holding it; this closes both the stale
+                # intent and check-then-delete races.
+                await vault_files_repo.lock_s3_key_for_mutation(
+                    conn, row["s3_key"],
+                )
+                referenced = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)",
+                    row["s3_key"],
+                )
+                if referenced:
+                    await _mark_success(conn, row["id"])
+                    succeeded += 1
+                    continue
+
+                try:
+                    await asyncio.to_thread(s3_adapter.delete, row["s3_key"])
+                except NotFoundError:
+                    # S3 object already absent — treat as success (delete is
+                    # idempotent; this also covers re-runs after a partial
+                    # failure).
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    await _mark_failure(conn, row["id"], row["retry_count"], str(e))
+                    continue
+
                 await _mark_success(conn, row["id"])
         succeeded += 1
 
