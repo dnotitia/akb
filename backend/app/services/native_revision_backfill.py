@@ -139,7 +139,8 @@ class NativeRevisionBackfill:
                 failed_items=0,
                 skipped_items=0,
             )
-        inventory = await self.bridge.inventory_for_run(run)
+        scope = await self.bridge.inventory_scope_for_run(run)
+        inventory = scope.inventory
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -161,7 +162,7 @@ class NativeRevisionBackfill:
                 skipped += 1
                 continue
             try:
-                async with self.bridge.materialize_body(inventory, document) as body:
+                async with self.bridge.materialize_body(scope, document) as body:
                     prepared = await self.body_store.prepare_text(
                         namespace_id=run.namespace_id,
                         payload=body,

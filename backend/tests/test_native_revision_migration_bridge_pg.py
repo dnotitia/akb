@@ -7,7 +7,7 @@ import importlib.util
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
@@ -292,11 +292,12 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
             git=fixture["git"],
         )
 
-        inventory = await bridge.capture_inventory(
+        scope = await bridge.capture_inventory_scope(
             namespace_id=fixture["namespace_id"],
             fixed_ref=fixture["unrelated_tip"],
             coverage_version="c9-v1",
         )
+        inventory = scope.inventory
         doc = next(
             item for item in inventory.documents
             if item.resource_id == fixture["document_one"]
@@ -304,7 +305,7 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
         assert doc.current_path == "renamed.md"
         assert doc.current_commit == fixture["current_oid"]
         assert not hasattr(doc, "body")
-        async with bridge.materialize_body(inventory, doc) as body:
+        async with bridge.materialize_body(scope, doc) as body:
             assert body == b"new v2\n"
             assert doc.byte_size == len(body)
         assert doc.lineage[-1].legacy_git_oid == fixture["current_oid"]
@@ -405,8 +406,8 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
             self.max_active_bodies = 0
 
         @asynccontextmanager
-        async def materialize_body(self, inventory, document):
-            async with super().materialize_body(inventory, document) as body:
+        async def materialize_body(self, scope, document):
+            async with super().materialize_body(scope, document) as body:
                 self.active_bodies += 1
                 self.max_active_bodies = max(
                     self.max_active_bodies,
@@ -435,6 +436,197 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
         assert result.status == "complete"
         assert bridge.max_active_bodies == 1
         assert bridge.active_bodies == 0
+
+
+async def test_capture_releases_each_source_body_before_reading_the_next(tmp_path):
+    class LiveBody(bytes):
+        active = 0
+        max_active = 0
+
+        def __new__(cls, value):
+            instance = super().__new__(cls, value)
+            cls.active += 1
+            cls.max_active = max(cls.max_active, cls.active)
+            return instance
+
+        def __del__(self):
+            type(self).active -= 1
+
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        original_history = fixture["git"].manual_fixed_ref_history
+
+        def tracked_history(*args, **kwargs):
+            snapshot = original_history(*args, **kwargs)
+            snapshot["body"] = LiveBody(snapshot["body"])
+            return snapshot
+
+        fixture["git"].manual_fixed_ref_history = tracked_history
+        bridge = LegacyRevisionBridge(pool, git=fixture["git"])
+
+        inventory = await bridge.capture_inventory(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-capture-max-live-body",
+        )
+
+        assert len(inventory.documents) == 2
+        assert LiveBody.max_active == 1
+        assert LiveBody.active == 0
+
+
+async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item(
+    tmp_path,
+    monkeypatch,
+):
+    document_count = 95
+    fixed_ref = "f" * 40
+    committed_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    class CountingGit:
+        def __init__(self):
+            self.bodies: dict[str, bytes] = {}
+            self.commits: dict[str, str] = {}
+            self.history_calls = 0
+            self.body_read_calls = 0
+
+        def manual_fixed_ref_history(
+            self,
+            vault_name,
+            observed_fixed_ref,
+            file_path,
+            *,
+            current_commit,
+            since_epoch=None,
+        ):
+            del vault_name, since_epoch
+            self.history_calls += 1
+            assert observed_fixed_ref == fixed_ref
+            assert current_commit == self.commits[file_path]
+            return {
+                "fixed_ref": observed_fixed_ref,
+                "current_commit": current_commit,
+                "body": self.bodies[file_path],
+                "history": [
+                    {
+                        "legacy_git_oid": current_commit,
+                        "path_at_revision": file_path,
+                        "committed_at": committed_at,
+                    }
+                ],
+                "activity": {
+                    "legacy_git_oid": current_commit,
+                    "committed_at": committed_at,
+                    "actor": "legacy-writer",
+                    "subject": file_path,
+                    "summary": f"create {file_path}",
+                    "action": "create",
+                    "path_from": None,
+                    "path_to": file_path,
+                    "changed_paths": [
+                        {"status": "A", "path_from": None, "path_to": file_path}
+                    ],
+                },
+            }
+
+        def read_file(self, vault_name, file_path, commit=None):
+            del vault_name
+            self.body_read_calls += 1
+            assert commit == self.commits[file_path]
+            return self.bodies[file_path].decode("utf-8")
+
+    class CountingRepository(NativeRevisionMigrationRepository):
+        def __init__(self, pool):
+            super().__init__(pool)
+            self.manual_vault_queries = 0
+
+        async def get_manual_vault(self, namespace_id, *, conn=None):
+            self.manual_vault_queries += 1
+            return await super().get_manual_vault(namespace_id, conn=conn)
+
+    class CountingBridge(LegacyRevisionBridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.run_scope_validations = 0
+
+        async def inventory_scope_for_run(self, run):
+            self.run_scope_validations += 1
+            return await super().inventory_scope_for_run(run)
+
+    canonical_calls = 0
+    canonical_digest = LegacyRevisionBridge.canonical_inventory_digest.__func__
+
+    def counted_canonical_digest(cls, **kwargs):
+        nonlocal canonical_calls
+        canonical_calls += 1
+        return canonical_digest(cls, **kwargs)
+
+    monkeypatch.setattr(
+        LegacyRevisionBridge,
+        "canonical_inventory_digest",
+        classmethod(counted_canonical_digest),
+    )
+
+    async with _fresh_schema(tmp_path) as pool:
+        git = CountingGit()
+        vault_name = f"c9-p95-{uuid.uuid4().hex}"
+        async with pool.acquire() as conn:
+            namespace_id = await conn.fetchval(
+                """
+                INSERT INTO vaults (name, git_path, status)
+                VALUES ($1, '/unused/p95.git', 'active')
+                RETURNING id
+                """,
+                vault_name,
+            )
+            rows = []
+            for index in range(document_count):
+                path = f"p95/{index:03d}.md"
+                current_commit = f"{index + 1:040x}"
+                git.bodies[path] = f"body-{index}\n".encode()
+                git.commits[path] = current_commit
+                rows.append(
+                    (
+                        uuid.uuid4(),
+                        namespace_id,
+                        path,
+                        committed_at - timedelta(seconds=1),
+                        current_commit,
+                    )
+                )
+            await conn.executemany(
+                """
+                INSERT INTO documents
+                    (id, vault_id, path, title, created_at, updated_at,
+                     current_commit, source)
+                VALUES ($1, $2, $3, $3, $4, $4, $5, 'manual')
+                """,
+                rows,
+            )
+
+        repository = CountingRepository(pool)
+        bridge = CountingBridge(pool, git=git, repository=repository)
+        backfill = NativeRevisionBackfill(
+            pool,
+            git=git,
+            bridge=bridge,
+            repository=repository,
+        )
+        run, inventory = await backfill.prepare_run(
+            namespace_id=namespace_id,
+            fixed_ref=fixed_ref,
+            coverage_version="c9-p95-linear-materialization",
+        )
+        assert len(inventory.documents) == document_count
+
+        result = await backfill.backfill_run(run.run_id)
+
+        assert result.status == "complete"
+        assert bridge.run_scope_validations == 1
+        assert canonical_calls == 2
+        assert repository.manual_vault_queries == 2
+        assert git.history_calls == document_count * 2
+        assert git.body_read_calls == document_count
 
 
 async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
@@ -699,7 +891,8 @@ async def test_current_move_activity_semantics_are_preserved(tmp_path):
         assert document.activity.path_from == "same.md"
         assert document.activity.path_to == "renamed.md"
         body_store = M1PgBodyStore(pool)
-        async with backfill.bridge.materialize_body(inventory, document) as body:
+        scope = await backfill.bridge.validated_inventory_scope(inventory)
+        async with backfill.bridge.materialize_body(scope, document) as body:
             await body_store.prepare_text(
                 namespace_id=namespace_id,
                 payload=body,
@@ -747,7 +940,8 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             if item.resource_id == fixture["document_one"]
         )
         body_store = M1PgBodyStore(pool)
-        async with backfill.bridge.materialize_body(inventory, document) as body:
+        scope = await backfill.bridge.validated_inventory_scope(inventory)
+        async with backfill.bridge.materialize_body(scope, document) as body:
             prepared = await body_store.prepare_text(
                 namespace_id=fixture["namespace_id"],
                 payload=body,
@@ -773,7 +967,7 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             )
 
         other = next(item for item in inventory.documents if item.resource_id != document.resource_id)
-        async with backfill.bridge.materialize_body(inventory, other) as body:
+        async with backfill.bridge.materialize_body(scope, other) as body:
             other_prepared = await body_store.prepare_text(
                 namespace_id=fixture["namespace_id"],
                 payload=body,

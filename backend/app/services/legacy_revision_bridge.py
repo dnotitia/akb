@@ -7,10 +7,11 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Literal
 
 import asyncpg
@@ -82,7 +83,7 @@ class LegacyActivitySemantics:
     action: Literal["create", "update", "move", "delete"]
     path_from: str | None
     path_to: str | None
-    changed_paths: tuple[dict[str, str | None], ...]
+    changed_paths: tuple[Mapping[str, str | None], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +121,16 @@ class LegacyInventory:
     coverage_version: str
     documents: tuple[LegacyInventoryDocument, ...]
     inventory_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyInventoryScope:
+    """Once-validated immutable facts for one inventory materialization pass."""
+
+    inventory: LegacyInventory
+    vault_name: str
+    fixed_git_oid: str
+    documents_by_id: Mapping[uuid.UUID, LegacyInventoryDocument]
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +218,9 @@ class LegacyRevisionBridge:
                         "action": document.activity.action,
                         "path_from": document.activity.path_from,
                         "path_to": document.activity.path_to,
-                        "changed_paths": list(document.activity.changed_paths),
+                        "changed_paths": [
+                            dict(change) for change in document.activity.changed_paths
+                        ],
                     },
                 }
                 for document in documents
@@ -221,13 +234,65 @@ class LegacyRevisionBridge:
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
-    async def capture_inventory(
+    async def _capture_source_metadata(
+        self,
+        *,
+        vault_name: str,
+        fixed_ref: str,
+        resource_id: uuid.UUID,
+        current_path: str,
+        current_commit: str,
+        created_at: datetime,
+    ) -> tuple[list[dict], dict, str, int]:
+        """Read one source body and return only frozen metadata about it."""
+
+        try:
+            snapshot = await asyncio.to_thread(
+                self.git.manual_fixed_ref_history,
+                vault_name,
+                fixed_ref,
+                current_path,
+                current_commit=current_commit,
+                since_epoch=int(created_at.timestamp()),
+            )
+        except FixedRefHistoryError as exc:
+            raise InventoryEligibilityError(
+                f"document {resource_id} is not readable at the fixed ref"
+            ) from exc
+        if not isinstance(snapshot, dict):
+            raise InventoryEligibilityError(
+                f"document {resource_id} returned invalid fixed-ref metadata"
+            )
+        history = snapshot.get("history")
+        activity = snapshot.get("activity")
+        body = snapshot.get("body")
+        if not isinstance(history, list) or not isinstance(activity, dict):
+            raise InventoryEligibilityError(
+                f"document {resource_id} returned invalid fixed-ref metadata"
+            )
+        if not isinstance(body, bytes):
+            raise InventoryEligibilityError(
+                f"document {resource_id} is not readable at the fixed ref"
+            )
+        if b"\x00" in body:
+            raise InventoryEligibilityError(
+                f"document {resource_id} body contains NUL bytes"
+            )
+        try:
+            body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise InventoryEligibilityError(
+                f"document {resource_id} body is not valid UTF-8"
+            ) from exc
+        return history, activity, hashlib.sha256(body).hexdigest(), len(body)
+
+    async def capture_inventory_scope(
         self,
         *,
         namespace_id: uuid.UUID,
         fixed_ref: str,
         coverage_version: str,
-    ) -> LegacyInventory:
+    ) -> LegacyInventoryScope:
         _require_oid(fixed_ref, "fixed_ref")
         if not isinstance(coverage_version, str) or not coverage_version.strip():
             raise InventoryEligibilityError("coverage_version must be non-empty")
@@ -280,28 +345,19 @@ class LegacyRevisionBridge:
                         raise InventoryEligibilityError(
                             f"document {row['id']} has no usable created_at"
                         )
-                    try:
-                        snapshot = await asyncio.to_thread(
-                            self.git.manual_fixed_ref_history,
-                            vault["name"],
-                            fixed_ref,
-                            row["path"],
+                    history, raw_activity, body_digest, byte_size = (
+                        await self._capture_source_metadata(
+                            vault_name=vault["name"],
+                            fixed_ref=fixed_ref,
+                            resource_id=row["id"],
+                            current_path=row["path"],
                             current_commit=current_commit,
-                            since_epoch=int(created_at.timestamp()),
+                            created_at=created_at,
                         )
-                    except FixedRefHistoryError as exc:
-                        raise InventoryEligibilityError(
-                            f"document {row['id']} is not readable at the fixed ref"
-                        ) from exc
-                    history = snapshot["history"]
+                    )
                     if not history or history[0]["legacy_git_oid"] != current_commit:
                         raise InventoryEligibilityError(
                             f"document {row['id']} current_commit is not the fixed-ref file head"
-                        )
-                    raw_activity = snapshot.get("activity")
-                    if not isinstance(raw_activity, dict):
-                        raise InventoryEligibilityError(
-                            f"document {row['id']} has no fixed-ref activity semantics"
                         )
                     activity_action = raw_activity.get("action")
                     if activity_action not in {"create", "update", "move", "delete"}:
@@ -327,6 +383,7 @@ class LegacyRevisionBridge:
                         or not isinstance(activity_summary, str)
                         or not isinstance(path_to, str)
                         or not isinstance(changed_paths, list)
+                        or not all(isinstance(change, dict) for change in changed_paths)
                     ):
                         raise InventoryEligibilityError(
                             f"document {row['id']} has incomplete current activity semantics"
@@ -348,20 +405,10 @@ class LegacyRevisionBridge:
                         action=activity_action,
                         path_from=path_from,
                         path_to=path_to,
-                        changed_paths=tuple(changed_paths),
+                        changed_paths=tuple(
+                            MappingProxyType(dict(change)) for change in changed_paths
+                        ),
                     )
-                    body = snapshot["body"]
-                    if b"\x00" in body:
-                        raise InventoryEligibilityError(
-                            f"document {row['id']} body contains NUL bytes"
-                        )
-                    try:
-                        body.decode("utf-8", errors="strict")
-                    except UnicodeDecodeError as exc:
-                        raise InventoryEligibilityError(
-                            f"document {row['id']} body is not valid UTF-8"
-                        ) from exc
-
                     newest: list[LegacyLineageEntry] = []
                     seen: set[str] = set()
                     for entry in history:
@@ -401,8 +448,8 @@ class LegacyRevisionBridge:
                             current_path=row["path"],
                             current_commit=current_commit,
                             created_at=created_at,
-                            body_digest=hashlib.sha256(body).hexdigest(),
-                            byte_size=len(body),
+                            body_digest=body_digest,
+                            byte_size=byte_size,
                             aliases=tuple(aliases),
                             lineage=lineage,
                             activity=activity,
@@ -410,7 +457,7 @@ class LegacyRevisionBridge:
                     )
 
         frozen_documents = tuple(documents)
-        return LegacyInventory(
+        inventory = LegacyInventory(
             namespace_id=namespace_id,
             fixed_git_oid=fixed_ref,
             coverage_version=coverage_version,
@@ -422,19 +469,48 @@ class LegacyRevisionBridge:
                 documents=frozen_documents,
             ),
         )
+        return self._scope_from_validated_inventory(inventory, vault_name=vault["name"])
 
-    @asynccontextmanager
-    async def materialize_body(
+    async def capture_inventory(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        fixed_ref: str,
+        coverage_version: str,
+    ) -> LegacyInventory:
+        scope = await self.capture_inventory_scope(
+            namespace_id=namespace_id,
+            fixed_ref=fixed_ref,
+            coverage_version=coverage_version,
+        )
+        return scope.inventory
+
+    @staticmethod
+    def _scope_from_validated_inventory(
+        inventory: LegacyInventory,
+        *,
+        vault_name: str,
+    ) -> LegacyInventoryScope:
+        documents_by_id: dict[uuid.UUID, LegacyInventoryDocument] = {}
+        for document in inventory.documents:
+            if document.resource_id in documents_by_id:
+                raise InventoryEligibilityError(
+                    "frozen inventory contains duplicate document resources"
+                )
+            documents_by_id[document.resource_id] = document
+        return LegacyInventoryScope(
+            inventory=inventory,
+            vault_name=vault_name,
+            fixed_git_oid=inventory.fixed_git_oid,
+            documents_by_id=MappingProxyType(documents_by_id),
+        )
+
+    async def validated_inventory_scope(
         self,
         inventory: LegacyInventory,
-        document: LegacyInventoryDocument,
-    ) -> AsyncIterator[bytes]:
-        """Read and verify one frozen body without retaining it in inventory."""
+    ) -> LegacyInventoryScope:
+        """Validate externally held inventory facts once before body reads."""
 
-        if document not in inventory.documents:
-            raise InventoryEligibilityError(
-                "body materialization requires a document from the frozen inventory"
-            )
         if (
             self.canonical_inventory_digest(
                 namespace_id=inventory.namespace_id,
@@ -445,32 +521,47 @@ class LegacyRevisionBridge:
             != inventory.inventory_digest
         ):
             raise InventoryEligibilityError("body materialization inventory digest is invalid")
-
         vault = await self.repository.get_manual_vault(inventory.namespace_id)
         if vault is None:
             raise NotFoundError("Vault", str(inventory.namespace_id))
         if vault["has_external_git"]:
             raise ManualVaultRequiredError()
-        try:
-            snapshot = await asyncio.to_thread(
-                self.git.manual_fixed_ref_history,
-                vault["name"],
-                inventory.fixed_git_oid,
-                document.current_path,
-                current_commit=document.current_commit,
-                since_epoch=int(document.created_at.timestamp()),
+        return self._scope_from_validated_inventory(inventory, vault_name=vault["name"])
+
+    @asynccontextmanager
+    async def materialize_body(
+        self,
+        scope: LegacyInventoryScope,
+        document: LegacyInventoryDocument,
+    ) -> AsyncIterator[bytes]:
+        """Perform one body-only read inside a once-validated inventory scope."""
+
+        if (
+            scope.fixed_git_oid != scope.inventory.fixed_git_oid
+            or scope.documents_by_id.get(document.resource_id) is not document
+        ):
+            raise InventoryEligibilityError(
+                "body materialization requires a document from the frozen inventory"
             )
-        except FixedRefHistoryError as exc:
+        try:
+            text = await asyncio.to_thread(
+                self.git.read_file,
+                scope.vault_name,
+                document.current_path,
+                document.current_commit,
+            )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise InventoryEligibilityError(
                 f"document {document.resource_id} is not readable at the fixed ref"
             ) from exc
-
-        body = snapshot.get("body") if isinstance(snapshot, dict) else None
+        if not isinstance(text, str):
+            raise InventoryEligibilityError(
+                f"document {document.resource_id} is not readable at the fixed ref"
+            )
+        body = text.encode("utf-8")
+        del text
         if (
-            not isinstance(body, bytes)
-            or snapshot.get("fixed_ref") != inventory.fixed_git_oid
-            or snapshot.get("current_commit") != document.current_commit
-            or len(body) != document.byte_size
+            len(body) != document.byte_size
             or hashlib.sha256(body).hexdigest() != document.body_digest
         ):
             raise InventoryEligibilityError(
@@ -490,7 +581,6 @@ class LegacyRevisionBridge:
             yield body
         finally:
             del body
-            del snapshot
 
     async def prepare_run(
         self,
@@ -499,11 +589,12 @@ class LegacyRevisionBridge:
         fixed_ref: str,
         coverage_version: str,
     ) -> tuple[MigrationRun, LegacyInventory]:
-        inventory = await self.capture_inventory(
+        scope = await self.capture_inventory_scope(
             namespace_id=namespace_id,
             fixed_ref=fixed_ref,
             coverage_version=coverage_version,
         )
+        inventory = scope.inventory
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 run = await self.repository.get_or_create_run(
@@ -520,15 +611,18 @@ class LegacyRevisionBridge:
                 )
         return run, inventory
 
-    async def inventory_for_run(self, run: MigrationRun) -> LegacyInventory:
-        inventory = await self.capture_inventory(
+    async def inventory_scope_for_run(self, run: MigrationRun) -> LegacyInventoryScope:
+        scope = await self.capture_inventory_scope(
             namespace_id=run.namespace_id,
             fixed_ref=run.fixed_git_oid,
             coverage_version=run.coverage_version,
         )
-        if inventory.inventory_digest != run.inventory_digest:
+        if scope.inventory.inventory_digest != run.inventory_digest:
             raise MigrationInventoryDriftError()
-        return inventory
+        return scope
+
+    async def inventory_for_run(self, run: MigrationRun) -> LegacyInventory:
+        return (await self.inventory_scope_for_run(run)).inventory
 
     async def resolve_selector(
         self,

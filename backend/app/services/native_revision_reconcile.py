@@ -200,11 +200,12 @@ class NativeRevisionReconcile:
         """Capture a final fixed ref and publish only changed Resources."""
 
         coverage = coverage_version or self.coverage_version
-        inventory = await self.bridge.capture_inventory(
+        scope = await self.bridge.capture_inventory_scope(
             namespace_id=namespace_id,
             fixed_ref=fixed_ref,
             coverage_version=coverage,
         )
+        inventory = scope.inventory
         await self._assert_inventory_covers_completed_resources(inventory)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -276,7 +277,7 @@ class NativeRevisionReconcile:
                     )
                     continue
                 async with self.bridge.materialize_body(
-                    inventory,
+                    scope,
                     change.document,
                 ) as body:
                     prepared = await self.body_store.prepare_text(
