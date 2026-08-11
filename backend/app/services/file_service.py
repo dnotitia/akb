@@ -300,14 +300,10 @@ class FileService:
 
         s3_adapter.ensure_bucket(self._bucket)
         collection_path = _normalize_collection_path(collection)
-        s3_key = _s3_key(
+        preferred_s3_key = _s3_key(
             vault_name, collection_path, filename, content_hash=content_hash,
         )
         file_id = uuid.uuid4()
-
-        presigned_url = s3_adapter.presign_put(
-            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
-        )
 
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -318,6 +314,26 @@ class FileService:
                     collection_id = await coll_repo.get_or_create(
                         vault_id, collection_path, conn=conn,
                     )
+                # A delayed delete intent may still own the deterministic key
+                # after its original metadata row disappeared. Never wait for
+                # remote object-store I/O on the request path: reserve the
+                # preferred key with a non-blocking advisory lock, otherwise
+                # use a fresh random key whose upload cannot be removed by the
+                # older intent.
+                s3_key = preferred_s3_key
+                for _attempt in range(4):
+                    if await vault_files_repo.s3_key_available_for_registration(
+                        conn, vault_id=vault_id, s3_key=s3_key,
+                    ):
+                        break
+                    s3_key = _s3_key(
+                        vault_name, collection_path, filename, content_hash=None,
+                    )
+                else:
+                    raise AKBError(
+                        "Could not reserve an object storage key",
+                        status_code=503,
+                    )
                 stored_id = await vault_files_repo.insert_or_adopt(
                     conn,
                     file_id=file_id, vault_id=vault_id,
@@ -327,6 +343,10 @@ class FileService:
                     created_by=actor_id,
                     collection_id=collection_id,
                 )
+
+        presigned_url = s3_adapter.presign_put(
+            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
+        )
 
         deduplicated = stored_id != file_id
         file_id = stored_id

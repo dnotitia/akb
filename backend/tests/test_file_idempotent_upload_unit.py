@@ -477,6 +477,119 @@ async def test_delete_and_key_registration_are_serialized(
         ) == registered_id
 
 
+async def test_file_initiation_does_not_wait_for_same_key_cleanup(
+    pool, vault_id, monkeypatch,
+):
+    """A request chooses a fresh key while cleanup owns the preferred key."""
+    from app.services import file_service as fs
+
+    async with pool.acquire() as conn:
+        vault_name = await conn.fetchval(
+            "SELECT name FROM vaults WHERE id = $1", vault_id,
+        )
+    preferred_key = _s3_key(
+        vault_name, "IS", "nonblocking.bin", content_hash=_HASH_A,
+    )
+
+    async def fake_get_pool():
+        return pool
+
+    monkeypatch.setattr(fs, "get_pool", fake_get_pool)
+    monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "presign_put",
+        lambda key, **_kwargs: f"https://storage.invalid/{key}",
+    )
+
+    async with pool.acquire() as cleanup_conn:
+        assert await vault_files_repo.try_lock_s3_key_for_cleanup(
+            cleanup_conn, preferred_key,
+        )
+        try:
+            result = await asyncio.wait_for(
+                fs.FileService().initiate_upload(
+                    vault_name=vault_name,
+                    vault_id=vault_id,
+                    collection="IS",
+                    filename="nonblocking.bin",
+                    actor_id="tester",
+                    content_hash=_HASH_A,
+                ),
+                timeout=1,
+            )
+        finally:
+            await vault_files_repo.unlock_s3_key_after_cleanup(
+                cleanup_conn, preferred_key,
+            )
+
+    assert result["s3_key"] != preferred_key
+    assert result["s3_key"].endswith("_nonblocking.bin")
+
+
+async def test_unprocessed_delete_intent_is_a_durable_key_barrier(
+    pool, vault_id,
+):
+    """A lost cleanup connection cannot make its old key reusable too soon."""
+    key = _s3_key("v", "IS", "barrier.bin", content_hash=_HASH_A)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM s3_delete_outbox")
+        outbox_id = await conn.fetchval(
+            """
+            INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
+            VALUES ($1, NOW())
+            RETURNING id
+            """,
+            key,
+        )
+
+        async with conn.transaction():
+            assert not await vault_files_repo.s3_key_available_for_registration(
+                conn, vault_id=vault_id, s3_key=key,
+            )
+
+        await conn.execute(
+            "UPDATE s3_delete_outbox SET processed_at = NOW() WHERE id = $1",
+            outbox_id,
+        )
+        async with conn.transaction():
+            assert await vault_files_repo.s3_key_available_for_registration(
+                conn, vault_id=vault_id, s3_key=key,
+            )
+
+
+async def test_s3_key_probes_have_dedicated_indexes(pool):
+    backend_dir = Path(__file__).resolve().parents[1]
+    migration_path = (
+        backend_dir
+        / "app"
+        / "db"
+        / "migrations"
+        / "067_vault_files_s3_key_lookup.py"
+    )
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("migration_067", migration_path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    async with pool.acquire() as conn:
+        await migration.migrate(conn)
+        index_defs = await conn.fetch(
+            """
+            SELECT indexname, indexdef
+              FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND indexname = ANY($1::text[])
+            """,
+            ["idx_vault_files_s3_key", "idx_s3_delete_pending_key"],
+        )
+
+    by_name = {row["indexname"]: row["indexdef"] for row in index_defs}
+    assert "(s3_key)" in by_name["idx_vault_files_s3_key"]
+    assert "(s3_key)" in by_name["idx_s3_delete_pending_key"]
+    assert "processed_at IS NULL" in by_name["idx_s3_delete_pending_key"]
+
+
 async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):
     """An older pod only sets hash_verified_at; the migration trigger keeps a
     rolling deployment from leaving that successfully uploaded File hidden."""

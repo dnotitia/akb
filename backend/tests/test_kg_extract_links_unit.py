@@ -65,6 +65,12 @@ def test_relative_image_target_remains_a_document_relation():
     ]
 
 
+def test_parent_relative_link_keeps_its_parent_traversal():
+    assert extract_markdown_links("[shared](../shared/spec.md)") == [
+        "../shared/spec.md"
+    ]
+
+
 def test_strip_code_spans_removes_code_keeps_prose():
     stripped = strip_code_spans("`akb://x/coll/y/doc/z.md` keep-this")
     assert "akb://" not in stripped

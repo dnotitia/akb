@@ -3,7 +3,9 @@ import {
   discardAsset,
   clearPrivateAssetCache,
   getAssetBlob,
+  getPublication,
   publicationAssetUrl,
+  refreshPublicationViewGrant,
   setPublicationToken,
   setToken,
   setViewGrant,
@@ -131,6 +133,30 @@ describe("editor image asset API", () => {
 
     expect(publicationAssetUrl("public slug", ASSET_ID)).toBe(
       `/api/v1/public/public%20slug/assets/${ASSET_ID}?token=password+token&grant=view+grant`,
+    );
+  });
+
+  it("uses the page session grant when refreshing a legacy fetch grant", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        resource_type: "document",
+        content: "![image](/api/assets/id)",
+        view_grant: "1000.legacy",
+        view_grant_session: "1000.4600.session",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        view_grant: "1601.2201.renewed",
+        view_grant_session: "1000.4600.rotated",
+      }));
+
+    await getPublication("share");
+    await refreshPublicationViewGrant("share");
+
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/public/share/grant?grant=1000.4600.session",
+    );
+    expect(publicationAssetUrl("share", ASSET_ID)).toContain(
+      "grant=1601.2201.renewed",
     );
   });
 });

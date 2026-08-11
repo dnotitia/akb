@@ -35,20 +35,90 @@ _S3_KEY_LOCK_NAMESPACE = 1_735_359_043
 
 
 async def lock_s3_key_for_mutation(conn, s3_key: str) -> None:
-    """Serialize object deletion with metadata registration for one S3 key.
+    """Take the blocking transaction lock used by the final metadata insert.
 
-    A deterministic File key can be reused after an abandoned upload, and a
-    vault name can be reused after vault deletion.  The delete worker holds
-    this transaction-scoped lock while it rechecks ``vault_files`` and removes
-    bytes.  File registration takes the same lock before inserting metadata,
-    making the two safe orderings explicit: either deletion finishes before a
-    new upload is registered, or the worker observes the new live reference.
+    New File uploads first use ``s3_key_available_for_registration`` so they
+    never wait behind object-store I/O. This blocking form remains the final
+    insert guard and keeps older callers safe during a rolling deployment.
     """
     await conn.fetchval(
         "SELECT pg_advisory_xact_lock($1::int, hashtext($2))",
         _S3_KEY_LOCK_NAMESPACE,
         s3_key,
     )
+
+
+async def try_lock_s3_key_for_cleanup(conn, s3_key: str) -> bool:
+    """Hold one session lock across a cleanup probe and remote delete.
+
+    The lock is session-scoped rather than transaction-scoped: object-store
+    latency must not leave a PostgreSQL transaction open. An unprocessed
+    outbox row remains the durable barrier if this connection is lost.
+    """
+    return bool(await conn.fetchval(
+        "SELECT pg_try_advisory_lock($1::int, hashtext($2))",
+        _S3_KEY_LOCK_NAMESPACE,
+        s3_key,
+    ))
+
+
+async def unlock_s3_key_after_cleanup(conn, s3_key: str) -> None:
+    await conn.fetchval(
+        "SELECT pg_advisory_unlock($1::int, hashtext($2))",
+        _S3_KEY_LOCK_NAMESPACE,
+        s3_key,
+    )
+
+
+async def s3_key_available_for_registration(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    s3_key: str,
+) -> bool:
+    """Reserve a key for this transaction without waiting on remote cleanup.
+
+    An unprocessed delete intent is a durable key barrier. If cleanup already
+    owns the session lock, or the barrier exists without a same-vault live row,
+    the caller selects a fresh random key. A same-vault row remains adoptable;
+    cleanup will observe that live reference and retire its stale intent.
+    """
+    locked = await conn.fetchval(
+        "SELECT pg_try_advisory_xact_lock($1::int, hashtext($2))",
+        _S3_KEY_LOCK_NAMESPACE,
+        s3_key,
+    )
+    if not locked:
+        return False
+
+    live_key = await conn.fetchrow(
+        """
+        SELECT EXISTS (
+                   SELECT 1 FROM vault_files WHERE s3_key = $1
+               ) AS any_vault,
+               EXISTS (
+                   SELECT 1
+                     FROM vault_files
+                    WHERE s3_key = $1 AND vault_id = $2
+               ) AS same_vault
+        """,
+        s3_key,
+        vault_id,
+    )
+    if live_key["any_vault"]:
+        return bool(live_key["same_vault"])
+
+    pending_delete = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM s3_delete_outbox
+             WHERE s3_key = $1 AND processed_at IS NULL
+        )
+        """,
+        s3_key,
+    )
+    return not pending_delete
 
 
 def confirmed_file_predicate(alias: str = "vf") -> str:

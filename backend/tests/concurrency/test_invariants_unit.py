@@ -1197,8 +1197,11 @@ async def test_publication_waits_for_vault_before_locking_document(
             ) is True
             await tx.commit()
 
-        with pytest.raises(ValueError, match="deleted concurrently"):
+        with pytest.raises(ValueError) as exc:
             await asyncio.wait_for(publisher, timeout=2)
+        assert str(exc.value) == (
+            "Document not found (resource was deleted concurrently): " + uri
+        )
     finally:
         await watch.close()
 

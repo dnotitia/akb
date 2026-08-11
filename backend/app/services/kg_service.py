@@ -116,7 +116,8 @@ def extract_markdown_links(content: str) -> list[str]:
                 targets.append(target)
                 seen.add(target)
             return
-        target = target.lstrip("./")
+        if target.startswith("./"):
+            target = target[2:]
         if "#" in target:
             target = target.split("#")[0]
         if target and target not in seen:

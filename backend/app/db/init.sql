@@ -430,6 +430,7 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_files_vault ON vault_files(vault_id);
+CREATE INDEX IF NOT EXISTS idx_vault_files_s3_key ON vault_files(s3_key);
 -- Guarded: `vault_files.collection_id` arrives with migration 020; see the
 -- note at the publications document_id guard below.
 DO $$

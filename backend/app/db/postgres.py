@@ -243,6 +243,7 @@ async def _apply_migrations() -> None:
         "064_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
         "065_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
         "066_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
+        "067_vault_files_s3_key_lookup.py",  # physical-key reachability + pending-delete barrier indexes
     ):
         if filename in applied:
             continue

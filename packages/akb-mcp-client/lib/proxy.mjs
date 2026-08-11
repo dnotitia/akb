@@ -737,8 +737,9 @@ export class AKBProxy {
       `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
     );
     let discarded = null;
-    if (response.text) {
-      const body = JSON.parse(response.text);
+    const responseText = response.text?.trim();
+    if (responseText) {
+      const body = JSON.parse(responseText);
       if (typeof body.discarded === "boolean") discarded = body.discarded;
     }
     return {
@@ -912,7 +913,7 @@ export class AKBProxy {
 
   // ── AKB HTTP helper ───────────────────────────────────────
 
-  _http(method, path, body = null, extraHeaders = {}, opts = {}) {
+  _http(method, path, body = null, extraHeaders = {}, callOptions = {}) {
     return new Promise((resolve, reject) => {
       const isHttps = this.url.protocol === "https:";
       const doRequest = isHttps ? httpsRequest : httpRequest;
@@ -928,7 +929,7 @@ export class AKBProxy {
         headers["Content-Length"] = Buffer.byteLength(body);
       }
 
-      const opts = {
+      const requestOptions = {
         hostname: this.url.hostname,
         port: this.url.port || (isHttps ? 443 : 80),
         path,
@@ -936,7 +937,7 @@ export class AKBProxy {
         headers,
         agent: isHttps ? httpsKeepAlive : httpKeepAlive,
       };
-      if (isHttps && this.insecure) opts.rejectUnauthorized = false;
+      if (isHttps && this.insecure) requestOptions.rejectUnauthorized = false;
 
       // Connect-phase timeout, separate from the (long) response timeout.
       // A VPN blackhole leaves a brand-new socket stuck in `connecting`;
@@ -952,7 +953,7 @@ export class AKBProxy {
         }
       };
 
-      const req = doRequest(opts, (res) => {
+      const req = doRequest(requestOptions, (res) => {
         clearConnectTimer();
         let data = "";
         res.setEncoding("utf8");
@@ -987,9 +988,9 @@ export class AKBProxy {
       // 30s caused the client to abort while the backend continued
       // processing, leaving the operator with a misleading timeout
       // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`, or per-call via
-      // `opts.timeoutMs` (liveness probes use the short probe timeout).
+      // `callOptions.timeoutMs` (liveness probes use the short probe timeout).
       const reqTimeoutMs =
-        opts.timeoutMs || Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
+        callOptions.timeoutMs || Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
       req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout (${Math.round(reqTimeoutMs / 1000)}s)`)));
       if (body) req.write(body);
       req.end();

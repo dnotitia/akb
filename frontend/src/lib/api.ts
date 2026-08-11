@@ -793,6 +793,8 @@ export interface PublicationResponse {
   // Short-lived grant minted by this page open; carried by /raw, /download and
   // CSV so they re-serve this same view without re-counting it.
   view_grant?: string;
+  // Bounded proof for rotating a legacy fetch grant during a rolling upgrade.
+  view_grant_session?: string;
 }
 
 export interface PublicationError {
@@ -827,12 +829,24 @@ function publicationGrantKey(slug: string) {
   return `akb_publication_grant_${slug}`;
 }
 
+function publicationSessionGrantKey(slug: string) {
+  return `akb_publication_grant_session_${slug}`;
+}
+
 export function getViewGrant(slug: string): string | null {
   return sessionStorage.getItem(publicationGrantKey(slug));
 }
 
 export function setViewGrant(slug: string, grant: string) {
   sessionStorage.setItem(publicationGrantKey(slug), grant);
+}
+
+function getViewGrantSession(slug: string): string | null {
+  return sessionStorage.getItem(publicationSessionGrantKey(slug));
+}
+
+function setViewGrantSession(slug: string, grant: string) {
+  sessionStorage.setItem(publicationSessionGrantKey(slug), grant);
 }
 
 async function fetchPublic(
@@ -873,6 +887,9 @@ export async function getPublication(
   // This page open spent one view and returned a grant; keep it so the paired
   // /raw + /download re-serves of this view aren't counted again.
   if (body.view_grant) setViewGrant(slug, body.view_grant);
+  if (body.view_grant_session) {
+    setViewGrantSession(slug, body.view_grant_session);
+  }
   return body;
 }
 
@@ -887,12 +904,25 @@ export async function getPublicationMeta(slug: string): Promise<any> {
 
 /** Rotate a subordinate-fetch grant without spending another publication view. */
 export async function refreshPublicationViewGrant(slug: string): Promise<string> {
-  const res = await fetchPublic(slug, "/grant", {}, { method: "POST" });
+  const search = new URLSearchParams();
+  const token = getPublicationToken(slug);
+  const renewalGrant = getViewGrantSession(slug) ?? getViewGrant(slug);
+  if (token) search.set("token", token);
+  if (renewalGrant) search.set("grant", renewalGrant);
+  const qs = search.toString();
+  const res = await fetch(
+    `${API_BASE}/public/${encodeURIComponent(slug)}/grant${qs ? `?${qs}` : ""}`,
+    { method: "POST" },
+  );
   const body = await res.json().catch(() => ({}));
   if (!res.ok || !body.view_grant) {
     throw new Error(body.detail || body.error || "Publication grant expired");
   }
   setViewGrant(slug, body.view_grant);
+  setViewGrantSession(
+    slug,
+    body.view_grant_session ?? body.view_grant,
+  );
   return body.view_grant;
 }
 

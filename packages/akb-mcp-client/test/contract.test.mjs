@@ -6,6 +6,7 @@
 // Run with: node packages/akb-mcp-client/test/contract.test.mjs
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -289,6 +290,43 @@ itAsync("_discardImage does not claim a backend no-op deleted anything", async (
   });
 
   assert.equal(result.discarded, false);
+});
+
+itAsync("_discardImage tolerates an empty legacy response", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const assetId = "11111111-2222-4333-8444-555555555555";
+  proxy._http = async () => ({ text: "  \n" });
+
+  const result = await proxy._discardImage({
+    vault: "myvault",
+    url: `/api/assets/${assetId}`,
+  });
+
+  assert.equal(result.discarded, null);
+});
+
+itAsync("_http honors the per-call probe timeout", async () => {
+  const server = createServer(() => {});
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.equal(typeof address, "object");
+    const proxy = new AKBProxy({
+      url: `http://127.0.0.1:${address.port}/mcp`,
+      pat: "test",
+    });
+    const started = Date.now();
+
+    await assert.rejects(
+      () => proxy._http("GET", "/hang", null, {}, { timeoutMs: 30 }),
+      /Request timeout/,
+    );
+
+    assert.ok(Date.now() - started < 1000, "probe must not inherit the 300s default");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 itAsync("_discardImage surfaces backend lookup failures", async () => {

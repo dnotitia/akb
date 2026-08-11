@@ -644,6 +644,7 @@ async def renew_publication_view_grant(slug: str, request: Request):
         raise _publication_error_to_http(exc)
     return {
         "view_grant": grant,
+        "view_grant_session": grant,
         "expires_in": settings.publication_view_grant_ttl_secs,
     }
 
@@ -1114,7 +1115,27 @@ async def get_public_publication(
     # from a single counted view, defeating the cap (Codex High). Only the JSON
     # page-open responses carry it — the CSV/HTML format branches are leaf
     # downloads, not the "open the page" call the viewer threads the grant from.
-    grant = incoming_grant if has_grant else _make_view_grant(slug)
+    if has_grant:
+        # Verification cannot succeed for None, but spelling out the narrowing
+        # keeps this response contract non-null for type checkers and callers.
+        assert incoming_grant is not None
+        grant = incoming_grant
+    else:
+        grant = _make_view_grant(slug)
+    # During the rolling-upgrade phase the fetch grant remains in the legacy
+    # two-field format so an older backend can still serve subordinate image
+    # requests. A separately minted bounded token proves the same counted page
+    # open to the refresh endpoint without promoting the legacy capability.
+    # Once legacy emission is disabled the two values are identical.
+    session_grant = None
+    if not has_grant:
+        session_grant = (
+            grant
+            if len(grant.split(".")) == 3
+            else _make_bounded_view_grant(slug)
+        )
+    elif incoming_grant and len(incoming_grant.split(".")) == 3:
+        session_grant = incoming_grant
 
     if rt == ResourceType.DOCUMENT:
         try:
@@ -1122,6 +1143,8 @@ async def get_public_publication(
         except PublicationError as e:
             raise _publication_error_to_http(e)
         data["view_grant"] = grant
+        if session_grant:
+            data["view_grant_session"] = session_grant
         return data
 
     if rt == ResourceType.FILE:
@@ -1134,6 +1157,8 @@ async def get_public_publication(
         # /public/{slug}/download (force-download). The legacy ?format=raw
         # alias was removed — it had no callers and no size cap.
         file_data["view_grant"] = grant
+        if session_grant:
+            file_data["view_grant_session"] = session_grant
         return file_data
 
     if rt == ResourceType.TABLE_QUERY:
@@ -1157,6 +1182,8 @@ async def get_public_publication(
         if fmt == "html":
             return await _to_html_table_response(data)
         data["view_grant"] = grant
+        if session_grant:
+            data["view_grant_session"] = session_grant
         return data
 
     raise HTTPException(status_code=400, detail=f"Unknown resource_type: {rt}")

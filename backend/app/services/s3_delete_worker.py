@@ -70,7 +70,7 @@ async def enqueue_pending_upload_delete(conn, s3_key: str) -> None:
 # ── Claim / mark ─────────────────────────────────────────────────
 
 
-async def _claim_batch(conn) -> list[dict]:
+async def _claim_batch(conn, limit: int = BATCH_SIZE) -> list[dict]:
     rows = await conn.fetch(
         """
         WITH pending AS (
@@ -89,7 +89,7 @@ async def _claim_batch(conn) -> list[dict]:
          WHERE o.id = p.id
         RETURNING o.id, o.s3_key, o.retry_count
         """,
-        BATCH_SIZE, MAX_RETRIES,
+        limit, MAX_RETRIES,
     )
     return [dict(r) for r in rows]
 
@@ -116,53 +116,113 @@ async def _mark_failure(conn, outbox_id, retry_count: int, error: str) -> None:
     )
 
 
+async def _release_claim(conn, outbox_id, *, delay_seconds: int = 1) -> None:
+    await conn.execute(
+        """
+        UPDATE s3_delete_outbox
+           SET next_attempt_at = NOW() + ($2 * INTERVAL '1 second')
+         WHERE id = $1 AND processed_at IS NULL
+        """,
+        outbox_id,
+        delay_seconds,
+    )
+
+
+async def _record_outcome(pool, marker, *args) -> bool:
+    """Record one outcome on a fresh connection without aborting the batch."""
+    try:
+        async with pool.acquire() as conn:
+            await marker(conn, *args)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "s3 delete outcome recording failed for outbox %s: %s",
+            args[0] if args else "unknown",
+            exc,
+        )
+        return False
+
+
 # ── Pipeline ─────────────────────────────────────────────────────
 
 
 async def _process_deletes_once() -> int:
     pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            batch = await _claim_batch(conn)
-    if not batch:
-        return 0
-
     succeeded = 0
-    for row in batch:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # A delayed intent may outlive the metadata row that created
-                # it. Deterministic File keys and recreated vault names can
-                # legitimately register the same key again before this worker
-                # runs. Share one key lock with File registration, then check
-                # reachability while holding it; this closes both the stale
-                # intent and check-then-delete races.
-                await vault_files_repo.lock_s3_key_for_mutation(
-                    conn, row["s3_key"],
-                )
-                referenced = await conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)",
-                    row["s3_key"],
-                )
-                if referenced:
-                    await _mark_success(conn, row["id"])
-                    succeeded += 1
-                    continue
+    # Claim one row at a time. A worst-case object-store retry therefore cannot
+    # consume the ten-minute lease of rows waiting later in the same batch.
+    for _ in range(BATCH_SIZE):
+        async with pool.acquire() as claim_conn:
+            async with claim_conn.transaction():
+                batch = await _claim_batch(claim_conn, limit=1)
+        if not batch:
+            break
+        row = batch[0]
 
-                try:
-                    await asyncio.to_thread(s3_adapter.delete, row["s3_key"])
-                except NotFoundError:
-                    # S3 object already absent — treat as success (delete is
-                    # idempotent; this also covers re-runs after a partial
-                    # failure).
-                    pass
-                except Exception as e:  # noqa: BLE001
-                    await _mark_failure(conn, row["id"], row["retry_count"], str(e))
-                    continue
+        outcome = "failure"
+        failure_error = "cleanup did not complete"
+        try:
+            async with pool.acquire() as lock_conn:
+                locked = await vault_files_repo.try_lock_s3_key_for_cleanup(
+                    lock_conn, row["s3_key"],
+                )
+                if not locked:
+                    outcome = "release"
+                else:
+                    try:
+                        # This lookup is intentionally global by physical
+                        # object key. A recreated vault can legitimately own
+                        # the same key; deleting it would corrupt that File.
+                        referenced = await lock_conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)",
+                            row["s3_key"],
+                        )
+                        if not referenced:
+                            try:
+                                # No PostgreSQL transaction is open across
+                                # this remote call. The session lock plus the
+                                # outbox barrier makes new writers choose a
+                                # different key.
+                                await asyncio.to_thread(
+                                    s3_adapter.delete, row["s3_key"],
+                                )
+                            except NotFoundError:
+                                pass
+                        outcome = "success"
+                    except Exception as exc:  # noqa: BLE001
+                        outcome = "failure"
+                        failure_error = str(exc)
+                    finally:
+                        try:
+                            await vault_files_repo.unlock_s3_key_after_cleanup(
+                                lock_conn, row["s3_key"],
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "s3 cleanup lock release failed for %s: %s",
+                                row["s3_key"],
+                                exc,
+                            )
+        except Exception as exc:  # noqa: BLE001
+            # A broken lock/probe connection affects only this claimed row.
+            # Its lease expires if recording also fails; later rows still run.
+            outcome = "failure"
+            failure_error = str(exc)
 
-                await _mark_success(conn, row["id"])
-        succeeded += 1
+        if outcome == "success":
+            recorded = await _record_outcome(pool, _mark_success, row["id"])
+        elif outcome == "release":
+            recorded = await _record_outcome(pool, _release_claim, row["id"])
+        else:
+            recorded = await _record_outcome(
+                pool,
+                _mark_failure,
+                row["id"],
+                row["retry_count"],
+                failure_error,
+            )
+        if recorded and outcome == "success":
+            succeeded += 1
 
     return succeeded
 

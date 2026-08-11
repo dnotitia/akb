@@ -742,6 +742,52 @@ def test_bounded_grant_rotation_does_not_downgrade_during_legacy_emission(
 
 
 @pytest.mark.asyncio
+async def test_default_page_open_emits_a_renewable_session_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rolling default keeps a legacy fetch grant without disabling refresh."""
+    from starlette.requests import Request
+    from app.api.routes import public
+
+    assert public.settings.publication_view_grant_emit_legacy is True
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+
+    async def fake_resolve(*_args, **_kwargs):
+        return {"resource_type": public.ResourceType.DOCUMENT, "vault_id": uuid.uuid4()}
+
+    async def fake_document(_publication):
+        return {"content": "![image](/api/assets/00000000-0000-4000-8000-000000000000)"}
+
+    monkeypatch.setattr(public, "_resolve_with_access", fake_resolve)
+    monkeypatch.setattr(
+        public.publication_service, "resolve_document_publication", fake_document,
+    )
+    request = Request({
+        "type": "http", "method": "GET", "path": "/", "headers": [],
+        "query_string": b"",
+    })
+
+    opened = await public.get_public_publication("share", request)
+
+    assert len(opened["view_grant"].split(".")) == 2
+    session_grant = opened["view_grant_session"]
+    assert len(session_grant.split(".")) == 3
+
+    now += 601
+    renewal_request = Request({
+        "type": "http", "method": "POST", "path": "/", "headers": [],
+        "query_string": f"grant={session_grant}".encode(),
+    })
+    renewed = await public.renew_publication_view_grant("share", renewal_request)
+
+    assert len(renewed["view_grant"].split(".")) == 3
+    assert public._verify_view_grant("share", renewed["view_grant"]) is True
+
+
+@pytest.mark.asyncio
 async def test_legacy_view_grant_cannot_be_promoted_to_a_longer_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1382,6 +1428,7 @@ async def test_s3_delete_worker_rechecks_live_key_under_shared_lock(
     from app.services import s3_delete_worker
 
     calls: list[tuple] = []
+    claimed = False
 
     class _Transaction:
         async def __aenter__(self):
@@ -1413,12 +1460,20 @@ async def test_s3_delete_worker_rechecks_live_key_under_shared_lock(
     async def fake_get_pool():
         return _Pool()
 
-    async def fake_claim(_conn):
+    async def fake_claim(_conn, limit=s3_delete_worker.BATCH_SIZE):
+        nonlocal claimed
         calls.append(("claim",))
+        if claimed:
+            return []
+        claimed = True
         return [{"id": 7, "s3_key": "vault/shared.bin", "retry_count": 0}]
 
     async def fake_lock(_conn, key):
         calls.append(("lock", key))
+        return True
+
+    async def fake_unlock(_conn, key):
+        calls.append(("unlock", key))
 
     async def fake_success(_conn, outbox_id):
         calls.append(("success", outbox_id))
@@ -1431,8 +1486,13 @@ async def test_s3_delete_worker_rechecks_live_key_under_shared_lock(
     monkeypatch.setattr(s3_delete_worker, "_mark_success", fake_success)
     monkeypatch.setattr(
         s3_delete_worker.vault_files_repo,
-        "lock_s3_key_for_mutation",
+        "try_lock_s3_key_for_cleanup",
         fake_lock,
+    )
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "unlock_s3_key_after_cleanup",
+        fake_unlock,
     )
     monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", fake_delete)
 
@@ -1446,4 +1506,165 @@ async def test_s3_delete_worker_rechecks_live_key_under_shared_lock(
         assert ("delete", "vault/shared.bin") not in calls
     else:
         assert calls[3] == ("delete", "vault/shared.bin")
-    assert calls[-1] == ("success", 7)
+    assert ("success", 7) in calls
+    assert ("unlock", "vault/shared.bin") in calls
+
+
+@pytest.mark.asyncio
+async def test_s3_delete_worker_keeps_remote_io_outside_transactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import s3_delete_worker
+
+    transaction_depth = 0
+    claimed = False
+
+    class _Transaction:
+        async def __aenter__(self):
+            nonlocal transaction_depth
+            transaction_depth += 1
+
+        async def __aexit__(self, *_args):
+            nonlocal transaction_depth
+            transaction_depth -= 1
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, sql, *_args):
+            if "SELECT EXISTS" in sql:
+                return False
+            return True
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_pool():
+        return _Pool()
+
+    async def fake_claim(_conn, limit=s3_delete_worker.BATCH_SIZE):
+        nonlocal claimed
+        if claimed:
+            return []
+        claimed = True
+        return [{"id": 1, "s3_key": "vault/slow.bin", "retry_count": 0}]
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def fake_lock(*_args, **_kwargs):
+        return True
+
+    def fake_delete(_key):
+        assert transaction_depth == 0
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_pool)
+    monkeypatch.setattr(s3_delete_worker, "_claim_batch", fake_claim)
+    monkeypatch.setattr(s3_delete_worker, "_mark_success", noop)
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "try_lock_s3_key_for_cleanup",
+        fake_lock,
+    )
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "unlock_s3_key_after_cleanup",
+        noop,
+    )
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", fake_delete)
+
+    assert await s3_delete_worker._process_deletes_once() == 1
+
+
+@pytest.mark.asyncio
+async def test_s3_delete_worker_continues_when_failure_recording_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import s3_delete_worker
+
+    rows = [
+        {"id": 1, "s3_key": "vault/first.bin", "retry_count": 0},
+        {"id": 2, "s3_key": "vault/second.bin", "retry_count": 0},
+    ]
+    deletes: list[str] = []
+
+    class _Connection:
+        def transaction(self):
+            class _Transaction:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *_args):
+                    return None
+
+            return _Transaction()
+
+        async def fetchval(self, sql, *_args):
+            if "SELECT EXISTS" in sql:
+                return False
+            return True
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_pool():
+        return _Pool()
+
+    async def fake_claim(_conn, limit=s3_delete_worker.BATCH_SIZE):
+        if not rows:
+            return []
+        if limit == 1:
+            return [rows.pop(0)]
+        claimed = list(rows)
+        rows.clear()
+        return claimed
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def fake_lock(*_args, **_kwargs):
+        return True
+
+    async def broken_mark_failure(*_args, **_kwargs):
+        raise ConnectionError("outcome connection closed")
+
+    def fake_delete(key):
+        deletes.append(key)
+        if key.endswith("first.bin"):
+            raise TimeoutError("object store timeout")
+
+    monkeypatch.setattr(s3_delete_worker, "get_pool", fake_pool)
+    monkeypatch.setattr(s3_delete_worker, "_claim_batch", fake_claim)
+    monkeypatch.setattr(s3_delete_worker, "_mark_success", noop)
+    monkeypatch.setattr(s3_delete_worker, "_mark_failure", broken_mark_failure)
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "try_lock_s3_key_for_cleanup",
+        fake_lock,
+    )
+    monkeypatch.setattr(
+        s3_delete_worker.vault_files_repo,
+        "unlock_s3_key_after_cleanup",
+        noop,
+    )
+    monkeypatch.setattr(s3_delete_worker.s3_adapter, "delete", fake_delete)
+
+    assert await s3_delete_worker._process_deletes_once() == 1
+    assert deletes == ["vault/first.bin", "vault/second.bin"]
