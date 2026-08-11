@@ -438,8 +438,8 @@ TOOLS = [
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
                 "regex": {"type": "boolean", "default": False, "description": "Treat pattern as PostgreSQL regex. REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
-                "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Supports regex backreferences (\\1, \\2) when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return"},
+                "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return; does not limit replacement writes"},
                 "max_replacements": {
                     "type": "integer",
                     "default": DEFAULT_MAX_REPLACEMENTS,

@@ -16,6 +16,8 @@ every matching document. Replacement receipts include both the new and previous
 commit, and a failure after earlier commits returns those completed receipts plus
 the failed document instead of discarding the partial result. The audit stream
 records a bounded summary and one metadata-only receipt per committed document.
+Literal-mode replacements now also preserve backslashes as ordinary text;
+replacement-template backreferences remain exclusive to regex mode.
 
 ### Added app installation lifecycle commands
 

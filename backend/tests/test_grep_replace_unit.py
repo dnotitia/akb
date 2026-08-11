@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.exceptions import WriteBusyError
+from app.exceptions import ValidationError, WriteBusyError
 from app.services import search_service
 from app.services.search_service import SearchService
 
@@ -124,6 +124,38 @@ async def test_replace_applies_to_full_scope_while_limit_only_bounds_preview(leg
     assert all(row["previous_commit"] for row in result["replacements"])
     assert all(content.startswith("TODO(owner)") for content in documents.contents.values())
     assert all(request.expected_commit == f"parent-{path}" for path, request in documents.update_calls)
+
+
+@pytest.mark.asyncio
+async def test_literal_replace_preserves_backslashes(legacy_grep):
+    rows = _rows(1, pattern="todo")
+    service = await legacy_grep(rows)
+    documents = _Documents(rows)
+    replacement = r"C:\temp\1"
+
+    result = await service.grep(
+        "TODO",
+        vault="test-vault",
+        replace=replacement,
+        doc_service=documents,
+        agent_id="tester",
+    )
+
+    assert result["replacement_complete"] is True
+    assert documents.contents[rows[0]["path"]] == f"{replacement} item 0"
+
+
+@pytest.mark.asyncio
+async def test_legacy_replace_requires_document_service(legacy_grep):
+    service = await legacy_grep(_rows(1))
+
+    with pytest.raises(ValidationError, match="doc_service is required"):
+        await service.grep(
+            "TODO",
+            vault="test-vault",
+            replace="done",
+            agent_id="tester",
+        )
 
 
 @pytest.mark.asyncio

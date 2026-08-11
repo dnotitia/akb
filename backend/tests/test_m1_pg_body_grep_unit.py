@@ -325,10 +325,11 @@ async def test_native_grep_replace_uses_full_scope_beyond_response_limit(monkeyp
     monkeypatch.setattr(service, "_require_write_access", require_write_access)
     monkeypatch.setattr(native_grep, "NativeRevisionService", lambda *_args, **_kwargs: _Native())
 
+    replacement = r"C:\temp\1"
     result = await service.grep_public(
         "TODO",
         user_id=uuid.uuid4(),
-        replace="TODO(owner)",
+        replace=replacement,
         actor="tester",
         limit=1,
         max_replacements=3,
@@ -342,6 +343,7 @@ async def test_native_grep_replace_uses_full_scope_beyond_response_limit(monkeyp
         body.revision_id for body in bodies
     ]
     assert len(calls) == 3
+    assert all(f"{replacement} item" in call["payload"] for call in calls)
 
 
 @pytest.mark.asyncio

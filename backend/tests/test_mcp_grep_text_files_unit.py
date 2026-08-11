@@ -23,6 +23,11 @@ def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
     replacement_budget = grep.inputSchema["properties"]["max_replacements"]
     assert replacement_budget["default"] == 50
     assert replacement_budget["maximum"] == 1000
+    assert (
+        "treated literally"
+        in grep.inputSchema["properties"]["replace"]["description"].lower()
+    )
+    assert "does not limit replacement writes" in grep.inputSchema["properties"]["limit"]["description"]
     assert argument["type"] == "boolean"
     assert argument["default"] is False
     assert "guarded native" in argument["description"].lower()

@@ -867,7 +867,7 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
-| replace | | Replacement string — triggers find-and-replace mode |
+| replace | | Replacement string — literal unless `regex=true`, which enables backreferences |
 | limit | | Max documents to return (default 20; does not limit writes) |
 | max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
 | count_only | | Return exact per-resource counts without snippets |

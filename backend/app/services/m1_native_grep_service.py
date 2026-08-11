@@ -26,6 +26,7 @@ from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
 from app.services.grep_replace import (
     DEFAULT_MAX_REPLACEMENTS,
+    apply_grep_replacement,
     replacement_budget_error,
     replacement_failure_error,
     validate_max_replacements,
@@ -301,19 +302,16 @@ def _replace_bodies_sync(
     regex: bool,
     case_sensitive: bool,
 ) -> list[str]:
-    replacements = []
-    for body in bodies:
-        search_text = body.search_text
-        if regex:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            replacements.append(re.sub(pattern, replace, search_text, flags=flags))
-        elif case_sensitive:
-            replacements.append(search_text.replace(pattern, replace))
-        else:
-            replacements.append(
-                re.sub(re.escape(pattern), replace, search_text, flags=re.IGNORECASE)
-            )
-    return replacements
+    return [
+        apply_grep_replacement(
+            body.search_text,
+            pattern,
+            replace,
+            regex=regex,
+            case_sensitive=case_sensitive,
+        )
+        for body in bodies
+    ]
 
 
 def _regex_child(

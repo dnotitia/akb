@@ -25,6 +25,7 @@ from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
 from app.services.grep_replace import (
     DEFAULT_MAX_REPLACEMENTS,
+    apply_grep_replacement,
     replacement_budget_error,
     replacement_failure_error,
     validate_max_replacements,
@@ -1139,6 +1140,9 @@ class SearchService:
                 include_text_files=measurement_include_text_files,
             )
 
+        if replace is not None and doc_service is None:
+            raise ValidationError("doc_service is required for legacy grep replacement")
+
         pool = await get_pool()
         async with pool.acquire() as conn:
             conditions = []
@@ -1308,9 +1312,7 @@ class SearchService:
                 total_docs=total_docs,
                 max_replacements=max_replacements,
             )
-        elif replace is not None and matched_docs and doc_service:
-            re_flags = 0 if case_sensitive else _re.IGNORECASE
-
+        elif replace is not None and matched_docs:
             for doc_info in matched_docs:
                 doc_vault = doc_info["vault"]
                 doc_path = doc_info["path"]
@@ -1320,19 +1322,13 @@ class SearchService:
                     doc = await doc_service.get(doc_vault, doc_path)
                     body = doc.content or ""
 
-                    if regex:
-                        new_body = _re.sub(pattern, replace, body, flags=re_flags)
-                    else:
-                        if case_sensitive:
-                            new_body = body.replace(pattern, replace)
-                        else:
-                            # Case-insensitive non-regex replace
-                            new_body = _re.sub(
-                                _re.escape(pattern),
-                                replace,
-                                body,
-                                flags=_re.IGNORECASE,
-                            )
+                    new_body = apply_grep_replacement(
+                        body,
+                        pattern,
+                        replace,
+                        regex=regex,
+                        case_sensitive=case_sensitive,
+                    )
 
                     if new_body == body:
                         unchanged_docs += 1
