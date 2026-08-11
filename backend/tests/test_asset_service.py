@@ -46,6 +46,49 @@ def test_safe_filename_uses_supported_format_metadata() -> None:
     assert asset_service._safe_filename("..", "image/jpeg") == "image.jpg"
 
 
+@pytest.mark.asyncio
+async def test_cancelled_upload_waits_for_decoder_before_releasing_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import asset_service
+
+    decode_started = threading.Event()
+    finish_decode = threading.Event()
+    storage_touched = False
+
+    def blocking_inspect(_body):
+        decode_started.set()
+        finish_decode.wait(timeout=2)
+        return "image/png", 1, 1
+
+    def unexpected_storage(*_args):
+        nonlocal storage_touched
+        storage_touched = True
+        raise AssertionError("cancelled inspection must not reach storage")
+
+    monkeypatch.setattr(asset_service, "measurement_enabled", lambda: False)
+    monkeypatch.setattr(asset_service, "inspect_image", blocking_inspect)
+    monkeypatch.setattr(asset_service.s3_adapter, "ensure_bucket", unexpected_storage)
+
+    upload = asyncio.create_task(asset_service.create_image_asset(
+        vault_id=uuid.uuid4(),
+        vault_name="team",
+        filename="diagram.png",
+        declared_mime="image/png",
+        body=ONE_PIXEL_PNG,
+        actor_id="alice",
+    ))
+    assert await asyncio.to_thread(decode_started.wait, 1)
+    upload.cancel()
+    await asyncio.sleep(0)
+    assert not upload.done()
+
+    finish_decode.set()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+    assert storage_touched is False
+
+
 def test_extract_asset_ids_is_conservative_around_code() -> None:
     visible = uuid.uuid4()
     titled = uuid.uuid4()
@@ -72,6 +115,13 @@ def test_extract_asset_ids_is_conservative_around_code() -> None:
 """
 
     assert extract_asset_ids(markdown) == {visible, titled, referenced}
+
+
+def test_asset_urls_use_one_lowercase_canonical_form() -> None:
+    asset_id = uuid.uuid4()
+    assert extract_asset_ids(f"![ok](/api/assets/{asset_id})") == {asset_id}
+    assert extract_asset_ids(f"![prefix](/API/assets/{asset_id})") == set()
+    assert extract_asset_ids(f"![uuid](/api/assets/{str(asset_id).upper()})") == set()
 
 
 @pytest.mark.asyncio
@@ -599,12 +649,77 @@ def test_publication_view_grant_is_short_lived(
     now = 1_000_000.0
     monkeypatch.setattr(public.time, "time", lambda: now)
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
     grant = public._make_view_grant("share")
 
     now += 599
     assert public._verify_view_grant("share", grant) is True
     now += 2
     assert public._verify_view_grant("share", grant) is False
+
+
+def test_publication_view_grant_cannot_rotate_past_fixed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.routes import public
+
+    now = 1_000_000.0
+    monkeypatch.setattr(public.time, "time", lambda: now)
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    grant = public._make_view_grant("share")
+
+    now += 3599
+    rotated = public._renew_view_grant("share", grant)
+    assert rotated is not None
+    issued, expires = public._parse_view_grant("share", rotated) or (0, 0)
+    assert expires == issued + 3600
+
+    now += 2
+    assert public._renew_view_grant("share", rotated) is None
+
+
+@pytest.mark.asyncio
+async def test_expired_view_grant_rotates_without_counting_another_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+    from app.api.routes import public
+
+    now = 1_000_000
+    monkeypatch.setattr(public.time, "time", lambda: float(now))
+    monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
+    monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
+    old_grant = public._make_view_grant("share")
+    now += 601
+    observed: dict = {}
+
+    async def fake_resolve(slug, request, increment_view=True, enforce_view_cap=True):
+        observed.update(
+            slug=slug,
+            increment_view=increment_view,
+            enforce_view_cap=enforce_view_cap,
+        )
+        return {"slug": slug}
+
+    monkeypatch.setattr(public, "_resolve_with_access", fake_resolve)
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "query_string": f"grant={old_grant}".encode(),
+    })
+
+    result = await public.renew_publication_view_grant("share", request)
+
+    assert result["view_grant"] != old_grant
+    assert public._verify_view_grant("share", result["view_grant"]) is True
+    assert observed == {
+        "slug": "share",
+        "increment_view": False,
+        "enforce_view_cap": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -770,6 +885,15 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
         calls.append(("delete", vault_id, file_id, created_by))
         return {"id": file_id, "s3_key": "vault/.akb-assets/object"}
 
+    async def fake_state(_conn, *, vault_id, file_id, created_by):
+        calls.append(("state", vault_id, file_id, created_by))
+        return {
+            "id": file_id,
+            "s3_key": "vault/.akb-assets/object",
+            "upload_state": "confirmed",
+            "attachment_claimed_at": None,
+        }
+
     async def fake_enqueue(_conn, key):
         calls.append(("enqueue", key))
 
@@ -778,6 +902,11 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
 
     monkeypatch.setattr(assets, "resolve_file_write_context", fake_actor)
     monkeypatch.setattr(assets, "get_pool", fake_get_pool)
+    monkeypatch.setattr(
+        assets.vault_files_repo,
+        "find_owned_attachment_for_discard",
+        fake_state,
+    )
     monkeypatch.setattr(
         assets.vault_files_repo,
         "delete_unclaimed_attachment",
@@ -792,6 +921,7 @@ async def test_discard_route_deletes_only_through_transactional_outbox(
     assert response.status_code == 204
     assert calls == [
         ("tx_enter",),
+        ("state", vault_id, file_id, "alice"),
         ("delete", vault_id, file_id, "alice"),
         ("enqueue", "vault/.akb-assets/object"),
         ("tx_exit",),
@@ -922,6 +1052,121 @@ async def test_private_asset_lookup_carries_live_owner_and_revision_scope() -> N
     assert captured["args"] == (
         file_id, vault_id, "alice", "notes/weekly.md", "abcdef1",
     )
+
+
+@pytest.mark.asyncio
+async def test_private_preview_uses_the_delegated_upload_actor(monkeypatch) -> None:
+    from app.api.routes import assets
+
+    file_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    captured: dict = {}
+
+    class _Acquire:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_access(*_args, **_kwargs):
+        return {"vault_id": vault_id}
+
+    async def fake_actor(request, vault, user):
+        assert vault == "team"
+        return "delegated-human"
+
+    actors: list[str] = []
+
+    async def fake_find(_conn, **kwargs):
+        actors.append(kwargs["created_by"])
+        captured.update(kwargs)
+        if kwargs["created_by"] == "service":
+            return None
+        return {"id": file_id, "s3_key": "key", "size_bytes": 1}
+
+    async def fake_response(row):
+        return row
+
+    async def fake_pool():
+        return _Pool()
+
+    monkeypatch.setattr(assets, "check_vault_access", fake_access)
+    monkeypatch.setattr(assets, "resolve_file_read_actor", fake_actor)
+    monkeypatch.setattr(assets, "get_pool", fake_pool)
+    monkeypatch.setattr(assets.vault_files_repo, "find_authorized_attachment", fake_find)
+    monkeypatch.setattr(assets, "image_asset_response", fake_response)
+
+    request = SimpleNamespace(headers={"x-akb-delegated-authorization": "Bearer session"})
+    result = await assets.read_document_image(
+        request,
+        str(file_id),
+        vault="team",
+        document=None,
+        commit=None,
+        user=SimpleNamespace(user_id="service", username="service"),
+    )
+
+    assert result["id"] == file_id
+    assert captured["created_by"] == "delegated-human"
+    assert actors == ["service", "delegated-human"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_private_image_does_not_require_delegated_writer(monkeypatch) -> None:
+    """A delegated header must not downgrade an ordinary reader path."""
+    from app.api.routes import assets
+
+    file_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def fake_access(*_args, **_kwargs):
+        return {"vault_id": vault_id}
+
+    async def unexpected_actor(*_args):
+        raise AssertionError("a claimed image must not require writer delegation")
+
+    async def fake_find(_conn, **kwargs):
+        assert kwargs["created_by"] == "reader-service"
+        return {"id": file_id, "s3_key": "key", "size_bytes": 1}
+
+    async def fake_response(row):
+        return row
+
+    async def fake_pool():
+        return _Pool()
+
+    monkeypatch.setattr(assets, "check_vault_access", fake_access)
+    monkeypatch.setattr(assets, "resolve_file_read_actor", unexpected_actor)
+    monkeypatch.setattr(assets, "get_pool", fake_pool)
+    monkeypatch.setattr(assets.vault_files_repo, "find_authorized_attachment", fake_find)
+    monkeypatch.setattr(assets, "image_asset_response", fake_response)
+
+    result = await assets.read_document_image(
+        SimpleNamespace(headers={"x-akb-delegated-authorization": "Bearer session"}),
+        str(file_id),
+        vault="team",
+        document=None,
+        commit=None,
+        user=SimpleNamespace(user_id="service", username="reader-service"),
+    )
+
+    assert result["id"] == file_id
 
 
 @pytest.mark.asyncio

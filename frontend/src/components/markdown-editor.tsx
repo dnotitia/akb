@@ -599,8 +599,8 @@ export interface MarkdownEditorProps {
   /** Initial markdown body. Component is uncontrolled after mount — change
    * the `key` prop on the parent to remount with a new initial value. */
   value: string;
-  /** Called with the serialized markdown on every edit. */
-  onChange?: (markdown: string) => void;
+  /** Called with the serialized Markdown and its canonical image-node ids. */
+  onChange?: (markdown: string, assetIds: readonly string[]) => void;
   placeholder?: string;
   autoFocus?: boolean;
   readOnly?: boolean;
@@ -620,8 +620,8 @@ export interface MarkdownEditorProps {
   /** Keep uploaded assets for an in-flight document save to claim. The server
    * GC remains the fallback when the save ultimately fails after navigation. */
   preserveUploadsOnUnmount?: boolean;
-  /** The owning document write completed and now owns every referenced upload. */
-  uploadsClaimed?: boolean;
+  /** Image-node ids from the exact editor snapshot accepted by the server. */
+  claimedAssetIds?: readonly string[] | null;
 }
 
 export function MarkdownEditor({
@@ -639,7 +639,7 @@ export function MarkdownEditor({
   commit,
   onUploadingChange,
   preserveUploadsOnUnmount = false,
-  uploadsClaimed = false,
+  claimedAssetIds = null,
 }: MarkdownEditorProps) {
   const [uploadingImage, setUploadingImage] = React.useState(false);
   const [uploadingName, setUploadingName] = React.useState("");
@@ -653,24 +653,36 @@ export function MarkdownEditor({
   const uploadInFlightRef = React.useRef(false);
   const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set<string>());
+  const discardingAssetIdsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(true);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
   const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
-  const uploadsClaimedRef = React.useRef(uploadsClaimed);
-  uploadsClaimedRef.current = uploadsClaimed;
+
+  const discardUnclaimedAsset = React.useCallback(
+    (assetId: string) => {
+      if (
+        !unclaimedAssetIdsRef.current.has(assetId) ||
+        discardingAssetIdsRef.current.has(assetId)
+      ) return;
+      discardingAssetIdsRef.current.add(assetId);
+      void discardAsset(vault, assetId)
+        .then(() => unclaimedAssetIdsRef.current.delete(assetId))
+        .catch(() => {
+          // Retain the id for a later unmount retry. Server-side TTL cleanup is
+          // the final backstop for an abrupt browser termination.
+        })
+        .finally(() => discardingAssetIdsRef.current.delete(assetId));
+    },
+    [vault],
+  );
 
   const discardIfUnclaimed = React.useCallback(
     (url: string | undefined) => {
       const assetId = assetIdFromUrl(url);
       if (!assetId || !unclaimedAssetIdsRef.current.has(assetId)) return;
-      void discardAsset(vault, assetId)
-        .then(() => unclaimedAssetIdsRef.current.delete(assetId))
-        .catch(() => {
-          // Retain the id for the unmount retry. A future server-side TTL
-          // sweep remains the final backstop for abrupt browser termination.
-        });
+      discardUnclaimedAsset(assetId);
     },
-    [vault],
+    [discardUnclaimedAsset],
   );
 
   React.useEffect(() => {
@@ -681,10 +693,6 @@ export function MarkdownEditor({
     preserveUploadsOnUnmountRef.current = preserveUploadsOnUnmount;
   }, [preserveUploadsOnUnmount]);
 
-  React.useLayoutEffect(() => {
-    if (uploadsClaimed) unclaimedAssetIdsRef.current.clear();
-  }, [uploadsClaimed]);
-
   React.useEffect(() => {
     // React StrictMode replays effects in development; reset the guard on the
     // second setup so completed uploads can still update their local status.
@@ -693,16 +701,14 @@ export function MarkdownEditor({
     return () => {
       mountedRef.current = false;
       uploadControllerRef.current?.abort();
-      if (!preserveUploadsOnUnmountRef.current && !uploadsClaimedRef.current) {
+      if (!preserveUploadsOnUnmountRef.current) {
         for (const assetId of unclaimedAssetIds) {
-          void discardAsset(vault, assetId)
-            .then(() => unclaimedAssetIds.delete(assetId))
-            .catch(() => undefined);
+          discardUnclaimedAsset(assetId);
         }
       }
       onUploadingChangeRef.current?.(false);
     };
-  }, [vault]);
+  }, [discardUnclaimedAsset]);
 
   const editor = usePlateEditor({
     plugins,
@@ -720,6 +726,18 @@ export function MarkdownEditor({
       }
     },
   });
+
+  React.useLayoutEffect(() => {
+    if (claimedAssetIds === null) return;
+    const accepted = new Set(claimedAssetIds);
+    for (const assetId of unclaimedAssetIdsRef.current) {
+      if (accepted.has(assetId)) {
+        unclaimedAssetIdsRef.current.delete(assetId);
+      } else {
+        discardUnclaimedAsset(assetId);
+      }
+    }
+  }, [claimedAssetIds, discardUnclaimedAsset]);
 
   const uploadImages = React.useCallback(
     async (files: File[], insertionRange = editor.selection) => {
@@ -847,7 +865,24 @@ export function MarkdownEditor({
           // (single-digit KB markdown), this is well under a millisecond. Move
           // to a debounce only if profiling shows the cost.
           const md = ed.getApi(MarkdownPlugin).markdown.serialize();
-          onChange(md);
+          const assetIds: string[] = [];
+          const visit = (nodes: unknown[]) => {
+            for (const node of nodes) {
+              if (!node || typeof node !== "object") continue;
+              const element = node as {
+                type?: string;
+                url?: string;
+                children?: unknown[];
+              };
+              if (element.type === ImagePlugin.key) {
+                const assetId = assetIdFromUrl(element.url);
+                if (assetId) assetIds.push(assetId);
+              }
+              if (Array.isArray(element.children)) visit(element.children);
+            }
+          };
+          visit(ed.children);
+          onChange(md, assetIds);
         }}
       >
       {!readOnly && (
@@ -915,14 +950,14 @@ export function MarkdownEditor({
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledby}
         aria-required={required || undefined}
-        onPaste={(event) => {
+        onPasteCapture={(event) => {
           if (readOnly) return;
           const files = transferredImages(event.clipboardData);
           if (files.length === 0) return;
-          const carriesDocumentContent = ["text/plain", "text/html"].some(
-            (type) => event.clipboardData.getData(type).trim().length > 0,
-          );
-          if (carriesDocumentContent) return;
+          // Browser "Copy image" clipboards commonly include an <img> HTML
+          // flavor beside the binary file. The file is the authoritative
+          // signal; allowing the default paste here would insert only the
+          // remote HTML/source URL and skip AKB's upload validation.
           event.preventDefault();
           if (uploadInFlightRef.current) {
             deferredImageFilesRef.current.push(...files);

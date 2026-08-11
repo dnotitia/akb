@@ -151,6 +151,81 @@ async def test_inv5_bm25_recompute_lock(pool, vault):
     assert len(skipped) == N - 1, f"expected {N-1} skipped, got {len(skipped)}"
 
 
+@pytest.mark.asyncio
+async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
+    """A manifest write finishes while a concurrent vault lifecycle lock waits.
+
+    The writer takes vault -> document -> asset, matching deletion. The retained
+    manifest has no second direct FK to vaults; its composite asset FK already
+    owns that lifecycle and avoids reacquiring the parent after child locks.
+    """
+    document_id = uuid.uuid4()
+    asset_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO documents (id, vault_id, path, title, doc_type, status, "
+            "created_at, updated_at, current_commit, tags, metadata) VALUES "
+            "($1, $2, 'image-lock.md', 'image lock', 'note', 'draft', NOW(), NOW(), "
+            "'abcdef1', '{}'::text[], '{}'::jsonb)",
+            document_id, vault["id"],
+        )
+        await conn.execute(
+            "INSERT INTO vault_files (id, vault_id, kind, upload_state, name, s3_key, "
+            "mime_type, size_bytes, content_hash, hash_algorithm, hash_verified_at, "
+            "created_by, attachment_claimed_at) VALUES "
+            "($1, $2, 'attachment', 'confirmed', 'image.png', $3, 'image/png', 1, "
+            "$4, 'sha256', NOW(), 'tester', NOW())",
+            asset_id, vault["id"], f"{vault['name']}/.akb-assets/{asset_id}/image.png",
+            "0" * 64,
+        )
+
+        direct_parent_fks = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM pg_constraint
+             WHERE conrelid = 'document_asset_revision_refs'::regclass
+               AND confrelid = 'vaults'::regclass
+               AND contype = 'f'
+            """
+        )
+        assert direct_parent_fks == 0
+
+    async with pool.acquire() as writer, pool.acquire() as lifecycle:
+        writer_tx = writer.transaction()
+        await writer_tx.start()
+        await writer.fetchval(
+            "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE", vault["id"],
+        )
+        await writer.fetchval(
+            "SELECT id FROM documents WHERE id = $1 FOR UPDATE", document_id,
+        )
+        await writer.fetchval(
+            "SELECT id FROM vault_files WHERE id = $1 FOR UPDATE", asset_id,
+        )
+
+        async def lock_vault_then_children() -> None:
+            async with lifecycle.transaction():
+                await lifecycle.fetchval(
+                    "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault["id"],
+                )
+                await lifecycle.fetchval(
+                    "SELECT id FROM vault_files WHERE id = $1 FOR UPDATE", asset_id,
+                )
+
+        lifecycle_task = asyncio.create_task(lock_vault_then_children())
+        await asyncio.sleep(0.05)
+        assert not lifecycle_task.done()
+
+        await writer.execute(
+            "INSERT INTO document_asset_revision_refs "
+            "(vault_id, document_path, commit_hash, asset_id, retain_until) "
+            "VALUES ($1, 'image-lock.md', 'abcdef1', $2, NOW() + INTERVAL '1 day')",
+            vault["id"], asset_id,
+        )
+        await writer_tx.commit()
+        await asyncio.wait_for(lifecycle_task, timeout=2)
+
+
 # ── INV-6: metadata_worker stale guard via expected_blob ───────────
 
 

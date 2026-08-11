@@ -58,11 +58,12 @@ export default function DocumentNewPage() {
   const [summary, setSummary] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [body, setBody] = useState("");
+  const [bodyAssetIds, setBodyAssetIds] = useState<readonly string[]>([]);
   const [error, setError] = useState("");
   const [invalidField, setInvalidField] = useState<"title" | "collection" | "body" | null>(null);
   const [creating, setCreating] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
-  const [uploadsClaimed, setUploadsClaimed] = useState(false);
+  const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [discardOpen, setDiscardOpen] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
@@ -155,6 +156,7 @@ export default function DocumentNewPage() {
     }
     if (!body.trim()) return fail("body", "Body cannot be empty.");
     if (body.length > 1_000_000) return fail("body", "Body is too large (1 MB max).");
+    const assetIdsToClaim = bodyAssetIds;
     setCreating(true);
     try {
       const result = await putDocument({
@@ -176,7 +178,7 @@ export default function DocumentNewPage() {
       // saved body did not claim.
       flushSync(() => {
         setCreating(false);
-        setUploadsClaimed(true);
+        setClaimedAssetIds(assetIdsToClaim);
       });
       const path = result?.path;
       if (path) {
@@ -385,20 +387,22 @@ export default function DocumentNewPage() {
           <Suspense fallback={<MarkdownEditorFallback />}>
             <MarkdownEditor
               value=""
-              onChange={(md) => {
+              onChange={(md, assetIds) => {
                 setBody(md);
+                setBodyAssetIds(assetIds);
                 if (invalidField === "body") setInvalidField(null);
               }}
               placeholder="Write the document body in markdown."
               ariaLabelledby="doc-body-label"
               required
+              readOnly={creating}
               vault={name!}
               onUploadingChange={(uploading) => {
                 setUploadingImage(uploading);
-                if (uploading) setUploadsClaimed(false);
+                if (uploading) setClaimedAssetIds(null);
               }}
               preserveUploadsOnUnmount={creating}
-              uploadsClaimed={uploadsClaimed}
+              claimedAssetIds={claimedAssetIds}
             />
           </Suspense>
         </div>

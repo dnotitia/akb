@@ -365,6 +365,11 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":
+        if self.publication_view_grant_session_secs < self.publication_view_grant_ttl_secs:
+            raise ValueError(
+                "publication_view_grant_session_secs must be >= "
+                "publication_view_grant_ttl_secs"
+            )
         if self.document_revision_backend == "native_ledger_m1":
             if not self.native_revision_m1_measurement_only:
                 raise ValueError(
@@ -707,6 +712,10 @@ class Settings(BaseModel):
     # paint. Keep this capability short-lived: it is carried by subordinate
     # URLs and suppresses repeat view counting for the same page open.
     publication_view_grant_ttl_secs: int = Field(default=600, ge=60, le=3600)
+    # An expired per-request grant may be rotated without spending another
+    # view, but only inside this fixed page-session window. Rotation preserves
+    # the original issue time, so it cannot extend the capability indefinitely.
+    publication_view_grant_session_secs: int = Field(default=3600, ge=600, le=3600)
 
     # Vector store (hybrid dense + BM25). Driver-pluggable.
     #

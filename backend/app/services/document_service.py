@@ -405,6 +405,17 @@ class DocumentService:
             pool = await get_pool()
             async with pool.acquire() as lock_conn:
                 async with lock_conn.transaction():
+                    # Canonical lifecycle order is vault -> document -> asset.
+                    # Taking the parent lock before any path/document/attachment
+                    # row prevents vault deletion (which locks the parent and
+                    # then cascades children) from deadlocking an image-bearing
+                    # document write in the opposite order.
+                    vault_exists = await lock_conn.fetchval(
+                        "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
+                        vault_id,
+                    )
+                    if vault_exists is None:
+                        raise NotFoundError("Vault", vault_name)
                     await acquire_path_lock(lock_conn, vault_id, file_path)
                     yield lock_conn
 
@@ -417,6 +428,12 @@ class DocumentService:
             pool = await get_pool()
             async with pool.acquire() as lock_conn:
                 async with lock_conn.transaction():
+                    vault_exists = await lock_conn.fetchval(
+                        "SELECT id FROM vaults WHERE id = $1 FOR KEY SHARE",
+                        vault_id,
+                    )
+                    if vault_exists is None:
+                        raise NotFoundError("Vault", vault_name)
                     for p in sorted({path_a, path_b}):
                         await acquire_path_lock(lock_conn, vault_id, p)
                     yield lock_conn
@@ -481,7 +498,13 @@ class DocumentService:
 
     # ── Put ───────────────────────────────────────────────────
 
-    async def put(self, req: DocumentPutRequest, agent_id: str | None = None) -> DocumentPutResponse:
+    async def put(
+        self,
+        req: DocumentPutRequest,
+        agent_id: str | None = None,
+        *,
+        allow_unavailable_asset_refs: bool = False,
+    ) -> DocumentPutResponse:
         if req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -513,11 +536,13 @@ class DocumentService:
                 explicit_slug=bool(req.slug), now=now,
                 normalized_collection=normalized_collection,
                 doc_repo=doc_repo, coll_repo=coll_repo, conn=conn,
+                allow_unavailable_asset_refs=allow_unavailable_asset_refs,
             )
 
     async def _put_locked(
         self, *, req, agent_id, vault_id, doc_id, base_path, base_slug,
         explicit_slug, now, normalized_collection, doc_repo, coll_repo, conn,
+        allow_unavailable_asset_refs=False,
     ) -> DocumentPutResponse:
         # Resolve the final path under the (vault, base_path) advisory lock,
         # which serializes writers racing on the same base slug. If the clean
@@ -575,7 +600,10 @@ class DocumentService:
         # every AKB asset URL it introduces must still be a confirmed attachment
         # in this vault. The row locks serialize a concurrent editor discard.
         asset_ids = await asset_service.claim_document_assets(
-            conn, vault_id=vault_id, markdown=req.content,
+            conn,
+            vault_id=vault_id,
+            markdown=req.content,
+            strict=not allow_unavailable_asset_refs,
         )
 
         # Git commit

@@ -105,26 +105,56 @@ def _verify_token(slug: str, token: str) -> bool:
 # ============================================================
 
 
-def _make_view_grant(slug: str) -> str:
-    ts = str(int(time.time()))
-    msg = f"grant:{slug}:{ts}".encode("utf-8")
+def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
+    now = int(time.time())
+    issued = now if issued_at is None else issued_at
+    expires = min(
+        now + settings.publication_view_grant_ttl_secs,
+        issued + settings.publication_view_grant_session_secs,
+    )
+    msg = f"grant:{slug}:{issued}:{expires}".encode("utf-8")
     sig = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return f"{ts}.{sig}"
+    return f"{issued}.{expires}.{sig}"
+
+
+def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
+    if not grant:
+        return None
+    try:
+        issued_str, expires_str, sig = grant.split(".", 2)
+        issued = int(issued_str)
+        expires = int(expires_str)
+    except (ValueError, AttributeError):
+        return None
+    if expires < issued:
+        return None
+    if expires > issued + settings.publication_view_grant_session_secs:
+        return None
+    msg = f"grant:{slug}:{issued_str}:{expires_str}".encode("utf-8")
+    expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    return issued, expires
 
 
 def _verify_view_grant(slug: str, grant: str | None) -> bool:
-    if not grant:
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
         return False
-    try:
-        ts_str, sig = grant.split(".", 1)
-        ts = int(ts_str)
-    except (ValueError, AttributeError):
-        return False
-    if abs(time.time() - ts) > settings.publication_view_grant_ttl_secs:
-        return False
-    msg = f"grant:{slug}:{ts_str}".encode("utf-8")
-    expected = hmac.new(settings.jwt_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+    issued, expires = parsed
+    now = int(time.time())
+    return issued <= now + 30 and now <= expires
+
+
+def _renew_view_grant(slug: str, grant: str | None) -> str | None:
+    parsed = _parse_view_grant(slug, grant)
+    if parsed is None:
+        return None
+    issued, _expires = parsed
+    now = int(time.time())
+    if issued > now + 30 or now >= issued + settings.publication_view_grant_session_secs:
+        return None
+    return _make_view_grant(slug, issued_at=issued)
 
 
 def _extract_view_grant(request: Request) -> str | None:
@@ -542,6 +572,32 @@ async def publication_auth(slug: str, req: PasswordAuthRequest, request: Request
         vault=pub.get("vault"), outcome="ok", meta={"ip": ip},
     )
     return {"authorized": True, "token": _make_token(slug), "expires_in": _TOKEN_TTL}
+
+
+@router.post("/public/{slug}/grant", summary="Rotate a document view grant")
+async def renew_publication_view_grant(slug: str, request: Request):
+    """Rotate an expired subordinate-fetch grant inside one counted view.
+
+    The original issue time is retained, so repeated rotations cannot outlive
+    the bounded page session. Publication expiry/unpublish/password checks are
+    re-run, while the already-counted view is never charged again.
+    """
+    grant = _renew_view_grant(slug, _extract_view_grant(request))
+    if grant is None:
+        raise HTTPException(status_code=404, detail="Publication grant not found")
+    try:
+        await _resolve_with_access(
+            slug,
+            request,
+            increment_view=False,
+            enforce_view_cap=False,
+        )
+    except PublicationError as exc:
+        raise _publication_error_to_http(exc)
+    return {
+        "view_grant": grant,
+        "expires_in": settings.publication_view_grant_ttl_secs,
+    }
 
 
 @router.get("/public/{slug}/meta", summary="Get publication metadata (no content)")

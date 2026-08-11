@@ -1,6 +1,10 @@
-import { useEffect, useMemo, useState, type ImgHTMLAttributes } from "react";
+import { useEffect, useMemo, useRef, useState, type ImgHTMLAttributes } from "react";
 import { ImageOff, Loader2 } from "lucide-react";
-import { getAssetBlob, publicationAssetUrl } from "@/lib/api";
+import {
+  getAssetBlob,
+  publicationAssetUrl,
+  refreshPublicationViewGrant,
+} from "@/lib/api";
 import { assetIdFromUrl } from "@/lib/image-assets";
 import { cn, sanitizeLinkUrl } from "@/lib/utils";
 
@@ -72,6 +76,11 @@ export function AssetImage({
       : assetKey
     : src ?? null;
   const [imageErrorKey, setImageErrorKey] = useState<string | null>(null);
+  const [publicationRetry, setPublicationRetry] = useState<{
+    key: string;
+    url: string;
+  } | null>(null);
+  const publicationRefreshKeyRef = useRef<string | null>(null);
   const imageFailed = !!renderKey && imageErrorKey === renderKey;
   const isPrivateAsset = !!assetId && !!privateVault;
 
@@ -112,12 +121,14 @@ export function AssetImage({
         return currentLoadState?.blobUrl ?? null;
       }
       if (publicationSlug) {
-        return publicationAssetUrl(publicationSlug, assetId);
+        return publicationRetry?.key === renderKey
+          ? publicationRetry.url
+          : publicationAssetUrl(publicationSlug, assetId);
       }
       return null;
     }
     return src ? safeExternalImageUrl(src) : null;
-  }, [assetId, currentLoadState?.blobUrl, privateVault, publicationSlug, src]);
+  }, [assetId, currentLoadState?.blobUrl, privateVault, publicationRetry, publicationSlug, renderKey, src]);
 
   const frameClass = cn(
     "block my-4 rounded-[var(--radius-lg)] border border-border max-w-full h-auto",
@@ -166,6 +177,27 @@ export function AssetImage({
       referrerPolicy="no-referrer"
       className={frameClass}
       onError={(event) => {
+        if (assetId && publicationSlug && renderKey) {
+          if (publicationRefreshKeyRef.current !== renderKey) {
+            // Mark the refresh before starting it. The browser can report the
+            // same failed URL more than once, but only one grant rotation
+            // should be in flight for this rendered image.
+            publicationRefreshKeyRef.current = renderKey;
+            void refreshPublicationViewGrant(publicationSlug)
+              .then(() => {
+                setPublicationRetry({
+                  key: renderKey,
+                  url: publicationAssetUrl(publicationSlug, assetId),
+                });
+              })
+              .catch(() => setImageErrorKey(renderKey));
+            return;
+          }
+          // Ignore duplicate errors from the expired URL while its one grant
+          // refresh is unresolved. An error after the retry URL is installed
+          // is final and falls through to the unavailable state below.
+          if (publicationRetry?.key !== renderKey) return;
+        }
         setImageErrorKey(renderKey);
         onError?.(event);
       }}

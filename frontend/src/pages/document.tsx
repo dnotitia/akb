@@ -82,11 +82,12 @@ export default function DocumentPage() {
   // Plate manages its own state; we remount via `editorKey` when hydrating
   // a fresh server value rather than treating `value` as controlled.
   const [editingContent, setEditingContent] = useState("");
+  const [editingAssetIds, setEditingAssetIds] = useState<readonly string[]>([]);
   const [originalContent, setOriginalContent] = useState("");
   const [editorKey, setEditorKey] = useState(0);
   const [savingBody, setSavingBody] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
-  const [uploadsClaimed, setUploadsClaimed] = useState(false);
+  const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [bodyError, setBodyError] = useState("");
   const [savedAt, setSavedAt] = useState<number | null>(null);
   // Plate's markdown roundtrip is not byte-identity: adopt the first
@@ -173,7 +174,7 @@ export default function DocumentPage() {
     setRelationsError(false);
     setHistoryError(false);
     setBodyError("");
-    setUploadsClaimed(false);
+    setClaimedAssetIds(null);
     if (!d) return;
     const body = d.content || "";
     setOriginalContent(body);
@@ -213,10 +214,12 @@ export default function DocumentPage() {
 
   async function handleSaveBody() {
     if (!name || !docId || uploadingImage) return;
+    const contentToSave = editingContent;
+    const assetIdsToClaim = editingAssetIds;
     setSavingBody(true);
     setBodyError("");
     try {
-      const saved = await updateDocument(name, docId, { content: editingContent });
+      const saved = await updateDocument(name, docId, { content: contentToSave });
       const now = new Date().toISOString();
       // Optimistically advance content + updated_at so the byline reads
       // "last changed just now" without waiting for a refetch. DocumentView
@@ -224,7 +227,7 @@ export default function DocumentPage() {
       // a local page override alone leaves its Rendered tab stale.
       const nextDoc = {
         ...(doc || {}),
-        content: editingContent,
+        content: contentToSave,
         updated_at: now,
         current_commit: saved.current_commit ?? saved.commit_hash ?? doc?.current_commit,
       };
@@ -236,7 +239,7 @@ export default function DocumentPage() {
           ...nextDoc,
         }),
       );
-      setOriginalContent(editingContent);
+      setOriginalContent(contentToSave);
       // Sidebar refresh is best-effort — its failure must not leave the
       // user looking at a "still dirty" editor after a successful save.
       try {
@@ -254,7 +257,7 @@ export default function DocumentPage() {
         // atomically claimed referenced uploads. During the request this stays
         // true so navigation cleanup cannot discard assets being saved.
         setSavingBody(false);
-        setUploadsClaimed(true);
+        setClaimedAssetIds(assetIdsToClaim);
       });
       const p = new URLSearchParams(searchParams);
       p.delete("view");
@@ -574,7 +577,8 @@ export default function DocumentPage() {
                 <MarkdownEditor
                   key={editorKey}
                   value={originalContent}
-                  onChange={(md) => {
+                  onChange={(md, assetIds) => {
+                    setEditingAssetIds(assetIds);
                     if (hydratedKey.current !== editorKey) {
                       hydratedKey.current = editorKey;
                       setOriginalContent(md);
@@ -585,15 +589,16 @@ export default function DocumentPage() {
                   }}
                   ariaLabel="Document body (markdown)"
                   autoFocus
+                  readOnly={savingBody}
                   vault={name!}
                   document={doc?.path}
                   commit={doc?.current_commit ?? undefined}
                   onUploadingChange={(uploading) => {
                     setUploadingImage(uploading);
-                    if (uploading) setUploadsClaimed(false);
+                    if (uploading) setClaimedAssetIds(null);
                   }}
                   preserveUploadsOnUnmount={savingBody}
-                  uploadsClaimed={uploadsClaimed}
+                  claimedAssetIds={claimedAssetIds}
                 />
               </Suspense>
               {bodyError && <Alert variant="destructive">{bodyError}</Alert>}

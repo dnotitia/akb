@@ -11,7 +11,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from app.api.bounded_body import read_bounded_body
 from app.api.deps import get_current_user
-from app.api.file_write_context import resolve_file_write_context
+from app.api.file_write_context import resolve_file_read_actor, resolve_file_write_context
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ForbiddenError, NotFoundError
 from app.config import settings
@@ -26,8 +26,11 @@ from app.util.text import to_nfc
 router = APIRouter()
 stable_router = APIRouter()
 logger = logging.getLogger("akb.assets")
-_asset_body_slots = asyncio.Semaphore(8)
-_asset_transfer_slots = asyncio.Semaphore(4)
+# Per worker: at most 40 MiB of compressed request bodies and two Pillow/S3
+# pipelines. The service-layer cancellation settlement keeps the decode bound
+# valid after a disconnected request releases its coroutine.
+_asset_body_slots = asyncio.Semaphore(4)
+_asset_transfer_slots = asyncio.Semaphore(2)
 
 
 @router.post("/assets/{vault}", status_code=201, summary="Upload a document image")
@@ -50,7 +53,8 @@ async def upload_document_image(
     # Slow request bodies have a separate, bounded admission pool. They cannot
     # occupy the scarcer Pillow/S3 slots, and the deadline prevents a writer
     # from keeping a body slot forever with a trickle upload. Holding the body
-    # slot until transfer completion also caps resident upload buffers at 8.
+    # slot until transfer completion also caps resident upload buffers at four
+    # per worker.
     body_slot_acquired = False
     try:
         try:
@@ -127,17 +131,35 @@ async def image_asset_response(row: dict, *, public: bool = False) -> Response:
 
 @stable_router.get("/assets/{file_id}", response_class=Response, summary="Read a document image")
 async def read_document_image(
+    request: Request,
     file_id: str,
     vault: str = Query(..., min_length=1),
     document: str | None = Query(None, min_length=1, max_length=1024),
     commit: str | None = Query(None, min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$"),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    delegated_preview_fallback = False
     try:
         access = await check_vault_access(user.user_id, vault, required_role="reader")
-    except (ForbiddenError, NotFoundError) as exc:
-        # Normalize cross-vault failures before resolving the asset.
-        raise NotFoundError("Asset", file_id) from exc
+    except (ForbiddenError, NotFoundError):
+        # An action-limited service key can upload on behalf of a vault member
+        # without itself being a member. Re-run the shared delegated writer
+        # policy so that principal can preview its still-unclaimed upload.
+        try:
+            access, actor_id, _delegated_actor = await resolve_file_write_context(
+                request, vault, user,
+            )
+        except (ForbiddenError, NotFoundError) as write_exc:
+            # Normalize cross-vault failures before resolving the asset.
+            raise NotFoundError("Asset", file_id) from write_exc
+    else:
+        # A live/historical document reference does not depend on uploader
+        # identity. Try that ordinary reader path first; only an unclaimed
+        # preview needs to authenticate the delegated human recorded at upload.
+        actor_id = user.username
+        delegated_preview_fallback = (
+            request.headers.get("x-akb-delegated-authorization") is not None
+        )
     try:
         fid = uuid.UUID(file_id)
     except (ValueError, AttributeError) as exc:
@@ -148,10 +170,24 @@ async def read_document_image(
             conn,
             vault_id=access["vault_id"],
             file_id=fid,
-            created_by=user.username,
+            created_by=actor_id,
             document_path=document,
             commit_prefix=commit,
         )
+    if row is None and delegated_preview_fallback:
+        try:
+            actor_id = await resolve_file_read_actor(request, vault, user)
+        except (ForbiddenError, NotFoundError) as actor_exc:
+            raise NotFoundError("Asset", file_id) from actor_exc
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_authorized_attachment(
+                conn,
+                vault_id=access["vault_id"],
+                file_id=fid,
+                created_by=actor_id,
+                document_path=document,
+                commit_prefix=commit,
+            )
     if row is None:
         raise NotFoundError("Asset", file_id)
     return await image_asset_response(row)
@@ -172,7 +208,8 @@ async def discard_document_image(
 
     Images already claimed by a document are intentionally retained: Git can
     still address older revisions after the current Markdown link is removed.
-    Missing, foreign, claimed, and other users' uploads share the same 404.
+    Repeating a completed cleanup is idempotent; a caller-owned upload that is
+    active or claimed returns a conflict instead of pretending it was removed.
     """
     access, actor_id, _delegated_actor = await resolve_file_write_context(
         request, vault, user,
@@ -185,6 +222,18 @@ async def discard_document_image(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            state = await vault_files_repo.find_owned_attachment_for_discard(
+                conn,
+                vault_id=access["vault_id"],
+                file_id=fid,
+                created_by=actor_id,
+            )
+            if state is None:
+                return Response(status_code=204)
+            if state["upload_state"] != "confirmed":
+                raise AKBError("Image upload is still being finalized", status_code=409)
+            if state["attachment_claimed_at"] is not None:
+                raise AKBError("Image is already retained by a document", status_code=409)
             row = await vault_files_repo.delete_unclaimed_attachment(
                 conn,
                 vault_id=access["vault_id"],
@@ -192,6 +241,6 @@ async def discard_document_image(
                 created_by=actor_id,
             )
             if row is None:
-                raise NotFoundError("Asset", file_id)
+                raise RuntimeError("locked unclaimed image changed during discard")
             await enqueue_delete(conn, row["s3_key"])
     return Response(status_code=204)

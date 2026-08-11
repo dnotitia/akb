@@ -1542,9 +1542,11 @@ The upload result contains:
 
 The backend accepts PNG, JPEG, GIF, and WebP up to 10 MiB and verifies the
 decoded content before storing it. A document write atomically claims every
-available same-vault image for Git revision history. An unavailable, expired,
-or cross-vault asset URL does not abort an otherwise valid document write; it
-renders as an unavailable placeholder. Always use the exact `markdown`
+available same-vault image for Git revision history. A new unavailable,
+expired, or cross-vault asset URL is rejected by `akb_put`, `akb_update`, and
+`akb_edit`; upload it to the same vault first. Existing broken references from
+an imported or previously stored document remain as unavailable placeholders
+so unrelated edits are still possible. Always use the exact `markdown`
 returned by `akb_put_image` rather than constructing an asset URL.
 
 If the document write fails or is abandoned, clean up the uncommitted upload:

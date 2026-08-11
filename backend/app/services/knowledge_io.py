@@ -145,7 +145,16 @@ async def import_bundle(
             domain=rec.get("domain"),
         )
         try:
-            resp = await doc_service.put(req, agent_id=actor_id)
+            # Bundle-local asset UUIDs are capabilities of the source vault and
+            # cannot be transferred by a text-only OKF archive. Preserve those
+            # Markdown references as fail-closed placeholders instead of
+            # omitting the entire document. Ordinary interactive/MCP creates
+            # remain strict and reject a newly introduced unavailable asset.
+            resp = await doc_service.put(
+                req,
+                agent_id=actor_id,
+                allow_unavailable_asset_refs=True,
+            )
             created.append(resp.uri)
         except ConflictError:
             skipped.append(rec["path"])

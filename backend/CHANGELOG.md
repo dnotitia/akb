@@ -28,10 +28,12 @@ and transactionally queues associated object deletion. The retention windows
 and GC cadence are configurable.
 
 Image validation fully decodes bounded frames on a worker thread rather than
-the API event loop. Upload metadata and cleanup state are recorded before object
-transfer, and cancellation completes the transfer outcome before scheduling
-cleanup. Valid CommonMark image nodes, including titled and reference-style
-forms, share one parser-backed reachability path. Expired revision manifests
+the API event loop. Per-worker admission bounds compressed request bodies and
+decoder concurrency, including after request cancellation. Upload metadata and
+cleanup state are recorded before object transfer, and cancellation completes
+the transfer outcome before scheduling cleanup. Valid CommonMark image nodes,
+including titled and reference-style forms, share one parser-backed
+reachability path. Expired revision manifests
 are removed in indexed batches, and verified image bodies stream through the
 API after a bounded metadata check instead of being fully buffered per request.
 
@@ -56,7 +58,14 @@ by default) and never increment publication views themselves, so a page
 containing multiple images consumes exactly one view-cap entry. The grant never
 replaces publication access: password-protected image requests must also carry
 the one-hour password token and continue to revalidate the exact published
-section before storage is touched.
+section before storage is touched. Lazy images can rotate an expired grant
+inside a fixed one-hour page session without spending another view; rotation
+preserves the original issue time and cannot extend that session indefinitely.
+
+Text-only OKF imports preserve source-vault image references as fail-closed
+placeholders rather than omitting the containing document. Interactive and MCP
+creates remain strict. Integrity repair is restricted to already-confirmed
+standalone Files and cannot perform an upload state transition.
 
 Pinned public-document image manifests cache only their bounded attachment UUID
 sets rather than retaining complete Markdown bodies. Existing imported

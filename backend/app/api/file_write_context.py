@@ -36,3 +36,23 @@ async def resolve_file_write_context(
         "service_user_id": delegated_actor.service_user_id,
         "service_token_id": delegated_actor.service_token_id,
     }
+
+
+async def resolve_file_read_actor(
+    request: Request,
+    vault: str,
+    user: AuthenticatedUser,
+) -> str:
+    """Resolve the uploader identity used by an unclaimed-image preview.
+
+    Normal readers use their own username. An action-limited service request
+    that forwards a delegated user session must be matched to the same human
+    identity recorded by the upload route; claimed document images remain
+    authorized independently through their document references.
+    """
+    if request.headers.get("x-akb-delegated-authorization") is None:
+        return user.username
+    _access, actor_id, _delegated_actor = await resolve_file_write_context(
+        request, vault, user,
+    )
+    return actor_id

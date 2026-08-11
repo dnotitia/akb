@@ -130,7 +130,7 @@ async def repair_resource_hashes(
                         chunks=file_service.s3_adapter.iter_chunks(row["s3_key"]),
                         head=head,
                     )
-                    await vault_files_repo.update_confirmed_metadata(
+                    repaired = await vault_files_repo.repair_confirmed_file_metadata(
                         conn,
                         row["id"],
                         size_bytes=file_projection["size_bytes"],
@@ -139,6 +139,8 @@ async def repair_resource_hashes(
                         etag=file_projection["etag"],
                         storage_version=file_projection["storage_version"],
                     )
+                    if not repaired:
+                        raise RuntimeError("confirmed file changed during integrity repair")
                     report.files_repaired += 1
                 except Exception as error:  # noqa: BLE001
                     report.errors.append(f"file {row['vault_name']}/{row['id']}: {error}")
@@ -177,6 +179,8 @@ async def _file_repair_rows(conn, *, vault: str | None, limit: int) -> list[dict
           FROM vault_files vf
           JOIN vaults v ON v.id = vf.vault_id
          WHERE ($1::text IS NULL OR v.name = $1)
+           AND vf.kind = 'file'
+           AND vf.upload_state = 'confirmed'
            AND (
                 vf.content_hash IS NULL
              OR vf.hash_algorithm IS DISTINCT FROM $2

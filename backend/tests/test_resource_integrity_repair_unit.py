@@ -32,8 +32,10 @@ class _Conn:
         self.document_rows = document_rows
         self.file_rows = file_rows
         self.executions: list[tuple[str, tuple]] = []
+        self.fetches: list[tuple[str, tuple]] = []
 
     async def fetch(self, sql: str, *args):
+        self.fetches.append((sql, args))
         if "FROM documents" in sql:
             return self.document_rows
         if "FROM vault_files" in sql:
@@ -132,15 +134,16 @@ async def test_repair_resource_hashes_backfills_documents_and_files(monkeypatch)
     async def fake_get_pool():
         return _Pool(conn)
 
-    async def fake_update_confirmed_metadata(conn_arg, row_id, **metadata):
+    async def fake_repair_confirmed_file_metadata(conn_arg, row_id, **metadata):
         file_updates.append((conn_arg, row_id, metadata))
+        return True
 
     monkeypatch.setattr(resource_integrity, "get_pool", fake_get_pool)
     monkeypatch.setattr(resource_integrity.file_service, "s3_adapter", s3)
     monkeypatch.setattr(
         resource_integrity.vault_files_repo,
-        "update_confirmed_metadata",
-        fake_update_confirmed_metadata,
+        "repair_confirmed_file_metadata",
+        fake_repair_confirmed_file_metadata,
     )
 
     report = await resource_integrity.repair_resource_hashes(
@@ -159,6 +162,9 @@ async def test_repair_resource_hashes_backfills_documents_and_files(monkeypatch)
     assert git.reads == [("repair-vault", "notes/doc.md", "c" * 40)]
     assert s3.heads == ["repair-vault/files/blob.bin"]
     assert s3.reads == ["repair-vault/files/blob.bin"]
+    file_query = next(sql for sql, _args in conn.fetches if "FROM vault_files" in sql)
+    assert "vf.kind = 'file'" in file_query
+    assert "vf.upload_state = 'confirmed'" in file_query
 
     _, doc_args = conn.executions[0]
     assert doc_args == (

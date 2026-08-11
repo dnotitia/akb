@@ -434,14 +434,16 @@ class FileService:
 
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await vault_files_repo.update_confirmed_metadata(
-                    conn, fid,
+                confirmed = await vault_files_repo.confirm_file_upload_metadata(
+                    conn, fid, vault_id,
                     size_bytes=size_bytes,
                     content_hash=server_content_hash,
                     hash_algorithm=HASH_ALGORITHM,
                     etag=etag,
                     storage_version=storage_version,
                 )
+                if not confirmed:
+                    raise NotFoundError("File", file_id)
                 vault_row = await conn.fetchrow(
                     "SELECT name FROM vaults WHERE id = $1", vault_id,
                 )

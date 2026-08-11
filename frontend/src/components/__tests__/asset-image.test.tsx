@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AssetImage } from "@/components/asset-image";
 import { MarkdownRender } from "@/components/markdown-render";
 import { assetIdFromUrl } from "@/lib/image-assets";
@@ -7,6 +7,7 @@ import { assetIdFromUrl } from "@/lib/image-assets";
 const apiMocks = vi.hoisted(() => ({
   getAssetBlob: vi.fn(),
   publicationAssetUrl: vi.fn(),
+  refreshPublicationViewGrant: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => apiMocks);
@@ -21,6 +22,7 @@ describe("AssetImage", () => {
   beforeEach(() => {
     apiMocks.getAssetBlob.mockReset();
     apiMocks.publicationAssetUrl.mockReset();
+    apiMocks.refreshPublicationViewGrant.mockReset();
     createObjectURL.mockClear();
     revokeObjectURL.mockClear();
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
@@ -33,6 +35,7 @@ describe("AssetImage", () => {
 
   it("recognizes only canonical private asset URLs", () => {
     expect(assetIdFromUrl(ASSET_URL)).toBe(ASSET_ID);
+    expect(assetIdFromUrl(ASSET_URL.toUpperCase())).toBeNull();
     expect(assetIdFromUrl(`/api/assets/not-a-uuid`)).toBeNull();
     expect(assetIdFromUrl(`https://example.test/api/assets/${ASSET_ID}`)).toBeNull();
   });
@@ -156,6 +159,35 @@ describe("AssetImage", () => {
     );
     expect(apiMocks.publicationAssetUrl).toHaveBeenCalledWith("slug", ASSET_ID);
     expect(apiMocks.getAssetBlob).not.toHaveBeenCalled();
+  });
+
+  it("rotates an expired publication grant and retries the lazy image", async () => {
+    let finishRefresh: ((grant: string) => void) | undefined;
+    apiMocks.publicationAssetUrl
+      .mockReturnValueOnce("/api/v1/public/slug/assets/id?grant=expired")
+      .mockReturnValue("/api/v1/public/slug/assets/id?grant=renewed");
+    apiMocks.refreshPublicationViewGrant.mockImplementation(
+      () => new Promise<string>((resolve) => { finishRefresh = resolve; }),
+    );
+
+    render(
+      <AssetImage
+        src={ASSET_URL}
+        alt="Late diagram"
+        assetContext={{ mode: "publication", slug: "slug" }}
+      />,
+    );
+    const image = screen.getByRole("img", { name: "Late diagram" });
+    fireEvent.error(image);
+    fireEvent.error(image);
+
+    await waitFor(() => expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledTimes(1));
+    expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledWith("slug");
+    finishRefresh?.("renewed");
+    await waitFor(() => expect(screen.getByRole("img", { name: "Late diagram" })).toHaveAttribute(
+      "src",
+      "/api/v1/public/slug/assets/id?grant=renewed",
+    ));
   });
 
   it("does not refetch when a parent recreates an equivalent asset context", async () => {

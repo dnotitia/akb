@@ -8,6 +8,7 @@ const apiMocks = vi.hoisted(() => ({
   discardAsset: vi.fn(),
   getAssetBlob: vi.fn(),
   publicationAssetUrl: vi.fn(),
+  refreshPublicationViewGrant: vi.fn(),
   ApiError: class ApiError extends Error {
     status = 400;
   },
@@ -85,7 +86,12 @@ describe("MarkdownEditor image insertion", () => {
 
     await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledWith("team", file, expect.any(AbortSignal)));
     await waitFor(() =>
-      expect(onChange.mock.calls.some(([markdown]) => markdown.includes(`![diagram](/api/assets/${ASSET_ID})`))).toBe(true),
+      expect(onChange.mock.calls.some(
+        ([markdown, assetIds]) =>
+          markdown.includes(`![diagram](/api/assets/${ASSET_ID})`) &&
+          assetIds.length === 1 &&
+          assetIds[0] === ASSET_ID,
+      )).toBe(true),
     );
     expect(await screen.findByRole("img", { name: "diagram" })).toHaveAttribute(
       "src",
@@ -110,8 +116,10 @@ describe("MarkdownEditor image insertion", () => {
     await waitFor(() =>
       expect(
         onChange.mock.calls.some(
-          ([markdown]) =>
-            markdown.includes("Before deletion") && !markdown.includes(`/api/assets/${ASSET_ID}`),
+          ([markdown, assetIds]) =>
+            markdown.includes("Before deletion") &&
+            !markdown.includes(`/api/assets/${ASSET_ID}`) &&
+            assetIds.length === 0,
         ),
       ).toBe(true),
     );
@@ -219,7 +227,7 @@ describe("MarkdownEditor image insertion", () => {
         value="Draft"
         vault="team"
         onChange={vi.fn()}
-        uploadsClaimed
+        claimedAssetIds={[ASSET_ID]}
       />,
     );
     unmount();
@@ -323,21 +331,62 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.uploadAsset.mock.calls[1][1]).toBe(second);
   });
 
-  it("leaves mixed rich-text clipboard content to the normal paste path", () => {
+  it("uploads a copied image even when the clipboard also carries HTML", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "sheet.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
     const { container } = render(
       <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
     );
     const file = new File(["image"], "sheet.png", { type: "image/png" });
     const editor = container.querySelector('[contenteditable="true"]');
 
-    fireEvent.paste(editor!, {
-      clipboardData: {
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
         files: [file],
         getData: (type: string) =>
-          type === "text/html" ? "<table><tr><td>Copied cell</td></tr></table>" : "Copied cell",
+          type === "text/html" ? "<img src='copied.png'>" : "Copied image",
       },
     });
+    fireEvent(editor!, paste);
 
-    expect(apiMocks.uploadAsset).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMocks.uploadAsset).toHaveBeenCalledWith(
+      "team",
+      file,
+      expect.any(AbortSignal),
+    ));
+  });
+
+  it("discards an uploaded image omitted from the accepted markdown", async () => {
+    apiMocks.uploadAsset.mockResolvedValue({
+      id: ASSET_ID,
+      url: `/api/assets/${ASSET_ID}`,
+      name: "diagram.png",
+      mime_type: "image/png",
+      size_bytes: 5,
+    });
+    const { container, rerender } = render(
+      <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
+    );
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] },
+    });
+    await screen.findByRole("img", { name: "diagram" });
+
+    rerender(
+      <MarkdownEditor
+        value="Draft"
+        vault="team"
+        onChange={vi.fn()}
+        claimedAssetIds={[]}
+      />,
+    );
+
+    await waitFor(() => expect(apiMocks.discardAsset).toHaveBeenCalledWith("team", ASSET_ID));
   });
 });

@@ -142,6 +142,7 @@ document_asset_upload_body_timeout_secs: 60
 jwt_algorithm: HS256
 jwt_expire_hours: 24
 publication_view_grant_ttl_secs: 600
+publication_view_grant_session_secs: 3600
 
 # === App identity exchange ===
 # Short-lived app tokens never carry Vaults, installations, or capabilities;

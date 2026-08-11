@@ -206,7 +206,8 @@ def test_inline_image_guidance_is_safe_and_matches_bounded_lifecycle() -> None:
     assert "30 days by default" in discard_image
     assert "same vault" in images
     assert "cross-vault" in images
-    assert "unavailable placeholder" in images
+    assert "is rejected" in images
+    assert "unavailable placeholders" in images
 
     unsafe_example = 'akb_update(uri="akb://eng/coll/specs/doc/auth.md",\n  content="# Authentication'
     assert unsafe_example not in put_image

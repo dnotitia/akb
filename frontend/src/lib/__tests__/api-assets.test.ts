@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   discardAsset,
+  clearPrivateAssetCache,
   getAssetBlob,
   publicationAssetUrl,
   setPublicationToken,
@@ -27,6 +28,7 @@ describe("editor image asset API", () => {
     localStorage.clear();
     sessionStorage.clear();
     setToken("test-token");
+    clearPrivateAssetCache();
   });
 
   afterEach(() => {
@@ -70,7 +72,7 @@ describe("editor image asset API", () => {
     await expect(getAssetBlob(ASSET_ID, "team vault")).resolves.toEqual(blob);
     expect(fetchMock).toHaveBeenCalledWith(`/api/assets/${ASSET_ID}?vault=team+vault`, {
       headers: { Authorization: "Bearer test-token" },
-      signal: undefined,
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -90,9 +92,23 @@ describe("editor image asset API", () => {
       `/api/assets/${ASSET_ID}?vault=team&document=notes%2Fweekly.md&commit=abcdef123456`, // pragma: allowlist secret — synthetic Git commit
       {
         headers: { Authorization: "Bearer test-token" },
-        signal: undefined,
+        signal: expect.any(AbortSignal),
       },
     );
+  });
+
+  it("reuses bounded private image bytes within the same auth session", async () => {
+    const blob = new Blob(["cached image"], { type: "image/png" });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      blob: vi.fn().mockResolvedValue(blob),
+    } as unknown as Response);
+
+    await expect(getAssetBlob(ASSET_ID, "team")).resolves.toBe(blob);
+    await expect(getAssetBlob(ASSET_ID, "team")).resolves.toBe(blob);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("discards an uncommitted upload through the vault-scoped endpoint", async () => {

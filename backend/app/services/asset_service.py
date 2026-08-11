@@ -10,6 +10,7 @@ import re
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from markdown_it import MarkdownIt
 from PIL import Image, ImageSequence, UnidentifiedImageError
@@ -25,12 +26,17 @@ from app.services.s3_delete_worker import enqueue_delete
 
 ASSET_URL_PREFIX = "/api/assets/"
 IMAGE_ASSET_MAX_BYTES = 10 * 1024 * 1024
-IMAGE_ASSET_MAX_PIXELS = 40_000_000
-IMAGE_ASSET_MAX_DIMENSION = 16_384
-IMAGE_ASSET_MAX_FRAMES = 300
-IMAGE_ASSET_MAX_TOTAL_FRAME_PIXELS = 80_000_000
+# Decode limits are intentionally lower than Pillow's generic bomb threshold.
+# The API admits two decoders per worker, so a 12 MP RGBA frame keeps the
+# aggregate working set bounded while still accepting 4K and common camera
+# images. Animated formats are decoded one frame at a time, with a separate
+# total-work bound to prevent a small compressed body monopolising a worker.
+IMAGE_ASSET_MAX_PIXELS = 12_000_000
+IMAGE_ASSET_MAX_DIMENSION = 8_192
+IMAGE_ASSET_MAX_FRAMES = 200
+IMAGE_ASSET_MAX_TOTAL_FRAME_PIXELS = 48_000_000
 
-_ASSET_ID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
+_ASSET_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 _ASSET_URL_RE = re.compile(
     rf"^{re.escape(ASSET_URL_PREFIX)}(?P<id>{_ASSET_ID})/?$"
 )
@@ -136,7 +142,7 @@ async def extract_asset_ids_async(markdown: str) -> set[uuid.UUID]:
     return await asyncio.to_thread(extract_asset_ids, markdown)
 
 
-async def _settle_must_complete_task(task: asyncio.Task[None]) -> None:
+async def _settle_must_complete_task(task: asyncio.Task[Any]) -> None:
     """Wait for a shielded storage call even after its caller is cancelled.
 
     Cancelling ``asyncio.to_thread`` only abandons the await; it cannot stop an
@@ -310,7 +316,18 @@ async def create_image_asset(
     # off the asyncio event loop so a large animated upload cannot stall probes
     # and unrelated API requests. The route-level semaphore bounds concurrent
     # calls into this thread path.
-    actual_mime, width, height = await asyncio.to_thread(inspect_image, body)
+    # Cancelling ``to_thread`` does not stop Pillow. Shield and settle the real
+    # decoder task before returning so the route-level admission slot remains
+    # an actual concurrency bound even when clients disconnect repeatedly.
+    inspect_task = asyncio.create_task(
+        asyncio.to_thread(inspect_image, body),
+        name="document-image-inspect",
+    )
+    try:
+        actual_mime, width, height = await asyncio.shield(inspect_task)
+    except BaseException:
+        await _settle_must_complete_task(inspect_task)
+        raise
     claimed = declared_mime.split(";", 1)[0].strip().lower()
     if claimed not in _ALLOWED_MIMES or claimed != actual_mime:
         raise AKBError("Image content does not match its declared MIME type", status_code=415)

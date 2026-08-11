@@ -286,7 +286,13 @@ class NativeDocumentService(DocumentService):
         self,
         req: DocumentPutRequest,
         agent_id: str | None = None,
+        *,
+        allow_unavailable_asset_refs: bool = False,
     ) -> DocumentPutResponse:
+        # The measurement backend stores Markdown verbatim and does not expose
+        # the attachment subsystem. Accept the shared import policy argument so
+        # callers can use either revision backend through one interface.
+        del allow_unavailable_asset_refs
         if req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id = await self._vault_id(req.vault)

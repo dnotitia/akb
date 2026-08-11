@@ -10,11 +10,11 @@ Adds two proxy-local tools for agent-authored document images:
   expression. Agents place that expression at the intended position with
   `akb_put`, `akb_update`, or a targeted `akb_edit`.
 - **`akb_discard_image`** removes an upload that never reached a document
-  commit. Cleanup is idempotent: an already absent or already claimed image is
-  reported as complete, while the backend still retains claimed bytes under
-  the document lifecycle. AKB derives access from current document references
-  and retains removed or deleted references for a bounded Git-revision window
-  before GC.
+  commit. Repeating a completed cleanup is idempotent; an active or already
+  claimed image reports that no deletion occurred, while the backend retains
+  claimed bytes under the document lifecycle. AKB derives access from current
+  document references and retains removed or deleted references for a bounded
+  Git-revision window before GC.
 
 Document images are deliberately separate from `akb_put_file`: they stay out
 of File browse/search/publication surfaces, inherit the document/vault access

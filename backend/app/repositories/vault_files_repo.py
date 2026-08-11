@@ -391,9 +391,10 @@ async def claim_attachment_references(
     """Lock and claim valid attachment ids from a document body.
 
     In strict mode every id must be a confirmed attachment in ``vault_id``.
-    Document writers use non-strict mode so imports, expired drafts, and copied
-    Markdown preserve broken links without making them readable; valid local
-    assets still gain historical-revision retention.
+    Explicit import/mirror paths use non-strict mode so text-only archives can
+    preserve source-vault links without making them readable in the target;
+    ordinary creates stay strict. Valid local assets still gain historical-
+    revision retention.
     """
     if not file_ids:
         return set()
@@ -571,6 +572,34 @@ async def delete_unclaimed_attachment(
     return dict(row) if row else None
 
 
+async def find_owned_attachment_for_discard(
+    conn,
+    *,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+    created_by: str,
+) -> dict | None:
+    """Lock one caller-owned attachment so discard can be idempotent safely.
+
+    A missing/foreign id is deliberately indistinguishable. Claimed and active
+    uploads are returned only to their uploader, allowing the API to report
+    that no deletion occurred without exposing another user's asset state.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, s3_key, upload_state, attachment_claimed_at
+          FROM vault_files
+         WHERE id = $1
+           AND vault_id = $2
+           AND kind = 'attachment'
+           AND created_by = $3
+         FOR UPDATE
+        """,
+        file_id, vault_id, created_by,
+    )
+    return dict(row) if row else None
+
+
 async def delete_failed_pending_attachment(
     conn,
     *,
@@ -647,17 +676,18 @@ async def update_size(conn, file_id: uuid.UUID, size_bytes: int) -> None:
     )
 
 
-async def update_confirmed_metadata(
+async def confirm_file_upload_metadata(
     conn,
     file_id: uuid.UUID,
+    vault_id: uuid.UUID,
     *,
     size_bytes: int,
     content_hash: str,
     hash_algorithm: str,
     etag: str | None,
     storage_version: str | None,
-) -> None:
-    await conn.execute(
+) -> bool:
+    row = await conn.fetchrow(
         """
         UPDATE vault_files SET
             size_bytes = $1,
@@ -669,9 +699,51 @@ async def update_confirmed_metadata(
             hash_verified_at = NOW(),
             updated_at = NOW()
         WHERE id = $6
+          AND vault_id = $7
+          AND kind = 'file'
+          AND upload_state IN ('pending', 'confirmed')
+        RETURNING id
+        """,
+        size_bytes, content_hash, hash_algorithm, etag, storage_version, file_id,
+        vault_id,
+    )
+    return row is not None
+
+
+async def repair_confirmed_file_metadata(
+    conn,
+    file_id: uuid.UUID,
+    *,
+    size_bytes: int,
+    content_hash: str,
+    hash_algorithm: str,
+    etag: str | None,
+    storage_version: str | None,
+) -> bool:
+    """Backfill integrity metadata without performing an upload transition.
+
+    Operator repair may certify bytes belonging to an already-published legacy
+    File, but it must never turn a pending presigned upload into a readable
+    resource. Keeping repair and confirmation as distinct repository methods
+    makes that state boundary structural rather than caller convention.
+    """
+    row = await conn.fetchrow(
+        f"""
+        UPDATE vault_files SET
+            size_bytes = $1,
+            content_hash = $2,
+            hash_algorithm = $3,
+            etag = $4,
+            storage_version = $5,
+            hash_verified_at = COALESCE(hash_verified_at, NOW()),
+            updated_at = NOW()
+        WHERE id = $6
+          AND {confirmed_file_predicate("vault_files")}
+        RETURNING id
         """,
         size_bytes, content_hash, hash_algorithm, etag, storage_version, file_id,
     )
+    return row is not None
 
 
 async def delete(conn, file_id: uuid.UUID) -> None:

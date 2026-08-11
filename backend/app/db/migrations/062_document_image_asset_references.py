@@ -44,7 +44,7 @@ async def migrate(conn) -> None:
             ON document_asset_refs (asset_id, vault_id);
 
         CREATE TABLE IF NOT EXISTS document_asset_revision_refs (
-            vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+            vault_id UUID NOT NULL,
             document_path TEXT NOT NULL,
             commit_hash TEXT NOT NULL,
             asset_id UUID NOT NULL,

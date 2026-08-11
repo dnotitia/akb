@@ -2,10 +2,78 @@ const API_BASE = "/api/v1";
 
 let _token: string | null = null;
 
+const PRIVATE_ASSET_CACHE_MAX_ENTRIES = 32;
+const PRIVATE_ASSET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const privateAssetCache = new Map<string, Blob>();
+let privateAssetCacheBytes = 0;
+type AssetFlight = {
+  controller: AbortController;
+  promise: Promise<Blob>;
+  subscribers: number;
+  settled: boolean;
+};
+const privateAssetFlights = new Map<string, AssetFlight>();
+
+export function clearPrivateAssetCache() {
+  privateAssetCache.clear();
+  privateAssetCacheBytes = 0;
+  for (const flight of privateAssetFlights.values()) flight.controller.abort();
+  privateAssetFlights.clear();
+}
+
 export function setToken(t: string | null) {
+  if (_token !== t) clearPrivateAssetCache();
   _token = t;
   if (t) localStorage.setItem("akb_token", t);
   else localStorage.removeItem("akb_token");
+}
+
+function privateAssetCacheKey(
+  token: string,
+  fileId: string,
+  vault: string,
+  source?: { document: string; commit: string },
+) {
+  return [token, vault, source?.document ?? "live", source?.commit ?? "live", fileId].join("\u0000");
+}
+
+function readPrivateAssetCache(key: string): Blob | null {
+  const blob = privateAssetCache.get(key);
+  if (!blob) return null;
+  // Map insertion order is the LRU order.
+  privateAssetCache.delete(key);
+  privateAssetCache.set(key, blob);
+  return blob;
+}
+
+function writePrivateAssetCache(key: string, blob: Blob) {
+  if (blob.size > PRIVATE_ASSET_CACHE_MAX_BYTES) return;
+  const previous = privateAssetCache.get(key);
+  if (previous) privateAssetCacheBytes -= previous.size;
+  privateAssetCache.delete(key);
+  privateAssetCache.set(key, blob);
+  privateAssetCacheBytes += blob.size;
+  while (
+    privateAssetCache.size > PRIVATE_ASSET_CACHE_MAX_ENTRIES ||
+    privateAssetCacheBytes > PRIVATE_ASSET_CACHE_MAX_BYTES
+  ) {
+    const oldest = privateAssetCache.entries().next().value as [string, Blob] | undefined;
+    if (!oldest) break;
+    privateAssetCache.delete(oldest[0]);
+    privateAssetCacheBytes -= oldest[1].size;
+  }
+}
+
+function waitForAssetFlight(flight: AssetFlight, signal?: AbortSignal): Promise<Blob> {
+  if (!signal) return flight.promise;
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    flight.promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
 }
 
 export function getToken(): string | null {
@@ -370,17 +438,50 @@ export async function getAssetBlob(
   signal?: AbortSignal,
   source?: { document: string; commit: string },
 ): Promise<Blob> {
-  const params = new URLSearchParams({ vault });
-  if (source) {
-    params.set("document", source.document);
-    params.set("commit", source.commit);
+  const token = getToken();
+  const cacheKey = privateAssetCacheKey(token ?? "anonymous", fileId, vault, source);
+  const cached = readPrivateAssetCache(cacheKey);
+  if (cached) return cached;
+
+  let flight = privateAssetFlights.get(cacheKey);
+  if (!flight) {
+    const controller = new AbortController();
+    const entry: AssetFlight = {
+      controller,
+      subscribers: 0,
+      settled: false,
+      promise: Promise.resolve(new Blob()),
+    };
+    entry.promise = (async () => {
+      const params = new URLSearchParams({ vault });
+      if (source) {
+        params.set("document", source.document);
+        params.set("commit", source.commit);
+      }
+      const res = await authenticatedFetch(
+        `/api/assets/${encodeURIComponent(fileId)}?${params}`,
+        { signal: controller.signal },
+      );
+      if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
+      const blob = await res.blob();
+      writePrivateAssetCache(cacheKey, blob);
+      return blob;
+    })().finally(() => {
+      entry.settled = true;
+      if (privateAssetFlights.get(cacheKey) === entry) {
+        privateAssetFlights.delete(cacheKey);
+      }
+    });
+    flight = entry;
+    privateAssetFlights.set(cacheKey, flight);
   }
-  const res = await authenticatedFetch(
-    `/api/assets/${encodeURIComponent(fileId)}?${params}`,
-    { signal },
-  );
-  if (!res.ok) throw new Error(`Image unavailable (${res.status})`);
-  return res.blob();
+  flight.subscribers += 1;
+  try {
+    return await waitForAssetFlight(flight, signal);
+  } finally {
+    flight.subscribers -= 1;
+    if (!flight.settled && flight.subscribers === 0) flight.controller.abort();
+  }
 }
 
 /** Best-effort cleanup for an upload that never reached a document commit. */
@@ -390,10 +491,8 @@ export async function discardAsset(vault: string, fileId: string): Promise<void>
     { method: "DELETE", keepalive: true },
     { redirectOnUnauthorized: false },
   );
-  // Cleanup is idempotent from the editor's perspective. A 404 also covers an
-  // asset that a successful save already claimed and therefore retained.
-  if (res.ok || res.status === 404) return;
-  throw new Error(`Image cleanup failed (${res.status})`);
+  if (res.ok) return;
+  await throwJsonApiError(res);
 }
 
 // ── Browse ──
@@ -736,7 +835,12 @@ export function setViewGrant(slug: string, grant: string) {
   sessionStorage.setItem(publicationGrantKey(slug), grant);
 }
 
-async function fetchPublic(slug: string, path: string = "", params?: Record<string, string>): Promise<Response> {
+async function fetchPublic(
+  slug: string,
+  path: string = "",
+  params?: Record<string, string>,
+  init?: RequestInit,
+): Promise<Response> {
   const token = getPublicationToken(slug);
   const grant = getViewGrant(slug);
   const search = new URLSearchParams(params || {});
@@ -746,7 +850,7 @@ async function fetchPublic(slug: string, path: string = "", params?: Record<stri
   if (grant) search.set("grant", grant);
   const qs = search.toString();
   const suffix = qs ? `?${qs}` : "";
-  return fetch(`${API_BASE}/public/${slug}${path}${suffix}`);
+  return fetch(`${API_BASE}/public/${slug}${path}${suffix}`, init);
 }
 
 export async function getPublication(
@@ -779,6 +883,17 @@ export async function getPublicationMeta(slug: string): Promise<any> {
     throw { message: body.detail || body.error || res.statusText, status: res.status, password_required: body.password_required } as PublicationError;
   }
   return res.json();
+}
+
+/** Rotate a subordinate-fetch grant without spending another publication view. */
+export async function refreshPublicationViewGrant(slug: string): Promise<string> {
+  const res = await fetchPublic(slug, "/grant", {}, { method: "POST" });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.view_grant) {
+    throw new Error(body.detail || body.error || "Publication grant expired");
+  }
+  setViewGrant(slug, body.view_grant);
+  return body.view_grant;
 }
 
 export interface PublicationCapabilities {

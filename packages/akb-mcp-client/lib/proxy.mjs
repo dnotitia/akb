@@ -70,7 +70,7 @@ const DOCUMENT_IMAGE_MIMES = new Set([
   "image/gif",
   "image/webp",
 ]);
-const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
+const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/;
 
 function parseAssetUrl(url) {
   if (typeof url !== "string") throw new Error("image url must be a string");
@@ -732,17 +732,10 @@ export class AKBProxy {
     }
     if (!args.url) throw new Error("url required");
     const assetId = parseAssetUrl(args.url);
-    try {
-      await this._http(
-        "DELETE",
-        `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
-      );
-    } catch (error) {
-      // A successful document save claims the image, while another cleanup may
-      // already have removed an abandoned upload. Both make discard complete
-      // from the caller's perspective.
-      if (error?.statusCode !== 404) throw error;
-    }
+    await this._http(
+      "DELETE",
+      `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
+    );
     return {
       kind: "document_image",
       vault,

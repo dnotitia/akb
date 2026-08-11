@@ -242,6 +242,7 @@ async def _apply_migrations() -> None:
         "063_document_image_asset_gc_index.py",  # retain_until-first index for bounded expired-manifest collection
         "064_vault_file_upload_state.py",  # distinguish pending uploads from hashless legacy confirmed Files
         "065_vault_file_lifecycle_indexes.py",  # indexed attachment health counts + stale pending File collection
+        "066_document_asset_revision_lock_order.py",  # remove redundant vault FK so manifest writes keep vault→asset lock order
     ):
         if filename in applied:
             continue
