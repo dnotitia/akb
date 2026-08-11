@@ -359,14 +359,33 @@ class LegacyFixedRefShadowReader:
         expected_history = [
             (entry.legacy_git_oid, entry.path_at_revision, entry.committed_at) for entry in reversed(document.lineage)
         ]
-        observed_history = [
-            (
-                entry.get("legacy_git_oid"),
-                entry.get("path_at_revision"),
-                entry.get("committed_at"),
+        observed_history = []
+        seen: set[str] = set()
+        for entry in snapshot.history:
+            oid = entry.get("legacy_git_oid")
+            committed_at = entry.get("committed_at")
+            if (
+                not isinstance(oid, str)
+                or _OID_RE.fullmatch(oid) is None
+                or not isinstance(committed_at, datetime)
+            ):
+                raise ShadowReaderScopeError("legacy fixed-ref history is invalid")
+            if oid in seen:
+                continue
+            if oid != document.current_commit and committed_at < document.created_at:
+                continue
+            seen.add(oid)
+            observed_history.append(
+                (
+                    oid,
+                    (
+                        document.current_path
+                        if oid == document.current_commit
+                        else entry.get("path_at_revision")
+                    ),
+                    committed_at,
+                )
             )
-            for entry in snapshot.history
-        ]
         if observed_history != expected_history:
             raise ShadowReaderScopeError("legacy fixed-ref history differs from C9 inventory")
 

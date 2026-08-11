@@ -1093,6 +1093,54 @@ async def test_product_readers_are_scoped_and_read_only():
     assert len(native_service.calls) == 3
 
 
+async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary():
+    document = _document()
+    created_at = document.created_at.replace(microsecond=487_280)
+    current_at = created_at.replace(microsecond=0) + timedelta(seconds=1)
+    document = replace(
+        document,
+        created_at=created_at,
+        lineage=(
+            LegacyLineageEntry(
+                document.current_commit,
+                document.current_path,
+                current_at,
+            ),
+        ),
+        activity=replace(document.activity, committed_at=current_at),
+    )
+    git = _NoWriteGit(document)
+    raw = git.manual_fixed_ref_history(
+        "p2-manual",
+        _oid("f"),
+        document.current_path,
+        current_commit=document.current_commit,
+    )
+    raw["history"].append(
+        {
+            "legacy_git_oid": _oid("b"),
+            "path_at_revision": document.current_path,
+            # Git's second-resolution --since boundary can include this row,
+            # while the C9 inventory excludes it against precise created_at.
+            "committed_at": created_at.replace(microsecond=0),
+        }
+    )
+    git.snapshot_override = raw
+
+    history = await LegacyFixedRefShadowReader(
+        git=git,
+        vault_name="p2-manual",
+    ).history(
+        document,
+        selector=document.current_commit,
+        fixed_ref=_oid("f"),
+    )
+
+    assert [entry["selector"] for entry in history["entries"]] == [
+        document.current_commit
+    ]
+
+
 async def test_legacy_reader_fails_closed_on_missing_or_corrupt_product_facts():
     document = _document()
     fixed_ref = _oid("f")
