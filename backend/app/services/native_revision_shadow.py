@@ -24,6 +24,11 @@ from app.services.legacy_revision_bridge import (
     LegacyInventory,
     LegacyInventoryDocument,
 )
+from app.services.native_revision_shadow_reader import (
+    LegacyFixedRefShadowReader,
+    NativeRevisionShadowReader,
+    ShadowReaderScopeError,
+)
 
 
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -43,6 +48,24 @@ _PATH_TO_RULE = {
     "activity:$.events[0].author.display": "BR-06",
     "history:$.lineage_boundary": "BR-07",
 }
+_RULE_CLASSIFICATION = {
+    "BR-01": "revision_token",
+    "BR-02": "history_source",
+    "BR-03": "diff_basis",
+    "BR-04": "projection_revision",
+    "BR-05": "formatting_only",
+    "BR-06": "activity_display",
+    "BR-07": "lineage_boundary",
+}
+__all__ = (
+    "LegacyFixedRefShadowReader",
+    "NativeRevisionShadowReader",
+    "NativeRevisionShadowComparator",
+    "NativeRevisionShadowService",
+    "ShadowComparisonError",
+    "ShadowReaderScopeError",
+    "ShadowRunIncompleteError",
+)
 
 
 class ShadowComparisonError(ConflictError):
@@ -108,7 +131,7 @@ class ShadowReader(Protocol):
 class NativeRevisionShadowComparator:
     """Compare legacy and candidate reads without opening a write path."""
 
-    protocol_version = "akb-native-revision-p2-w1-c10/v1"
+    protocol_version = "akb-native-revision-p2-w1-c10/v2"
 
     def __init__(
         self,
@@ -157,7 +180,7 @@ class NativeRevisionShadowComparator:
             )
 
         receipt: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "protocol_version": self.protocol_version,
             "status": "passed",
             "passed": True,
@@ -170,11 +193,11 @@ class NativeRevisionShadowComparator:
                 "claim_scope": "semantic_candidate_evidence",
                 "write_authority": "legacy_only",
                 "comparison_ref": "one completed C9 fixed_ref",
-                "final_coverage_gate": "Migration E current-head/retained/eager inventory before final P2 coverage selection or P2 exit",
+                "final_coverage_gate": "P2 L1-L6 product-backed evidence before final coverage selection",
                 "p3_fence_cutover_out_of_scope": True,
             },
             "run": {
-                "run_id": str(self._value(run, "run_id")),
+                "run_key": self._public_key(self._value(run, "run_id"), "run"),
                 "status": "complete",
                 "fixed_ref": self._value(run, "fixed_git_oid"),
                 "inventory_digest": self._value(run, "inventory_digest"),
@@ -188,6 +211,8 @@ class NativeRevisionShadowComparator:
                     for resource in resources
                     for operation in resource["operations"].values()
                 ),
+                "unexplained_mismatch_count": 0,
+                "classified_mismatches": self._classified_mismatches(resources),
                 "used_rules": sorted(
                     {
                         mismatch["rule_id"]
@@ -215,7 +240,7 @@ class NativeRevisionShadowComparator:
         del inventory
         operations: dict[str, Any] = {}
         for operation in _OPERATIONS:
-            selector = document.current_commit if operation != "history" else document.current_commit
+            selector = document.current_commit
             legacy = await self._read(
                 self.legacy_reader,
                 operation,
@@ -239,7 +264,7 @@ class NativeRevisionShadowComparator:
                     document,
                     native_revision_id,
                 )
-            normalized_legacy, normalized_candidate, mismatches = self._compare_operation(
+            _, _, mismatches = self._compare_operation(
                 operation,
                 legacy,
                 candidate,
@@ -247,21 +272,13 @@ class NativeRevisionShadowComparator:
                 native_revision_id,
             )
             operations[operation] = {
-                "legacy": legacy,
-                "raw_candidate": raw_candidate,
-                "candidate": candidate,
-                "normalized": {
-                    "legacy": normalized_legacy,
-                    "candidate": normalized_candidate,
-                },
                 "mismatches": mismatches,
                 "normalized_equal": True,
+                "mismatch_count": len(mismatches),
+                "mismatch_classes": sorted({mismatch["classification"] for mismatch in mismatches}),
             }
         return {
-            "resource_id": str(document.resource_id),
-            "path": document.current_path,
-            "legacy_head_oid": document.current_commit,
-            "native_revision_id": native_revision_id,
+            "resource_key": self._public_key(document.resource_id, "resource"),
             "operations": operations,
         }
 
@@ -402,7 +419,11 @@ class NativeRevisionShadowComparator:
             cls._set_path(normalized_legacy, path, normalized_left)
             cls._set_path(normalized_candidate, path, normalized_right)
             mismatches.append(
-                {"path": path, "legacy": left, "candidate": right, "rule_id": rule_id}
+                {
+                    "path": path,
+                    "rule_id": rule_id,
+                    "classification": _RULE_CLASSIFICATION[rule_id],
+                }
             )
         if normalized_legacy != normalized_candidate:
             raise ShadowComparisonError(f"unapproved mismatch at {operation}: normalized envelopes differ")
@@ -560,6 +581,30 @@ class NativeRevisionShadowComparator:
         if not document.lineage:
             raise ShadowComparisonError("inventory document has no lineage boundary")
         return document.lineage[0].legacy_git_oid
+
+    @staticmethod
+    def _public_key(value: Any, prefix: str) -> str:
+        """Return a stable receipt key without retaining a raw UUID."""
+        digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+        return f"{prefix}-{digest}"
+
+    @staticmethod
+    def _classified_mismatches(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        counts: dict[tuple[str, str, str], int] = {}
+        for resource in resources:
+            for operation, result in resource["operations"].items():
+                for mismatch in result["mismatches"]:
+                    key = (operation, mismatch["rule_id"], mismatch["classification"])
+                    counts[key] = counts.get(key, 0) + 1
+        return [
+            {
+                "operation": operation,
+                "rule_id": rule_id,
+                "classification": classification,
+                "count": count,
+            }
+            for (operation, rule_id, classification), count in sorted(counts.items())
+        ]
 
     @staticmethod
     def _value(value: Any, name: str) -> Any:

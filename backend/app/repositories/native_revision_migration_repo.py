@@ -650,6 +650,283 @@ class NativeRevisionMigrationRepository:
             raise MigrationIntegrityError("mapping disappeared during insertion")
         return _mapping(row)
 
+    async def list_resource_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """List completed immutable mappings for one Resource.
+
+        Reconcile uses this read to prove that a later fixed-ref inventory is
+        an extension of the already-published lineage.  It intentionally
+        does not expose mappings from an incomplete run as selector authority.
+        """
+
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1
+               AND m.resource_id = $2
+               AND r.status = 'complete'
+             ORDER BY m.lineage_ordinal, m.legacy_git_oid
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id, resource_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id, resource_id)
+        return [_mapping(row) for row in rows]
+
+    async def list_resource_mappings_for_reconcile(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        run_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """Read lineage with the explicit completed-item reconcile exception.
+
+        Completed runs are always visible.  The only incomplete-run exception
+        is the explicitly named reconcile run, and even then only after the
+        corresponding migration item has committed as ``complete``.  This is
+        intentionally separate from the public selector read above.
+        """
+
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+              LEFT JOIN native_revision_migration_items current_item
+                ON current_item.run_id = $3
+               AND current_item.namespace_id = m.namespace_id
+               AND current_item.native_resource_id = m.resource_id
+             WHERE m.namespace_id = $1
+               AND m.resource_id = $2
+               AND (
+                   r.status = 'complete'
+                   OR (
+                       m.run_id = $3
+                       AND current_item.status = 'complete'
+                   )
+               )
+             ORDER BY m.lineage_ordinal, m.legacy_git_oid
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id, resource_id, run_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id, resource_id, run_id)
+        return [_mapping(row) for row in rows]
+
+    async def mapping_for_native_revision(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        native_revision_id: str,
+        conn: asyncpg.Connection | None = None,
+    ) -> LegacyRevisionMapping | None:
+        """Return the completed legacy binding for a native Head revision."""
+
+        _require_oid(native_revision_id, "native_revision_id")
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1
+               AND m.resource_id = $2
+               AND m.native_revision_id = $3
+               AND m.resolution = 'native'
+               AND r.status = 'complete'
+        """
+        if conn is not None:
+            row = await conn.fetchrow(sql, namespace_id, resource_id, native_revision_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(sql, namespace_id, resource_id, native_revision_id)
+        return _mapping(row) if row is not None else None
+
+    async def mapping_for_native_revision_for_reconcile(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        native_revision_id: str,
+        run_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> LegacyRevisionMapping | None:
+        """Read a Head binding under reconcile's completed-item authority."""
+
+        _require_oid(native_revision_id, "native_revision_id")
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+              LEFT JOIN native_revision_migration_items current_item
+                ON current_item.run_id = $3
+               AND current_item.namespace_id = m.namespace_id
+               AND current_item.native_resource_id = m.resource_id
+             WHERE m.namespace_id = $1
+               AND m.resource_id = $2
+               AND m.native_revision_id = $4
+               AND m.resolution = 'native'
+               AND (
+                   r.status = 'complete'
+                   OR (
+                       m.run_id = $3
+                       AND current_item.status = 'complete'
+                   )
+               )
+        """
+        if conn is not None:
+            row = await conn.fetchrow(
+                sql,
+                namespace_id,
+                resource_id,
+                run_id,
+                native_revision_id,
+            )
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(
+                    sql,
+                    namespace_id,
+                    resource_id,
+                    run_id,
+                    native_revision_id,
+                )
+        return _mapping(row) if row is not None else None
+
+    async def migrated_resource_ids(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> set[uuid.UUID]:
+        """Return Resources with at least one completed bridge mapping."""
+
+        sql = """
+            SELECT DISTINCT m.resource_id
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1 AND r.status = 'complete'
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id)
+        return {row["resource_id"] for row in rows}
+
+    @staticmethod
+    async def ensure_cross_run_mapping(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+        path_at_revision: str,
+        resolution: str,
+        native_revision_id: str | None,
+        run_id: uuid.UUID,
+        lineage_ordinal: int,
+    ) -> LegacyRevisionMapping:
+        """Insert a new suffix mapping without re-homing an old mapping.
+
+        A legacy OID is globally immutable for a Resource.  If another
+        completed run already owns the exact facts, the existing row is
+        returned as-is; its original ``run_id`` and ordinal are never changed.
+        A non-complete row from another run is rejected because it is not
+        selector authority.
+        """
+
+        _require_oid(legacy_git_oid, "legacy_git_oid")
+        if resolution not in {"native", "bridge"}:
+            raise ValueError("resolution must be native or bridge")
+        if resolution == "native" and native_revision_id is None:
+            raise ValueError("native mappings require native_revision_id")
+        if resolution == "bridge" and native_revision_id is not None:
+            raise ValueError("bridge mappings cannot carry native_revision_id")
+        if native_revision_id is not None:
+            _require_oid(native_revision_id, "native_revision_id")
+        if not isinstance(path_at_revision, str) or not path_at_revision.strip():
+            raise ValueError("mapping path must be non-empty")
+        if lineage_ordinal < 0:
+            raise ValueError("lineage ordinal must be non-negative")
+
+        select_sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid, r.status
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resource_id = $1 AND m.legacy_git_oid = $2
+             FOR UPDATE
+        """
+        row = await conn.fetchrow(select_sql, resource_id, legacy_git_oid)
+        if row is None:
+            await conn.execute(
+                """
+                INSERT INTO legacy_revision_mappings
+                    (namespace_id, resource_id, legacy_git_oid, path_at_revision,
+                     resolution, native_revision_id, run_id, lineage_ordinal)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (resource_id, legacy_git_oid) DO NOTHING
+                """,
+                namespace_id,
+                resource_id,
+                legacy_git_oid,
+                path_at_revision,
+                resolution,
+                native_revision_id,
+                run_id,
+                lineage_ordinal,
+            )
+            row = await conn.fetchrow(select_sql, resource_id, legacy_git_oid)
+        if row is None:
+            raise MigrationIntegrityError("cross-run mapping disappeared during insertion")
+        if row["status"] != "complete" and row["run_id"] != run_id:
+            raise MigrationIntegrityError("cross-run mapping belongs to an incomplete run")
+
+        observed = (
+            row["namespace_id"],
+            row["resource_id"],
+            row["legacy_git_oid"],
+            row["path_at_revision"],
+            row["resolution"],
+            row["native_revision_id"],
+        )
+        expected = (
+            namespace_id,
+            resource_id,
+            legacy_git_oid,
+            path_at_revision,
+            resolution,
+            native_revision_id,
+        )
+        if observed != expected:
+            raise MigrationIntegrityError("cross-run mapping conflicts with immutable lineage")
+
+        return _mapping(row)
+
     async def allocate_native_revision_id(
         self,
         conn: asyncpg.Connection,
@@ -744,6 +1021,59 @@ class NativeRevisionMigrationRepository:
         else:
             async with self.pool.acquire() as acquired:
                 row = await acquired.fetchrow(sql, resource_id, legacy_git_oid)
+        return _mapping(row) if row is not None else None
+
+    async def exact_mapping_for_reconcile(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+        run_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> LegacyRevisionMapping | None:
+        """Read an exact mapping with the explicit reconcile-run exception."""
+
+        _require_oid(legacy_git_oid, "legacy_git_oid")
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+              LEFT JOIN native_revision_migration_items current_item
+                ON current_item.run_id = $3
+               AND current_item.namespace_id = m.namespace_id
+               AND current_item.native_resource_id = m.resource_id
+             WHERE m.namespace_id = $1
+               AND m.resource_id = $2
+               AND m.legacy_git_oid = $4
+               AND (
+                   r.status = 'complete'
+                   OR (
+                       m.run_id = $3
+                       AND current_item.status = 'complete'
+                   )
+               )
+        """
+        if conn is not None:
+            row = await conn.fetchrow(
+                sql,
+                namespace_id,
+                resource_id,
+                run_id,
+                legacy_git_oid,
+            )
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(
+                    sql,
+                    namespace_id,
+                    resource_id,
+                    run_id,
+                    legacy_git_oid,
+                )
         return _mapping(row) if row is not None else None
 
     async def prefix_mappings(

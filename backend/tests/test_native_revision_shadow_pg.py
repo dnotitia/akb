@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from dataclasses import replace
@@ -302,28 +303,21 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert receipt["final_p2_coverage_claim"] is False
     assert receipt["cutover_claim"] is False
     assert len(receipt["resources"]) == 2
-    assert [row["resource_id"] for row in receipt["resources"]] == sorted(
-        str(document.resource_id) for document in inventory.documents
+    assert [row["resource_key"] for row in receipt["resources"]] == sorted(
+        f"resource-{hashlib.sha256(str(document.resource_id).encode()).hexdigest()[:16]}"
+        for document in inventory.documents
     )
     assert set(receipt["summary"]["used_rules"]) == {f"BR-0{index}" for index in range(1, 8)}
-    documents_by_id = {str(document.resource_id): document for document in inventory.documents}
     for resource in receipt["resources"]:
         assert set(resource["operations"]) == {"get", "history", "diff", "activity"}
-        activity = resource["operations"]["activity"]
-        raw_event = activity["raw_candidate"]["events"][0]
-        public_event = activity["candidate"]["events"][0]
-        document = documents_by_id[resource["resource_id"]]
-        assert raw_event["action"] == "create"
-        assert raw_event["author"] == {
-            "id": "akb-native-revision-migration",
-            "display": "Migration",
-        }
-        assert raw_event["subject"] == "internal migration subject"
-        assert raw_event["summary"] == "C9 fixed-ref native genesis"
-        assert public_event["action"] == document.activity.action
-        assert public_event["author"]["id"] == document.activity.actor
-        assert public_event["subject"] == document.activity.subject
-        assert public_event["summary"] == document.activity.summary
+        for operation in resource["operations"].values():
+            assert operation["normalized_equal"] is True
+            assert operation["mismatch_count"] == len(operation["mismatches"])
+            for mismatch in operation["mismatches"]:
+                assert set(mismatch) == {"path", "rule_id", "classification"}
+    encoded = json.dumps(receipt, sort_keys=True)
+    assert all(document.body.decode() not in encoded for document in inventory.documents)
+    assert all(str(document.resource_id) not in encoded for document in inventory.documents)
     assert {name for name, _ in legacy.calls} == {"get", "history", "diff", "activity"}
     assert len(legacy.calls) == len(inventory.documents) * 4
     assert len(candidate.calls) == len(inventory.documents) * 4
