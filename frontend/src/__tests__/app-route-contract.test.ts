@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appRouteContract } from "@/app-route-contract";
+import { appRouteBoundaryForPath, appRouteContract } from "@/app-route-contract";
 
 describe("application route contract", () => {
   it("keeps route, component, and shell ownership explicit", () => {
@@ -32,5 +32,31 @@ describe("application route contract", () => {
   it("does not declare duplicate paths", () => {
     const paths = appRouteContract.map(({ path }) => path);
     expect(new Set(paths).size).toBe(paths.length);
+  });
+
+  it("resolves every declared route to its contract boundary", () => {
+    for (const route of appRouteContract) {
+      const pathname = route.path === "*"
+        ? "/route-not-declared-elsewhere"
+        : route.path.replace(/:[^/]+/g, "example");
+      expect(appRouteBoundaryForPath(pathname)).toBe(route.boundary);
+    }
+  });
+
+  it.each([
+    ["/auth", "auth"],
+    ["/auth/forgot", "auth"],
+    ["/p/storybook-guide", "public"],
+    ["/", "app-layout"],
+    ["/vault/new", "app-layout"],
+    ["/search", "app-layout"],
+    ["/vault", "vault-shell"],
+    ["/vault/akb", "vault-shell"],
+    ["/vault/akb/doc/new", "vault-shell"],
+    ["/vault/akb/doc/overview%2Fvault-skill.md", "vault-shell"],
+    ["/vault/akb/skill", "vault-shell"],
+    ["/stale/route", "app-layout"],
+  ] as const)("resolves %s to the %s boundary", (pathname, boundary) => {
+    expect(appRouteBoundaryForPath(pathname)).toBe(boundary);
   });
 });

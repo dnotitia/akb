@@ -1,3 +1,5 @@
+import { matchRoutes, type RouteObject } from "react-router-dom";
+
 export type AppRouteBoundary = "auth" | "public" | "app-layout" | "vault-shell";
 
 export interface AppRouteDefinition {
@@ -39,3 +41,15 @@ export const appRouteContract = [
 ] as const satisfies readonly AppRouteDefinition[];
 
 export type AppRouteComponentName = (typeof appRouteContract)[number]["component"];
+
+type BoundaryRouteObject = RouteObject & { boundary: AppRouteBoundary };
+
+const boundaryRouteObjects: BoundaryRouteObject[] = appRouteContract.map(
+  ({ path, boundary }) => ({ path, boundary }),
+);
+
+/** Resolve ownership with the same specificity ranking React Router uses. */
+export function appRouteBoundaryForPath(pathname: string): AppRouteBoundary | undefined {
+  const matches = matchRoutes<BoundaryRouteObject>(boundaryRouteObjects, pathname);
+  return matches?.at(-1)?.route.boundary;
+}
