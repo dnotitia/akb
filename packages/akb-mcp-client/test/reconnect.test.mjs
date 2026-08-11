@@ -34,7 +34,7 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
   return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
 }
-const fileToolNames = ["akb_put_file", "akb_get_file", "akb_delete_file"];
+const fileToolNames = ["akb_put_file", "akb_get_file", "akb_update_file", "akb_delete_file"];
 
 // ── initialize is answered locally, never blocking on the backend ────
 

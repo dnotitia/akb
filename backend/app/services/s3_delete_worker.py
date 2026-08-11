@@ -38,13 +38,19 @@ _last_sweep_at: float = 0.0
 # ── Outbox helpers (called by services in their TX) ──────────────
 
 
-async def enqueue_delete(conn, s3_key: str) -> None:
-    """Enqueue an S3 object for asynchronous deletion. MUST be called
-    inside the same TX as the DB write that removes the row pointing
-    at this object — that's the only way to guarantee no orphan."""
+async def enqueue_delete(conn, s3_key: str, *, delay_seconds: int = 0) -> None:
+    """Enqueue an S3 object for asynchronous deletion.
+
+    Row-owned objects must be enqueued inside the same transaction as the DB
+    mutation that disowns them. ``delay_seconds`` also supports staging
+    objects that must remain available until a presigned capability expires.
+    """
     await conn.execute(
-        "INSERT INTO s3_delete_outbox (s3_key, next_attempt_at) VALUES ($1, NOW())",
-        s3_key,
+        """
+        INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
+        VALUES ($1, NOW() + ($2 * INTERVAL '1 second'))
+        """,
+        s3_key, delay_seconds,
     )
 
 

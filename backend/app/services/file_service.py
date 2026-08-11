@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, NotFoundError
+from app.exceptions import AKBError, ConflictError, NotFoundError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -48,6 +48,7 @@ logger = logging.getLogger("akb.files")
 _PRESIGN_UPLOAD_TTL = 3600
 _PRESIGN_DOWNLOAD_TTL = 3600
 _S3_STREAM_CHUNK_SIZE = 64 * 1024
+_REPLACEMENT_STAGING_DELETE_DELAY = _PRESIGN_UPLOAD_TTL + 300
 
 _DELEGATED_ACTOR_EVENT_KEYS = (
     "delegated_user_id",
@@ -203,6 +204,56 @@ def _content_key_honors_hash(s3_key: str, content_hash: str) -> bool:
     return last_segment.startswith(f"{_content_key_prefix(content_hash)}_")
 
 
+def _replacement_staging_key(
+    vault_name: str,
+    file_id: uuid.UUID,
+    replacement_id: uuid.UUID,
+) -> str:
+    """Private upload target for one replacement attempt.
+
+    The caller receives a presigned URL for this key, never for the live file
+    key.  Confirmation copies these bytes to a fresh, non-presigned key before
+    publishing the metadata switch.
+    """
+    return f"__akb_file_replacements__/{vault_name}/{file_id}/{replacement_id}"
+
+
+def _file_version(row: dict) -> str | None:
+    """Return the opaque optimistic-concurrency token exposed to callers."""
+    return row.get("storage_version") or row.get("etag")
+
+
+def _check_file_preconditions(
+    row: dict,
+    *,
+    expected_content_hash: str | None,
+    expected_version: str | None,
+) -> None:
+    if expected_content_hash is not None and row.get("content_hash") != expected_content_hash:
+        raise ConflictError(f"content_hash moved: expected {expected_content_hash}, actual {row.get('content_hash')}")
+    current_version = _file_version(row)
+    if expected_version is not None and current_version != expected_version:
+        raise ConflictError(f"file version moved: expected {expected_version}, actual {current_version}")
+
+
+async def _discard_replacement_objects(*s3_keys: str) -> None:
+    """Best-effort cleanup for unpublished replacement objects.
+
+    A precondition failure must remain a 409 even if storage cleanup has a
+    transient failure.  Successful publishes use the durable delete outbox;
+    this helper is only for objects that never became database-owned.
+    """
+    for s3_key in s3_keys:
+        if not s3_key:
+            continue
+        try:
+            await asyncio.to_thread(s3_adapter.delete, s3_key)
+        except NotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not discard unpublished replacement object %s: %s", s3_key, exc)
+
+
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
 
 
@@ -336,6 +387,290 @@ class FileService:
             "expires_in": _PRESIGN_UPLOAD_TTL,
             "deduplicated": deduplicated,
         }
+
+    async def initiate_replace(
+        self,
+        vault_name: str,
+        vault_id: uuid.UUID,
+        file_id: str,
+        *,
+        content_hash: str,
+        mime_type: str | None = None,
+        expected_content_hash: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict:
+        """Prepare an isolated upload that can replace one logical file.
+
+        No live object key is exposed for PUT.  The caller uploads to a
+        replacement-specific staging key and ``confirm_replace`` publishes a
+        fresh object only after re-checking the optimistic-concurrency pins.
+        """
+        if not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        if expected_content_hash is not None and not is_sha256_hex(expected_content_hash):
+            raise AKBError(
+                "expected_content_hash must be a lowercase sha256 hex digest",
+                status_code=400,
+            )
+        if self._measurement is not None:
+            raise ConflictError("File replacement is unavailable for the active measurement storage driver")
+
+        fid = uuid.UUID(file_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        if not row:
+            raise NotFoundError("File", file_id)
+        _check_file_preconditions(
+            row,
+            expected_content_hash=expected_content_hash,
+            expected_version=expected_version,
+        )
+
+        current_version = _file_version(row)
+        canonical_uri = file_uri(vault_name, file_id, collection=row["collection"])
+        if row.get("content_hash") == content_hash:
+            return {
+                "kind": "file",
+                "uri": canonical_uri,
+                "vault": vault_name,
+                "collection": row["collection"],
+                "name": row["name"],
+                "mime_type": row["mime_type"],
+                "size_bytes": row["size_bytes"],
+                "content_hash": row["content_hash"],
+                "hash_algorithm": row["hash_algorithm"],
+                "etag": row["etag"],
+                "storage_version": row["storage_version"],
+                "version": current_version,
+                "unchanged": True,
+            }
+
+        s3_adapter.ensure_bucket(self._bucket)
+        replacement_id = uuid.uuid4()
+        staging_key = _replacement_staging_key(vault_name, fid, replacement_id)
+        upload_mime_type = mime_type or row.get("mime_type") or "application/octet-stream"
+        upload_url = s3_adapter.presign_put(
+            staging_key,
+            content_type=upload_mime_type,
+            ttl=_PRESIGN_UPLOAD_TTL,
+        )
+        # An abandoned replacement has no vault_files row from which a normal
+        # delete can discover its staging key.  Schedule cleanup just after the
+        # presigned URL expires; successful confirmation also enqueues an
+        # immediate delete, and duplicate S3 deletes are intentionally safe.
+        async with pool.acquire() as conn:
+            await _enqueue_s3_delete(
+                conn,
+                staging_key,
+                delay_seconds=_REPLACEMENT_STAGING_DELETE_DELAY,
+            )
+        return {
+            "kind": "file",
+            "uri": canonical_uri,
+            "vault": vault_name,
+            "collection": row["collection"],
+            "name": row["name"],
+            "mime_type": upload_mime_type,
+            "replacement_id": str(replacement_id),
+            "upload_url": upload_url,
+            "expires_in": _PRESIGN_UPLOAD_TTL,
+            "current_content_hash": row.get("content_hash"),
+            "current_version": current_version,
+            "unchanged": False,
+        }
+
+    async def confirm_replace(
+        self,
+        vault_name: str,
+        vault_id: uuid.UUID,
+        file_id: str,
+        replacement_id: str,
+        *,
+        actor_id: str,
+        delegated_actor: dict[str, str] | None = None,
+        content_hash: str,
+        expected_content_hash: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict:
+        """Publish staged replacement bytes under the existing file URI."""
+        if not is_sha256_hex(content_hash):
+            raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
+        if expected_content_hash is not None and not is_sha256_hex(expected_content_hash):
+            raise AKBError(
+                "expected_content_hash must be a lowercase sha256 hex digest",
+                status_code=400,
+            )
+        if self._measurement is not None:
+            raise ConflictError("File replacement is unavailable for the active measurement storage driver")
+
+        fid = uuid.UUID(file_id)
+        rid = uuid.UUID(replacement_id)
+        staging_key = _replacement_staging_key(vault_name, fid, rid)
+        pool = await get_pool()
+
+        # Cheap stale-request rejection before any server-side copy.  The same
+        # checks run again under a row lock below; this first pass is only an
+        # optimization and is not the concurrency boundary.
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        if not row:
+            await _discard_replacement_objects(staging_key)
+            raise NotFoundError("File", file_id)
+        try:
+            _check_file_preconditions(
+                row,
+                expected_content_hash=expected_content_hash,
+                expected_version=expected_version,
+            )
+        except ConflictError:
+            await _discard_replacement_objects(staging_key)
+            raise
+
+        # The presigned staging URL remains valid until its TTL elapses.  Copy
+        # to a fresh, non-presigned key and certify THAT immutable candidate;
+        # a later reuse of the staging URL therefore cannot mutate live bytes.
+        final_key = _s3_key(
+            vault_name,
+            row.get("collection") or "",
+            row["name"],
+        )
+        try:
+            final_meta = await asyncio.to_thread(s3_adapter.copy, staging_key, final_key)
+            server_content_hash = await asyncio.to_thread(
+                compute_stream_content_hash,
+                s3_adapter.iter_chunks(final_key),
+            )
+        except Exception:
+            await _discard_replacement_objects(staging_key, final_key)
+            raise
+
+        if server_content_hash != content_hash:
+            await _discard_replacement_objects(staging_key, final_key)
+            raise ConflictError("Uploaded replacement file hash mismatch")
+
+        size_bytes = final_meta["ContentLength"]
+        mime_type = final_meta.get("ContentType") or row.get("mime_type") or "application/octet-stream"
+        etag = (final_meta.get("ETag") or "").strip('"') or None
+        storage_version = final_meta.get("VersionId")
+        previous_content_hash: str | None = None
+        previous_version: str | None = None
+        unchanged = False
+
+        transaction_committed = False
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
+                    if not locked:
+                        raise NotFoundError("File", file_id)
+                    _check_file_preconditions(
+                        locked,
+                        expected_content_hash=expected_content_hash,
+                        expected_version=expected_version,
+                    )
+                    previous_content_hash = locked.get("content_hash")
+                    previous_version = _file_version(locked)
+
+                    # A concurrent unconditional writer may have published the
+                    # same bytes since initiation.  Keep its object/version and
+                    # retire both candidates without manufacturing a write.
+                    if previous_content_hash == server_content_hash:
+                        unchanged = True
+                        await _enqueue_s3_delete(conn, staging_key)
+                        await _enqueue_s3_delete(conn, final_key)
+                        result_row = locked
+                    else:
+                        await vault_files_repo.replace_confirmed_metadata(
+                            conn,
+                            fid,
+                            s3_key=final_key,
+                            mime_type=mime_type,
+                            size_bytes=size_bytes,
+                            content_hash=server_content_hash,
+                            hash_algorithm=HASH_ALGORITHM,
+                            etag=etag,
+                            storage_version=storage_version,
+                        )
+                        await _enqueue_s3_delete(conn, locked["s3_key"])
+                        await _enqueue_s3_delete(conn, staging_key)
+                        await emit_event(
+                            conn,
+                            "file.update",
+                            vault_id=vault_id,
+                            resource_uri=file_uri(
+                                vault_name,
+                                file_id,
+                                collection=locked["collection"],
+                            ),
+                            actor_id=actor_id,
+                            payload={
+                                "vault": vault_name,
+                                "collection": locked["collection"],
+                                "name": locked["name"],
+                                "mime_type": mime_type,
+                                "size_bytes": size_bytes,
+                                "content_hash": server_content_hash,
+                                "hash_algorithm": HASH_ALGORITHM,
+                                "etag": etag,
+                                "storage_version": storage_version,
+                                "previous_content_hash": previous_content_hash,
+                                "previous_version": previous_version,
+                                **_delegated_actor_event_fields(delegated_actor),
+                            },
+                        )
+                        result_row = {
+                            **locked,
+                            "s3_key": final_key,
+                            "mime_type": mime_type,
+                            "size_bytes": size_bytes,
+                            "content_hash": server_content_hash,
+                            "hash_algorithm": HASH_ALGORITHM,
+                            "etag": etag,
+                            "storage_version": storage_version,
+                        }
+                transaction_committed = True
+        except Exception:
+            # The transaction did not publish ``final_key``.  It is therefore
+            # safe to remove both candidates without touching the current row.
+            if not transaction_committed:
+                await _discard_replacement_objects(staging_key, final_key)
+            raise
+
+        if not unchanged:
+            try:
+                await index_file_metadata(
+                    file_id,
+                    vault_id=vault_id,
+                    vault_name=vault_name,
+                    collection=result_row["collection"] or "",
+                    name=result_row["name"],
+                    mime_type=result_row["mime_type"],
+                    size_bytes=result_row["size_bytes"],
+                    description=result_row["description"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("file metadata indexing failed for %s: %s", file_id, exc)
+
+        result_version = _file_version(result_row)
+        return {
+            "kind": "file",
+            "uri": file_uri(vault_name, file_id, collection=result_row["collection"]),
+            "vault": vault_name,
+            "collection": result_row["collection"],
+            "name": result_row["name"],
+            "mime_type": result_row["mime_type"],
+            "size_bytes": result_row["size_bytes"],
+            "content_hash": result_row["content_hash"],
+            "hash_algorithm": result_row["hash_algorithm"],
+            "etag": result_row["etag"],
+            "storage_version": result_row["storage_version"],
+            "version": result_version,
+            "previous_content_hash": previous_content_hash,
+            "previous_version": previous_version,
+            "unchanged": unchanged,
+        }
+
 
     async def confirm_upload(
         self,
@@ -492,6 +827,7 @@ class FileService:
             "hash_algorithm": HASH_ALGORITHM,
             "etag": etag,
             "storage_version": storage_version,
+            "version": storage_version or etag,
         }
 
     async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
@@ -531,6 +867,7 @@ class FileService:
             "hash_algorithm": row["hash_algorithm"],
             "etag": row["etag"],
             "storage_version": row["storage_version"],
+            "version": _file_version(row),
             "expires_in": _PRESIGN_DOWNLOAD_TTL,
         }
 
@@ -585,6 +922,7 @@ class FileService:
                 "hash_algorithm": r["hash_algorithm"],
                 "etag": r["etag"],
                 "storage_version": r["storage_version"],
+                "version": _file_version(r),
                 "description": r["description"],
                 "created_by": r["created_by"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,

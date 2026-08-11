@@ -349,6 +349,8 @@ def test_kind_envelope_routes_reference_typed_success_schemas():
         ("/api/v1/tables/{vault}/{table_name}", "delete", "200"): "AkbTableEnvelope",
         ("/api/v1/files/{vault}/upload", "post", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}/confirm", "post", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/replace", "post", "200"): "AkbFileEnvelope",
+        ("/api/v1/files/{vault}/{file_id}/replace/{replacement_id}/confirm", "post", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}/download", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}", "get", "200"): "AkbFileEnvelope",
         ("/api/v1/files/{vault}/{file_id}", "delete", "200"): "AkbFileEnvelope",
