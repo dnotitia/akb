@@ -342,6 +342,53 @@ def _target_of(args: dict) -> str | None:
     return None
 
 
+def _grep_replace_meta(args: dict, result) -> dict | None:
+    """Bounded summary for the argument-driven ``akb_grep`` write mode."""
+    if args.get("replace") is None or not isinstance(result, dict):
+        return None
+    return {
+        "total_docs": result.get("total_docs"),
+        "max_replacements": result.get("max_replacements"),
+        "replaced_docs": result.get("replaced_docs", 0),
+        "unchanged_docs": result.get("unchanged_docs", 0),
+        "replacement_complete": result.get("replacement_complete", False),
+    }
+
+
+def _record_grep_replace_receipts(args: dict, user, result) -> None:
+    """Emit one compact recovery receipt per committed grep replacement.
+
+    The summary tool record cannot identify every document without becoming one
+    potentially large JSON line.  Individual metadata-only receipts keep each
+    line bounded while retaining the new and previous commit needed to inspect
+    or revert a partial multi-document operation.  Bodies and replacement text
+    are deliberately excluded.
+    """
+    if args.get("replace") is None or not isinstance(result, dict):
+        return
+    replacements = result.get("replacements")
+    if not isinstance(replacements, list):
+        return
+    for replacement in replacements:
+        if not isinstance(replacement, dict) or not replacement.get("uri"):
+            continue
+        target = f"uri={replacement['uri']}"
+        if len(target) > _TARGET_MAX:
+            target = target[:_TARGET_MAX] + "…"
+        record(
+            action="akb_grep.replace",
+            actor=getattr(user, "username", None),
+            actor_id=getattr(user, "user_id", None),
+            vault=(args.get("vault") if isinstance(args, dict) else None),
+            target=target,
+            outcome="ok",
+            meta={
+                "commit": replacement.get("commit"),
+                "previous_commit": replacement.get("previous_commit"),
+            },
+        )
+
+
 def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) -> None:
     """Audit one MCP tool call from the dispatch chokepoint. ``user`` is the
     resolved _MCPUser; ``result`` is the handler's return envelope (or the
@@ -369,6 +416,8 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
         outcome = "error"
         code = result.get("code")
+    if name == "akb_grep" and is_write:
+        _record_grep_replace_receipts(args, user, result)
     record(
         action=name,
         actor=getattr(user, "username", None),
@@ -377,6 +426,7 @@ def record_tool(name: str, args: dict, user, result, *, is_write: bool = False) 
         target=(_target_of(args) if isinstance(args, dict) else None),
         outcome=outcome,
         code=code,
+        meta=(_grep_replace_meta(args, result) if name == "akb_grep" and is_write else None),
     )
 
 

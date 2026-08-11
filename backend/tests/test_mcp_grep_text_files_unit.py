@@ -20,6 +20,9 @@ def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
     argument = grep.inputSchema["properties"]["measurement_include_text_files"]
 
     assert grep.inputSchema["properties"]["pattern"]["minLength"] == 1
+    replacement_budget = grep.inputSchema["properties"]["max_replacements"]
+    assert replacement_budget["default"] == 50
+    assert replacement_budget["maximum"] == 1000
     assert argument["type"] == "boolean"
     assert argument["default"] is False
     assert "guarded native" in argument["description"].lower()
@@ -53,6 +56,7 @@ async def test_mcp_grep_preserves_legacy_scope_and_defaults_to_documents(monkeyp
     assert access_checks == [("user-1", "legacy-vault", "reader")]
     assert grep_calls[0]["vault"] == "legacy-vault"
     assert grep_calls[0]["collection"] == "notes"
+    assert grep_calls[0]["max_replacements"] == 50
     assert grep_calls[0]["measurement_include_text_files"] is False
 
 
@@ -77,6 +81,7 @@ async def test_mcp_grep_passes_explicit_text_file_measurement_argument(monkeypat
         {
             "pattern": "needle",
             "vault": "measurement",
+            "max_replacements": 17,
             "measurement_include_text_files": True,
         },
         user.user_id,
@@ -84,6 +89,7 @@ async def test_mcp_grep_passes_explicit_text_file_measurement_argument(monkeypat
     )
 
     assert grep_calls[0]["measurement_include_text_files"] is True
+    assert grep_calls[0]["max_replacements"] == 17
 
 
 @pytest.mark.asyncio

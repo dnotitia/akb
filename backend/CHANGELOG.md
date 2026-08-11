@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed scoped grep replacement completeness and recovery
+
+`akb_grep(replace=...)` now treats `limit` only as a response-preview bound and
+uses a separate `max_replacements` write budget. A scope larger than that budget
+is rejected before any document changes, while an accepted scope is applied to
+every matching document. Replacement receipts include both the new and previous
+commit, and a failure after earlier commits returns those completed receipts plus
+the failed document instead of discarding the partial result. The audit stream
+records a bounded summary and one metadata-only receipt per committed document.
+
 ### Added app installation lifecycle commands
 
 Added administrator install, restore, fresh, status, and uninstall commands

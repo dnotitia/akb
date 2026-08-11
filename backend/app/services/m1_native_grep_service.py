@@ -24,6 +24,12 @@ import asyncpg
 
 from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services.document_service import _parse_markdown
+from app.services.grep_replace import (
+    DEFAULT_MAX_REPLACEMENTS,
+    replacement_budget_error,
+    replacement_failure_error,
+    validate_max_replacements,
+)
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_payload_verification import (
     payload_store_for_placement,
@@ -147,6 +153,7 @@ def _scan_bodies_sync(
     case_sensitive: bool,
     mode: Literal["default", "count_only", "files_with_matches"] = "default",
     resource_limit: int = 20,
+    collect_matched_body_indexes: bool = False,
     limits: GrepScanLimits | None = None,
 ) -> dict[str, Any]:
     """Run exact Head matching with bounded response materialization."""
@@ -157,6 +164,7 @@ def _scan_bodies_sync(
     items: list[dict[str, Any]] = []
     by_resource: dict[str, int] = {}
     resources: list[dict[str, Any]] = []
+    matched_body_indexes: list[int] = []
     total_resources = 0
     total_matches = 0
     materialized_matches = 0
@@ -221,6 +229,8 @@ def _scan_bodies_sync(
             continue
         total_resources += 1
         total_matches += resource_matches
+        if collect_matched_body_indexes:
+            matched_body_indexes.append(body_index)
         if mode == "count_only":
             by_resource[body.uri] = resource_matches
         elif mode == "files_with_matches":
@@ -253,6 +263,7 @@ def _scan_bodies_sync(
         "items": items,
         "by_resource": by_resource,
         "resources": resources,
+        "matched_body_indexes": matched_body_indexes,
         "total_resources": total_resources,
         "total_matches": total_matches,
         "materialized_matches": materialized_matches,
@@ -636,6 +647,7 @@ class M1NativeGrepService:
         count_only: bool = False,
         files_with_matches: bool = False,
         limit: int = 20,
+        max_replacements: int = DEFAULT_MAX_REPLACEMENTS,
         replace: str | None = None,
         actor: str | None = None,
         include_text_files: bool = False,
@@ -650,6 +662,8 @@ class M1NativeGrepService:
             raise ValidationError("native grep replace does not support File resources")
         if replace is not None and not actor:
             raise ValidationError("actor is required for native grep replacement")
+        if replace is not None:
+            max_replacements = validate_max_replacements(max_replacements)
         if limit < 1 or limit > 1000:
             raise ValidationError("limit must be between 1 and 1000")
         if len(pattern.encode("utf-8")) > NATIVE_GREP_MAX_PATTERN_BYTES:
@@ -694,6 +708,7 @@ class M1NativeGrepService:
                         "case_sensitive": case_sensitive,
                         "mode": mode,
                         "resource_limit": limit,
+                        "collect_matched_body_indexes": replace is not None,
                         "limits": scan_limits,
                     },
                     NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
@@ -714,6 +729,7 @@ class M1NativeGrepService:
                 case_sensitive=case_sensitive,
                 mode=mode,
                 resource_limit=limit,
+                collect_matched_body_indexes=replace is not None,
                 limits=scan_limits,
             )
         matched = scanned["items"]
@@ -737,10 +753,19 @@ class M1NativeGrepService:
             resources = scanned["resources"]
             return {**base, "n_resources": len(resources), "resources": resources}
 
-        selected = matched
         replacements: list[dict[str, Any]] = []
-        if replace is not None:
-            selected_bodies = [item["_body"] for item in selected]
+        unchanged_resources = 0
+        replacement_error: dict[str, Any] | None = None
+        if replace is not None and scanned["total_resources"] > max_replacements:
+            replacement_error = replacement_budget_error(
+                total_docs=scanned["total_resources"],
+                max_replacements=max_replacements,
+            )
+        elif replace is not None:
+            selected_bodies = [
+                bodies[index]
+                for index in scanned["matched_body_indexes"]
+            ]
             # Validate every matched Head before starting the first mutation:
             # mixed placement is permitted across the scan, but an unknown
             # placement must not leave an earlier replacement committed.
@@ -779,14 +804,14 @@ class M1NativeGrepService:
                     regex=False,
                     case_sensitive=case_sensitive,
                 )
-            for item, new_search_text, payload_store in zip(
-                selected,
+            for head_body, new_search_text, payload_store in zip(
+                selected_bodies,
                 replacement_texts,
                 payload_stores,
                 strict=True,
             ):
-                head_body: HeadBody = item["_body"]
                 if new_search_text == head_body.search_text:
+                    unchanged_resources += 1
                     continue
                 if head_body.surface == "document":
                     metadata, _ = _parse_markdown(head_body.text)
@@ -795,25 +820,45 @@ class M1NativeGrepService:
                     new_text = _compose_markdown(metadata, new_search_text)
                 else:
                     new_text = new_search_text
-                result = await NativeRevisionService(
-                    self.pool,
-                    payload_store=payload_store,
-                ).replace_text(
-                    namespace_id=head_body.namespace_id,
-                    surface=head_body.surface,
-                    path=head_body.path,
-                    payload=new_text,
-                    actor=actor or "",
-                    mutation_id=uuid.uuid4(),
-                    expected_revision_id=head_body.revision_id,
-                    expected_resource_id=head_body.resource_id,
-                    message=f"grep replace: {pattern!r}",
+                try:
+                    result = await NativeRevisionService(
+                        self.pool,
+                        payload_store=payload_store,
+                    ).replace_text(
+                        namespace_id=head_body.namespace_id,
+                        surface=head_body.surface,
+                        path=head_body.path,
+                        payload=new_text,
+                        actor=actor or "",
+                        mutation_id=uuid.uuid4(),
+                        expected_revision_id=head_body.revision_id,
+                        expected_resource_id=head_body.resource_id,
+                        message=f"grep replace: {pattern!r}",
+                    )
+                except Exception as exc:  # noqa: BLE001 — return recovery receipt
+                    replacement_error = replacement_failure_error(
+                        exc,
+                        failed_uri=head_body.uri,
+                        committed_replacements=len(replacements),
+                    )
+                    break
+                replacements.append(
+                    {
+                        "uri": head_body.uri,
+                        "path": head_body.path,
+                        "title": head_body.title,
+                        "revision": result.revision_id,
+                        "previous_revision": getattr(
+                            result,
+                            "parent_revision_id",
+                            head_body.revision_id,
+                        ),
+                    }
                 )
-                replacements.append({"uri": head_body.uri, "revision": result.revision_id})
 
         clean = [
             {key: value for key, value in item.items() if not key.startswith("_")}
-            for item in selected
+            for item in matched
         ]
         response: dict[str, Any] = {
             **base,
@@ -829,8 +874,17 @@ class M1NativeGrepService:
             }
         if replace is not None:
             response.update(
-                {"replace": replace, "replaced_resources": len(replacements), "replacements": replacements}
+                {
+                    "replace": replace,
+                    "max_replacements": max_replacements,
+                    "replaced_resources": len(replacements),
+                    "unchanged_resources": unchanged_resources,
+                    "replacement_complete": replacement_error is None,
+                    "replacements": replacements,
+                }
             )
+            if replacement_error is not None:
+                response.update(replacement_error)
         return response
 
     @staticmethod
@@ -895,23 +949,31 @@ class M1NativeGrepService:
         if "truncation" in native:
             result["truncation"] = native["truncation"]
         if "replace" in native:
-            replacements_by_uri = {row["uri"]: row for row in native.get("replacements", [])}
             result.update(
                 {
                     "replace": native["replace"],
+                    "max_replacements": native.get(
+                        "max_replacements",
+                        DEFAULT_MAX_REPLACEMENTS,
+                    ),
                     "replaced_docs": native.get("replaced_resources", 0),
+                    "unchanged_docs": native.get("unchanged_resources", 0),
+                    "replacement_complete": native.get("replacement_complete", True),
                     "replacements": [
                         {
                             "uri": row["uri"],
                             "path": row["path"],
                             "title": row["title"],
-                            "commit": replacements_by_uri[row["uri"]]["revision"],
+                            "commit": row["revision"],
+                            "previous_commit": row.get("previous_revision"),
                         }
-                        for row in native.get("results", [])
-                        if row["uri"] in replacements_by_uri
+                        for row in native.get("replacements", [])
                     ],
                 }
             )
+            for key in ("error", "code", "hint", "details"):
+                if key in native:
+                    result[key] = native[key]
         return result
 
     async def grep_public(self, pattern: str, **kwargs) -> dict[str, Any]:

@@ -176,10 +176,18 @@ for i in 1 2 3; do
 done
 pass "3 docs with OLD_PLACEHOLDER created"
 
-# Replace OLD_PLACEHOLDER → NEW_VALUE across all
-R=$(m1 "akb_grep" "{\"pattern\":\"OLD_PLACEHOLDER\",\"vault\":\"$VAULT1\",\"replace\":\"NEW_VALUE\"}")
+# A replacement budget smaller than the full scope must fail before writing.
+R=$(m1 "akb_grep" "{\"pattern\":\"OLD_PLACEHOLDER\",\"vault\":\"$VAULT1\",\"replace\":\"SHOULD_NOT_APPEAR\",\"limit\":1,\"max_replacements\":2}")
+BUDGET_CODE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code',''))" 2>/dev/null)
+[ "$BUDGET_CODE" = "bulk_too_large" ] && pass "Replace budget fails closed" || fail "Replace budget" "$R"
+
+# Replace OLD_PLACEHOLDER → NEW_VALUE across all.  limit=1 bounds only the
+# returned preview; max_replacements authorizes the full three-document write.
+R=$(m1 "akb_grep" "{\"pattern\":\"OLD_PLACEHOLDER\",\"vault\":\"$VAULT1\",\"replace\":\"NEW_VALUE\",\"limit\":1,\"max_replacements\":3}")
 REPLACED_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('replaced_docs',0) or len(d.get('replaced',d.get('replacements',[]))))" 2>/dev/null)
 [ "$REPLACED_COUNT" = "3" ] && pass "Replaced in $REPLACED_COUNT documents" || fail "Grep replace" "expected 3, got $REPLACED_COUNT"
+PARENT_COUNT=$(echo "$R" | python3 -c "import sys,json; print(sum(bool(x.get('previous_commit')) for x in json.load(sys.stdin).get('replacements',[])))" 2>/dev/null)
+[ "$PARENT_COUNT" = "3" ] && pass "Replacement receipts include previous commits" || fail "Replace receipts" "$R"
 
 # Verify replacement (wait for the post-replace re-index)
 wait_for_indexing
