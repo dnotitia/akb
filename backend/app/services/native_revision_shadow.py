@@ -58,6 +58,9 @@ _RULE_CLASSIFICATION = {
     "BR-06": "activity_display",
     "BR-07": "lineage_boundary",
 }
+_ACTIVITY_AUDIT_PROFILE = "akb-native-revision-p2-activity-audit/v1"
+_EVIDENCE_BINDING_CANONICALIZATION = "utf8-json-sort-keys-no-whitespace-v1"
+_EVIDENCE_BINDING_DOMAIN = "akb-native-revision-p2-w1-c10/evidence-binding/v1"
 __all__ = (
     "LegacyFixedRefShadowReader",
     "NativeRevisionShadowReader",
@@ -99,11 +102,18 @@ class MigrationReadRepository(Protocol):
 
 
 class _NativeBinding:
-    __slots__ = ("fixed_ref", "native_revision_id")
+    __slots__ = ("fixed_ref", "native_revision_id", "evidence_fact")
 
-    def __init__(self, *, fixed_ref: str, native_revision_id: str):
+    def __init__(
+        self,
+        *,
+        fixed_ref: str,
+        native_revision_id: str,
+        evidence_fact: dict[str, Any],
+    ):
         self.fixed_ref = fixed_ref
         self.native_revision_id = native_revision_id
+        self.evidence_fact = evidence_fact
 
 
 class InventoryReader(Protocol):
@@ -143,11 +153,19 @@ class ShadowReader(Protocol):
         fixed_ref: str,
     ) -> Mapping[str, Any]: ...
 
+    async def audit_activity(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> None: ...
+
 
 class NativeRevisionShadowComparator:
     """Compare legacy and candidate reads without opening a write path."""
 
-    protocol_version = "akb-native-revision-p2-w1-c10/v3"
+    protocol_version = "akb-native-revision-p2-w1-c10/v4"
 
     def __init__(
         self,
@@ -174,6 +192,7 @@ class NativeRevisionShadowComparator:
             raise NotFoundError("Native revision migration run", str(parsed_run_id))
         if self._value(run, "status") != "complete":
             raise ShadowRunIncompleteError(parsed_run_id)
+        run_facts = self._run_facts(run, label="completed comparison run")
 
         # The bridge is deliberately called before any candidate read.  Its
         # inventory digest check is the immutable C9 gate and its existing
@@ -194,9 +213,10 @@ class NativeRevisionShadowComparator:
                     bindings[document.resource_id],
                 )
             )
+        evidence_binding = self._evidence_binding(run_facts, bindings)
 
         receipt: dict[str, Any] = {
-            "schema_version": 3,
+            "schema_version": 4,
             "protocol_version": self.protocol_version,
             "status": "passed",
             "passed": True,
@@ -224,6 +244,15 @@ class NativeRevisionShadowComparator:
                 ),
                 "unexplained_mismatch_count": 0,
                 "classified_mismatches": self._classified_mismatches(resources),
+                "raw_activity_audit_count": sum(
+                    1
+                    for resource in resources
+                    if resource["operations"]["activity"].get("raw_activity_audit")
+                    == {
+                        "profile": _ACTIVITY_AUDIT_PROFILE,
+                        "status": "passed",
+                    }
+                ),
                 "used_rules": sorted(
                     {
                         mismatch["rule_id"]
@@ -233,6 +262,7 @@ class NativeRevisionShadowComparator:
                     }
                 ),
             },
+            "evidence_binding": evidence_binding,
         }
         receipt["receipt_digest"] = self._digest(receipt)
         return receipt
@@ -270,6 +300,11 @@ class NativeRevisionShadowComparator:
             )
             candidate = raw_candidate
             if operation == "activity":
+                await self._audit_candidate_activity(
+                    document,
+                    selector=native_revision_id,
+                    fixed_ref=binding.fixed_ref,
+                )
                 candidate = self._project_candidate_activity(
                     legacy,
                     raw_candidate,
@@ -283,13 +318,35 @@ class NativeRevisionShadowComparator:
                 document,
                 native_revision_id,
             )
-            operations[operation] = {
+            operation_result: dict[str, Any] = {
                 "normalized_equal": True,
                 "mismatch_count": len(mismatches),
                 "mismatch_classes": sorted({mismatch["classification"] for mismatch in mismatches}),
                 "classified_mismatches": self._count_operation_mismatches(mismatches),
             }
+            if operation == "activity":
+                operation_result["raw_activity_audit"] = {
+                    "profile": _ACTIVITY_AUDIT_PROFILE,
+                    "status": "passed",
+                }
+            operations[operation] = operation_result
         return {"operations": operations}
+
+    async def _audit_candidate_activity(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> None:
+        auditor = getattr(self.candidate_reader, "audit_activity", None)
+        if auditor is None:
+            raise ShadowComparisonError(
+                "candidate reader cannot prove the raw native activity audit"
+            )
+        value = auditor(document, selector=selector, fixed_ref=fixed_ref)
+        if inspect.isawaitable(value):
+            await value
 
     async def _read(
         self,
@@ -514,8 +571,137 @@ class NativeRevisionShadowComparator:
         current[tokens[-1]] = value
 
     @classmethod
+    def _run_facts(cls, run: Any, *, label: str) -> dict[str, str]:
+        try:
+            run_id = uuid.UUID(str(cls._value(run, "run_id")))
+            namespace_id = uuid.UUID(str(cls._value(run, "namespace_id")))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ShadowComparisonError(f"{label} has invalid UUID facts") from exc
+        fixed_git_oid = cls._value(run, "fixed_git_oid")
+        inventory_digest = cls._value(run, "inventory_digest")
+        coverage_version = cls._value(run, "coverage_version")
+        status = cls._value(run, "status")
+        if (
+            not isinstance(fixed_git_oid, str)
+            or _OID_RE.fullmatch(fixed_git_oid) is None
+            or not isinstance(inventory_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", inventory_digest) is None
+            or not isinstance(coverage_version, str)
+            or not coverage_version
+            or status != "complete"
+        ):
+            raise ShadowComparisonError(f"{label} has invalid immutable scope facts")
+        return {
+            "run_id": str(run_id),
+            "namespace_id": str(namespace_id),
+            "fixed_git_oid": fixed_git_oid,
+            "inventory_digest": inventory_digest,
+            "coverage_version": coverage_version,
+            "status": status,
+        }
+
+    @classmethod
+    def _mapping_evidence_fact(
+        cls,
+        *,
+        run: Any,
+        document: LegacyInventoryDocument,
+        mapping: Any,
+        owner_facts: dict[str, str],
+        native_revision_id: str,
+    ) -> dict[str, Any]:
+        try:
+            run_namespace = uuid.UUID(str(cls._value(run, "namespace_id")))
+            mapping_namespace = uuid.UUID(str(cls._value(mapping, "namespace_id")))
+            mapping_resource = uuid.UUID(str(cls._value(mapping, "resource_id")))
+            mapping_owner = uuid.UUID(str(cls._value(mapping, "run_id")))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ShadowComparisonError("completed mapping has invalid UUID facts") from exc
+        legacy_head_oid = cls._value(mapping, "legacy_git_oid")
+        path_at_revision = cls._value(mapping, "path_at_revision")
+        resolution = cls._value(mapping, "resolution")
+        lineage_ordinal = cls._value(mapping, "lineage_ordinal")
+        mapping_native_id = cls._value(mapping, "native_revision_id")
+        mapping_fixed_ref = cls._value(mapping, "fixed_git_oid")
+        if (
+            mapping_namespace != run_namespace
+            or mapping_resource != document.resource_id
+            or legacy_head_oid != document.current_commit
+            or not isinstance(legacy_head_oid, str)
+            or _OID_RE.fullmatch(legacy_head_oid) is None
+            or path_at_revision != document.current_path
+            or not isinstance(path_at_revision, str)
+            or not path_at_revision.strip()
+            or resolution != "native"
+            or not isinstance(mapping_native_id, str)
+            or mapping_native_id != native_revision_id
+            or _OID_RE.fullmatch(mapping_native_id) is None
+            or not isinstance(lineage_ordinal, int)
+            or isinstance(lineage_ordinal, bool)
+            or lineage_ordinal != len(document.lineage) - 1
+            or not isinstance(mapping_fixed_ref, str)
+            or _OID_RE.fullmatch(mapping_fixed_ref) is None
+            or mapping_owner != uuid.UUID(owner_facts["run_id"])
+            or mapping_fixed_ref != owner_facts["fixed_git_oid"]
+        ):
+            raise ShadowComparisonError(
+                "completed current native mapping differs from its immutable owner facts"
+            )
+        return {
+            "resource_id": str(mapping_resource),
+            "legacy_head_oid": legacy_head_oid,
+            "path_at_revision": path_at_revision,
+            "native_revision_id": mapping_native_id,
+            "lineage_ordinal": lineage_ordinal,
+            "resolution": resolution,
+            "owner_run": owner_facts,
+        }
+
+    @classmethod
+    def _evidence_binding(
+        cls,
+        run_facts: dict[str, str],
+        bindings: dict[uuid.UUID, _NativeBinding],
+    ) -> dict[str, Any]:
+        mappings = sorted(
+            (copy.deepcopy(binding.evidence_fact) for binding in bindings.values()),
+            key=lambda fact: (
+                fact["resource_id"],
+                fact["legacy_head_oid"],
+                fact["native_revision_id"],
+            ),
+        )
+        preimage = {
+            "comparison_run": run_facts,
+            "mapping_owner_scope": mappings,
+        }
+        canonical = json.dumps(
+            preimage,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        commitment = hashlib.sha256(
+            _EVIDENCE_BINDING_DOMAIN.encode("utf-8") + b"\0" + canonical
+        ).hexdigest()
+        owner_run_ids = {fact["owner_run"]["run_id"] for fact in mappings}
+        return {
+            "scheme": "sha256",
+            "canonicalization": _EVIDENCE_BINDING_CANONICALIZATION,
+            "domain": _EVIDENCE_BINDING_DOMAIN,
+            "commitment": commitment,
+            "mapping_count": len(mappings),
+            "owner_run_count": len(owner_run_ids),
+        }
+
+    @classmethod
     def _validate_inventory_binding(cls, run: MigrationRun, inventory: LegacyInventory) -> None:
-        if cls._value(run, "inventory_digest") != cls._value(inventory, "inventory_digest"):
+        cls._run_facts(run, label="completed comparison run")
+        if (
+            cls._value(run, "namespace_id") != cls._value(inventory, "namespace_id")
+            or cls._value(run, "inventory_digest") != cls._value(inventory, "inventory_digest")
+            or cls._value(run, "coverage_version") != cls._value(inventory, "coverage_version")
+        ):
             raise ShadowComparisonError("C9 inventory digest does not match the completed run")
         if cls._value(run, "fixed_git_oid") != cls._value(inventory, "fixed_git_oid"):
             raise ShadowComparisonError("C9 inventory fixed_ref does not match the completed run")
@@ -538,6 +724,7 @@ class NativeRevisionShadowComparator:
         documents: tuple[LegacyInventoryDocument, ...],
         items: list[MigrationItem],
     ) -> dict[uuid.UUID, _NativeBinding]:
+        comparison_run_facts = self._run_facts(run, label="completed comparison run")
         documents_by_id = {document.resource_id: document for document in documents}
         items_by_id: dict[uuid.UUID, MigrationItem] = {}
         for item in items:
@@ -616,23 +803,37 @@ class NativeRevisionShadowComparator:
                 )
 
             owner_run_id = self._value(mapping, "run_id")
+            try:
+                owner_run_uuid = uuid.UUID(str(owner_run_id))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ShadowComparisonError(
+                    "immutable mapping owner has an invalid run id"
+                ) from exc
             owner = (
                 run
-                if owner_run_id == self._value(run, "run_id")
-                else await self.repository.get_run(owner_run_id)
+                if owner_run_uuid == uuid.UUID(comparison_run_facts["run_id"])
+                else await self.repository.get_run(owner_run_uuid)
+            )
+            if owner is None:
+                raise ShadowComparisonError(
+                    "immutable mapping owner is not a completed fixed-ref run"
+                )
+            owner_facts = (
+                comparison_run_facts
+                if owner is run
+                else self._run_facts(owner, label="immutable mapping owner run")
             )
             if (
-                owner is None
-                or self._value(owner, "status") != "complete"
-                or self._value(owner, "namespace_id") != self._value(run, "namespace_id")
-                or self._value(owner, "fixed_git_oid") != fixed_ref
+                owner_facts["status"] != "complete"
+                or owner_facts["namespace_id"] != comparison_run_facts["namespace_id"]
+                or owner_facts["fixed_git_oid"] != fixed_ref
             ):
                 raise ShadowComparisonError(
                     "immutable mapping owner is not a completed fixed-ref run"
                 )
 
             current_item = items_by_id.get(document.resource_id)
-            if owner_run_id == self._value(run, "run_id"):
+            if owner_run_uuid == uuid.UUID(comparison_run_facts["run_id"]):
                 if (
                     current_item is None
                     or self._value(current_item, "native_head_revision_id") != native_id
@@ -644,9 +845,17 @@ class NativeRevisionShadowComparator:
                 raise ShadowComparisonError(
                     "current-run item attempts to re-home an immutable mapping"
                 )
+            evidence_fact = self._mapping_evidence_fact(
+                run=run,
+                document=document,
+                mapping=mapping,
+                owner_facts=owner_facts,
+                native_revision_id=native_id,
+            )
             result[document.resource_id] = _NativeBinding(
                 fixed_ref=fixed_ref,
                 native_revision_id=native_id,
+                evidence_fact=evidence_fact,
             )
         return result
 
@@ -689,7 +898,7 @@ class NativeRevisionShadowComparator:
 
     @staticmethod
     def _value(value: Any, name: str) -> Any:
-        return value.get(name) if isinstance(value, Mapping) else getattr(value, name)
+        return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
 
     @staticmethod
     def _run_id(value: uuid.UUID | str) -> uuid.UUID:

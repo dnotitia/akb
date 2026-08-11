@@ -87,6 +87,69 @@ class _ReadRepository:
         )
 
 
+class _EvidenceRepository:
+    def __init__(
+        self,
+        run: MigrationRun,
+        items: list[MigrationItem],
+        native_ids: dict[uuid.UUID, str],
+        *,
+        owner_runs: list[MigrationRun] = (),
+        mapping_owner_ids: dict[uuid.UUID, uuid.UUID] | None = None,
+        reverse_items: bool = False,
+    ):
+        self.run = run
+        self.items = list(reversed(items)) if reverse_items else list(items)
+        self.native_ids = native_ids
+        self.owner_runs = {run.run_id: run}
+        self.owner_runs.update({owner.run_id: owner for owner in owner_runs})
+        self.mapping_owner_ids = mapping_owner_ids or {}
+
+    async def get_run(self, run_id: uuid.UUID) -> MigrationRun | None:
+        return self.owner_runs.get(run_id)
+
+    async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]:
+        assert run_id == self.run.run_id
+        return list(self.items)
+
+    async def exact_mapping(
+        self,
+        *,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+    ) -> LegacyRevisionMapping | None:
+        item = next(
+            (
+                item
+                for item in self.items
+                if item.legacy_document_id == resource_id
+                and item.legacy_head_oid == legacy_git_oid
+            ),
+            None,
+        )
+        owner_id = self.mapping_owner_ids.get(resource_id, self.run.run_id)
+        owner = self.owner_runs[owner_id]
+        return LegacyRevisionMapping(
+            namespace_id=self.run.namespace_id,
+            resource_id=resource_id,
+            legacy_git_oid=legacy_git_oid,
+            path_at_revision=next(
+                document.current_path
+                for document in _fixtures()[1].documents
+                if document.resource_id == resource_id
+            ),
+            resolution="native",
+            native_revision_id=(
+                item.native_head_revision_id
+                if item is not None
+                else self.native_ids[resource_id]
+            ),
+            run_id=owner_id,
+            lineage_ordinal=1,
+            fixed_git_oid=owner.fixed_git_oid,
+        )
+
+
 class _Bridge:
     def __init__(self, inventory: LegacyInventory):
         self.inventory = inventory
@@ -293,6 +356,15 @@ class _Reader:
             ]
         }
 
+    async def audit_activity(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> None:
+        del document, selector, fixed_ref
+
 
 class _CrossRunReadRepository:
     def __init__(
@@ -373,6 +445,11 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert receipt["write_authority"] == "legacy_only"
     assert receipt["final_p2_coverage_claim"] is False
     assert receipt["cutover_claim"] is False
+    assert receipt["schema_version"] == 4
+    assert receipt["protocol_version"] == "akb-native-revision-p2-w1-c10/v4"
+    assert receipt["summary"]["raw_activity_audit_count"] == 2
+    assert receipt["evidence_binding"]["mapping_count"] == 2
+    assert receipt["evidence_binding"]["owner_run_count"] == 1
     assert len(receipt["resources"]) == 2
     assert set(receipt["summary"]["used_rules"]) == {f"BR-0{index}" for index in range(1, 8)}
     for resource in receipt["resources"]:
@@ -384,6 +461,10 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
             )
             for mismatch in operation["classified_mismatches"]:
                 assert set(mismatch) == {"rule_id", "classification", "count"}
+        assert resource["operations"]["activity"]["raw_activity_audit"] == {
+            "profile": "akb-native-revision-p2-activity-audit/v1",
+            "status": "passed",
+        }
     encoded = json.dumps(receipt, sort_keys=True)
     assert all(document.body.decode() not in encoded for document in inventory.documents)
     assert all(str(document.resource_id) not in encoded for document in inventory.documents)
@@ -451,6 +532,7 @@ async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_
     assert receipt["status"] == "passed"
     assert receipt["summary"]["resource_count"] == 2
     assert receipt["summary"]["operation_count"] == 8
+    assert receipt["summary"]["raw_activity_audit_count"] == 2
 
 
 async def test_incomplete_run_and_inventory_drift_are_rejected_before_reads():
@@ -527,3 +609,121 @@ async def test_stale_or_cross_run_item_binding_fails_before_any_reader(
         await comparator.compare_run(run.run_id)
     assert legacy.calls == []
     assert candidate.calls == []
+
+
+def _evidence_comparator(
+    run: MigrationRun,
+    inventory: LegacyInventory,
+    repository: _EvidenceRepository,
+    native_ids: dict[uuid.UUID, str],
+    *,
+    fixed_refs: dict[uuid.UUID, str] | None = None,
+) -> NativeRevisionShadowComparator:
+    refs = fixed_refs or {resource_id: run.fixed_git_oid for resource_id in native_ids}
+    return NativeRevisionShadowComparator(
+        repository=repository,
+        bridge=_Bridge(inventory),
+        legacy_reader=_Reader(native_ids, candidate=False, fixed_refs=refs),
+        candidate_reader=_Reader(native_ids, candidate=True, fixed_refs=refs),
+    )
+
+
+async def test_evidence_binding_is_stable_under_scope_and_item_order_shuffle():
+    run, inventory, items, native_ids = _fixtures()
+    shuffled_inventory = replace(inventory, documents=tuple(reversed(inventory.documents)))
+    first = await _evidence_comparator(
+        run,
+        inventory,
+        _EvidenceRepository(run, items, native_ids),
+        native_ids,
+    ).compare_run(run.run_id)
+    second = await _evidence_comparator(
+        run,
+        shuffled_inventory,
+        _EvidenceRepository(run, list(reversed(items)), native_ids, reverse_items=True),
+        native_ids,
+    ).compare_run(run.run_id)
+
+    assert first["evidence_binding"] == second["evidence_binding"]
+    assert first["receipt_digest"] == second["receipt_digest"]
+    assert first["summary"]["raw_activity_audit_count"] == 2
+    assert all(
+        resource["operations"]["activity"]["raw_activity_audit"]["status"] == "passed"
+        for resource in first["resources"]
+    )
+    encoded = json.dumps(first, sort_keys=True)
+    assert all(document.body.decode() not in encoded for document in inventory.documents)
+    assert all(document.current_path not in encoded for document in inventory.documents)
+    assert all(str(document.resource_id) not in encoded for document in inventory.documents)
+    assert all(document.activity.actor not in encoded for document in inventory.documents)
+    assert all(document.activity.subject not in encoded for document in inventory.documents)
+    assert all(document.activity.summary not in encoded for document in inventory.documents)
+
+
+@pytest.mark.parametrize("changed", ("run", "ref", "inventory", "mapping_owner"))
+async def test_evidence_binding_changes_when_any_private_scope_fact_changes(changed):
+    run, inventory, items, native_ids = _fixtures()
+    base = await _evidence_comparator(
+        run,
+        inventory,
+        _EvidenceRepository(run, items, native_ids),
+        native_ids,
+    ).compare_run(run.run_id)
+
+    if changed == "run":
+        changed_run = replace(
+            run,
+            run_id=uuid.UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        )
+        changed_items = [replace(item, run_id=changed_run.run_id) for item in items]
+        changed_inventory = inventory
+        changed_repo = _EvidenceRepository(changed_run, changed_items, native_ids)
+        changed_receipt = await _evidence_comparator(
+            changed_run,
+            changed_inventory,
+            changed_repo,
+            native_ids,
+        ).compare_run(changed_run.run_id)
+    elif changed == "ref":
+        changed_run = replace(run, fixed_git_oid=_oid("a"))
+        changed_inventory = replace(inventory, fixed_git_oid=changed_run.fixed_git_oid)
+        refs = {resource_id: changed_run.fixed_git_oid for resource_id in native_ids}
+        changed_receipt = await _evidence_comparator(
+            changed_run,
+            changed_inventory,
+            _EvidenceRepository(changed_run, items, native_ids),
+            native_ids,
+            fixed_refs=refs,
+        ).compare_run(changed_run.run_id)
+    elif changed == "inventory":
+        changed_run = replace(run, inventory_digest="e" * 64)
+        changed_inventory = replace(inventory, inventory_digest=changed_run.inventory_digest)
+        changed_receipt = await _evidence_comparator(
+            changed_run,
+            changed_inventory,
+            _EvidenceRepository(changed_run, items, native_ids),
+            native_ids,
+        ).compare_run(changed_run.run_id)
+    else:
+        owner = replace(
+            run,
+            run_id=uuid.UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+            fixed_git_oid=_oid("b"),
+            inventory_digest="f" * 64,
+        )
+        refs = {resource_id: owner.fixed_git_oid for resource_id in native_ids}
+        changed_receipt = await _evidence_comparator(
+            run,
+            inventory,
+            _EvidenceRepository(
+                run,
+                [],
+                native_ids,
+                owner_runs=[owner],
+                mapping_owner_ids={resource_id: owner.run_id for resource_id in native_ids},
+            ),
+            native_ids,
+            fixed_refs=refs,
+        ).compare_run(run.run_id)
+
+    assert base["evidence_binding"]["commitment"] != changed_receipt["evidence_binding"]["commitment"]

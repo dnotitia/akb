@@ -34,7 +34,10 @@ from app.services.legacy_revision_bridge import (
     SelectorResolution,
     SelectorUnknownError,
 )
-from app.services.native_revision_shadow import NativeRevisionShadowComparator
+from app.services.native_revision_shadow import (
+    NativeRevisionShadowComparator,
+    ShadowComparisonError,
+)
 from app.services.native_revision_shadow_reader import (
     _apply_unified_patch,
     LegacyFixedRefShadowReader,
@@ -392,6 +395,15 @@ class _WireReader:
             ]
         }
 
+    async def audit_activity(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> None:
+        del document, selector, fixed_ref
+
 
 class _NoWriteGit:
     def __init__(self, *documents: LegacyInventoryDocument):
@@ -660,6 +672,193 @@ class _SelectorBridgeRouter:
             resource_id=resource_id,
             selector=selector,
         )
+
+
+def _activity_for_revision(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "resource_id": row["resource_id"],
+        "revision_id": row["revision_id"],
+        "action": row["action"],
+        "actor": row["actor"],
+        "subject": row["subject"],
+        "summary": row["summary"],
+        "changed_path_from": row["path_from"],
+        "changed_path_to": row["path_to"],
+        "occurred_at": row["occurred_at"],
+        "path_at_revision": row["path_at_revision"],
+    }
+
+
+def _native_activity_reader(
+    document: LegacyInventoryDocument,
+    native_id: str,
+    fixed_ref: str,
+    service: _NoWriteNative,
+    repository: _NoWriteNativeRepository,
+) -> NativeRevisionShadowReader:
+    return NativeRevisionShadowReader(
+        pool=None,
+        namespace_id=uuid.UUID("22222222-2222-4222-8222-222222222222"),
+        vault_name="p2-manual",
+        native_service=service,
+        native_repository=repository,
+        selector_bridge=_CompletedSelectorBridge(document, native_id, fixed_ref),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action", "replace"),
+        ("actor", "forged-actor"),
+        ("subject", "forged-subject"),
+        ("summary", "forged-summary"),
+        ("path_from", "notes/forged-parent.md"),
+        ("path_to", "notes/forged-current.md"),
+        ("occurred_at", datetime(2026, 8, 11, tzinfo=UTC)),
+    ],
+)
+async def test_genesis_activity_audit_rejects_forged_persisted_facts(field, value):
+    document = _document()
+    native_id = _oid("c")
+    fixed_ref = _oid("f")
+    service = _NoWriteNative((document, native_id))
+    repository = _NoWriteNativeRepository((document, native_id))
+    row = repository._revision(document.resource_id)
+    forged = {**row, field: value}
+    repository.revision_selector_overrides[(document.resource_id, native_id)] = forged
+    repository.activity_override = _activity_for_revision(forged)
+    snapshot = _Snapshot(
+        resource_id=document.resource_id,
+        revision_id=native_id,
+        surface="document",
+        path=document.current_path,
+        text=document.body.decode(),
+        digest=document.body_digest,
+        byte_size=document.byte_size,
+        action=forged["action"],
+        occurred_at=forged["occurred_at"],
+    )
+    service.snapshot_overrides[(document.resource_id, native_id)] = snapshot
+
+    with pytest.raises(ShadowReaderScopeError, match="activity audit"):
+        await _native_activity_reader(
+            document,
+            native_id,
+            fixed_ref,
+            service,
+            repository,
+        ).activity(document, selector=native_id, fixed_ref=fixed_ref)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action", "replace"),
+        ("actor", "forged-actor"),
+        ("summary", "forged-summary"),
+    ],
+)
+async def test_reconcile_activity_audit_derives_action_from_parent_and_current_paths(
+    field,
+    value,
+):
+    document = _document()
+    native_id = _oid("c")
+    parent_id = _oid("e")
+    fixed_ref = _oid("f")
+    service = _NoWriteNative((document, native_id))
+    repository = _NoWriteNativeRepository((document, native_id))
+    old_path = "notes/old-migration-candidate.md"
+    selected = {
+        **repository._revision(document.resource_id),
+        "action": "move",
+        "parent_revision_id": parent_id,
+        "path_from": old_path,
+        "path_to": document.current_path,
+        "actor": document.activity.actor,
+        "subject": document.activity.subject,
+        "summary": document.activity.summary,
+    }
+    if field == "action":
+        selected = {
+            **selected,
+            "action": value,
+            "path_from": None,
+            "path_to": None,
+        }
+    else:
+        selected = {**selected, field: value}
+    parent = {
+        **repository._revision(document.resource_id),
+        "revision_id": parent_id,
+        "path_at_revision": old_path,
+        "path_from": None,
+        "path_to": old_path,
+    }
+    repository.revision_selector_overrides[(document.resource_id, native_id)] = selected
+    repository.revision_selector_overrides[(document.resource_id, parent_id)] = parent
+    repository.activity_override = _activity_for_revision(selected)
+    repository.history_overrides[document.resource_id] = [selected, parent]
+    service.snapshot_overrides[(document.resource_id, native_id)] = _Snapshot(
+        resource_id=document.resource_id,
+        revision_id=native_id,
+        surface="document",
+        path=document.current_path,
+        text=document.body.decode(),
+        digest=document.body_digest,
+        byte_size=document.byte_size,
+        action=selected["action"],
+        parent_revision_id=parent_id,
+        occurred_at=selected["occurred_at"],
+    )
+
+    with pytest.raises(ShadowReaderScopeError, match="activity audit"):
+        await _native_activity_reader(
+            document,
+            native_id,
+            fixed_ref,
+            service,
+            repository,
+        ).activity(document, selector=native_id, fixed_ref=fixed_ref)
+
+
+async def test_activity_audit_failure_prevents_shadow_projection(monkeypatch):
+    document = _document()
+    run, item, inventory, native_id = _run_and_item(document)
+    service = _NoWriteNative((document, native_id))
+    repository = _NoWriteNativeRepository((document, native_id))
+    forged = {**repository._revision(document.resource_id), "actor": "forged-actor"}
+    repository.revision_selector_overrides[(document.resource_id, native_id)] = forged
+    repository.activity_override = _activity_for_revision(forged)
+    native_candidate = _native_activity_reader(
+        document,
+        native_id,
+        run.fixed_git_oid,
+        service,
+        repository,
+    )
+    candidate = _WireReader(native_id, candidate=True)
+    candidate.activity = native_candidate.activity
+    candidate.audit_activity = native_candidate.audit_activity
+    comparator = NativeRevisionShadowComparator(
+        repository=_ReadRepository(run, item),
+        bridge=_InventoryBridge(inventory),
+        legacy_reader=_WireReader(native_id, candidate=False),
+        candidate_reader=candidate,
+    )
+    projection_calls: list[object] = []
+
+    def project(*args):
+        del args
+        projection_calls.append(object())
+        raise AssertionError("activity projection ran after audit failure")
+
+    monkeypatch.setattr(comparator, "_project_candidate_activity", project)
+
+    with pytest.raises(ShadowReaderScopeError, match="activity audit"):
+        await comparator.compare_run(run.run_id)
+    assert projection_calls == []
 
 
 async def test_product_readers_are_scoped_and_read_only():
@@ -1161,13 +1360,34 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert document.body.decode() not in encoded
     assert document.current_path not in encoded
     assert str(document.resource_id) not in encoded
+    assert document.activity.actor not in encoded
+    assert document.activity.subject not in encoded
+    assert document.activity.summary not in encoded
     assert str(run.run_id) not in encoded
     assert "raw_candidate" not in receipt
-    assert receipt["schema_version"] == 3
-    assert receipt["protocol_version"].endswith("/v3")
+    assert receipt["schema_version"] == 4
+    assert receipt["protocol_version"] == "akb-native-revision-p2-w1-c10/v4"
     assert "legacy" not in receipt["resources"][0]["operations"]["get"]
     assert receipt["summary"]["unexplained_mismatch_count"] == 0
     assert receipt["summary"]["mismatch_count"] == 12
+    assert receipt["summary"]["raw_activity_audit_count"] == 1
+    assert receipt["evidence_binding"]["mapping_count"] == 1
+    assert receipt["evidence_binding"]["owner_run_count"] == 1
+    assert receipt["evidence_binding"]["scheme"] == "sha256"
+    assert receipt["evidence_binding"]["canonicalization"] == (
+        "utf8-json-sort-keys-no-whitespace-v1"
+    )
+    assert receipt["evidence_binding"]["domain"] == (
+        "akb-native-revision-p2-w1-c10/evidence-binding/v1"
+    )
+    assert len(receipt["evidence_binding"]["commitment"]) == 64
+    assert all(
+        resource["operations"]["activity"]["raw_activity_audit"] == {
+            "profile": "akb-native-revision-p2-activity-audit/v1",
+            "status": "passed",
+        }
+        for resource in receipt["resources"]
+    )
     assert receipt["resources"][0]["operations"]["get"]["classified_mismatches"] == [
         {
             "rule_id": "BR-01",
@@ -1188,6 +1408,25 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert document.current_commit not in encoded
     assert run.fixed_git_oid not in encoded
     assert run.inventory_digest not in encoded
+
+
+async def test_comparator_requires_a_candidate_raw_activity_auditor():
+    document = _document()
+    run, item, inventory, native_id = _run_and_item(document)
+    candidate = _WireReader(native_id, candidate=True)
+    candidate.audit_activity = None
+    comparator = NativeRevisionShadowComparator(
+        repository=_ReadRepository(run, item),
+        bridge=_InventoryBridge(inventory),
+        legacy_reader=_WireReader(native_id, candidate=False),
+        candidate_reader=candidate,
+    )
+
+    with pytest.raises(
+        ShadowComparisonError,
+        match="cannot prove the raw native activity audit",
+    ):
+        await comparator.compare_run(run.run_id)
 
 
 async def test_product_readers_compare_a_completed_pg_backfill_without_writes(tmp_path):

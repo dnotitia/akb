@@ -34,6 +34,7 @@ _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _HUNK_RE = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
 )
+_NATIVE_ACTIVITY_MIGRATION_ACTOR = "akb-native-revision-migration"
 
 
 class ShadowReaderScopeError(ConflictError):
@@ -1049,13 +1050,34 @@ class NativeRevisionShadowReader:
             "format": "unified",
         }
 
-    async def activity(
+    async def audit_activity(
         self,
         document: LegacyInventoryDocument,
         *,
         selector: str,
         fixed_ref: str,
-    ) -> dict[str, Any]:
+    ) -> None:
+        """Validate persisted native activity before a shadow projection."""
+
+        snapshot, raw_selected, activity = await self._activity_facts(
+            document,
+            selector=selector,
+            fixed_ref=fixed_ref,
+        )
+        await self._audit_activity_facts(
+            document,
+            snapshot=snapshot,
+            raw_selected=raw_selected,
+            activity=activity,
+        )
+
+    async def _activity_facts(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> tuple[_NativeMaterialization, Mapping[str, Any], Mapping[str, Any]]:
         snapshot = await self._native_snapshot(document, selector=selector, fixed_ref=fixed_ref)
         raw_selected = await self.native_repository.get_revision(
             resource_id=document.resource_id,
@@ -1063,6 +1085,11 @@ class NativeRevisionShadowReader:
         )
         if not isinstance(raw_selected, Mapping):
             raise ShadowReaderScopeError("native revision activity selection is missing")
+        if (
+            raw_selected.get("namespace_id") != self.namespace_id
+            or raw_selected.get("surface") != "document"
+        ):
+            raise ShadowReaderScopeError("native activity audit selected Revision is out of scope")
         self._validate_selected_revision(
             raw_selected,
             snapshot,
@@ -1077,7 +1104,6 @@ class NativeRevisionShadowReader:
         )
         if not isinstance(raw_activity, Mapping):
             raise ShadowReaderScopeError("native revision activity is missing")
-        activity = raw_activity
         expected = (
             document.resource_id,
             selector,
@@ -1091,21 +1117,150 @@ class NativeRevisionShadowReader:
             self._row_path(raw_selected),
         )
         observed = (
-            activity.get("resource_id"),
-            activity.get("revision_id"),
-            activity.get("action"),
-            activity.get("actor"),
-            activity.get("subject"),
-            activity.get("summary"),
-            activity.get("changed_path_from"),
-            activity.get("changed_path_to"),
-            activity.get("occurred_at"),
-            activity.get("path_at_revision"),
+            raw_activity.get("resource_id"),
+            raw_activity.get("revision_id"),
+            raw_activity.get("action"),
+            raw_activity.get("actor"),
+            raw_activity.get("subject"),
+            raw_activity.get("summary"),
+            raw_activity.get("changed_path_from"),
+            raw_activity.get("changed_path_to"),
+            raw_activity.get("occurred_at"),
+            raw_activity.get("path_at_revision"),
         )
         if observed != expected:
             raise ShadowReaderScopeError(
                 "native revision activity differs from persisted Revision facts"
             )
+        return snapshot, raw_selected, raw_activity
+
+    async def _audit_activity_facts(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        snapshot: _NativeMaterialization,
+        raw_selected: Mapping[str, Any],
+        activity: Mapping[str, Any],
+    ) -> None:
+        if not document.lineage:
+            raise ShadowReaderScopeError("native activity audit has no frozen lineage head")
+        frozen_time = document.lineage[-1].committed_at
+        if (
+            snapshot.occurred_at != frozen_time
+            or raw_selected.get("occurred_at") != frozen_time
+            or activity.get("occurred_at") != frozen_time
+        ):
+            raise ShadowReaderScopeError(
+                "native activity audit timestamp differs from frozen lineage head"
+            )
+
+        parent_id = raw_selected.get("parent_revision_id")
+        if parent_id is None:
+            expected = {
+                "action": "create",
+                "actor": _NATIVE_ACTIVITY_MIGRATION_ACTOR,
+                "subject": None,
+                "summary": None,
+                "path_from": None,
+                "path_to": document.current_path,
+            }
+            observed_revision = {
+                "action": raw_selected.get("action"),
+                "actor": raw_selected.get("actor"),
+                "subject": raw_selected.get("subject"),
+                "summary": raw_selected.get("summary"),
+                "path_from": raw_selected.get("path_from"),
+                "path_to": raw_selected.get("path_to"),
+            }
+            observed_activity = {
+                "action": activity.get("action"),
+                "actor": activity.get("actor"),
+                "subject": activity.get("subject"),
+                "summary": activity.get("summary"),
+                "path_from": activity.get("changed_path_from"),
+                "path_to": activity.get("changed_path_to"),
+            }
+            if observed_revision != expected or observed_activity != expected:
+                raise ShadowReaderScopeError(
+                    "native activity audit genesis facts are invalid"
+                )
+            return
+
+        _require_oid(parent_id, "native activity parent revision")
+        if parent_id == raw_selected.get("revision_id"):
+            raise ShadowReaderScopeError("native activity audit parent is self-referential")
+        raw_parent = await self.native_repository.get_revision(
+            resource_id=document.resource_id,
+            revision_id=parent_id,
+        )
+        if not isinstance(raw_parent, Mapping):
+            raise ShadowReaderScopeError("native activity audit parent Revision is missing")
+        if (
+            raw_parent.get("namespace_id") != self.namespace_id
+            or raw_parent.get("resource_id") != document.resource_id
+            or raw_parent.get("surface") != "document"
+            or raw_parent.get("revision_id") != parent_id
+        ):
+            raise ShadowReaderScopeError(
+                "native activity audit parent Revision is outside the Resource scope"
+            )
+        parent_path = self._row_path(raw_parent)
+        current_path = self._row_path(raw_selected)
+        if (
+            not isinstance(parent_path, str)
+            or not parent_path
+            or not isinstance(current_path, str)
+            or not current_path
+        ):
+            raise ShadowReaderScopeError("native activity audit parent/current path is invalid")
+        action = "move" if parent_path != current_path else "replace"
+        expected = {
+            "action": action,
+            "actor": document.activity.actor,
+            "subject": document.activity.subject,
+            "summary": document.activity.summary,
+            "path_from": parent_path if action == "move" else None,
+            "path_to": current_path if action == "move" else None,
+        }
+        observed_revision = {
+            "action": raw_selected.get("action"),
+            "actor": raw_selected.get("actor"),
+            "subject": raw_selected.get("subject"),
+            "summary": raw_selected.get("summary"),
+            "path_from": raw_selected.get("path_from"),
+            "path_to": raw_selected.get("path_to"),
+        }
+        observed_activity = {
+            "action": activity.get("action"),
+            "actor": activity.get("actor"),
+            "subject": activity.get("subject"),
+            "summary": activity.get("summary"),
+            "path_from": activity.get("changed_path_from"),
+            "path_to": activity.get("changed_path_to"),
+        }
+        if observed_revision != expected or observed_activity != expected:
+            raise ShadowReaderScopeError(
+                "native activity audit reconcile facts are invalid"
+            )
+
+    async def activity(
+        self,
+        document: LegacyInventoryDocument,
+        *,
+        selector: str,
+        fixed_ref: str,
+    ) -> dict[str, Any]:
+        snapshot, raw_selected, activity = await self._activity_facts(
+            document,
+            selector=selector,
+            fixed_ref=fixed_ref,
+        )
+        await self._audit_activity_facts(
+            document,
+            snapshot=snapshot,
+            raw_selected=raw_selected,
+            activity=activity,
+        )
         actor = activity.get("actor")
         if not isinstance(actor, str) or not actor:
             raise ShadowReaderScopeError("native revision activity actor is invalid")
