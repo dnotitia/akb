@@ -24,30 +24,24 @@ AKB_URL=http://localhost:8000 bash backend/tests/test_publications_e2e.sh
 ```
 
 The shared curated gate is implemented by
-`backend/scripts/ci/e2e_suite_runner.py`. Its current 15-suite list is:
+`backend/scripts/ci/e2e_suite_runner.py`. `CURATED_SUITES` is the executable
+list, while `DEFERRED_SUITE_GROUPS` is the explicit opt-out list with reviewed
+reasons. Every `backend/tests/*_e2e.sh` file must appear in exactly one side of
+that manifest. The static check and the live gate both fail when a suite is
+unclassified, duplicated, overlaps both sides, or no longer exists.
 
-1. `test_probes_e2e.sh`
-2. `test_mcp_e2e.sh`
-3. `test_edit_e2e.sh`
-4. `test_security_edge_e2e.sh`
-5. `test_pg_rbac_e2e.sh`
-6. `test_graph_replace_e2e.sh`
-7. `test_relations_rest_e2e.sh`
-8. `test_collection_lifecycle_e2e.sh`
-9. `test_history_rest_e2e.sh`
-10. `test_jwt_revocation_e2e.sh`
-11. `test_table_constraints_e2e.sh`
-12. `test_forbidden_permission_code_e2e.sh`
-13. `test_okf_export_import_e2e.sh`
-14. `test_publication_resolution_e2e.sh`
-15. `test_publications_e2e.sh`
+Validate the manifest without starting any services:
+
+```bash
+python backend/scripts/ci/e2e_suite_runner.py --check-manifest
+```
 
 The runner is fail-closed. Each suite must finish successfully and provide a
 complete `Results: N passed, M failed` line. A missing summary, a non-zero
 suite return code, any failed assertion, or an unexpected zero-count suite
-fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Keep this
-runner and the hosted workflow aligned; `scripts/run_canonical_e2e.sh` is not
-the curated gate's source of truth.
+fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Hosted CI,
+the isolated runtime, and `scripts/run_canonical_e2e.sh` all execute this same
+runner, so there is no second suite array to keep synchronized.
 
 ### 2. Repository-owned isolated runtime
 
@@ -211,7 +205,7 @@ When changing this area, preserve all of the following:
 - backend, embedding stub, fixture control, and suite runner remain host-side
   processes;
 - Python `>=3.14` and `backend/uv.lock` are used with `uv sync --locked`;
-- the 15-suite list and fail-closed assertion-count semantics remain shared;
+- the suite manifest and fail-closed assertion-count semantics remain shared;
 - descriptor stdout stays parseable as one schema v2 JSON line; and
 - runtime state stays private and outside the checkout.
 

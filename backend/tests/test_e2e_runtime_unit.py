@@ -33,8 +33,11 @@ from e2e_gate_observability import (  # noqa: E402
 import e2e_suite_runner  # noqa: E402
 from e2e_suite_runner import (  # noqa: E402
     CURATED_SUITES,
+    DEFERRED_SUITE_GROUPS,
+    DeferredSuiteGroup,
     SuiteResult,
     parse_assertion_summary,
+    validate_suite_manifest,
 )
 from fixture_control import create_app  # noqa: E402
 
@@ -43,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
+LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
@@ -217,7 +221,58 @@ def test_suite_summary_uses_last_complete_line_and_fails_closed():
     assert SuiteResult("suite.sh", 0, 0, 0, None, "").gate_failed
     assert SuiteResult("suite.sh", 0, 2, 0, "Results: 2 passed, 0 failed", "").gate_failed is False
     assert SuiteResult("suite.sh", -4, 0, 0, None, "").signal == 4
-    assert len(CURATED_SUITES) == 15
+    assert len(CURATED_SUITES) == 25
+
+
+def test_shell_e2e_manifest_classifies_every_suite_exactly_once():
+    assert validate_suite_manifest(REPO_ROOT) == ()
+    discovered = {
+        path.name for path in (REPO_ROOT / "backend" / "tests").glob("*_e2e.sh")
+    }
+    deferred = {
+        suite for group in DEFERRED_SUITE_GROUPS for suite in group.suites
+    }
+    assert discovered == set(CURATED_SUITES) | deferred
+    assert set(CURATED_SUITES).isdisjoint(deferred)
+
+
+def test_shell_e2e_manifest_reports_unclassified_overlap_and_missing(
+    tmp_path, monkeypatch
+):
+    tests_dir = tmp_path / "backend" / "tests"
+    tests_dir.mkdir(parents=True)
+    for name in ("test_run_e2e.sh", "test_defer_e2e.sh", "test_new_e2e.sh"):
+        (tests_dir / name).touch()
+
+    monkeypatch.setattr(
+        e2e_suite_runner,
+        "CURATED_SUITES",
+        ("test_run_e2e.sh", "test_overlap_e2e.sh"),
+    )
+    monkeypatch.setattr(
+        e2e_suite_runner,
+        "DEFERRED_SUITE_GROUPS",
+        (
+            DeferredSuiteGroup(
+                reason="fixture",
+                suites=("test_defer_e2e.sh", "test_overlap_e2e.sh"),
+            ),
+        ),
+    )
+
+    errors = validate_suite_manifest(tmp_path)
+    assert any(
+        "unclassified E2E suites" in error and "test_new_e2e.sh" in error
+        for error in errors
+    )
+    assert any(
+        "both curated and deferred" in error and "test_overlap_e2e.sh" in error
+        for error in errors
+    )
+    assert any(
+        "without a matching suite file" in error and "test_overlap_e2e.sh" in error
+        for error in errors
+    )
 
 
 def test_gate_events_are_safe_and_shell_signal_aware(capsys):
@@ -247,6 +302,7 @@ def test_gate_events_are_safe_and_shell_signal_aware(capsys):
 
 def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
     monkeypatch.setattr(e2e_suite_runner, "CURATED_SUITES", ("test_fake.sh",))
+    monkeypatch.setattr(e2e_suite_runner, "check_suite_manifest", lambda _repo_root: 0)
     monkeypatch.setattr(
         e2e_suite_runner,
         "run_suite",
@@ -460,6 +516,10 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     for suite in CURATED_SUITES:
         assert suite not in workflow
     assert "akb-e2e-runtime-logs" in workflow
+
+    local_runner = LOCAL_CANONICAL_RUNNER.read_text()
+    assert "backend/scripts/ci/e2e_suite_runner.py" in local_runner
+    assert "SUITES=(" not in local_runner
 
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
