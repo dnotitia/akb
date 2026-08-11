@@ -127,7 +127,7 @@ async def _mark_job_blocked(conn: Any, target: dict[str, Any], reason: str) -> N
         target["job_id"],
     )
     await conn.execute(
-        "UPDATE app_rollout_snapshot_targets SET state='skipped', reason_code='rollout_blocked' WHERE snapshot_target_id IN (SELECT snapshot_target_id FROM app_rollout_targets WHERE job_id=$1 AND state='blocked')",
+        "UPDATE app_rollout_snapshot_targets SET state='skipped', reason_code='rollout_blocked' WHERE id IN (SELECT snapshot_target_id FROM app_rollout_targets WHERE job_id=$1 AND state='blocked')",
         target["job_id"],
     )
 
@@ -231,17 +231,28 @@ async def _run_backfill(conn: Any, target: dict[str, Any], step: dict[str, Any],
         await conn.execute("UPDATE app_rollout_steps SET state='applied', completed_at=NOW(), lease_owner=NULL, lease_expires_at=NULL WHERE id=$1", step["id"])
         return True
     ids = [row["id"] for row in rows]
+    if cursor:
+        previous_cursor = uuid.UUID(str(cursor))
+        if any(row["id"] <= previous_cursor for row in rows):
+            raise ConflictError("Rollout backfill cursor did not advance")
     await conn.execute(
         f"UPDATE {pg_name} SET {column}=$1 WHERE id=ANY($2::uuid[]) AND {column} IS NULL",
         payload.get("value"), ids,
     )
     last = str(ids[-1])
+    previous_completed = checkpoint.get("completed", 0)
+    previous_total = checkpoint.get("total", 0)
+    if not isinstance(previous_completed, int) or isinstance(previous_completed, bool):
+        previous_completed = 0
+    if not isinstance(previous_total, int) or isinstance(previous_total, bool):
+        previous_total = 0
+    completed = previous_completed + len(ids)
     checkpoint = {
         "cursor": last,
         "phase": "backfill",
         "step": step["step_id"],
-        "completed": len(ids),
-        "total": int(checkpoint.get("total", 0)) + len(ids),
+        "completed": completed,
+        "total": max(previous_total, completed),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     await conn.execute("UPDATE app_rollout_steps SET checkpoint=$2::jsonb, state='pending', lease_owner=NULL, lease_expires_at=NULL WHERE id=$1", step["id"], json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":")))

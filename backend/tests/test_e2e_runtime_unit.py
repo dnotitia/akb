@@ -499,6 +499,73 @@ def test_rollout_fixture_discovery_is_source_neutral_and_redacted(tmp_path):
     assert discovery["polling"]["rollout_status"]["terminal_statuses"] == ["applied", "blocked"]
 
 
+def test_rollout_failure_control_discovery_has_exact_stable_targets(tmp_path):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-rollout-control-unit",
+            scenario="app-release-rollout",
+        )
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-release-rollout",
+        "apps": {"target": {"id": "target-app"}},
+        "installations": [{"ordinal": ordinal, "id": f"installation-{ordinal}"} for ordinal in range(13)],
+    }
+
+    discovery = runtime.fixture_discovery()
+    failure = discovery["controls"]["failure_injection"]
+    assert failure["accepted_target_values"] == ["canary", "ordinal:11"]
+    assert failure["target_examples"] == [
+        {"value": "canary", "ordinal": 0, "expected_outcome": "blocked"},
+        {"value": "ordinal:11", "ordinal": 11, "expected_outcome": "blocked"},
+    ]
+    assert failure["body"]["target"] == "canary"
+
+    assert runtime._resolve_failure_target_ordinal("canary") == 0
+    assert runtime._resolve_failure_target_ordinal("ordinal:0") == 0
+    assert runtime._resolve_failure_target_ordinal("0") == 0
+    assert runtime._resolve_failure_target_ordinal("ordinal:11") == 11
+    assert runtime._resolve_failure_target_ordinal("11") == 11
+    with pytest.raises(ValueError):
+        runtime._resolve_failure_target_ordinal("ordinal:12")
+
+
+@pytest.mark.asyncio
+async def test_rollout_failure_control_applies_before_ack(tmp_path, monkeypatch):
+    runtime = E2ERuntime(
+        RuntimeConfig(
+            checkout=REPO_ROOT,
+            runtime_root=tmp_path / "runtime",
+            mode="serve",
+            compose_file=COMPOSE_FILE,
+            compose_project="akb-e2e-rollout-control-ack-unit",
+            scenario="app-release-rollout",
+        )
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-release-rollout",
+        "installations": [{"ordinal": ordinal, "id": f"installation-{ordinal}"} for ordinal in range(13)],
+    }
+    applied: list[str] = []
+
+    async def record_application(target: str) -> bool:
+        applied.append(target)
+        return True
+
+    monkeypatch.setattr(runtime, "_apply_failure_injection", record_application)
+    result = await runtime.fixture_control("failure_injection", "11", True)
+
+    assert result["status"] == "accepted"
+    assert applied == ["ordinal:11"]
+    assert runtime._fixture_controls["failure_target"] == "ordinal:11"
+
+
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
     compose = yaml.safe_load(COMPOSE_FILE.read_text())
     assert set(compose["services"]) == {"postgres", "minio"}

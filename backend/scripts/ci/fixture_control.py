@@ -7,14 +7,16 @@ runtime implementation and are never returned as raw private state.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+import inspect
+from typing import Awaitable, Literal, Protocol
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 
 class FixtureRuntime(Protocol):
-    scenario: str
+    @property
+    def scenario(self) -> str: ...
 
     def fixture_health(self) -> dict[str, object]: ...
 
@@ -24,7 +26,9 @@ class FixtureRuntime(Protocol):
 
     async def reset_scenario(self) -> None: ...
 
-    def fixture_control(self, action: str, target: str | None, enabled: bool) -> dict[str, object]: ...
+    def fixture_control(
+        self, action: str, target: str | None, enabled: bool
+    ) -> object | Awaitable[dict[str, object]]: ...
 
 
 class ResetRequest(BaseModel):
@@ -81,6 +85,11 @@ def create_app(runtime: FixtureRuntime) -> FastAPI:
         handler = getattr(runtime, "fixture_control", None)
         if handler is None:
             raise HTTPException(status_code=404, detail="fixture control is unavailable")
-        return handler(request.action, request.target, request.enabled)
+        result = handler(request.action, request.target, request.enabled)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=500, detail="fixture control returned an invalid result")
+        return result
 
     return app

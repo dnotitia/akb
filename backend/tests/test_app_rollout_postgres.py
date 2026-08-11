@@ -117,7 +117,17 @@ async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeyp
         replay = await rollout.request_rollout(app_id, release_id=new_id, manifest_checksum_value=checksum, idempotency_key=key, requested_by_kind="admin", correlation_id="test", actor="test", actor_id="test")
         assert replay["replayed"] is True
         assert replay["job_id"] == first["job_id"]
-        for _ in range(6):
+        await worker.run_once()
+        async with pool.acquire() as conn:
+            checkpoint = await conn.fetchval(
+                "SELECT checkpoint FROM app_rollout_steps WHERE job_id=$1",
+                uuid.UUID(first["job_id"]),
+            )
+            if isinstance(checkpoint, str):
+                checkpoint = json.loads(checkpoint)
+            assert checkpoint["completed"] == 1
+            assert checkpoint["total"] == 1
+        for _ in range(5):
             await worker.run_once()
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT status FROM app_rollout_jobs WHERE id=$1", uuid.UUID(first["job_id"])) == "applied"
