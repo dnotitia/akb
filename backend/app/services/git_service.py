@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import stat
 import threading
@@ -36,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from git import Blob, Repo
-from git.exc import GitError
+from git.exc import BadName, BadObject, GitError
 
 from app.config import settings
 from app.exceptions import AKBError, MirrorMarkerError
@@ -169,6 +170,10 @@ class ExternalGitOversizedError(AKBError):
             status_code=413,
             code="external_git_blob_oversized",
         )
+
+
+class FixedRefHistoryError(RuntimeError):
+    """A manual-vault fixed-ref history read could not be completed."""
 
 
 class GitService:
@@ -1010,6 +1015,182 @@ class GitService:
         except (KeyError, TypeError):
             return None
 
+    def manual_fixed_ref_history(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        file_path: str,
+        *,
+        current_commit: str,
+        since_epoch: int | None = None,
+    ) -> dict:
+        """Read one manual-vault document and its rename-following history.
+
+        The caller supplies an exact, full commit OID for both the frozen tip
+        and the document's recorded current commit.  This primitive never
+        follows ``HEAD`` and deliberately refuses a mirror marker, so bridge
+        code cannot accidentally use the external-git reader for a fixed-ref
+        capture.  The returned body is the exact UTF-8 byte sequence at
+        ``(current_commit, file_path)``; history entries use full commit OIDs
+        and the path that commit carried after ``--follow`` rename tracking.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref):
+            raise FixedRefHistoryError("fixed_ref must be a full lowercase 40-hex commit OID")
+        if not full_oid.fullmatch(current_commit):
+            raise FixedRefHistoryError(
+                "current_commit must be a full lowercase 40-hex commit OID"
+            )
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref history is limited to manual vaults")
+
+        try:
+            repo = self._get_repo(vault_name)
+            repo.commit(fixed_ref)
+            current = repo.commit(current_commit)
+            repo.git.merge_base("--is-ancestor", current_commit, fixed_ref)
+            blob = current.tree / file_path
+            body = blob.data_stream.read()
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve the requested commit or body"
+            ) from exc
+
+        try:
+            body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise FixedRefHistoryError("fixed-ref body is not valid UTF-8") from exc
+
+        log_args = [
+            "--follow",
+            "-M",
+            "--name-status",
+        ]
+        if since_epoch is not None:
+            log_args.append(f"--since=@{since_epoch}")
+        log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
+        try:
+            output = repo.git.log(*log_args)
+        except (GitError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref history could not be read") from exc
+
+        activity = self._manual_fixed_ref_activity(repo, current, file_path)
+
+        history: list[dict] = []
+        active: dict | None = None
+
+        def flush() -> None:
+            if active is not None and active.get("path_at_revision"):
+                history.append(active.copy())
+
+        for line in str(output).splitlines():
+            if "\x00" in line:
+                flush()
+                oid, epoch, *_ = line.split("\x00")
+                active = {
+                    "legacy_git_oid": oid,
+                    "committed_at": datetime.fromtimestamp(
+                        int(epoch), tz=timezone.utc
+                    ),
+                }
+                continue
+            if active is None or not line:
+                continue
+            fields = line.split("\t")
+            status = fields[0]
+            if status.startswith("R") and len(fields) >= 3:
+                active["path_at_revision"] = fields[-1]
+            elif len(fields) >= 2:
+                active["path_at_revision"] = fields[-1]
+        flush()
+
+        return {
+            "fixed_ref": fixed_ref,
+            "current_commit": current_commit,
+            "body": body,
+            "history": history,
+            "activity": activity,
+        }
+
+    def _manual_fixed_ref_activity(self, repo: Repo, commit, file_path: str) -> dict:
+        """Freeze the legacy public activity projection for one file commit."""
+        metadata = self._legacy_commit_metadata(commit)
+        action = metadata["action"]
+        if action not in {"create", "update", "move", "delete"}:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has no supported public activity action"
+            )
+        if not metadata["subject"] or not metadata["agent"]:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has incomplete activity identity"
+            )
+
+        try:
+            output = repo.git.diff_tree(
+                "--root", "-r", "--name-status", "-M", commit.hexsha,
+            )
+        except (GitError, ValueError) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity could not be read"
+            ) from exc
+
+        changes: list[dict[str, str | None]] = []
+        for line in str(output).splitlines():
+            fields = line.split("\t")
+            if not fields:
+                continue
+            status = fields[0]
+            if status.startswith(("R", "C")) and len(fields) >= 3:
+                path_from, path_to = fields[-2], fields[-1]
+                if path_to == file_path:
+                    changes.append(
+                        {
+                            "change": "move",
+                            "path_from": path_from,
+                            "path_to": path_to,
+                        }
+                    )
+            elif len(fields) >= 2 and fields[-1] == file_path:
+                change_kind = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if change_kind is not None:
+                    changes.append(
+                        {
+                            "change": change_kind,
+                            "path_from": None,
+                            "path_to": file_path,
+                        }
+                    )
+        if len(changes) != 1 or changes[0]["change"] != action:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
+        selected_change = changes[0]
+        return {
+            "legacy_git_oid": commit.hexsha,
+            "committed_at": datetime.fromtimestamp(
+                commit.committed_date, tz=timezone.utc
+            ),
+            "actor": metadata["agent"],
+            "subject": metadata["subject"],
+            "summary": metadata["summary"],
+            "action": action,
+            "path_from": selected_change["path_from"],
+            "path_to": selected_change["path_to"],
+            "changed_paths": changes,
+        }
+
     # ── Mirror read variants (hermetic runner) ───────────
     def _read_file_mirror(
         self, vault_name: str, file_path: str, commit: str | None
@@ -1569,6 +1750,21 @@ class GitService:
             for c in commits
         ]
 
+    @staticmethod
+    def _legacy_commit_metadata(commit) -> dict[str, str]:
+        """Parse the commit-message metadata used by the legacy activity feed."""
+        message = str(commit.message)
+        lines = message.strip().split("\n")
+        metadata: dict[str, str] = {"subject": lines[0] if lines else ""}
+        for body_line in (line.strip() for line in lines[1:] if line.strip()):
+            if ":" in body_line:
+                key, value = body_line.split(":", 1)
+                metadata[key.strip().lower()] = value.strip()
+        metadata.setdefault("action", "")
+        metadata.setdefault("summary", "")
+        metadata.setdefault("agent", str(commit.author))
+        return metadata
+
     def vault_log(self, vault_name: str, max_count: int = 30, since: str | None = None, path: str | None = None) -> list[dict]:
         """Get commit log for the vault, optionally scoped to a path.
 
@@ -1601,16 +1797,7 @@ class GitService:
             # `str | bytes` per the stub; in practice gitpython always
             # decodes to str via its `default_encoding`. `str(...)` is
             # a cheap normalisation that also satisfies mypy.
-            message = str(c.message)
-            lines = message.strip().split("\n")
-            subject = lines[0] if lines else ""
-            body_lines = [line.strip() for line in lines[1:] if line.strip()]
-
-            meta = {}
-            for bl in body_lines:
-                if ":" in bl:
-                    k, v = bl.split(":", 1)
-                    meta[k.strip().lower()] = v.strip()
+            meta = self._legacy_commit_metadata(c)
 
             # Get changed files
             changed_files: list[dict] = []
@@ -1644,7 +1831,7 @@ class GitService:
 
             results.append({
                 "hash": c.hexsha[:12],
-                "subject": subject,
+                "subject": meta["subject"],
                 "author": str(c.author),
                 "date": datetime.fromtimestamp(c.committed_date, tz=timezone.utc).isoformat(),
                 "action": meta.get("action", ""),
