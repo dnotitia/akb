@@ -770,9 +770,16 @@ class NativeRevisionShadowComparator:
         if rule_id == "BR-05":
             if not isinstance(legacy, str) or not isinstance(candidate, str) or "\r" in candidate:
                 raise ShadowComparisonError("BR-05 may normalize only CRLF formatting")
-            body = document.body.decode("utf-8", errors="strict")
             left = legacy.replace("\r\n", "\n")
-            if left != candidate or candidate != body:
+            try:
+                candidate_body = candidate.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise ShadowComparisonError("BR-05 candidate body is not valid UTF-8") from exc
+            if (
+                left != candidate
+                or len(candidate_body) != document.byte_size
+                or hashlib.sha256(candidate_body).hexdigest() != document.body_digest
+            ):
                 raise ShadowComparisonError("BR-05 formatting-only normalization changed content")
             return left, candidate
         if rule_id == "BR-06":
@@ -1043,24 +1050,30 @@ class NativeRevisionShadowComparator:
             )
             for fact in native_parent_bindings
         )
+        owner_run_commitments = sorted(
+            {
+                cls._domain_digest(
+                    f"{_EVIDENCE_BINDING_DOMAIN}/owner-run",
+                    owner_run,
+                )
+                for fact in mappings
+                for owner_run in (
+                    fact["owner_run"],
+                    *(mapping["owner_run"] for mapping in fact["retained_mappings"]),
+                )
+            }
+        )
         redacted_preimage = {
             "comparison_run": comparison_run_commitment,
             "mapping_owner_activity": mapping_commitments,
             "retained_mapping_closure": retained_mapping_commitments,
             "native_parent_bindings": native_parent_commitments,
+            "owner_runs": owner_run_commitments,
         }
         commitment = cls._domain_digest(
             _EVIDENCE_BINDING_DOMAIN,
             redacted_preimage,
         )
-        owner_run_ids = {
-            owner_run_id
-            for fact in mappings
-            for owner_run_id in (
-                fact["owner_run"]["run_id"],
-                *(mapping["owner_run"]["run_id"] for mapping in fact["retained_mappings"]),
-            )
-        }
         return {
             "scheme": "sha256",
             "canonicalization": _EVIDENCE_BINDING_CANONICALIZATION,
@@ -1070,7 +1083,7 @@ class NativeRevisionShadowComparator:
             "mapping_count": len(mappings),
             "retained_mapping_count": len(retained_mappings),
             "native_parent_binding_count": len(native_parent_bindings),
-            "owner_run_count": len(owner_run_ids),
+            "owner_run_count": len(owner_run_commitments),
         }
 
     @staticmethod

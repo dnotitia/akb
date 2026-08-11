@@ -132,6 +132,14 @@ def _oid(char: str) -> str:
     return char * 40
 
 
+def _document_body(document: LegacyInventoryDocument) -> bytes:
+    if document.resource_id == uuid.UUID("11111111-1111-4111-8111-111111111111"):
+        return b"# Migration candidate\n\nsecret body\n"
+    if document.resource_id == uuid.UUID("44444444-4444-4444-8444-444444444444"):
+        return b"# Second candidate\n\nother secret body\n"
+    raise AssertionError(f"unexpected synthetic document: {document.resource_id}")
+
+
 @pytest.mark.parametrize(
     ("parent_text", "patch", "expected"),
     [
@@ -176,7 +184,6 @@ def _document() -> LegacyInventoryDocument:
         current_path=path,
         current_commit=current,
         created_at=at,
-        body=body.encode(),
         body_digest=hashlib.sha256(body.encode()).hexdigest(),
         byte_size=len(body.encode()),
         aliases=(),
@@ -211,7 +218,6 @@ def _second_document() -> LegacyInventoryDocument:
         current_path=path,
         current_commit=current,
         created_at=at,
-        body=body,
         body_digest=hashlib.sha256(body).hexdigest(),
         byte_size=len(body),
         lineage=(
@@ -228,6 +234,12 @@ def _second_document() -> LegacyInventoryDocument:
             changed_paths=({"change": "update", "path_from": None, "path_to": path},),
         ),
     )
+
+
+async def test_inventory_document_schema_does_not_retain_body_text():
+    document = _document()
+
+    assert not hasattr(document, "body")
 
 
 def _run_and_item(
@@ -401,7 +413,7 @@ class _WireReader:
 
     async def get(self, document: LegacyInventoryDocument, *, selector: str, fixed_ref: str) -> dict[str, Any]:
         del fixed_ref
-        body = document.body.decode()
+        body = _document_body(document).decode()
         if not self.candidate:
             body = body.replace("\n", "\r\n")
         return {
@@ -489,10 +501,13 @@ class _WireReader:
 class _NoWriteGit:
     def __init__(self, *documents: LegacyInventoryDocument):
         self.documents = documents
-        self.bodies = {(document.current_path, document.current_commit): document.body for document in documents}
+        self.bodies = {
+            (document.current_path, document.current_commit): _document_body(document)
+            for document in documents
+        }
         for document in documents:
             for entry in document.lineage[:-1]:
-                self.bodies[(entry.path_at_revision, entry.legacy_git_oid)] = document.body.replace(
+                self.bodies[(entry.path_at_revision, entry.legacy_git_oid)] = _document_body(document).replace(
                     b"secret body", b"old body"
                 )
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
@@ -586,7 +601,7 @@ class _NoWriteNative:
         if override is not None:
             return override
         assert kwargs["revision_id"] == native_id
-        body = document.body
+        body = _document_body(document)
         return _Snapshot(
             resource_id=document.resource_id,
             revision_id=native_id,
@@ -798,7 +813,7 @@ async def test_genesis_activity_audit_rejects_forged_persisted_facts(field, valu
         revision_id=native_id,
         surface="document",
         path=document.current_path,
-        text=document.body.decode(),
+        text=_document_body(document).decode(),
         digest=document.body_digest,
         byte_size=document.byte_size,
         action=forged["action"],
@@ -874,7 +889,7 @@ async def test_reconcile_activity_audit_derives_action_from_parent_and_current_p
         revision_id=native_id,
         surface="document",
         path=document.current_path,
-        text=document.body.decode(),
+        text=_document_body(document).decode(),
         digest=document.body_digest,
         byte_size=document.byte_size,
         action=selected["action"],
@@ -926,7 +941,7 @@ async def test_reconcile_activity_audit_rejects_correlated_parent_path_tampering
         revision_id=native_id,
         surface="document",
         path=document.current_path,
-        text=document.body.decode(),
+        text=_document_body(document).decode(),
         digest=document.body_digest,
         byte_size=document.byte_size,
         action="move",
@@ -1251,7 +1266,7 @@ def _native_replace_fakes(
 ) -> tuple[_NoWriteNative, _NoWriteNativeRepository, dict[str, Any], dict[str, Any]]:
     service = _NoWriteNative((document, native_id))
     repository = _NoWriteNativeRepository((document, native_id))
-    old_text = document.body.decode().replace("secret body", "old body")
+    old_text = _document_body(document).decode().replace("secret body", "old body")
     old_bytes = old_text.encode()
     selected_row = {
         **repository._revision(document.resource_id),
@@ -1274,7 +1289,7 @@ def _native_replace_fakes(
         revision_id=native_id,
         surface="document",
         path=document.current_path,
-        text=document.body.decode(),
+        text=_document_body(document).decode(),
         digest=document.body_digest,
         byte_size=document.byte_size,
         action="replace",
@@ -1349,7 +1364,7 @@ async def test_native_history_rejects_invalid_parent_graph_shapes():
                 revision_id=native_id,
                 surface="document",
                 path=document.current_path,
-                text=document.body.decode(),
+                text=_document_body(document).decode(),
                 digest=document.body_digest,
                 byte_size=document.byte_size,
                 action="replace",
@@ -1466,6 +1481,23 @@ async def test_failed_cache_replacement_evicts_the_prior_resource():
     assert len(native_service.calls) == 3
 
 
+async def test_legacy_shadow_reader_retains_at_most_one_materialized_body():
+    first = _document()
+    second = _second_document()
+    fixed_ref = _oid("f")
+    git = _NoWriteGit(first, second)
+    reader = LegacyFixedRefShadowReader(git=git, vault_name="p2-manual")
+
+    await reader.get(first, selector=first.current_commit, fixed_ref=fixed_ref)
+    assert reader._snapshot_cache is not None
+    assert reader._snapshot_cache[0].resource_id == first.resource_id
+
+    await reader.get(second, selector=second.current_commit, fixed_ref=fixed_ref)
+    assert reader._snapshot_cache is not None
+    assert reader._snapshot_cache[0].resource_id == second.resource_id
+    assert len(git.calls) == 2
+
+
 async def test_comparator_receipt_is_redacted_and_classified():
     document = _document()
     run, item, inventory, native_id = _run_and_item(document)
@@ -1479,7 +1511,7 @@ async def test_comparator_receipt_is_redacted_and_classified():
     receipt = await comparator.compare_run(run.run_id)
     encoded = json.dumps(receipt, sort_keys=True)
 
-    assert document.body.decode() not in encoded
+    assert _document_body(document).decode() not in encoded
     assert document.current_path not in encoded
     assert str(document.resource_id) not in encoded
     assert document.activity.actor not in encoded
@@ -1506,11 +1538,20 @@ async def test_comparator_receipt_is_redacted_and_classified():
         "mapping_owner_activity",
         "retained_mapping_closure",
         "native_parent_bindings",
+        "owner_runs",
     }
     assert len(components["comparison_run"]) == 64
     assert len(components["mapping_owner_activity"]) == 1
     assert len(components["retained_mapping_closure"]) == 1
     assert len(components["native_parent_bindings"]) == 1
+    assert components["owner_runs"] == sorted(set(components["owner_runs"]))
+    assert receipt["evidence_binding"]["owner_run_count"] == len(
+        components["owner_runs"]
+    )
+    assert all(
+        len(commitment) == 64 and set(commitment) <= set("0123456789abcdef")
+        for commitment in components["owner_runs"]
+    )
     recomputed = hashlib.sha256(
         (receipt["evidence_binding"]["domain"] + "\0").encode()
         + json.dumps(
@@ -1550,6 +1591,57 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert document.current_commit not in encoded
     assert run.fixed_git_oid not in encoded
     assert run.inventory_digest not in encoded
+
+
+async def test_owner_run_count_tamper_cannot_survive_correlated_recompute():
+    document = _document()
+    run, item, inventory, native_id = _run_and_item(document)
+    comparator = NativeRevisionShadowComparator(
+        repository=_ReadRepository(run, item),
+        bridge=_InventoryBridge(inventory),
+        legacy_reader=_WireReader(native_id, candidate=False),
+        candidate_reader=_WireReader(native_id, candidate=True),
+    )
+    receipt = await comparator.compare_run(run.run_id)
+
+    count_tamper = json.loads(json.dumps(receipt))
+    count_tamper["evidence_binding"]["owner_run_count"] += 1
+    count_tamper.pop("receipt_digest")
+    count_tamper["receipt_digest"] = hashlib.sha256(
+        json.dumps(
+            count_tamper,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert count_tamper["evidence_binding"]["owner_run_count"] != len(
+        count_tamper["evidence_binding"]["components"]["owner_runs"]
+    )
+
+    component_tamper = json.loads(json.dumps(receipt))
+    component_tamper["evidence_binding"]["components"]["owner_runs"].append("0" * 64)
+    component_tamper["evidence_binding"]["commitment"] = hashlib.sha256(
+        (component_tamper["evidence_binding"]["domain"] + "\0").encode()
+        + json.dumps(
+            component_tamper["evidence_binding"]["components"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    component_tamper.pop("receipt_digest")
+    component_tamper["receipt_digest"] = hashlib.sha256(
+        json.dumps(
+            component_tamper,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert component_tamper["evidence_binding"]["owner_run_count"] != len(
+        component_tamper["evidence_binding"]["components"]["owner_runs"]
+    )
 
 
 async def test_comparator_rejects_correlated_activity_fact_tamper():

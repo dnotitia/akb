@@ -161,12 +161,13 @@ class NativeRevisionBackfill:
                 skipped += 1
                 continue
             try:
-                prepared = await self.body_store.prepare_text(
-                    namespace_id=run.namespace_id,
-                    payload=document.body,
-                    expected_digest=document.body_digest,
-                    expected_size=document.byte_size,
-                )
+                async with self.bridge.materialize_body(inventory, document) as body:
+                    prepared = await self.body_store.prepare_text(
+                        namespace_id=run.namespace_id,
+                        payload=body,
+                        expected_digest=document.body_digest,
+                        expected_size=document.byte_size,
+                    )
                 await self._hit("payload.after_prepare_before_tx")
                 await self._publish_item(
                     run=run,

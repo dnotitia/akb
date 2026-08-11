@@ -7,6 +7,8 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -95,7 +97,6 @@ class LegacyInventoryDocument:
     current_path: str
     current_commit: str
     created_at: datetime
-    body: bytes
     body_digest: str
     byte_size: int
     aliases: tuple[LegacyInventoryAlias, ...]
@@ -400,7 +401,6 @@ class LegacyRevisionBridge:
                             current_path=row["path"],
                             current_commit=current_commit,
                             created_at=created_at,
-                            body=body,
                             body_digest=hashlib.sha256(body).hexdigest(),
                             byte_size=len(body),
                             aliases=tuple(aliases),
@@ -422,6 +422,75 @@ class LegacyRevisionBridge:
                 documents=frozen_documents,
             ),
         )
+
+    @asynccontextmanager
+    async def materialize_body(
+        self,
+        inventory: LegacyInventory,
+        document: LegacyInventoryDocument,
+    ) -> AsyncIterator[bytes]:
+        """Read and verify one frozen body without retaining it in inventory."""
+
+        if document not in inventory.documents:
+            raise InventoryEligibilityError(
+                "body materialization requires a document from the frozen inventory"
+            )
+        if (
+            self.canonical_inventory_digest(
+                namespace_id=inventory.namespace_id,
+                fixed_git_oid=inventory.fixed_git_oid,
+                coverage_version=inventory.coverage_version,
+                documents=inventory.documents,
+            )
+            != inventory.inventory_digest
+        ):
+            raise InventoryEligibilityError("body materialization inventory digest is invalid")
+
+        vault = await self.repository.get_manual_vault(inventory.namespace_id)
+        if vault is None:
+            raise NotFoundError("Vault", str(inventory.namespace_id))
+        if vault["has_external_git"]:
+            raise ManualVaultRequiredError()
+        try:
+            snapshot = await asyncio.to_thread(
+                self.git.manual_fixed_ref_history,
+                vault["name"],
+                inventory.fixed_git_oid,
+                document.current_path,
+                current_commit=document.current_commit,
+                since_epoch=int(document.created_at.timestamp()),
+            )
+        except FixedRefHistoryError as exc:
+            raise InventoryEligibilityError(
+                f"document {document.resource_id} is not readable at the fixed ref"
+            ) from exc
+
+        body = snapshot.get("body") if isinstance(snapshot, dict) else None
+        if (
+            not isinstance(body, bytes)
+            or snapshot.get("fixed_ref") != inventory.fixed_git_oid
+            or snapshot.get("current_commit") != document.current_commit
+            or len(body) != document.byte_size
+            or hashlib.sha256(body).hexdigest() != document.body_digest
+        ):
+            raise InventoryEligibilityError(
+                f"document {document.resource_id} body differs from the frozen inventory"
+            )
+        if b"\x00" in body:
+            raise InventoryEligibilityError(
+                f"document {document.resource_id} body contains NUL bytes"
+            )
+        try:
+            body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise InventoryEligibilityError(
+                f"document {document.resource_id} body is not valid UTF-8"
+            ) from exc
+        try:
+            yield body
+        finally:
+            del body
+            del snapshot
 
     async def prepare_run(
         self,

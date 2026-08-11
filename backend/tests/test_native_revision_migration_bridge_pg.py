@@ -303,8 +303,10 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
         )
         assert doc.current_path == "renamed.md"
         assert doc.current_commit == fixture["current_oid"]
-        assert doc.body == b"new v2\n"
-        assert doc.byte_size == len(doc.body)
+        assert not hasattr(doc, "body")
+        async with bridge.materialize_body(inventory, doc) as body:
+            assert body == b"new v2\n"
+            assert doc.byte_size == len(body)
         assert doc.lineage[-1].legacy_git_oid == fixture["current_oid"]
         assert [entry.path_at_revision for entry in doc.lineage] == [
             "same.md", "renamed.md", "renamed.md",
@@ -391,6 +393,48 @@ async def test_inventory_is_fixed_ref_bounded_and_manual_only(tmp_path):
                 "SELECT count(*) FROM native_resources WHERE namespace_id = $1",
                 fixture["namespace_id"],
             ) == 0
+
+
+async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_a_time(
+    tmp_path,
+):
+    class TrackingBodyBridge(LegacyRevisionBridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.active_bodies = 0
+            self.max_active_bodies = 0
+
+        @asynccontextmanager
+        async def materialize_body(self, inventory, document):
+            async with super().materialize_body(inventory, document) as body:
+                self.active_bodies += 1
+                self.max_active_bodies = max(
+                    self.max_active_bodies,
+                    self.active_bodies,
+                )
+                try:
+                    yield body
+                finally:
+                    self.active_bodies -= 1
+
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _make_fixture(pool, tmp_path)
+        bridge = TrackingBodyBridge(pool, git=fixture["git"])
+        backfill = NativeRevisionBackfill(pool, git=fixture["git"], bridge=bridge)
+        run, inventory = await backfill.prepare_run(
+            namespace_id=fixture["namespace_id"],
+            fixed_ref=fixture["unrelated_tip"],
+            coverage_version="c9-metadata-only-memory-bound",
+        )
+
+        assert len(inventory.documents) == 2
+        assert all(not hasattr(document, "body") for document in inventory.documents)
+
+        result = await backfill.backfill_run(run.run_id)
+
+        assert result.status == "complete"
+        assert bridge.max_active_bodies == 1
+        assert bridge.active_bodies == 0
 
 
 async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
@@ -655,12 +699,13 @@ async def test_current_move_activity_semantics_are_preserved(tmp_path):
         assert document.activity.path_from == "same.md"
         assert document.activity.path_to == "renamed.md"
         body_store = M1PgBodyStore(pool)
-        await body_store.prepare_text(
-            namespace_id=namespace_id,
-            payload=document.body,
-            expected_digest=document.body_digest,
-            expected_size=document.byte_size,
-        )
+        async with backfill.bridge.materialize_body(inventory, document) as body:
+            await body_store.prepare_text(
+                namespace_id=namespace_id,
+                payload=body,
+                expected_digest=document.body_digest,
+                expected_size=document.byte_size,
+            )
         result = await backfill.backfill_run(run.run_id)
         async with pool.acquire() as conn:
             item_error = await conn.fetchval(
@@ -702,12 +747,13 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             if item.resource_id == fixture["document_one"]
         )
         body_store = M1PgBodyStore(pool)
-        prepared = await body_store.prepare_text(
-            namespace_id=fixture["namespace_id"],
-            payload=document.body,
-            expected_digest=document.body_digest,
-            expected_size=document.byte_size,
-        )
+        async with backfill.bridge.materialize_body(inventory, document) as body:
+            prepared = await body_store.prepare_text(
+                namespace_id=fixture["namespace_id"],
+                payload=body,
+                expected_digest=document.body_digest,
+                expected_size=document.byte_size,
+            )
         await backfill._publish_item(
             run=run,
             document=document,
@@ -727,12 +773,13 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             )
 
         other = next(item for item in inventory.documents if item.resource_id != document.resource_id)
-        other_prepared = await body_store.prepare_text(
-            namespace_id=fixture["namespace_id"],
-            payload=other.body,
-            expected_digest=other.body_digest,
-            expected_size=other.byte_size,
-        )
+        async with backfill.bridge.materialize_body(inventory, other) as body:
+            other_prepared = await body_store.prepare_text(
+                namespace_id=fixture["namespace_id"],
+                payload=body,
+                expected_digest=other.body_digest,
+                expected_size=other.byte_size,
+            )
         await backfill._publish_item(
             run=run,
             document=other,

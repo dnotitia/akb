@@ -221,6 +221,11 @@ def _oid(char: str) -> str:
     return char * 40
 
 
+def _document_body(document: LegacyInventoryDocument) -> str:
+    index = int(str(document.resource_id).split("-", 1)[0])
+    return f"# Document {index}\n\nbody at fixed ref\n"
+
+
 def _doc(index: int) -> LegacyInventoryDocument:
     resource_id = uuid.UUID(f"{index:08d}-1111-4111-8111-111111111111")
     legacy_head = _oid(str(index + 1))
@@ -244,7 +249,6 @@ def _doc(index: int) -> LegacyInventoryDocument:
         current_path=path,
         current_commit=legacy_head,
         created_at=at - timedelta(days=1),
-        body=body.encode(),
         body_digest=hashlib.sha256(body.encode()).hexdigest(),
         byte_size=len(body.encode()),
         lineage=(
@@ -378,7 +382,7 @@ class _Reader:
             selector = native_id
         else:
             selector = document.current_commit
-        body = document.body.decode()
+        body = _document_body(document)
         if not self.candidate:
             body = body.replace("\n", "\r\n")
         result = {
@@ -601,6 +605,9 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert receipt["evidence_binding"]["retained_mapping_count"] == 2
     assert receipt["evidence_binding"]["native_parent_binding_count"] == 2
     assert receipt["evidence_binding"]["owner_run_count"] == 1
+    owner_runs = receipt["evidence_binding"]["components"]["owner_runs"]
+    assert owner_runs == sorted(set(owner_runs))
+    assert receipt["evidence_binding"]["owner_run_count"] == len(owner_runs)
     assert len(receipt["resources"]) == 2
     assert set(receipt["summary"]["used_rules"]) == {f"BR-0{index}" for index in range(1, 8)}
     for resource in receipt["resources"]:
@@ -617,7 +624,7 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
             "status": "passed",
         }
     encoded = json.dumps(receipt, sort_keys=True)
-    assert all(document.body.decode() not in encoded for document in inventory.documents)
+    assert all(_document_body(document) not in encoded for document in inventory.documents)
     assert all(str(document.resource_id) not in encoded for document in inventory.documents)
     assert {name for name, _ in legacy.calls} == {"get", "history", "diff", "activity"}
     assert len(legacy.calls) == len(inventory.documents) * 4
@@ -690,6 +697,8 @@ async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_
     assert receipt["summary"]["resource_count"] == 2
     assert receipt["summary"]["operation_count"] == 8
     assert receipt["summary"]["raw_activity_audit_count"] == 2
+    assert receipt["evidence_binding"]["owner_run_count"] == 2
+    assert len(receipt["evidence_binding"]["components"]["owner_runs"]) == 2
 
 
 async def test_completed_reconcile_rejects_rehomed_unchanged_mapping():
@@ -868,7 +877,7 @@ async def test_evidence_binding_is_stable_under_scope_and_item_order_shuffle():
         for resource in first["resources"]
     )
     encoded = json.dumps(first, sort_keys=True)
-    assert all(document.body.decode() not in encoded for document in inventory.documents)
+    assert all(_document_body(document) not in encoded for document in inventory.documents)
     assert all(document.current_path not in encoded for document in inventory.documents)
     assert all(str(document.resource_id) not in encoded for document in inventory.documents)
     assert all(document.activity.actor not in encoded for document in inventory.documents)
@@ -1002,4 +1011,9 @@ async def test_evidence_binding_changes_when_any_private_scope_fact_changes(chan
         assert (
             base["evidence_binding"]["components"]["retained_mapping_closure"]
             != changed_receipt["evidence_binding"]["components"]["retained_mapping_closure"]
+        )
+    if changed == "mapping_owner":
+        assert (
+            base["evidence_binding"]["components"]["owner_runs"]
+            != changed_receipt["evidence_binding"]["components"]["owner_runs"]
         )
