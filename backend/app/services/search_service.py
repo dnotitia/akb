@@ -23,6 +23,13 @@ from app.exceptions import ValidationError
 from app.models.document import SearchResponse, SearchResult
 from app.services import sparse_encoder
 from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
+from app.services.grep_replace import (
+    DEFAULT_MAX_REPLACEMENTS,
+    apply_grep_replacement,
+    replacement_budget_error,
+    replacement_failure_error,
+    validate_max_replacements,
+)
 from app.services.vector_store import VectorHit, get_vector_store
 from app.services.vector_store.base import VectorStoreUnavailable, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
@@ -1046,6 +1053,7 @@ class SearchService:
         agent_id: str | None = None,
         user_id: str | None = None,
         limit: int = 20,
+        max_replacements: int = DEFAULT_MAX_REPLACEMENTS,
         count_only: bool = False,
         files_with_matches: bool = False,
         measurement_include_text_files: bool = False,
@@ -1080,6 +1088,8 @@ class SearchService:
                 "error": "replace= is incompatible with count_only / files_with_matches",
                 "pattern": pattern,
             }
+        if replace is not None:
+            max_replacements = validate_max_replacements(max_replacements)
 
         # Validate regex pattern early to give a clear error
         if regex:
@@ -1124,10 +1134,14 @@ class SearchService:
                 replace=replace,
                 actor=agent_id,
                 limit=limit,
+                max_replacements=max_replacements,
                 count_only=count_only,
                 files_with_matches=files_with_matches,
                 include_text_files=measurement_include_text_files,
             )
+
+        if replace is not None and doc_service is None:
+            raise ValidationError("doc_service is required for legacy grep replacement")
 
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -1284,50 +1298,70 @@ class SearchService:
         result_docs = matched_docs[:limit]
         returned_matches = sum(len(d["matches"]) for d in result_docs)
 
-        # Replace mode: apply find-and-replace on each matching document.
+        # Replace mode: apply find-and-replace on each matching document.  The
+        # response ``limit`` remains a preview-only knob; writes are governed by
+        # the independent, caller-visible ``max_replacements`` budget.
         # Service-layer `doc_service.update` still wants the doc path
         # (which find_by_ref accepts) — we pass `path` rather than re-
         # parsing the URI we just built.
         replaced: list[dict] = []
-        if replace is not None and result_docs and doc_service:
-            re_flags = 0 if case_sensitive else _re.IGNORECASE
-
-            for doc_info in result_docs:
+        unchanged_docs = 0
+        replacement_error: dict | None = None
+        if replace is not None and total_docs > max_replacements:
+            replacement_error = replacement_budget_error(
+                total_docs=total_docs,
+                max_replacements=max_replacements,
+            )
+        elif replace is not None and matched_docs:
+            for doc_info in matched_docs:
                 doc_vault = doc_info["vault"]
                 doc_path = doc_info["path"]
                 doc_uri_str = doc_info["uri"]
 
                 try:
                     doc = await doc_service.get(doc_vault, doc_path)
-                except Exception:
-                    replaced.append({"uri": doc_uri_str, "error": "not found"})
-                    continue
+                    body = doc.content or ""
 
-                body = doc.content or ""
+                    new_body = apply_grep_replacement(
+                        body,
+                        pattern,
+                        replace,
+                        regex=regex,
+                        case_sensitive=case_sensitive,
+                    )
 
-                if regex:
-                    new_body = _re.sub(pattern, replace, body, flags=re_flags)
-                else:
-                    if case_sensitive:
-                        new_body = body.replace(pattern, replace)
-                    else:
-                        # Case-insensitive non-regex replace
-                        new_body = _re.sub(_re.escape(pattern), replace, body, flags=_re.IGNORECASE)
+                    if new_body == body:
+                        unchanged_docs += 1
+                        continue
 
-                if new_body == body:
-                    continue  # no actual change
+                    from app.models.document import DocumentUpdateRequest
+                    req = DocumentUpdateRequest(
+                        content=new_body,
+                        message=f"grep replace: '{pattern}' → '{replace}'",
+                        # Do not overwrite a concurrent edit made after the
+                        # replacement body was read.
+                        expected_commit=doc.current_commit,
+                    )
+                    result = await doc_service.update(
+                        doc_vault,
+                        doc_path,
+                        req,
+                        agent_id=agent_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — return recovery receipt
+                    replacement_error = replacement_failure_error(
+                        exc,
+                        failed_uri=doc_uri_str,
+                        committed_replacements=len(replaced),
+                    )
+                    break
 
-                from app.models.document import DocumentUpdateRequest
-                req = DocumentUpdateRequest(
-                    content=new_body,
-                    message=f"grep replace: '{pattern}' → '{replace}'",
-                )
-                result = await doc_service.update(doc_vault, doc_path, req, agent_id=agent_id)
                 replaced.append({
                     "uri": doc_uri_str,
                     "path": doc_path,
                     "title": doc_info["title"],
                     "commit": result.commit_hash,
+                    "previous_commit": result.previous_commit,
                 })
 
         # Build response — strip internal handles (`_doc_pk`, `metadata`)
@@ -1367,8 +1401,13 @@ class SearchService:
 
         if replace is not None:
             resp["replace"] = replace
+            resp["max_replacements"] = max_replacements
             resp["replaced_docs"] = len(replaced)
+            resp["unchanged_docs"] = unchanged_docs
+            resp["replacement_complete"] = replacement_error is None
             resp["replacements"] = replaced
+            if replacement_error is not None:
+                resp.update(replacement_error)
         return resp
 
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:

@@ -184,6 +184,32 @@ def put_bytes(
         raise StorageError(wrap_error(e, f"write {key}").message) from e
 
 
+def copy(source_key: str, destination_key: str) -> dict[str, Any]:
+    """Copy one object to another key and return the destination metadata.
+
+    File replacement uploads land on a short-lived staging key. The server
+    copies those bytes to a fresh, non-presigned key before publishing the
+    metadata switch, so the still-valid upload URL cannot mutate the live
+    object after confirmation.
+    """
+    try:
+        # Managed copy automatically switches to multipart copy above the
+        # single CopyObject limit, preserving the proxy's large-file contract.
+        client().copy(
+            {"Bucket": settings.s3_bucket, "Key": source_key},
+            settings.s3_bucket,
+            destination_key,
+        )
+    except ClientError as e:
+        raise StorageError(
+            wrap_error(e, f"copy {source_key} to {destination_key}").message
+        ) from e
+    except Exception as e:  # noqa: BLE001 — managed transfer wraps worker failures
+        logger.error("S3 managed copy failed: %s", e)
+        raise StorageError("copy failed") from e
+    return head(destination_key)
+
+
 def delete(key: str) -> None:
     try:
         client().delete_object(Bucket=settings.s3_bucket, Key=key)

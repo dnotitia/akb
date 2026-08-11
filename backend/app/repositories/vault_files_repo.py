@@ -178,6 +178,29 @@ async def find_by_id(
     return dict(row) if row else None
 
 
+async def find_by_id_for_update(
+    conn,
+    vault_id: uuid.UUID,
+    file_id: uuid.UUID,
+) -> dict | None:
+    """Return and row-lock one file for an atomic metadata replacement."""
+    row = await conn.fetchrow(
+        """
+        SELECT vf.id, vf.vault_id, vf.collection_id, c.path AS collection,
+               vf.name, vf.s3_key, vf.mime_type, vf.size_bytes,
+               vf.description, vf.created_by, vf.created_at, vf.updated_at,
+               vf.content_hash, vf.hash_algorithm, vf.etag,
+               vf.storage_version, vf.hash_verified_at
+          FROM vault_files vf
+          LEFT JOIN collections c ON c.id = vf.collection_id
+         WHERE vf.id = $1 AND vf.vault_id = $2
+         FOR UPDATE OF vf
+        """,
+        file_id, vault_id,
+    )
+    return dict(row) if row else None
+
+
 async def find_measurement_by_id(conn, vault_id: uuid.UUID, file_id: uuid.UUID) -> dict | None:
     row = await conn.fetchrow(
         """
@@ -248,6 +271,38 @@ async def update_confirmed_metadata(
         WHERE id = $6
         """,
         size_bytes, content_hash, hash_algorithm, etag, storage_version, file_id,
+    )
+
+
+async def replace_confirmed_metadata(
+    conn,
+    file_id: uuid.UUID,
+    *,
+    s3_key: str,
+    mime_type: str,
+    size_bytes: int,
+    content_hash: str,
+    hash_algorithm: str,
+    etag: str | None,
+    storage_version: str | None,
+) -> None:
+    """Publish replacement bytes while preserving the logical file id."""
+    await conn.execute(
+        """
+        UPDATE vault_files SET
+            s3_key = $1,
+            mime_type = $2,
+            size_bytes = $3,
+            content_hash = $4,
+            hash_algorithm = $5,
+            etag = $6,
+            storage_version = $7,
+            hash_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $8
+        """,
+        s3_key, mime_type, size_bytes, content_hash, hash_algorithm,
+        etag, storage_version, file_id,
     )
 
 

@@ -41,10 +41,12 @@ _MCP = Path(__file__).resolve().parents[1] / "mcp_server"
 _PLUGINS = Path(__file__).resolve().parents[2] / "plugins"
 
 # Tools the backend deliberately does NOT define: the Node stdio proxy owns
-# local filesystem access, so it synthesises these three itself and they never
+# local filesystem access, so it synthesises these four itself and they never
 # appear in the backend `TOOLS` list (see packages/akb-mcp-client/lib/proxy.mjs
 # and the boundary rule in AGENTS.md). Prose is allowed to name them.
-_PROXY_ONLY_TOOLS = frozenset({"akb_put_file", "akb_get_file", "akb_delete_file"})
+_PROXY_ONLY_TOOLS = frozenset(
+    {"akb_put_file", "akb_get_file", "akb_update_file", "akb_delete_file"}
+)
 
 # The trailing \b and the digit class matter: `\bakb_[a-z_]+` would match the
 # `akb_search` PREFIX of a ghost named `akb_search2` and wave it through as a

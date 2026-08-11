@@ -17,6 +17,26 @@ observed-state convergence. Added admin and self-app request/status routes,
 worker lifecycle registration, migration 060, and the source-neutral
 `app-release-rollout` repository E2E fixture scenario.
 
+### Fixed scoped grep replacement completeness and recovery
+
+`akb_grep(replace=...)` now treats `limit` only as a response-preview bound and
+uses a separate `max_replacements` write budget. A scope larger than that budget
+is rejected before any document changes, while an accepted scope is applied to
+every matching document. Replacement receipts include both the new and previous
+commit, and a failure after earlier commits returns those completed receipts plus
+the failed document instead of discarding the partial result. The audit stream
+records a bounded summary and one metadata-only receipt per committed document.
+Literal-mode replacements now also preserve backslashes as ordinary text;
+replacement-template backreferences remain exclusive to regex mode.
+
+### Added conflict-safe file replacement
+
+The File REST surface and stdio proxy now support replacing an existing file's
+bytes without changing its canonical URI. Callers may pin the current sha256,
+an opaque file version, or both; stale confirmation attempts return 409.
+Replacement uploads are isolated from the live object until a row-locked final
+precondition check succeeds, and identical content skips the byte transfer.
+
 ### Added app installation lifecycle commands
 
 Added administrator install, restore, fresh, status, and uninstall commands

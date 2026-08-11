@@ -168,6 +168,8 @@ akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="n
 ## akb_grep — Exact Text Search & Replace
 Find exact strings or regex patterns across documents. Use when you need precision, not meaning.
 Add `replace` to find-and-replace across all matching documents in one call.
+`limit` controls only the returned preview; `max_replacements` is the separate
+write budget and rejects the call before any write when the scope is larger.
 
 ```
 akb_grep(pattern="PostgreSQL 14")                                      # Find exact string
@@ -865,8 +867,9 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
-| replace | | Replacement string — triggers find-and-replace mode |
-| limit | | Max documents to return (default 20) |
+| replace | | Replacement string — literal unless `regex=true`, which enables backreferences |
+| limit | | Max documents to return (default 20; does not limit writes) |
+| max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
 | count_only | | Return exact per-resource counts without snippets |
 | measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
 
@@ -896,7 +899,8 @@ akb_grep(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16")
 akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 ```
 
-**Tip:** Run grep WITHOUT replace first to preview matches, then add replace.
+**Tip:** Run grep WITHOUT replace first to preview matches, then add replace with
+`max_replacements` set high enough for the intended scope.
 Each replaced document gets its own git commit and is re-indexed for search.
 
 ## Result Structure
@@ -1441,8 +1445,37 @@ Downloads from S3 to a local path. Handled by akb-mcp stdio proxy.
 ## Example
 ```
 akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
-→ {"name": "diagram.png", "save_to": "/tmp/downloads/diagram.png", "size_bytes": 45000}
+→ {"name": "diagram.png", "save_to": "/tmp/downloads/diagram.png", "size_bytes": 45000,
+   "content_hash": "…", "version": "…"}
 ```""",
+
+    "akb_update_file": """# akb_update_file — Replace a File
+
+Replaces an existing file's bytes while preserving its AKB URI. Handled by the
+akb-mcp stdio proxy. The proxy hashes the local file first, so an identical
+replacement returns `unchanged=true` without uploading bytes.
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| uri | ✓ | Existing file AKB URI |
+| file_path | ✓ | Absolute path to the local replacement file |
+| expected_content_hash | | Hash returned by `akb_get_file`; stale values return 409 |
+| expected_version | | Opaque `version` returned by `akb_get_file`; stale values return 409 |
+| mime_type | | New MIME type; existing type is preserved when omitted |
+
+## Example
+```
+current = akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/current.pdf")
+akb_update_file(
+  uri="akb://eng/file/abc123",
+  file_path="/tmp/revised.pdf",
+  expected_content_hash=current["content_hash"],
+  expected_version=current["version"])
+```
+
+When both preconditions are supplied, both must still match at confirmation.
+Re-read the file before retrying a 409 conflict.""",
 
     "akb_delete_file": """# akb_delete_file — Delete a File
 
@@ -1484,7 +1517,7 @@ Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
 Binary files (images, PDFs, exports) stored in S3 with metadata in PostgreSQL.
 Files appear in `akb_browse` alongside documents and tables.
 
-File tools (`akb_put_file`, `akb_get_file`, `akb_delete_file`) work with local file paths —
+File tools (`akb_put_file`, `akb_get_file`, `akb_update_file`, `akb_delete_file`) work with local file paths —
 they are handled by the akb-mcp stdio proxy which streams files directly to/from S3.
 
 ## Tools
@@ -1493,6 +1526,7 @@ they are handled by the akb-mcp stdio proxy which streams files directly to/from
 |------|-------------|
 | `akb_put_file` | Upload a local file to vault storage |
 | `akb_get_file` | Download a file to a local path |
+| `akb_update_file` | Replace a file with optional hash/version preconditions |
 | `akb_delete_file` | Delete a file |
 | `akb_browse` | Files appear in unified browse |
 | `akb_link` | Connect file to documents or tables |
@@ -1508,6 +1542,13 @@ result = akb_put_file(vault="eng", file_path="/path/to/diagram.png", collection=
 ```
 akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/downloads/")
 # → {name: "diagram.png", save_to: "/tmp/downloads/diagram.png", size_bytes: 45000}
+```
+
+## Replace without clobbering a concurrent update
+```
+current = akb_get_file(uri="akb://eng/file/abc123", save_to="/tmp/diagram.png")
+akb_update_file(uri="akb://eng/file/abc123", file_path="/tmp/new-diagram.png",
+  expected_content_hash=current["content_hash"], expected_version=current["version"])
 ```
 
 ## Link a file to a document

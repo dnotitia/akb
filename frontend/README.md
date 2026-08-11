@@ -83,7 +83,7 @@ backend reachable at `AKB_URL` (defaults to `http://localhost:8000`).
 
 ## Adding routes
 
-Routes are declared in `src/main.tsx` inside the `<Routes>` block.
-Doc routes are nested under `VaultShell`; the doc-create route
-(`/vault/:name/doc/new`) sits *before* `/vault/:name/doc/:id` so the
-literal `new` segment matches first.
+The canonical route/component/shell map lives in `src/app-route-contract.ts`.
+`src/app-routes.tsx` renders that contract for both the real application and
+Storybook's routed page scenarios. Update the contract test whenever a route,
+page component, auth/public boundary, or shell owner changes.

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.0 — conflict-safe in-place file replacement
+
+Adds the proxy-only `akb_update_file` tool. It preserves the existing file URI
+while replacing its bytes and accepts optional `expected_content_hash` and
+`expected_version` optimistic-concurrency pins. A stale pin returns HTTP 409,
+matching the document update contract.
+
+Replacement bytes upload to an isolated staging object. Confirmation copies
+them to a fresh, non-presigned object and rechecks both pins while holding the
+file metadata row lock before switching the logical file to that object. A
+stale or failed attempt therefore cannot overwrite the live object. Identical
+content is detected from the local sha256 and returns `unchanged=true` before
+any byte transfer.
+
+`akb_get_file` now returns an opaque `version` token (the object-store version
+ID when available, otherwise its ETag) for use with `expected_version`.
+
 ## 2.1.0 — survive backend/VPN outages without a session restart
 
 Resilience fix for the failure mode where a long VPN/backend outage

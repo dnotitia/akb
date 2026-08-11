@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # AKB stdio MCP File Tools E2E Test
-# Tests file upload/download/list/delete via akb-mcp stdio proxy
+# Tests file upload/download/update/list/delete via akb-mcp stdio proxy
 #
 set -uo pipefail
 
@@ -113,11 +113,11 @@ FILE_TOOL_COUNT=$(echo "$TOOLS" | python3 -c '
 import sys,json
 d = json.load(sys.stdin)
 tools = d["result"]["tools"]
-file_tools = [t["name"] for t in tools if t["name"] in ("akb_put_file","akb_get_file","akb_delete_file")]
+file_tools = [t["name"] for t in tools if t["name"] in ("akb_put_file","akb_get_file","akb_update_file","akb_delete_file")]
 print(len(file_tools))
 ' 2>/dev/null)
 
-[ "$FILE_TOOL_COUNT" = "3" ] && pass "3 file tools found (list_files replaced by browse)" || fail "File tools" "expected 3, got $FILE_TOOL_COUNT"
+[ "$FILE_TOOL_COUNT" = "4" ] && pass "4 file tools found (list_files replaced by browse)" || fail "File tools" "expected 4, got $FILE_TOOL_COUNT"
 
 TOTAL_TOOLS=$(echo "$TOOLS" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["result"]["tools"]))' 2>/dev/null)
 [ "$TOTAL_TOOLS" -ge 40 ] 2>/dev/null && pass "Total tools: $TOTAL_TOOLS" || fail "Total tools" "expected >=40, got $TOTAL_TOOLS"
@@ -170,6 +170,8 @@ DL_PATH="/tmp/akb-stdio-dl"
 mkdir -p "$DL_PATH"
 DL1=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"save_to\":\"$DL_PATH\"}}")
 DL1_PATH=$(tool_result "$DL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("save_to",""))' 2>/dev/null)
+DL1_HASH=$(tool_result "$DL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content_hash","") or "")' 2>/dev/null)
+DL1_VERSION=$(tool_result "$DL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("version","") or "")' 2>/dev/null)
 
 if [ -f "$DL1_PATH" ]; then
   diff "$TEST_FILE1" "$DL1_PATH" > /dev/null 2>&1 && pass "Text file content matches" || fail "Download text" "content mismatch"
@@ -186,9 +188,46 @@ else
   fail "Download binary" "file not saved to $DL2_PATH"
 fi
 
-# ── 7. Delete file ───────────────────────────────────────────
+# ── 7. Replace file with OCC pins ───────────────────────────
 echo ""
-echo "▸ 7. Delete file"
+echo "▸ 7. Replace file with optimistic concurrency"
+
+REPLACEMENT_FILE="/tmp/akb-stdio-replacement.txt"
+echo "Updated through akb_update_file" > "$REPLACEMENT_FILE"
+
+UPDATE1=$(rpc_call "tools/call" "{\"name\":\"akb_update_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"file_path\":\"$REPLACEMENT_FILE\",\"expected_content_hash\":\"$DL1_HASH\",\"expected_version\":\"$DL1_VERSION\"}}")
+UPDATED_URI=$(tool_result "$UPDATE1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
+UPDATED_HASH=$(tool_result "$UPDATE1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content_hash","") or "")' 2>/dev/null)
+UPDATED_VERSION=$(tool_result "$UPDATE1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("version","") or "")' 2>/dev/null)
+[ "$UPDATED_URI" = "$FILE1_URI" ] && [ -n "$UPDATED_HASH" ] && [ -n "$UPDATED_VERSION" ] \
+  && pass "Replacement preserved URI and returned new hash/version" \
+  || fail "Replace file" "unexpected result: $(tool_result "$UPDATE1")"
+
+UPDATED_DL="$DL_PATH/updated.txt"
+DL_UPDATED=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"save_to\":\"$UPDATED_DL\"}}")
+if [ -f "$UPDATED_DL" ]; then
+  diff "$REPLACEMENT_FILE" "$UPDATED_DL" > /dev/null 2>&1 \
+    && pass "Replacement bytes are downloadable through the original URI" \
+    || fail "Replacement download" "content mismatch"
+else
+  fail "Replacement download" "file not saved to $UPDATED_DL — $(tool_result "$DL_UPDATED")"
+fi
+
+STALE=$(rpc_call "tools/call" "{\"name\":\"akb_update_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"file_path\":\"$REPLACEMENT_FILE\",\"expected_content_hash\":\"$DL1_HASH\",\"expected_version\":\"$DL1_VERSION\"}}")
+STALE_MSG=$(tool_result "$STALE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
+echo "$STALE_MSG" | grep -q "HTTP 409" \
+  && pass "Stale hash/version precondition returns 409" \
+  || fail "Stale replacement" "expected HTTP 409, got: $STALE_MSG"
+
+UNCHANGED=$(rpc_call "tools/call" "{\"name\":\"akb_update_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"file_path\":\"$REPLACEMENT_FILE\",\"expected_content_hash\":\"$UPDATED_HASH\",\"expected_version\":\"$UPDATED_VERSION\"}}")
+UNCHANGED_VALUE=$(tool_result "$UNCHANGED" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("unchanged",False))' 2>/dev/null)
+[ "$UNCHANGED_VALUE" = "True" ] \
+  && pass "Identical replacement skips transfer" \
+  || fail "Identical replacement" "expected unchanged=true, got: $(tool_result "$UNCHANGED")"
+
+# ── 8. Delete file ───────────────────────────────────────────
+echo ""
+echo "▸ 8. Delete file"
 
 DEL1=$(rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri\":\"$FILE1_URI\"}}")
 DELETED=$(tool_result "$DEL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted",False))' 2>/dev/null)
@@ -198,9 +237,9 @@ BROWSE_AFTER=$(rpc_call "tools/call" "{\"name\":\"akb_browse\",\"arguments\":{\"
 REMAINING=$(tool_result "$BROWSE_AFTER" | python3 -c 'import sys,json; print(len([i for i in json.load(sys.stdin).get("items",[]) if i["type"]=="file"]))' 2>/dev/null)
 [ "$REMAINING" = "1" ] && pass "1 file remaining after delete" || fail "Post-delete browse" "expected 1, got $REMAINING"
 
-# ── 8. Error cases ───────────────────────────────────────────
+# ── 9. Error cases ───────────────────────────────────────────
 echo ""
-echo "▸ 8. Error cases"
+echo "▸ 9. Error cases"
 
 ERR_UPLOAD=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"vault\":\"$VAULT\",\"file_path\":\"/nonexistent/file.txt\"}}")
 ERR_MSG=$(tool_result "$ERR_UPLOAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
@@ -210,9 +249,9 @@ ERR_DL=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\
 ERR_DL_MSG=$(tool_result "$ERR_DL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_DL_MSG" ] && pass "Download nonexistent file returns error" || fail "Error case" "no error for missing file"
 
-# ── 9. Vault delete cleans up S3 files ──────────────────────
+# ── 10. Vault delete cleans up S3 files ─────────────────────
 echo ""
-echo "▸ 9. Vault delete cleans S3 files"
+echo "▸ 10. Vault delete cleans S3 files"
 
 # Upload a file, then delete the vault — file should be gone from S3
 VAULT2="stdio-file-e2e-cleanup-$(date +%s)"
@@ -233,9 +272,9 @@ ERR_GONE_MSG=$(tool_result "$ERR_GONE" | python3 -c 'import sys,json; print(json
 [ -n "$ERR_GONE_MSG" ] && pass "Deleted vault's files are inaccessible" || fail "Vault cleanup" "file still accessible after vault delete"
 rm -f "$CLEANUP_FILE"
 
-# ── 10. Cleanup ──────────────────────────────────────────────
+# ── 11. Cleanup ──────────────────────────────────────────────
 echo ""
-echo "▸ 10. Cleanup"
+echo "▸ 11. Cleanup"
 
 # Delete remaining file from original vault
 rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri\":\"$FILE2_URI\"}}" >/dev/null
@@ -243,7 +282,7 @@ rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri\":\"$F
 rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT\"}}" >/dev/null
 pass "Cleanup done"
 
-rm -f "$TEST_FILE1" "$TEST_FILE2" "$DL_PATH"/*
+rm -f "$TEST_FILE1" "$TEST_FILE2" "$REPLACEMENT_FILE" "$DL_PATH"/*
 
 # ── Results ──────────────────────────────────────────────────
 echo ""

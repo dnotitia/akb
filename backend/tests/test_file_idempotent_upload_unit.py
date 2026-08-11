@@ -234,6 +234,7 @@ async def test_default_s3_facade_file_envelope_is_unchanged(monkeypatch):
     assert set(items[0]) == {
         "kind", "uri", "collection", "name", "mime_type", "size_bytes",
         "content_hash", "hash_algorithm", "etag", "storage_version",
+        "version",
         "description", "created_by", "created_at",
     }
 

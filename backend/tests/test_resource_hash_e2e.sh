@@ -151,7 +151,7 @@ DL_HASH=$(echo "$DL" | json_get "d['content_hash']")
 rm -f "$TMP_FILE"
 
 echo ""
-echo "Passed: $PASS  Failed: $FAIL"
+echo "Results: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
   printf ' - %s\n' "${ERRORS[@]}"
   exit 1
