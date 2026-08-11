@@ -63,7 +63,7 @@ _DSN = os.environ.get(
 async def _reachable() -> bool:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         return False
     await conn.close()
     return True
@@ -125,10 +125,7 @@ async def _authority_counts(pool) -> tuple[tuple[str, int], ...]:
         "legacy_revision_mappings",
     )
     async with pool.acquire() as conn:
-        return tuple([
-            (table, int(await conn.fetchval(f'SELECT count(*) FROM "{table}"')))
-            for table in tables
-        ])
+        return tuple([(table, int(await conn.fetchval(f'SELECT count(*) FROM "{table}"'))) for table in tables])
 
 
 def _oid(char: str) -> str:
@@ -228,9 +225,7 @@ def _second_document() -> LegacyInventoryDocument:
             subject="akb://p2-manual/coll/notes/second-candidate.md",
             summary="update second candidate at fixed ref",
             path_to=path,
-            changed_paths=(
-                {"change": "update", "path_from": None, "path_to": path},
-            ),
+            changed_paths=({"change": "update", "path_from": None, "path_to": path},),
         ),
     )
 
@@ -297,10 +292,7 @@ class _ReadRepository:
         resource_id: uuid.UUID,
         legacy_git_oid: str,
     ) -> LegacyRevisionMapping | None:
-        if (
-            resource_id != self.item.legacy_document_id
-            or legacy_git_oid != self.item.legacy_head_oid
-        ):
+        if resource_id != self.item.legacy_document_id or legacy_git_oid != self.item.legacy_head_oid:
             return None
         return LegacyRevisionMapping(
             namespace_id=self.run.namespace_id,
@@ -314,6 +306,30 @@ class _ReadRepository:
             fixed_git_oid=self.run.fixed_git_oid,
         )
 
+    async def list_resource_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+    ) -> list[LegacyRevisionMapping]:
+        assert namespace_id == self.run.namespace_id
+        document = _document()
+        assert resource_id == document.resource_id
+        return [
+            LegacyRevisionMapping(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                legacy_git_oid=entry.legacy_git_oid,
+                path_at_revision=entry.path_at_revision,
+                resolution="native" if index == len(document.lineage) - 1 else "bridge",
+                native_revision_id=(self.item.native_head_revision_id if index == len(document.lineage) - 1 else None),
+                run_id=self.run.run_id,
+                lineage_ordinal=index,
+                fixed_git_oid=self.run.fixed_git_oid,
+            )
+            for index, entry in enumerate(document.lineage)
+        ]
+
 
 class _InventoryBridge:
     def __init__(self, inventory: LegacyInventory):
@@ -322,6 +338,57 @@ class _InventoryBridge:
     async def inventory_for_run(self, run: MigrationRun) -> LegacyInventory:
         assert run.inventory_digest == self.inventory.inventory_digest
         return self.inventory
+
+
+def _activity_binding_fact(
+    document: LegacyInventoryDocument,
+    *,
+    selector: str,
+    fixed_ref: str,
+) -> dict[str, Any]:
+    namespace_id = "22222222-2222-4222-8222-222222222222"
+    resource_id = str(document.resource_id)
+    occurred_at = document.lineage[-1].committed_at.isoformat()
+    current_mapping = {
+        "namespace_id": namespace_id,
+        "resource_id": resource_id,
+        "legacy_git_oid": document.current_commit,
+        "path_at_revision": document.current_path,
+        "resolution": "native",
+        "native_revision_id": selector,
+        "fixed_git_oid": fixed_ref,
+        "run_id": "33333333-3333-4333-8333-333333333333",
+    }
+    selected_revision = {
+        "namespace_id": namespace_id,
+        "resource_id": resource_id,
+        "revision_id": selector,
+        "parent_revision_id": None,
+        "surface": "document",
+        "action": "create",
+        "path_at_revision": document.current_path,
+        "path_from": None,
+        "path_to": document.current_path,
+        "actor": "akb-native-revision-migration",
+        "subject": None,
+        "summary": None,
+        "occurred_at": occurred_at,
+        "digest": document.body_digest,
+        "byte_size": document.byte_size,
+    }
+    return {
+        "profile": "akb-native-revision-p2-activity-audit/v1",
+        "selector": selector,
+        "fixed_ref": fixed_ref,
+        "current_mapping": current_mapping,
+        "selected_revision": selected_revision,
+        "activity": {
+            key: value
+            for key, value in selected_revision.items()
+            if key not in {"parent_revision_id", "digest", "byte_size"}
+        },
+        "completed_parent_mapping": None,
+    }
 
 
 class _WireReader:
@@ -380,17 +447,18 @@ class _WireReader:
     async def activity(self, document: LegacyInventoryDocument, *, selector: str, fixed_ref: str) -> dict[str, Any]:
         del fixed_ref
         activity = document.activity
+        actor = "akb-native-revision-migration" if self.candidate else activity.actor
         return {
             "events": [
                 {
                     "hash": selector,
-                    "subject": activity.subject,
+                    "subject": None if self.candidate else activity.subject,
                     "author": {
-                        "id": activity.actor,
-                        "display": "Legacy Writer (Git)" if not self.candidate else "Migration",
+                        "id": actor,
+                        "display": actor if self.candidate else "Legacy Writer (Git)",
                     },
                     "action": activity.action if not self.candidate else "create",
-                    "summary": activity.summary if not self.candidate else "C9 fixed-ref native genesis",
+                    "summary": activity.summary if not self.candidate else None,
                     "projection_revision": selector,
                 }
             ]
@@ -410,26 +478,22 @@ class _WireReader:
         )
         return NativeActivityEvidence(
             envelope=envelope,
-            binding_fact={
-                "profile": "akb-native-revision-p2-activity-audit/v1",
-                "resource_id": str(document.resource_id),
-                "selector": selector,
-                "fixed_ref": fixed_ref,
-            },
+            binding_fact=_activity_binding_fact(
+                document,
+                selector=selector,
+                fixed_ref=fixed_ref,
+            ),
         )
 
 
 class _NoWriteGit:
     def __init__(self, *documents: LegacyInventoryDocument):
         self.documents = documents
-        self.bodies = {
-            (document.current_path, document.current_commit): document.body
-            for document in documents
-        }
+        self.bodies = {(document.current_path, document.current_commit): document.body for document in documents}
         for document in documents:
             for entry in document.lineage[:-1]:
-                self.bodies[(entry.path_at_revision, entry.legacy_git_oid)] = (
-                    document.body.replace(b"secret body", b"old body")
+                self.bodies[(entry.path_at_revision, entry.legacy_git_oid)] = document.body.replace(
+                    b"secret body", b"old body"
                 )
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.snapshot_override: dict[str, Any] | None = None
@@ -437,11 +501,7 @@ class _NoWriteGit:
 
     def manual_fixed_ref_history(self, *args, **kwargs) -> dict[str, Any]:
         self.calls.append(("manual_fixed_ref_history", args))
-        document = next(
-            document
-            for document in self.documents
-            if document.current_path == args[2]
-        )
+        document = next(document for document in self.documents if document.current_path == args[2])
         result = {
             "fixed_ref": args[1],
             "current_commit": kwargs["current_commit"],
@@ -470,11 +530,7 @@ class _NoWriteGit:
 
     def file_diff(self, *args) -> dict[str, Any]:
         self.calls.append(("file_diff", args))
-        document = next(
-            document
-            for document in self.documents
-            if document.current_path == args[1]
-        )
+        document = next(document for document in self.documents if document.current_path == args[1])
         previous = document.lineage[-2]
         parent = self.bodies[(previous.path_at_revision, previous.legacy_git_oid)].decode()
         current = self.bodies[(document.current_path, document.current_commit)].decode()
@@ -519,19 +575,14 @@ class _NoWriteNative:
         self,
         *entries: tuple[LegacyInventoryDocument, str],
     ):
-        self.entries = {
-            document.resource_id: (document, native_id)
-            for document, native_id in entries
-        }
+        self.entries = {document.resource_id: (document, native_id) for document, native_id in entries}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.snapshot_overrides: dict[tuple[uuid.UUID, str], _Snapshot] = {}
 
     async def get_resource_revision(self, **kwargs) -> _Snapshot:
         self.calls.append(("get_resource_revision", kwargs))
         document, native_id = self.entries[kwargs["resource_id"]]
-        override = self.snapshot_overrides.get(
-            (kwargs["resource_id"], kwargs["revision_id"])
-        )
+        override = self.snapshot_overrides.get((kwargs["resource_id"], kwargs["revision_id"]))
         if override is not None:
             return override
         assert kwargs["revision_id"] == native_id
@@ -550,16 +601,11 @@ class _NoWriteNative:
 
 class _NoWriteNativeRepository:
     def __init__(self, *entries: tuple[LegacyInventoryDocument, str]):
-        self.entries = {
-            document.resource_id: (document, native_id)
-            for document, native_id in entries
-        }
+        self.entries = {document.resource_id: (document, native_id) for document, native_id in entries}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.history_overrides: dict[uuid.UUID, list[dict[str, Any]]] = {}
         self.revision_overrides: dict[uuid.UUID, dict[str, Any] | None] = {}
-        self.revision_selector_overrides: dict[
-            tuple[uuid.UUID, str], dict[str, Any] | None
-        ] = {}
+        self.revision_selector_overrides: dict[tuple[uuid.UUID, str], dict[str, Any] | None] = {}
         self.activity_override: dict[str, Any] | None = None
 
     def _revision(self, resource_id: uuid.UUID) -> dict[str, Any]:
@@ -669,9 +715,7 @@ class _CompletedSelectorBridge:
             fixed_git_oid=self.fixed_ref,
             legacy_git_oid=selector,
             path_at_revision=(
-                "notes/corrupt-retained.md"
-                if selector in self.corrupt_paths
-                else entry.path_at_revision
+                "notes/corrupt-retained.md" if selector in self.corrupt_paths else entry.path_at_revision
             ),
             run_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
         )
@@ -1367,9 +1411,7 @@ async def test_native_diff_binds_selected_and_parent_rows_to_persisted_bodies():
             selector_bridge=bridge,
         ).diff(document, selector=native_id, fixed_ref=fixed_ref)
 
-    corrupt_parent_service, corrupt_parent_repo, _, parent_row = _native_replace_fakes(
-        document, native_id, parent_id
-    )
+    corrupt_parent_service, corrupt_parent_repo, _, parent_row = _native_replace_fakes(document, native_id, parent_id)
     corrupt_parent_service.snapshot_overrides[(document.resource_id, parent_id)] = replace(
         corrupt_parent_service.snapshot_overrides[(document.resource_id, parent_id)],
         text="# Migration candidate\n\nforged parent\n",
@@ -1452,22 +1494,25 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert receipt["summary"]["mismatch_count"] == 12
     assert receipt["summary"]["raw_activity_audit_count"] == 1
     assert receipt["evidence_binding"]["mapping_count"] == 1
+    assert receipt["evidence_binding"]["retained_mapping_count"] == 1
+    assert receipt["evidence_binding"]["native_parent_binding_count"] == 1
     assert receipt["evidence_binding"]["owner_run_count"] == 1
     assert receipt["evidence_binding"]["scheme"] == "sha256"
-    assert receipt["evidence_binding"]["canonicalization"] == (
-        "utf8-json-sort-keys-no-whitespace-v1"
-    )
-    assert receipt["evidence_binding"]["domain"] == (
-        "akb-native-revision-p2-w1-c10/evidence-binding/v1"
-    )
+    assert receipt["evidence_binding"]["canonicalization"] == ("utf8-json-sort-keys-no-whitespace-v1")
+    assert receipt["evidence_binding"]["domain"] == ("akb-native-revision-p2-w1-c10/evidence-binding/v1")
     components = receipt["evidence_binding"]["components"]
-    assert set(components) == {"comparison_run", "mapping_owner_activity"}
+    assert set(components) == {
+        "comparison_run",
+        "mapping_owner_activity",
+        "retained_mapping_closure",
+        "native_parent_bindings",
+    }
     assert len(components["comparison_run"]) == 64
     assert len(components["mapping_owner_activity"]) == 1
+    assert len(components["retained_mapping_closure"]) == 1
+    assert len(components["native_parent_bindings"]) == 1
     recomputed = hashlib.sha256(
-        (
-            receipt["evidence_binding"]["domain"] + "\0"
-        ).encode()
+        (receipt["evidence_binding"]["domain"] + "\0").encode()
         + json.dumps(
             components,
             ensure_ascii=False,
@@ -1478,7 +1523,8 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert receipt["evidence_binding"]["commitment"] == recomputed
     assert len(receipt["evidence_binding"]["commitment"]) == 64
     assert all(
-        resource["operations"]["activity"]["raw_activity_audit"] == {
+        resource["operations"]["activity"]["raw_activity_audit"]
+        == {
             "profile": "akb-native-revision-p2-activity-audit/v1",
             "status": "passed",
         }
@@ -1506,10 +1552,9 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert run.inventory_digest not in encoded
 
 
-async def test_evidence_binding_commits_to_private_audited_activity_facts():
+async def test_comparator_rejects_correlated_activity_fact_tamper():
     document = _document()
     run, item, inventory, native_id = _run_and_item(document)
-    baseline_candidate = _WireReader(native_id, candidate=True)
     changed_candidate = _WireReader(native_id, candidate=True)
     original_evidence = changed_candidate.activity_evidence
 
@@ -1517,26 +1562,26 @@ async def test_evidence_binding_commits_to_private_audited_activity_facts():
         evidence = await original_evidence(*args, **kwargs)
         return NativeActivityEvidence(
             envelope=evidence.envelope,
-            binding_fact={**evidence.binding_fact, "audit_variant": "changed"},
+            binding_fact={
+                **evidence.binding_fact,
+                "selected_revision": {
+                    **evidence.binding_fact["selected_revision"],
+                    "resource_id": str(uuid.uuid4()),
+                },
+            },
         )
 
     changed_candidate.activity_evidence = changed_evidence
 
-    async def compare(candidate):
-        return await NativeRevisionShadowComparator(
-            repository=_ReadRepository(run, item),
-            bridge=_InventoryBridge(inventory),
-            legacy_reader=_WireReader(native_id, candidate=False),
-            candidate_reader=candidate,
-        ).compare_run(run.run_id)
+    comparator = NativeRevisionShadowComparator(
+        repository=_ReadRepository(run, item),
+        bridge=_InventoryBridge(inventory),
+        legacy_reader=_WireReader(native_id, candidate=False),
+        candidate_reader=changed_candidate,
+    )
 
-    baseline = await compare(baseline_candidate)
-    changed = await compare(changed_candidate)
-
-    assert baseline["resources"] == changed["resources"]
-    assert baseline["summary"] == changed["summary"]
-    assert baseline["evidence_binding"]["commitment"] != changed["evidence_binding"]["commitment"]
-    assert baseline["receipt_digest"] != changed["receipt_digest"]
+    with pytest.raises(ShadowComparisonError, match="not correlated"):
+        await comparator.compare_run(run.run_id)
 
 
 async def test_comparator_requires_a_candidate_raw_activity_auditor():
@@ -1555,6 +1600,31 @@ async def test_comparator_requires_a_candidate_raw_activity_auditor():
         ShadowComparisonError,
         match="cannot prove the raw native activity audit",
     ):
+        await comparator.compare_run(run.run_id)
+
+
+async def test_comparator_rejects_profile_only_activity_evidence():
+    document = _document()
+    run, item, inventory, native_id = _run_and_item(document)
+    candidate = _WireReader(native_id, candidate=True)
+    original_evidence = candidate.activity_evidence
+
+    async def profile_only(*args, **kwargs):
+        evidence = await original_evidence(*args, **kwargs)
+        return NativeActivityEvidence(
+            envelope=evidence.envelope,
+            binding_fact={"profile": "akb-native-revision-p2-activity-audit/v1"},
+        )
+
+    candidate.activity_evidence = profile_only
+    comparator = NativeRevisionShadowComparator(
+        repository=_ReadRepository(run, item),
+        bridge=_InventoryBridge(inventory),
+        legacy_reader=_WireReader(native_id, candidate=False),
+        candidate_reader=candidate,
+    )
+
+    with pytest.raises(ShadowComparisonError, match="activity audit schema"):
         await comparator.compare_run(run.run_id)
 
 

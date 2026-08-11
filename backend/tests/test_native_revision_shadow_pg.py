@@ -68,8 +68,7 @@ class _ReadRepository:
             (
                 item
                 for item in self.items
-                if item.legacy_document_id == resource_id
-                and item.legacy_head_oid == legacy_git_oid
+                if item.legacy_document_id == resource_id and item.legacy_head_oid == legacy_git_oid
             ),
             None,
         )
@@ -86,6 +85,30 @@ class _ReadRepository:
             lineage_ordinal=1,
             fixed_git_oid=self.run.fixed_git_oid,
         )
+
+    async def list_resource_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+    ) -> list[LegacyRevisionMapping]:
+        assert namespace_id == self.run.namespace_id
+        document = next(document for document in _fixtures()[1].documents if document.resource_id == resource_id)
+        item = next(item for item in self.items if item.legacy_document_id == resource_id)
+        return [
+            LegacyRevisionMapping(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                legacy_git_oid=entry.legacy_git_oid,
+                path_at_revision=entry.path_at_revision,
+                resolution="native" if index == len(document.lineage) - 1 else "bridge",
+                native_revision_id=(item.native_head_revision_id if index == len(document.lineage) - 1 else None),
+                run_id=self.run.run_id,
+                lineage_ordinal=index,
+                fixed_git_oid=self.run.fixed_git_oid,
+            )
+            for index, entry in enumerate(document.lineage)
+        ]
 
 
 class _EvidenceRepository:
@@ -110,8 +133,18 @@ class _EvidenceRepository:
         return self.owner_runs.get(run_id)
 
     async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]:
-        assert run_id == self.run.run_id
-        return list(self.items)
+        if run_id == self.run.run_id:
+            return list(self.items)
+        owner = self.owner_runs[run_id]
+        return [
+            replace(
+                item,
+                run_id=run_id,
+                namespace_id=owner.namespace_id,
+            )
+            for item in _fixtures()[2]
+            if self.mapping_owner_ids.get(item.legacy_document_id) == run_id
+        ]
 
     async def exact_mapping(
         self,
@@ -123,8 +156,7 @@ class _EvidenceRepository:
             (
                 item
                 for item in self.items
-                if item.legacy_document_id == resource_id
-                and item.legacy_head_oid == legacy_git_oid
+                if item.legacy_document_id == resource_id and item.legacy_head_oid == legacy_git_oid
             ),
             None,
         )
@@ -135,20 +167,40 @@ class _EvidenceRepository:
             resource_id=resource_id,
             legacy_git_oid=legacy_git_oid,
             path_at_revision=next(
-                document.current_path
-                for document in _fixtures()[1].documents
-                if document.resource_id == resource_id
+                document.current_path for document in _fixtures()[1].documents if document.resource_id == resource_id
             ),
             resolution="native",
-            native_revision_id=(
-                item.native_head_revision_id
-                if item is not None
-                else self.native_ids[resource_id]
-            ),
+            native_revision_id=(item.native_head_revision_id if item is not None else self.native_ids[resource_id]),
             run_id=owner_id,
             lineage_ordinal=1,
             fixed_git_oid=owner.fixed_git_oid,
         )
+
+    async def list_resource_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+    ) -> list[LegacyRevisionMapping]:
+        assert namespace_id == self.run.namespace_id
+        document = next(document for document in _fixtures()[1].documents if document.resource_id == resource_id)
+        owner_id = self.mapping_owner_ids.get(resource_id, self.run.run_id)
+        owner = self.owner_runs[owner_id]
+        native_id = self.native_ids[resource_id]
+        return [
+            LegacyRevisionMapping(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                legacy_git_oid=entry.legacy_git_oid,
+                path_at_revision=entry.path_at_revision,
+                resolution="native" if index == len(document.lineage) - 1 else "bridge",
+                native_revision_id=(native_id if index == len(document.lineage) - 1 else None),
+                run_id=owner_id,
+                lineage_ordinal=index,
+                fixed_git_oid=owner.fixed_git_oid,
+            )
+            for index, entry in enumerate(document.lineage)
+        ]
 
 
 class _Bridge:
@@ -228,10 +280,7 @@ def _fixtures() -> tuple[MigrationRun, LegacyInventory, list[MigrationItem], dic
         documents=documents,
         inventory_digest=digest,
     )
-    native_ids = {
-        document.resource_id: _oid(str(index + 5))
-        for index, document in enumerate(documents)
-    }
+    native_ids = {document.resource_id: _oid(str(index + 5)) for index, document in enumerate(documents)}
     items = [
         MigrationItem(
             run_id=run_id,
@@ -251,6 +300,58 @@ def _fixtures() -> tuple[MigrationRun, LegacyInventory, list[MigrationItem], dic
     return run, inventory, items, native_ids
 
 
+def _activity_binding_fact(
+    document: LegacyInventoryDocument,
+    *,
+    namespace_id: uuid.UUID,
+    selector: str,
+    fixed_ref: str,
+    owner_run_id: uuid.UUID,
+) -> dict[str, Any]:
+    resource_id = str(document.resource_id)
+    occurred_at = document.lineage[-1].committed_at.isoformat()
+    current_mapping = {
+        "namespace_id": str(namespace_id),
+        "resource_id": resource_id,
+        "legacy_git_oid": document.current_commit,
+        "path_at_revision": document.current_path,
+        "resolution": "native",
+        "native_revision_id": selector,
+        "fixed_git_oid": fixed_ref,
+        "run_id": str(owner_run_id),
+    }
+    selected_revision = {
+        "namespace_id": str(namespace_id),
+        "resource_id": resource_id,
+        "revision_id": selector,
+        "parent_revision_id": None,
+        "surface": "document",
+        "action": "create",
+        "path_at_revision": document.current_path,
+        "path_from": None,
+        "path_to": document.current_path,
+        "actor": "akb-native-revision-migration",
+        "subject": None,
+        "summary": None,
+        "occurred_at": occurred_at,
+        "digest": document.body_digest,
+        "byte_size": document.byte_size,
+    }
+    return {
+        "profile": "akb-native-revision-p2-activity-audit/v1",
+        "selector": selector,
+        "fixed_ref": fixed_ref,
+        "current_mapping": current_mapping,
+        "selected_revision": selected_revision,
+        "activity": {
+            key: value
+            for key, value in selected_revision.items()
+            if key not in {"parent_revision_id", "digest", "byte_size"}
+        },
+        "completed_parent_mapping": None,
+    }
+
+
 class _Reader:
     def __init__(
         self,
@@ -258,11 +359,13 @@ class _Reader:
         *,
         candidate: bool,
         fixed_refs: dict[uuid.UUID, str] | None = None,
+        owner_run_ids: dict[uuid.UUID, uuid.UUID] | None = None,
     ):
         self.native_ids = native_ids
         self.candidate = candidate
-        self.fixed_refs = fixed_refs or {
-            resource_id: _oid("f") for resource_id in native_ids
+        self.fixed_refs = fixed_refs or {resource_id: _oid("f") for resource_id in native_ids}
+        self.owner_run_ids = owner_run_ids or {
+            resource_id: uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb") for resource_id in native_ids
         }
         self.calls: list[tuple[str, uuid.UUID]] = []
         self.unknown_delta = False
@@ -300,7 +403,9 @@ class _Reader:
         assert selector == (self.native_ids[document.resource_id] if self.candidate else document.current_commit)
         entries = []
         for index, entry in enumerate(reversed(document.lineage)):
-            entry_selector = self.native_ids[document.resource_id] if self.candidate and index == 0 else entry.legacy_git_oid
+            entry_selector = (
+                self.native_ids[document.resource_id] if self.candidate and index == 0 else entry.legacy_git_oid
+            )
             projection = entry_selector if index == 0 else None
             entries.append(
                 {
@@ -336,10 +441,13 @@ class _Reader:
                 "events": [
                     {
                         "hash": native_id,
-                        "subject": "internal migration subject",
-                        "author": {"id": "akb-native-revision-migration", "display": "Migration"},
+                        "subject": None,
+                        "author": {
+                            "id": "akb-native-revision-migration",
+                            "display": "akb-native-revision-migration",
+                        },
                         "action": "create",
-                        "summary": "C9 fixed-ref native genesis",
+                        "summary": None,
                         "projection_revision": native_id,
                     }
                 ]
@@ -371,12 +479,13 @@ class _Reader:
         )
         return NativeActivityEvidence(
             envelope=envelope,
-            binding_fact={
-                "profile": "akb-native-revision-p2-activity-audit/v1",
-                "resource_id": str(document.resource_id),
-                "selector": selector,
-                "fixed_ref": fixed_ref,
-            },
+            binding_fact=_activity_binding_fact(
+                document,
+                namespace_id=uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                selector=selector,
+                fixed_ref=fixed_ref,
+                owner_run_id=self.owner_run_ids[document.resource_id],
+            ),
         )
 
 
@@ -397,8 +506,10 @@ class _CrossRunReadRepository:
         return self.runs.get(run_id)
 
     async def list_items(self, run_id: uuid.UUID) -> list[MigrationItem]:
-        assert run_id == self.final_run.run_id
-        return [self.item]
+        if run_id == self.final_run.run_id:
+            return [self.item]
+        unchanged_item = _fixtures()[2][1]
+        return [replace(unchanged_item, run_id=run_id)]
 
     async def exact_mapping(
         self,
@@ -411,11 +522,35 @@ class _CrossRunReadRepository:
             return None
         return mapping
 
+    async def list_resource_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+    ) -> list[LegacyRevisionMapping]:
+        assert namespace_id == self.final_run.namespace_id
+        document = next(document for document in _fixtures()[1].documents if document.resource_id == resource_id)
+        current = self.mappings[resource_id]
+        return [
+            LegacyRevisionMapping(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                legacy_git_oid=entry.legacy_git_oid,
+                path_at_revision=entry.path_at_revision,
+                resolution="native" if index == len(document.lineage) - 1 else "bridge",
+                native_revision_id=(current.native_revision_id if index == len(document.lineage) - 1 else None),
+                run_id=current.run_id,
+                lineage_ordinal=index,
+                fixed_git_oid=current.fixed_git_oid,
+            )
+            for index, entry in enumerate(document.lineage)
+        ]
+
 
 async def _table_counts() -> tuple[tuple[str, int], ...]:
     try:
         conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
+    except OSError, asyncpg.PostgresError:
         pytest.skip(f"Postgres not reachable at {_DSN}")
     try:
         rows = await conn.fetch(
@@ -463,6 +598,8 @@ async def test_completed_run_compares_every_resource_and_is_immutable():
     assert receipt["protocol_version"] == "akb-native-revision-p2-w1-c10/v4"
     assert receipt["summary"]["raw_activity_audit_count"] == 2
     assert receipt["evidence_binding"]["mapping_count"] == 2
+    assert receipt["evidence_binding"]["retained_mapping_count"] == 2
+    assert receipt["evidence_binding"]["native_parent_binding_count"] == 2
     assert receipt["evidence_binding"]["owner_run_count"] == 1
     assert len(receipt["resources"]) == 2
     assert set(receipt["summary"]["used_rules"]) == {f"BR-0{index}" for index in range(1, 8)}
@@ -526,6 +663,10 @@ async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_
         changed.resource_id: run.fixed_git_oid,
         unchanged.resource_id: owner_run.fixed_git_oid,
     }
+    owner_run_ids = {
+        changed.resource_id: run.run_id,
+        unchanged.resource_id: owner_run.run_id,
+    }
     comparator = NativeRevisionShadowComparator(
         repository=_CrossRunReadRepository(run, owner_run, items[0], mappings),
         bridge=_Bridge(inventory),
@@ -533,11 +674,13 @@ async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_
             native_ids,
             candidate=False,
             fixed_refs=fixed_refs,
+            owner_run_ids=owner_run_ids,
         ),
         candidate_reader=_Reader(
             native_ids,
             candidate=True,
             fixed_refs=fixed_refs,
+            owner_run_ids=owner_run_ids,
         ),
     )
 
@@ -547,6 +690,52 @@ async def test_completed_reconcile_resolves_an_unchanged_mapping_from_its_owner_
     assert receipt["summary"]["resource_count"] == 2
     assert receipt["summary"]["operation_count"] == 8
     assert receipt["summary"]["raw_activity_audit_count"] == 2
+
+
+async def test_completed_reconcile_rejects_rehomed_unchanged_mapping():
+    run, inventory, items, native_ids = _fixtures()
+    changed, unchanged = inventory.documents
+    owner_run = replace(
+        run,
+        run_id=uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        fixed_git_oid=_oid("a"),
+        coverage_version="c9-owner-v1",
+        inventory_digest="e" * 64,
+    )
+    mappings = {
+        changed.resource_id: LegacyRevisionMapping(
+            namespace_id=run.namespace_id,
+            resource_id=changed.resource_id,
+            legacy_git_oid=changed.current_commit,
+            path_at_revision=changed.current_path,
+            resolution="native",
+            native_revision_id=native_ids[changed.resource_id],
+            run_id=run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=run.fixed_git_oid,
+        ),
+        unchanged.resource_id: LegacyRevisionMapping(
+            namespace_id=run.namespace_id,
+            resource_id=unchanged.resource_id,
+            legacy_git_oid=unchanged.current_commit,
+            path_at_revision=unchanged.current_path,
+            resolution="native",
+            native_revision_id=native_ids[unchanged.resource_id],
+            run_id=run.run_id,
+            lineage_ordinal=1,
+            fixed_git_oid=run.fixed_git_oid,
+        ),
+    }
+    repository = _CrossRunReadRepository(run, owner_run, items[0], mappings)
+    comparator = NativeRevisionShadowComparator(
+        repository=repository,
+        bridge=_Bridge(inventory),
+        legacy_reader=_Reader(native_ids, candidate=False),
+        candidate_reader=_Reader(native_ids, candidate=True),
+    )
+
+    with pytest.raises(ShadowComparisonError, match="exact completed owner item"):
+        await comparator.compare_run(run.run_id)
 
 
 async def test_incomplete_run_and_inventory_drift_are_rejected_before_reads():
@@ -634,11 +823,24 @@ def _evidence_comparator(
     fixed_refs: dict[uuid.UUID, str] | None = None,
 ) -> NativeRevisionShadowComparator:
     refs = fixed_refs or {resource_id: run.fixed_git_oid for resource_id in native_ids}
+    owner_run_ids = {
+        resource_id: repository.mapping_owner_ids.get(resource_id, run.run_id) for resource_id in native_ids
+    }
     return NativeRevisionShadowComparator(
         repository=repository,
         bridge=_Bridge(inventory),
-        legacy_reader=_Reader(native_ids, candidate=False, fixed_refs=refs),
-        candidate_reader=_Reader(native_ids, candidate=True, fixed_refs=refs),
+        legacy_reader=_Reader(
+            native_ids,
+            candidate=False,
+            fixed_refs=refs,
+            owner_run_ids=owner_run_ids,
+        ),
+        candidate_reader=_Reader(
+            native_ids,
+            candidate=True,
+            fixed_refs=refs,
+            owner_run_ids=owner_run_ids,
+        ),
     )
 
 
@@ -672,6 +874,61 @@ async def test_evidence_binding_is_stable_under_scope_and_item_order_shuffle():
     assert all(document.activity.actor not in encoded for document in inventory.documents)
     assert all(document.activity.subject not in encoded for document in inventory.documents)
     assert all(document.activity.summary not in encoded for document in inventory.documents)
+
+
+@pytest.mark.parametrize("tamper", ("owner", "ordinal"))
+async def test_retained_mapping_owner_or_ordinal_tamper_fails_closed(tamper):
+    run, inventory, items, native_ids = _fixtures()
+    repository = _EvidenceRepository(run, items, native_ids)
+    original = repository.list_resource_mappings
+
+    async def tampered_mappings(*, namespace_id, resource_id):
+        mappings = await original(
+            namespace_id=namespace_id,
+            resource_id=resource_id,
+        )
+        if resource_id != inventory.documents[0].resource_id:
+            return mappings
+        if tamper == "owner":
+            mappings[0] = replace(mappings[0], run_id=uuid.uuid4())
+        else:
+            mappings[0] = replace(mappings[0], lineage_ordinal=1)
+        return mappings
+
+    repository.list_resource_mappings = tampered_mappings
+    comparator = _evidence_comparator(run, inventory, repository, native_ids)
+
+    with pytest.raises(ShadowComparisonError, match="mapping|owner"):
+        await comparator.compare_run(run.run_id)
+
+
+@pytest.mark.parametrize("owner_fact", ("fixed_ref", "namespace", "coverage"))
+async def test_invalid_retained_mapping_owner_run_facts_fail(owner_fact):
+    run, inventory, _, native_ids = _fixtures()
+    owner = replace(
+        run,
+        run_id=uuid.UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+        fixed_git_oid=_oid("b"),
+        inventory_digest="f" * 64,
+        coverage_version="c9-owner-v1",
+    )
+    if owner_fact == "fixed_ref":
+        owner = replace(owner, fixed_git_oid="invalid")
+    elif owner_fact == "namespace":
+        owner = replace(owner, namespace_id=uuid.uuid4())
+    else:
+        owner = replace(owner, coverage_version="")
+    repository = _EvidenceRepository(
+        run,
+        [],
+        native_ids,
+        owner_runs=[owner],
+        mapping_owner_ids={resource_id: owner.run_id for resource_id in native_ids},
+    )
+    comparator = _evidence_comparator(run, inventory, repository, native_ids)
+
+    with pytest.raises(ShadowComparisonError, match="owner|scope facts"):
+        await comparator.compare_run(run.run_id)
 
 
 @pytest.mark.parametrize("changed", ("run", "ref", "inventory", "mapping_owner"))
@@ -741,3 +998,8 @@ async def test_evidence_binding_changes_when_any_private_scope_fact_changes(chan
         ).compare_run(run.run_id)
 
     assert base["evidence_binding"]["commitment"] != changed_receipt["evidence_binding"]["commitment"]
+    if changed in {"inventory", "mapping_owner"}:
+        assert (
+            base["evidence_binding"]["components"]["retained_mapping_closure"]
+            != changed_receipt["evidence_binding"]["components"]["retained_mapping_closure"]
+        )
