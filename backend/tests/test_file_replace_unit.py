@@ -34,6 +34,15 @@ class _Conn:
     def transaction(self):
         return _Context(self)
 
+    async def fetchval(self, *_args):
+        return 1
+
+    async def fetchrow(self, *_args):
+        return None
+
+    async def execute(self, *_args):
+        return None
+
 
 class _Pool:
     def __init__(self):
@@ -158,6 +167,7 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
 
     async def _enqueue(_conn, key, *, delay_seconds=0):
         scheduled.append((key, delay_seconds))
+        return len(scheduled)
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
@@ -190,7 +200,8 @@ async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monke
     old = _row()
     copied: list[tuple[str, str]] = []
     replaced: list[dict] = []
-    enqueued: list[str] = []
+    enqueued: list[tuple[str, int]] = []
+    cancelled: list[int] = []
     events: list[tuple] = []
 
     async def _find(*_args):
@@ -202,8 +213,12 @@ async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monke
     async def _replace(_conn, _fid, **kwargs):
         replaced.append(kwargs)
 
-    async def _enqueue(_conn, key):
-        enqueued.append(key)
+    async def _enqueue(_conn, key, *, delay_seconds=0):
+        enqueued.append((key, delay_seconds))
+        return len(enqueued)
+
+    async def _cancel(_conn, outbox_id):
+        cancelled.append(outbox_id)
 
     async def _event(*args, **kwargs):
         events.append((args, kwargs))
@@ -223,6 +238,7 @@ async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monke
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", _locked)
     monkeypatch.setattr(fs.vault_files_repo, "replace_confirmed_metadata", _replace)
     monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
+    monkeypatch.setattr(fs, "_cancel_s3_delete", _cancel)
     monkeypatch.setattr(fs, "emit_event", _event)
     monkeypatch.setattr(fs, "index_file_metadata", _index)
     monkeypatch.setattr(fs.s3_adapter, "copy", _copy)
@@ -250,9 +266,17 @@ async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monke
     assert staging_key != old["s3_key"]
     assert final_key != old["s3_key"]
     assert final_key != staging_key
+    assert final_key.split("/")[-1].startswith(
+        "99999999888877776666555555555555_"
+    )
     assert replaced[0]["s3_key"] == final_key
     assert replaced[0]["content_hash"] == _NEW_HASH
-    assert enqueued == [old["s3_key"], staging_key]
+    assert enqueued == [
+        (final_key, fs._REPLACEMENT_CANDIDATE_DELETE_DELAY),
+        (old["s3_key"], 0),
+        (staging_key, 0),
+    ]
+    assert cancelled == [1]
     assert events[0][0][1] == "file.update"
 
 
@@ -262,6 +286,7 @@ async def test_confirm_replace_detects_race_under_lock_without_touching_live_key
     raced = _row(content_hash=hashlib.sha256(b"concurrent").hexdigest(), etag="etag-raced")
     copied: list[tuple[str, str]] = []
     deleted: list[str] = []
+    enqueued: list[tuple[str, int]] = []
 
     async def _find(*_args):
         return dict(old)
@@ -277,6 +302,10 @@ async def test_confirm_replace_detects_race_under_lock_without_touching_live_key
             "ETag": '"etag-new"',
         }
 
+    async def _enqueue(_conn, key, *, delay_seconds=0):
+        enqueued.append((key, delay_seconds))
+        return len(enqueued)
+
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", _locked)
     monkeypatch.setattr(
@@ -287,6 +316,7 @@ async def test_confirm_replace_detects_race_under_lock_without_touching_live_key
     monkeypatch.setattr(fs.s3_adapter, "copy", _copy)
     monkeypatch.setattr(fs.s3_adapter, "iter_chunks", lambda key: iter([_NEW_BYTES]))
     monkeypatch.setattr(fs.s3_adapter, "delete", lambda key: deleted.append(key))
+    monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
 
     with pytest.raises(ConflictError, match="content_hash moved") as exc:
         await service.confirm_replace(
@@ -303,6 +333,7 @@ async def test_confirm_replace_detects_race_under_lock_without_touching_live_key
     assert exc.value.status_code == 409
     assert copied[0][1] != old["s3_key"], "the candidate copy must never target the live key"
     assert set(deleted) == set(copied[0])
+    assert (copied[0][1], fs._REPLACEMENT_CANDIDATE_DELETE_DELAY) in enqueued
 
 
 async def test_confirm_replace_rejects_mismatched_uploaded_bytes(monkeypatch):
@@ -338,6 +369,115 @@ async def test_confirm_replace_rejects_mismatched_uploaded_bytes(monkeypatch):
         )
 
     assert set(deleted) == set(copied[0])
+
+
+async def test_confirm_replace_never_deletes_candidate_on_ambiguous_commit(monkeypatch):
+    """A successful COMMIT can still surface a transport error to the caller.
+
+    The final object must stay intact in that case; its delayed cleanup is
+    cancelled atomically by the same transaction if publication committed.
+    """
+    service, pool = await _service(monkeypatch)
+    old = _row()
+    deleted: list[str] = []
+    enqueued: list[tuple[str, int]] = []
+
+    class _AmbiguousTransaction(_Context):
+        async def __aexit__(self, exc_type, *_args):
+            if exc_type is None:
+                raise RuntimeError("commit outcome unknown")
+            return None
+
+    class _AmbiguousConn(_Conn):
+        def transaction(self):
+            return _AmbiguousTransaction(self)
+
+    pool.conn = _AmbiguousConn()
+
+    async def _find(*_args):
+        return dict(old)
+
+    async def _replace(*_args, **_kwargs):
+        return None
+
+    async def _enqueue(_conn, key, *, delay_seconds=0):
+        enqueued.append((key, delay_seconds))
+        return len(enqueued)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", _find)
+    monkeypatch.setattr(fs.vault_files_repo, "replace_confirmed_metadata", _replace)
+    monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
+    monkeypatch.setattr(fs, "_cancel_s3_delete", _noop)
+    monkeypatch.setattr(fs, "emit_event", _noop)
+    monkeypatch.setattr(
+        fs.s3_adapter,
+        "copy",
+        lambda _source, _destination: {
+            "ContentLength": len(_NEW_BYTES),
+            "ContentType": "application/octet-stream",
+            "ETag": '"etag-new"',
+        },
+    )
+    monkeypatch.setattr(fs.s3_adapter, "iter_chunks", lambda _key: iter([_NEW_BYTES]))
+    monkeypatch.setattr(fs.s3_adapter, "delete", lambda key: deleted.append(key))
+
+    replacement_id = uuid.uuid4()
+    with pytest.raises(RuntimeError, match="commit outcome unknown"):
+        await service.confirm_replace(
+            "team",
+            old["vault_id"],
+            str(old["id"]),
+            str(replacement_id),
+            actor_id="tester",
+            content_hash=_NEW_HASH,
+        )
+
+    staging_key = fs._replacement_staging_key("team", old["id"], replacement_id)
+    final_key = fs._replacement_final_key(
+        "team", old["collection"], old["name"], replacement_id,
+    )
+    assert staging_key in deleted
+    assert final_key not in deleted
+    assert (final_key, fs._REPLACEMENT_CANDIDATE_DELETE_DELAY) in enqueued
+
+
+async def test_delete_locks_row_before_selecting_object_for_cleanup(monkeypatch):
+    """Delete must enqueue the key observed after serializing with replace."""
+    service, _pool = await _service(monkeypatch)
+    current = _row(s3_key="team/newly-published.bin")
+    enqueued: list[str] = []
+
+    async def _locked(*_args):
+        return dict(current)
+
+    async def _legacy_read(*_args):
+        pytest.fail("delete must not read file metadata outside the row lock")
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _enqueue(_conn, key, *, delay_seconds=0):
+        assert delay_seconds == 0
+        enqueued.append(key)
+        return len(enqueued)
+
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _legacy_read)
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", _locked)
+    monkeypatch.setattr(fs.vault_files_repo, "delete", _noop)
+    monkeypatch.setattr(fs, "delete_file_chunks", _noop)
+    monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
+    monkeypatch.setattr(fs, "emit_event", _noop)
+
+    result = await service.delete(
+        current["vault_id"], str(current["id"]), actor_id="tester",
+    )
+
+    assert result["deleted"] is True
+    assert enqueued == [current["s3_key"]]
 
 
 async def test_storage_copy_uses_boto_managed_copy_for_large_file_compatibility(monkeypatch):
