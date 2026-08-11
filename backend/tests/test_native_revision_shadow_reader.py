@@ -1460,6 +1460,22 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert receipt["evidence_binding"]["domain"] == (
         "akb-native-revision-p2-w1-c10/evidence-binding/v1"
     )
+    components = receipt["evidence_binding"]["components"]
+    assert set(components) == {"comparison_run", "mapping_owner_activity"}
+    assert len(components["comparison_run"]) == 64
+    assert len(components["mapping_owner_activity"]) == 1
+    recomputed = hashlib.sha256(
+        (
+            receipt["evidence_binding"]["domain"] + "\0"
+        ).encode()
+        + json.dumps(
+            components,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert receipt["evidence_binding"]["commitment"] == recomputed
     assert len(receipt["evidence_binding"]["commitment"]) == 64
     assert all(
         resource["operations"]["activity"]["raw_activity_audit"] == {

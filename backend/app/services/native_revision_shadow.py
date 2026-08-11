@@ -693,28 +693,45 @@ class NativeRevisionShadowComparator:
             raise ShadowComparisonError(
                 "evidence binding is missing an audited native activity fact"
             )
-        preimage = {
-            "comparison_run": run_facts,
-            "mapping_owner_scope": mappings,
+        comparison_run_commitment = cls._domain_digest(
+            f"{_EVIDENCE_BINDING_DOMAIN}/comparison-run",
+            run_facts,
+        )
+        mapping_commitments = sorted(
+            cls._domain_digest(
+                f"{_EVIDENCE_BINDING_DOMAIN}/mapping-owner-activity",
+                fact,
+            )
+            for fact in mappings
+        )
+        redacted_preimage = {
+            "comparison_run": comparison_run_commitment,
+            "mapping_owner_activity": mapping_commitments,
         }
-        canonical = json.dumps(
-            preimage,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        commitment = hashlib.sha256(
-            _EVIDENCE_BINDING_DOMAIN.encode("utf-8") + b"\0" + canonical
-        ).hexdigest()
+        commitment = cls._domain_digest(
+            _EVIDENCE_BINDING_DOMAIN,
+            redacted_preimage,
+        )
         owner_run_ids = {fact["owner_run"]["run_id"] for fact in mappings}
         return {
             "scheme": "sha256",
             "canonicalization": _EVIDENCE_BINDING_CANONICALIZATION,
             "domain": _EVIDENCE_BINDING_DOMAIN,
             "commitment": commitment,
+            "components": redacted_preimage,
             "mapping_count": len(mappings),
             "owner_run_count": len(owner_run_ids),
         }
+
+    @staticmethod
+    def _domain_digest(domain: str, value: Any) -> str:
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(domain.encode("utf-8") + b"\0" + canonical).hexdigest()
 
     @classmethod
     def _validate_inventory_binding(cls, run: MigrationRun, inventory: LegacyInventory) -> None:
