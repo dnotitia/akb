@@ -597,15 +597,20 @@ class LegacyFixedRefShadowReader:
         snapshot_text = snapshot.body.decode("utf-8")
         if current_text != snapshot_text:
             raise ShadowReaderScopeError("legacy fixed-ref diff current body differs from C9 facts")
-        patch_parent = "" if diff_type == "added" else parent_text
-        applied = _apply_unified_patch(patch_parent, raw_diff["diff"], diff_type)
+        if previous is None and diff_type == "modified":
+            transition_parent = ""
+            applied = current_text
+        else:
+            patch_parent = "" if diff_type == "added" else parent_text
+            transition_parent = parent_text
+            applied = _apply_unified_patch(patch_parent, raw_diff["diff"], diff_type)
         if applied != current_text:
             raise ShadowReaderScopeError("legacy fixed-ref diff patch differs from current body")
         return {
             "file": document.current_path,
             "commit": selector,
             "basis": "git-parent",
-            "text": _canonical_transition(parent_text, applied),
+            "text": _canonical_transition(transition_parent, applied),
             "format": "unified",
         }
 

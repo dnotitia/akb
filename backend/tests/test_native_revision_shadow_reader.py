@@ -40,6 +40,7 @@ from app.services.native_revision_shadow import (
 )
 from app.services.native_revision_shadow_reader import (
     _apply_unified_patch,
+    _canonical_transition,
     LegacyFixedRefShadowReader,
     NativeActivityEvidence,
     NativeRevisionShadowReader,
@@ -571,6 +572,28 @@ class _NoWriteGit:
         return body.decode() if body is not None else None
 
 
+class _GenesisDiffGit(_NoWriteGit):
+    def __init__(self, document: LegacyInventoryDocument, *, diff: dict[str, Any], body: str):
+        super().__init__(document)
+        self.diff_override = diff
+        self.parent_reads: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.bodies[(document.current_path, document.current_commit)] = body.encode()
+
+    def file_diff(self, *args) -> dict[str, Any]:
+        self.calls.append(("file_diff", args))
+        return self.diff_override
+
+    def read_file(self, *args, **kwargs) -> str:
+        if (args[1], kwargs.get("commit")) != (
+            self.documents[0].current_path,
+            self.documents[0].current_commit,
+        ):
+            self.parent_reads.append((args, kwargs))
+            raise AssertionError("genesis diff read outside logical lineage")
+        self.calls.append(("read_file", args))
+        return self.bodies[(args[1], kwargs["commit"])].decode()
+
+
 @dataclass
 class _Snapshot:
     resource_id: uuid.UUID
@@ -1091,6 +1114,84 @@ async def test_product_readers_are_scoped_and_read_only():
 
     await native.get(document, selector=native_id, fixed_ref=fixed_ref)
     assert len(native_service.calls) == 3
+
+
+def _genesis_document(*, action: str, body: str) -> LegacyInventoryDocument:
+    base = _document()
+    current = base.lineage[-1]
+    return replace(
+        base,
+        body_digest=hashlib.sha256(body.encode()).hexdigest(),
+        byte_size=len(body.encode()),
+        lineage=(current,),
+        activity=replace(
+            base.activity,
+            action=action,
+            summary=f"{action} migration candidate at fixed ref",
+            changed_paths=({"change": action, "path_from": None, "path_to": base.current_path},),
+        ),
+    )
+
+
+async def test_legacy_reader_treats_modified_singleton_lineage_as_logical_genesis():
+    body = "# Migration candidate\n\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n"
+    document = _genesis_document(action="update", body=body)
+    path = document.current_path
+    raw_diff = {
+        "file": path,
+        "commit": document.current_commit,
+        "type": "modified",
+        "diff": "\n".join(
+            [
+                f"--- a/{path}",
+                f"+++ b/{path}",
+                "@@ -5,7 +5,7 @@",
+                *(f"-out-of-lineage-{index}" for index in range(1, 8)),
+                *(f"+line {index}" for index in range(3, 10)),
+            ]
+        ),
+    }
+    git = _GenesisDiffGit(document, diff=raw_diff, body=body)
+
+    result = await LegacyFixedRefShadowReader(git=git, vault_name="p2-manual").diff(
+        document,
+        selector=document.current_commit,
+        fixed_ref=_oid("f"),
+    )
+
+    assert result["text"] == _canonical_transition("", body)
+    assert git.parent_reads == []
+    assert [name for name, _ in git.calls] == [
+        "manual_fixed_ref_history",
+        "file_diff",
+        "read_file",
+    ]
+
+
+async def test_legacy_reader_rejects_malformed_added_genesis_patch():
+    body = "# Migration candidate\n\ncurrent body\n"
+    document = _genesis_document(action="create", body=body)
+    path = document.current_path
+    lines = body.splitlines()
+    raw_diff = {
+        "file": path,
+        "commit": document.current_commit,
+        "type": "added",
+        "diff": "\n".join(
+            [
+                f"@@ -5,0 +1,{len(lines)} @@",
+                *(f"+{line}" for line in lines),
+            ]
+        ),
+    }
+    git = _GenesisDiffGit(document, diff=raw_diff, body=body)
+
+    with pytest.raises(ShadowReaderScopeError, match="invalid parent range"):
+        await LegacyFixedRefShadowReader(git=git, vault_name="p2-manual").diff(
+            document,
+            selector=document.current_commit,
+            fixed_ref=_oid("f"),
+        )
 
 
 async def test_legacy_reader_matches_inventory_after_subsecond_lineage_boundary():
